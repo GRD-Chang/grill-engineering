@@ -3,9 +3,9 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.git_errors import GitHubReadError
-from agent_run_kernel import DeliveryKind, Requirements
-from agent_run_kernel.model import ReadWait, Step
+from agent_run.errors import GitHubReadError
+from agent_run.model import DeliveryKind, Requirements
+from agent_run.model import ReadWait, Step
 from support.offline import OfflinePort, Scenario
 from support.offline_api import SyntheticGitHub
 from support.effect_boundary import EffectBoundary, effect_boundary

@@ -4,10 +4,11 @@ import shutil
 
 import pytest
 
-from agent_run_kernel import Effect, Execution, KernelError, ResourceWitness
-from agent_run_kernel.effects import LocalGit
-from agent_run_kernel.local_effects import LocalEffects
-from agent_run_kernel.model import resource_wire
+from agent_run.model import Effect, Execution, ResourceWitness
+from agent_run.errors import KernelError
+from agent_run.adapters.git_objects import LocalGit
+from agent_run.adapters.local_git import LocalEffects
+from agent_run.model import resource_wire
 
 
 def _original(git_repo: Path, tmp_path: Path):

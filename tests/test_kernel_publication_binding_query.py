@@ -4,11 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel import Issue, ParentIssue, Requirements
-from agent_run_kernel import query
-from agent_run_kernel.model import Role
+from agent_run.model import Issue, ParentIssue, Requirements
+import agent_run.queries.run as query
+from agent_run.model import Role
 from support.offline import GraphScenario
-from agent_run_kernel.query_render import render
+from agent_run.cli.render import render
 from tests.test_kernel_notification_events import _project, _recorded_agents
 from tests.test_kernel_query_cli import _snapshot
 

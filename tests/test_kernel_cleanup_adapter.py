@@ -6,12 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel import Effect, Execution, KernelError
-from agent_run_kernel.cleanup_adapter import (
-    cleanup_local_ref, cleanup_remote_ref, cleanup_worktree,
-    inspect_local_ref, inspect_remote_ref, inspect_worktree,
-)
-from agent_run_kernel.effects import LocalGit
+from agent_run.model import Effect, Execution
+from agent_run.errors import KernelError
+from agent_run.adapters.cleanup import cleanup_local_ref, cleanup_remote_ref, cleanup_worktree, inspect_local_ref, inspect_remote_ref, inspect_worktree
+from agent_run.adapters.git_objects import LocalGit
 
 
 REF = "refs/heads/task"

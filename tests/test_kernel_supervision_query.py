@@ -1,16 +1,17 @@
 """Public supervision reads the original scoped Core waits without authorizing them."""
-from agent_run_kernel.operation_runner import OperationRunner
+from agent_run.core.operation_runner import OperationRunner
 from dataclasses import replace
 from io import StringIO
 
 import pytest
 
-from agent_run_kernel import DeliveryKind, Kernel, Issue, ParentIssue, Requirements
-from agent_run_kernel import query
+from agent_run.model import DeliveryKind, Issue, ParentIssue, Requirements
+from agent_run.core.kernel import Kernel
+import agent_run.queries.run as query
 from support.offline import GraphScenario, Scenario
-from agent_run_kernel.operation_runner import ReadUnavailable
+from agent_run.core.operation_contract import ReadUnavailable
 from support.core_operations import CoreOperations
-from agent_run_kernel.query_render import render
+from agent_run.cli.render import render
 from test_kernel_automatic_supervision import delivery_run, source_operations
 from test_kernel_query_cli import _snapshot
 

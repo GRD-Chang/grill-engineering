@@ -9,8 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel import DeliveryKind, KernelError, executor
-from agent_run_kernel.model import Execution, HostObservation
+import agent_run.runtime.executor as executor
+from agent_run.model import DeliveryKind
+from agent_run.errors import KernelError
+from agent_run.model import Execution, HostObservation
 from support.offline import Scenario
 
 
@@ -53,8 +55,8 @@ def test_direct_claim_quiesces_at_unknown_push_and_resume_reads_its_original(
 
     monkeypatch.setattr(scenario.port, "reconcile", original_readback)
     monkeypatch.setattr(executor, "_make_ports", scenario.make_ports)
-    monkeypatch.setattr("agent_run_kernel.notifications.NativeNotifications", _NoNotifications)
-    monkeypatch.setattr("agent_run_kernel.codex_execution.execute_selected_codex",
+    monkeypatch.setattr('agent_run.notifications.sender.NativeNotifications', _NoNotifications)
+    monkeypatch.setattr('agent_run.runtime.codex.execute_selected_codex',
                         lambda *a, **kw: pytest.fail("Original push recovery allocates no Agent"))
     # This fixture has a direct Core claim, not an admitted native Host. Its
     # passive state never activates an operational poll or grants a fresh write.
@@ -152,8 +154,8 @@ def test_public_run_reads_a_restored_third_push_before_conflict_resume(
         return physical_reconcile(effect)
 
     monkeypatch.setattr(scenario.port, "reconcile", read_original)
-    monkeypatch.setattr("agent_run_kernel.notifications.NativeNotifications", _NoNotifications)
-    monkeypatch.setattr("agent_run_kernel.codex_execution.execute_selected_codex",
+    monkeypatch.setattr('agent_run.notifications.sender.NativeNotifications', _NoNotifications)
+    monkeypatch.setattr('agent_run.runtime.codex.execute_selected_codex',
                         lambda *a, **kw: pytest.fail("Original push readback needs no Agent"))
     monkeypatch.setattr(executor, "_make_ports", scenario.make_ports)
 

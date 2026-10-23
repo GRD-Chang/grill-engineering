@@ -5,11 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel.artifact_contract import (
-    ArtifactContractError, MAX_HUMAN_BLOCKER_LENGTH, MAX_HUMAN_BLOCKERS,
-    parse_artifact, role_schema,
-)
-from agent_run_kernel.model import KernelError, Role, artifact as native_artifact, review_outcome, wire_json
+from agent_run.errors import ArtifactContractError
+from agent_run.contracts.artifact import MAX_HUMAN_BLOCKER_LENGTH, MAX_HUMAN_BLOCKERS, parse_artifact, role_schema
+from agent_run.errors import KernelError
+from agent_run.model import Role, artifact as native_artifact, review_outcome, wire_json
 
 
 PASS_EVIDENCE = {

@@ -14,8 +14,8 @@ from collections.abc import Iterator
 
 import pytest
 
-from agent_run import notification_transport as transport
-from agent_run.process_cleanup import child_subreaper
+import agent_run.adapters.notification_transport as transport
+from agent_run.runtime.process_cleanup import child_subreaper
 
 
 CONFIG = {"enabled": True, "profile": "notify", "open_id": "ou_recipient", "app_id": "cli_app"}
@@ -135,12 +135,11 @@ def test_executor_death_reaps_cli_and_detached_descendant(
     fake_cli: Path, monkeypatch: pytest.MonkeyPatch, death_signal: int,
 ) -> None:
     monkeypatch.setenv("FAKE_MODE", "hang")
-    environment = {**os.environ, "PYTHONPATH": str(Path(transport.__file__).resolve().parent.parent)}
+    environment = {**os.environ, "PYTHONPATH": str(Path(transport.__file__).resolve().parents[2])}
     with child_subreaper():
         owner = subprocess.Popen([
             sys.executable, "-c",
-            "from agent_run.notification_transport import send; from threading import Event; "
-            f"send({CONFIG!r}, {CARD!r}, 'key', Event())",
+            f"from agent_run.adapters.notification_transport import send; from threading import Event; send({CONFIG!r}, {CARD!r}, 'key', Event())",
         ], env=environment)
         pids: list[int] = []
         try:
@@ -178,7 +177,7 @@ def test_supervisor_deadline_works_without_owner_cancellation(
     fake_cli: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("FAKE_MODE", "hang")
-    environment = {**os.environ, "PYTHONPATH": str(Path(transport.__file__).resolve().parent.parent)}
+    environment = {**os.environ, "PYTHONPATH": str(Path(transport.__file__).resolve().parents[2])}
     supervisor = subprocess.Popen(
         [sys.executable, "-c",
          "import sys; from pathlib import Path; from types import SimpleNamespace; "

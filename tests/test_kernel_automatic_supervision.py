@@ -1,15 +1,17 @@
 """Real Core operations retain the original bounded supervision contract."""
-from agent_run_kernel.operation_runner import OperationRunner
+from agent_run.core.operation_runner import OperationRunner
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, RunSpec
-from agent_run_kernel.model import Issue, ParentIssue, ReadWait, Requirements
+from agent_run.model import Commit, Delivery, DeliveryKind, Policy, RunSpec
+from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
+from agent_run.model import Issue, ParentIssue, ReadWait, Requirements
 from support.offline import GraphScenario, Scenario, fixture_inputs
-from agent_run_kernel.operation_runner import DeliveryFacts, ReadUnavailable
-from agent_run_kernel.query import read
+from agent_run.core.operation_contract import DeliveryFacts, ReadUnavailable
+from agent_run.queries.run import read
 from support.core_operations import CoreOperations, ReadOnlyPorts, scripted_return
 
 

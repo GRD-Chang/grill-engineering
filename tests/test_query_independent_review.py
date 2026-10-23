@@ -1,11 +1,11 @@
 """Retired locator material cannot override an exact native Task publication."""
 import json
 from pathlib import Path
-from agent_run.managed_workspace import ManagedWorkspace
-from agent_run.paths import app_data_root
-from agent_run.task_identity import TaskKey
-from agent_run_kernel.query import task_binding
-from agent_run_kernel.query_cli import main
+from agent_run.adapters.workspace import ManagedWorkspace
+from agent_run.config.paths import app_data_root
+from agent_run.contracts.task import TaskKey
+from agent_run.queries.run import task_binding
+from agent_run.cli.main import main
 from test_kernel_query_cli import _snapshot as _bytes
 from test_kernel_query_discovery import _published
 

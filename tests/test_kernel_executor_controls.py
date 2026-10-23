@@ -5,10 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel import Policy
-from agent_run_kernel.executor import _make_ports
+from agent_run.model import Policy
+from agent_run.runtime.executor import _make_ports
 from support.core_operations import CoreOperations
-from agent_run_kernel.model import Execution, HostObservation
+from agent_run.model import Execution, HostObservation
 from support.offline import GraphScenario
 from test_kernel_remote_effects import _fixture
 from test_kernel_requirements import independent_source

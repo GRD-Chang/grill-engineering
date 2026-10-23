@@ -1,14 +1,14 @@
 """Only a proved obsolete source operation may yield to the Core runner."""
-from agent_run_kernel.operation_runner import OperationRunner
+from agent_run.core.operation_runner import OperationRunner
 from dataclasses import replace
 from threading import Event, Thread, current_thread
 
 import pytest
 
-from agent_run.git_errors import GitHubReadError
-from agent_run_kernel import Kernel
-from agent_run_kernel.model import KernelError
-from agent_run_kernel.source_reading import read_requirements
+from agent_run.errors import GitHubReadError
+from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
+from agent_run.adapters.source import read_requirements
 from support.core_operations import CoreOperations
 from test_kernel_remote_effects import _change, _fixture, _source_kernel
 
@@ -27,7 +27,7 @@ def source_operations(tmp_path, port, push, monkeypatch):
 
 
 def test_executor_discards_a_source_read_superseded_during_real_external_io(tmp_path, monkeypatch):
-    import agent_run_kernel.remote_effects as external
+    import agent_run.adapters.remote as external
 
     port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
     operations = source_operations(tmp_path, port, push, monkeypatch)
@@ -77,7 +77,7 @@ def test_executor_discards_a_source_read_superseded_during_real_external_io(tmp_
 
 @pytest.mark.parametrize("code", ["source_observation_changed", "source_subject_changed", "upstream_unavailable"])
 def test_executor_preserves_unproved_or_upstream_read_errors(tmp_path, monkeypatch, code):
-    import agent_run_kernel.remote_effects as external
+    import agent_run.adapters.remote as external
 
     port, _git, push, _state, _calls = _fixture(tmp_path, monkeypatch)
     operations = source_operations(tmp_path, port, push, monkeypatch)

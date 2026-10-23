@@ -1,12 +1,13 @@
 """A nonzero physical write remains audited when exact readback succeeds."""
-from agent_run_kernel.operation_runner import OperationRunner
+from agent_run.core.operation_runner import OperationRunner
 import json
 from pathlib import Path
 import shutil
 import sys
 
-from agent_run_kernel import Delivery, DeliveryKind, Kernel, RunSpec
-from agent_run_kernel.model import ParentIssue, Requirements
+from agent_run.model import Delivery, DeliveryKind, RunSpec
+from agent_run.core.kernel import Kernel
+from agent_run.model import ParentIssue, Requirements
 from support.offline import Scenario, fixture_inputs
 from test_kernel_remote_effects import _fixture
 
@@ -61,7 +62,7 @@ def test_actual_nonzero_push_is_audited_once_despite_target_readback(tmp_path, m
 
 
 def test_publication_unknown_response_diagnostic_remains_public_after_successful_exact_readback(tmp_path):
-    from agent_run_kernel.query import read
+    from agent_run.queries.run import read
 
     scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
     now = [100.25]

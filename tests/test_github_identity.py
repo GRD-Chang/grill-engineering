@@ -4,11 +4,10 @@ import subprocess
 
 import pytest
 
-from agent_run.github_identity import (
-    GitHubIdentityError, describe_identity, native_github_environment, normalize_github_config,
-    resolve_worker_identity, resolve_runner_identity, validate_identity_snapshot, validate_worker_auth,
-)
-from agent_run.user_defaults import UserDefaultsStore
+from agent_run.errors import GitHubIdentityError
+from agent_run.contracts.identity import describe_identity, normalize_github_config, validate_identity_snapshot
+from agent_run.adapters.auth.identity import native_github_environment, resolve_worker_identity, resolve_runner_identity, validate_worker_auth
+from agent_run.config.defaults import UserDefaultsStore
 from support.user_defaults import settings
 
 

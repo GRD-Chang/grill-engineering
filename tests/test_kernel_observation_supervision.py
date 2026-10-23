@@ -8,10 +8,11 @@ from threading import Event, Thread
 
 import pytest
 
-from agent_run_kernel.execution import execute
-from agent_run_kernel.executor import _make_ports
+from agent_run.runtime.execution import execute
+from agent_run.runtime.executor import _make_ports
 from support.core_operations import CoreOperations
-from agent_run_kernel.model import KernelError, ReadWait
+from agent_run.errors import KernelError
+from agent_run.model import ReadWait
 from test_kernel_remote_effects import _fixture, _publish_pr, _source_kernel
 from test_kernel_worker_source_windows import _allocated_worker, RAW
 

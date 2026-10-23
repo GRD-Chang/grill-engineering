@@ -1,16 +1,17 @@
 """Public Core operation seam: selection, bounded I/O and durable settlement."""
-from agent_run_kernel.operation_runner import OperationRunner, observe_control
+from agent_run.core.operation_runner import OperationRunner, observe_control
 from pathlib import Path
 from dataclasses import replace
 
 import pytest
 
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, Policy, Requirements, RunSpec
-from agent_run_kernel.model import Checks, Issue, ParentIssue
-from agent_run_kernel.model import KernelError
+from agent_run.model import Commit, Delivery, DeliveryKind, Policy, Requirements, RunSpec
+from agent_run.core.kernel import Kernel
+from agent_run.model import Checks, Issue, ParentIssue
+from agent_run.errors import KernelError
 from support.offline import GraphScenario
-from agent_run_kernel.operation_runner import ReadUnavailable
-from agent_run_kernel.query import read
+from agent_run.core.operation_contract import ReadUnavailable
+from agent_run.queries.run import read
 from test_kernel_requirements import independent_source, native_input
 
 
@@ -330,7 +331,7 @@ def test_explicit_approval_poll_observes_target_append_without_background_pollin
 
 @pytest.mark.parametrize("uncertain", ["unknown", "third"])
 def test_sent_merge_can_settle_a_late_readback_without_new_write_or_attempt(tmp_path, uncertain):
-    from agent_run_kernel.model import EffectResult
+    from agent_run.model import EffectResult
 
     source = Requirements(ParentIssue(1, "Parent", "One exact ticket", (2,)),
                           (Issue(2, "Ticket", "Ticket requirement", "OPEN", frozenset({"ready-for-agent"})),))

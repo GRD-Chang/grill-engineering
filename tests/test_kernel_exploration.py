@@ -10,9 +10,11 @@ import sqlite3
 
 import pytest
 
-from agent_run_kernel import Checks, Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, RunSpec, World
+from agent_run.model import Checks, Commit, Delivery, DeliveryKind, Policy, RunSpec, World
+from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
 from support.offline import Scenario, review_result
-from agent_run_kernel.model import wire_json
+from agent_run.model import wire_json
 from support.core_operations import CoreOperations, native_agent_fixture, scripted_return
 from support.effect_boundary import EffectBoundary, effect_boundary
 
@@ -128,7 +130,7 @@ def test_stop_late_raw_is_settlement_only_and_independent_process_can_read_it(tm
         operations.runner.authorize_agent(step.call)
     environment = dict(os.environ, PYTHONPATH=os.pathsep.join((
         str(Path(__file__).resolve().parents[1] / "src"), str(Path(__file__).resolve().parent))))
-    command = "from pathlib import Path; from agent_run_kernel import Kernel; import json,sys; print(json.dumps(Kernel(Path(sys.argv[1])).status('ticket:2')))"
+    command = "from pathlib import Path; from agent_run.core.kernel import Kernel; import json,sys; print(json.dumps(Kernel(Path(sys.argv[1])).status('ticket:2')))"
     process = subprocess.run([sys.executable, "-c", command, str(path)], env=environment,
                              text=True, capture_output=True, check=True, timeout=15)
     observed = json.loads(process.stdout)
@@ -142,8 +144,9 @@ def test_stop_late_raw_is_settlement_only_and_independent_process_can_read_it(tm
         operations.runner.authorize_agent(step.call)
     replacement = kernel.claim_executor("executor-two")
     consume_command = """from pathlib import Path
-from agent_run_kernel import Kernel, Execution, Commit, Requirements, ParentIssue, Issue
-from agent_run_kernel.operation_runner import DeliveryFacts
+from agent_run.core.kernel import Kernel
+from agent_run.model import Execution, Commit, Requirements, ParentIssue, Issue
+from agent_run.core.operation_contract import DeliveryFacts
 from support.core_operations import CoreOperations, ReadOnlyPorts
 import json, sys
 k = Kernel(Path(sys.argv[1]))

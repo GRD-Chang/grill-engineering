@@ -1,14 +1,16 @@
 """Recover a paused native sender without a second queue or a fresh budget."""
 from __future__ import annotations
 
+import agent_run.queries.read_facts
+
 from pathlib import Path
 from threading import Event
 from typing import Any
 
 import pytest
 
-from agent_run import notification_outbox as outbox
-from agent_run_kernel import notifications
+import agent_run.storage.notification_outbox as outbox
+import agent_run.notifications.sender as notifications
 from test_kernel_notifications import _kernel
 
 
@@ -17,7 +19,7 @@ def test_healthy_observation_recovers_the_original_sender(tmp_path: Path, monkey
     kernel = _kernel(tmp_path)
     delivered = Event()
     sent: list[str] = []
-    original = notifications.read_boundaries
+    original = agent_run.queries.read_facts.read_boundaries
 
     def unavailable(*_args: Any, **_kwargs: Any) -> Any:
         raise OSError("notification read temporarily unavailable")
@@ -156,7 +158,7 @@ def test_claim_commit_tail_failure_is_known_unsent_and_does_not_block_sender(tmp
 def test_inflight_cancel_finishes_before_the_requested_recovery(tmp_path: Path, monkeypatch) -> None:
     kernel = _kernel(tmp_path)
     started, cancelled, release, returned = Event(), Event(), Event(), Event()
-    original = notifications.read_boundaries
+    original = agent_run.queries.read_facts.read_boundaries
     calls: list[str] = []
 
     def unavailable(*_args: Any, **_kwargs: Any) -> Any:
@@ -206,7 +208,7 @@ def test_inflight_cancel_finishes_before_the_requested_recovery(tmp_path: Path, 
 def test_fatal_close_wins_over_a_late_healthy_recovery_read(tmp_path: Path, monkeypatch) -> None:
     kernel = _kernel(tmp_path)
     entered, release = Event(), Event()
-    original = notifications.read_boundaries
+    original = agent_run.queries.read_facts.read_boundaries
     calls: list[str] = []
 
     def unavailable(*_args: Any, **_kwargs: Any) -> Any:

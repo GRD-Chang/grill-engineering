@@ -1,5 +1,5 @@
 """Real source callbacks retain one call and one launch across concurrent reads."""
-from agent_run_kernel.operation_runner import OperationRunner
+from agent_run.core.operation_runner import OperationRunner
 from dataclasses import replace
 import json
 import os
@@ -10,14 +10,15 @@ from threading import Event, Thread, current_thread
 
 import pytest
 
-from agent_run_kernel import Issue, KernelError, ParentIssue, Requirements
-from agent_run_kernel.operation_runner import ReadUnavailable
-from agent_run_kernel.execution import execute
-from agent_run_kernel.executor import _make_ports
+from agent_run.model import Issue, ParentIssue, Requirements
+from agent_run.errors import KernelError
+from agent_run.core.operation_contract import ReadUnavailable
+from agent_run.runtime.execution import execute
+from agent_run.runtime.executor import _make_ports
 from support.core_operations import CoreOperations
 from support.offline import GraphScenario
-from agent_run_kernel.remote_effects import RemoteEffects
-from agent_run_kernel.source_reading import read_requirements
+from agent_run.adapters.remote import RemoteEffects
+from agent_run.adapters.source import read_requirements
 from test_kernel_remote_effects import _fixture
 
 RAW = b'{"result_kind":"development","summary":"one actual worker","human_blockers":null}'
@@ -50,7 +51,7 @@ def _allocated_worker(tmp_path, monkeypatch):
 @pytest.mark.parametrize("window", [1, 2], ids=["before_popen", "before_release"])
 @pytest.mark.parametrize("change", ["labels", "requirement", "upstream"])
 def test_worker_source_callback_preserves_authority_and_exact_process_settlement(tmp_path, monkeypatch, window, change):
-    import agent_run_kernel.remote_effects as external
+    import agent_run.adapters.remote as external
 
     scenario, operations, state, call = _allocated_worker(tmp_path, monkeypatch)
     kernel = scenario.kernel

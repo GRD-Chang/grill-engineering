@@ -19,11 +19,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from agent_run.credential_lifecycle import RenewableCredential, ReadCredential
-from agent_run.github_auth import _GitHubAppCredentialProvider, mint_installation_credential, GitHubCredentialError
-from agent_run.github_auth_profile import GitHubAppProfile
-from agent_run.process_cleanup import capture_process_scope, child_subreaper, descendant_pids
-from agent_run.worker_credentials import NativeCredentialDelivery
+from agent_run.adapters.auth.credential_lifecycle import RenewableCredential, ReadCredential
+from agent_run.adapters.auth.app import _GitHubAppCredentialProvider, mint_installation_credential, GitHubCredentialError
+from agent_run.config.github_app import GitHubAppProfile
+from agent_run.runtime.process_cleanup import capture_process_scope, child_subreaper, descendant_pids
+from agent_run.adapters.auth.worker_credentials import NativeCredentialDelivery
 
 def test_app_credential_lifecycle_close_reclaims_a_blocked_signer_tree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -82,7 +82,7 @@ def test_app_credential_lifecycle_close_reclaims_a_blocked_signer_tree(
             ).encode()
         )
 
-    monkeypatch.setattr("agent_run.github_auth.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr('agent_run.adapters.auth.app.urllib.request.urlopen', fake_urlopen)
     profile = GitHubAppProfile("123", "456", tmp_path / "private.pem")
     profile.private_key_path.write_text("private-key", encoding="utf-8")
     profile.private_key_path.chmod(0o600)
@@ -206,8 +206,8 @@ def test_app_credential_lifecycle_close_after_network_timeout_joins_renewal(
             ).encode()
         )
 
-    monkeypatch.setattr("agent_run.github_auth._create_app_jwt", fake_jwt)
-    monkeypatch.setattr("agent_run.github_auth.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr('agent_run.adapters.auth.app._create_app_jwt', fake_jwt)
+    monkeypatch.setattr('agent_run.adapters.auth.app.urllib.request.urlopen', fake_urlopen)
     credentials = RenewableCredential(
         _GitHubAppCredentialProvider(profile),
         renewal_margin=10**12,
@@ -321,9 +321,9 @@ def test_app_credential_lifecycle_close_interrupts_network_response(
             **options,
         )
 
-    monkeypatch.setattr("agent_run.github_auth.urllib.request.Request", local_request)
+    monkeypatch.setattr('agent_run.adapters.auth.app.urllib.request.Request', local_request)
     monkeypatch.setattr(
-        "agent_run.github_auth._create_app_jwt",
+        'agent_run.adapters.auth.app._create_app_jwt',
         lambda *_arguments, **_options: "jwt",
     )
     original_read = http.client.HTTPResponse.read
@@ -382,7 +382,7 @@ def test_installation_scopes_are_independent(
     profile = GitHubAppProfile("123", "456", tmp_path / "key")
     profile.private_key_path.write_text("test-key")
     profile.private_key_path.chmod(0o600)
-    monkeypatch.setattr("agent_run.github_auth._create_app_jwt", lambda *a, **kw: "jwt")
+    monkeypatch.setattr('agent_run.adapters.auth.app._create_app_jwt', lambda *a, **kw: "jwt")
     requests: list[urllib.request.Request] = []
     granted = {"contents": "write", "metadata": "read", "workflows": "write",
                "profile": "write", "organization_projects": "admin"}
@@ -407,7 +407,7 @@ def test_installation_scopes_are_independent(
                 body["repositories"] = [{"full_name": repository}]
         return io.BytesIO(json.dumps(body).encode())
 
-    monkeypatch.setattr("agent_run.github_auth.urllib.request.urlopen", respond)
+    monkeypatch.setattr('agent_run.adapters.auth.app.urllib.request.urlopen', respond)
     credential = mint_installation_credential(profile, read_only=read_only, repository=repository)
     payload = json.loads(requests[-1].data)
     assert payload.get("permissions") == (expected if read_only else None)
@@ -432,14 +432,14 @@ def test_installation_response_cannot_broaden_selected_scope(
     profile = GitHubAppProfile("123", "456", tmp_path / "key")
     profile.private_key_path.write_text("test-key")
     profile.private_key_path.chmod(0o600)
-    monkeypatch.setattr("agent_run.github_auth._create_app_jwt", lambda *a, **kw: "jwt")
+    monkeypatch.setattr('agent_run.adapters.auth.app._create_app_jwt', lambda *a, **kw: "jwt")
     def respond(request: urllib.request.Request, **kwargs: Any) -> io.BytesIO:
         granted = {"contents": "write", "workflows": "write", "profile": "write"}
         body = {"permissions": granted if request.get_method() == "GET" else permissions,
                 "account": {"login": "acme"}, "token": "secret",
                 "expires_at": "2030-01-01T00:00:00Z"}
         return io.BytesIO(json.dumps(body).encode())
-    monkeypatch.setattr("agent_run.github_auth.urllib.request.urlopen", respond)
+    monkeypatch.setattr('agent_run.adapters.auth.app.urllib.request.urlopen', respond)
     with pytest.raises(GitHubCredentialError, match="read-only"):
         mint_installation_credential(profile, read_only=True)
     with pytest.raises(GitHubCredentialError, match="does not belong"):
@@ -572,7 +572,7 @@ def test_scope_instances_do_not_share_delivered_tokens():
     (lambda: (_ for _ in ()).throw(OSError("secret credential")), "provider unavailable"),
 ])
 def test_initial_credential_failure_has_safe_actionable_category(provider, category):
-    from agent_run.credential_lifecycle import WorkerCredentialError
+    from agent_run.adapters.auth.credential_lifecycle import WorkerCredentialError
     lifecycle = RenewableCredential(provider, on_update=lambda value: None)
     with pytest.raises(WorkerCredentialError, match=category) as caught:
         lifecycle.start()
@@ -602,6 +602,6 @@ def test_malformed_private_key_is_rejected_before_issuing_credentials(
     def no_request(*args: object, **kwargs: object) -> None:
         pytest.fail("malformed signing input must not issue an installation credential")
 
-    monkeypatch.setattr("agent_run.github_auth.urllib.request.urlopen", no_request)
+    monkeypatch.setattr('agent_run.adapters.auth.app.urllib.request.urlopen', no_request)
     with pytest.raises(GitHubCredentialError, match="could not sign GitHub App JWT"):
         mint_installation_credential(GitHubAppProfile("123", "456", key))

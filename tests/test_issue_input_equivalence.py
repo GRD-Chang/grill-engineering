@@ -41,6 +41,29 @@ print(json.dumps(output, ensure_ascii=False, sort_keys=True, default=sorted))
 """
 
 
+_CURRENT_READ = """
+import agent_run.adapters.github
+import agent_run.model
+
+from dataclasses import asdict
+import json, sys
+from pathlib import Path
+from agent_run.adapters.github import GhGitHubReader
+from agent_run.errors import GitHubReadError
+from agent_run.adapters.source import read_requirements, read_pull_request_facts
+import agent_run.adapters.github; import agent_run.model
+source, root, repository, operation = sys.argv[1:]
+assert Path(agent_run.adapters.github.__file__).is_relative_to(source)
+assert Path(agent_run.model.__file__).is_relative_to(source)
+reader = GhGitHubReader(repository, working_directory=Path(root), runner_identity={'source': 'host'})
+try:
+    value = asdict(read_requirements(reader, 1)) if operation == 'requirements' else read_pull_request_facts(reader, 17)
+    output = {'value': value}
+except (GitHubReadError, ValueError) as error:
+    output = {'error': getattr(error, 'code', type(error).__name__), 'message': str(error)}
+print(json.dumps(output, ensure_ascii=False, sort_keys=True, default=sorted))
+"""
+
 @pytest.fixture(scope="session")
 def original_source(tmp_path_factory):
     root = tmp_path_factory.mktemp("issue-input-baseline")
@@ -63,7 +86,7 @@ def original_source(tmp_path_factory):
 
 def _observe(source, root, repository, operation, log):
     log.unlink(missing_ok=True)
-    child = subprocess.run([sys.executable, "-B", "-c", _READ, str(source), str(root), repository, operation],
+    child = subprocess.run([sys.executable, "-B", "-c", _CURRENT_READ if source.resolve() == (Path(__file__).resolve().parents[1] / "src") else _READ, str(source), str(root), repository, operation],
                            env={**os.environ, "PYTHONPATH": str(source)}, cwd=root,
                            text=True, capture_output=True, timeout=15)
     assert child.returncode == 0, child.stderr

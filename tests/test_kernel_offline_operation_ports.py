@@ -5,9 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel import DeliveryKind, Effect, KernelError
+from agent_run.model import DeliveryKind, Effect
+from agent_run.errors import KernelError
 from support.offline import Scenario
-from agent_run_kernel.operation_runner import DeliveryRead, OperationBinding, OperationPorts, ReadUnavailable
+from agent_run.core.operation_contract import DeliveryRead, OperationBinding, OperationPorts, ReadUnavailable
 
 
 def bound_ports(scenario: Scenario) -> OperationPorts:

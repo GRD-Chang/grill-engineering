@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from agent_run import notification_transport as transport
+import agent_run.adapters.notification_transport as transport
 
 
 @pytest.mark.parametrize("remaining,expected", [(0.25, 1000.5), (20, 1010.25)])

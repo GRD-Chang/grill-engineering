@@ -3,11 +3,12 @@ import hashlib
 import json
 from pathlib import Path
 
-from agent_run.managed_workspace import ManagedWorkspace, read_git_identity
-from agent_run.task_identity import TaskKey
-from agent_run_kernel import host_adapter, lifecycle_cli
-from agent_run_kernel.query_cli import main
-from agent_run_kernel.task_location import read_task, task_path
+from agent_run.adapters.workspace import ManagedWorkspace, read_git_identity
+from agent_run.contracts.task import TaskKey
+import agent_run.adapters.systemd as host_adapter
+import agent_run.cli.lifecycle as lifecycle_cli
+from agent_run.cli.main import main
+from agent_run.storage.tasks import read_task, task_path
 from tests.test_kernel_host_adapter import controlled_manager
 from tests.test_kernel_legacy_admission import old_owner, unchanged_v6_source
 

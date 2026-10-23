@@ -3,13 +3,14 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.prompt_resources import builtin_resources
-from agent_run.user_defaults import UserDefaultsStore
-from agent_run_kernel import AgentCall, Issue, Kernel, ParentIssue, Policy, Requirements
-from agent_run_kernel.configuration import freeze_creation
-from agent_run_kernel.model import Execution, HostObservation
+from agent_run.config.resources import builtin_resources
+from agent_run.config.defaults import UserDefaultsStore
+from agent_run.model import AgentCall, Issue, ParentIssue, Policy, Requirements
+from agent_run.core.kernel import Kernel
+from agent_run.config.creation import freeze_creation
+from agent_run.model import Execution, HostObservation
 from support.offline import GraphScenario
-from agent_run_kernel.role_prompt import render_role_prompt
+from agent_run.core.prompts.role import render_role_prompt
 from support.core_operations import CoreOperations, scripted_return
 
 

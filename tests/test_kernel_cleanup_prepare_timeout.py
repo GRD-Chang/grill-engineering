@@ -13,10 +13,12 @@ import time
 
 import pytest
 
-from agent_run.process_binding import _process_start_token
-from agent_run.process_cleanup import child_subreaper
-from agent_run_kernel import DeliveryKind, Kernel, KernelError
-import agent_run_kernel.cleanup_adapter as cleanup
+from agent_run.runtime.process_identity import _process_start_token
+from agent_run.runtime.process_cleanup import child_subreaper
+from agent_run.model import DeliveryKind
+from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
+import agent_run.adapters.cleanup as cleanup
 from support.worker_process_timing import wait_until
 from test_kernel_cleanup_lifecycle import _native_scenario, _local_head
 
@@ -199,9 +201,7 @@ def _exercise(root: Path) -> None:
                           local=_local_head(scenario, effect.source_ref), remote=scenario.port.remote_refs(),
                           refs=scenario.port.git.run("for-each-ref", "--format=%(refname) %(objectname)").stdout)
             hook.write_text(f"#!{sys.executable}\n" +
-                "import json,os,signal,sys\nfrom pathlib import Path\n"
-                "from agent_run.process_binding import _process_start_token\n"
-                f"if sys.argv[1] == 'prepared' and Path({head_lock!r}).exists() and not Path({str(root / 'hook.json')!r}).exists():\n" +
+                f"import json,os,signal,sys\nfrom pathlib import Path\nfrom agent_run.runtime.process_identity import _process_start_token\nif sys.argv[1] == 'prepared' and Path({head_lock!r}).exists() and not Path({str(root / 'hook.json')!r}).exists():\n" +
                 f"    locks=[str(p) for p in Path({str(common)!r}).rglob('*.lock')]\n" +
                 f"    Path({str(root / 'hook.json')!r}).write_text(json.dumps(dict(pid=os.getpid(),token=_process_start_token(os.getpid()),parent=os.getppid(),group=os.getpgrp(),locks=locks)))\n"
                 "    signal.pause()\n")
@@ -297,14 +297,14 @@ def test_forced_controller_exit_reaps_only_its_recorded_descendants(tmp_path, mo
     """Mechanical cleanup validation only; synthetic Python children, no Core/DB."""
     hook_program = """import json,os,signal,sys
 from pathlib import Path
-from agent_run.process_binding import _process_start_token
+from agent_run.runtime.process_identity import _process_start_token
 root=Path(sys.argv[1])
 (root/'hook.json').write_text(json.dumps(dict(pid=os.getpid(),token=_process_start_token(os.getpid()))))
 signal.pause()
 """
     git_program = """import json,os,signal,subprocess,sys
 from pathlib import Path
-from agent_run.process_binding import _process_start_token
+from agent_run.runtime.process_identity import _process_start_token
 root=Path(sys.argv[1])
 (root/'git.json').write_text(json.dumps(dict(pid=os.getpid(),token=_process_start_token(os.getpid()))))
 subprocess.Popen([sys.executable,'-c',sys.argv[2],str(root)])

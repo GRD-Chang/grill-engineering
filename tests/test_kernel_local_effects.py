@@ -12,9 +12,10 @@ import time
 
 import pytest
 
-from agent_run_kernel import Effect, Execution, KernelError
-from agent_run_kernel.effects import LocalGit
-from agent_run_kernel.local_effects import LocalEffects
+from agent_run.model import Effect, Execution
+from agent_run.errors import KernelError
+from agent_run.adapters.git_objects import LocalGit
+from agent_run.adapters.local_git import LocalEffects
 
 
 def publication(git_repo: Path, tmp_path: Path) -> tuple[LocalGit, LocalEffects, Effect]:
@@ -210,8 +211,8 @@ def test_local_git_uses_bounded_capture_and_its_explicit_environment(tmp_path: P
 
 @pytest.mark.parametrize("outcome", ["output", "overflow", "timeout"])
 def test_selected_remote_environment_redacts_git_process_diagnostics(tmp_path: Path, outcome: str) -> None:
-    from agent_run.git_errors import GitError
-    from agent_run.git_output import run_git
+    from agent_run.errors import GitError
+    from agent_run.runtime.git_command import run_git
 
     commands = tmp_path / "selected-remote-commands"
     commands.mkdir()

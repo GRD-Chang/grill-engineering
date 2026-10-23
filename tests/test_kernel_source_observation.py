@@ -1,5 +1,5 @@
 """Real read/commit interleavings cannot publish mixed source observations."""
-from agent_run_kernel.operation_runner import OperationRunner
+from agent_run.core.operation_runner import OperationRunner
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
@@ -8,10 +8,11 @@ from threading import Event
 
 import pytest
 
-from agent_run_kernel import Kernel, KernelError
-from agent_run_kernel.model import Blocker, Issue, ParentIssue, Requirements
+from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
+from agent_run.model import Blocker, Issue, ParentIssue, Requirements
 from support.offline import GraphScenario
-from agent_run_kernel.operation_runner import ReadUnavailable
+from agent_run.core.operation_contract import ReadUnavailable
 from support.core_operations import CoreOperations
 
 

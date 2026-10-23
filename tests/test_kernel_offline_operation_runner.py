@@ -4,14 +4,15 @@ from dataclasses import replace
 
 import pytest
 
-from agent_run_kernel import DeliveryKind, KernelError, Requirements
-from agent_run_kernel.model import Issue, ParentIssue
+from agent_run.model import DeliveryKind, Requirements
+from agent_run.errors import KernelError
+from agent_run.model import Issue, ParentIssue
 from support.offline import GraphScenario, Scenario
 
 
 def test_abandon_terminal_comes_from_core_without_completing_the_delivery(tmp_path: Path) -> None:
     scenario = Scenario(tmp_path / 'abandon', DeliveryKind.PARENT_ONLY)
-    from agent_run_kernel.local_effects import LocalEffects
+    from agent_run.adapters.local_git import LocalEffects
     before = scenario.kernel.status(scenario.delivery.key)
     inspections = LocalEffects(scenario.port.git).inspect_resources(scenario.kernel.generation_resources())
     assert scenario.kernel.control('abandon', 'original-abandon', resource_inspections=inspections) == 'pending'

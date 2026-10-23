@@ -4,11 +4,11 @@ import json
 
 import pytest
 
-from agent_run_kernel import KernelError
-from agent_run_kernel.effects import LocalGit
-from agent_run_kernel.model import Effect, Execution
-from agent_run_kernel.operation_runner import ReadUnavailable
-from agent_run_kernel.remote_effects import RemoteEffects
+from agent_run.errors import KernelError
+from agent_run.adapters.git_objects import LocalGit
+from agent_run.model import Effect, Execution
+from agent_run.core.operation_contract import ReadUnavailable
+from agent_run.adapters.remote import RemoteEffects
 from support.managed_abandon_transport import install_currentness
 from test_kernel_managed_entry_end_to_end import _CODEX, _control_environment
 

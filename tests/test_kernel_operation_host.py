@@ -5,11 +5,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_run_kernel import executor
-from agent_run_kernel.execution import ProcessExitUnknown
-from agent_run_kernel.model import AgentCall, Execution, Profile, Purpose, Role, Step
+import agent_run.runtime.executor as executor
+from agent_run.runtime.execution import ProcessExitUnknown
+from agent_run.model import AgentCall, Execution, Profile, Purpose, Role, Step
 from support.offline import fixture_inputs
-from agent_run_kernel.operation_runner import OperationBinding, OperationState
+from agent_run.core.operation_contract import OperationBinding, OperationState
 
 
 @pytest.mark.parametrize("settled", [True, False])
@@ -85,8 +85,8 @@ def test_host_dispatches_call_then_polls_independent_io_and_requires_durable_exi
 
     monkeypatch.setattr(executor, "OperationRunner", make_runner)
     monkeypatch.setattr(executor, "render_role_prompt", lambda _call: "frozen prompt")
-    monkeypatch.setattr("agent_run_kernel.codex_execution.execute_selected_codex", execute)
-    monkeypatch.setattr("agent_run_kernel.notifications.NativeNotifications", Notifications)
+    monkeypatch.setattr('agent_run.runtime.codex.execute_selected_codex', execute)
+    monkeypatch.setattr('agent_run.notifications.sender.NativeNotifications', Notifications)
     if settled:
         assert executor.run(Core(), execution, {"FROZEN_ENV": "captured"}) == 0
     else:

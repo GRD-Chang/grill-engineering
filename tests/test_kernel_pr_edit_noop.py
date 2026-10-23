@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel.model import KernelError
+from agent_run.errors import KernelError
 from test_kernel_remote_effects import _fixture, _publish_pr
 
 

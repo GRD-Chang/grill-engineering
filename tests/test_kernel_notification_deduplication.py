@@ -5,9 +5,9 @@ from typing import Any
 
 import pytest
 
-from agent_run import notification_outbox as outbox
-from agent_run.notification_event_facts import event_envelope
-from agent_run_kernel.notifications import NativeNotifications
+import agent_run.storage.notification_outbox as outbox
+from agent_run.notifications.envelope import event_envelope
+from agent_run.notifications.sender import NativeNotifications
 from test_kernel_notifications import _kernel
 
 

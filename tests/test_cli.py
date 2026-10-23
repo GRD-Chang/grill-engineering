@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 
-import agent_run.doctor as doctor
+import agent_run.install.doctor as doctor
 
 
 PROJECT_ROOT = Path(__file__).parents[1]

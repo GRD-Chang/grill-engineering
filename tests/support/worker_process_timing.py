@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 import pytest
 
-import agent_run.worker_sandbox as worker_sandbox
+import agent_run.runtime.sandbox as worker_sandbox
 
 
 def wait_until(predicate: Callable[[], Any], *, timeout: float = 10) -> Any:

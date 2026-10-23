@@ -6,14 +6,15 @@ import time
 
 import pytest
 
-from agent_run import notification_outbox as outbox
-from agent_run.notification_event_facts import event_envelope
-from agent_run.user_defaults import UserDefaultsStore
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, RunSpec
-from agent_run_kernel.configuration import freeze_creation
-from agent_run_kernel.query_cli import main
-from agent_run_kernel.read_facts import read_boundaries
-from agent_run_kernel.storage import Transaction
+import agent_run.storage.notification_outbox as outbox
+from agent_run.notifications.envelope import event_envelope
+from agent_run.config.defaults import UserDefaultsStore
+from agent_run.model import Commit, Delivery, DeliveryKind, RunSpec
+from agent_run.core.kernel import Kernel
+from agent_run.config.creation import freeze_creation
+from agent_run.cli.main import main
+from agent_run.queries.read_facts import read_boundaries
+from agent_run.storage.sqlite import Transaction
 
 
 def _snapshot(root: Path) -> dict[str, bytes]:
@@ -70,9 +71,9 @@ def _journal(kernel: Kernel, run_id: str = "notification-query") -> None:
 def test_notification_boundary_reader_keeps_ticket_completion_distinct_from_the_original_final_close(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    from agent_run_kernel import Issue, ParentIssue, Requirements
+    from agent_run.model import Issue, ParentIssue, Requirements
     from support.offline import GraphScenario
-    from agent_run_kernel import query
+    import agent_run.queries.run as query
 
     scenario = GraphScenario(tmp_path / "delivery", Requirements(
         ParentIssue(1, "Full Parent", "Original requirements", (2,)),
@@ -121,8 +122,8 @@ def test_notification_boundary_reader_keeps_ticket_completion_distinct_from_the_
 def test_notification_boundary_reader_returns_the_original_abandon_action_until_terminal_cleanup(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    from agent_run_kernel import query
-    from agent_run_kernel.local_effects import LocalEffects
+    import agent_run.queries.run as query
+    from agent_run.adapters.local_git import LocalEffects
     from support.offline import Scenario
 
     scenario = Scenario(tmp_path / "abandon", DeliveryKind.PARENT_ONLY)
@@ -156,15 +157,15 @@ def test_public_notification_query_keeps_pending_retry_and_delivery_facts_withou
     def forbidden(*_args, **_kwargs):
         raise AssertionError("A notification query attempted sending, locking or repair")
 
-    from agent_run_kernel.operation_runner import OperationRunner
+    from agent_run.core.operation_runner import OperationRunner
     monkeypatch.setattr(Kernel, "begin_observation", forbidden)
     monkeypatch.setattr(Kernel, "accept_requirements", forbidden)
     for method in ("__init__", "run_once", "observe", "authorize_agent", "worker_settled", "state"):
         monkeypatch.setattr(OperationRunner, method, forbidden)
     monkeypatch.setattr(outbox, "transaction", forbidden)
     monkeypatch.setattr(outbox, "settle", forbidden)
-    monkeypatch.setattr("agent_run_kernel.notifications.NativeNotifications", forbidden)
-    monkeypatch.setattr("agent_run.notification_transport.send", forbidden)
+    monkeypatch.setattr('agent_run.notifications.sender.NativeNotifications', forbidden)
+    monkeypatch.setattr('agent_run.adapters.notification_transport.send', forbidden)
     assert main([command, "notification-query", "--state-dir", str(kernel.storage.path), "--json"]) == 0
     output = json.loads(capsys.readouterr().out)
     notifications = output["notifications"]

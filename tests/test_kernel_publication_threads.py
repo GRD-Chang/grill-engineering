@@ -4,9 +4,9 @@ from pathlib import Path
 import pytest
 
 from support.core_operations import CoreOperations, scripted_return, final_scenario
-from agent_run_kernel import AgentCall, DeliveryKind, Role
+from agent_run.model import AgentCall, DeliveryKind, Role
 from support.offline import Scenario
-from agent_run_kernel.role_prompt import render_role_prompt
+from agent_run.core.prompts.role import render_role_prompt
 from test_kernel_codex_transport import local_codex
 
 

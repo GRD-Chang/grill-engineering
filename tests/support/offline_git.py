@@ -16,8 +16,8 @@ from tempfile import TemporaryDirectory
 from time import monotonic
 from typing import Any
 
-from agent_run.git_errors import GitError
-from agent_run.git_output import MAX_GIT_ERROR_BYTES, _kill_group, run_git
+from agent_run.errors import GitError
+from agent_run.runtime.git_command import MAX_GIT_ERROR_BYTES, _kill_group, run_git
 
 
 class OfflineGit:

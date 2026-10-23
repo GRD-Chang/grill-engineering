@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.github import GhGitHubReader
-from agent_run.github_retry import MAX_COMMAND_OUTPUT_BYTES, run_read_command
-from agent_run.models import Repository
+from agent_run.adapters.github import GhGitHubReader
+from agent_run.adapters.github_commands import MAX_COMMAND_OUTPUT_BYTES, run_read_command
+from agent_run.model import Repository
 
 
 def test_github_reader_retries_transient_timeout(
@@ -27,8 +27,8 @@ def test_github_reader_retries_transient_timeout(
                 )
         return _repository_response()
 
-    monkeypatch.setattr("agent_run.github_retry._run_bounded_command", fake_run)
-    monkeypatch.setattr("agent_run.github_retry.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr('agent_run.adapters.github_commands._run_bounded_command', fake_run)
+    monkeypatch.setattr('agent_run.adapters.github_commands.time.sleep', lambda _seconds: None)
 
     reader = GhGitHubReader("example/project")
     assert reader.repository().name_with_owner == "example/project"
@@ -64,8 +64,8 @@ def test_github_read_retries_do_not_classify_stderr(
         attempts += 1
         return subprocess.CompletedProcess(arguments, 1, "", stderr)
 
-    monkeypatch.setattr("agent_run.github_retry._run_bounded_command", fake_run)
-    monkeypatch.setattr("agent_run.github_retry.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr('agent_run.adapters.github_commands._run_bounded_command', fake_run)
+    monkeypatch.setattr('agent_run.adapters.github_commands.time.sleep', lambda _seconds: None)
 
     result = run_read_command(["gh", "api", "repos/example/project"])
 
@@ -88,7 +88,7 @@ def test_github_reader_derives_repository_hint_from_origin(
     expected: str | None,
 ) -> None:
     monkeypatch.setattr(
-        "agent_run.github.subprocess.run",
+        'agent_run.adapters.github.subprocess.run',
         lambda *_args, **_kwargs: subprocess.CompletedProcess(
             ["git"], 0, f"{remote}\n", ""
         ),
@@ -154,8 +154,8 @@ def test_github_reader_retries_transient_http_status(
                 )
         return _repository_response()
 
-    monkeypatch.setattr("agent_run.github_retry._run_bounded_command", fake_run)
-    monkeypatch.setattr("agent_run.github_retry.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr('agent_run.adapters.github_commands._run_bounded_command', fake_run)
+    monkeypatch.setattr('agent_run.adapters.github_commands.time.sleep', lambda _seconds: None)
 
     reader = GhGitHubReader("example/project")
     assert reader.repository().name_with_owner == "example/project"

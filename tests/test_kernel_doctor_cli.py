@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.runner_installer import _runtime_identity
+from agent_run.install.installer import _runtime_identity
 from support.environment import _user_environment as _isolated_environment
 
 
@@ -63,8 +63,7 @@ def test_doctor_cli_separates_installation_and_execution_readiness(
         entry = snapshot / "bin" / "agent-run"
         entry.parent.mkdir()
         entry.write_text(
-            f"#!{sys.executable}\n"
-            "from agent_run_kernel.query_cli import main\nraise SystemExit(main())\n"
+            f'#!{sys.executable}\nfrom agent_run.cli.main import main\nraise SystemExit(main())\n'
         )
         entry.chmod(0o700)
         generation = root / "generations" / "fixture"
@@ -115,7 +114,7 @@ def test_doctor_rejects_version_only_or_incompatible_dependencies(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str], dependency: str, script: str, status: str,
 ) -> None:
-    from agent_run_kernel.query_cli import main
+    from agent_run.cli.main import main
 
     tools = tmp_path / "tools"
     tools.mkdir()

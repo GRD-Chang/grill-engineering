@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent_run.error_safety import bounded_error, redact_credentials
+from agent_run.errors import bounded_error, redact_credentials
 
 
 @pytest.mark.parametrize(

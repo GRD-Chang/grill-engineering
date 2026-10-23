@@ -3,9 +3,11 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel import Blocker, Commit, Delivery, DeliveryKind, Issue, Kernel, KernelError, ParentIssue, Policy, Requirements, RunSpec
-from agent_run_kernel.operation_runner import DeliveryFacts
-from agent_run_kernel.query import read
+from agent_run.model import Blocker, Commit, Delivery, DeliveryKind, Issue, ParentIssue, Policy, Requirements, RunSpec
+from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
+from agent_run.core.operation_contract import DeliveryFacts
+from agent_run.queries.run import read
 from support.offline import fixture_inputs
 from support.core_operations import CoreOperations, ReadOnlyPorts
 

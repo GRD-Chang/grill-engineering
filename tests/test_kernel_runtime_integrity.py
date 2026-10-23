@@ -6,15 +6,15 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.runner_installer import InstallerError, _runtime_identity, _validate_snapshot
-from agent_run.runner_runtime import RuntimeTreeError, find_runtime_package
+from agent_run.install.installer import InstallerError, _runtime_identity, _validate_snapshot
+from agent_run.install.runtime_tree import RuntimeTreeError, find_runtime_package
 
 
 def _snapshot(root: Path, *, native: bool = True) -> tuple[Path, Path, str]:
     package = root / "lib/python3/site-packages/agent_run"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("legacy\n")
-    kernel = package.with_name("agent_run_kernel")
+    kernel = package.with_name('agent_run')
     if native:
         kernel.mkdir()
         (kernel / "__init__.py").write_text("native\n")

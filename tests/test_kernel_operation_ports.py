@@ -4,9 +4,10 @@ import json
 
 import pytest
 
-from agent_run_kernel.model import KernelError, ResourceWitness
-from agent_run_kernel.operation_runner import DeliveryRead, OperationPorts
-from agent_run_kernel.remote_effects import RemoteEffects
+from agent_run.errors import KernelError
+from agent_run.model import ResourceWitness
+from agent_run.core.operation_contract import DeliveryRead, OperationPorts
+from agent_run.adapters.remote import RemoteEffects
 from test_kernel_local_effects import publication
 from test_kernel_remote_effects import _change, _fixture, _publish_pr
 

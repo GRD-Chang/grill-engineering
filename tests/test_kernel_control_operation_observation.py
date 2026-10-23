@@ -1,5 +1,5 @@
 """Manual managed controls share Core observation without an Executor claim."""
-from agent_run_kernel.operation_runner import OperationRunner, observe_control
+from agent_run.core.operation_runner import OperationRunner, observe_control
 from dataclasses import replace
 import json
 import os
@@ -7,14 +7,16 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.user_defaults import UserDefaultsStore
-from agent_run_kernel import Kernel, KernelError
-from agent_run_kernel import lifecycle_cli
-from agent_run_kernel.model import DeliveryKind, Execution, ObservationSuperseded
+from agent_run.config.defaults import UserDefaultsStore
+from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
+import agent_run.cli.lifecycle as lifecycle_cli
+from agent_run.model import DeliveryKind, Execution
+from agent_run.errors import ObservationSuperseded
 from support.offline import Scenario
-from agent_run_kernel.operation_runner import ReadUnavailable
-from agent_run_kernel.query_cli import _parser
-from agent_run_kernel.remote_effects import RemoteEffects
+from agent_run.core.operation_contract import ReadUnavailable
+from agent_run.cli.main import _parser
+from agent_run.adapters.remote import RemoteEffects
 from test_kernel_host_adapter import controlled_manager
 from test_kernel_operation_runner import setup
 from test_kernel_remote_effects import _fixture
@@ -129,7 +131,7 @@ def managed_approval(tmp_path, monkeypatch, *, tickets):
     else:
         raise AssertionError("The managed Run never reached its real approval")
     monkeypatch.setattr(lifecycle_cli, "_active_runner", lambda: True)
-    import agent_run_kernel.host_adapter as adapter
+    import agent_run.adapters.systemd as adapter
     monkeypatch.setattr(adapter, "SystemdHost", lambda **kwargs: manager)
     return kernel, runner, physical, state, calls, request, subject, source
 

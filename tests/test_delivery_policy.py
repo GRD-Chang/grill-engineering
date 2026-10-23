@@ -1,8 +1,9 @@
 """Public settings resolution and native frozen Policy values."""
 import pytest
 
-from agent_run.delivery_policy import DeliveryPolicyError, resolve_delivery_policy
-from agent_run_kernel import Policy
+from agent_run.errors import DeliveryPolicyError
+from agent_run.contracts.policy_values import resolve_delivery_policy
+from agent_run.model import Policy
 from support.user_defaults import settings
 
 

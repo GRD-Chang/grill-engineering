@@ -7,10 +7,10 @@ from pathlib import Path
 import pytest
 
 from support.core_operations import CoreOperations, scripted_return
-from agent_run_kernel import Role
-from agent_run_kernel.artifact_contract import role_schema
-from agent_run_kernel.codex_execution import _CodexCapture
-from agent_run_kernel.model import ParentIssue, Requirements, wire_json
+from agent_run.model import Role
+from agent_run.contracts.artifact import role_schema
+from agent_run.runtime.codex import _CodexCapture
+from agent_run.model import ParentIssue, Requirements, wire_json
 from support.offline import GraphScenario, review_result
 
 

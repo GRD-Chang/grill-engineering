@@ -8,8 +8,8 @@ from typing import Any
 
 import pytest
 
-from agent_run.credential_lifecycle import ReadCredential, RenewableCredential
-from agent_run.worker_credentials import NativeCredentialDelivery
+from agent_run.adapters.auth.credential_lifecycle import ReadCredential, RenewableCredential
+from agent_run.adapters.auth.worker_credentials import NativeCredentialDelivery
 
 
 def test_delivery_instances_do_not_share_credentials(tmp_path: Path) -> None:
@@ -44,7 +44,7 @@ def test_expiry_with_blocked_renewal_removes_token_and_cancels_signing(
             cancelled.set()
     def lifecycle(provider: Any, **options: Any) -> RenewableCredential:
         return RenewableCredential(provider, clock=lambda: now[0], renewal_margin=5, **options)
-    monkeypatch.setattr("agent_run.worker_credentials.RenewableCredential", lifecycle)
+    monkeypatch.setattr('agent_run.adapters.auth.credential_lifecycle.RenewableCredential', lifecycle)
     messages: list[str] = []
     def failed(message: str) -> None:
         messages.append(message)

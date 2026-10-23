@@ -1,5 +1,5 @@
 """Managed abandonment retains exact recovery obligations and authority."""
-from agent_run_kernel.operation_runner import OperationRunner
+from agent_run.core.operation_runner import OperationRunner
 
 import json
 from dataclasses import replace
@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel import KernelError
-from agent_run_kernel.model import DeliveryKind, Execution, HostLaunch, HostObservation, ResourceInspection
+from agent_run.errors import KernelError
+from agent_run.model import DeliveryKind, Execution, HostLaunch, HostObservation, ResourceInspection
 from support.offline import GraphScenario, Scenario
 from test_kernel_requirements import independent_source
 from support.core_operations import CoreOperations, scripted_return

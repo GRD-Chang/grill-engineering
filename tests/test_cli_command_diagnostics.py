@@ -30,9 +30,9 @@ def test_resume_without_a_managed_workspace_explains_how_to_start(tmp_path: Path
 def test_current_command_help_uses_personal_language_without_starting_work(
     tmp_path: Path, monkeypatch, capsys, language: str, arguments: list[str],
 ) -> None:
-    from agent_run.user_defaults import UserDefaultsStore
-    from agent_run_kernel.kernel import Kernel
-    from agent_run_kernel.query_cli import main
+    from agent_run.config.defaults import UserDefaultsStore
+    from agent_run.core.kernel import Kernel
+    from agent_run.cli.main import main
 
     store = UserDefaultsStore()
     store.configure(language=language)
@@ -56,8 +56,8 @@ def test_current_command_help_uses_personal_language_without_starting_work(
 def test_invalid_choice_localizes_copy_and_preserves_argument_facts(
     monkeypatch, capsys, language: str,
 ) -> None:
-    from agent_run.user_defaults import UserDefaultsStore
-    from agent_run_kernel.query_cli import main
+    from agent_run.config.defaults import UserDefaultsStore
+    from agent_run.cli.main import main
 
     store = UserDefaultsStore()
     store.configure(language=language)
@@ -77,8 +77,8 @@ def test_invalid_choice_localizes_copy_and_preserves_argument_facts(
 def test_missing_run_keeps_current_code_and_explains_discovery_before_creation(
     tmp_path: Path, monkeypatch, capsys, language: str, as_json: bool,
 ) -> None:
-    from agent_run.user_defaults import UserDefaultsStore
-    from agent_run_kernel.query_cli import main
+    from agent_run.config.defaults import UserDefaultsStore
+    from agent_run.cli.main import main
 
     monkeypatch.chdir(tmp_path)
     store = UserDefaultsStore()

@@ -4,9 +4,10 @@ import json
 
 import pytest
 
-from agent_run.managed_workspace import ManagedWorkspace
-from agent_run_kernel.query import QueryError, discover
-from agent_run_kernel.query_cli import main
+from agent_run.adapters.workspace import ManagedWorkspace
+from agent_run.queries.read_facts import QueryError
+from agent_run.queries.run import discover
+from agent_run.cli.main import main
 
 
 def test_explicit_unsupported_state_keeps_its_location_and_bytes(tmp_path: Path, capsys) -> None:

@@ -1,11 +1,13 @@
 """Manual Resume notifications require progress by the original target."""
+
+import agent_run
 from pathlib import Path
 
 import pytest
 
 from support.core_operations import CoreOperations, scripted_return
-from agent_run_kernel import Issue, ParentIssue, Requirements
-from agent_run_kernel.model import wire_json
+from agent_run.model import Issue, ParentIssue, Requirements
+from agent_run.model import wire_json
 from support.offline import GraphScenario
 from test_kernel_notification_events import _project, _recorded_agents
 
@@ -131,7 +133,7 @@ def test_effort_keeps_closed_partial_unknown_segments_and_original_thread_config
     assert set(configs) == {calls[0].profile.model, "new-thread-model"}
     assert configs["new-thread-model"]["reasoning_effort"] == "high"
     assert all(config["rounds"] == 1 for config in configs.values())
-    from agent_run_kernel.query import read
+    from agent_run.queries.run import read
     query = read(scenario.kernel.storage.path, "history").data
     first_output = query["agent_invocations"][0]["outputs"][0]
     assert first_output["elapsed_seconds"] is None and first_output["recorded_execution_seconds"] == 2
@@ -209,7 +211,7 @@ def test_whole_resume_without_an_invocation_fk_requires_original_stop_and_actual
 
 @pytest.mark.parametrize("outcome", ["failed", "human_action"])
 def test_resume_failure_and_human_result_bind_the_original_gate_without_a_second_card(tmp_path, monkeypatch, outcome):
-    import agent_run_kernel.event_projection as projection
+    import agent_run.notifications.event_projection as projection
 
     scenario = GraphScenario(tmp_path, Requirements(
         ParentIssue(1, "Parent", "Original scope", (2,)),
@@ -229,7 +231,7 @@ def test_resume_failure_and_human_result_bind_the_original_gate_without_a_second
         assert scenario.step().kind == "paused"
     with scenario.kernel.storage.transaction(write=False) as tx:
         row = dict(tx.one("SELECT * FROM history WHERE subject='ticket:2' AND kind='paused' ORDER BY position DESC LIMIT 1"))
-        facts = projection.resume_facts(tx, row)
+        facts = agent_run.queries.resume_facts.resume_facts(tx, row)
         assert facts["resume_id"] == "resume-gate-result" and facts["resume_outcome"] == outcome
         assert facts["resume_scope"] == "subject" and facts["resume_subject"] == "ticket:2"
         assert facts["resume_generation"] == 1 and facts["source_position"] == row["position"]
@@ -239,7 +241,8 @@ def test_resume_failure_and_human_result_bind_the_original_gate_without_a_second
 
 
 def test_query_rejects_out_of_calendar_recorded_activity_with_public_diagnostic(tmp_path):
-    from agent_run_kernel.query import QueryError, read
+    from agent_run.queries.read_facts import QueryError
+    from agent_run.queries.run import read
     from test_kernel_public_v9_facts import _kernel
 
     kernel, ports = _kernel(tmp_path)

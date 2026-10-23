@@ -7,13 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.managed_workspace import (
-    ManagedWorkspace,
-    ManagedWorkspaceError,
-    read_git_identity,
-    workspace_state_root,
-)
-from agent_run.paths import app_data_root
+from agent_run.adapters.workspace import ManagedWorkspace, ManagedWorkspaceError, read_git_identity, workspace_state_root
+from agent_run.config.paths import app_data_root
 
 
 def git(root: Path, *arguments: str) -> str:
@@ -174,7 +169,7 @@ def test_clone_timeout_removes_partial_workspace_and_releases_initialization_loc
 ) -> None:
     import os
     import sys
-    import agent_run.managed_workspace as module
+    import agent_run.adapters.workspace as module
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -186,7 +181,7 @@ def test_clone_timeout_removes_partial_workspace_and_releases_initialization_loc
     workspace = ManagedWorkspace.for_repository("owner/project")
     with pytest.raises(ManagedWorkspaceError, match="超时") as caught:
         workspace.ensure_path()
-    from agent_run.messages import error_detail
+    from agent_run.errors import error_detail
 
     assert error_detail(caught.value, "en") == (
         "The Runner independent repository operation timed out; rerun the command"
@@ -276,7 +271,7 @@ def test_clone_failure_localizes_classified_reason_and_preserves_audit(
 ) -> None:
     import os
     import sys
-    from agent_run.messages import error_detail
+    from agent_run.errors import error_detail
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()

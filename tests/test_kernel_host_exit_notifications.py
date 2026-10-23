@@ -7,9 +7,9 @@ import shutil
 import sys
 import pytest
 
-from agent_run.runner_lease import runner_usage_lease
-from agent_run_kernel.model import HostObservation
-from agent_run_kernel.native_host import prepare_handoff
+from agent_run.runtime.package_lease import runner_usage_lease
+from agent_run.model import HostObservation
+from agent_run.runtime.handoff import prepare_handoff
 from test_kernel_host_adapter import host_kernel
 
 
@@ -37,15 +37,15 @@ def test_original_private_credential_keeps_runner_binding_after_startup_expiry(t
             assert handoff.process.wait(timeout=3) == 1
             assert not request.environment_carrier.exists()
             held = os.fstat(terminal.fileno())
-            import agent_run_kernel.native_host as native
+            import agent_run.runtime.handoff as native
             assert handoff.receipt["runner"] == {
-                "package_root": str(Path(native.__file__).resolve().parents[1]),
+                "package_root": str(Path(native.__file__).resolve().parents[2]),
                 "python": sys.executable, "lock": str(lock.resolve()),
                 "device": held.st_dev, "inode": held.st_ino,
             }
             original = kernel.host_usage("original")
             assert original is not None and json.loads(original.evidence) == handoff.receipt
-            from agent_run_kernel.native_host import read_exit_environment
+            from agent_run.runtime.handoff import read_exit_environment
             inherited = read_exit_environment(request, runner_lock=lock, credential=credential)
             assert inherited.environment == {"PATH": os.defpath, "PRIVATE_TEST_VALUE": "original"}
             assert inherited.receipt == handoff.receipt
@@ -60,8 +60,8 @@ def test_killed_original_host_notice_is_exact_current_and_business_read_only(tmp
     from copy import deepcopy
     import select
     import subprocess
-    from agent_run.process_binding import _process_start_token
-    from agent_run_kernel.execution import _cgroup
+    from agent_run.runtime.process_identity import _process_start_token
+    from agent_run.runtime.execution import _cgroup
     from test_kernel_notifications import _kernel
 
     kernel = _kernel(tmp_path)
@@ -92,7 +92,8 @@ def test_killed_original_host_notice_is_exact_current_and_business_read_only(tmp
             child.kill()
             assert child.wait(timeout=3) == -9
             before = kernel.storage.path.read_bytes()
-            from agent_run_kernel.host_exit_facts import host_exit_notice, host_exit_current, host_exit_event
+            from agent_run.queries.host_exit import host_exit_notice, host_exit_current
+            from agent_run.notifications.event_projection import host_exit_event
             notice = host_exit_notice(kernel.storage.path, "original", handoff.receipt,
                                       service_result="signal", exit_code="killed", exit_status="KILL",
                                       invocation_id="1" * 32)
@@ -162,7 +163,7 @@ def test_startup_exit_requires_exact_manager_identity_when_readiness_was_never_r
     tmp_path: Path, monkeypatch,
 ) -> None:
     import subprocess
-    from agent_run_kernel.host_exit_facts import host_exit_notice, host_exit_current
+    from agent_run.queries.host_exit import host_exit_notice, host_exit_current
     from test_kernel_host_adapter import controlled_manager
     from test_kernel_notifications import _kernel
 
@@ -229,10 +230,11 @@ def test_startup_exit_requires_exact_manager_identity_when_readiness_was_never_r
 
 
 def test_enabled_host_arms_only_the_exact_bounded_exit_command_without_private_environment(tmp_path: Path, monkeypatch) -> None:
-    from agent_run.prompt_resources import RESOURCE_KEYS
-    from agent_run.user_defaults import UserDefaultsStore
-    from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, RunSpec
-    from agent_run_kernel.configuration import freeze_creation
+    from agent_run.contracts.prompt import RESOURCE_KEYS
+    from agent_run.config.defaults import UserDefaultsStore
+    from agent_run.model import Commit, Delivery, DeliveryKind, RunSpec
+    from agent_run.core.kernel import Kernel
+    from agent_run.config.creation import freeze_creation
     from test_kernel_host_adapter import controlled_manager
     from test_kernel_notifications import _kernel
 
@@ -245,7 +247,7 @@ def test_enabled_host_arms_only_the_exact_bounded_exit_command_without_private_e
     lock = tmp_path / "runner.lock"
     environment = {"PATH": os.defpath, "PRIVATE_TEST_VALUE": "must-never-enter-unit-properties",
                    "LD_LIBRARY_PATH": "/test/sqlite path%literal/$library"}
-    from agent_run_kernel.host_exit_notifications import exit_properties
+    from agent_run.cli.host_exit import exit_properties
     properties = exit_properties(kernel.storage.path, "enabled", request, lock, environment)
     command, = [value for value in properties if value.startswith("ExecStopPost=")]
     assert command.startswith("ExecStopPost=-:") and "host_exit_notifications" in command
@@ -253,8 +255,8 @@ def test_enabled_host_arms_only_the_exact_bounded_exit_command_without_private_e
     assert "path%%literal/$library" in command
     assert "TimeoutStopSec=70s" in properties and "TimeoutStopFailureMode=kill" in properties
     assert "OOMPolicy=continue" in properties
-    from agent_run_kernel import native_host
-    from agent_run_kernel.lifecycle_cli import attach
+    import agent_run.runtime.handoff as native_host
+    from agent_run.cli.lifecycle import attach
     guardians = []
     original_prepare = native_host.prepare_handoff
     def short_handoff(*args, **kwargs):
@@ -295,11 +297,11 @@ def test_enabled_host_arms_only_the_exact_bounded_exit_command_without_private_e
 def test_real_post_exit_entry_restores_only_original_environment_and_calls_the_one_sender(tmp_path: Path) -> None:
     import select
     import subprocess
-    from agent_run.process_binding import _process_start_token
-    from agent_run.runner_lease import runner_management_lease
-    from agent_run_kernel.execution import _cgroup
+    from agent_run.runtime.process_identity import _process_start_token
+    from agent_run.runtime.package_lease import runner_management_lease
+    from agent_run.runtime.execution import _cgroup
     from test_kernel_notifications import _kernel
-    import agent_run_kernel.native_host as native
+    import agent_run.runtime.handoff as native
 
     kernel = _kernel(tmp_path)
     private = tmp_path / "private"
@@ -335,31 +337,14 @@ def test_real_post_exit_entry_restores_only_original_environment_and_calls_the_o
         with runner_management_lease(lock):
             pass  # Neither the terminal nor expired guardian holds this test lock.
         output = tmp_path / "captured-notice.json"
-        bootstrap = f'''import sys,os,json,fcntl
-from pathlib import Path
-sys.path.insert(0,sys.argv[1])
-from agent_run_kernel import notifications
-def capture(database,state_root,notice):
-    assert os.environ['HOST_EXIT_TEST_VALUE']=='terminal-original'
-    with open({str(lock)!r},'r') as held:
-        try:
-            fcntl.flock(held.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BlockingIOError:
-            pass
-        else:
-            raise AssertionError('post-exit entry did not hold its original Runner lease')
-    Path({str(output)!r}).write_text(json.dumps({{'notice':notice,'database':str(database),'state_root':str(state_root)}}))
-notifications.deliver_host_exit_notice=capture
-from agent_run_kernel.host_exit_notifications import main
-raise SystemExit(main(sys.argv[2:]))
-'''
+        bootstrap = f"import sys,os,json,fcntl\nfrom pathlib import Path\nsys.path.insert(0,sys.argv[1])\nimport agent_run.notifications.sender as notifications\ndef capture(database,state_root,notice):\n    assert os.environ['HOST_EXIT_TEST_VALUE']=='terminal-original'\n    with open({str(lock)!r},'r') as held:\n        try:\n            fcntl.flock(held.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)\n        except BlockingIOError:\n            pass\n        else:\n            raise AssertionError('post-exit entry did not hold its original Runner lease')\n    Path({str(output)!r}).write_text(json.dumps({{'notice':notice,'database':str(database),'state_root':str(state_root)}}))\nnotifications.deliver_host_exit_notice=capture\nfrom agent_run.cli.host_exit import main\nraise SystemExit(main(sys.argv[2:]))\n"
         environment = {"PATH": os.defpath, "CREDENTIALS_DIRECTORY": str(credentials),
                        "SERVICE_RESULT": "signal", "EXIT_CODE": "killed", "EXIT_STATUS": "KILL",
                        "INVOCATION_ID": "1" * 32, "HOST_EXIT_TEST_VALUE": "manager-wrong"}
         if captured.get("LD_LIBRARY_PATH"):
             environment["LD_LIBRARY_PATH"] = captured["LD_LIBRARY_PATH"]
         before = kernel.storage.path.read_bytes()
-        hook = subprocess.Popen([sys.executable, "-I", "-c", bootstrap, str(Path(native.__file__).resolve().parents[1]),
+        hook = subprocess.Popen([sys.executable, "-I", "-c", bootstrap, str(Path(native.__file__).resolve().parents[2]),
                                  "--database", str(kernel.storage.path), "--action", "entry", "--runner-lock", str(lock)],
                                 env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         stdout, stderr = hook.communicate(timeout=8)

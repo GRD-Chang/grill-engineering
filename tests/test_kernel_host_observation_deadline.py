@@ -1,7 +1,7 @@
 """A late physical read remains auditable without retiring its original wait."""
 import json
 
-from agent_run_kernel.operation_runner import ReadUnavailable
+from agent_run.core.operation_contract import ReadUnavailable
 from test_kernel_host_observation import sent_workspaces
 
 

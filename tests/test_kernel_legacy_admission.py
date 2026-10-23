@@ -14,9 +14,11 @@ from typing import Iterator
 
 import pytest
 
-from agent_run.task_identity import TaskKey
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, Requirements, RunSpec
-from agent_run_kernel.task_location import locked_task, read_task
+from agent_run.contracts.task import TaskKey
+from agent_run.model import Commit, Delivery, DeliveryKind, Requirements, RunSpec
+from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
+from agent_run.storage.tasks import locked_task, read_task
 from test_kernel_requirements import independent_source
 
 
@@ -41,12 +43,12 @@ def unchanged_v6_source(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return root / "project" / "src"
 
 
-_OLD_OWNER = r"""
+_OLD_OWNER = """
 import json, os, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 from agent_run.task_control import TaskControlStore
-from agent_run.task_identity import TaskKey
+from agent_run.contracts.task import TaskKey
 from agent_run.run_locator import RunLocatorIndex
 root, state = Path(sys.argv[2]), Path(sys.argv[3])
 task = TaskKey(root, 'example/project', 1)

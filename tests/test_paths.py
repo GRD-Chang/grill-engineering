@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.paths import app_config_root, app_data_root, app_runtime_root
+from agent_run.config.paths import app_config_root, app_data_root, app_runtime_root
 
 
 @pytest.mark.parametrize("value", [None, ""])

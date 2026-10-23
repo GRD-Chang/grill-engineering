@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 
-from agent_run.user_defaults import UserDefaultsStore
+from agent_run.config.defaults import UserDefaultsStore
 
 
 def test_resync_limit_configures_future_runs() -> None:
@@ -49,7 +49,7 @@ def test_public_settings_ignore_old_policy_and_preserve_atomic_failure(
         raise OSError("injected write failure")
 
     with monkeypatch.context() as scoped:
-        scoped.setattr("agent_run.user_defaults.os.replace", fail_replace)
+        scoped.setattr('agent_run.config.defaults.os.replace', fail_replace)
         code, rejected = settings("configure", "--ticket-review-rounds", "9")
     assert code == 2 and rejected["result"] == "error"
     assert store.path.read_bytes() == previous
@@ -90,7 +90,7 @@ def test_notification_settings_are_optional_and_bound_to_an_app() -> None:
 
 
 def test_bad_notification_settings_do_not_block_run_configuration() -> None:
-    from agent_run.user_defaults import notification_snapshot
+    from agent_run.config.defaults import notification_snapshot
 
     store = UserDefaultsStore()
     store.path.parent.mkdir(parents=True, exist_ok=True)
@@ -105,7 +105,7 @@ def test_bad_notification_settings_do_not_block_run_configuration() -> None:
 
 @pytest.mark.parametrize("mode", ["concise", "detailed"])
 def test_notification_mode_configuration_and_override(mode: str) -> None:
-    from agent_run.user_defaults import notification_snapshot
+    from agent_run.config.defaults import notification_snapshot
 
     code, configured = settings("configure", "--notification-mode", mode)
     assert code == 0
@@ -134,7 +134,7 @@ def test_language_file_validation_preserves_original(value: object) -> None:
 
 
 def test_short_copy_selects_frozen_run_or_personal_language() -> None:
-    from agent_run.messages import selected_language, text
+    from agent_run.contracts.copy import selected_language, text
 
     assert selected_language() == "zh"
     UserDefaultsStore().configure(language="en")

@@ -10,11 +10,13 @@ from typing import Iterator
 
 import pytest
 
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, ParentIssue, Requirements, RunSpec
-from agent_run_kernel.model import Execution, HostObservation
+from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
+from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
+from agent_run.model import Execution, HostObservation
 from support.core_operations import CoreOperations, ReadOnlyPorts, native_agent_fixture
 from support.offline import GraphScenario, Scenario
-from agent_run_kernel.storage import Transaction
+from agent_run.storage.sqlite import Transaction
 
 
 def task_run(root: Path, run_id: str, *, parent: int = 1) -> tuple[Kernel, ReadOnlyPorts]:
@@ -85,10 +87,10 @@ def test_host_observation_cannot_replace_the_first_systemd_invocation(tmp_path: 
 
 def test_two_processes_cannot_admit_different_runs_for_one_task(tmp_path: Path) -> None:
     first, other = task_run(tmp_path, "first")[0], task_run(tmp_path, "other")[0]
-    script = """\
-import json,sys
+    script = """import json,sys
 from pathlib import Path
-from agent_run_kernel import Kernel, KernelError
+from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
 sys.stdin.read(1)
 kernel = Kernel(Path(sys.argv[1]))
 try:

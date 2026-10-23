@@ -2,11 +2,11 @@
 import json
 import time
 
-from agent_run import notification_outbox as outbox
-from agent_run.notification_event_facts import event_copy
-from agent_run_kernel import DeliveryKind
-from agent_run_kernel.notifications import NativeNotifications
-from agent_run_kernel.operation_runner import ReadUnavailable
+import agent_run.storage.notification_outbox as outbox
+from agent_run.notifications.envelope import event_copy
+from agent_run.model import DeliveryKind
+from agent_run.notifications.sender import NativeNotifications
+from agent_run.core.operation_contract import ReadUnavailable
 from support.core_operations import CoreOperations
 from test_kernel_notification_lifecycle import _enabled_scenario
 from test_kernel_query_cli import _snapshot

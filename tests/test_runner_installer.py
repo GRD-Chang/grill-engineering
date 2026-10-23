@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import agent_run.install.runtime_tree
+import agent_run.runtime.process_cleanup
+
 import json
 import fcntl
 import os
@@ -14,8 +17,8 @@ from typing import Any, Callable, Iterator
 
 import pytest
 
-from agent_run.runner_probe import RunnerProbeBackend, RunnerProbeError
-from agent_run import runner_installer
+from agent_run.install.probe import RunnerProbeBackend, RunnerProbeError
+import agent_run.install.installer as runner_installer
 from support.fast_runner_installer import build_candidate as fast_build_candidate
 from support.offline_install import offline_pip_environment, prepare_offline_wheels
 
@@ -84,7 +87,7 @@ def test_build_output_timeout_cleans_process(
 
 def test_build_output_retains_only_the_merged_diagnostic_tail() -> None:
     limit = runner_installer._MAX_BUILD_OUTPUT_BYTES
-    baseline = runner_installer.capture_process_scope()
+    baseline = agent_run.runtime.process_cleanup.capture_process_scope()
     process = subprocess.Popen(
         [sys.executable, '-c',
          f"import os\nos.write(1, b'x' * {limit + 100})\nos.write(2, b'err-tail')"],
@@ -97,7 +100,7 @@ def test_build_output_retains_only_the_merged_diagnostic_tail() -> None:
         assert process.returncode == 0
     finally:
         if process.poll() is None:
-            runner_installer._terminate_process_group(process, adopted_baseline=baseline)
+            agent_run.runtime.process_cleanup.terminate_process_group(process, adopted_baseline=baseline)
         process.stdout.close()
 
 
@@ -128,7 +131,7 @@ def test_git_status_first_byte_deadlines_and_cleanup(
     waits = []
     cleanups = []
     original_popen = subprocess.Popen
-    original_cleanup = runner_installer._terminate_process_group
+    original_cleanup = agent_run.runtime.process_cleanup.terminate_process_group
 
     def start(*args, **kwargs):
         process = original_popen(*args, **kwargs)
@@ -180,7 +183,7 @@ def test_build_completed_with_child_holding_output_is_cleaned(
         encoding="utf-8",
     )
     fake_python.chmod(0o755)
-    with runner_installer.child_subreaper():
+    with agent_run.runtime.process_cleanup.child_subreaper():
         assert runner_installer._run_pip_install(fake_python, tmp_path) == 0
     _assert_process_gone(child_pid)
 
@@ -667,7 +670,7 @@ def test_install_freezes_source_and_reinstall_same_active_is_idempotent(
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, count, _status_file = _fake_codex(tmp_path)
-    probe = source / "src/agent_run/prompt_text_context.py"
+    probe = source / 'src/agent_run/contracts/text_context.py'
     probe.write_text(
         probe.read_text() + '\nTEXTS["context/probe"]["en"] += "\\n候选包探针独有内容"\n',
         encoding="utf-8",
@@ -689,7 +692,7 @@ def test_install_freezes_source_and_reinstall_same_active_is_idempotent(
     first_snapshot = _active_snapshot(home)
     first_manifest = _manifest(first_snapshot)
     first_identity = first_manifest["content_identity"]
-    package = runner_installer.find_runtime_package(first_snapshot)
+    package = agent_run.install.runtime_tree.find_runtime_package(first_snapshot)
     default_method = package / "resources/en/methods/development.md"
     old_method = default_method.read_text(encoding="utf-8")
     assert first_manifest["source_provenance"] == {"kind": "source-directory"}
@@ -796,8 +799,9 @@ def test_probe_timeout_terminates_its_process_group(
     candidate = tmp_path / "candidate" / "lib" / "python3.11" / "site-packages" / "agent_run"
     candidate.mkdir(parents=True)
     (candidate / "__init__.py").write_text("__version__ = 'probe'\n", encoding="utf-8")
-    for module in PROJECT_ROOT.glob("src/agent_run/prompt_text_*.py"):
-        shutil.copyfile(module, candidate / module.name)
+    for module in PROJECT_ROOT.glob("src/agent_run/contracts/text_*.py"):
+        (candidate / "contracts").mkdir(exist_ok=True)
+        shutil.copyfile(module, candidate / "contracts" / module.name)
     fake_codex = tmp_path / "codex"
     fake_codex.write_text(
         "#!/usr/bin/python3\nimport time\ntime.sleep(10)\n", encoding="utf-8"
@@ -815,8 +819,9 @@ def test_probe_success_terminates_descendants_after_codex_exits(
     candidate = tmp_path / "candidate" / "lib" / "python3.11" / "site-packages" / "agent_run"
     candidate.mkdir(parents=True)
     (candidate / "__init__.py").write_text("__version__ = 'probe'\n", encoding="utf-8")
-    for module in PROJECT_ROOT.glob("src/agent_run/prompt_text_*.py"):
-        shutil.copyfile(module, candidate / module.name)
+    for module in PROJECT_ROOT.glob("src/agent_run/contracts/text_*.py"):
+        (candidate / "contracts").mkdir(exist_ok=True)
+        shutil.copyfile(module, candidate / "contracts" / module.name)
     child_pid_file = tmp_path / "child.pid"
     fake_codex = tmp_path / "codex"
     fake_codex.write_text(
@@ -868,7 +873,7 @@ def test_candidate_probe_timeout_cleans_nested_process_and_probe_temporary_files
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = _source_tree(tmp_path)
-    installer = source / "src" / "agent_run" / "runner_installer.py"
+    installer = source / 'src/agent_run/install/installer.py'
     installer.write_text(
         installer.read_text(encoding="utf-8").replace(
             "_CANDIDATE_PROBE_TIMEOUT_SECONDS = 150.0",
@@ -876,7 +881,7 @@ def test_candidate_probe_timeout_cleans_nested_process_and_probe_temporary_files
         ),
         encoding="utf-8",
     )
-    probe = source / "src" / "agent_run" / "runner_probe.py"
+    probe = source / 'src/agent_run/install/probe.py'
     probe.write_text(
         probe.read_text(encoding="utf-8").replace(
             "PROBE_TIMEOUT_SECONDS = 120.0", "PROBE_TIMEOUT_SECONDS = 10.0"
@@ -962,7 +967,7 @@ def test_candidate_probe_captures_both_streams_and_rejects_overflow_without_eof(
         f"import os, signal\nos.write({1 if output == 'stdout' else 2}, b'x' * {limit + 1})\n"
         "signal.pause()\n"
     )
-    baseline = runner_installer.capture_process_scope()
+    baseline = agent_run.runtime.process_cleanup.capture_process_scope()
     process = subprocess.Popen(
         [sys.executable, "-c", program], stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, start_new_session=True,
@@ -983,7 +988,7 @@ def test_candidate_probe_captures_both_streams_and_rejects_overflow_without_eof(
         assert process.stdout.closed and process.stderr.closed
     finally:
         if process.poll() is None:
-            runner_installer._terminate_process_group(process, adopted_baseline=baseline)
+            agent_run.runtime.process_cleanup.terminate_process_group(process, adopted_baseline=baseline)
         process.stdout.close()
         process.stderr.close()
 
@@ -993,7 +998,7 @@ def test_candidate_probe_inner_timeout_kills_forked_codex_children(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = _source_tree(tmp_path)
-    installer = source / "src" / "agent_run" / "runner_installer.py"
+    installer = source / 'src/agent_run/install/installer.py'
     installer.write_text(
         installer.read_text(encoding="utf-8").replace(
             "_CANDIDATE_PROBE_TIMEOUT_SECONDS = 150.0",
@@ -1001,7 +1006,7 @@ def test_candidate_probe_inner_timeout_kills_forked_codex_children(
         ),
         encoding="utf-8",
     )
-    probe = source / "src" / "agent_run" / "runner_probe.py"
+    probe = source / 'src/agent_run/install/probe.py'
     probe.write_text(
         probe.read_text(encoding="utf-8").replace(
             "PROBE_TIMEOUT_SECONDS = 120.0", "PROBE_TIMEOUT_SECONDS = 0.2"
@@ -1081,7 +1086,7 @@ def test_compatibility_check_executes_candidate_probe_code(
         fake_bin
     )
     first_identity = _manifest(_active_snapshot(home))["content_identity"]
-    probe = source / "src" / "agent_run" / "runner_probe.py"
+    probe = source / 'src/agent_run/install/probe.py'
     probe.write_text(
         probe.read_text(encoding="utf-8").replace(
             "raise SystemExit(main())", "raise SystemExit(3)"
@@ -1113,8 +1118,10 @@ def test_candidate_probe_ignores_pythonpath_outside_the_snapshot(
 
     shadow_package = tmp_path / "shadow" / "agent_run"
     shadow_package.mkdir(parents=True)
+    (shadow_package / "install").mkdir()
+    (shadow_package / "install/__init__.py").write_text("\n", encoding="utf-8")
     (shadow_package / "__init__.py").write_text("\n", encoding="utf-8")
-    (shadow_package / "runner_probe.py").write_text(
+    (shadow_package / "install/probe.py").write_text(
         "raise SystemExit(7)\n", encoding="utf-8"
     )
     monkeypatch.setenv("PYTHONPATH", str(shadow_package.parent.parent))
@@ -1135,7 +1142,7 @@ def test_compatibility_check_rejects_schema_drift_in_candidate_probe(
     fake_bin, count, _status_file = _fake_codex(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
-    probe = source / "src" / "agent_run" / "runner_probe.py"
+    probe = source / 'src/agent_run/install/probe.py'
     probe.write_text(
         probe.read_text(encoding="utf-8").replace('"enum": ["ok"]', '"enum": ["wrong"]'),
         encoding="utf-8",
@@ -1242,7 +1249,7 @@ def test_public_install_failures_preserve_existing_state(
         (tmp_path / "codex-behavior").write_text("nonzero", encoding="utf-8")
     elif failure == "timeout":
         (tmp_path / "codex-behavior").write_text("timeout", encoding="utf-8")
-        probe = source / "src" / "agent_run" / "runner_probe.py"
+        probe = source / 'src/agent_run/install/probe.py'
         probe.write_text(
             probe.read_text(encoding="utf-8").replace(
                 "PROBE_TIMEOUT_SECONDS = 120.0", "PROBE_TIMEOUT_SECONDS = 0.2"
@@ -1275,7 +1282,7 @@ def _write_activation_fault_sitecustomize(
         "import os\n"
         "import sys\n"
         "\n"
-        "if sys.argv and sys.argv[0].endswith('runner_installer.py'):\n"
+        "if sys.argv and sys.argv[0].endswith('installer.py'):\n"
         f"    fault = {fault!r}\n"
         f"    active = {str(data_root / 'active')!r}\n"
         f"    generations = {str(data_root / 'generations')!r}\n"
@@ -1404,7 +1411,7 @@ def test_public_signal_during_post_activation_cleanup_keeps_new_generation_compl
         "__version__ = 'c'\n", encoding="utf-8"
     )
     marker = tmp_path / "post-activation-cleanup-started"
-    installer = source / "src" / "agent_run" / "runner_installer.py"
+    installer = source / 'src/agent_run/install/installer.py'
     installer.write_text(
         installer.read_text(encoding="utf-8").replace(
             "            try:\n                warnings = [\n",
@@ -1465,7 +1472,7 @@ def test_public_signal_before_candidate_creation_cleans_preexisting_staging(
         "__version__ = 'c'\n", encoding="utf-8"
     )
     marker = tmp_path / "preflight-started"
-    installer = source / "src" / "agent_run" / "runner_installer.py"
+    installer = source / 'src/agent_run/install/installer.py'
     installer.write_text(
         installer.read_text(encoding="utf-8").replace(
             "    _check_prerequisites(source)\n",
@@ -1508,7 +1515,7 @@ def test_public_idempotent_signal_restores_profile_and_entry(
     home = tmp_path / "home"
     home.mkdir()
     marker = tmp_path / "idempotent-cleanup-started"
-    installer = source / "src" / "agent_run" / "runner_installer.py"
+    installer = source / 'src/agent_run/install/installer.py'
     installer.write_text(
         installer.read_text(encoding="utf-8").replace(
             "            try:\n                _ensure_profile(paths)\n                _ensure_stable_entry(paths)\n                warnings = [\n",
@@ -2529,9 +2536,10 @@ def test_probe_invalid_candidate_text_fails_before_codex(tmp_path: Path, failure
     package = candidate / "lib/python3.11/site-packages/agent_run"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("__version__ = 'probe'\n", encoding="utf-8")
-    for module in PROJECT_ROOT.glob("src/agent_run/prompt_text_*.py"):
-        shutil.copyfile(module, package / module.name)
-    context = package / "prompt_text_context.py"
+    for module in PROJECT_ROOT.glob("src/agent_run/contracts/text_*.py"):
+        (package / "contracts").mkdir(exist_ok=True)
+        shutil.copyfile(module, package / "contracts" / module.name)
+    context = package / "contracts/text_context.py"
     if failure == "missing":
         context.unlink()
     elif failure == "syntax":

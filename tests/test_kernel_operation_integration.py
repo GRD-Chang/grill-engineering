@@ -1,8 +1,8 @@
 """Actual Core operation runner through Host; Agent and GitHub are synthetic."""
-from agent_run_kernel.operation_runner import OperationRunner
+from agent_run.core.operation_runner import OperationRunner
 import pytest
 
-from agent_run_kernel import executor
+import agent_run.runtime.executor as executor
 from support.offline import GraphScenario
 from test_kernel_host_observation import admit_scenario
 from test_kernel_operation_runner import Ports
@@ -35,7 +35,7 @@ def test_github_reader_can_be_imported_cold_in_an_independent_process():
     import subprocess
     import sys
     source = Path(__file__).resolve().parents[1] / "src"
-    result = subprocess.run([sys.executable, "-c", "import agent_run.github"],
+    result = subprocess.run([sys.executable, "-c", 'import agent_run.adapters.github'],
                             env={**os.environ, "PYTHONPATH": str(source)},
                             text=True, capture_output=True, timeout=10)
     assert result.returncode == 0, result.stderr
@@ -59,8 +59,8 @@ def test_host_real_core_original_merge_readback_final_approval_and_cleanup(tmp_p
         finally:
             kernel.agent_exited(call, process, 0)
 
-    monkeypatch.setattr("agent_run_kernel.codex_execution.execute_selected_codex", execute)
-    monkeypatch.setattr("agent_run_kernel.notifications.NativeNotifications", Notifications)
+    monkeypatch.setattr('agent_run.runtime.codex.execute_selected_codex', execute)
+    monkeypatch.setattr('agent_run.notifications.sender.NativeNotifications', Notifications)
     assert executor.run(scenario.kernel, scenario.execution, {}) == 0
     final = scenario.kernel.source_status()["final_subject"]
     assert final is not None and scenario.kernel.status(final)["phase"] == "approval"
@@ -79,7 +79,7 @@ def test_host_real_core_original_merge_readback_final_approval_and_cleanup(tmp_p
 @pytest.mark.parametrize("stage", ["source", "delivery"])
 def test_bootstrap_source_outage_keeps_original_call_and_bounded_read_wait(tmp_path, monkeypatch, stage):
     import pytest
-    from agent_run_kernel.model import ReadWait
+    from agent_run.model import ReadWait
     from support.core_operations import CoreOperations
     from test_kernel_remote_effects import _change, _fixture, _source_kernel
     port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
@@ -129,7 +129,7 @@ def test_bootstrap_source_outage_keeps_original_call_and_bounded_read_wait(tmp_p
 def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, monkeypatch):
     from dataclasses import replace
     import threading
-    from agent_run_kernel.model import Checks, Policy
+    from agent_run.model import Checks, Policy
     source = independent_source()
     source = replace(source, issues=tuple(replace(issue, state="CLOSED") if issue.number == 4 else issue for issue in source.issues))
     scenario = GraphScenario(tmp_path / "concurrent", source, policy=Policy(concurrency=1))
@@ -189,8 +189,8 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
             kernel.receive(call, scenario.agent(call))
         finally:
             kernel.agent_exited(call, process, 0)
-    monkeypatch.setattr("agent_run_kernel.codex_execution.execute_selected_codex", execute)
-    monkeypatch.setattr("agent_run_kernel.notifications.NativeNotifications", Notifications)
+    monkeypatch.setattr('agent_run.runtime.codex.execute_selected_codex', execute)
+    monkeypatch.setattr('agent_run.notifications.sender.NativeNotifications', Notifications)
     assert executor.run(scenario.kernel, scenario.execution, {}) == 0
     assert entered.is_set() and polled.is_set()
     assert scenario.kernel.status(scenario.kernel.source_status()["final_subject"])["phase"] == "approval"
@@ -198,7 +198,7 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
 
 def test_real_core_future_failure_and_raw_cannot_release_unknown_process(tmp_path, monkeypatch):
     import pytest
-    from agent_run_kernel.execution import ProcessExitUnknown
+    from agent_run.runtime.execution import ProcessExitUnknown
     scenario = GraphScenario(tmp_path / "unknown", independent_source())
     host = _admit_host(scenario, tmp_path)
     ports = Ports(scenario)
@@ -213,8 +213,8 @@ def test_real_core_future_failure_and_raw_cannot_release_unknown_process(tmp_pat
         scenario.select(call.subject)
         kernel.receive(call, scenario.agent(call))
         raise RuntimeError("synthetic exit observation unavailable")
-    monkeypatch.setattr("agent_run_kernel.codex_execution.execute_selected_codex", execute)
-    monkeypatch.setattr("agent_run_kernel.notifications.NativeNotifications", Notifications)
+    monkeypatch.setattr('agent_run.runtime.codex.execute_selected_codex', execute)
+    monkeypatch.setattr('agent_run.notifications.sender.NativeNotifications', Notifications)
     with pytest.raises(ProcessExitUnknown):
         executor.run(scenario.kernel, scenario.execution, {})
     assert len(selected) == 1

@@ -12,7 +12,7 @@ import pytest
 def test_capture_signals_group_once_even_when_wait_fails(
     monkeypatch: pytest.MonkeyPatch, wait_fails: bool,
 ) -> None:
-    from agent_run.bounded_command import capture_command
+    from agent_run.runtime.command import capture_command
 
     process = subprocess.Popen(
         [sys.executable, '-c', "print('completed', flush=True)"],
@@ -42,17 +42,17 @@ def test_capture_signals_group_once_even_when_wait_fails(
     assert process.stdout.closed and process.stderr.closed
 
 
-_PROBE = r'''
+_PROBE = """
 import ctypes, os, select, signal, subprocess, sys, threading, selectors
 from pathlib import Path
-from agent_run.github_retry import _run_bounded_command
-from agent_run.git_output import run_git
-from agent_run_kernel.host_adapter import HostUnavailable, SystemdHost
+from agent_run.adapters.github_commands import _run_bounded_command
+from agent_run.runtime.git_command import run_git
+from agent_run.adapters.systemd import HostUnavailable, SystemdHost
 
 assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0  # Own and reap fixture orphans.
 helper, outcome, root = sys.argv[1], sys.argv[2], Path(sys.argv[3])
 escaped = sys.argv[4] == 'escaped'
-command = r"""
+command = r\"\"\"
 import os, signal, sys
 from pathlib import Path
 root, outcome = Path(sys.argv[1]), sys.argv[2]
@@ -78,7 +78,7 @@ with (root / 'ready.fifo').open('w') as ready:
 if outcome == 'normal':
     os._exit(0)
 signal.pause()
-"""
+\"\"\"
 real_popen = subprocess.Popen
 unrelated = real_popen([sys.executable, '-c', 'import signal; signal.pause()'],
                       start_new_session=True)
@@ -159,7 +159,7 @@ try:
                 assert outcome not in {'exception', 'capture_setup_failure'}
                 stdout = result.stdout.decode() if helper == 'systemd' else result.stdout
                 stderr = result.stderr.decode() if helper == 'systemd' else result.stderr
-                assert stdout == 'normal output\n'
+                assert stdout == 'normal output\\n'
                 assert 'error tail' in stderr
                 assert outcome == 'normal'
                 assert result.returncode == 0
@@ -207,7 +207,7 @@ try:
 finally:
     unrelated.kill()
     unrelated.wait()
-'''
+"""
 
 
 @pytest.mark.skipif(not hasattr(os, 'pidfd_open'), reason='requires Linux pidfd')

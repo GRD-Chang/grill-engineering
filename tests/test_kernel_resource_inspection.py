@@ -1,10 +1,10 @@
 """Original managed Git witnesses are inspected without changing their resources."""
 from pathlib import Path
 
-from agent_run_kernel import Effect, Execution, ResourceWitness
-from agent_run_kernel.effects import LocalGit
-from agent_run_kernel.local_effects import LocalEffects
-from agent_run_kernel.model import resource_wire
+from agent_run.model import Effect, Execution, ResourceWitness
+from agent_run.adapters.git_objects import LocalGit
+from agent_run.adapters.local_git import LocalEffects
+from agent_run.model import resource_wire
 
 
 def test_resource_preflight_distinguishes_owned_dirty_absent_and_foreign_without_writes(

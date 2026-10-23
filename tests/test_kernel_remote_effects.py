@@ -1,5 +1,5 @@
 """Remote effects through real bare Git and an isolated stateful gh executable."""
-from agent_run_kernel.operation_runner import OperationRunner
+from agent_run.core.operation_runner import OperationRunner
 from dataclasses import replace
 import json
 import os
@@ -9,11 +9,12 @@ import sys
 
 import pytest
 
-from agent_run.git_errors import GitHubReadError
-from agent_run_kernel.effects import LocalGit
-from agent_run_kernel.model import Effect, Execution, KernelError
-from agent_run_kernel.remote_effects import RemoteEffects
-from agent_run_kernel.operation_runner import ReadUnavailable
+from agent_run.errors import GitHubReadError
+from agent_run.adapters.git_objects import LocalGit
+from agent_run.model import Effect, Execution
+from agent_run.errors import KernelError
+from agent_run.adapters.remote import RemoteEffects
+from agent_run.core.operation_contract import ReadUnavailable
 from support.effect_boundary import EffectBoundary, effect_boundary
 
 
@@ -320,8 +321,8 @@ def test_optional_issue_link_keeps_exact_successful_graphql_acknowledgement(tmp_
 
 @pytest.mark.parametrize("mode", ["acknowledged", "ack-lost", "unavailable"])
 def test_real_issue_ack_stays_optional_and_once_across_kernel_reopen(tmp_path, monkeypatch, mode):
-    from agent_run_kernel import Kernel
-    from agent_run_kernel.model import Issue, ParentIssue, Requirements
+    from agent_run.core.kernel import Kernel
+    from agent_run.model import Issue, ParentIssue, Requirements
     from support.offline import GraphScenario
     from test_kernel_operation_runner import Ports, settle_agent
     _port, _git, _push, state, calls = _fixture(tmp_path, monkeypatch)
@@ -404,10 +405,11 @@ def test_remote_cleanup_uses_selected_runner_transport_and_original_head(tmp_pat
 
 
 def _source_kernel(tmp_path, port, push):
-    from agent_run_kernel import Delivery, DeliveryKind, Kernel, RunSpec
-    from agent_run.agent_profiles import resolve_profiles
-    from agent_run.prompt_resources import resolve_resources
-    from agent_run_kernel.model import CreationInputs, ParentIssue, Requirements
+    from agent_run.model import Delivery, DeliveryKind, RunSpec
+    from agent_run.core.kernel import Kernel
+    from agent_run.contracts.agent_profiles import resolve_profiles
+    from agent_run.config.resources import resolve_resources
+    from agent_run.model import CreationInputs, ParentIssue, Requirements
     source = Requirements(ParentIssue(1, "Parent", "Whole requirement", ()), ())
     job = Delivery("parent:1", DeliveryKind.PARENT_ONLY, 1, "not-authority", push.base,
                    push.source_ref, push.target_ref)
@@ -466,9 +468,9 @@ def test_observe_uses_real_requirements_remote_commits_and_required_ci_facts(tmp
 
 def test_observe_rejects_a_real_old_source_read_when_new_requirements_commit_first(tmp_path, monkeypatch):
     from threading import Event, Thread
-    import agent_run_kernel.remote_effects as external
-    from agent_run.github import GhGitHubReader
-    from agent_run_kernel.source_reading import read_requirements
+    import agent_run.adapters.remote as external
+    from agent_run.adapters.github import GhGitHubReader
+    from agent_run.adapters.source import read_requirements
     port, _git, push, state, _calls = _fixture(tmp_path, monkeypatch)
     kernel = _source_kernel(tmp_path, port, push)
     before = kernel.source_status()
@@ -504,7 +506,7 @@ def test_observe_rejects_a_real_old_source_read_when_new_requirements_commit_fir
 
 
 def test_final_observation_proves_real_current_completions_into_remote_run_before_activation(tmp_path, monkeypatch):
-    from agent_run_kernel.model import Issue, ParentIssue, Requirements
+    from agent_run.model import Issue, ParentIssue, Requirements
     from support.offline import GraphScenario
     _port, _git, _push, state, calls = _fixture(tmp_path, monkeypatch)
     source = Requirements(ParentIssue(1, "Parent", "Whole requirement", (2,)),

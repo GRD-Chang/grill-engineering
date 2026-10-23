@@ -6,10 +6,11 @@ import sys
 
 import pytest
 
-from agent_run_kernel import executor
-from agent_run_kernel import codex_execution
-from agent_run_kernel.kernel import Kernel
-from agent_run_kernel.model import Commit, Delivery, DeliveryKind, KernelError, RunSpec
+import agent_run.runtime.executor as executor
+import agent_run.runtime.codex as codex_execution
+from agent_run.core.kernel import Kernel
+from agent_run.model import Commit, Delivery, DeliveryKind, RunSpec
+from agent_run.errors import KernelError
 
 
 def test_host_command_seals_library_path_without_resolving_venv_or_leaking_secrets(
@@ -24,7 +25,7 @@ def test_host_command_seals_library_path_without_resolving_venv_or_leaking_secre
     command = executor.command(database, "original-action", lock, environment)
     assert command == (
         "/usr/bin/env", "LD_LIBRARY_PATH=/private/sqlite/lib:/another path/lib", str(selected),
-        "-m", "agent_run_kernel.executor", "--database", str(database),
+        "-m", 'agent_run.runtime.executor', "--database", str(database),
         "--action", "original-action", "--runner-lock", str(lock),
     )
     assert "secret-sentinel" not in " ".join(command)
@@ -44,7 +45,7 @@ def test_unmanaged_executor_entry_refuses_before_accessing_a_database(
 
 
 def test_native_executor_enumerates_more_than_one_query_page(tmp_path: Path) -> None:
-    from agent_run_kernel.model import Issue, ParentIssue, Requirements
+    from agent_run.model import Issue, ParentIssue, Requirements
     numbers = tuple(range(2, 132))
     deliveries = tuple(Delivery(f"ticket:{n}", DeliveryKind.TICKET, n, "untrusted", Commit("base", "tree"),
                                 f"refs/heads/ticket-{n}", "refs/heads/run") for n in numbers)

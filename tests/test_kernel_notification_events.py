@@ -6,9 +6,10 @@ from typing import Any
 
 import pytest
 
-from agent_run_kernel import AgentCall, DeliveryKind, Issue, Kernel, ParentIssue, Requirements, Role, Step
-from agent_run_kernel.model import wire_json
-from agent_run_kernel.event_projection import project_event
+from agent_run.model import AgentCall, DeliveryKind, Issue, ParentIssue, Requirements, Role, Step
+from agent_run.core.kernel import Kernel
+from agent_run.model import wire_json
+from agent_run.notifications.event_projection import project_event
 from support.offline import GraphScenario, Scenario
 
 
@@ -111,7 +112,7 @@ def test_role_events_require_real_start_and_consumption_and_do_not_duplicate_fir
 
 @pytest.mark.parametrize("mode", ["detailed", "concise"])
 def test_full_run_first_review_and_repair_replace_corresponding_stage_events(tmp_path, monkeypatch, mode):
-    from agent_run.notification_event_facts import event_copy
+    from agent_run.notifications.envelope import event_copy
 
     # d847's Final fixture retains a real historical Ticket and Completion.
     # Its prefix has already passed Review; this script begins at Final Review.

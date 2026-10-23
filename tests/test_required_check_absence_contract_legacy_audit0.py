@@ -141,15 +141,16 @@ at_ten = ExternalSupervisor(now=lambda: 700.25, sleeper=lambda delay: None).befo
 print(json.dumps({'first_retry_sleeps': sleeps, 'allows_retry_at_ten_minutes': at_ten, 'status_at_ten_minutes': expired['status'], 'status': result['status'], 'phase': owner['phase'], 'checks': owner.get('required_checks_evidence'), 'ci': owner.get('ci_recovery'), 'supervision': durable.get('supervision_window'), 'diagnostics': durable.get('diagnostics'), 'events': agents.events, 'before_approve': before_approve, 'approval_grant': owner.get('approval_grant'), 'approval_error': approval_error, 'query_code': code, 'query_stdout': stream.getvalue(), 'mutations': json.loads(fixture.read_text()).get('delivery', {}).get('mutations', [])}))
 """
 
-NATIVE_CALLER = r"""
+NATIVE_CALLER = """
 import json, os, sys, io, contextlib
 from pathlib import Path
 from dataclasses import replace, asdict
-from agent_run.github import GhGitHubReader
-from agent_run_kernel import Issue, ParentIssue, Requirements, Kernel
+from agent_run.adapters.github import GhGitHubReader
+from agent_run.model import Issue, ParentIssue, Requirements
+from agent_run.core.kernel import Kernel
 from support.offline import GraphScenario
-from agent_run_kernel.source_reading import read_required_check_facts, normalize_required_checks
-from agent_run_kernel.query_cli import main
+from agent_run.adapters.source import read_required_check_facts, normalize_required_checks
+from agent_run.cli.main import main
 req = json.load(sys.stdin)
 root = Path(req['root'])
 root.mkdir()
@@ -196,11 +197,11 @@ window = status.get('read_waits')
 approval_error = None
 if req.get('approve') and kind == 'parent':
     try:
-        from agent_run_kernel.operation_runner import observe_control
+        from agent_run.core.operation_runner import observe_control
         s.kernel.control('approve', 'audit-approval', subject=s.delivery.key, world=observe_control(s.kernel, s.delivery.key, s.make_ports))
     except Exception as error:
         approval_error = getattr(error, 'code', str(error))
-from agent_run_kernel import query as query_clock
+import agent_run.queries.run as query_clock
 query_clock.time.time = lambda: now[0]
 qio = io.StringIO()
 with contextlib.redirect_stdout(qio):

@@ -8,8 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel import DeliveryKind, Policy, executor
-from agent_run_kernel.model import EffectResult, Execution, HostObservation
+import agent_run.runtime.executor as executor
+from agent_run.model import DeliveryKind, Policy
+from agent_run.model import EffectResult, Execution, HostObservation
 from support.offline import GraphScenario, Scenario
 from test_kernel_requirements import independent_source
 
@@ -66,7 +67,7 @@ def test_admitted_run_does_not_starve_later_gated_intent_behind_unknown(
 
     monkeypatch.setattr(scenario.port, "reconcile", original_readback)
     monkeypatch.setattr(executor, "_make_ports", scenario.make_ports)
-    monkeypatch.setattr("agent_run_kernel.codex_execution.execute_selected_codex",
+    monkeypatch.setattr('agent_run.runtime.codex.execute_selected_codex',
                         lambda *a, **kw: pytest.fail("Gated intent observation allocates no Agent"))
     assert kernel.operation_state().disposition == "quiescent"
     assert executor.run(kernel, scenario.execution, {}) == 0
@@ -115,7 +116,7 @@ def test_admitted_run_observes_approval_without_pending_intent_once(
     monkeypatch.setattr(scenario.port, "source", source_read)
     monkeypatch.setattr(scenario.port, "delivery", delivery_read)
     monkeypatch.setattr(executor, "_make_ports", scenario.make_ports)
-    monkeypatch.setattr("agent_run_kernel.codex_execution.execute_selected_codex",
+    monkeypatch.setattr('agent_run.runtime.codex.execute_selected_codex',
                         lambda *a, **kw: pytest.fail("Approval observation allocates no Agent"))
     assert kernel.operation_state().disposition == "quiescent"
     assert executor.run(kernel, scenario.execution, {}) == 0

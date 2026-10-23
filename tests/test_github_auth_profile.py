@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.github_auth_profile import GitHubAppProfileStore, GitHubAuthProfileError
+from agent_run.config.github_app import GitHubAppProfileStore, GitHubAuthProfileError
 
 
 def _legacy_profile(tmp_path: Path) -> tuple[GitHubAppProfileStore, Path]:

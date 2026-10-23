@@ -1,15 +1,17 @@
 """Actual source observation feeds the original first Run-ref empty CAS."""
-from agent_run_kernel.operation_runner import observe_control
+from agent_run.core.operation_runner import observe_control
 from pathlib import Path
 from dataclasses import replace
 import json
 
 import pytest
 
-from agent_run_kernel import Kernel, KernelError, RunSpec
-from agent_run_kernel.lifecycle_cli import creation_resources
-from agent_run_kernel.source_reading import read_requirements
-from agent_run.github import GhGitHubReader
+from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
+from agent_run.model import RunSpec
+from agent_run.cli.lifecycle import creation_resources
+from agent_run.adapters.source import read_requirements
+from agent_run.adapters.github import GhGitHubReader
 from test_kernel_remote_effects import _fixture, _source_kernel, _publish_pr
 from support.core_operations import CoreOperations
 
@@ -22,9 +24,9 @@ def test_real_empty_run_ref_is_observed_and_created_before_a_ticket_workspace(tm
     state.write_text(json.dumps(document))
     reader = GhGitHubReader(port.repository, working_directory=port.root, runner_identity=port.identity)
     source = read_requirements(reader, 1)
-    from agent_run.agent_profiles import resolve_profiles
-    from agent_run.prompt_resources import resolve_resources
-    from agent_run_kernel.model import CreationInputs
+    from agent_run.contracts.agent_profiles import resolve_profiles
+    from agent_run.config.resources import resolve_resources
+    from agent_run.model import CreationInputs
     inputs = CreationInputs(resolve_profiles(preset="economy"), resolve_resources("en"),
         {"source": "host"}, {"source": "host"}, {"enabled": False}, {"source": "explicit-test"})
     resources = creation_resources("new-run", source, seed.base, "refs/heads/main", port.root.resolve())

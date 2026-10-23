@@ -9,13 +9,14 @@ import sys
 
 import pytest
 
-from agent_run.prompt_resources import RESOURCE_KEYS
-from agent_run.user_defaults import UserDefaultsStore
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Effect, EffectResult, Kernel, RunSpec
-from agent_run_kernel.configuration import freeze_creation
+from agent_run.contracts.prompt import RESOURCE_KEYS
+from agent_run.config.defaults import UserDefaultsStore
+from agent_run.model import Commit, Delivery, DeliveryKind, Effect, EffectResult, RunSpec
+from agent_run.core.kernel import Kernel
+from agent_run.config.creation import freeze_creation
 from support.offline import LostResponse, Scenario
-from agent_run_kernel.query import read
-from agent_run_kernel.remote_effects import RemoteEffects
+from agent_run.queries.run import read
+from agent_run.adapters.remote import RemoteEffects
 from support.core_operations import CoreOperations, native_agent_fixture, scripted_return
 
 

@@ -1,9 +1,9 @@
 """A Core request retains the real initial pass and the original Executor fence."""
 import pytest
 
-from agent_run_kernel import KernelError
-from agent_run_kernel.model import HostObservation
-from agent_run_kernel.operation_contract import EffectIO
+from agent_run.errors import KernelError
+from agent_run.model import HostObservation
+from agent_run.core.operation_contract import EffectIO
 from test_kernel_host_observation import sent_workspaces
 
 

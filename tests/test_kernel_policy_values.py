@@ -3,19 +3,21 @@ from dataclasses import replace
 
 import pytest
 
-from agent_run import delivery_policy
-from agent_run.delivery_policy import DeliveryPolicyError, resolve_delivery_policy
-from agent_run_kernel import Policy, Profile
-from agent_run_kernel.configuration import checkpoint_policy
+import agent_run.contracts.policy_values as delivery_policy
+from agent_run.errors import DeliveryPolicyError
+from agent_run.contracts.policy_values import resolve_delivery_policy
+from agent_run.model import Policy, Profile
+from agent_run.contracts.policy_values import checkpoint_policy
 
 
 def test_settings_sparse_overrides_freeze_native_policy_and_renew_from_frozen(tmp_path, capsys, monkeypatch) -> None:
     import json
 
-    from agent_run.user_defaults import UserDefaultsStore
-    from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, RunSpec
-    from agent_run_kernel.configuration import freeze_creation
-    from agent_run_kernel.query_cli import main
+    from agent_run.config.defaults import UserDefaultsStore
+    from agent_run.model import Commit, Delivery, DeliveryKind, RunSpec
+    from agent_run.core.kernel import Kernel
+    from agent_run.config.creation import freeze_creation
+    from agent_run.cli.main import main
     from support.core_operations import CoreOperations, native_agent_fixture
 
     defaults = UserDefaultsStore()

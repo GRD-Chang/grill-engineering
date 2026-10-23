@@ -5,11 +5,12 @@ from pathlib import Path
 import pytest
 
 from support.core_operations import CoreOperations, scripted_return
-from agent_run_kernel import Issue, ParentIssue, Requirements, Role
-from agent_run_kernel.model import KernelError, wire_json
-from agent_run.notification_event_facts import event_envelope
-from agent_run_kernel.notification_progress import obsolete_progress
-from agent_run_kernel.event_projection import event_state, project_event
+from agent_run.model import Issue, ParentIssue, Requirements, Role
+from agent_run.errors import KernelError
+from agent_run.model import wire_json
+from agent_run.notifications.envelope import event_envelope
+from agent_run.notifications.progress import obsolete_progress
+from agent_run.notifications.event_projection import event_state, project_event
 from support.offline import GraphScenario
 from test_kernel_notification_events import _project, _recorded_agents
 

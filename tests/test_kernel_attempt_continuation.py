@@ -5,16 +5,16 @@ from dataclasses import replace
 import json
 
 import pytest
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError
-from agent_run_kernel.attempt_continuation import (
-    AttemptContinuationBasis, ContinuationOpening, bind_attempt_continuation, load_continuation,
-)
-from agent_run_kernel.model import wire_json
-from agent_run_kernel.model import Issue, ParentIssue, Requirements
+from agent_run.model import Commit, Delivery, DeliveryKind
+from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
+from agent_run.core.attempt_continuation import AttemptContinuationBasis, ContinuationOpening, bind_attempt_continuation, load_continuation
+from agent_run.model import wire_json
+from agent_run.model import Issue, ParentIssue, Requirements
 from support.offline import GraphScenario, fixture_inputs
 from support.core_operations import CoreOperations, ReadOnlyPorts
-from agent_run_kernel.operation_runner import DeliveryFacts
-from agent_run_kernel.storage import PROTOCOL
+from agent_run.core.operation_contract import DeliveryFacts
+from agent_run.storage.preflight import PROTOCOL
 from test_kernel_exploration import ticket_spec
 
 

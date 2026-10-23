@@ -12,13 +12,15 @@ from typing import Any
 
 import pytest
 
-from agent_run_kernel import AgentCall, Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, RunSpec
-from agent_run_kernel.execution import execute
-from agent_run_kernel.model import Requirements
+from agent_run.model import AgentCall, Commit, Delivery, DeliveryKind, Policy, RunSpec
+from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
+from agent_run.runtime.execution import execute
+from agent_run.model import Requirements
 from support.core_operations import CoreOperations, ReadOnlyPorts, native_agent_fixture
-from agent_run_kernel.operation_runner import DeliveryFacts
+from agent_run.core.operation_contract import DeliveryFacts
 from support.offline import fixture_inputs
-from agent_run.process_cleanup import child_subreaper
+from agent_run.runtime.process_cleanup import child_subreaper
 
 
 RAW = b'{"result_kind":"development","summary":"saved local work","human_blockers":null}'

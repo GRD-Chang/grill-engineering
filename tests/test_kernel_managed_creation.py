@@ -9,10 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel.executor import _make_ports
+from agent_run.runtime.executor import _make_ports
 from support.core_operations import CoreOperations
 
-from agent_run.managed_workspace import ManagedWorkspace, read_git_identity
+from agent_run.adapters.workspace import ManagedWorkspace, read_git_identity
 
 
 def git(root: Path, *arguments: str) -> str:
@@ -41,14 +41,14 @@ def test_native_clone_copies_only_original_identity_and_opens_without_legacy_run
     assert read_git_identity(clone) == original
     assert (clone / "README.md").read_text() == "unfinished native delivery\n"
     assert git(git_repo, "status", "--porcelain=v1") == before
-    program = "from agent_run.managed_workspace import ManagedWorkspace; import sys; assert 'agent_run.git' not in sys.modules"
+    program = "from agent_run.adapters.workspace import ManagedWorkspace; import sys; assert 'agent_run.git' not in sys.modules"
     result = subprocess.run([sys.executable, "-c", program], text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
 
 
 def test_creation_freezes_three_delivery_resource_kinds_without_creating_worktrees(tmp_path: Path) -> None:
-    from agent_run_kernel.lifecycle_cli import creation_resources
-    from agent_run_kernel.model import Commit, DeliveryKind, Issue, ParentIssue, Requirements
+    from agent_run.cli.lifecycle import creation_resources
+    from agent_run.model import Commit, DeliveryKind, Issue, ParentIssue, Requirements
     source = Requirements(ParentIssue(1, "Parent", "Exact body", (9, 3)), (
         Issue(9, "Later", "body", "OPEN"), Issue(3, "First", "body", "CLOSED")))
     base = Commit("a" * 40, "b" * 40)
@@ -72,10 +72,11 @@ def test_creation_freezes_three_delivery_resource_kinds_without_creating_worktre
 def test_host_preflight_failure_never_accepts_action_or_creates_environment(tmp_path: Path) -> None:
     import os
     import pytest
-    from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, RunSpec
-    from agent_run_kernel.host_adapter import HostUnavailable, SystemdHost
-    from agent_run_kernel.lifecycle_cli import submit
-    from agent_run.paths import app_runtime_root
+    from agent_run.model import Commit, Delivery, DeliveryKind, RunSpec
+    from agent_run.core.kernel import Kernel
+    from agent_run.adapters.systemd import HostUnavailable, SystemdHost
+    from agent_run.cli.lifecycle import submit
+    from agent_run.config.paths import app_runtime_root
     delivery = Delivery("parent:1", DeliveryKind.PARENT_ONLY, 1, "revision", Commit("base", "tree"),
                         "refs/heads/parent", "refs/heads/main")
     kernel = Kernel.create(tmp_path / "state.sqlite3", RunSpec("run-1", "example/project", 1,
@@ -83,7 +84,7 @@ def test_host_preflight_failure_never_accepts_action_or_creates_environment(tmp_
     manager = SystemdHost(systemctl=str(tmp_path / "missing-systemctl"),
                           systemd_run=str(tmp_path / "missing-systemd-run"), environment=dict(os.environ))
     with pytest.raises(HostUnavailable):
-        submit(kernel, "run", action_id="not-applied", command=(sys.executable, "-m", "agent_run_kernel.executor"),
+        submit(kernel, "run", action_id="not-applied", command=(sys.executable, "-m", 'agent_run.runtime.executor'),
                manager=manager, environment=dict(os.environ), runner_lock=tmp_path / "runner.lock")
     with kernel.storage.transaction(write=False) as tx:
         assert tx.one("SELECT count(*) FROM actions")[0] == 0
@@ -98,9 +99,9 @@ def test_prepare_creation_uses_original_defaults_real_remote_and_independent_clo
     import json
     import os
     from tests.test_kernel_remote_effects import FAKE_GH
-    from agent_run.user_defaults import UserDefaultsStore
-    from agent_run_kernel.lifecycle_cli import prepare_creation
-    from agent_run_kernel.model import DeliveryKind
+    from agent_run.config.defaults import UserDefaultsStore
+    from agent_run.cli.lifecycle import prepare_creation
+    from agent_run.model import DeliveryKind
     remote = tmp_path / "origin.git"
     git(git_repo, "init", "--bare", "--initial-branch=main", str(remote))
     git(git_repo, "push", str(remote), "HEAD:refs/heads/main")
@@ -142,7 +143,7 @@ def test_prepare_creation_uses_original_defaults_real_remote_and_independent_clo
 
 
 def test_native_public_parser_preserves_creation_and_resume_arguments() -> None:
-    from agent_run_kernel.query_cli import _parser
+    from agent_run.cli.main import _parser
     parser = _parser("en")
     run = parser.parse_args(["run", "1", "--repo", "example/project", "--profile-preset", "economy",
                              "--dev-model", "chosen", "--dev-effort", "high", "--ticket-review-round", "1",
@@ -160,8 +161,8 @@ def test_native_public_parser_preserves_creation_and_resume_arguments() -> None:
 
 def test_requeue_of_a_missing_run_reports_failure_without_mutating_settings(tmp_path: Path, capsys) -> None:
     import json
-    from agent_run.user_defaults import UserDefaultsStore
-    from agent_run_kernel.query_cli import main
+    from agent_run.config.defaults import UserDefaultsStore
+    from agent_run.cli.main import main
     defaults = UserDefaultsStore()
     defaults.configure(language="en")
     before = defaults.path.read_bytes()
@@ -174,10 +175,11 @@ def test_requeue_of_a_missing_run_reports_failure_without_mutating_settings(tmp_
 def test_existing_run_error_uses_frozen_language_after_personal_language_changes(
     git_repo: Path, tmp_path: Path, capsys, monkeypatch,
 ) -> None:
-    from agent_run.user_defaults import UserDefaultsStore
-    from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, RunSpec
-    from agent_run_kernel.configuration import freeze_creation
-    from agent_run_kernel.query_cli import main
+    from agent_run.config.defaults import UserDefaultsStore
+    from agent_run.model import Commit, Delivery, DeliveryKind, RunSpec
+    from agent_run.core.kernel import Kernel
+    from agent_run.config.creation import freeze_creation
+    from agent_run.cli.main import main
     workspace = ManagedWorkspace.for_repository("example/project")
     root = workspace.ensure_path(str(git_repo), identity=read_git_identity(git_repo))
     base = Commit(git(root, "rev-parse", "HEAD"), git(root, "rev-parse", "HEAD^{tree}"))
@@ -187,14 +189,15 @@ def test_existing_run_error_uses_frozen_language_after_personal_language_changes
     defaults.configure(language="en")
     spec = freeze_creation(RunSpec("run-1", "example/project", 1, "parent", "graph", (delivery,),
                                    repository_root=str(root)), defaults)
-    from agent_run_kernel import ParentIssue, Requirements
+    from agent_run.model import ParentIssue, Requirements
     kernel = Kernel.create_task(workspace.state_root / "run-1" / "kernel.sqlite3", spec,
         requirements=Requirements(ParentIssue(1, "Parent", "Frozen requirement"), ()))
     defaults.configure(language="zh")
     # This is a language/selection test, not a real user-bus release claim.
     # Keep readiness explicit through the existing executable manager fixture.
     from tests.test_kernel_host_adapter import controlled_manager
-    from agent_run_kernel import lifecycle_cli, host_adapter
+    import agent_run.cli.lifecycle as lifecycle_cli
+    import agent_run.adapters.systemd as host_adapter
     manager, _request, _response, _calls = controlled_manager(tmp_path)
     monkeypatch.setattr(lifecycle_cli, "_active_runner", lambda: True)
     monkeypatch.setattr(host_adapter, "SystemdHost", lambda **kwargs: manager)
@@ -213,7 +216,7 @@ def test_dispatched_unknown_host_is_attached_without_applying_a_new_action(tmp_p
     import json
     import os
     from tests.test_kernel_host_adapter import controlled_manager, host_kernel
-    from agent_run_kernel.lifecycle_cli import attach
+    from agent_run.cli.lifecycle import attach
     kernel = host_kernel(tmp_path)
     manager, fixture, response, calls = controlled_manager(tmp_path)
     private = tmp_path / "original-host"
@@ -242,8 +245,8 @@ def test_allocated_original_host_continues_its_one_dispatch_and_then_only_attach
     import json
     import os
     from tests.test_kernel_host_adapter import controlled_manager, host_kernel
-    from agent_run_kernel import native_host
-    from agent_run_kernel.lifecycle_cli import attach
+    import agent_run.runtime.handoff as native_host
+    from agent_run.cli.lifecycle import attach
     kernel = host_kernel(tmp_path)
     manager, fixture, response, calls = controlled_manager(tmp_path)
     private = tmp_path / "original-host"
@@ -284,7 +287,7 @@ def test_allocated_original_host_continues_its_one_dispatch_and_then_only_attach
 
 def test_lifecycle_rejects_unsupported_github_host_before_managed_or_remote_access(monkeypatch, capsys) -> None:
     import json
-    from agent_run_kernel.query_cli import main
+    from agent_run.cli.main import main
     monkeypatch.setenv("GH_HOST", "outside.example.test")
     workspace = ManagedWorkspace.for_repository("example/project")
     assert main(["resume", "run-1", "--repo", "example/project", "--json"]) == 2
@@ -303,9 +306,10 @@ def _running_public_parent(git_repo: Path, tmp_path: Path, monkeypatch, *, admit
     """
     import json
     import os
-    from agent_run.user_defaults import UserDefaultsStore
-    from agent_run_kernel import Commit, Delivery, DeliveryKind, Issue, Kernel, ParentIssue, Requirements, RunSpec
-    from agent_run_kernel.configuration import freeze_creation
+    from agent_run.config.defaults import UserDefaultsStore
+    from agent_run.model import Commit, Delivery, DeliveryKind, Issue, ParentIssue, Requirements, RunSpec
+    from agent_run.core.kernel import Kernel
+    from agent_run.config.creation import freeze_creation
     from tests.test_kernel_remote_effects import FAKE_GH
     binary = tmp_path / "source-bin"
     binary.mkdir()
@@ -353,14 +357,15 @@ def _running_public_parent(git_repo: Path, tmp_path: Path, monkeypatch, *, admit
 def _ready_public_host(kernel, tmp_path: Path, monkeypatch, *, admit: bool = True):
     """Use the original executable manager and real PID; readiness is explicit."""
     import json
-    from agent_run.paths import app_data_root
-    from agent_run_kernel import host_adapter, lifecycle_cli
-    from agent_run_kernel.model import Execution
+    from agent_run.config.paths import app_data_root
+    import agent_run.adapters.systemd as host_adapter
+    import agent_run.cli.lifecycle as lifecycle_cli
+    from agent_run.model import Execution
     from tests.test_kernel_host_adapter import controlled_manager
 
     active = app_data_root() / "active" / "current"
     active.parent.mkdir(parents=True)
-    active.symlink_to(Path(lifecycle_cli.__file__).resolve().parents[2], target_is_directory=True)
+    active.symlink_to(Path(lifecycle_cli.__file__).resolve().parents[3], target_is_directory=True)
     manager_root = tmp_path / "manager"
     manager_root.mkdir()
     manager, fixture, response, calls = controlled_manager(manager_root)
@@ -392,8 +397,8 @@ def test_public_busy_checkpoint_resume_applies_policy_to_the_original_host(
     git_repo: Path, tmp_path: Path, monkeypatch, capsys,
 ) -> None:
     import json
-    from agent_run_kernel.model import EffectResult
-    from agent_run_kernel.query_cli import main
+    from agent_run.model import EffectResult
+    from agent_run.cli.main import main
     with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, execution, base, calls):
         operations = CoreOperations(kernel, execution, _make_ports)
         original = operations.until(lambda step: step.call is not None).call
@@ -438,7 +443,7 @@ def test_public_ordinary_busy_resume_rejects_policy_without_consuming_an_action(
     git_repo: Path, tmp_path: Path, monkeypatch, capsys,
 ) -> None:
     import json
-    from agent_run_kernel.query_cli import main
+    from agent_run.cli.main import main
     with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, execution, base, calls):
         operations = CoreOperations(kernel, execution, _make_ports)
         original = operations.until(lambda step: step.call is not None).call
@@ -463,10 +468,10 @@ def test_public_requeue_replaces_the_exact_stale_parent_generation_on_its_origin
     git_repo: Path, tmp_path: Path, monkeypatch, capsys,
 ) -> None:
     import json
-    from agent_run.github import GhGitHubReader
-    from agent_run_kernel import lifecycle_cli
-    from agent_run_kernel.query_cli import main
-    from agent_run_kernel.source_reading import read_requirements
+    from agent_run.adapters.github import GhGitHubReader
+    import agent_run.cli.lifecycle as lifecycle_cli
+    from agent_run.cli.main import main
+    from agent_run.adapters.source import read_requirements
 
     with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, execution, base, calls):
         operations = CoreOperations(kernel, execution, _make_ports)
@@ -517,7 +522,7 @@ def test_public_requeue_without_a_current_change_job_does_not_consume_an_action(
     git_repo: Path, tmp_path: Path, monkeypatch, capsys,
 ) -> None:
     import json
-    from agent_run_kernel.query_cli import main
+    from agent_run.cli.main import main
 
     with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, _execution, _world, _calls):
         before = kernel.source_status()
@@ -534,7 +539,7 @@ def test_public_requeue_with_multiple_stale_tickets_requires_an_exact_current_ch
     git_repo: Path, tmp_path: Path, monkeypatch, capsys,
 ) -> None:
     import json
-    from agent_run_kernel.query_cli import main
+    from agent_run.cli.main import main
 
     with _running_public_parent(git_repo, tmp_path, monkeypatch, tickets=(2, 3)) as (kernel, request, execution, base, _calls):
         operations = CoreOperations(kernel, execution, _make_ports)
@@ -564,8 +569,8 @@ def test_public_idle_requeue_binds_the_exact_replacement_to_the_original_host_in
     git_repo: Path, tmp_path: Path, monkeypatch, capsys,
 ) -> None:
     import json
-    from agent_run_kernel import lifecycle_cli
-    from agent_run_kernel.query_cli import main
+    import agent_run.cli.lifecycle as lifecycle_cli
+    from agent_run.cli.main import main
 
     with _running_public_parent(git_repo, tmp_path, monkeypatch, admit=False) as (kernel, _request, _execution, base, _calls):
         execution = kernel.claim_executor("isolated-preparation")
@@ -611,9 +616,12 @@ def test_public_abandon_of_an_unknown_host_only_fences_the_published_task(
 ) -> None:
     import json
     import pytest
-    from agent_run_kernel import host_adapter, lifecycle_cli, remote_effects
-    from agent_run_kernel.model import HostObservation, KernelError
-    from agent_run_kernel.query_cli import main
+    import agent_run.adapters.systemd as host_adapter
+    import agent_run.cli.lifecycle as lifecycle_cli
+    import agent_run.adapters.remote as remote_effects
+    from agent_run.model import HostObservation
+    from agent_run.errors import KernelError
+    from agent_run.cli.main import main
 
     with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, execution, base, _calls):
         operations = CoreOperations(kernel, execution, _make_ports)
@@ -651,9 +659,9 @@ def test_public_queries_show_the_recorded_pending_abandonment_instead_of_new_bus
     git_repo: Path, tmp_path: Path, monkeypatch, capsys,
 ) -> None:
     import json
-    from agent_run_kernel.effects import LocalGit
-    from agent_run_kernel.local_effects import LocalEffects
-    from agent_run_kernel.query_cli import main
+    from agent_run.adapters.git_objects import LocalGit
+    from agent_run.adapters.local_git import LocalEffects
+    from agent_run.cli.main import main
 
     with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, _execution, _world, _calls):
         with kernel.storage.transaction(write=False) as tx:
@@ -680,8 +688,8 @@ def test_public_abandon_uses_the_original_ready_host_without_a_second_launch(
     git_repo: Path, tmp_path: Path, monkeypatch, capsys,
 ) -> None:
     import json
-    from agent_run_kernel import lifecycle_cli
-    from agent_run_kernel.query_cli import main
+    import agent_run.cli.lifecycle as lifecycle_cli
+    from agent_run.cli.main import main
 
     with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, _execution, _world, calls):
         monkeypatch.setattr(lifecycle_cli, "submit", lambda *_a, **_kw: pytest.fail("A ready original Host must not be replaced"))
@@ -701,10 +709,10 @@ def test_public_idle_abandon_records_the_exact_initial_or_continuation_host_inte
     git_repo: Path, tmp_path: Path, monkeypatch, capsys, continuation: bool,
 ) -> None:
     import json
-    from agent_run_kernel import lifecycle_cli
-    from agent_run_kernel.effects import LocalGit
-    from agent_run_kernel.local_effects import LocalEffects
-    from agent_run_kernel.query_cli import main
+    import agent_run.cli.lifecycle as lifecycle_cli
+    from agent_run.adapters.git_objects import LocalGit
+    from agent_run.adapters.local_git import LocalEffects
+    from agent_run.cli.main import main
 
     with _running_public_parent(git_repo, tmp_path, monkeypatch, admit=False) as (kernel, _request, _execution, _world, _calls):
         if continuation:

@@ -1,6 +1,6 @@
 """Each current object keeps its notification slot beyond the ordinary queue."""
-from agent_run import notification_outbox as outbox
-from agent_run_kernel.notifications import NativeNotifications
+import agent_run.storage.notification_outbox as outbox
+from agent_run.notifications.sender import NativeNotifications
 from test_kernel_notifications import _kernel
 
 

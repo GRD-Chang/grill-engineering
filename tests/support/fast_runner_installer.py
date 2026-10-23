@@ -24,7 +24,7 @@ if __name__ == "__main__":
     sys.dont_write_bytecode = True
     sys.path.insert(0, str(PACKAGE_SOURCE))
 
-from agent_run import runner_installer  # noqa: E402
+import agent_run.install.installer as runner_installer  # noqa: E402
 
 
 def build_candidate(candidate: Path, source: Path) -> tuple[str, str]:
@@ -38,7 +38,7 @@ def build_candidate(candidate: Path, source: Path) -> tuple[str, str]:
     site_packages = candidate / "lib" / f"python{python_version}" / "site-packages"
     package = site_packages / "agent_run"
     site_packages.mkdir(parents=True, exist_ok=True)
-    for name in ("agent_run", "agent_run_kernel"):
+    for name in ("agent_run",):
         shutil.copytree(
             source / "src" / name,
             site_packages / name,
@@ -47,9 +47,7 @@ def build_candidate(candidate: Path, source: Path) -> tuple[str, str]:
 
     entry = candidate / "bin" / "agent-run"
     entry.write_text(
-        f"#!{candidate / 'bin' / 'python'}\n"
-        "from agent_run_kernel.query_cli import main\n"
-        "raise SystemExit(main())\n",
+        f"#!{candidate / 'bin' / 'python'}\nfrom agent_run.cli.main import main\nraise SystemExit(main())\n",
         encoding="utf-8",
     )
     entry.chmod(0o755)

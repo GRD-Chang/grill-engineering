@@ -60,8 +60,8 @@ import agent_run.cli as cli
 import agent_run.executor as executor
 from agent_run.codex import _worker_hidden_paths
 from agent_run.executor_exit import CREDENTIAL
-from agent_run.worker_sandbox import bubblewrap_command, worker_environment
-from agent_run.sqlite_runtime import require_wal_runtime
+from agent_run.runtime.sandbox import bubblewrap_command, worker_environment
+from agent_run.storage.sqlite_runtime import require_wal_runtime
 require_wal_runtime()
 with closing(sqlite3.connect(':memory:')):
     pass

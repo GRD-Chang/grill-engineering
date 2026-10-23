@@ -7,14 +7,14 @@ import subprocess
 
 import pytest
 
-from agent_run.git_errors import GitError
-from agent_run.git_output import run_git
+from agent_run.errors import GitError
+from agent_run.runtime.git_command import run_git
 
 
 def test_git_reads_ignore_inherited_shallow_file_but_keep_repository_boundary(
     git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from agent_run.git_output import run_git
+    from agent_run.runtime.git_command import run_git
 
     def raw_git(*arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -48,7 +48,7 @@ def test_git_reads_ignore_inherited_shallow_file_but_keep_repository_boundary(
 def test_git_dispatch_honors_path_changes_after_cached_resolution(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from agent_run.git_output import run_git
+    from agent_run.runtime.git_command import run_git
 
     original_path = os.environ.get("PATH", "")
     for marker in ("first", "second"):
@@ -85,7 +85,7 @@ def test_failing_hook_keeps_only_bounded_error_tail(git_repo: Path, megabytes: i
 
 
 def test_both_git_pipes_are_drained_with_bounded_buffers(git_repo: Path, monkeypatch) -> None:
-    from agent_run import git_output
+    import agent_run.runtime.git_command as git_output
 
     buffers = []
 
@@ -99,7 +99,7 @@ def test_both_git_pipes_are_drained_with_bounded_buffers(git_repo: Path, monkeyp
             super().extend(value)
             self.maximum = max(self.maximum, len(self))
 
-    from agent_run import _process_io
+    import agent_run.runtime.process_io as _process_io
 
     monkeypatch.setattr(_process_io, "bytearray", MeasuredBuffer, raising=False)
     program = git_repo / "noisy.py"
@@ -117,7 +117,7 @@ def test_both_git_pipes_are_drained_with_bounded_buffers(git_repo: Path, monkeyp
 
 
 def test_git_reader_reaps_process_on_read_failure(git_repo: Path, monkeypatch) -> None:
-    from agent_run import git_output
+    import agent_run.runtime.git_command as git_output
 
     processes = []
     real_popen = git_output.subprocess.Popen
@@ -179,7 +179,7 @@ def test_git_stdin_and_both_outputs_make_progress_before_deadline(git_repo: Path
 
 
 def test_git_deadline_retains_diagnostics_and_reaps_child(git_repo: Path, monkeypatch) -> None:
-    from agent_run import git_output
+    import agent_run.runtime.git_command as git_output
 
     processes = []
     real_popen = subprocess.Popen
@@ -206,7 +206,7 @@ def test_git_deadline_retains_diagnostics_and_reaps_child(git_repo: Path, monkey
 
 
 def test_selector_creation_failure_reaps_git(git_repo: Path, monkeypatch) -> None:
-    from agent_run import git_output
+    import agent_run.runtime.git_command as git_output
 
     processes = []
     real_popen = git_output.subprocess.Popen
@@ -220,7 +220,7 @@ def test_selector_creation_failure_reaps_git(git_repo: Path, monkeypatch) -> Non
         raise OSError("injected selector failure")
 
     monkeypatch.setattr(git_output.subprocess, "Popen", start)
-    from agent_run import _process_io
+    import agent_run.runtime.process_io as _process_io
 
     monkeypatch.setattr(_process_io.selectors, "DefaultSelector", failed_selector)
     with pytest.raises(OSError, match="selector failure"):

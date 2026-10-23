@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 
 from support.core_operations import CoreOperations, scripted_return, final_scenario
-from agent_run_kernel import AgentCall, DeliveryKind, Policy, Role, Step
-from agent_run_kernel.model import wire_json
+from agent_run.model import AgentCall, DeliveryKind, Policy, Role, Step
+from agent_run.model import wire_json
 from support.offline import Scenario, review_result
 
 

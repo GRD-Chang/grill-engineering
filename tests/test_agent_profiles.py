@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-from agent_run.agent_profiles import resolve_profiles
+from agent_run.contracts.agent_profiles import resolve_profiles
 
 
 def test_preset_resolution_respects_publication_defaults_and_overrides() -> None:

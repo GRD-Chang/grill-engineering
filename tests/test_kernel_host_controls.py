@@ -5,10 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel import DeliveryKind, KernelError, Policy
-from agent_run_kernel.model import Execution, HostObservation
+from agent_run.model import DeliveryKind, Policy
+from agent_run.errors import KernelError
+from agent_run.model import Execution, HostObservation
 from support.offline import GraphScenario, Scenario
-from agent_run_kernel.model import Issue, ParentIssue, Requirements
+from agent_run.model import Issue, ParentIssue, Requirements
 from support.core_operations import CoreOperations
 
 

@@ -6,12 +6,13 @@ import sys
 
 import pytest
 
-from agent_run import prompt_resources
-from agent_run.messages import error_message, selected_language
-from agent_run.runner_probe import RunnerProbeBackend, RunnerProbeError
-from agent_run.user_defaults import UserDefaultsStore
-from agent_run_kernel.query import read
-from agent_run_kernel.query_cli import main
+import agent_run.config.resources as prompt_resources
+from agent_run.errors import error_message
+from agent_run.contracts.copy import selected_language
+from agent_run.install.probe import RunnerProbeBackend, RunnerProbeError
+from agent_run.config.defaults import UserDefaultsStore
+from agent_run.queries.run import read
+from agent_run.cli.main import main
 from test_kernel_query_cli import _create
 
 
@@ -71,9 +72,10 @@ def test_install_probe_selects_personal_language_from_the_candidate_package(tmp_
     candidate = tmp_path / 'candidate'
     package = candidate / 'lib/python3.11/site-packages/agent_run'
     package.mkdir(parents=True)
-    for module in Path(prompt_resources.__file__).parent.glob('prompt_text_*.py'):
-        shutil.copyfile(module, package / module.name)
-    context = package / 'prompt_text_context.py'
+    for module in (Path(prompt_resources.__file__).resolve().parents[1] / 'contracts').glob('text_*.py'):
+        (package / 'contracts').mkdir(exist_ok=True)
+        shutil.copyfile(module, package / 'contracts' / module.name)
+    context = package / 'contracts/text_context.py'
     with context.open('a', encoding='utf-8') as stream:
         stream.write('\nTEXTS["context/probe"]["en"] += "\\ncandidate-probe-en"\n'
                      'TEXTS["context/probe"]["zh"] += "\\ncandidate-probe-zh"\n')

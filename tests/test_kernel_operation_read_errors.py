@@ -1,5 +1,5 @@
 """Physical read outages become Core waits without importing concrete adapters."""
-from agent_run_kernel.operation_runner import OperationRunner
+from agent_run.core.operation_runner import OperationRunner
 import os
 from pathlib import Path
 import subprocess
@@ -7,20 +7,20 @@ import sys
 
 import pytest
 
-from agent_run_kernel import Kernel
-from agent_run_kernel.model import ReadWait
+from agent_run.core.kernel import Kernel
+from agent_run.model import ReadWait
 from test_kernel_operation_runner import setup
 
 
 def test_cold_github_import_does_not_cycle_through_operation_runner():
     source = str(Path(__file__).resolve().parents[1] / "src")
-    result = subprocess.run([sys.executable, "-c", "import agent_run.github; from agent_run_kernel.operation_runner import OperationRunner"],
+    result = subprocess.run([sys.executable, "-c", 'import agent_run.adapters.github; from agent_run.core.operation_runner import OperationRunner'],
         env={**os.environ, "PYTHONPATH": source}, text=True, capture_output=True, timeout=15)
     assert result.returncode == 0, result.stderr
 
 
 def test_bootstrap_read_outage_retains_original_wait_and_lease(tmp_path):
-    from agent_run_kernel.operation_runner import ReadUnavailable
+    from agent_run.core.operation_contract import ReadUnavailable
     s, ports, runner = setup(tmp_path, dependent=True)
     for _ in range(12):
         step = runner.run_once()
@@ -56,7 +56,7 @@ def test_bootstrap_read_outage_retains_original_wait_and_lease(tmp_path):
 
 
 def test_source_read_window_survives_stop_and_a_proven_executor_handoff(tmp_path):
-    from agent_run_kernel.operation_runner import ReadUnavailable
+    from agent_run.core.operation_contract import ReadUnavailable
 
     s, ports, runner = setup(tmp_path)
     now = [100.25]
@@ -88,7 +88,7 @@ def test_source_read_window_survives_stop_and_a_proven_executor_handoff(tmp_path
 
 @pytest.mark.parametrize("physical_read", ["source", "delivery"])
 def test_slow_successful_read_cannot_allocate_past_the_original_wait_deadline(tmp_path, physical_read):
-    from agent_run_kernel.operation_runner import ReadUnavailable
+    from agent_run.core.operation_contract import ReadUnavailable
 
     s, ports, runner = setup(tmp_path)
     now = [100.25]

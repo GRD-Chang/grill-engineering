@@ -8,10 +8,10 @@ from pathlib import Path
 import subprocess
 import sys
 
-from agent_run.managed_workspace import ManagedWorkspace, normalize_repository, read_git_identity
-from agent_run.messages import error_message
-from agent_run.paths import app_data_root
-from agent_run.process_cleanup import terminate_process_group
+from agent_run.adapters.workspace import ManagedWorkspace, normalize_repository, read_git_identity
+from agent_run.errors import error_message
+from agent_run.config.paths import app_data_root
+from agent_run.runtime.process_cleanup import terminate_process_group
 
 
 def managed_workspace(
@@ -63,10 +63,7 @@ def prepare_workspace(
         environment = {**os.environ, **extra_env}
         environment["PYTHONPATH"] = os.pathsep.join(filter(None, (source, environment.get("PYTHONPATH"))))
         command = [sys.executable, "-c",
-                   "import sys; from pathlib import Path; "
-                   "from agent_run.managed_workspace import ManagedWorkspace, read_git_identity; "
-                   "repo = Path(sys.argv[2]); "
-                   "ManagedWorkspace.for_repository(sys.argv[1]).ensure_path(remote_url=str(repo), identity=read_git_identity(repo))",
+                   'import sys; from pathlib import Path; from agent_run.adapters.workspace import ManagedWorkspace, read_git_identity; repo = Path(sys.argv[2]); ManagedWorkspace.for_repository(sys.argv[1]).ensure_path(remote_url=str(repo), identity=read_git_identity(repo))',
                    workspace.repository, str(repo)]
         process = subprocess.Popen(
             command, cwd=repo, env=environment, stdout=subprocess.PIPE,

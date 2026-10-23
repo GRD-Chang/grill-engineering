@@ -7,13 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.runner_lease import (
-    RunnerLeaseBusy,
-    RunnerLeaseError,
-    retain_lease_for_systemd_exit,
-    runner_management_lease,
-    runner_usage_lease,
-)
+from agent_run.runtime.package_lease import RunnerLeaseBusy, RunnerLeaseError, retain_lease_for_systemd_exit, runner_management_lease, runner_usage_lease
 
 
 def test_multiple_tasks_hold_shared_usage_lease_and_management_fails_fast(
@@ -35,7 +29,7 @@ def test_process_exit_releases_usage_lease_to_the_operating_system(
     script = """
 import os
 from pathlib import Path
-from agent_run.runner_lease import runner_usage_lease
+from agent_run.runtime.package_lease import runner_usage_lease
 with runner_usage_lease(Path(os.environ['LEASE_PATH'])):
     os.write(int(os.environ['READY_FD']), b'1')
     os.read(int(os.environ['RELEASE_FD']), 1)

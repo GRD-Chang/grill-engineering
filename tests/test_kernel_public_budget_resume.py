@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-from agent_run_kernel import Kernel
+from agent_run.core.kernel import Kernel
 from tests.test_kernel_managed_entry_end_to_end import (
     _CODEX, _approval_read_barrier, _control_environment, _git, _local_manager,
 )
@@ -23,33 +23,7 @@ FINDING = "The compatibility evidence file must document the exact supported inp
 def _checkpoint_read_hook(directory: Path, address: str, ready: Path) -> Path:
     """Install only a child-process read barrier; public CLI and Workers bypass it."""
     directory.mkdir()
-    (directory / "sitecustomize.py").write_text(f'''import os, sys
-if '--database' in sys.argv and os.environ.get('ENTRY_BUDGET_CONTROL'):
-    import socket, time
-    from pathlib import Path
-    from agent_run_kernel.operation_runner import OperationRunner
-    original_state = OperationRunner.state
-    selected = Path(sys.argv[sys.argv.index('--database') + 1])
-    reached = False
-    def state(self):
-        global reached
-        if self.kernel.storage.path == selected and not reached:
-            with self.kernel.storage.transaction(write=False) as tx:
-                checkpoint = tx.rows("SELECT subject FROM gates WHERE subject='parent:1' AND code='review_budget_exhausted'")
-            if checkpoint:
-                reached = True
-                deadline = time.monotonic() + 15
-                while not Path({str(ready)!r}).exists():
-                    assert time.monotonic() < deadline, 'The checkpoint observer was not ready'
-                    time.sleep(0.01)
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
-                    channel.settimeout(25)
-                    channel.connect(chr(0) + {address!r}[1:])
-                    channel.sendall(b'1'); channel.shutdown(socket.SHUT_WR)
-                    assert channel.recv(1) == b'1'
-        return original_state(self)
-    OperationRunner.state = state
-''')
+    (directory / "sitecustomize.py").write_text(f"""import os, sys\nif '--database' in sys.argv and os.environ.get('ENTRY_BUDGET_CONTROL'):\n    import socket, time\n    from pathlib import Path\n    from agent_run.core.operation_runner import OperationRunner\n    original_state = OperationRunner.state\n    selected = Path(sys.argv[sys.argv.index('--database') + 1])\n    reached = False\n    def state(self):\n        global reached\n        if self.kernel.storage.path == selected and not reached:\n            with self.kernel.storage.transaction(write=False) as tx:\n                checkpoint = tx.rows("SELECT subject FROM gates WHERE subject='parent:1' AND code='review_budget_exhausted'")\n            if checkpoint:\n                reached = True\n                deadline = time.monotonic() + 15\n                while not Path({str(ready)!r}).exists():\n                    assert time.monotonic() < deadline, 'The checkpoint observer was not ready'\n                    time.sleep(0.01)\n                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:\n                    channel.settimeout(25)\n                    channel.connect(chr(0) + {address!r}[1:])\n                    channel.sendall(b'1'); channel.shutdown(socket.SHUT_WR)\n                    assert channel.recv(1) == b'1'\n        return original_state(self)\n    OperationRunner.state = state\n""")
     return directory
 
 
@@ -91,7 +65,7 @@ if role == 'development':
                 environment["PATH"] = str(Path(manager.systemctl).parent) + os.pathsep + environment["PATH"]
 
                 def public(*arguments: str):
-                    result = subprocess.run([sys.executable, "-m", "agent_run_kernel", *arguments,
+                    result = subprocess.run([sys.executable, "-m", 'agent_run', *arguments,
                         "--repo", "example/project", "--json"], cwd=git_repo, env=environment,
                         text=True, capture_output=True, timeout=min(20, max(0.1, deadline - time.monotonic())))
                     assert result.returncode == 0, (result.stdout, result.stderr)

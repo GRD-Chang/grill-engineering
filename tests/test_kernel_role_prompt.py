@@ -9,13 +9,15 @@ import pytest
 
 from dataclasses import replace
 
-from agent_run.prompt_resources import builtin_resources, personal_method_directory
-from agent_run.user_defaults import UserDefaultsStore
-from agent_run_kernel import AgentCall, Commit, Delivery, DeliveryKind, Kernel, KernelError, Role, RunSpec
-from agent_run_kernel.codex_execution import execute_codex
-from agent_run_kernel.configuration import freeze_creation
+from agent_run.config.resources import builtin_resources, personal_method_directory
+from agent_run.config.defaults import UserDefaultsStore
+from agent_run.model import AgentCall, Commit, Delivery, DeliveryKind, Role, RunSpec
+from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
+from agent_run.runtime.codex import execute_codex
+from agent_run.config.creation import freeze_creation
 from support.offline import Scenario, review_result
-from agent_run_kernel.role_prompt import render_role_prompt
+from agent_run.core.prompts.role import render_role_prompt
 from support.core_operations import CoreOperations, native_agent_fixture, scripted_return, final_scenario
 
 

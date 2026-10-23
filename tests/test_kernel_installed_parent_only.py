@@ -8,8 +8,9 @@ import subprocess
 import sys
 import time
 
-from agent_run.runner_lease import default_runner_lock_path, runner_management_lease
-from agent_run_kernel import Kernel, lifecycle_cli
+from agent_run.runtime.package_lease import default_runner_lock_path, runner_management_lease
+import agent_run.cli.lifecycle as lifecycle_cli
+from agent_run.core.kernel import Kernel
 from tests.test_kernel_managed_entry_end_to_end import (
     _CODEX, _approval_read_barrier, _control_environment, _git, _local_manager,
     _hold_host_operation_return,
@@ -43,7 +44,7 @@ def test_installed_public_parent_only_reaches_approval_close_cleanup_and_normal_
                 return max(0.01, deadline - time.monotonic())
 
             def public(*arguments):
-                result = subprocess.run([sys.executable, "-m", "agent_run_kernel", *arguments,
+                result = subprocess.run([sys.executable, "-m", 'agent_run', *arguments,
                     "--repo", "example/project", "--json"], cwd=git_repo, env=environment,
                     text=True, capture_output=True, timeout=min(20, remaining()))
                 assert result.returncode == 0, (result.stdout, result.stderr)
@@ -56,7 +57,7 @@ def test_installed_public_parent_only_reaches_approval_close_cleanup_and_normal_
                 accepted = public("run", "1", "--no-notifications")
                 assert accepted["result"] == "accepted"
                 command = commands[0]
-                assert command[command.index("-m") + 1] == "agent_run_kernel.executor"
+                assert command[command.index("-m") + 1] == 'agent_run.runtime.executor'
                 kernel = Kernel(Path(command[command.index("--database") + 1]))
                 databases.append(kernel)
                 # Only the original Host's actual external reads wait here.

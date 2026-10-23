@@ -1,5 +1,5 @@
 """The live Worker JSONL buffer retains thread/error evidence within its byte cap."""
-from agent_run.worker_sandbox import _BoundedJsonlStream
+from agent_run.runtime.sandbox import _BoundedJsonlStream
 
 
 def test_jsonl_stream_uses_fixed_chunks_and_keeps_thread_and_error_tail() -> None:

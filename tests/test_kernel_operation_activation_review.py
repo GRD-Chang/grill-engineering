@@ -6,11 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_run_kernel.model import EffectResult, Execution, HostObservation
-from agent_run_kernel import DeliveryKind, Policy
-from agent_run_kernel import executor
+from agent_run.model import EffectResult, Execution, HostObservation
+from agent_run.model import DeliveryKind, Policy
+import agent_run.runtime.executor as executor
 from support.offline import GraphScenario, Scenario
-from agent_run_kernel.operation_runner import ReadUnavailable
+from agent_run.core.operation_contract import ReadUnavailable
 from test_kernel_requirements import independent_source
 from test_kernel_operation_review_host import _NoNotifications
 
@@ -242,8 +242,8 @@ def test_formal_host_readwait_observes_second_before_retrying_first(tmp_path, mo
     monkeypatch.setattr(ports, "reconcile", physical)
     monkeypatch.setattr(ports, "execute", lambda *a: pytest.fail("Host observation grants no write"))
     monkeypatch.setattr(executor, "_make_ports", lambda binding: ports)
-    monkeypatch.setattr("agent_run_kernel.notifications.NativeNotifications", _NoNotifications)
-    monkeypatch.setattr("agent_run_kernel.codex_execution.execute_selected_codex",
+    monkeypatch.setattr('agent_run.notifications.sender.NativeNotifications', _NoNotifications)
+    monkeypatch.setattr('agent_run.runtime.codex.execute_selected_codex',
                         lambda *a, **kw: pytest.fail("Host observation allocates no Agent"))
     assert executor.run(s.kernel, s.execution, {}) == 0
     assert calls == [originals[0]["id"], originals[1]["id"], originals[0]["id"]]
@@ -281,8 +281,8 @@ def test_formal_host_approval_cas_retries_without_consuming_its_observation(tmp_
     monkeypatch.setattr(executor, "_make_ports", lambda binding: ports)
     # Replace only the Host's dependency; subprocess.wait keeps real time.sleep.
     monkeypatch.setattr(executor, "time", SimpleNamespace(sleep=idle))
-    monkeypatch.setattr("agent_run_kernel.notifications.NativeNotifications", _NoNotifications)
-    monkeypatch.setattr("agent_run_kernel.codex_execution.execute_selected_codex",
+    monkeypatch.setattr('agent_run.notifications.sender.NativeNotifications', _NoNotifications)
+    monkeypatch.setattr('agent_run.runtime.codex.execute_selected_codex',
                         lambda *a, **kw: pytest.fail("CAS recovery allocates no Agent"))
     assert executor.run(s.kernel, s.execution, {}) == 0
     assert len(reads) == 2 and len(sleeps) == 1

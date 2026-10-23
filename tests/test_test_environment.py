@@ -49,13 +49,13 @@ def test_pytest_isolates_each_case_and_cli_from_host_state(tmp_path: Path) -> No
     suite.mkdir()
     shutil.copyfile(project / "tests/conftest.py", suite / "conftest.py")
     (suite / "test_isolation.py").write_text(
-        '''import json
+        """import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 import pytest
-from agent_run_kernel.task_location import read_task_bindings
+from agent_run.storage.tasks import read_task_bindings
 from support.environment import _assert_python_and_git_environment
 
 @pytest.mark.parametrize("case", ["first", "second"])
@@ -81,12 +81,13 @@ def test_case(git_repo, tmp_path, monkeypatch, case):
         assert subprocess.check_output(["git", "config", "isolation.injected"], cwd=git_repo, text=True).strip() == case
     assert "GIT_CONFIG_COUNT" not in os.environ
     # Seed through the public native creation API in a real child process.
-    creation = """
+    creation = \"\"\"
 import json, sys
 from pathlib import Path
-from agent_run.managed_workspace import ManagedWorkspace
-from agent_run_kernel import Delivery, DeliveryKind, Kernel, ParentIssue, Requirements, RunSpec
-from agent_run_kernel.effects import LocalGit
+from agent_run.adapters.workspace import ManagedWorkspace
+from agent_run.model import Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
+from agent_run.core.kernel import Kernel
+from agent_run.adapters.git_objects import LocalGit
 repository = Path(sys.argv[1])
 run_id = "isolation-" + sys.argv[2]
 base = LocalGit(repository).commit("HEAD")
@@ -98,7 +99,7 @@ managed = ManagedWorkspace.for_repository(spec.repository)
 Kernel.create_task(managed.state_root / run_id / "kernel.sqlite3", spec,
                    requirements=Requirements(ParentIssue(1, "Parent", "Isolated requirement"), ()))
 print(json.dumps({"run_id": run_id}))
-"""
+\"\"\"
     started = subprocess.run([sys.executable, "-c", creation, str(git_repo), case],
                              cwd=git_repo, text=True, capture_output=True, timeout=20)
     assert started.returncode == 0, started.stderr
@@ -112,7 +113,7 @@ print(json.dumps({"run_id": run_id}))
     (git_repo / "README.md").write_text("changed by this case")
     (git_repo / "previous-case").touch()
     subprocess.run(["git", "config", "user.name", "Changed User"], cwd=git_repo, check=True)
-''',
+""",
         encoding="utf-8",
     )
     environment = os.environ.copy()

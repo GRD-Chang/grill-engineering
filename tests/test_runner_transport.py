@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.github_retry import run_write_command
-from agent_run.runner_transport import runner_git_environment
+from agent_run.adapters.github_commands import run_write_command
+from agent_run.adapters.auth.runner_transport import runner_git_environment
 
 
 def test_pat_git_rewrites_ssh_and_resets_host_helper(
@@ -62,7 +62,7 @@ def test_transport_redacts_failed_and_timed_out_output(
     )
     assert result.returncode == 1
     assert result.stdout == result.stderr == "[REDACTED]\n"
-    monkeypatch.setattr("agent_run.github_retry.READ_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr('agent_run.adapters.github_commands.READ_TIMEOUT_SECONDS', 0.1)
     result = run_write_command(
         [sys.executable, "-c", "import os,time; print(os.environ['GH_TOKEN'], flush=True); time.sleep(5)"],
         runner_identity=identity,
@@ -78,7 +78,7 @@ def test_selected_initial_clone_uses_https_without_host_login(
 ) -> None:
     import shutil
 
-    from agent_run.managed_workspace import ManagedWorkspace
+    from agent_run.adapters.workspace import ManagedWorkspace
 
     real_git = shutil.which("git")
     tools = tmp_path / "tools"
@@ -101,10 +101,10 @@ subprocess.run([{real_git!r}, "config", "remote.origin.url", sys.argv[-2]], cwd=
     workspace = ManagedWorkspace.for_repository("example/project")
     identity = {"source": "pat", "pat": {"env": "RUNNER_PAT"}}
     if source == "app":
-        from agent_run.github_identity import resolve_runner_identity
+        from agent_run.adapters.auth.identity import resolve_runner_identity
         identity = resolve_runner_identity({"runner_source": "app", "app": {
             "app_id": "123", "installation_id": "456", "private_key_path": str(tmp_path / "key")}})
-        monkeypatch.setattr("agent_run.runner_credentials.runner_app_token", lambda _identity: "clone-pat")
+        monkeypatch.setattr('agent_run.adapters.auth.runner_credentials.runner_app_token', lambda _identity: "clone-pat")
     checkout = workspace.ensure_path(runner_identity=identity)
     assert checkout == workspace.repository_root
     call = json.loads(calls.read_text())

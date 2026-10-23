@@ -3,11 +3,13 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel import DeliveryKind, EffectResult, KernelError, Policy
-from agent_run_kernel.model import Execution, HostObservation, Issue, ObservationSuperseded, ParentIssue, Requirements
+from agent_run.model import DeliveryKind, EffectResult, Policy
+from agent_run.errors import KernelError
+from agent_run.model import Execution, HostObservation, Issue, ParentIssue, Requirements
+from agent_run.errors import ObservationSuperseded
 from support.offline import GraphScenario, Scenario
-from agent_run_kernel.query import read
-from agent_run_kernel.operation_runner import ReadUnavailable
+from agent_run.queries.run import read
+from agent_run.core.operation_contract import ReadUnavailable
 
 
 def managed_parent(tmp_path):

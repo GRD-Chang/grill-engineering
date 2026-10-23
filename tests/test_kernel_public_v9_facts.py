@@ -4,14 +4,15 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.prompt_resources import RESOURCE_KEYS
-from agent_run.user_defaults import UserDefaultsStore
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, Policy, RunSpec, Issue, ParentIssue, Requirements
-from agent_run_kernel.configuration import freeze_creation
+from agent_run.contracts.prompt import RESOURCE_KEYS
+from agent_run.config.defaults import UserDefaultsStore
+from agent_run.model import Commit, Delivery, DeliveryKind, Policy, RunSpec, Issue, ParentIssue, Requirements
+from agent_run.core.kernel import Kernel
+from agent_run.config.creation import freeze_creation
 from support.offline import Scenario
-from agent_run_kernel.query import read
-from agent_run_kernel.query_cli import main
-from agent_run_kernel.operation_runner import DeliveryFacts
+from agent_run.queries.run import read
+from agent_run.cli.main import main
+from agent_run.core.operation_contract import DeliveryFacts
 from support.core_operations import CoreOperations, ReadOnlyPorts
 from test_kernel_configuration import _actual_publication_push
 

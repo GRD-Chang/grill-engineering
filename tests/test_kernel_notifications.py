@@ -11,16 +11,17 @@ from typing import Any
 
 import pytest
 
-from agent_run import notification_outbox as outbox
-from agent_run import process_binding
-from agent_run.process_binding import _process_start_token
-from agent_run.prompt_resources import RESOURCE_KEYS
-from agent_run.user_defaults import UserDefaultsStore
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, Issue, ParentIssue, Requirements, RunSpec, World
-from agent_run_kernel.configuration import freeze_creation
-from agent_run_kernel.notifications import NativeNotifications
+import agent_run.storage.notification_outbox as outbox
+import agent_run.runtime.process_identity as process_binding
+from agent_run.runtime.process_identity import _process_start_token
+from agent_run.contracts.prompt import RESOURCE_KEYS
+from agent_run.config.defaults import UserDefaultsStore
+from agent_run.model import Commit, Delivery, DeliveryKind, Issue, ParentIssue, Requirements, RunSpec, World
+from agent_run.core.kernel import Kernel
+from agent_run.config.creation import freeze_creation
+from agent_run.notifications.sender import NativeNotifications
 from support.offline import OfflinePort, Scenario
-from agent_run_kernel.operation_runner import DeliveryFacts
+from agent_run.core.operation_contract import DeliveryFacts
 from support.core_operations import CoreOperations, ReadOnlyPorts
 
 
@@ -64,7 +65,7 @@ def test_native_run_start_is_sent_once_from_the_frozen_run_and_query_does_not_se
         sent.append((rendered["header"]["title"]["content"], key))
         return {"outcome": "success", "reason": None}
 
-    from agent_run_kernel.query import read
+    from agent_run.queries.run import read
     assert read(kernel.storage.path, "status").data["run_id"] == "run-native"
     assert sent == [] and not (tmp_path / "notifications").exists()
     NativeNotifications(kernel.storage.path, tmp_path, transport=fake).close()
@@ -208,7 +209,7 @@ def test_native_pr_creation_requires_consumed_receipt_and_does_not_repeat_for_ed
     created = [record for record in records if record["kind"] == "pr_created"]
     assert len(created) == (1 if mode == "detailed" else 0)
     if created:
-        from agent_run.notification_event_facts import _identity
+        from agent_run.notifications.envelope import _identity
         assert created[0]["id"] == _identity(scenario.spec.run_id, "pr_created", pr.number)
         rendered = next(card for card, _key in sent
                         if f"#{pr.number}" in card["header"]["title"]["content"])
@@ -267,7 +268,7 @@ def test_native_first_worker_event_uses_committed_start_once(tmp_path: Path) -> 
     NativeNotifications(kernel.storage.path, tmp_path, transport=fake).close()
     records = outbox.read_notifications(tmp_path, "run-native")["records"]
     assert {record["kind"] for record in records} == {"run_start", "ticket_started"}
-    from agent_run.notification_event_facts import _identity
+    from agent_run.notifications.envelope import _identity
     assert next(record for record in records if record["kind"] == "ticket_started")["id"] == (
         _identity("run-native", "ticket_started", "ticket:2"))
     assert len(sent) == 2
@@ -471,7 +472,7 @@ def test_gate_batch_wakes_a_parked_sender_without_close(tmp_path: Path) -> None:
 
 
 def test_accumulated_gate_history_continues_within_each_read_budget(tmp_path: Path, monkeypatch) -> None:
-    from agent_run_kernel import storage
+    import agent_run.storage.sqlite as storage
 
     kernel = _kernel(tmp_path)
     for index in range(200):

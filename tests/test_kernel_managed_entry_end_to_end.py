@@ -21,10 +21,10 @@ import time
 
 import pytest
 
-from agent_run.paths import app_data_root
-from agent_run.runner_lease import RunnerLeaseBusy, default_runner_lock_path, runner_management_lease
-from agent_run.user_defaults import UserDefaultsStore
-from agent_run_kernel import Kernel
+from agent_run.config.paths import app_data_root
+from agent_run.runtime.package_lease import RunnerLeaseBusy, default_runner_lock_path, runner_management_lease
+from agent_run.config.defaults import UserDefaultsStore
+from agent_run.core.kernel import Kernel
 from tests.test_kernel_host_adapter import controlled_manager
 from tests.test_kernel_remote_effects import FAKE_GH
 from support.worker_process_timing import wait_until
@@ -223,7 +223,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
 def test_public_run_reaches_ticket_close_through_managed_host_after_lost_merge_reply(
     git_repo: Path, tmp_path: Path, monkeypatch,
 ) -> None:
-    from agent_run_kernel import lifecycle_cli
+    import agent_run.cli.lifecycle as lifecycle_cli
 
     remote = tmp_path / "origin.git"
     _git(git_repo, "init", "--bare", "--initial-branch=main", str(remote))
@@ -261,13 +261,13 @@ if '--hostname' in sys.argv:
     defaults.configure(language="en", profile={"preset": "economy"})
     active = app_data_root() / "active" / "current"
     active.parent.mkdir(parents=True)
-    active.symlink_to(Path(lifecycle_cli.__file__).resolve().parents[2], target_is_directory=True)
+    active.symlink_to(Path(lifecycle_cli.__file__).resolve().parents[3], target_is_directory=True)
     environment = dict(os.environ)
     with _local_manager(tmp_path / "manager", environment) as (manager, serving, errors, children, trace, commands, output):
         monkeypatch.setenv("PATH", str(Path(manager.systemctl).parent) + os.pathsep + environment["PATH"])
         # The same sealed terminal PATH must reach both the CLI and the Host.
         environment["PATH"] = os.environ["PATH"]
-        result = subprocess.run([sys.executable, "-m", "agent_run_kernel", "run", "1", "--repo", "example/project",
+        result = subprocess.run([sys.executable, "-m", 'agent_run', "run", "1", "--repo", "example/project",
                                  "--no-notifications", "--json"], cwd=git_repo, env=environment,
                                 text=True, capture_output=True, timeout=30)
         assert result.returncode == 0, (result.stdout, result.stderr)
@@ -278,7 +278,7 @@ if '--hostname' in sys.argv:
         assert len(children) == len(commands) == 1 and children[0].returncode == 0, output
         assert trace == ["fdstore", "barrier", "host_exited", "store_closed"]
         command = commands[0]
-        assert command[command.index("-m") + 1] == "agent_run_kernel.executor"
+        assert command[command.index("-m") + 1] == 'agent_run.runtime.executor'
         database = Path(command[command.index("--database") + 1])
         kernel = Kernel(database)
         assert kernel.status("ticket:2")["phase"] == "complete"
@@ -392,7 +392,7 @@ def _worker_controls(directory: Path):
 
 def _control_environment(git_repo: Path, directory: Path, monkeypatch, *, codex: str,
                          tickets: tuple[int, ...] = (2, 3)) -> tuple[dict[str, str], Path]:
-    from agent_run_kernel import lifecycle_cli
+    import agent_run.cli.lifecycle as lifecycle_cli
     remote = directory / "origin.git"
     _git(git_repo, "init", "--bare", "--initial-branch=main", str(remote))
     _git(remote, "config", "gc.auto", "0")
@@ -485,7 +485,7 @@ if os.environ.get('ENTRY_APPROVAL_CONTROL') and sys.argv[1:3] == ['api', 'graphq
     UserDefaultsStore().configure(language="en", profile={"preset": "economy"}, policy={"ticket_development_workers": 2})
     active = app_data_root() / "active" / "current"
     active.parent.mkdir(parents=True)
-    active.symlink_to(Path(lifecycle_cli.__file__).resolve().parents[2], target_is_directory=True)
+    active.symlink_to(Path(lifecycle_cli.__file__).resolve().parents[3], target_is_directory=True)
     return dict(os.environ), state
 
 
@@ -523,7 +523,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
             def remaining():
                 return max(0.01, supervision_deadline - time.monotonic())
             def public(*arguments: str):
-                result = subprocess.run([sys.executable, "-m", "agent_run_kernel", *arguments, "--repo", "example/project", "--json"],
+                result = subprocess.run([sys.executable, "-m", 'agent_run', *arguments, "--repo", "example/project", "--json"],
                     cwd=git_repo, env=environment, text=True, capture_output=True, timeout=min(20, remaining()))
                 return result.returncode, json.loads(result.stdout)
             code, accepted = public("run", "1", "--no-notifications")
@@ -542,7 +542,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                     return dict(row) if row["backend_id"] else None
             original = wait_until(original_thread, timeout=min(10, remaining()))
             def sibling_running():
-                from agent_run.process_binding import _process_start_token
+                from agent_run.runtime.process_identity import _process_start_token
                 with kernel.storage.transaction(write=False) as tx:
                     row = tx.one("SELECT l.id,l.invocation,o.process_identity,o.dispatch_state,o.exit_code FROM leases l "
                         "JOIN invocation_outputs o ON o.lease=l.id WHERE l.subject='ticket:3'")
@@ -689,10 +689,10 @@ def _hold_host_operation_return(directory: Path, monkeypatch: pytest.MonkeyPatch
     """
     hook = directory / "host-return-hook"
     hook.mkdir()
-    (hook / "sitecustomize.py").write_text('''import os, sys
-if sys.orig_argv[1:3] == ["-m", "agent_run_kernel.executor"]:
+    (hook / "sitecustomize.py").write_text("""import os, sys
+if sys.orig_argv[1:3] == ["-m", 'agent_run.runtime.executor']:
     import socket
-    from agent_run_kernel.operation_runner import OperationRunner
+    from agent_run.core.operation_runner import OperationRunner
     original_run_once = OperationRunner.run_once
     def observe_return(self, *, agent_capacity=1):
         step = original_run_once(self, agent_capacity=agent_capacity)
@@ -705,7 +705,7 @@ if sys.orig_argv[1:3] == ["-m", "agent_run_kernel.executor"]:
                 assert channel.recv(1) == b"1"
         return step
     OperationRunner.run_once = observe_return
-''')
+""")
     monkeypatch.setenv("PYTHONPATH", str(hook) + os.pathsep + os.environ.get("PYTHONPATH", ""))
 
 
@@ -741,7 +741,7 @@ if role == 'development':
             try:
                 environment["PATH"] = str(Path(manager.systemctl).parent) + os.pathsep + environment["PATH"]
                 def public(*arguments: str):
-                    result = subprocess.run([sys.executable, "-m", "agent_run_kernel", *arguments, "--repo", "example/project", "--json"],
+                    result = subprocess.run([sys.executable, "-m", 'agent_run', *arguments, "--repo", "example/project", "--json"],
                         cwd=git_repo, env=environment, text=True, capture_output=True, timeout=20)
                     return result.returncode, json.loads(result.stdout)
                 preparation_started = time.monotonic()
@@ -866,7 +866,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                 return max(0.01, deadline - time.monotonic())
 
             def public(*arguments):
-                result = subprocess.run([sys.executable, "-m", "agent_run_kernel", *arguments,
+                result = subprocess.run([sys.executable, "-m", 'agent_run', *arguments,
                     "--repo", "example/project", "--json"], cwd=git_repo, env=environment,
                     text=True, capture_output=True, timeout=min(20, remaining()))
                 return result.returncode, json.loads(result.stdout)

@@ -56,7 +56,7 @@ print(json.dumps({'before': before, 'after': after, 'probes': probes,
                   'query_code': code, 'query_stdout': stream.getvalue()}))
 '''
 
-NATIVE_TRANSITIONS = NATIVE_PREFIX + r'''
+NATIVE_TRANSITIONS = NATIVE_PREFIX + """
 from support.offline import _physical_read
 later_payload = payload.pop('_later')
 
@@ -86,22 +86,22 @@ now[0] = 105.25
 later_steps = boundary(initial=False)
 after = snapshot()
 import subprocess
-restart_program = """import json, sys
+restart_program = \"\"\"import json, sys
 from pathlib import Path
-from agent_run_kernel import Kernel
+from agent_run.core.kernel import Kernel
 request = json.load(sys.stdin)
 kernel = Kernel(Path(request['path']))
 status = kernel.status(request['subject'])
 with kernel.storage.transaction(write=False) as tx:
     windows = [dict(row) for row in tx.all('SELECT * FROM waits')]
 print(json.dumps({'status': status, 'windows': windows}))
-"""
+\"\"\"
 restarted_process = subprocess.run([sys.executable, '-B', '-c', restart_program],
     input=json.dumps({'path': str(s.kernel.storage.path), 'subject': s.delivery.key}),
     text=True, capture_output=True, timeout=10)
 assert restarted_process.returncode == 0, restarted_process.stdout + restarted_process.stderr
 restarted = json.loads(restarted_process.stdout)
-from agent_run_kernel import query as query_clock
+import agent_run.queries.run as query_clock
 query_clock.time.time = lambda: now[0]
 qio = io.StringIO()
 with contextlib.redirect_stdout(qio):
@@ -118,7 +118,7 @@ print(json.dumps({'before': before, 'after': after, 'probes': probes,
                   'initial_steps': initial_steps, 'later_steps': later_steps,
                   'restarted': restarted,
                   'writes': s.port.writes(), 'query_code': code, 'query': json.loads(qio.getvalue())}))
-'''
+"""
 
 
 def check_input(value):
@@ -298,9 +298,9 @@ base_make = s.make_ports''').replace(
     'if request.check_head is not None and facts.pr is not None:',
     'if facts.pr is not None and facts.pr.state == "OPEN":',
 ).replace('expected_head_sha=request.check_head',
-          'expected_head_sha=request.check_head or facts.source.sha') + r'''
+          'expected_head_sha=request.check_head or facts.source.sha') + """
 from support.offline import _physical_read
-from agent_run_kernel.operation_runner import observe_control
+from agent_run.core.operation_runner import observe_control
 after_approval = payload.pop('_after_approval', None)
 
 def boundary():
@@ -337,7 +337,7 @@ status = s.kernel.status(s.delivery.key)
 with s.kernel.storage.transaction(write=False) as tx:
     waits = [dict(r) for r in tx.all('SELECT * FROM waits')]
     grant = tx.one('SELECT grant_id FROM subjects WHERE id=?', (s.delivery.key,))[0]
-from agent_run_kernel import query as query_clock
+import agent_run.queries.run as query_clock
 query_clock.time.time = lambda: now[0]
 qio = io.StringIO()
 with contextlib.redirect_stdout(qio):
@@ -348,7 +348,7 @@ print(json.dumps({'initial_status': initial_status, 'status': status,
     'pr_state': s.port.pr_by_number(status['pr_number']).state,
     'target_sha': s.port.physical.refs()[s.delivery.target_ref], 'initial_base': s.initial.sha,
     'query_code': code, 'query': json.loads(qio.getvalue())}))
-'''
+"""
 
 
 @pytest.mark.parametrize('kind', ['parent', 'final'])
@@ -435,9 +435,9 @@ print(json.dumps({'status': durable['status'], 'checks_evidence': job.get('requi
 NATIVE_AGGREGATION_ACCEPTANCE = NATIVE_PREFIX.replace(
     'observations.append(asdict(checks))',
     'observations.append(asdict(checks))\n            captured_readers.append((reader, pr.number, request.check_head))',
-) + r'''
+) + """
 from support.offline import _physical_read
-from agent_run.github import GitHubReadError
+from agent_run.errors import GitHubReadError
 captured_readers = []
 for _ in range(80):
     step = s.runner().run_once()
@@ -451,7 +451,7 @@ else:
 status = s.kernel.status(s.delivery.key)
 with s.kernel.storage.transaction(write=False) as tx:
     waits = [dict(row) for row in tx.all('SELECT * FROM waits')]
-from agent_run_kernel import query as query_clock
+import agent_run.queries.run as query_clock
 query_clock.time.time = lambda: now[0]
 qio = io.StringIO()
 with contextlib.redirect_stdout(qio):
@@ -484,4 +484,4 @@ print(json.dumps({'status': status, 'after_poll': after_poll, 'status_after_guar
  'guard_error': guard_error, 'guard_restored_result': restored.result,
  'role_calls': [{'role': call['role'], 'purpose': call['purpose']} for call in s.role_calls],
  'writes': s.port.writes(), 'query_code': code, 'query': json.loads(qio.getvalue())}))
-'''
+"""

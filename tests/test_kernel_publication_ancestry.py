@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel import DeliveryKind
+from agent_run.model import DeliveryKind
 from support.offline import Scenario
 
 

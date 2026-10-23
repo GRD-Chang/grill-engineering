@@ -1,5 +1,5 @@
 """Ordinary native resource material retains only its actual owned fields."""
-from agent_run_kernel.model import ResourceInspection, ResourceWitness, inspection_wire, resource_wire
+from agent_run.model import ResourceInspection, ResourceWitness, inspection_wire, resource_wire
 
 
 def test_ordinary_resource_wire_keeps_its_existing_material_shape():

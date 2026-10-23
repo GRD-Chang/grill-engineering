@@ -6,10 +6,11 @@ import sys
 
 import pytest
 
-from agent_run.github import GhGitHubReader
-from agent_run.git_errors import GitHubReadError
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, RunSpec
-from agent_run_kernel.source_reading import read_requirements
+from agent_run.adapters.github import GhGitHubReader
+from agent_run.errors import GitHubReadError
+from agent_run.model import Commit, Delivery, DeliveryKind, RunSpec
+from agent_run.core.kernel import Kernel
+from agent_run.adapters.source import read_requirements
 
 
 def _reader(root: Path, monkeypatch, *, invalid: bool = False) -> tuple[GhGitHubReader, Path]:
@@ -106,7 +107,7 @@ def test_paginated_source_preserves_native_order_text_and_external_blockers(tmp_
 
 
 def test_public_graph_returns_the_canonical_requirement_values(tmp_path: Path, monkeypatch) -> None:
-    from agent_run_kernel.model import Blocker, Issue, ParentIssue
+    from agent_run.model import Blocker, Issue, ParentIssue
     reader, _log = _reader(tmp_path, monkeypatch)
     graph = reader.delivery_graph(1)
     assert isinstance(graph.parent, ParentIssue)
@@ -138,8 +139,8 @@ def test_invalid_native_graph_is_not_replaced_by_empty_requirements(tmp_path: Pa
 
 
 def test_remote_heads_are_independent_of_local_refs_and_missing_is_not_read_failure(tmp_path: Path) -> None:
-    from agent_run_kernel.effects import LocalGit
-    from agent_run_kernel.source_reading import read_remote_heads
+    from agent_run.adapters.git_objects import LocalGit
+    from agent_run.adapters.source import read_remote_heads
     remote = tmp_path / 'origin.git'
     root = tmp_path / 'checkout'
     root.mkdir()
@@ -178,7 +179,7 @@ def test_remote_heads_are_independent_of_local_refs_and_missing_is_not_read_fail
 
 
 def test_pr_observation_preserves_foreign_head_repository_and_original_actor_text(tmp_path: Path, monkeypatch) -> None:
-    from agent_run_kernel.source_reading import read_pull_request_facts
+    from agent_run.adapters.source import read_pull_request_facts
     reader, _log = _reader(tmp_path, monkeypatch)
     observed = read_pull_request_facts(reader, 17)
     assert observed['head']['repo']['full_name'] == 'outside/fork'
@@ -190,7 +191,7 @@ def test_pr_observation_preserves_foreign_head_repository_and_original_actor_tex
 
 @pytest.mark.parametrize('configured', [False, True], ids=['no-configured-checks', 'unreported-required-context'])
 def test_checks_observation_retains_configuration_and_never_invents_none_or_pass(tmp_path: Path, monkeypatch, configured: bool) -> None:
-    from agent_run_kernel.source_reading import read_required_check_facts, normalize_required_checks
+    from agent_run.adapters.source import read_required_check_facts, normalize_required_checks
     reader, _log = _reader(tmp_path, monkeypatch)
     responses = tmp_path / 'responses.json'
     data = json.loads(responses.read_text())
@@ -233,7 +234,7 @@ def test_checks_observation_retains_configuration_and_never_invents_none_or_pass
 
 
 def test_check_head_race_and_malformed_check_output_are_errors_not_empty_success(tmp_path: Path, monkeypatch) -> None:
-    from agent_run_kernel.source_reading import read_required_check_facts
+    from agent_run.adapters.source import read_required_check_facts
     reader, log = _reader(tmp_path, monkeypatch)
     responses = tmp_path / 'responses.json'
     data = json.loads(responses.read_text())
@@ -253,7 +254,7 @@ def test_check_head_race_and_malformed_check_output_are_errors_not_empty_success
 
 @pytest.mark.parametrize('bucket,result', [('pass', 'pass'), ('pending', 'pending'), ('fail', 'fail'), ('new-server-state', 'unknown')])
 def test_check_normalizer_uses_original_required_status_not_cli_exit_or_incidental_checks(tmp_path: Path, monkeypatch, bucket: str, result: str) -> None:
-    from agent_run_kernel.source_reading import read_required_check_facts, normalize_required_checks
+    from agent_run.adapters.source import read_required_check_facts, normalize_required_checks
     reader, _log = _reader(tmp_path, monkeypatch)
     responses = tmp_path / 'responses.json'
     data = json.loads(responses.read_text())
@@ -271,7 +272,7 @@ def test_check_normalizer_uses_original_required_status_not_cli_exit_or_incident
 
 @pytest.mark.parametrize('http_status', [404, 403], ids=['classic-absent-does-not-erase-ruleset', 'permission-error-is-not-absence'])
 def test_classic_protection_absence_and_permission_failure_have_distinct_meanings(tmp_path: Path, monkeypatch, http_status: int) -> None:
-    from agent_run_kernel.source_reading import read_required_check_facts, normalize_required_checks
+    from agent_run.adapters.source import read_required_check_facts, normalize_required_checks
     reader, _log = _reader(tmp_path, monkeypatch)
     responses = tmp_path / 'responses.json'
     data = json.loads(responses.read_text())
@@ -311,7 +312,7 @@ def _failed_job(root: Path, *, logs_http: int = 0) -> None:
 
 
 def test_failed_check_keeps_exact_job_workflow_step_and_original_logs_without_repairability(tmp_path: Path, monkeypatch) -> None:
-    from agent_run_kernel.source_reading import read_required_check_facts, normalize_required_checks
+    from agent_run.adapters.source import read_required_check_facts, normalize_required_checks
     reader, log = _reader(tmp_path, monkeypatch)
     _failed_job(tmp_path)
     policy = tmp_path / 'pyproject.toml'
@@ -333,7 +334,7 @@ def test_failed_check_keeps_exact_job_workflow_step_and_original_logs_without_re
 
 
 def test_unavailable_job_logs_do_not_erase_an_exact_failure_or_become_empty_logs(tmp_path: Path, monkeypatch) -> None:
-    from agent_run_kernel.source_reading import read_required_check_facts, normalize_required_checks
+    from agent_run.adapters.source import read_required_check_facts, normalize_required_checks
     reader, _log = _reader(tmp_path, monkeypatch)
     _failed_job(tmp_path, logs_http=403)
     facts = read_required_check_facts(reader, 17, expected_head_sha='2' * 40)
@@ -345,7 +346,7 @@ def test_unavailable_job_logs_do_not_erase_an_exact_failure_or_become_empty_logs
 
 @pytest.mark.parametrize('damage', ['head', 'job-id', 'not-completed'])
 def test_failed_job_evidence_must_match_the_actual_requested_job_and_head(tmp_path: Path, monkeypatch, damage: str) -> None:
-    from agent_run_kernel.source_reading import read_required_check_facts
+    from agent_run.adapters.source import read_required_check_facts
     reader, _log = _reader(tmp_path, monkeypatch)
     _failed_job(tmp_path)
     responses = tmp_path / 'responses.json'
@@ -363,7 +364,7 @@ def test_failed_job_evidence_must_match_the_actual_requested_job_and_head(tmp_pa
 
 
 def test_non_actions_failure_preserves_the_original_provider_evidence_without_classification(tmp_path: Path, monkeypatch) -> None:
-    from agent_run_kernel.source_reading import read_required_check_facts, normalize_required_checks
+    from agent_run.adapters.source import read_required_check_facts, normalize_required_checks
     reader, log = _reader(tmp_path, monkeypatch)
     responses = tmp_path / 'responses.json'
     data = json.loads(responses.read_text())

@@ -10,8 +10,8 @@ import tarfile
 
 import pytest
 
-from agent_run_kernel.state_preflight import PROTOCOL, UnsupportedState, require_supported_state
-from agent_run_kernel.storage import Storage
+from agent_run.storage.preflight import PROTOCOL, UnsupportedState, require_supported_state
+from agent_run.storage.sqlite import Storage
 from test_kernel_legacy_admission import old_owner, unchanged_v6_source
 
 
@@ -52,15 +52,16 @@ def test_latest_only_refusal_preserves_normal_producer_state_and_wal(
                 assert stream is not None
                 target.write_bytes(stream.read())
     previous = tmp_path / 'previous' / 'kernel.sqlite3'
-    producer = subprocess.run([sys.executable, '-c', '''
+    producer = subprocess.run([sys.executable, '-c', """
 from pathlib import Path
 import sys
-from agent_run_kernel import Commit,Delivery,DeliveryKind,Kernel,Policy,RunSpec
+from agent_run.model import Commit, Delivery, DeliveryKind, Policy, RunSpec
+from agent_run.core.kernel import Kernel
 spec=RunSpec('old-native','example/project',1,'parent','graph',(
     Delivery('parent:1',DeliveryKind.PARENT_ONLY,1,'revision',Commit('base','tree'),
              'refs/heads/parent','refs/heads/main'),),Policy(),language='en')
 Kernel.create(Path(sys.argv[1]),spec)
-''', str(previous)], env={**os.environ, 'PYTHONPATH': str(source / 'project/src'),
+""", str(previous)], env={**os.environ, 'PYTHONPATH': str(source / 'project/src'),
     'PYTHONDONTWRITEBYTECODE': '1'}, capture_output=True, text=True, timeout=20)
     assert producer.returncode == 0, producer.stdout + producer.stderr
     with closing(sqlite3.connect(previous.as_uri() + '?mode=ro', uri=True)) as reader:

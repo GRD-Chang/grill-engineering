@@ -1,13 +1,15 @@
 """Pending requeue reads retain their Action, deadline and write boundaries."""
-from agent_run_kernel.operation_runner import observe_control
+from agent_run.core.operation_runner import observe_control
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from agent_run_kernel import Issue, Kernel, KernelError, ParentIssue, Requirements
+from agent_run.model import Issue, ParentIssue, Requirements
+from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
 from support.offline import GraphScenario
-from agent_run_kernel.operation_runner import ReadUnavailable
+from agent_run.core.operation_contract import ReadUnavailable
 from support.core_operations import CoreOperations, scripted_return
 
 

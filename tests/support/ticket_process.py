@@ -15,18 +15,18 @@ from typing import Any
 
 import pytest
 
-from agent_run.process_cleanup import child_subreaper
+from agent_run.runtime.process_cleanup import child_subreaper
 from support.process_scope import cleanup_owned_process
 
 
-_CHILD_TEST = r'''
+_CHILD_TEST = """
 import importlib, json, os, socket, sys, threading, traceback, warnings
 from pathlib import Path
 result = socket.socket(fileno=int(sys.argv[1]))
 payload = json.loads(sys.stdin.read())
 sys.path[:] = payload['sys_path']
 import pytest
-from agent_run.process_cleanup import child_subreaper, descendant_pids
+from agent_run.runtime.process_cleanup import child_subreaper, descendant_pids
 
 def decode(value):
     if isinstance(value, dict) and value.get('__fixture__') == 'path':
@@ -52,7 +52,7 @@ try:
         alive = [thread.name for thread in threading.enumerate()
                  if thread is not threading.current_thread() and thread.is_alive()]
         assert not alive, f'Ticket test returned with live threads: {alive}'
-        assert not thread_errors, '\n'.join(thread_errors)
+        assert not thread_errors, '\\n'.join(thread_errors)
         for pid in descendant_pids(os.getpid()):
             try:
                 state = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[0]
@@ -62,7 +62,7 @@ try:
 except BaseException:
     error = traceback.format_exc()
     if thread_errors:
-        error += "\nBackground thread errors:\n" + "\n".join(thread_errors)
+        error += "\\nBackground thread errors:\\n" + "\\n".join(thread_errors)
 result.sendall(json.dumps({'error': error}).encode())
 # Forked business descendants can inherit this fd. Shutdown makes the result
 # boundary independent of their exit, so the parent can reap them on failure.
@@ -70,15 +70,15 @@ result.shutdown(socket.SHUT_WR)
 sys.stdout.flush()
 sys.stderr.flush()
 os._exit(1 if error else 0)
-'''
+"""
 
 
-_SUPERVISOR = r'''
+_SUPERVISOR = """
 import ctypes, json, select, signal, socket, subprocess, sys, traceback
 result = socket.socket(fileno=int(sys.argv[1]))
 payload = json.loads(sys.stdin.read())
 sys.path[:] = payload['sys_path']
-from agent_run.process_cleanup import child_subreaper
+from agent_run.runtime.process_cleanup import child_subreaper
 
 # Keep an owner alive independently of the test interpreter. Even a setsid
 # descendant is adopted here if that interpreter exits without reporting.
@@ -119,10 +119,10 @@ with child_subreaper():
         except ValueError:
             reported = {}
         original = reported.get('error') if isinstance(reported, dict) else None
-        outcome = {'error': original + '\nSupervisor receive/exit failed:\n' + failure
+        outcome = {'error': original + '\\nSupervisor receive/exit failed:\\n' + failure
                    if original else failure, 'returncode': 1}
         if response and not original:
-            outcome['error'] += '\nReceived test response:\n' + response.decode(errors='replace')
+            outcome['error'] += '\\nReceived test response:\\n' + response.decode(errors='replace')
     try:
         result.sendall(json.dumps(outcome).encode())
         result.shutdown(socket.SHUT_WR)
@@ -131,7 +131,7 @@ with child_subreaper():
         # before its bounded process-tree cleanup has frozen this supervisor.
         while True:
             signal.pause()
-'''
+"""
 
 
 def _encode(value: Any) -> Any:

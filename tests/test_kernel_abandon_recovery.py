@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel import KernelError
-from agent_run_kernel.model import Effect, EffectResult, Execution, HostObservation
-from agent_run_kernel.query import read
+from agent_run.errors import KernelError
+from agent_run.model import Effect, EffectResult, Execution, HostObservation
+from agent_run.queries.run import read
 from test_kernel_abandon import managed_abandon_scenario
 from support.core_operations import CoreOperations
 

@@ -5,7 +5,7 @@ Its scripts control external outcomes, never internal kernel transitions.
 """
 
 from __future__ import annotations
-from agent_run_kernel.operation_runner import observe_control
+from agent_run.core.operation_runner import observe_control
 
 from dataclasses import asdict, replace
 import json
@@ -14,20 +14,21 @@ import sqlite3
 import subprocess
 from typing import Any, Callable, Mapping, Sequence, TypeVar
 
-from agent_run.agent_profiles import resolve_profiles
-from agent_run.error_safety import bounded_error
-from agent_run.git_errors import GitHubReadError
-from agent_run.prompt_resources import resolve_resources
+from agent_run.contracts.agent_profiles import resolve_profiles
+from agent_run.errors import bounded_error
+from agent_run.errors import GitHubReadError
+from agent_run.config.resources import resolve_resources
 
-from agent_run_kernel.effects import LocalGit
-from agent_run_kernel.local_effects import LocalEffects
-from agent_run_kernel.remote_effects import EffectReadError, RemoteEffects
+from agent_run.adapters.git_objects import LocalGit
+from agent_run.adapters.local_git import LocalEffects
+from agent_run.adapters.remote import EffectReadError, RemoteEffects
 from .offline_api import ExternalObjects, SyntheticGitHub
 from .offline_git import OfflineGit
-from agent_run_kernel.kernel import Kernel
-from agent_run_kernel.operation_runner import DeliveryFacts, DeliveryRead, OperationBinding, OperationPorts, OperationRunner, ReadUnavailable
-from agent_run_kernel.model import (AgentCall, Checks, Commit, CreationInputs, Delivery, DeliveryKind, Effect, EffectResult, Execution,
-                    Issue, KernelError, ParentIssue, Policy, PullRequest, Requirements, ResourceInspection, ResourceWitness, Role, RunSpec, Step, World, wire_json)
+from agent_run.core.kernel import Kernel
+from agent_run.core.operation_contract import DeliveryFacts, DeliveryRead, OperationBinding, OperationPorts, ReadUnavailable
+from agent_run.core.operation_runner import OperationRunner
+from agent_run.model import AgentCall, Checks, Commit, CreationInputs, Delivery, DeliveryKind, Effect, EffectResult, Execution, Issue, ParentIssue, Policy, PullRequest, Requirements, ResourceInspection, ResourceWitness, Role, RunSpec, Step, World, wire_json
+from agent_run.errors import KernelError
 
 
 class LostResponse(OSError):

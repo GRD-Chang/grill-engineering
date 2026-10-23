@@ -4,8 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, RunSpec, World
-from agent_run_kernel.model import EffectResult, Execution, HostLaunch, HostObservation, wire_json
+from agent_run.model import Commit, Delivery, DeliveryKind, Policy, RunSpec, World
+from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
+from agent_run.model import EffectResult, Execution, HostLaunch, HostObservation, wire_json
 from support.offline import Scenario
 from support.core_operations import CoreOperations, ReadOnlyPorts, native_agent_fixture, final_scenario
 

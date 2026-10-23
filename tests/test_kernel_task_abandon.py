@@ -4,11 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.task_identity import TaskKey
-from agent_run_kernel import Kernel, KernelError
-from agent_run_kernel.model import Execution, HostObservation
+from agent_run.contracts.task import TaskKey
+from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
+from agent_run.model import Execution, HostObservation
 from support.offline import GraphScenario
-from agent_run_kernel.task_location import bind_task, locked_task
+from agent_run.storage.tasks import bind_task, locked_task
 from test_kernel_requirements import independent_source
 from support.core_operations import CoreOperations
 

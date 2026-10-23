@@ -10,10 +10,12 @@ import time
 
 import pytest
 
-from agent_run_kernel.host_adapter import HostUnavailable, SystemdHost
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError
-from agent_run_kernel.model import RunSpec
-from agent_run_kernel.model import HostLaunch
+from agent_run.adapters.systemd import HostUnavailable, SystemdHost
+from agent_run.model import Commit, Delivery, DeliveryKind
+from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
+from agent_run.model import RunSpec
+from agent_run.model import HostLaunch
 
 
 def test_missing_user_manager_refuses_host_readiness(tmp_path: Path) -> None:

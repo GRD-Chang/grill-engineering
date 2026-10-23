@@ -10,14 +10,15 @@ from typing import Any
 
 import pytest
 
-from agent_run import notification_outbox as outbox, notification_transport
-from agent_run.process_binding import _process_start_token
-from agent_run.runner_lease import runner_usage_lease
-from agent_run_kernel.execution import _cgroup
-from agent_run_kernel.host_exit_facts import host_exit_notice
-from agent_run_kernel.model import HostObservation
-from agent_run_kernel.native_host import prepare_handoff
-from agent_run_kernel.notifications import NativeNotifications
+import agent_run.storage.notification_outbox as outbox
+import agent_run.adapters.notification_transport as notification_transport
+from agent_run.runtime.process_identity import _process_start_token
+from agent_run.runtime.package_lease import runner_usage_lease
+from agent_run.runtime.execution import _cgroup
+from agent_run.queries.host_exit import host_exit_notice
+from agent_run.model import HostObservation
+from agent_run.runtime.handoff import prepare_handoff
+from agent_run.notifications.sender import NativeNotifications
 from test_kernel_notifications import _kernel
 
 
@@ -144,7 +145,7 @@ def test_full_exit_journal_records_first_unsent_failure_without_renewing_budget(
 
 
 def test_exit_invalidated_after_claim_is_recorded_unsent_not_unknown(tmp_path: Path, monkeypatch):
-    import agent_run_kernel.host_exit_facts as facts
+    import agent_run.queries.host_exit as facts
     with _killed_host(tmp_path) as (kernel, notice):
         original_current = facts.host_exit_current
         stopped = False
@@ -169,7 +170,7 @@ def test_exit_invalidated_after_claim_is_recorded_unsent_not_unknown(tmp_path: P
 
 
 def test_temporary_unsent_claim_does_not_label_later_success_unsent(tmp_path: Path, monkeypatch):
-    import agent_run_kernel.host_exit_facts as facts
+    import agent_run.queries.host_exit as facts
     with _killed_host(tmp_path) as (kernel, notice):
         original_current = facts.host_exit_current
         interrupted = False
@@ -201,7 +202,7 @@ def test_temporary_unsent_claim_does_not_label_later_success_unsent(tmp_path: Pa
 
 
 def test_exit_identity_read_fault_before_submit_keeps_original_unsent_attempt(tmp_path, monkeypatch):
-    import agent_run_kernel.host_exit_facts as facts
+    import agent_run.queries.host_exit as facts
     with _killed_host(tmp_path) as (kernel, notice):
         original_current = facts.host_exit_current
         identity_ready = False

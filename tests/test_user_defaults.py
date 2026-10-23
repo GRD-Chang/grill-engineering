@@ -5,8 +5,8 @@ from threading import Barrier
 
 import pytest
 
-from agent_run.agent_profiles import resolve_profiles
-from agent_run.user_defaults import UserDefaultsError, UserDefaultsStore
+from agent_run.contracts.agent_profiles import resolve_profiles
+from agent_run.config.defaults import UserDefaultsError, UserDefaultsStore
 
 
 @pytest.mark.parametrize("old_contents", ['{"ticket_review_rounds":7}', 'broken old JSON'])
@@ -84,7 +84,7 @@ def test_validation_and_atomic_replace_failure_preserve_file(tmp_path: Path, mon
         store.configure(profile={"publication_from_development": True, "publication_model": "x"})
     def fail_replace(*args: object) -> None:
         raise OSError("replace failed")
-    monkeypatch.setattr("agent_run.user_defaults.os.replace", fail_replace)
+    monkeypatch.setattr('agent_run.config.defaults.os.replace', fail_replace)
     with pytest.raises(OSError, match="replace failed"):
         store.configure(profile={"preset": "premium"}, language="en")
     assert store.path.read_bytes() == before
@@ -134,7 +134,7 @@ def test_directory_sync_failure_restores_original(
             raise OSError("directory sync failed")
         real_fsync(descriptor)
 
-    monkeypatch.setattr("agent_run.user_defaults.os.fsync", fail_directory_sync)
+    monkeypatch.setattr('agent_run.config.defaults.os.fsync', fail_directory_sync)
     with pytest.raises(OSError, match="已恢复原配置"):
         store.configure(profile={"preset": "premium"})
     assert (store.path.read_bytes() if store.path.exists() else None) == before
@@ -177,7 +177,7 @@ def test_app_settings_sync_failure_restores_identity_and_preserves_legacy_materi
             raise OSError("injected settings directory fsync failure")
         real_fsync(descriptor)
 
-    monkeypatch.setattr("agent_run.user_defaults.os.fsync", fail_once)
+    monkeypatch.setattr('agent_run.config.defaults.os.fsync', fail_once)
     with pytest.raises(OSError, match="injected settings directory fsync failure"):
         store.configure(github={"worker_source": source, "app": {**app, "app_id": "789"}})
     assert store.path.read_bytes() == before

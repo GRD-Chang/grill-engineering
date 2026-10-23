@@ -1,7 +1,7 @@
 """The graph transport names unallocated Ticket resources without creating them."""
 from pathlib import Path
 
-from agent_run_kernel.model import DeliveryKind
+from agent_run.model import DeliveryKind
 from support.offline import GraphScenario
 from test_kernel_requirements import independent_source
 

@@ -19,17 +19,11 @@ import urllib.request
 
 import pytest
 
-from agent_run.github import GhGitHubReader
-from agent_run.github_auth import (
-    GitHubCredentialError,
-    _CancellableHTTPSHandler,
-    _SigningProcessRegistry,
-    _create_app_jwt,
-    mint_installation_credential,
-)
-from agent_run.github_auth_profile import GitHubAppProfile
-from agent_run.github_retry import MAX_COMMAND_OUTPUT_BYTES, run_read_command
-from agent_run.models import Repository
+from agent_run.adapters.github import GhGitHubReader
+from agent_run.adapters.auth.app import GitHubCredentialError, _CancellableHTTPSHandler, _SigningProcessRegistry, _create_app_jwt, mint_installation_credential
+from agent_run.config.github_app import GitHubAppProfile
+from agent_run.adapters.github_commands import MAX_COMMAND_OUTPUT_BYTES, run_read_command
+from agent_run.model import Repository
 
 
 def test_github_reader_retries_transient_timeout(
@@ -47,8 +41,8 @@ def test_github_reader_retries_transient_timeout(
                 )
         return _repository_response()
 
-    monkeypatch.setattr("agent_run.github_retry._run_bounded_command", fake_run)
-    monkeypatch.setattr("agent_run.github_retry.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr('agent_run.adapters.github_commands._run_bounded_command', fake_run)
+    monkeypatch.setattr('agent_run.adapters.github_commands.time.sleep', lambda _seconds: None)
 
     reader = GhGitHubReader("example/project")
     assert reader.repository().name_with_owner == "example/project"
@@ -84,8 +78,8 @@ def test_github_read_retries_do_not_classify_stderr(
         attempts += 1
         return subprocess.CompletedProcess(arguments, 1, "", stderr)
 
-    monkeypatch.setattr("agent_run.github_retry._run_bounded_command", fake_run)
-    monkeypatch.setattr("agent_run.github_retry.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr('agent_run.adapters.github_commands._run_bounded_command', fake_run)
+    monkeypatch.setattr('agent_run.adapters.github_commands.time.sleep', lambda _seconds: None)
 
     result = run_read_command(["gh", "api", "repos/example/project"])
 
@@ -108,7 +102,7 @@ def test_github_reader_derives_repository_hint_from_origin(
     expected: str | None,
 ) -> None:
     monkeypatch.setattr(
-        "agent_run.github.subprocess.run",
+        'agent_run.adapters.github.subprocess.run',
         lambda *_args, **_kwargs: subprocess.CompletedProcess(
             ["git"], 0, f"{remote}\n", ""
         ),
@@ -174,8 +168,8 @@ def test_github_reader_retries_transient_http_status(
                 )
         return _repository_response()
 
-    monkeypatch.setattr("agent_run.github_retry._run_bounded_command", fake_run)
-    monkeypatch.setattr("agent_run.github_retry.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr('agent_run.adapters.github_commands._run_bounded_command', fake_run)
+    monkeypatch.setattr('agent_run.adapters.github_commands.time.sleep', lambda _seconds: None)
 
     reader = GhGitHubReader("example/project")
     assert reader.repository().name_with_owner == "example/project"
@@ -204,7 +198,7 @@ def test_github_app_token_mint_extracts_only_the_http_status(
     private_key.write_text("private-key", encoding="utf-8")
     private_key.chmod(0o600)
     profile = GitHubAppProfile("123", "456", private_key)
-    monkeypatch.setattr("agent_run.github_auth._create_app_jwt", lambda *_: "jwt")
+    monkeypatch.setattr('agent_run.adapters.auth.app._create_app_jwt', lambda *_: "jwt")
 
     def reject(*_args: object, **_kwargs: object) -> object:
         raise urllib.error.HTTPError(
@@ -215,7 +209,7 @@ def test_github_app_token_mint_extracts_only_the_http_status(
             None,
         )
 
-    monkeypatch.setattr("agent_run.github_auth.urllib.request.urlopen", reject)
+    monkeypatch.setattr('agent_run.adapters.auth.app.urllib.request.urlopen', reject)
     with pytest.raises(GitHubCredentialError) as raised:
         mint_installation_credential(profile)
 
@@ -257,7 +251,7 @@ def test_app_jwt_is_rs256_and_cleans_temporary_key(
         capture_output=True,
     )
     before = set(Path(tempfile.gettempdir()).glob("agent-run-app-key-*"))
-    monkeypatch.setattr("agent_run.github_auth.time.time", lambda: 1_800_000_000)
+    monkeypatch.setattr('agent_run.adapters.auth.app.time.time', lambda: 1_800_000_000)
 
     token = _create_app_jwt("123", private_key.read_text(encoding="utf-8"))
 
@@ -302,7 +296,7 @@ def test_app_jwt_signing_failure_does_not_expose_openssl_stderr(
             b"Provider routines::bad decrypt private-key-material",
         )
 
-    monkeypatch.setattr("agent_run.github_auth.subprocess.run", failed_signing)
+    monkeypatch.setattr('agent_run.adapters.auth.app.subprocess.run', failed_signing)
 
     with pytest.raises(GitHubCredentialError, match="could not sign GitHub App JWT") as error:
         _create_app_jwt("123", "private-key")

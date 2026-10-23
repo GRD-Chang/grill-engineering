@@ -6,7 +6,7 @@ import json
 from contextlib import redirect_stdout
 from io import StringIO
 from typing import Any
-from agent_run_kernel.query_cli import main
+from agent_run.cli.main import main
 
 
 def settings(*arguments: str) -> tuple[int, dict[str, Any]]:

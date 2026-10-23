@@ -9,9 +9,10 @@ from pathlib import Path
 
 from typing import TYPE_CHECKING, Any, Mapping
 
-from agent_run_kernel import (AgentCall, CreationInputs, Delivery, DeliveryKind, Effect, EffectResult, Execution, Issue, Kernel, Policy,
-                              ParentIssue, Requirements, ResourceInspection, ResourceWitness, RunSpec, Step)
-from agent_run_kernel.operation_runner import DeliveryFacts, DeliveryRead, OperationBinding, OperationPorts, OperationRunner
+from agent_run.model import AgentCall, CreationInputs, Delivery, DeliveryKind, Effect, EffectResult, Execution, Issue, Policy, ParentIssue, Requirements, ResourceInspection, ResourceWitness, RunSpec, Step
+from agent_run.core.kernel import Kernel
+from agent_run.core.operation_contract import DeliveryFacts, DeliveryRead, OperationBinding, OperationPorts
+from agent_run.core.operation_runner import OperationRunner
 
 
 if TYPE_CHECKING:

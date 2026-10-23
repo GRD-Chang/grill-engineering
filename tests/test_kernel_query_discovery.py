@@ -6,12 +6,13 @@ import shutil
 
 import pytest
 
-from agent_run.managed_workspace import ManagedWorkspace
-from agent_run.task_identity import TaskKey
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, ParentIssue, Requirements, RunSpec
+from agent_run.adapters.workspace import ManagedWorkspace
+from agent_run.contracts.task import TaskKey
+from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
+from agent_run.core.kernel import Kernel
 from support.offline import OfflinePort, Scenario
-from agent_run_kernel.query_cli import main
-from agent_run_kernel.task_location import bind_task, locked_task, task_path
+from agent_run.cli.main import main
+from agent_run.storage.tasks import bind_task, locked_task, task_path
 from tests.test_kernel_query_cli import _create, _snapshot
 
 

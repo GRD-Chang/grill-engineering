@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel import Effect
+from agent_run.model import Effect
 from support.offline import GraphScenario
 from test_kernel_requirements import independent_source
 

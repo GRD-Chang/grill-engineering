@@ -1,4 +1,6 @@
 """Existing public Profile/Prompt commands use native facts and retained assemblers."""
+
+import agent_run.core
 import json
 import os
 from pathlib import Path
@@ -7,14 +9,14 @@ import sys
 
 import pytest
 
-import agent_run_kernel
-from agent_run import prompt_resources
-from agent_run.managed_workspace import ManagedWorkspace
-from agent_run.user_defaults import UserDefaultsStore
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, ParentIssue, Requirements, RunSpec
-from agent_run_kernel.configuration import freeze_creation
-from agent_run_kernel.query_cli import main
-from agent_run_kernel.operation_runner import DeliveryFacts
+import agent_run.config.resources as prompt_resources
+from agent_run.adapters.workspace import ManagedWorkspace
+from agent_run.config.defaults import UserDefaultsStore
+from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
+from agent_run.core.kernel import Kernel
+from agent_run.config.creation import freeze_creation
+from agent_run.cli.main import main
+from agent_run.core.operation_contract import DeliveryFacts
 from support.core_operations import CoreOperations, ReadOnlyPorts
 
 
@@ -35,7 +37,8 @@ def _published_profile_task(git_repo: Path) -> Kernel:
 
 @pytest.mark.parametrize('command', ['configure', 'config', 'profile'])
 def test_public_run_profile_revision_changes_only_future_threads(git_repo, command, monkeypatch, capsys):
-    from agent_run_kernel import host_adapter, lifecycle_cli
+    import agent_run.adapters.systemd as host_adapter
+    import agent_run.cli.lifecycle as lifecycle_cli
 
     kernel = _published_profile_task(git_repo)
     execution = kernel.claim_executor('profile-test-owner')
@@ -103,8 +106,8 @@ def test_public_run_profile_rejects_invalid_changes_and_unpublished_snapshots_wi
     git_repo, tmp_path, capsys, case,
 ):
     from tests.test_kernel_query_cli import _snapshot
-    from agent_run.task_identity import TaskKey
-    from agent_run_kernel.task_location import task_path
+    from agent_run.contracts.task import TaskKey
+    from agent_run.storage.tasks import task_path
     import shutil
 
     kernel = _published_profile_task(git_repo)
@@ -137,13 +140,13 @@ def test_public_run_profile_rejects_invalid_changes_and_unpublished_snapshots_wi
 
 def _native(*arguments: str) -> subprocess.CompletedProcess[str]:
     environment = dict(os.environ)
-    environment['PYTHONPATH'] = str(Path(agent_run_kernel.__file__).resolve().parents[1])
-    return subprocess.run([sys.executable, '-m', 'agent_run_kernel', *arguments], env=environment,
+    environment['PYTHONPATH'] = str(Path(agent_run.core.__file__).resolve().parents[2])
+    return subprocess.run([sys.executable, '-m', 'agent_run', *arguments], env=environment,
                           text=True, capture_output=True, timeout=15)
 
 
 def test_public_native_prompts_preserve_personal_methods_and_preview_original_frozen_resources(tmp_path):
-    from agent_run.paths import app_data_root
+    from agent_run.config.paths import app_data_root
 
     UserDefaultsStore().configure(language='en')
     directory = prompt_resources.personal_method_directory('en')
@@ -184,7 +187,7 @@ def test_public_native_prompts_preserve_personal_methods_and_preview_original_fr
 
 
 def test_public_prompt_preview_errors_preserve_request_and_personal_files(tmp_path, capsys):
-    from agent_run.paths import app_data_root
+    from agent_run.config.paths import app_data_root
 
     UserDefaultsStore().configure(language='en')
     path = tmp_path / 'invalid-request.json'

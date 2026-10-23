@@ -12,8 +12,8 @@ from typing import Callable
 
 import pytest
 
-from agent_run.user_defaults import UserDefaultsStore
-from agent_run_kernel.query_cli import main
+from agent_run.config.defaults import UserDefaultsStore
+from agent_run.cli.main import main
 
 
 @pytest.fixture
@@ -177,7 +177,7 @@ def test_public_configure_preserves_original_on_atomic_storage_failure(
         raise OSError("simulated " + failure + " failure")
 
     if failure == "replace":
-        monkeypatch.setattr("agent_run.user_defaults.os.replace", fail)
+        monkeypatch.setattr('agent_run.config.defaults.os.replace', fail)
     else:
         monkeypatch.setattr(UserDefaultsStore, "_sync_directory", fail)
     code, output = _call(main, ["settings", "configure", "--preset", "premium", "--json"], capsys)
@@ -237,7 +237,7 @@ def test_personal_plain_output_uses_real_language_and_does_not_send_or_open_runs
     def forbidden(*_args, **_kwargs):
         raise AssertionError("Personal settings attempted Run/online work")
 
-    monkeypatch.setattr("agent_run_kernel.cli_selection._candidates", forbidden)
+    monkeypatch.setattr('agent_run.cli.selection._candidates', forbidden)
     monkeypatch.setattr("subprocess.run", forbidden)
     assert main(["settings", "show"]) == 0
     output = capsys.readouterr().out

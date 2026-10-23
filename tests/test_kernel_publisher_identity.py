@@ -6,10 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.user_defaults import UserDefaultsStore
-from agent_run_kernel import DeliveryKind, Kernel, KernelError
-from agent_run_kernel.configuration import freeze_creation
-from agent_run_kernel.model import Effect, EffectResult
+from agent_run.config.defaults import UserDefaultsStore
+from agent_run.model import DeliveryKind
+from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
+from agent_run.config.creation import freeze_creation
+from agent_run.model import Effect, EffectResult
 from support.offline import Scenario
 from support.offline_api import SyntheticGitHub
 from test_kernel_remote_effects import EffectBoundary, effect_boundary
@@ -76,7 +78,7 @@ def test_unconfigured_run_cannot_publish_with_two_missing_identity_selections(tm
     scenario.execution = scenario.kernel.claim_executor("unconfigured-owner")
     # A deliberately unconfigured input is a publisher-validation unit, not
     # a managed native Run. The runner rejects its missing creation binding.
-    from agent_run_kernel.model import World
+    from agent_run.model import World
     world = World("parent", "graph", "subject", scenario.initial,
                   publisher_actor="offline-publisher", publisher_identity=None)
     assert world.publisher_actor is not None and world.publisher_identity is None

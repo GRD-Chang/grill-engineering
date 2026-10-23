@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from agent_run_kernel import Kernel
-from agent_run_kernel.executor import _make_ports
-from agent_run_kernel.model import Execution
+from agent_run.core.kernel import Kernel
+from agent_run.runtime.executor import _make_ports
+from agent_run.model import Execution
 from support.core_operations import CoreOperations
 from test_kernel_executor_controls import (
     test_native_executor_consumes_the_original_control_action_with_fresh_source_and_resources as _control_case,

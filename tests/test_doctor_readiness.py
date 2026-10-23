@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import agent_run.runtime.process_cleanup
+
 import json
 import os
 import subprocess
@@ -9,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.runner_installer import _runtime_identity
+from agent_run.install.installer import _runtime_identity
 from support.environment import _user_environment as _isolated_environment
 from test_kernel_doctor_cli import _file_snapshot
 
@@ -19,11 +21,11 @@ from test_kernel_doctor_cli import _file_snapshot
 def test_doctor_probe_stream_policy_and_cleanup_order(
     monkeypatch: pytest.MonkeyPatch, mode: str, overflow: bool,
 ) -> None:
-    from agent_run import doctor
+    import agent_run.install.doctor as doctor
 
     processes = []
     order = []
-    original_popen, original_cleanup = subprocess.Popen, doctor._terminate_process_group
+    original_popen, original_cleanup = subprocess.Popen, agent_run.runtime.process_cleanup.terminate_process_group
 
     def start(*args, **kwargs):
         process = original_popen(*args, **kwargs)
@@ -72,7 +74,7 @@ def test_doctor_probe_stream_policy_and_cleanup_order(
 def test_doctor_probe_early_stdin_close_keeps_result_and_reaps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capture: bool,
 ) -> None:
-    from agent_run import doctor
+    import agent_run.install.doctor as doctor
 
     ready = tmp_path / "closed"
     processes = []
@@ -156,8 +158,7 @@ def test_doctor_cli_separates_installation_and_execution_readiness(
         entry = snapshot / "bin" / "agent-run"
         entry.parent.mkdir()
         entry.write_text(
-            f"#!{sys.executable}\n"
-            "from agent_run_kernel.query_cli import main\nraise SystemExit(main())\n"
+            f'#!{sys.executable}\nfrom agent_run.cli.main import main\nraise SystemExit(main())\n'
         )
         entry.chmod(0o700)
         generation = root / "generations" / "fixture"
@@ -208,7 +209,7 @@ def test_doctor_rejects_version_only_or_incompatible_dependencies(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str], dependency: str, script: str, status: str,
 ) -> None:
-    from agent_run_kernel.query_cli import main
+    from agent_run.cli.main import main
 
     tools = tmp_path / "tools"
     tools.mkdir()
@@ -228,10 +229,10 @@ def test_doctor_preserves_current_settings_profile_and_task(
     tmp_path: Path, git_repo: Path, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str], as_json: bool,
 ) -> None:
-    from agent_run.managed_workspace import ManagedWorkspace
-    from agent_run.task_identity import TaskKey
-    from agent_run_kernel.query_cli import main
-    from agent_run_kernel.task_location import read_task, task_path
+    from agent_run.adapters.workspace import ManagedWorkspace
+    from agent_run.contracts.task import TaskKey
+    from agent_run.cli.main import main
+    from agent_run.storage.tasks import read_task, task_path
     from test_kernel_profile_prompt_cli import _published_profile_task
 
     # The existing native fixture uses freeze_creation and Kernel.create_task,
@@ -273,7 +274,7 @@ def test_doctor_preserves_current_settings_profile_and_task(
     assert read_task(task_path(task)) == binding
 
 
-@pytest.mark.parametrize("module", ["agent_run", "agent_run_kernel"])
+@pytest.mark.parametrize("module", ["agent_run", 'agent_run'])
 @pytest.mark.parametrize("command", [[], ["doctor"]])
 def test_public_help_is_read_only_without_host_dependencies(
     tmp_path: Path, module: str, command: list[str],

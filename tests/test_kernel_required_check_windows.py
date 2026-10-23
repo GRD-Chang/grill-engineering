@@ -1,12 +1,13 @@
 """Real pending starts its checks window; later uncertainty preserves it."""
-from agent_run_kernel.operation_runner import OperationRunner
+from agent_run.core.operation_runner import OperationRunner
 from dataclasses import replace
 
 import pytest
 
-from agent_run_kernel import Checks, DeliveryKind, Kernel
+from agent_run.model import Checks, DeliveryKind
+from agent_run.core.kernel import Kernel
 from support.offline import Scenario
-from agent_run_kernel.operation_runner import ReadUnavailable
+from agent_run.core.operation_contract import ReadUnavailable
 
 
 @pytest.mark.parametrize("kind,initial,later,budget", [

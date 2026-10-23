@@ -10,13 +10,15 @@ import sys
 
 import pytest
 
-from agent_run.agent_profiles import resolve_profiles
+from agent_run.contracts.agent_profiles import resolve_profiles
 
-from agent_run_kernel import Blocker, Commit, Delivery, DeliveryKind, Issue, Kernel, ParentIssue, Policy, Profile, Requirements, RunSpec
-from agent_run_kernel import query
-from agent_run_kernel.query_cli import main
+from agent_run.model import Blocker, Commit, Delivery, DeliveryKind, Issue, ParentIssue, Policy, Profile, Requirements, RunSpec
+from agent_run.core.kernel import Kernel
+import agent_run.queries.run as query
+from agent_run.cli.main import main
 from support.offline import Scenario, fixture_inputs
-from agent_run_kernel.operation_runner import DeliveryFacts, OperationRunner
+from agent_run.core.operation_contract import DeliveryFacts
+from agent_run.core.operation_runner import OperationRunner
 from support.core_operations import CoreOperations, ReadOnlyPorts
 
 
@@ -130,7 +132,7 @@ def test_latest_resume_distinguishes_application_from_the_target_start_and_ignor
     tmp_path: Path, capsys,
 ) -> None:
     from io import StringIO
-    from agent_run_kernel.query_render import render
+    from agent_run.cli.render import render
 
     base = Commit("base", "base-tree")
     deliveries = tuple(Delivery(f"ticket:{number}", DeliveryKind.TICKET, number, "ticket-v1", base,
@@ -196,8 +198,8 @@ def test_status_reports_the_original_worker_exit_wait_without_inventing_an_accep
     tmp_path: Path,
 ) -> None:
     from io import StringIO
-    from agent_run_kernel import KernelError
-    from agent_run_kernel.query_render import render
+    from agent_run.errors import KernelError
+    from agent_run.cli.render import render
 
     kernel = _create(tmp_path)
     execution = kernel.claim_executor("query-executor")
@@ -407,7 +409,7 @@ def test_parser_errors_use_personal_language_stderr_and_exit_two(
 def test_interrupted_read_returns_130_without_advancing_or_writing(
     tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from agent_run_kernel import query_cli
+    import agent_run.cli.main as query_cli
     kernel = _create(tmp_path)
     before = _snapshot(tmp_path)
 
@@ -480,7 +482,7 @@ def test_machine_data_is_independent_of_run_language_and_history_details(
 
 
 def test_history_keeps_raw_feedback_and_pages_without_losing_events(tmp_path: Path, capsys, monkeypatch) -> None:
-    from agent_run_kernel.storage import Transaction
+    from agent_run.storage.sqlite import Transaction
 
     kernel = _create(tmp_path)
     _human(kernel)
@@ -565,7 +567,7 @@ def test_public_cli_process_uses_only_native_readers_and_preserves_state(tmp_pat
     before = _snapshot(tmp_path)
     env = dict(os.environ)
     env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
-    completed = subprocess.run([sys.executable, "-m", "agent_run_kernel", *_arguments(kernel, "status", "--json")],
+    completed = subprocess.run([sys.executable, "-m", 'agent_run', *_arguments(kernel, "status", "--json")],
                                text=True, capture_output=True, env=env, timeout=15, check=False)
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout)["run_id"] == "run-query"
@@ -578,7 +580,7 @@ def test_public_cli_process_uses_only_native_readers_and_preserves_state(tmp_pat
 def test_public_delivery_boundaries_match_observed_02_meanings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: DeliveryKind, completed_phase: str,
 ) -> None:
-    from agent_run_kernel import Issue, ParentIssue, Requirements
+    from agent_run.model import Issue, ParentIssue, Requirements
     from support.offline import GraphScenario
 
     # The former isolated Scenario had no original workspace ownership effect;

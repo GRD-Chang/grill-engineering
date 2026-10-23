@@ -5,12 +5,14 @@ import time
 
 import pytest
 
-from agent_run_kernel import Checks, DeliveryKind, Kernel
-from agent_run_kernel import query
+from agent_run.model import Checks, DeliveryKind
+from agent_run.core.kernel import Kernel
+import agent_run.queries.run as query
 from support.offline import Scenario
-from agent_run_kernel.operation_runner import OperationRunner, ReadUnavailable
-from agent_run_kernel.query_cli import main
-from agent_run_kernel.read_facts import read_boundaries
+from agent_run.core.operation_runner import OperationRunner
+from agent_run.core.operation_contract import ReadUnavailable
+from agent_run.cli.main import main
+from agent_run.queries.read_facts import read_boundaries
 from tests.test_kernel_query_cli import _snapshot
 
 

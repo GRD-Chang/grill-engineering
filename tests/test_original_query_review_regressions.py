@@ -1,5 +1,5 @@
 """Native control history stays in recorded order and queries remain read-only."""
-from agent_run_kernel.query import read
+from agent_run.queries.run import read
 from test_kernel_query_cli import _create, _snapshot as _bytes
 
 

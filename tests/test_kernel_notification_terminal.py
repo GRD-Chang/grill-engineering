@@ -4,11 +4,11 @@ from typing import Any
 
 import pytest
 
-from agent_run import notification_outbox as outbox
-from agent_run.notification_event_facts import event_copy
-from agent_run_kernel import DeliveryKind
-from agent_run_kernel.local_effects import LocalEffects
-from agent_run_kernel.notifications import NativeNotifications
+import agent_run.storage.notification_outbox as outbox
+from agent_run.notifications.envelope import event_copy
+from agent_run.model import DeliveryKind
+from agent_run.adapters.local_git import LocalEffects
+from agent_run.notifications.sender import NativeNotifications
 from test_kernel_notification_lifecycle import _enabled_scenario
 
 

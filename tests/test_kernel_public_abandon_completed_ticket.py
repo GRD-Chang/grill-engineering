@@ -6,8 +6,8 @@ import subprocess
 import sys
 import time
 
-from agent_run.runner_lease import default_runner_lock_path, runner_management_lease
-from agent_run_kernel import Kernel
+from agent_run.runtime.package_lease import default_runner_lock_path, runner_management_lease
+from agent_run.core.kernel import Kernel
 from support.managed_abandon_transport import install_currentness
 from tests.test_kernel_managed_entry_end_to_end import (
     _CODEX, _approval_read_barrier, _control_environment, _git, _hold_host_operation_return, _local_manager,
@@ -38,7 +38,7 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
             environment["PATH"] = str(Path(manager.systemctl).parent) + os.pathsep + environment["PATH"]
 
             def public(*arguments):
-                result = subprocess.run([sys.executable, "-m", "agent_run_kernel", *arguments,
+                result = subprocess.run([sys.executable, "-m", 'agent_run', *arguments,
                     "--repo", "example/project", "--json"], cwd=git_repo, env=environment,
                     text=True, capture_output=True, timeout=min(20, max(0.01, deadline - time.monotonic())))
                 assert result.returncode == 0, (result.stdout, result.stderr)

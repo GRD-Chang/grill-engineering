@@ -10,9 +10,9 @@ from threading import Event, Thread
 
 import pytest
 
-from agent_run import managed_workspace as product_workspace
-from agent_run.managed_workspace import ManagedWorkspace
-from agent_run.paths import app_data_root
+import agent_run.adapters.workspace as product_workspace
+from agent_run.adapters.workspace import ManagedWorkspace
+from agent_run.config.paths import app_data_root
 from support import workspace
 from support.observer_errors import ObserverErrors
 

@@ -14,11 +14,13 @@ import threading
 
 import pytest
 
-from agent_run.runner_lease import RunnerLeaseBusy, runner_management_lease, runner_usage_lease
-from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, RunSpec
-from agent_run_kernel.model import Execution, HostObservation
+from agent_run.runtime.package_lease import RunnerLeaseBusy, runner_management_lease, runner_usage_lease
+from agent_run.model import Commit, Delivery, DeliveryKind, RunSpec
+from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
+from agent_run.model import Execution, HostObservation
 from support.core_operations import CoreOperations, native_agent_fixture
-from agent_run_kernel.native_host import HandoffError, host_environment, launch_handoff, prepare_handoff
+from agent_run.runtime.handoff import HandoffError, host_environment, launch_handoff, prepare_handoff
 from test_kernel_host_adapter import controlled_manager, host_kernel
 
 
@@ -132,14 +134,14 @@ def _exercise_handoff(tmp_path: Path, *, managed: bool) -> None:
         script = """
 import json, os, sys
 from pathlib import Path
-from agent_run_kernel.model import HostLaunch
-from agent_run_kernel import Kernel
-from agent_run_kernel.native_host import host_environment
-from agent_run_kernel.host_adapter import SystemdHost
+from agent_run.model import HostLaunch
+from agent_run.core.kernel import Kernel
+from agent_run.runtime.handoff import host_environment
+from agent_run.adapters.systemd import SystemdHost
 value = json.loads(sys.argv[1]); value['environment_carrier'] = Path(value['environment_carrier'])
 value['command'] = tuple(value['command'])
 if sys.argv[7] == 'managed':
-    from agent_run_kernel.native_host import managed_host_environment
+    from agent_run.runtime.handoff import managed_host_environment
     state_path = Path(sys.argv[8]); state = json.loads(state_path.read_text())
     group = next(line[3:] for line in Path('/proc/self/cgroup').read_text().splitlines() if line.startswith('0::'))
     state['fields'].update(Id=value['unit_name'], Description=HostLaunch(**value).description,
@@ -198,7 +200,7 @@ with selected as inherited:
             with runner_management_lease(lock):
                 raise AssertionError("management crossed the manager's retained FD")
         if managed:
-            from agent_run_kernel.native_host import reconcile_handoff
+            from agent_run.runtime.handoff import reconcile_handoff
             reopened = Kernel(kernel.storage.path)
             state = json.loads(response.read_text())
             group = state["fields"]["ControlGroup"]
@@ -302,8 +304,8 @@ def test_unacknowledged_host_keeps_original_guardian_receipt_until_the_sealed_de
         script = """
 import json, sys
 from pathlib import Path
-from agent_run_kernel.model import HostLaunch
-from agent_run_kernel.native_host import host_environment
+from agent_run.model import HostLaunch
+from agent_run.runtime.handoff import host_environment
 value = json.loads(sys.argv[1]); value['environment_carrier'] = Path(value['environment_carrier'])
 value['command'] = tuple(value['command'])
 with host_environment(HostLaunch(**value), runner_lock=Path(sys.argv[2]),
