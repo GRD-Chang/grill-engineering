@@ -55,7 +55,7 @@ def prepare_workspace(
 ) -> ManagedWorkspace:
     workspace = managed_workspace(repo, extra_env=extra_env, repository=repository)
     if not extra_env:
-        workspace.ensure(remote_url=str(repo), identity=read_git_identity(repo))
+        workspace.ensure_path(remote_url=str(repo), identity=read_git_identity(repo))
     else:
         # Creation validates the environment's managed ancestors. Keep that
         # production boundary in an isolated process when overrides are needed.
@@ -66,7 +66,7 @@ def prepare_workspace(
                    "import sys; from pathlib import Path; "
                    "from agent_run.managed_workspace import ManagedWorkspace, read_git_identity; "
                    "repo = Path(sys.argv[2]); "
-                   "ManagedWorkspace.for_repository(sys.argv[1]).ensure(remote_url=str(repo), identity=read_git_identity(repo))",
+                   "ManagedWorkspace.for_repository(sys.argv[1]).ensure_path(remote_url=str(repo), identity=read_git_identity(repo))",
                    workspace.repository, str(repo)]
         process = subprocess.Popen(
             command, cwd=repo, env=environment, stdout=subprocess.PIPE,

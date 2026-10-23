@@ -105,8 +105,8 @@ subprocess.run([{real_git!r}, "config", "remote.origin.url", sys.argv[-2]], cwd=
         identity = resolve_runner_identity({"runner_source": "app", "app": {
             "app_id": "123", "installation_id": "456", "private_key_path": str(tmp_path / "key")}})
         monkeypatch.setattr("agent_run.runner_credentials.runner_app_token", lambda _identity: "clone-pat")
-    git = workspace.ensure(runner_identity=identity)
-    assert git.root == workspace.repository_root
+    checkout = workspace.ensure_path(runner_identity=identity)
+    assert checkout == workspace.repository_root
     call = json.loads(calls.read_text())
     assert call["args"][-2] == "https://github.com/example/project.git"
     assert call["token"] == "clone-pat"

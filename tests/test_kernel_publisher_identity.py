@@ -1,8 +1,8 @@
 """Current publisher witnesses and original comment receipts bind remote writes."""
 
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
-import sqlite3
 
 import pytest
 
@@ -11,10 +11,13 @@ from agent_run_kernel import DeliveryKind, Kernel, KernelError
 from agent_run_kernel.configuration import freeze_creation
 from agent_run_kernel.model import Effect, EffectResult
 from support.offline import Scenario
+from support.offline_api import SyntheticGitHub
 from test_kernel_remote_effects import EffectBoundary, effect_boundary
 
 
 def publisher_scenario(path: Path, monkeypatch: pytest.MonkeyPatch) -> Scenario:
+    # Declare the synthetic account before any Core observation or API write.
+    monkeypatch.setattr("support.offline.SyntheticGitHub", partial(SyntheticGitHub, actor="actual-runner"))
     scenario = Scenario(path, DeliveryKind.PARENT_ONLY)
     remote = scenario.spec.inputs.repository_remote
     frozen = freeze_creation(scenario.spec, UserDefaultsStore(path / "personal.json"))
@@ -184,9 +187,7 @@ def test_same_actor_close_seen_before_first_dispatch_is_not_adopted(
     assert close.operation == "close"
     # Even the exact actor and prospective target cannot prove a request which
     # this Run has not dispatched. This is a separate external-store change.
-    with sqlite3.connect(scenario.port.database) as db:
-        db.execute("INSERT INTO closed VALUES (?,?,?,?)", (close.payload["issue"], close.effect_id,
-                                                          close.actor, close.payload["merge_sha"]))
+    scenario.port.objects.set_state(close.payload["issue"], "closed", close.actor)
     assert scenario.runner().run_once().kind == "paused"
     with scenario.kernel.storage.transaction(write=False) as tx:
         original = tx.one("SELECT status,attempts,receipt_id FROM effects WHERE id=?", (close.effect_id,))

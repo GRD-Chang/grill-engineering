@@ -344,8 +344,8 @@ with contextlib.redirect_stdout(qio):
 print(json.dumps({'initial_status': initial_status, 'status': status,
     'grant_before_external_change': grant_before_external_change, 'grant': grant,
     'checks': observations[-1], 'waits': waits, 'writes': s.writes(),
-    'pr_state': s.port.pull_request(s.delivery.key).state,
-    'target_sha': s.port.remote_commit(s.delivery.target_ref).sha, 'initial_base': s.initial.sha,
+    'pr_state': s.port.pr_by_number(status['pr_number']).state,
+    'target_sha': s.port.physical.refs()[s.delivery.target_ref], 'initial_base': s.initial.sha,
     'query_code': code, 'query': json.loads(qio.getvalue())}))
 '''
 

@@ -38,35 +38,35 @@ def test_workspace_clones_committed_private_files_and_reuses_its_own_git(
     }
 
     workspace = ManagedWorkspace.for_repository("Owner/Project")
-    managed = workspace.ensure(remote_url=str(git_repo))
+    managed = workspace.ensure_path(remote_url=str(git_repo))
 
     assert ManagedWorkspace.for_repository("owner/project") == workspace
-    assert managed.root == workspace.repository_root
-    assert workspace_state_root(managed.root) == workspace.state_root
-    assert workspace.state_root.parent == managed.root.parent
-    assert (managed.root / "research" / "private.md").read_text() == "private committed context\n"
-    assert (managed.root / "AGENTS.md").read_text() == "private instructions\n"
-    assert (managed.root / "README.md").read_text() == "# fixture\n"
-    assert not (managed.root / "local-only.md").exists()
-    assert (managed.root / ".git").is_dir()
-    assert not (managed.root / ".git" / "objects" / "info" / "alternates").exists()
-    (managed.root / "README.md").write_text("managed unfinished work\n")
-    assert workspace.ensure().root == managed.root
-    assert (managed.root / "README.md").read_text() == "managed unfinished work\n"
+    assert managed == workspace.repository_root
+    assert workspace_state_root(managed) == workspace.state_root
+    assert workspace.state_root.parent == managed.parent
+    assert (managed / "research" / "private.md").read_text() == "private committed context\n"
+    assert (managed / "AGENTS.md").read_text() == "private instructions\n"
+    assert (managed / "README.md").read_text() == "# fixture\n"
+    assert not (managed / "local-only.md").exists()
+    assert (managed / ".git").is_dir()
+    assert not (managed / ".git" / "objects" / "info" / "alternates").exists()
+    (managed / "README.md").write_text("managed unfinished work\n")
+    assert workspace.ensure_path() == managed
+    assert (managed / "README.md").read_text() == "managed unfinished work\n"
     assert before == {
         str(path.relative_to(git_repo)): path.read_bytes()
         for path in git_repo.rglob("*") if path.is_file()
     }
     source_inodes = {path.stat().st_ino for path in (git_repo / ".git").rglob("*") if path.is_file()}
     assert not source_inodes.intersection(
-        path.stat().st_ino for path in (managed.root / ".git").rglob("*") if path.is_file()
+        path.stat().st_ino for path in (managed / ".git").rglob("*") if path.is_file()
     )
 
 
 def test_missing_workspace_lookup_is_read_only(git_repo: Path) -> None:
     workspace = ManagedWorkspace.for_repository("owner/project")
     with pytest.raises(ManagedWorkspaceError):
-        workspace.open()
+        workspace.open_path()
     with pytest.raises(ManagedWorkspaceError):
         workspace_state_root(git_repo)
     assert not workspace.root.exists()
@@ -76,7 +76,7 @@ def test_missing_workspace_lookup_is_read_only(git_repo: Path) -> None:
 def test_failed_clone_removes_only_its_partial_checkout(tmp_path: Path) -> None:
     workspace = ManagedWorkspace.for_repository("owner/project")
     with pytest.raises(ManagedWorkspaceError, match="远端仓库不存在"):
-        workspace.ensure(remote_url=str(tmp_path / "missing-remote"))
+        workspace.ensure_path(remote_url=str(tmp_path / "missing-remote"))
     assert not workspace.root.exists()
     assert not list(workspace.root.parent.iterdir())
 
@@ -87,7 +87,7 @@ def test_workspace_refuses_existing_unowned_directory(tmp_path: Path) -> None:
     sentinel = workspace.root / "user-file"
     sentinel.write_text("keep")
     with pytest.raises(ManagedWorkspaceError, match="不属于 Runner"):
-        workspace.ensure(remote_url=str(tmp_path / "not-used"))
+        workspace.ensure_path(remote_url=str(tmp_path / "not-used"))
     assert sentinel.read_text() == "keep"
 
 
@@ -98,7 +98,7 @@ def test_workspace_refuses_symlink_destination(tmp_path: Path) -> None:
     outside.mkdir()
     workspace.root.symlink_to(outside, target_is_directory=True)
     with pytest.raises(ManagedWorkspaceError, match="不是独立目录"):
-        workspace.ensure()
+        workspace.ensure_path()
     assert not list(outside.iterdir())
 
 
@@ -110,7 +110,7 @@ def test_workspace_initialization_is_exclusive(tmp_path: Path) -> None:
     with lock_path.open("w") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         with pytest.raises(ManagedWorkspaceError, match="正在创建"):
-            workspace.ensure(remote_url=str(tmp_path / "not-used"))
+            workspace.ensure_path(remote_url=str(tmp_path / "not-used"))
     assert not workspace.root.exists()
 
 
@@ -122,7 +122,7 @@ def test_workspace_rejects_data_root_inside_a_user_repository(
     monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
     workspace = ManagedWorkspace.for_repository("owner/project")
     with pytest.raises(ManagedWorkspaceError, match="必须位于用户仓库之外"):
-        workspace.ensure(remote_url=str(git_repo))
+        workspace.ensure_path(remote_url=str(git_repo))
     assert not data_home.exists()
 
 
@@ -136,11 +136,11 @@ def test_workspace_accepts_a_symlink_to_the_data_disk(
     monkeypatch.setenv("XDG_DATA_HOME", str(alias))
     workspace = ManagedWorkspace.for_repository("owner/project")
 
-    managed = workspace.ensure(remote_url=str(git_repo))
+    managed = workspace.ensure_path(remote_url=str(git_repo))
 
-    assert managed.root == disk / "agent-run/repositories/owner/project/repository"
-    assert workspace.open().root == managed.root
-    assert workspace.ensure().root == managed.root
+    assert managed == disk / "agent-run/repositories/owner/project/repository"
+    assert workspace.open_path() == managed
+    assert workspace.ensure_path() == managed
 
 
 @pytest.mark.parametrize("relative", ["data", ".git/runner-data"])
@@ -148,7 +148,7 @@ def test_existing_workspace_cannot_be_relocated_inside_a_user_repository(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch, relative: str,
 ) -> None:
     workspace = ManagedWorkspace.for_repository("owner/project")
-    workspace.ensure(remote_url=str(git_repo))
+    workspace.ensure_path(remote_url=str(git_repo))
     data_home = git_repo / relative
     data_home.mkdir(parents=True)
     shutil.move(str(app_data_root()), str(data_home / "agent-run"))
@@ -159,7 +159,7 @@ def test_existing_workspace_cannot_be_relocated_inside_a_user_repository(
         for path in git_repo.rglob("*") if path.is_file()
     }
 
-    for action in (moved.open, moved.ensure):
+    for action in (moved.open_path, moved.ensure_path):
         with pytest.raises(ManagedWorkspaceError, match="必须位于用户仓库之外"):
             action()
 
@@ -185,7 +185,7 @@ def test_clone_timeout_removes_partial_workspace_and_releases_initialization_loc
     monkeypatch.setattr(module, "_CLONE_TIMEOUT_SECONDS", 0.05)
     workspace = ManagedWorkspace.for_repository("owner/project")
     with pytest.raises(ManagedWorkspaceError, match="超时") as caught:
-        workspace.ensure()
+        workspace.ensure_path()
     from agent_run.messages import error_detail
 
     assert error_detail(caught.value, "en") == (
@@ -194,7 +194,7 @@ def test_clone_timeout_removes_partial_workspace_and_releases_initialization_loc
     assert not workspace.root.exists()
     assert not list(workspace.root.parent.iterdir())
     with pytest.raises(ManagedWorkspaceError, match="远端仓库不存在"):
-        workspace.ensure(remote_url=str(tmp_path / "missing"))
+        workspace.ensure_path(remote_url=str(tmp_path / "missing"))
 
 
 @pytest.mark.parametrize("repository", ["../project", "owner/..", "owner/", "/repo", "owner/repo/more"])
@@ -241,20 +241,20 @@ def test_workspace_copies_only_local_commit_identity_and_can_commit(
     identity = read_git_identity(git_repo)
     assert identity == {"user.name": "Local Maintainer", "user.email": "local@example.invalid"}
     workspace = ManagedWorkspace.for_repository("owner/project")
-    managed = workspace.ensure(remote_url=str(git_repo), identity=identity)
+    managed = workspace.ensure_path(remote_url=str(git_repo), identity=identity)
     for key in ("core.hooksPath", "credential.helper", "agent-run.private-note"):
         local_value = subprocess.run(
-            ["git", "config", "--local", "--get", key], cwd=managed.root, capture_output=True,
+            ["git", "config", "--local", "--get", key], cwd=managed, capture_output=True,
         )
         assert local_value.returncode == 1
-    assert not (managed.root / ".git" / "private-hooks").exists()
-    assert not (managed.root / ".git" / "hooks" / "pre-commit").exists()
-    (managed.root / "candidate.txt").write_text("independent committed change\n")
-    git(managed.root, "add", "candidate.txt")
-    git(managed.root, "commit", "-m", "candidate using local identity")
-    assert git(managed.root, "log", "-1", "--format=%an <%ae>") == "Local Maintainer <local@example.invalid>"
-    workspace.ensure(identity={"user.name": "Different Maintainer"})
-    assert git(managed.root, "config", "--local", "user.name") == "Local Maintainer"
+    assert not (managed / ".git" / "private-hooks").exists()
+    assert not (managed / ".git" / "hooks" / "pre-commit").exists()
+    (managed / "candidate.txt").write_text("independent committed change\n")
+    git(managed, "add", "candidate.txt")
+    git(managed, "commit", "-m", "candidate using local identity")
+    assert git(managed, "log", "-1", "--format=%an <%ae>") == "Local Maintainer <local@example.invalid>"
+    workspace.ensure_path(identity={"user.name": "Different Maintainer"})
+    assert git(managed, "config", "--local", "user.name") == "Local Maintainer"
     assert before == {
         path.relative_to(git_repo): (path.read_bytes(), path.stat().st_mtime_ns)
         for path in git_repo.rglob("*") if path.is_file()
@@ -288,7 +288,7 @@ def test_clone_failure_localizes_classified_reason_and_preserves_audit(
     monkeypatch.setenv("PATH", str(fake_bin) + os.pathsep + os.environ["PATH"])
     workspace = ManagedWorkspace.for_repository("owner/project")
     with pytest.raises(ManagedWorkspaceError) as caught:
-        workspace.ensure()
+        workspace.ensure_path()
     audit = f"Runner 独立仓库操作失败（退出码 7）：{zh}"
     assert str(caught.value) == audit
     assert error_detail(caught.value, "zh") == audit

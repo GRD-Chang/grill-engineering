@@ -261,7 +261,8 @@ def observations(tmp_path, original, payload, *, kind="ticket", approve=False):
     for mode, script in (("old", OLD_CALLER), ("native", NATIVE_CALLER)):
         api.write_text(json.dumps({"pr": {}, "classic": [], **payload}))
         pythonpath = (os.pathsep.join(str(source / x) for x in ("project/src", "project/tests"))
-                      if mode == "old" else str(Path(__file__).resolve().parents[1] / "src"))
+                      if mode == "old" else os.pathsep.join(str(Path(__file__).resolve().parents[1] / name)
+                                                          for name in ("src", "tests")))
         result = subprocess.run(
             [sys.executable, "-B", "-c", script],
             input=json.dumps({"root": str(tmp_path / (mode + "-run")), "operation": "engine",

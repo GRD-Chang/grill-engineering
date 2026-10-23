@@ -180,11 +180,13 @@ class ExternalObjects:
 
 class SyntheticGitHub:
     def __init__(self, git: LocalGit, database: Path, repository: str, *,
-                 physical: OfflineGit, written: Callable[[int, Mapping[str, Any], subprocess.CompletedProcess[str]], None], read_faults: set[str]) -> None:
+                 physical: OfflineGit, written: Callable[[int, Mapping[str, Any], subprocess.CompletedProcess[str]], None], read_faults: set[str],
+                 actor: str = 'offline-publisher') -> None:
         self.git, self.database, self.repository = git, database, repository
         self.objects = ExternalObjects(database)
         self.physical, self.remote = physical, physical.remote
         self.written, self.read_faults = written, read_faults
+        self.actor = actor
 
     def _record(self, method: str, endpoint: str, body: Mapping[str, Any], response: Any) -> int:
         if method == 'GET':
@@ -214,7 +216,7 @@ class SyntheticGitHub:
         self._read(endpoint)
         tail = endpoint.removeprefix('repos/' + self.repository + '/')
         if endpoint == 'user':
-            result: dict[str, Any] = {'login': 'offline-publisher'}
+            result: dict[str, Any] = {'login': self.actor}
         elif tail.startswith('git/commits/'):
             result = self.physical.commit(tail.rsplit('/', 1)[1])
         elif tail.startswith('compare/'):
@@ -248,7 +250,7 @@ class SyntheticGitHub:
 
     def write(self, endpoint: str, method: str, body: Mapping[str, Any]) -> subprocess.CompletedProcess[str]:
         tail = endpoint.removeprefix('repos/' + self.repository + '/'); refs = self.physical.refs()
-        actor = 'offline-publisher'; response: dict[str, Any]
+        actor = self.actor; response: dict[str, Any]
         if tail == 'pulls' and method == 'POST':
             number = self.objects.next_number()
             source, target = 'refs/heads/' + body['head'], 'refs/heads/' + body['base']
