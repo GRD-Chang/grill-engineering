@@ -675,7 +675,8 @@ def test_public_queries_show_the_recorded_pending_abandonment_instead_of_new_bus
             assert main([command, "--parent", "1", "--repo", "example/project", "--json"]) == 0
             document = json.loads(capsys.readouterr().out)
             assert document["status"] == "abandonment_pending"
-            assert document["progress"]["status"] == "abandonment_pending"
+            assert document["phase"] == "abandonment_pending"
+            assert "progress" not in document
             assert document["abandonment"]["action"] == "original-abandon"
             assert document["abandonment"]["status"] == "pending"
             assert all(action["operation"] == "abandon" for action in document["operator_actions"])
