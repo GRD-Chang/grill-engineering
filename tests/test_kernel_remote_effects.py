@@ -392,7 +392,8 @@ def test_remote_cleanup_uses_selected_runner_transport_and_original_head(tmp_pat
         payload={"remote": "origin", "branch_ref": push.source_ref, "expected_head": push.after_sha, "github_identity": identity})
     authorized = []
     result = selected.execute(cleanup, lambda: authorized.append("delete"))
-    assert result.disposition == "target" and authorized == ["delete"]
+    # Cleanup authorizes the intent; Git rechecks immediately before spawning.
+    assert result.disposition == "target" and authorized == ["delete", "delete"]
     assert git.run("show-ref", "--verify", "--hash", push.source_ref).stdout.strip() == push.after_sha
     observed = [json.loads(line) for line in log.read_text().splitlines()]
     def verb(row):

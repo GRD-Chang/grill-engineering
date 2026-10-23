@@ -59,7 +59,9 @@ def test_delivery_adapter_reads_real_refs_and_scripted_checks_without_world_vers
         None, 'offline-publisher', {'title': 'Independent PR', 'body': 'Observed external body.'}, scenario.execution)
     authorized = []
     acknowledgement = port.execute(effect, lambda: authorized.append(True))
-    assert authorized == [True] and acknowledgement is not None
+    # Recheck authority after readback, immediately before the single POST.
+    assert authorized == [True, True] and acknowledgement is not None
+    assert sum(row['operation'] == 'pr_write' for row in port.writes()) == 1
     assert acknowledgement.pr is not None
     request = DeliveryRead(effect.source_ref, effect.target_ref, acknowledgement.pr.number, (base.sha,))
     operations = bound_ports(scenario)
