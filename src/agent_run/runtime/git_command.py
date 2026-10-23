@@ -6,7 +6,7 @@ import signal
 import subprocess
 import time
 from functools import lru_cache
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from agent_run.errors import GitError
@@ -44,16 +44,41 @@ def git_environment(environment: Mapping[str, str] | None = None) -> dict[str, s
     } | {"GIT_OPTIONAL_LOCKS": "0"}
 
 
+def _wait_child(kind: int, identity: int, options: int) -> os.waitid_result | None:
+    try:
+        return os.waitid(kind, identity, options)
+    except ChildProcessError as error:
+        raise GitError("Git child ownership lost") from error
+
+
+def _reap_child(kind: int, identity: int) -> int:
+    try:
+        result = _wait_child(kind, identity, os.WEXITED)
+    except GitError:
+        raise
+    except BaseException as wait_error:
+        # A failed wait can already have consumed the child. Only a stable
+        # pidfd may be retried; a numeric PID must never be looked up again.
+        if kind == os.P_PIDFD:
+            try:
+                _wait_child(kind, identity, os.WEXITED)
+            except BaseException as cleanup_error:
+                raise wait_error from cleanup_error
+        raise
+    assert result is not None
+    return result.si_status if result.si_code == os.CLD_EXITED else -result.si_status
+
+
 def _require_waitable_children() -> None:
     """Linux admission, without changing the host's SIGCHLD disposition.
 
     The kernel masks catch C handlers invisible to Python's signal cache. A
-    short exact-PID reap also detects SIG_DFL with hidden SA_NOCLDWAIT. The
+    short probe also detects SIG_DFL with hidden SA_NOCLDWAIT. The
     caller must retain this policy and exclusive ownership during run_git.
     """
     try:
-        if not hasattr(os, "WNOWAIT"):
-            raise ValueError("WNOWAIT is unavailable")
+        if not all(hasattr(os, name) for name in ("WNOWAIT", "P_PIDFD", "pidfd_open")):
+            raise ValueError("Linux pidfd/WNOWAIT support is unavailable")
         masks = dict(
             line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines()
             if line.startswith(("SigIgn:", "SigCgt:"))
@@ -64,18 +89,23 @@ def _require_waitable_children() -> None:
         # /bin/true is already required by the Linux installation/probes. No
         # inherited loader environment, fork-in-Python, or signal policy change.
         probe = os.posix_spawn("/bin/true", ["/bin/true"], {})
+        probe_fd = None
         try:
-            os.waitid(os.P_PID, probe, os.WEXITED | os.WNOWAIT)
+            probe_fd = os.pidfd_open(probe)
+            _wait_child(os.P_PIDFD, probe_fd, os.WEXITED | os.WNOWAIT)
         finally:
             try:
-                os.waitpid(probe, 0)
-            except OSError:
-                try:
-                    os.waitpid(probe, 0)
-                except OSError:
-                    pass
-                raise
-    except (OSError, ValueError, KeyError, AttributeError) as error:
+                if probe_fd is None:
+                    # Acquisition failure permits one first reap only after
+                    # WNOWAIT proves a still-pinned zombie. SA_NOCLDWAIT
+                    # cannot yield a waitable exit, so it never reaches reap.
+                    _wait_child(os.P_PID, probe, os.WEXITED | os.WNOWAIT)
+                _reap_child(os.P_PID if probe_fd is None else os.P_PIDFD,
+                            probe if probe_fd is None else probe_fd)
+            finally:
+                if probe_fd is not None:
+                    os.close(probe_fd)
+    except (GitError, OSError, ValueError, KeyError, AttributeError) as error:
         raise GitError(
             "Git requires waitable children and a fixed default SIGCHLD policy"
         ) from error
@@ -85,11 +115,13 @@ def run_git(
     arguments: list[str], *, cwd: Path, input: str | None = None,
     timeout: float | None = None,
     environment: Mapping[str, str] | None = None,
+    authorize: Callable[[], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Drain both pipes; never return a truncated patch or other Git result.
 
-    Linux host contract: fixed default SIGCHLD policy, no competing reaper,
-    and exclusive ownership of this private Popen until final reap.
+    Linux/CPython host contract: fixed default SIGCHLD policy, no competing
+    reaper, and exclusive ownership of this private Popen until final reap.
+    The optional write guard runs after preparation, immediately before spawn.
     """
     if input is not None and len(input) > MAX_GIT_OUTPUT_BYTES:
         raise GitError("Git input exceeds the 1 MiB transfer limit")
@@ -110,25 +142,30 @@ def run_git(
 
     _require_waitable_children()
     executable = _git_executable(environment.get("PATH", os.defpath))
+    prepared = [executable, *arguments[1:]]
+    if authorize is not None:
+        authorize()
     process = subprocess.Popen(
-        [executable, *arguments[1:]], cwd=cwd,
+        prepared, cwd=cwd,
         stdin=subprocess.PIPE if input is not None else None,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
         env=environment,
     )
+    # Transfer reaping out of Popen, including its CPython destructor/_active
+    # cleanup. returncode stays None if a wait result is genuinely unknown.
+    setattr(process, "_child_created", False)
+    pidfd = None
     deadline = time.monotonic() + timeout if timeout is not None else None
     stdout, stderr = CompleteOutput(MAX_GIT_OUTPUT_BYTES), TailOutput(MAX_GIT_ERROR_BYTES)
     exited = False
     group_signalled = False
 
     def observe(*, block: bool = False) -> bool:
-        try:
-            return os.waitid(
-                os.P_PID, process.pid,
-                os.WEXITED | os.WNOWAIT | (0 if block else os.WNOHANG),
-            ) is not None
-        except ChildProcessError as error:
-            raise GitError("Git child ownership lost before group cleanup") from error
+        return _wait_child(
+            os.P_PID if pidfd is None else os.P_PIDFD,
+            process.pid if pidfd is None else pidfd,
+            os.WEXITED | os.WNOWAIT | (0 if block else os.WNOHANG),
+        ) is not None
 
     def close_group() -> None:
         nonlocal group_signalled
@@ -138,15 +175,6 @@ def run_git(
             observe()
             group_signalled = True
             _kill_group(process.pid)
-
-    def reap() -> int:
-        try:
-            _, status = os.waitpid(process.pid, 0)
-        except ChildProcessError as error:
-            # Popen.wait would silently turn ECHILD into success.
-            raise GitError("Git child ownership lost during final reap") from error
-        process.returncode = os.waitstatus_to_exitcode(status)
-        return process.returncode
 
     def check() -> bool:
         nonlocal exited
@@ -160,6 +188,9 @@ def run_git(
         return True
 
     try:
+        # Admission and sole ownership pin the new child's PID until our first
+        # consuming wait. Acquire its stable identity before entering the pump.
+        pidfd = os.pidfd_open(process.pid)
         # The pump must not reap through poll, including after pipe EOF.
         pump(process, stdout=stdout, stderr=stderr, input_data=data, check=check, stop_at_eof=True)
         while not exited:
@@ -180,20 +211,17 @@ def run_git(
     finally:
         try:
             close_group()
-            try:
-                returncode = reap()
-            except BaseException as wait_error:
-                # A wait may have consumed the child before raising. Retry only
-                # the exact reap, never signal an uncertain numeric PGID again.
-                try:
-                    reap()
-                except BaseException as cleanup_error:
-                    raise wait_error from cleanup_error
-                raise
+            returncode = _reap_child(os.P_PID if pidfd is None else os.P_PIDFD,
+                                     process.pid if pidfd is None else pidfd)
+            process.returncode = returncode
         finally:
-            for stream in (process.stdout, process.stderr, process.stdin):
-                if stream is not None:
-                    stream.close()
+            try:
+                for stream in (process.stdout, process.stderr, process.stdin):
+                    if stream is not None:
+                        stream.close()
+            finally:
+                if pidfd is not None:
+                    os.close(pidfd)
     error = safe_output(stderr.data.decode("utf-8", errors="replace"))
     # Replacement decoding may expand invalid bytes; the diagnostic is byte bounded too.
     encoded = error.encode()

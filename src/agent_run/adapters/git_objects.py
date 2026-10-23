@@ -25,13 +25,13 @@ class LocalGit:
     def run(self, *arguments: str, cwd: Path | None = None, input_text: str | None = None,
             check: bool = True) -> subprocess.CompletedProcess[str]:
         command = ("git", "-C", str(cwd or self.root), *arguments)
-        if arguments and (arguments[0] in {"init", "config", "add", "commit", "commit-tree", "reset", "update-ref", "worktree", "switch", "write-tree", "merge-tree", "merge"}
+        authorize = None
+        if arguments and (arguments[0] in {"init", "config", "add", "commit", "commit-tree", "reset", "update-ref", "worktree", "switch", "write-tree", "merge-tree", "merge", "push"}
                           or arguments[0] == "hash-object" and "-w" in arguments):
-            if self.authorize is not None:
-                self.authorize()
+            authorize = self.authorize
         try:
             result = run_git(list(command), cwd=cwd or self.root, input=input_text,
-                             timeout=30, environment=self.env)
+                             timeout=30, environment=self.env, authorize=authorize)
         except GitError as error:
             raise KernelError("git_operation_failed", str(error)) from error
         if check and result.returncode:

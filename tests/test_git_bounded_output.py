@@ -22,7 +22,8 @@ def test_git_wait_failure_still_closes_all_owned_pipes(
         raise OSError("injected wait failure")
 
     streams = [(tmp_path / name).open("w+b") for name in ("stdin", "stdout", "stderr")]
-    descriptors = [stream.fileno() for stream in streams]
+    handle = os.open(os.devnull, os.O_RDONLY)
+    descriptors = [stream.fileno() for stream in streams] + [handle]
     try:
         process = SimpleNamespace(
             pid=900000001, stdin=streams[0], stdout=streams[1], stderr=streams[2],
@@ -31,8 +32,14 @@ def test_git_wait_failure_still_closes_all_owned_pipes(
         monkeypatch.setattr(git_command.subprocess, "Popen", lambda *a, **k: process)
         monkeypatch.setattr(git_command, "pump", lambda *a, **k: None)
         monkeypatch.setattr(git_command, "_require_waitable_children", lambda: None)
-        monkeypatch.setattr(git_command.os, "waitid", lambda *a: SimpleNamespace(si_pid=process.pid))
-        monkeypatch.setattr(git_command.os, "waitpid", failed_wait)
+        def waitid(kind, identity, options):
+            assert kind == os.P_PIDFD and identity == handle
+            if not options & os.WNOWAIT:
+                failed_wait()
+            return SimpleNamespace(si_pid=process.pid)
+
+        monkeypatch.setattr(git_command.os, "pidfd_open", lambda *a: handle)
+        monkeypatch.setattr(git_command.os, "waitid", waitid)
         # This failure-path check sends no signal to any actual process or group.
         monkeypatch.setattr(git_command.os, "killpg", lambda *a: None)
         with pytest.raises(OSError, match="injected wait failure"):
@@ -45,6 +52,10 @@ def test_git_wait_failure_still_closes_all_owned_pipes(
     finally:
         for stream in streams:
             stream.close()
+        try:
+            os.close(handle)
+        except OSError:
+            pass
 
 
 def test_git_reads_ignore_inherited_shallow_file_but_keep_repository_boundary(

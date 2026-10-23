@@ -16,38 +16,33 @@ def test_git_group_signal_precedes_only_reap_and_wait_errors_close_fds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wait_failure: str | None,
 ) -> None:
     streams = [(tmp_path / name).open("w+b") for name in ("stdin", "stdout", "stderr")]
-    descriptors = [stream.fileno() for stream in streams]
+    handle = os.open(os.devnull, os.O_RDONLY)  # Mock identity, not a live PID.
+    descriptors = [stream.fileno() for stream in streams] + [handle]
     reaped = False
     waits = 0
     signals = []
 
-    def waitpid(pid, options):
+    def waitid(kind, identity, options):
         nonlocal reaped, waits
-        assert pid == 900000001 and options == 0
-        waits += 1
+        assert kind == os.P_PIDFD and identity == handle
+        if not options & os.WNOWAIT:
+            waits += 1
         if reaped:
             raise ChildProcessError("injected already reaped")
-        if waits == 1 and wait_failure == "before_reap":
-            raise OSError("injected wait failure")
-        reaped = True
-        if waits == 1 and wait_failure == "after_reap":
-            raise OSError("injected wait failure")
-        return pid, 7 << 8
-
-    def waitid(kind, pid, options):
-        assert kind == os.P_PID and pid == 900000001
-        assert options & os.WNOWAIT
-        if reaped:
-            raise ChildProcessError("injected already reaped")
-        return SimpleNamespace(si_pid=pid)
+        if not options & os.WNOWAIT:
+            if waits == 1 and wait_failure == "before_reap":
+                raise OSError("injected wait failure")
+            reaped = True
+            if waits == 1 and wait_failure == "after_reap":
+                raise OSError("injected wait failure")
+        return SimpleNamespace(si_pid=900000001, si_code=os.CLD_EXITED, si_status=7)
 
     def forbidden_poll():
         pytest.fail("Git or pump consumed the leader through poll")
 
     process = SimpleNamespace(
         pid=900000001, stdin=streams[0], stdout=streams[1], stderr=streams[2],
-        poll=forbidden_poll, wait=lambda **kw: waitpid(900000001, 0)[1] >> 8,
-        returncode=None,
+        poll=forbidden_poll, returncode=None,
     )
 
     def pipe_boundary(process, *, check, stdout, stderr, **kwargs):
@@ -56,11 +51,11 @@ def test_git_group_signal_precedes_only_reap_and_wait_errors_close_fds(
         stdout.feed(b"complete output\n")
         stderr.feed(b"diagnostic\n")
 
-    monkeypatch.setattr(git_command, "_require_waitable_children", lambda: None, raising=False)
+    monkeypatch.setattr(git_command, "_require_waitable_children", lambda: None)
     monkeypatch.setattr(git_command.subprocess, "Popen", lambda *a, **kw: process)
     monkeypatch.setattr(git_command, "pump", pipe_boundary)
+    monkeypatch.setattr(os, "pidfd_open", lambda *a: handle)
     monkeypatch.setattr(os, "waitid", waitid)
-    monkeypatch.setattr(os, "waitpid", waitpid)
     # Numeric fixture identity is never signalled on the actual OS.
     monkeypatch.setattr(os, "killpg", lambda pid, sig: signals.append((pid, reaped)))
     try:
@@ -81,6 +76,10 @@ def test_git_group_signal_precedes_only_reap_and_wait_errors_close_fds(
     finally:
         for stream in streams:
             stream.close()
+        try:
+            os.close(handle)
+        except OSError:
+            pass
 
 
 @pytest.mark.parametrize("phase", ["observe", "reap"])
@@ -88,31 +87,39 @@ def test_git_lost_child_ownership_never_signals_after_loss(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
 ) -> None:
     streams = [(tmp_path / name).open("w+b") for name in ("stdout", "stderr")]
+    handle = os.open(os.devnull, os.O_RDONLY)
     signals = []
     process = SimpleNamespace(
         pid=900000001, stdin=None, stdout=streams[0], stderr=streams[1], returncode=None,
-        poll=lambda: 0, wait=lambda **kw: 0,
     )
 
-    def lost_child(*args):
-        raise ChildProcessError("injected ECHILD")
+    def waitid(kind, identity, options):
+        assert kind == os.P_PIDFD and identity == handle
+        if phase == "observe" or not options & os.WNOWAIT:
+            raise ChildProcessError("injected ECHILD")
+        return SimpleNamespace(si_pid=process.pid)
 
-    monkeypatch.setattr(git_command, "_require_waitable_children", lambda: None, raising=False)
+    monkeypatch.setattr(git_command, "_require_waitable_children", lambda: None)
     monkeypatch.setattr(git_command.subprocess, "Popen", lambda *a, **kw: process)
     monkeypatch.setattr(git_command, "pump", lambda *a, **kw: kw["check"]())
-    monkeypatch.setattr(
-        os, "waitid", lost_child if phase == "observe" else lambda *a: SimpleNamespace(si_pid=process.pid),
-    )
-    monkeypatch.setattr(os, "waitpid", lost_child)
+    monkeypatch.setattr(os, "pidfd_open", lambda *a: handle)
+    monkeypatch.setattr(os, "waitid", waitid)
     monkeypatch.setattr(os, "killpg", lambda *a: signals.append(a))
     try:
         with pytest.raises(GitError, match="child ownership lost"):
             git_command.run_git(["git", "--version"], cwd=tmp_path)
         assert len(signals) == (0 if phase == "observe" else 1)
         assert all(stream.closed for stream in streams)
+        assert process._child_created is False
+        with pytest.raises(OSError):
+            os.fstat(handle)
     finally:
         for stream in streams:
             stream.close()
+        try:
+            os.close(handle)
+        except OSError:
+            pass
 
 
 @pytest.fixture(scope="module")
@@ -198,7 +205,9 @@ def test_two_concurrent_git_calls_own_reaping_without_poll(
     processes = []
     signalled = []
     reaped = []
-    real_spawn, real_signal, real_wait = subprocess.Popen, os.killpg, os.waitpid
+    real_spawn, real_signal = subprocess.Popen, os.killpg
+    real_open, real_wait = os.pidfd_open, os.waitid
+    handles = {}
 
     def spawn(*args, **kwargs):
         process = real_spawn(*args, **kwargs)
@@ -219,15 +228,24 @@ def test_two_concurrent_git_calls_own_reaping_without_poll(
         signalled.append(pid)
         real_signal(pid, sig)
 
-    def waitpid(pid, options):
-        result = real_wait(pid, options)
-        if pid in {process.pid for process in processes}:
-            reaped.append(pid)
+    def pidfd_open(pid, flags=0):
+        fd = real_open(pid, flags)
+        handles[fd] = pid
+        return fd
+
+    def waitid(kind, identity, options):
+        result = real_wait(kind, identity, options)
+        if not options & os.WNOWAIT:
+            assert kind == os.P_PIDFD
+            assert result.si_pid == handles[identity]
+            if result.si_pid in {process.pid for process in processes}:
+                reaped.append(result.si_pid)
         return result
 
     monkeypatch.setattr(subprocess, "Popen", spawn)
     monkeypatch.setattr(os, "killpg", signal_group)
-    monkeypatch.setattr(os, "waitpid", waitpid)
+    monkeypatch.setattr(os, "pidfd_open", pidfd_open)
+    monkeypatch.setattr(os, "waitid", waitid)
     with ThreadPoolExecutor(max_workers=2) as executor:
         calls = [executor.submit(git_command.run_git, ["git", "--version"], cwd=tmp_path)
                  for _ in range(2)]
@@ -318,3 +336,299 @@ def test_git_waits_for_live_leader_after_pipe_eof(tmp_path: Path, timeout: float
     assert result.returncode == 7
     assert result.stdout == result.stderr == ""
     assert (tmp_path / "finished").is_file()
+
+
+@pytest.mark.parametrize("stop_at", ["probe_return", "guard_read"])
+def test_public_stop_at_git_probe_return_prevents_workspace_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop_at: str,
+) -> None:
+    from agent_run.adapters import git_objects
+    from agent_run.adapters.local_git import LocalEffects
+    from agent_run.model import DeliveryKind
+    from support.offline import Scenario
+
+    scenario = Scenario(tmp_path / "stop-at-probe", DeliveryKind.TICKET)
+    checkout = Path(scenario.delivery.checkout)
+    assert not checkout.exists()
+    real_run, real_probe, real_spawn = git_objects.run_git, git_command._require_waitable_children, git_command.subprocess.Popen
+    creating = False
+    stopped = False
+    worktree_spawns = []
+    real_reconcile = LocalEffects.reconcile
+
+    def stop():
+        nonlocal stopped
+        assert scenario.kernel.control("stop", "stop-at-git-probe") == "applied"
+        stopped = True
+
+    def reconcile(local, effect):
+        result = real_reconcile(local, effect)
+        if creating and not stopped and stop_at == "guard_read":
+            stop()
+        return result
+
+    def run(arguments, **kwargs):
+        nonlocal creating
+        previous = creating
+        creating = "worktree" in arguments and "add" in arguments
+        try:
+            return real_run(arguments, **kwargs)
+        finally:
+            creating = previous
+
+    def probe():
+        nonlocal stopped
+        real_probe()
+        if creating and not stopped and stop_at == "probe_return":
+            stop()
+
+    def spawn(arguments, **kwargs):
+        if "worktree" in arguments and "add" in arguments:
+            worktree_spawns.append(arguments)
+        return real_spawn(arguments, **kwargs)
+
+    monkeypatch.setattr(LocalEffects, "reconcile", reconcile)
+    monkeypatch.setattr(git_objects, "run_git", run)
+    monkeypatch.setattr(git_command, "_require_waitable_children", probe)
+    monkeypatch.setattr(git_command.subprocess, "Popen", spawn)
+    for _ in range(16):
+        scenario.runner().run_once()
+        if stopped:
+            break
+    assert stopped and scenario.kernel.source_status()["stopped"] is True
+    assert not checkout.exists()
+    assert worktree_spawns == []
+
+
+@pytest.mark.parametrize("consume_first", [False, True], ids=["before_reap", "after_reap"])
+def test_real_popen_wait_error_uses_stable_identity_and_disables_automatic_reap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, consume_first: bool,
+) -> None:
+    import subprocess
+
+    processes = []
+    signals = []
+    stable_waits = []
+    owned_fds = []
+    numeric_reaps = []
+    poll_attempts = []
+    handles = {}
+    injected = False
+    real_spawn, real_open = subprocess.Popen, os.pidfd_open
+    real_waitid, real_waitpid, real_signal = os.waitid, os.waitpid, os.killpg
+
+    def spawn(*args, **kwargs):
+        process = real_spawn(*args, **kwargs)
+        processes.append(process)
+        owned_fds.extend(stream.fileno() for stream in (process.stdout, process.stderr, process.stdin))
+        return process
+
+    def pidfd_open(pid, flags=0):
+        fd = real_open(pid, flags)
+        handles[fd] = pid
+        if processes and pid == processes[0].pid:
+            owned_fds.append(fd)
+        return fd
+
+    def waitid(kind, identity, options):
+        nonlocal injected
+        target = processes and handles.get(identity) == processes[0].pid
+        if kind == os.P_PIDFD and target and not options & os.WNOWAIT:
+            stable_waits.append(identity)
+            if not injected:
+                injected = True
+                if consume_first:
+                    real_waitid(kind, identity, options)
+                raise OSError("injected uncertain wait result")
+        return real_waitid(kind, identity, options)
+
+    def waitpid(pid, options):
+        nonlocal injected
+        if processes and pid == processes[0].pid:
+            numeric_reaps.append(pid)
+            if not injected:
+                injected = True
+                if consume_first:
+                    real_waitpid(pid, options)
+                raise OSError("injected uncertain wait result")
+        return real_waitpid(pid, options)
+
+    def signal_group(pid, sig):
+        assert pid == processes[0].pid
+        signals.append(pid)
+        real_signal(pid, sig)
+
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    monkeypatch.setattr(os, "pidfd_open", pidfd_open)
+    monkeypatch.setattr(os, "waitid", waitid)
+    monkeypatch.setattr(os, "waitpid", waitpid)
+    monkeypatch.setattr(os, "killpg", signal_group)
+    with pytest.raises(OSError, match="injected uncertain wait result"):
+        git_command.run_git(["git", "--version"], cwd=tmp_path, input="input")
+    process = processes[0]
+    assert process.stdout.closed and process.stderr.closed and process.stdin.closed
+    # Exercise the real Popen destructor, not a SimpleNamespace stand-in.
+    monkeypatch.setattr(process, "_internal_poll", lambda **kw: poll_attempts.append(kw))
+    process.__del__()
+    # Keep a failing baseline test from enqueuing its fixture for later
+    # implicit numeric reaping after the assertion has already caught it.
+    setattr(process, "_child_created", False)
+    if process in subprocess._active:
+        subprocess._active.remove(process)
+    assert poll_attempts == []
+    assert numeric_reaps == []
+    assert len(stable_waits) == 2 and stable_waits[0] == stable_waits[1]
+    assert signals == [process.pid]
+    assert process.returncode is None  # Do not invent a success/exit status.
+    for fd in owned_fds:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+    with pytest.raises(ChildProcessError):
+        real_waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+
+
+@pytest.mark.parametrize("consume_first", [False, True], ids=["before_reap", "after_reap"])
+def test_probe_uncertain_reap_retries_same_pidfd_without_starting_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, consume_first: bool,
+) -> None:
+    real_wait = os.waitid
+    waits = []
+    injected = False
+
+    def waitid(kind, identity, options):
+        nonlocal injected
+        if not options & os.WNOWAIT:
+            assert kind == os.P_PIDFD
+            waits.append(identity)
+            if not injected:
+                injected = True
+                if consume_first:
+                    real_wait(kind, identity, options)
+                raise OSError("injected uncertain probe wait")
+        return real_wait(kind, identity, options)
+
+    def forbidden_spawn(*args, **kwargs):
+        pytest.fail("Git started after the admission probe failed")
+
+    monkeypatch.setattr(os, "waitid", waitid)
+    monkeypatch.setattr(git_command.subprocess, "Popen", forbidden_spawn)
+    with pytest.raises(GitError, match="waitable children"):
+        git_command.run_git(["git", "--version"], cwd=tmp_path)
+    assert len(waits) == 2 and waits[0] == waits[1]
+    with pytest.raises(OSError):
+        os.fstat(waits[0])
+
+
+@pytest.mark.parametrize("arguments", [
+    ("init",), ("config", "user.name", "synthetic"), ("add", "file"),
+    ("commit",), ("commit-tree",), ("reset",), ("update-ref",),
+    ("worktree", "add"), ("switch",), ("write-tree",),
+    ("merge-tree", "--write-tree"), ("merge",), ("hash-object", "-w"), ("push",),
+])
+def test_local_git_mutations_recheck_authority_after_preparation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arguments: tuple[str, ...],
+) -> None:
+    from agent_run.adapters.git_objects import LocalGit
+    from agent_run.errors import KernelError
+
+    boundary = []
+
+    def probe():
+        boundary.append("probe")
+
+    def authorize():
+        assert boundary == ["probe"]
+        boundary.append("authorize")
+        raise KernelError("synthetic_stop")
+
+    def forbidden_spawn(*args, **kwargs):
+        pytest.fail("a stopped mutation reached Popen")
+
+    monkeypatch.setattr(git_command, "_require_waitable_children", probe)
+    monkeypatch.setattr(git_command.subprocess, "Popen", forbidden_spawn)
+    with pytest.raises(KernelError, match="synthetic_stop"):
+        LocalGit(tmp_path, authorize).run(*arguments)
+    assert boundary == ["probe", "authorize"]
+
+
+@pytest.mark.parametrize("phase", ["probe", "git"])
+def test_pidfd_acquisition_failure_reaps_pinned_child_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
+) -> None:
+    import subprocess
+
+    processes, probes, numeric_reaps, signals = [], [], [], []
+    real_spawn, real_probe = subprocess.Popen, os.posix_spawn
+    real_open, real_wait, real_signal = os.pidfd_open, os.waitid, os.killpg
+
+    def spawn(*args, **kwargs):
+        process = real_spawn(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    def probe(*args, **kwargs):
+        pid = real_probe(*args, **kwargs)
+        probes.append(pid)
+        return pid
+
+    def pidfd_open(pid, flags=0):
+        if (phase == "probe" and pid in probes or phase == "git" and processes
+                and pid == processes[0].pid):
+            raise OSError("injected pidfd acquisition failure")
+        return real_open(pid, flags)
+
+    def waitid(kind, identity, options):
+        if kind == os.P_PID and not options & os.WNOWAIT:
+            numeric_reaps.append(identity)
+        return real_wait(kind, identity, options)
+
+    def signal_group(pid, sig):
+        assert processes and pid == processes[0].pid
+        # No consuming wait has happened on this acquisition-failure path.
+        real_wait(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        signals.append(pid)
+        real_signal(pid, sig)
+
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    monkeypatch.setattr(os, "posix_spawn", probe)
+    monkeypatch.setattr(os, "pidfd_open", pidfd_open)
+    monkeypatch.setattr(os, "waitid", waitid)
+    monkeypatch.setattr(os, "killpg", signal_group)
+    with pytest.raises(GitError if phase == "probe" else OSError):
+        git_command.run_git(["git", "--version"], cwd=tmp_path)
+    target = probes[0] if phase == "probe" else processes[0].pid
+    assert numeric_reaps == [target]
+    assert signals == ([] if phase == "probe" else [target])
+    if phase == "probe":
+        assert processes == []
+    else:
+        assert processes[0].stdout.closed and processes[0].stderr.closed
+        assert processes[0]._child_created is False
+    with pytest.raises(ChildProcessError):
+        real_wait(os.P_PID, target, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+
+
+def test_probe_observation_error_still_reaps_by_pidfd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_wait = os.waitid
+    waits = []
+
+    def waitid(kind, identity, options):
+        assert kind == os.P_PIDFD
+        waits.append((identity, options))
+        result = real_wait(kind, identity, options)
+        if options & os.WNOWAIT:
+            raise OSError("injected probe observation failure")
+        return result
+
+    def forbidden_spawn(*args, **kwargs):
+        pytest.fail("Git started after the admission probe failed")
+
+    monkeypatch.setattr(os, "waitid", waitid)
+    monkeypatch.setattr(git_command.subprocess, "Popen", forbidden_spawn)
+    with pytest.raises(GitError, match="waitable children"):
+        git_command.run_git(["git", "--version"], cwd=tmp_path)
+    assert len(waits) == 2 and waits[0][0] == waits[1][0]
+    with pytest.raises(OSError):
+        os.fstat(waits[0][0])

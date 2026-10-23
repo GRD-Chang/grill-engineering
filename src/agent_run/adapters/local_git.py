@@ -279,6 +279,9 @@ class LocalEffects:
             current = self.reconcile(effect)
             if current.disposition not in {"prior", "target"}:
                 raise KernelError("local_effect_boundary_changed")
+            # Reconciliation can wait for Git; retain the original admission
+            # boundary and recheck Core authority after the last physical read.
+            authorize()
 
         writer = LocalGit(self.git.root, guard)
         writer.env = self.git.env.copy()
