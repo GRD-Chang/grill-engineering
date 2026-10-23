@@ -872,6 +872,43 @@ def test_candidate_probe_timeout_cleans_nested_process_and_probe_temporary_files
     assert not list((_data_root(home) / "snapshots").glob("*"))
 
 
+@pytest.mark.parametrize("output", ["complete", "stdout", "stderr"])
+def test_candidate_probe_captures_both_streams_and_rejects_overflow_without_eof(
+    output: str,
+) -> None:
+    limit = runner_installer._MAX_CANDIDATE_PROBE_OUTPUT_BYTES
+    program = (
+        f"import os\nos.write(1, b'o' * {limit})\nos.write(2, b'e' * {limit})\n"
+        if output == "complete" else
+        f"import os, signal\nos.write({1 if output == 'stdout' else 2}, b'x' * {limit + 1})\n"
+        "signal.pause()\n"
+    )
+    baseline = runner_installer.capture_process_scope()
+    process = subprocess.Popen(
+        [sys.executable, "-c", program], stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, start_new_session=True,
+    )
+    try:
+        if output == "complete":
+            assert runner_installer._read_candidate_probe_output(
+                process, timeout_seconds=2, adopted_baseline=baseline,
+            ) == (b'o' * limit, b'e' * limit)
+        else:
+            # The writer never closes its pipe: rejection must precede EOF
+            # and report overflow rather than exhausting the read deadline.
+            with pytest.raises(runner_installer.InstallerError, match="output is too large"):
+                runner_installer._read_candidate_probe_output(
+                    process, timeout_seconds=2, adopted_baseline=baseline,
+                )
+        assert process.poll() is not None
+        assert process.stdout.closed and process.stderr.closed
+    finally:
+        if process.poll() is None:
+            runner_installer._terminate_process_group(process, adopted_baseline=baseline)
+        process.stdout.close()
+        process.stderr.close()
+
+
 def test_candidate_probe_inner_timeout_kills_forked_codex_children(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

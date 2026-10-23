@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Sequence, cast
+from typing import Any, Iterator, Sequence
 
 # Direct scripts locate their own package before importing business modules.
 # Keep this rule identical in installer, setup and compatibility probe.
@@ -28,6 +28,7 @@ if __package__ in (None, ""):
     sys.dont_write_bytecode = True
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from agent_run._process_io import CompleteOutput, pump
 from agent_run.paths import app_data_root
 from agent_run.process_cleanup import (
     capture_process_scope,
@@ -602,51 +603,36 @@ def _read_candidate_probe_output(
     timeout_seconds: float,
     adopted_baseline: set[int] | None = None,
 ) -> tuple[bytes, bytes]:
-    streams = {"stdout": process.stdout, "stderr": process.stderr}
-    if any(stream is None for stream in streams.values()):
+    streams = (process.stdout, process.stderr)
+    if any(stream is None for stream in streams):
         _terminate_process_group(process, adopted_baseline=adopted_baseline)
         raise InstallerError("Runner Compatibility Check failed")
     deadline = time.monotonic() + timeout_seconds
-    buffers = {name: bytearray() for name in streams}
+
+    class ProbeOutput(CompleteOutput):
+        def feed(self, chunk: bytes) -> None:
+            super().feed(chunk)
+            if self.overflow:
+                raise InstallerError("Runner Compatibility Check output is too large")
+
+    stdout = ProbeOutput(_MAX_CANDIDATE_PROBE_OUTPUT_BYTES)
+    stderr = ProbeOutput(_MAX_CANDIDATE_PROBE_OUTPUT_BYTES)
+
+    def check() -> bool:
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired("Runner Compatibility Check", timeout_seconds)
+        return True
+
     try:
-        with selectors.DefaultSelector() as selector:
-            for stream in streams.values():
-                assert stream is not None
-                selector.register(stream, selectors.EVENT_READ)
-            while selector.get_map():
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    _terminate_process_group(process, adopted_baseline=adopted_baseline)
-                    raise InstallerError("Runner Compatibility Check timed out")
-                events = selector.select(timeout=remaining)
-                if not events:
-                    _terminate_process_group(process, adopted_baseline=adopted_baseline)
-                    raise InstallerError("Runner Compatibility Check timed out")
-                for key, _mask in events:
-                    stream = cast(Any, key.fileobj)
-                    chunk = os.read(stream.fileno(), 4096)
-                    if not chunk:
-                        selector.unregister(stream)
-                        continue
-                    name = next(
-                        stream_name
-                        for stream_name, candidate_stream in streams.items()
-                        if candidate_stream is stream
-                    )
-                    buffers[name].extend(chunk)
-                    if len(buffers[name]) > _MAX_CANDIDATE_PROBE_OUTPUT_BYTES:
-                        _terminate_process_group(process, adopted_baseline=adopted_baseline)
-                        raise InstallerError("Runner Compatibility Check output is too large")
+        pump(process, stdout=stdout, stderr=stderr, check=check)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            _terminate_process_group(process, adopted_baseline=adopted_baseline)
-            raise InstallerError("Runner Compatibility Check timed out")
-        try:
-            process.wait(timeout=remaining)
-        except subprocess.TimeoutExpired as error:
-            _terminate_process_group(process, adopted_baseline=adopted_baseline)
-            raise InstallerError("Runner Compatibility Check timed out") from error
-        return bytes(buffers["stdout"]), bytes(buffers["stderr"])
+            raise subprocess.TimeoutExpired("Runner Compatibility Check", timeout_seconds)
+        process.wait(timeout=remaining)
+        return stdout.finish(), stderr.finish()
+    except subprocess.TimeoutExpired as error:
+        _terminate_process_group(process, adopted_baseline=adopted_baseline)
+        raise InstallerError("Runner Compatibility Check timed out") from error
     except (OSError, subprocess.SubprocessError) as error:
         _terminate_process_group(process, adopted_baseline=adopted_baseline)
         raise InstallerError("Runner Compatibility Check failed") from error
@@ -654,7 +640,7 @@ def _read_candidate_probe_output(
         _terminate_process_group(process, adopted_baseline=adopted_baseline)
         raise
     finally:
-        for stream in streams.values():
+        for stream in streams:
             if stream is not None:
                 stream.close()
 
