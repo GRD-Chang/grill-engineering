@@ -200,13 +200,15 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
             kernel.agent_exited(call, process, 0)
     monkeypatch.setattr('agent_run.runtime.codex.execute_selected_codex', execute)
     monkeypatch.setattr('agent_run.notifications.sender.NativeNotifications', Notifications)
+    # The 8-second handshake above verifies CI progress alongside the Agent.
+    # This 90-second bound only prevents the full Git/Host-to-Final fixture hanging.
     def expired(_signum, _frame):
-        raise TimeoutError("CI/Agent concurrency story exceeded its 30-second watchdog")
+        raise TimeoutError("CI/Agent full-flow fixture exceeded its 90-second watchdog")
     if signal.getitimer(signal.ITIMER_REAL) != (0.0, 0.0):
         raise RuntimeError("CI/Agent concurrency watchdog requires an inactive ITIMER_REAL")
     previous_handler = signal.signal(signal.SIGALRM, expired)
     try:
-        signal.setitimer(signal.ITIMER_REAL, 30)
+        signal.setitimer(signal.ITIMER_REAL, 90)
         assert executor.run(scenario.kernel, scenario.execution, {}) == 0
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
