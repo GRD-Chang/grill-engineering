@@ -70,7 +70,7 @@ def test_exact_original_pr_edit_noop_authorizes_and_rechecks_live_anchors(
         if mode == "current":
             assert result.pr is not None and result.pr.number == original.number and result.pr.head == revised
             assert port.reconcile(effect) == result
-    assert authorized == ([] if mode == "stale_base" else [mode])
+    assert authorized == ([mode] if mode in {"current", "stopped"} else [])
     assert prepared == ([] if mode == "stale_base" else [mode])
     observed_calls = [json.loads(line) for line in calls.read_text().splitlines()]
     writes = [call for call in observed_calls if "--method" in call]

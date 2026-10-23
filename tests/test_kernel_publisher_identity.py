@@ -9,7 +9,8 @@ import pytest
 from agent_run.config.defaults import UserDefaultsStore
 from agent_run.model import DeliveryKind
 from agent_run.core.kernel import Kernel
-from agent_run.errors import KernelError
+from agent_run.errors import GitHubReadError, KernelError
+from agent_run.core.operation_contract import ReadUnavailable
 from agent_run.config.creation import freeze_creation
 from agent_run.model import Effect, EffectResult
 from support.offline import Scenario
@@ -208,7 +209,23 @@ def test_rearmed_close_settles_the_original_late_write_without_dispatching_again
     boundary = capture_effect(scenario, monkeypatch, "close")
     close = boundary.effect
     assert close.operation == "close"
-    boundary.authorize.prepare()()
+    physical_write = SyntheticGitHub.write
+    queued = []
+
+    def queue_original_close(provider, endpoint, method, body):
+        if endpoint == f"repos/{close.repository}/issues/{close.payload['issue']}" and method == "PATCH":
+            # Queue the actual request only after typed final admission. Retain
+            # its real provider/callback so later server completion produces
+            # the original raw transition and write audit, not a new grant.
+            queued.append((provider, endpoint, method, dict(body)))
+            raise GitHubReadError("write_response_unavailable", "Original close request remains in flight")
+        return physical_write(provider, endpoint, method, body)
+
+    with monkeypatch.context() as in_flight:
+        in_flight.setattr(SyntheticGitHub, "write", queue_original_close)
+        with pytest.raises(ReadUnavailable, match="Original close request remains in flight"):
+            scenario.port.execute(close, boundary.authorize)
+    assert len(queued) == 1
     prior = scenario.port.reconcile(close)
     assert prior.disposition == "prior"
     assert scenario.runner().run_once().kind == "progress"
@@ -216,7 +233,8 @@ def test_rearmed_close_settles_the_original_late_write_without_dispatching_again
     assert rearmed.effect_id == close.effect_id
     assert rearmed.dispatch_serial == 2
     # The original dispatched request completes after its earlier prior read.
-    scenario.port.execute(close, boundary.authorize)
+    provider, endpoint, method, body = queued[0]
+    assert physical_write(provider, endpoint, method, body).returncode == 0
     target = scenario.port.reconcile(rearmed)
     assert target.disposition == "target"
     assert scenario.runner().run_once().kind == "progress"

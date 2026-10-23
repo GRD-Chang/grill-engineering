@@ -62,6 +62,8 @@ def test_public_stop_during_post_authorization_pr_read_prevents_the_first_post(t
     scenario = Scenario(tmp_path / 'scenario', DeliveryKind.TICKET)
     held = advance_to_effect(scenario, monkeypatch, 'pr_write')
     effect = held.effect
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        original_intent = tuple(tx.one('SELECT payload_id,actor,before_sha,after_sha FROM effects WHERE id=?', (effect.effect_id,)))
     prepared, authorized, stopped, refused = [], [], [], []
     read = SyntheticGitHub.list
 
@@ -92,7 +94,9 @@ def test_public_stop_during_post_authorization_pr_read_prevents_the_first_post(t
     assert scenario.port.objects.pulls() == []
     assert len(refused) == 1
     with scenario.kernel.storage.transaction(write=False) as tx:
-        assert tuple(tx.one('SELECT status,attempts FROM effects WHERE id=?', (effect.effect_id,))) == ('prepared', 0)
+        # Stop retires an unstarted request; preparation never dispatched it.
+        assert tuple(tx.one('SELECT status,attempts,receipt_id FROM effects WHERE id=?', (effect.effect_id,))) == ('cancelled', 0, None)
+        assert tuple(tx.one('SELECT payload_id,actor,before_sha,after_sha FROM effects WHERE id=?', (effect.effect_id,))) == original_intent
 
 
 @pytest.mark.parametrize('change', ['source', 'late_pr'])
