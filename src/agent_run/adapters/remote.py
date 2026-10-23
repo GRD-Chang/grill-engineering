@@ -159,6 +159,12 @@ class RemoteEffects:
         if self.actor() != effect.actor:
             raise KernelError("remote_actor_changed")
         operation = effect.operation
+
+        def check_prior() -> None:
+            fresh = self._reconcile(effect)
+            if fresh.disposition != "prior" or fresh != observed:
+                raise KernelError("pr_boundary_changed" if operation == "pr_write" else "operation_boundary_changed")
+
         if operation in {"push", "run_branch"}:
             after = _text(effect.after_sha)
             if not self.git.is_ancestor(effect.before_sha, after):
@@ -173,19 +179,13 @@ class RemoteEffects:
                 response = self.git_writes.push(effect.source_ref, expected, after)
         elif operation == "pr_write":
             body = {"title": _text(effect.payload["title"]), "body": _text(effect.payload["body"])}
-            boundary = None
             if effect.pr_number is None:
                 endpoint, method = f"repos/{self.repository}/pulls", "POST"
                 body.update(head=effect.source_ref.removeprefix("refs/heads/"),
                             base=effect.target_ref.removeprefix("refs/heads/"))
-                def current_create() -> None:
-                    fresh = self._reconcile(effect)
-                    if fresh.disposition != "prior" or fresh.pr is not None or fresh.raw != observed.raw:
-                        raise KernelError("pr_boundary_changed")
-                boundary = current_create
             else:
                 endpoint, method = f"repos/{self.repository}/pulls/{effect.pr_number}", "PATCH"
-            response = self._write(endpoint, method, body, authorize, boundary)
+            response = self._write(endpoint, method, body, authorize, check_prior)
         elif operation == "merge":
             message = _text(effect.payload["commit_message"])
             title, _, message_body = message.partition("\n")
@@ -199,10 +199,16 @@ class RemoteEffects:
             events = self._events(effect)
             baseline = max((event["id"] for event in events), default=0)
             intent = self._comment_intent(effect, baseline)
+
+            def check_comment() -> None:
+                check_prior()
+                if max((event["id"] for event in self._events(effect)), default=0) != baseline:
+                    raise KernelError("operation_boundary_changed")
+
             response = self._write(self._issue_path(effect) + "/comments", "POST",
-                                   {"body": self._comment_body(effect, intent)}, authorize)
+                                   {"body": self._comment_body(effect, intent)}, authorize, check_comment)
         elif operation == "close":
-            response = self._write(self._issue_path(effect), "PATCH", {"state": "closed"}, authorize)
+            response = self._write(self._issue_path(effect), "PATCH", {"state": "closed"}, authorize, check_prior)
         else:
             raise KernelError("unsupported_remote_effect", operation)
         return self._readback(effect, response)
