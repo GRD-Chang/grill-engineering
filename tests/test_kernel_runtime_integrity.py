@@ -14,7 +14,7 @@ def _snapshot(root: Path, *, native: bool = True) -> tuple[Path, Path, str]:
     package = root / "lib/python3/site-packages/agent_run"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("legacy\n")
-    kernel = package.with_name('agent_run')
+    kernel = package / "core"
     if native:
         kernel.mkdir()
         (kernel / "__init__.py").write_text("native\n")

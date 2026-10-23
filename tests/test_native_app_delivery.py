@@ -44,7 +44,7 @@ def test_expiry_with_blocked_renewal_removes_token_and_cancels_signing(
             cancelled.set()
     def lifecycle(provider: Any, **options: Any) -> RenewableCredential:
         return RenewableCredential(provider, clock=lambda: now[0], renewal_margin=5, **options)
-    monkeypatch.setattr('agent_run.adapters.auth.credential_lifecycle.RenewableCredential', lifecycle)
+    monkeypatch.setattr('agent_run.adapters.auth.worker_credentials.RenewableCredential', lifecycle)
     messages: list[str] = []
     def failed(message: str) -> None:
         messages.append(message)

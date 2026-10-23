@@ -153,7 +153,7 @@ def test_managed_control_observes_without_replacing_a_running_host(tmp_path, mon
     arguments = [command, request.run_id, "--repo", physical.repository, "--state-dir", str(kernel.storage.path), "--json"]
     if command == "revise":
         arguments.extend(["--message", " Preserve the requested revision "])
-    result = lifecycle_cli.execute(_parser("en").parse_args(arguments))
+    result = lifecycle_cli.execute(_parser("en").parse_args(arguments), language="en")
     assert result["result"] == "accepted" and result["host"] == "running"
     assert result["action"] == command
     assert result["status"] == ("action_applied" if command == "revise" else "action_pending")

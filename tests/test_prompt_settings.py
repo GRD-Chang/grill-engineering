@@ -72,7 +72,7 @@ def test_unreadable_override_reports_error(tmp_path: Path, language: str) -> Non
     from agent_run.config.defaults import UserDefaultsStore
 
     UserDefaultsStore().configure(language=language)
-    directory = prompt_resources.personal_method_directory()
+    directory = prompt_resources.personal_method_directory(language)
     directory.mkdir(parents=True)
     (directory / "acceptance.md").mkdir()
     result = cli("diff", "--json")
@@ -170,12 +170,12 @@ def test_language_methods_are_independent_and_preview_matches(tmp_path: Path, la
     other_directory.mkdir(parents=True)
     other_method = other_directory / "acceptance.md"
     other_method.write_text("OTHER LANGUAGE CUSTOM METHOD", encoding="utf-8")
-    assert prompt_resources.resolve_resources()["methods/acceptance"] == prompt_resources.builtin_resources(language)["methods/acceptance"]
+    assert prompt_resources.resolve_resources(language)["methods/acceptance"] == prompt_resources.builtin_resources(language)["methods/acceptance"]
     initialized = cli("init", "--json")
     assert initialized.returncode == 0, initialized.stdout + initialized.stderr
     assert len(json.loads(initialized.stdout)["created"]) == 4
     assert other_method.read_text() == "OTHER LANGUAGE CUSTOM METHOD"
-    directory = prompt_resources.personal_method_directory()
+    directory = prompt_resources.personal_method_directory(language)
     method = directory / "acceptance.md"
     method.write_text("SELECTED LANGUAGE CUSTOM METHOD", encoding="utf-8")
     before = method.stat().st_mtime_ns
@@ -231,7 +231,7 @@ def test_legacy_files_are_preserved_and_sources_are_explicit(tmp_path: Path, lan
     from agent_run.config.defaults import UserDefaultsStore
 
     UserDefaultsStore().configure(language=language)
-    directory = prompt_resources.personal_method_directory()
+    directory = prompt_resources.personal_method_directory(language)
     directory.mkdir(parents=True)
     old_names = ("development-common", "development-initial", "development-repair", "review", "publication")
     for name in old_names:

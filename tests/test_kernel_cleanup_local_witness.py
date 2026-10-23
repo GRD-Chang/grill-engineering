@@ -43,7 +43,7 @@ def test_generation_two_cleanup_uses_the_original_local_marker_and_published_rem
                 intent = json.loads(tx.get(workspace["payload_id"], subject))
             assert intent["create_ref"] is True and workspace["source_ref"] == replacement.source_ref
             marker[:] = [workspace["before_sha"]]
-            pr = scenario.port.pull_request(subject, replacement.source_ref)
+            pr = scenario.port.pull_request_by_ref(replacement.source_ref, replacement.target_ref)
             assert pr is not None and pr.head.sha != marker[0]
             if effect.operation == "cleanup_worktree":
                 # The native workspace creates this marker once and checks out
@@ -60,7 +60,7 @@ def test_generation_two_cleanup_uses_the_original_local_marker_and_published_rem
     monkeypatch.setattr(scenario.port, "execute", execute)
     assert scenario.run().kind == "complete"
     cleanup = kernel.status(subject)["resource_cleanup"]
-    pr = scenario.port.pull_request(subject, replacement.source_ref)
+    pr = scenario.port.pull_request_by_ref(replacement.source_ref, replacement.target_ref)
     assert pr is not None and pr.merged is not None
     assert cleanup["source_sha"] == pr.head.sha
     assert scenario.port.git.commit(original.source_ref).sha == original_marker

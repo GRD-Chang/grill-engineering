@@ -135,12 +135,13 @@ def test_language_file_validation_preserves_original(value: object) -> None:
 
 def test_short_copy_selects_frozen_run_or_personal_language() -> None:
     from agent_run.contracts.copy import selected_language, text
+    from agent_run.cli.messages import personal_language
 
-    assert selected_language() == "zh"
+    assert personal_language() == "zh"
     UserDefaultsStore().configure(language="en")
-    assert selected_language() == "en"
+    assert personal_language() == "en"
     assert selected_language({"language": "zh"}) == "zh"
-    assert text("settings.personal_title", language=selected_language()) == "Personal Run defaults"
+    assert text("settings.personal_title", language=personal_language()) == "Personal Run defaults"
     assert text("settings.personal_title", language=selected_language({"language": "zh"})) == "个人运行默认配置"
 
 
