@@ -1,7 +1,7 @@
 """CLI resource selection without making Run operations depend on personal defaults."""
 from __future__ import annotations
 
-from agent_run.contracts.copy import DEFAULT_LANGUAGE, text
+from agent_run.contracts.copy import DEFAULT_LANGUAGE
 from agent_run.errors import error_message as error_message, error_detail as error_detail
 from agent_run.config.defaults import UserDefaultsError, UserDefaultsStore
 
@@ -12,7 +12,3 @@ def personal_language() -> str:
     except (UserDefaultsError, OSError):
         # Invalid personal settings must still permit help and existing Run access.
         return DEFAULT_LANGUAGE
-
-
-def cli_message(key: str, *, language: str | None = None, **values: object) -> str:
-    return text(key, language=language or personal_language(), **values)

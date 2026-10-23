@@ -7,9 +7,6 @@ from __future__ import annotations
 
 
 import json
-from contextlib import contextmanager
-from contextvars import ContextVar
-from collections.abc import Iterator
 from functools import lru_cache
 from pathlib import Path
 
@@ -43,24 +40,3 @@ def text(key: str, *, language: str = DEFAULT_LANGUAGE, **values: object) -> str
 def selected_language(state: dict[str, object]) -> str:
     """Select only a Run's frozen language; missing or invalid values fail."""
     return validate_language(state.get("language"))
-
-# Human rendering is scoped to one query. Machine projections and background
-# notification decisions keep their explicit/default language outside this scope.
-_display_language: ContextVar[str] = ContextVar("display_language", default="zh")
-
-
-def display_language() -> str:
-    return _display_language.get()
-
-
-@contextmanager
-def presentation_language(language: str) -> Iterator[None]:
-    token = _display_language.set(validate_language(language))
-    try:
-        yield
-    finally:
-        _display_language.reset(token)
-
-
-def display_text(key: str, **values: object) -> str:
-    return text(key, language=display_language(), **values)

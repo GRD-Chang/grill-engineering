@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from typing import Any
 
 from agent_run.contracts.copy import selected_language, text
@@ -32,15 +31,5 @@ def event_envelope(state: dict[str, Any], kind: str, identity: object, title: st
         "url": f"https://github.com/{repository}/issues/{number}" if number else None,
         "query": f"agent-run history {state.get('run_id')} --details", **facts,
     }
-
-
-def event_subject(state: dict[str, Any], subject: object) -> dict[str, Any]:
-    match = re.search(r"ticket:(\d+)", str(subject))
-    if not match:
-        return {}
-    number = match.group(1)
-    ticket = ((state.get("ticket_graph") or {}).get("tickets") or {}).get(number, {})
-    return {"task_number": int(number), "task_title": ticket.get("title") or "",
-            "url": f"https://github.com/{state.get('repository')}/issues/{number}"}
 
 

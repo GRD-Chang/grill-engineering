@@ -3,7 +3,6 @@ from __future__ import annotations
 
 
 import sqlite3
-import time
 
 from agent_run.errors import IncompatibleRunStateError
 
@@ -11,27 +10,6 @@ from agent_run.errors import IncompatibleRunStateError
 # Current projections use more than sqlite3's default 128 statement slots.
 # Keep this per-connection cache bounded; closing its scope releases all SQL.
 STATEMENT_CACHE_SIZE = 256
-
-
-def enable_wal(connection: sqlite3.Connection, *, timeout: float) -> None:
-    """Let simultaneous first creators finish the WAL mode transition."""
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
-            if mode != "wal":
-                mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
-            if mode != "wal":
-                raise OSError("SQLite Run state requires WAL journal support")
-            return
-        except sqlite3.OperationalError as error:
-            # SQLite can refuse a competing journal-mode promotion before its
-            # busy handler runs. Retry only lock contention, outside a write
-            # transaction and within the existing admission timeout.
-            if (getattr(error, "sqlite_errorcode", None) not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
-                    or time.monotonic() >= deadline):
-                raise
-            time.sleep(min(0.01, max(0, deadline - time.monotonic())))
 
 
 def require_wal_runtime() -> None:
