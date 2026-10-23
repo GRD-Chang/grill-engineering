@@ -44,12 +44,53 @@ def git_environment(environment: Mapping[str, str] | None = None) -> dict[str, s
     } | {"GIT_OPTIONAL_LOCKS": "0"}
 
 
+def _require_waitable_children() -> None:
+    """Linux admission, without changing the host's SIGCHLD disposition.
+
+    The kernel masks catch C handlers invisible to Python's signal cache. A
+    short exact-PID reap also detects SIG_DFL with hidden SA_NOCLDWAIT. The
+    caller must retain this policy and exclusive ownership during run_git.
+    """
+    try:
+        if not hasattr(os, "WNOWAIT"):
+            raise ValueError("WNOWAIT is unavailable")
+        masks = dict(
+            line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines()
+            if line.startswith(("SigIgn:", "SigCgt:"))
+        )
+        child_signal = 1 << (signal.SIGCHLD - 1)
+        if any(int(masks[name], 16) & child_signal for name in ("SigIgn", "SigCgt")):
+            raise ValueError("SIGCHLD is ignored or caught")
+        # /bin/true is already required by the Linux installation/probes. No
+        # inherited loader environment, fork-in-Python, or signal policy change.
+        probe = os.posix_spawn("/bin/true", ["/bin/true"], {})
+        try:
+            os.waitid(os.P_PID, probe, os.WEXITED | os.WNOWAIT)
+        finally:
+            try:
+                os.waitpid(probe, 0)
+            except OSError:
+                try:
+                    os.waitpid(probe, 0)
+                except OSError:
+                    pass
+                raise
+    except (OSError, ValueError, KeyError, AttributeError) as error:
+        raise GitError(
+            "Git requires waitable children and a fixed default SIGCHLD policy"
+        ) from error
+
+
 def run_git(
     arguments: list[str], *, cwd: Path, input: str | None = None,
     timeout: float | None = None,
     environment: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Drain both pipes; never return a truncated patch or other Git result."""
+    """Drain both pipes; never return a truncated patch or other Git result.
+
+    Linux host contract: fixed default SIGCHLD policy, no competing reaper,
+    and exclusive ownership of this private Popen until final reap.
+    """
     if input is not None and len(input) > MAX_GIT_OUTPUT_BYTES:
         raise GitError("Git input exceeds the 1 MiB transfer limit")
     data = input.encode() if input is not None else b""
@@ -67,6 +108,7 @@ def run_git(
             return redact_transport_output(value, selected_environment)
         return value
 
+    _require_waitable_children()
     executable = _git_executable(environment.get("PATH", os.defpath))
     process = subprocess.Popen(
         [executable, *arguments[1:]], cwd=cwd,
@@ -76,20 +118,57 @@ def run_git(
     )
     deadline = time.monotonic() + timeout if timeout is not None else None
     stdout, stderr = CompleteOutput(MAX_GIT_OUTPUT_BYTES), TailOutput(MAX_GIT_ERROR_BYTES)
+    exited = False
+    group_signalled = False
+
+    def observe(*, block: bool = False) -> bool:
+        try:
+            return os.waitid(
+                os.P_PID, process.pid,
+                os.WEXITED | os.WNOWAIT | (0 if block else os.WNOHANG),
+            ) is not None
+        except ChildProcessError as error:
+            raise GitError("Git child ownership lost before group cleanup") from error
+
+    def close_group() -> None:
+        nonlocal group_signalled
+        if not group_signalled:
+            # A live child or its unreaped zombie reserves the PID/PGID. The
+            # host must keep SIGCHLD policy fixed and leave this child to us.
+            observe()
+            group_signalled = True
+            _kill_group(process.pid)
+
+    def reap() -> int:
+        try:
+            _, status = os.waitpid(process.pid, 0)
+        except ChildProcessError as error:
+            # Popen.wait would silently turn ECHILD into success.
+            raise GitError("Git child ownership lost during final reap") from error
+        process.returncode = os.waitstatus_to_exitcode(status)
+        return process.returncode
 
     def check() -> bool:
+        nonlocal exited
         if deadline is not None and time.monotonic() >= deadline:
             assert timeout is not None
             raise subprocess.TimeoutExpired(arguments, timeout)
-        if process.poll() is not None:
+        exited = observe()
+        if exited:
             # Hooks must not leave descendants holding our output pipes open.
-            _kill_group(process.pid)
+            close_group()
         return True
 
     try:
-        pump(process, stdout=stdout, stderr=stderr, input_data=data, check=check)
-        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-        returncode = process.wait(timeout=remaining)
+        # The pump must not reap through poll, including after pipe EOF.
+        pump(process, stdout=stdout, stderr=stderr, input_data=data, check=check, stop_at_eof=True)
+        while not exited:
+            if deadline is None:
+                exited = observe(block=True)
+            else:
+                check()
+                if not exited:
+                    time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
     except subprocess.TimeoutExpired as timeout_error:
         raise GitError(
             f"Git command timed out after {timeout:g} seconds",
@@ -100,8 +179,17 @@ def run_git(
         ) from timeout_error
     finally:
         try:
-            _kill_group(process.pid)
-            process.wait()
+            close_group()
+            try:
+                returncode = reap()
+            except BaseException as wait_error:
+                # A wait may have consumed the child before raising. Retry only
+                # the exact reap, never signal an uncertain numeric PGID again.
+                try:
+                    reap()
+                except BaseException as cleanup_error:
+                    raise wait_error from cleanup_error
+                raise
         finally:
             for stream in (process.stdout, process.stderr, process.stdin):
                 if stream is not None:

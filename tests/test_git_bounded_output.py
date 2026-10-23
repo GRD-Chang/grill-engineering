@@ -18,7 +18,7 @@ def test_git_wait_failure_still_closes_all_owned_pipes(
     from types import SimpleNamespace
     from agent_run.runtime import git_command
 
-    def failed_wait(**kwargs):
+    def failed_wait(*args, **kwargs):
         raise OSError("injected wait failure")
 
     streams = [(tmp_path / name).open("w+b") for name in ("stdin", "stdout", "stderr")]
@@ -30,6 +30,9 @@ def test_git_wait_failure_still_closes_all_owned_pipes(
         )
         monkeypatch.setattr(git_command.subprocess, "Popen", lambda *a, **k: process)
         monkeypatch.setattr(git_command, "pump", lambda *a, **k: None)
+        monkeypatch.setattr(git_command, "_require_waitable_children", lambda: None)
+        monkeypatch.setattr(git_command.os, "waitid", lambda *a: SimpleNamespace(si_pid=process.pid))
+        monkeypatch.setattr(git_command.os, "waitpid", failed_wait)
         # This failure-path check sends no signal to any actual process or group.
         monkeypatch.setattr(git_command.os, "killpg", lambda *a: None)
         with pytest.raises(OSError, match="injected wait failure"):
@@ -154,6 +157,16 @@ def test_git_reader_reaps_process_on_read_failure(git_repo: Path, monkeypatch) -
 
     processes = []
     real_popen = git_output.subprocess.Popen
+    real_signal = os.killpg
+    signals = []
+
+    def signal_group(pid, sig):
+        assert pid == processes[0].pid
+        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        signals.append(pid)
+        real_signal(pid, sig)
+
+    monkeypatch.setattr(os, "killpg", signal_group)
 
     def start(*args, **kwargs):
         process = real_popen(*args, **kwargs)
@@ -174,6 +187,7 @@ def test_git_reader_reaps_process_on_read_failure(git_repo: Path, monkeypatch) -
     assert len(processes) == 1
     assert processes[0].poll() is not None
     assert processes[0].stdout.closed and processes[0].stderr.closed
+    assert signals == [processes[0].pid]
 
 
 def test_bounded_stdin_and_broken_pipe_do_not_deadlock(git_repo: Path) -> None:
@@ -216,6 +230,16 @@ def test_git_deadline_retains_diagnostics_and_reaps_child(git_repo: Path, monkey
 
     processes = []
     real_popen = subprocess.Popen
+    real_signal = os.killpg
+    signals = []
+
+    def signal_group(pid, sig):
+        assert pid == processes[0].pid
+        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        signals.append(pid)
+        real_signal(pid, sig)
+
+    monkeypatch.setattr(os, "killpg", signal_group)
 
     def start(*args, **kwargs):
         process = real_popen(*args, **kwargs)
@@ -236,6 +260,7 @@ def test_git_deadline_retains_diagnostics_and_reaps_child(git_repo: Path, monkey
     assert error.value.evidence["timeout_seconds"] == 1
     assert len(processes) == 1 and processes[0].poll() is not None
     assert processes[0].stdout.closed and processes[0].stderr.closed
+    assert signals == [processes[0].pid]
 
 
 def test_selector_creation_failure_reaps_git(git_repo: Path, monkeypatch) -> None:
