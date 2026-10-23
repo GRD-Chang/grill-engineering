@@ -209,6 +209,12 @@ def test_rearmed_close_settles_the_original_late_write_without_dispatching_again
     boundary = capture_effect(scenario, monkeypatch, "close")
     close = boundary.effect
     assert close.operation == "close"
+
+    def original_state():
+        with scenario.kernel.storage.transaction(write=False) as tx:
+            return tuple(tx.one("SELECT status,attempts,receipt_id FROM effects WHERE id=?", (close.effect_id,)))
+
+    assert original_state() == ("prepared", 0, None)
     physical_write = SyntheticGitHub.write
     queued = []
 
@@ -226,19 +232,26 @@ def test_rearmed_close_settles_the_original_late_write_without_dispatching_again
         with pytest.raises(ReadUnavailable, match="Original close request remains in flight"):
             scenario.port.execute(close, boundary.authorize)
     assert len(queued) == 1
+    assert original_state() == ("sent", 1, None)
+    assert not [write for write in scenario.port.writes() if write["operation"] == "close"]
     prior = scenario.port.reconcile(close)
     assert prior.disposition == "prior"
     assert scenario.runner().run_once().kind == "progress"
     rearmed = capture_effect(scenario, monkeypatch, "close").effect
     assert rearmed.effect_id == close.effect_id
     assert rearmed.dispatch_serial == 2
+    assert original_state() == ("prepared", 1, None)
     # The original dispatched request completes after its earlier prior read.
     provider, endpoint, method, body = queued[0]
     assert physical_write(provider, endpoint, method, body).returncode == 0
     target = scenario.port.reconcile(rearmed)
     assert target.disposition == "target"
     assert scenario.runner().run_once().kind == "progress"
+    observed = original_state()
+    assert observed[0:2] == ("observed", 1) and observed[2] is not None
+    assert scenario.kernel.status(scenario.delivery.key)["phase"] == "close"
     assert scenario.runner().run_once().kind == "progress"
+    assert original_state() == ("confirmed", 1, observed[2])
     assert scenario.kernel.status(scenario.delivery.key)["phase"] == "complete"
     with scenario.kernel.storage.transaction(write=False) as tx:
         assert tuple(tx.one("SELECT status,attempts FROM effects WHERE id=?", (close.effect_id,))) == ("confirmed", 1)

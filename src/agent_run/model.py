@@ -395,7 +395,6 @@ class Step:
     subject: str
     reason: str = ""
     call: AgentCall | None = None
-    effect: Effect | None = None
     retry_at: float | None = None
 
 
