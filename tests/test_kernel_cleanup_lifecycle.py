@@ -80,7 +80,7 @@ def test_completed_delivery_retires_only_its_recorded_resources(
                     "rev-parse", "HEAD", cwd=checkout,
                 ).stdout.strip()
             else:
-                pr = scenario.port.pull_request(scenario.delivery.key)
+                pr = scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref)
                 assert pr is not None and pr.merged is not None
                 assert effect.payload["branch_ref"] == scenario.delivery.source_ref
                 assert effect.payload["expected_head"] == (_local_marker(scenario) if effect.operation == "cleanup_local_ref" else pr.head.sha)
@@ -108,10 +108,10 @@ def test_completed_delivery_retires_only_its_recorded_resources(
     if kind == DeliveryKind.PARENT_ONLY:
         assert scenario.port.git.run("for-each-ref", "--format=%(refname)").stdout.splitlines() == [main, sibling]
         assert set(scenario.port.remote_refs()) == {main}
-    pr = scenario.port.pull_request(scenario.delivery.key)
+    pr = scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref)
     assert pr is not None and pr.merged is not None
     assert scenario.kernel.status(scenario.delivery.key)["issue_link"]["state"] == "linked"
-    assert scenario.port.git.commit(scenario.delivery.target_ref) == pr.merged
+    assert scenario.port.remote_commit(scenario.delivery.target_ref) == pr.merged
     if kind == DeliveryKind.TICKET:
         assert scenario.port.git.commit(main) == main_before
     for effect in retired:
@@ -168,9 +168,9 @@ def test_foreign_remote_head_keeps_completed_delivery_and_original_cleanup_inten
     assert cleanup["effect_id"] == original.effect_id
     with scenario.kernel.storage.transaction(write=False) as tx:
         assert tuple(tx.one("SELECT status,attempts FROM effects WHERE id=?", (original.effect_id,))) == ("sent", 1)
-    pr = scenario.port.pull_request(scenario.delivery.key)
+    pr = scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref)
     assert pr is not None and pr.merged is not None
-    assert scenario.port.git.commit(scenario.delivery.target_ref) == pr.merged
+    assert scenario.port.remote_commit(scenario.delivery.target_ref) == pr.merged
     assert scenario.port.git.run("show", f"{foreign_heads[0]}:foreign.txt").stdout == "another actor's retained work\n"
     calls_before, writes_before = list(scenario.role_calls), scenario.port.writes()
     scenario.kernel = Kernel(scenario.port.root / "kernel.sqlite3")
@@ -221,7 +221,7 @@ def test_dirty_checkout_keeps_completed_delivery_and_blocks_later_resource_delet
     with scenario.kernel.storage.transaction(write=False) as tx:
         assert tuple(tx.one("SELECT status,attempts FROM effects WHERE id=?", (attempts[0].effect_id,))) == ("sent", 1)
         assert not tx.rows("SELECT id FROM effects WHERE subject=? AND operation IN ('cleanup_local_ref','cleanup_remote_ref')", (scenario.delivery.key,))
-    pr = scenario.port.pull_request(scenario.delivery.key)
+    pr = scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref)
     assert pr is not None and pr.merged is not None
     assert _local_head(scenario, scenario.delivery.source_ref) == _local_marker(scenario)
     assert scenario.port.remote_refs()[scenario.delivery.source_ref] == pr.head.sha

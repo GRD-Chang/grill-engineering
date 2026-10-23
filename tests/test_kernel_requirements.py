@@ -12,6 +12,7 @@ from agent_run.errors import KernelError
 from support.offline import GraphScenario
 from agent_run.model import Effect, Execution, HostObservation
 from support.core_operations import CoreOperations, scripted_return
+from support.api_observation import api_writes, lose_api_reply, pr_author_read
 
 
 def native_input() -> dict:
@@ -55,7 +56,7 @@ def test_real_ticket_close_receipts_create_completion_before_dependency_and_fina
     assert scenario.run().kind == "complete"
     completed = scenario.kernel.source_status()["completions"]
     assert [entry["subject"] for entry in completed] == ["ticket:3"]
-    assert completed[0]["source_sha"] == scenario.port.pull_request("ticket:3").head.sha
+    assert completed[0]["source_sha"] == scenario.port.pr_by_number(completed[0]["pr_number"]).head.sha
     assert scenario.kernel.source_status()["frontier"] == ["ticket:4"]
     scenario.select("ticket:4")
     # Close has actually happened; a fresh source read sees CLOSED before its
@@ -71,7 +72,7 @@ def test_real_ticket_close_receipts_create_completion_before_dependency_and_fina
     scenario.refresh()
     assert scenario.kernel.source_status()["final_subject"] is None
     assert scenario.run().kind == "complete"
-    before = scenario.port.git.commit("refs/heads/run")
+    before = scenario.port.remote_commit("refs/heads/run")
     original_completions = scenario.kernel.source_status()["completions"]
     scenario.requirements = replace(source, parent=replace(source.parent, body="Clarified overall Parent outcome."),
                                     issues=tuple(replace(issue, title="Post-completion title edit", body="Edited after delivery")
@@ -96,7 +97,7 @@ def test_real_ticket_close_receipts_create_completion_before_dependency_and_fina
     assert all(entry["development"]["artifact"]["summary"] for entry in context["ticket_completions"])
     assert len(scenario.kernel.source_status()["completions"]) == 2
     assert all(entry["tree"] for entry in scenario.kernel.source_status()["completions"])
-    assert scenario.port.git.commit("refs/heads/main") != scenario.port.git.commit("refs/heads/run")
+    assert scenario.port.remote_commit("refs/heads/main") != scenario.port.remote_commit("refs/heads/run")
     scenario.kernel.control("approve", "approve-whole-parent", subject=final, world=scenario.world())
     assert scenario.run().kind == "complete"
 
@@ -148,7 +149,7 @@ def test_requirement_requeue_is_explicit_idempotent_and_retains_sibling_return(t
 
 
 @pytest.mark.parametrize("retirement_race", ["none", "foreign_author", "target_append_after_receipt", "target_append_after_lost_ack", "requirements_after_receipt", "requirements_then_foreign_close"])
-def test_managed_requeue_reconciles_the_original_pr_before_replacing_its_generation(tmp_path: Path, retirement_race: str) -> None:
+def test_managed_requeue_reconciles_the_original_pr_before_replacing_its_generation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retirement_race: str) -> None:
     scenario = GraphScenario(tmp_path / "managed-requeue", independent_source(), policy=Policy(concurrency=2))
     kernel, subject = scenario.kernel, scenario.delivery.key
     kernel.control("stop", "retire-fixture")
@@ -180,9 +181,9 @@ def test_managed_requeue_reconciles_the_original_pr_before_replacing_its_generat
     assert sibling is not None
     scenario.checks = ["none"]
     now[0] = 105.0  # The original CI poll is due; observing never renews its window.
-    original_pr = scenario.port.pull_request(subject)
-    assert original_pr is not None and original_pr.state == "OPEN"
     original = kernel.delivery(subject)
+    original_pr = scenario.port.pull_request_by_ref(original.source_ref, original.target_ref)
+    assert original_pr is not None and original_pr.state == "OPEN"
     preserved = Path(original.checkout) / "operator-note.txt"
     preserved.write_text("Uncommitted work from the retired generation\n")
     assert kernel.dispatch_agent(sibling)
@@ -195,7 +196,9 @@ def test_managed_requeue_reconciles_the_original_pr_before_replacing_its_generat
     replacement = replace(original, source_ref=original.source_ref + "-g2", checkout=str(Path(original.checkout).with_name("ticket-3-g2")),
                           base=world.target)
     if retirement_race == "foreign_author":
-        scenario.port._write_pr(subject, replace(original_pr, actor="foreign-pr-author"))
+        observed = scenario.port.objects.pr(original_pr.number)
+        assert observed is not None
+        scenario.port.objects.put_pr({**observed, "user": {"login": "foreign-pr-author"}})
         with pytest.raises(KernelError, match="retirement_pr_changed"):
             kernel.control_host(request, "requeue", "replace-generation", subject=subject, world=scenario.world(),
                                 replacement=replacement)
@@ -215,7 +218,8 @@ def test_managed_requeue_reconciles_the_original_pr_before_replacing_its_generat
         return execute(effect, authorize)
     scenario.port.execute = capture_retirement
     if retirement_race not in {"target_append_after_receipt", "requirements_after_receipt", "requirements_then_foreign_close"}:
-        scenario.port.lose_response.add("retire_pr")
+        lose_api_reply(monkeypatch, scenario.port.database, "PATCH",
+                       f"repos/{original_pr.repository}/pulls/{original_pr.number}")
     retirement_step = operations.once()
     if retirement_step.retry_at is not None:
         now[0] = retirement_step.retry_at
@@ -224,7 +228,14 @@ def test_managed_requeue_reconciles_the_original_pr_before_replacing_its_generat
     assert retirement.pr_number == original_pr.number and retirement.before_sha == original_pr.head.sha
     assert kernel.status(subject)["generation"] == 1
     assert not kernel.status(subject)["retired_generations"]
-    assert scenario.port.pull_request(subject).state == "CLOSED"
+    assert scenario.port.pr_by_number(original_pr.number).state == "CLOSED"
+    def retirement_intents():
+        commands = [write for write in scenario.port.writes() if write["operation"] == "retire_pr"]
+        assert len(commands) == 2
+        comment = f"repos/{original_pr.repository}/issues/{original_pr.number}/comments"
+        close = f"repos/{original_pr.repository}/pulls/{original_pr.number}"
+        assert api_writes(scenario.port.objects, {comment, close}) == [("POST", comment), ("PATCH", close)]
+        return {write["intent"] for write in commands}
     if retirement_race in {"requirements_after_receipt", "requirements_then_foreign_close"}:
         scenario.requirements = replace(scenario.requirements, issues=tuple(
             replace(issue, body=issue.body + "\nAnother requirement after the accepted Action") if issue.number == original.issue else issue
@@ -235,7 +246,7 @@ def test_managed_requeue_reconciles_the_original_pr_before_replacing_its_generat
         assert kernel.status(subject)["generation"] == 1
         assert kernel.status(subject)["pending_write"] is None
         assert not kernel.status(subject)["retired_generations"]
-        assert len([write for write in scenario.port.writes() if write["operation"] == "retire_pr"]) == 1
+        assert len(retirement_intents()) == 1
         if retirement_race == "requirements_then_foreign_close":
             scenario.port.external_pr_transition(original_pr.number, "OPEN", "another-maintainer")
             scenario.port.external_pr_transition(original_pr.number, "CLOSED", "another-maintainer")
@@ -252,13 +263,13 @@ def test_managed_requeue_reconciles_the_original_pr_before_replacing_its_generat
             assert kernel.control_host(request, "requeue", "accept-new-requirements", subject=subject, world=latest,
                                        replacement=renewed) == "superseded"
             assert kernel.status(subject)["pending_write"] is None
-            assert len([write for write in scenario.port.writes() if write["operation"] == "retire_pr"]) == 1
+            assert len(retirement_intents()) == 1
             return
         assert scenario.step().kind == "progress"
         assert kernel.status(subject)["generation"] == 2
         assert scenario.run().kind == "complete"
         assert scenario.port.pr_by_number(original_pr.number).state == "CLOSED"
-        assert len([write for write in scenario.port.writes() if write["operation"] == "retire_pr"]) == 1
+        assert len(retirement_intents()) == 1
         return
     if retirement_race in {"target_append_after_receipt", "target_append_after_lost_ack"}:
         scenario.port.external_remote_append(original.target_ref, {"independent-target.txt": "Independent target advancement\n"}, "after-retirement")
@@ -272,10 +283,10 @@ def test_managed_requeue_reconciles_the_original_pr_before_replacing_its_generat
     assert preserved.read_text() == "Uncommitted work from the retired generation\n"
     assert scenario.port.ref_commit(replacement.source_ref) is None
     assert scenario.run().kind == "complete"
-    replacement_pr = scenario.port.pull_request(subject)
+    replacement_pr = scenario.port.pull_request_by_ref(replacement.source_ref, replacement.target_ref)
     assert replacement_pr is not None and replacement_pr.number != original_pr.number
     assert scenario.port.pr_by_number(original_pr.number).state == "CLOSED"
-    assert len([write for write in scenario.port.writes() if write["operation"] == "retire_pr"]) == 1
+    assert len(retirement_intents()) == 1
 
 
 def test_graph_refresh_cannot_reopen_stop_and_late_siblings_settle_without_authority(tmp_path: Path) -> None:
@@ -483,12 +494,13 @@ def test_original_final_merge_settles_after_remote_target_appends(tmp_path: Path
     # Old test_run_publication_reconciliation preserves the original grant
     # after our merge and a later external default-branch advance.
     scenario, effect = final_merge_in_flight(tmp_path / "graph")
-    pr = scenario.port.pull_request(effect.subject)
+    pr = scenario.port.pr_by_number(effect.pr_number)
     assert pr is not None and pr.merged is not None
     merged = pr.merged
     before = scenario.kernel.status(effect.subject)
+    local_before = scenario.port.git.commit(effect.target_ref)
     advanced = scenario.port.external_remote_append(effect.target_ref, {"later.txt": "Later independent work\n"}, "after-merge")
-    assert scenario.port.git.commit(effect.target_ref) == merged
+    assert scenario.port.git.commit(effect.target_ref) == local_before
     assert scenario.port.remote_commit(effect.target_ref) == advanced
     observed = scenario.port.reconcile(effect)
     assert observed.disposition == "target"
@@ -501,15 +513,16 @@ def test_original_final_merge_settles_after_remote_target_appends(tmp_path: Path
 
 
 @pytest.mark.parametrize("first_read", ["unknown", "third"])
-def test_original_final_merge_keeps_closeout_after_uncertain_read_and_parent_drift(tmp_path: Path, first_read: str) -> None:
+def test_original_final_merge_keeps_closeout_after_uncertain_read_and_parent_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first_read: str) -> None:
     scenario, effect = final_merge_in_flight(tmp_path / "graph")
     before = scenario.kernel.status(effect.subject)
-    scenario.port.force_read["merge"] = first_read
+    restore_read = pr_author_read(monkeypatch, scenario.port.database, effect.pr_number,
+                                  None if first_read == "unknown" else "foreign-publisher")
     paused = scenario.runner().run_once()
     assert paused.kind == "paused"
     assert scenario.kernel.status(effect.subject)["pending_write"]["id"] == effect.effect_id
     assert not [write for write in scenario.port.writes() if write["subject"] == effect.subject and write["operation"] == "close"]
-    scenario.port.force_read.clear()
+    restore_read()
     scenario.kernel = Kernel(scenario.kernel.storage.path)
     scenario.requirements = replace(scenario.requirements, parent=replace(scenario.requirements.parent, body="Changed after uncertain original merge readback."))
     # Original sent intent readback precedes any source refresh, even across restart.

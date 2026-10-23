@@ -10,6 +10,7 @@ import pytest
 from agent_run.errors import KernelError
 from agent_run.model import DeliveryKind, Execution, HostLaunch, HostObservation, ResourceInspection
 from support.offline import GraphScenario, Scenario
+from support.api_observation import api_writes, lose_api_reply, pr_author_read
 from test_kernel_requirements import independent_source
 from support.core_operations import CoreOperations, scripted_return
 
@@ -49,14 +50,15 @@ def test_abandon_cannot_take_over_an_unsettled_final_merge(
     assert scenario.run().kind == "approval"
     scenario.kernel.control("approve", "original-final-approval", subject=scenario.delivery.key, world=scenario.world())
     merge = _merge_response_lost(scenario, monkeypatch)
-    scenario.port.force_read["merge"] = uncertain
+    restore_read = pr_author_read(monkeypatch, scenario.port.database, merge.pr_number,
+                                   None if uncertain == "unknown" else "foreign-publisher")
     assert operations.once().kind == "paused"
     resources = scenario.kernel.generation_resources()
     inspections = scenario.port.inspect_resources(resources)
     with pytest.raises(KernelError, match="final_merge_unsettled"):
         scenario.kernel.control("abandon", "cannot-abandon-default-merge", resource_inspections=inspections)
     assert scenario.kernel.source_status()["abandonment"] is None
-    scenario.port.force_read.clear()
+    restore_read()
     assert operations.once().kind == "progress"
     scenario.kernel.control("resume", "resume-original-closeout", subject=merge.subject)
     assert scenario.run().kind == "complete"
@@ -74,21 +76,22 @@ def test_parent_only_default_merge_cannot_be_abandoned(
     assert scenario.run().kind == "approval"
     before = scenario.port.remote_commit(scenario.delivery.target_ref)
     kernel.control("approve", "approve-default", subject=subject, world=scenario.world())
-    _merge_response_lost(scenario, monkeypatch)
+    merge = _merge_response_lost(scenario, monkeypatch)
     assert scenario.port.remote_commit(scenario.delivery.target_ref) != before
     if acknowledgement == "confirmed":
         assert operations.once().kind == "progress"
         assert scenario.run().kind == "complete"
         expected = "merged_run_noncancellable"
     else:
-        scenario.port.force_read["merge"] = acknowledgement
+        restore_read = pr_author_read(monkeypatch, scenario.port.database, merge.pr_number,
+                                       None if acknowledgement == "unknown" else "foreign-publisher")
         assert operations.once().kind == "paused"
         expected = "final_merge_unsettled"
     with pytest.raises(KernelError, match=expected):
         kernel.control("abandon", "reject-default-abandon", resource_inspections=scenario.port.inspect_resources(kernel.generation_resources()))
     assert kernel.source_status()["abandonment"] is None
-    scenario.port.force_read.clear()
     if acknowledgement != "confirmed":
+        restore_read()
         assert operations.once().kind == "progress"
         kernel.control("resume", "resume-default-closeout", subject=subject)
     assert scenario.run().kind == "complete"
@@ -124,7 +127,7 @@ def test_abandon_continuation_settles_the_original_sent_intent_before_fresh_insp
             break
     else:
         raise AssertionError("The original Ticket never published its PR")
-    prior_pr = scenario.port.pull_request(scenario.delivery.key)
+    prior_pr = scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref)
     assert prior_pr is not None and prior_pr.state == "OPEN"
     kernel.control_host(request, "abandon", "original-abandon",
                         resource_inspections=scenario.port.inspect_resources(kernel.generation_resources()))
@@ -145,7 +148,8 @@ def test_abandon_continuation_settles_the_original_sent_intent_before_fresh_insp
     assert interrupted.reason == "original_write_readback_required"
     original, = sent
     # The original launch outcome is uncertain; no close has actually happened.
-    scenario.port.force_read["retire_pr"] = "unknown" if uncertainty == "prior_after_continuation" else uncertainty
+    restore_read = pr_author_read(monkeypatch, scenario.port.database, prior_pr.number,
+        "foreign-publisher" if uncertainty == "third" else None)
     assert operations.once().kind == "paused"
     if uncertainty != "prior_after_continuation":
         assert kernel.operation_state().disposition == "quiescent"
@@ -159,7 +163,7 @@ def test_abandon_continuation_settles_the_original_sent_intent_before_fresh_insp
     assert kernel.observe_host(continuation, HostObservation("running", continuation.unit_name, "new", "/new-host", "boot",
                                                            43, "new-start", usage_ready=True)) == "running"
     scenario.execution = Execution(continuation.run_id, continuation.owner, continuation.epoch)
-    scenario.port.force_read.clear()
+    restore_read()
     events = []
     reconcile = scenario.port.reconcile
 
@@ -187,7 +191,12 @@ def test_abandon_continuation_settles_the_original_sent_intent_before_fresh_insp
             break
     else:
         raise AssertionError("The original finite abandonment could not continue after an exact prior readback")
-    retired = [write for write in scenario.port.writes() if write["operation"] == "retire_pr"]
+    commands = [write for write in scenario.port.writes() if write["operation"] == "retire_pr"]
+    assert len(commands) == 2
+    comment = f"repos/{prior_pr.repository}/issues/{prior_pr.number}/comments"
+    close = f"repos/{prior_pr.repository}/pulls/{prior_pr.number}"
+    assert api_writes(scenario.port.objects, {comment, close}) == [("POST", comment), ("PATCH", close)]
+    retired = list({write["intent"]: write for write in commands}.values())
     assert len(retired) == 1 and retired[0]["intent"] == original.effect_id
     assert scenario.port.pr_by_number(prior_pr.number).state == "CLOSED"
     assert kernel.source_status()["abandonment"]["status"] == "complete"
@@ -292,7 +301,7 @@ def test_abandon_continuation_reinspects_after_a_late_dirty_observation(tmp_path
     assert not [write for write in scenario.port.writes() if write["operation"] in kernel.REMOTE]
 
 
-def test_managed_abandon_refuses_dirty_before_action_then_recovers_own_ticket(tmp_path: Path) -> None:
+def test_managed_abandon_refuses_dirty_before_action_then_recovers_own_ticket(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     scenario, request = managed_abandon_scenario(tmp_path)
     kernel = scenario.kernel
     assert scenario.run().kind == "complete"
@@ -306,7 +315,7 @@ def test_managed_abandon_refuses_dirty_before_action_then_recovers_own_ticket(tm
             break
     else:
         raise AssertionError("The remaining Ticket never published its original PR")
-    prior_pr = scenario.port.pull_request("ticket:4")
+    prior_pr = scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref)
     assert prior_pr is not None and prior_pr.state == "OPEN"
     checkout = Path(scenario.delivery.checkout)
     note = checkout / "operator-note.txt"
@@ -333,7 +342,8 @@ def test_managed_abandon_refuses_dirty_before_action_then_recovers_own_ticket(tm
     with pytest.raises(KernelError, match="run_abandoned"):
         kernel.control_host(request, "resume", "never-resume-business")
     # The same exact Host has only the original Action's finite cleanup cap.
-    scenario.port.lose_response.add("retire_pr")
+    close = f"repos/{prior_pr.repository}/pulls/{prior_pr.number}"
+    lose_api_reply(monkeypatch, scenario.port.database, "PATCH", close)
     now = [1000.25]
     kernel.clock = lambda: now[0]
     for _ in range(100):
@@ -350,7 +360,11 @@ def test_managed_abandon_refuses_dirty_before_action_then_recovers_own_ticket(tm
     assert kernel.source_status()["completions"] == completed
     assert scenario.port.issue_state(3) == "OPEN"
     assert not checkout.exists()
-    assert len([write for write in scenario.port.writes() if write["operation"] == "retire_pr"]) == 1
+    retired = [write for write in scenario.port.writes() if write["operation"] == "retire_pr"]
+    assert len({write["intent"] for write in retired}) == 1
+    assert len(retired) == 2
+    comment = f"repos/{prior_pr.repository}/issues/{prior_pr.number}/comments"
+    assert api_writes(scenario.port.objects, {comment, close}) == [("POST", comment), ("PATCH", close)]
     assert len([write for write in scenario.port.writes() if write["operation"] == "reopen_ticket"]) == 1
     writes = scenario.port.writes()
     recovery = [write for write in writes if write["operation"] == "recovery_comment"]

@@ -56,7 +56,9 @@ def test_unproven_sent_recovery_never_replays_and_uses_original_read_window(
     kernel.clock = lambda: now[0]
     original_writes = scenario.port.writes()
     for disposition in ("prior", "unknown"):
-        scenario.port.force_read[operation] = disposition
+        scenario.port.read_faults.clear()
+        if disposition == "unknown":
+            scenario.port.read_faults.add("*")
         waiting = operations.once()
         assert waiting.kind == "waiting" and waiting.retry_at == 1005.25
         with subtests.test(projection="read_wait_disposition", disposition=disposition):
@@ -74,7 +76,7 @@ def test_unproven_sent_recovery_never_replays_and_uses_original_read_window(
     assert kernel._guard_automatic_step(token, scenario.execution, readback=effect).kind == "waiting"
     assert kernel._guard_automatic_step(token, scenario.execution, after_read=True, readback=effect) is None
     now[0] = 1600.25
-    scenario.port.force_read[operation] = "prior"
+    scenario.port.read_faults.clear()
     assert operations.once().reason == "supervision_timeout"
     with subtests.test(projection="timeout_disposition"):
         assert kernel.operation_state().disposition == "quiescent"

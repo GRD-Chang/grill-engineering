@@ -33,9 +33,9 @@ def test_original_requeue_action_closes_once_after_real_remote_ack_loss(
             break
     else:
         raise AssertionError("The original delivery never published its PR")
-    prior = scenario.port.pull_request(subject)
-    assert prior is not None and prior.state == "OPEN" and prior.actor is not None
     original = kernel.delivery(subject)
+    prior = scenario.port.pull_request_by_ref(original.source_ref, original.target_ref)
+    assert prior is not None and prior.state == "OPEN" and prior.actor is not None
     scenario.requirements = replace(scenario.requirements, issues=tuple(
         replace(issue, body=issue.body + "\nClarified requirement") if issue.number == original.issue else issue
         for issue in scenario.requirements.issues))
@@ -48,10 +48,8 @@ def test_original_requeue_action_closes_once_after_real_remote_ack_loss(
     transport_root.mkdir()
     _fixture_port, _git, _push, state, calls = _fixture(transport_root, monkeypatch,
         repository=prior.repository, actor=prior.actor)
-    bare = transport_root / "origin.git"
-    scenario.port.git.run("remote", "add", "native-test", str(bare))
-    scenario.port.git.run("push", "--force", "native-test", prior.head.sha + ":" + prior.source_ref,
-                          prior.base.sha + ":" + prior.target_ref)
+    bare = scenario.port.physical.remote
+    monkeypatch.setenv("REMOTE_TEST_BARE", str(bare))
     raw_pr = {"number": prior.number, "state": "open", "title": prior.title, "body": prior.body,
               "user": {"login": prior.actor}, "merged": False, "merge_commit_sha": None,
               "head": {"sha": prior.head.sha, "ref": prior.source_ref.removeprefix("refs/heads/"),
@@ -61,7 +59,7 @@ def test_original_requeue_action_closes_once_after_real_remote_ack_loss(
     state.write_text(json.dumps({"prs": [raw_pr], "comments": [], "events": [],
                                  "issue_state": "open", "lose_operation": "pr"}))
     remote = RemoteEffects(scenario.port.git.root, prior.repository,
-                           runner_identity={"source": "host"}, remote="native-test")
+                           runner_identity={"source": "host"}, remote=str(bare))
 
     make_ports = scenario.make_ports
     effects, results = [], []
