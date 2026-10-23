@@ -227,9 +227,9 @@ def _positive_duration(value: Any, name: str) -> float:
     return positive_seconds(value, name)
 
 
-from typing import Any, Mapping
+from typing import Mapping as _CheckpointMapping
 from agent_run.model import Policy
 
-def checkpoint_policy(current: Policy, overrides: Mapping[str, Any]) -> Policy:
+def checkpoint_policy(current: Policy, overrides: _CheckpointMapping[str, Any]) -> Policy:
     """Resolve an explicit new window against this owner's frozen policy."""
     return resolve_delivery_policy(user_defaults=current, command_overrides=overrides)

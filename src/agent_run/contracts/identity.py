@@ -60,8 +60,6 @@ def normalize_github_config(raw: object) -> dict[str, Any]:
     return result
 
 
-from collections.abc import Mapping
-from typing import Any
 
 def validate_identity_snapshot(raw: object) -> dict[str, Any]:
     """Validate frozen non-secret data without consulting current defaults."""
@@ -84,8 +82,6 @@ def validate_identity_snapshot(raw: object) -> dict[str, Any]:
     return {"source": source}
 
 
-from collections.abc import Mapping
-from typing import Any
 from agent_run.contracts.copy import text
 
 def describe_identity(

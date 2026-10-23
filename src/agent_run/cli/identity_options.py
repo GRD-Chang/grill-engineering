@@ -19,7 +19,6 @@ def add_identity_options(parser: argparse.ArgumentParser, language: str) -> None
     references.add_argument("--github-pat-file", help=text("identity.file_help", language=language))
 
 
-import argparse
 from typing import Any
 
 def identity_overrides(parsed: argparse.Namespace) -> dict[str, Any]:

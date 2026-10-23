@@ -425,10 +425,6 @@ def review_outcome(data: Mapping[str, Any]) -> str:
     return "fail" if "fail" in states else "blocked" if "blocked" in states else "pass"
 
 
-from dataclasses import dataclass
-
-
-
 @dataclass(frozen=True)
 class Repository:
     name_with_owner: str
