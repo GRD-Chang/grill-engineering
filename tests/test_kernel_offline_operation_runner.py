@@ -6,7 +6,7 @@ import pytest
 
 from agent_run_kernel import DeliveryKind, KernelError, Requirements
 from agent_run_kernel.model import Issue, ParentIssue
-from agent_run_kernel.offline import GraphScenario, Scenario
+from support.offline import GraphScenario, Scenario
 
 
 def test_abandon_terminal_comes_from_core_without_completing_the_delivery(tmp_path: Path) -> None:
