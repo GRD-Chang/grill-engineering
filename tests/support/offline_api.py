@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from datetime import datetime, timezone
 import json
 import re
 from pathlib import Path
@@ -21,7 +22,7 @@ class ExternalObjects:
         with self._connect() as db:
             present = db.execute("SELECT name FROM sqlite_master WHERE name='external_format'").fetchone()
             versions = db.execute('SELECT version FROM external_format').fetchall() if present else []
-        if versions != [(1,)]:
+        if versions != [(2,)]:
             raise GitHubReadError('offline_format_unsupported', 'Only the current raw API world format is supported')
 
     def _connect(self) -> sqlite3.Connection:
@@ -31,9 +32,10 @@ class ExternalObjects:
     def create(db: sqlite3.Connection) -> None:
         db.executescript('''
             CREATE TABLE external_format(version INTEGER NOT NULL,repository TEXT);
-            INSERT INTO external_format VALUES (1,NULL);
+            INSERT INTO external_format VALUES (2,NULL);
             CREATE TABLE prs(number INTEGER PRIMARY KEY,body TEXT NOT NULL);
-            CREATE TABLE issues(number INTEGER PRIMARY KEY,state TEXT NOT NULL);
+            CREATE TABLE issues(number INTEGER PRIMARY KEY,state TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
             CREATE TABLE comments(id INTEGER PRIMARY KEY AUTOINCREMENT,issue INTEGER NOT NULL,
                 actor TEXT NOT NULL,body TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
@@ -58,7 +60,7 @@ class ExternalObjects:
             if current is not None and current != repository:
                 raise GitHubReadError('offline_repository_changed', 'External world belongs to a different repository')
             db.execute('UPDATE external_format SET repository=?', (repository,))
-            db.executemany('INSERT OR IGNORE INTO issues VALUES (?,?)', issues.items())
+            db.executemany('INSERT OR IGNORE INTO issues(number,state) VALUES (?,?)', issues.items())
 
     def pr(self, number: int) -> dict[str, Any] | None:
         with self._connect() as db:
@@ -89,6 +91,19 @@ class ExternalObjects:
             row = db.execute('SELECT state FROM issues WHERE number=?', (number,)).fetchone()
         return 'open' if row is None else row[0]
 
+    def issue(self, number: int) -> dict[str, Any]:
+        pr = self.pr(number)
+        if pr is not None:
+            state, updated_at = pr['state'], pr['updated_at']
+        else:
+            with self._connect() as db:
+                row = db.execute('SELECT state,updated_at FROM issues WHERE number=?', (number,)).fetchone()
+            if row is None:
+                raise GitHubReadError('remote_read_failed', 'HTTP 404 Issue absent')
+            state, updated_at = row
+        return {'number': number, 'node_id': 'synthetic-issue-' + str(number),
+                'state': state, 'updated_at': updated_at}
+
     def closed_issues(self) -> set[int]:
         with self._connect() as db:
             return {row[0] for row in db.execute("SELECT number FROM issues WHERE state='closed'")}
@@ -96,14 +111,18 @@ class ExternalObjects:
     def set_state(self, number: int, state: str, actor: str) -> None:
         prior = self.pr(number)
         before = prior['state'] if prior is not None else self.issue_state(number)
+        if before == state:
+            return
+        updated_at = datetime.now(timezone.utc).isoformat()
         with sqlite3.connect(self.database) as db:
             if prior is not None:
-                db.execute('UPDATE prs SET body=? WHERE number=?', (json.dumps({**prior, 'state': state}), number))
+                db.execute('UPDATE prs SET body=? WHERE number=?',
+                           (json.dumps({**prior, 'state': state, 'updated_at': updated_at}), number))
             else:
-                db.execute('INSERT INTO issues VALUES (?,?) ON CONFLICT(number) DO UPDATE SET state=excluded.state', (number, state))
-            if before != state:
-                db.execute('INSERT INTO issue_events(issue,event,actor) VALUES (?,?,?)',
-                           (number, 'closed' if state == 'closed' else 'reopened', actor))
+                db.execute('INSERT INTO issues VALUES (?,?,?) ON CONFLICT(number) DO UPDATE SET '
+                           'state=excluded.state,updated_at=excluded.updated_at', (number, state, updated_at))
+            db.execute('INSERT INTO issue_events(issue,event,actor,created_at) VALUES (?,?,?,?)',
+                       (number, 'closed' if state == 'closed' else 'reopened', actor, updated_at))
 
     def comments(self, number: int) -> list[dict[str, Any]]:
         with self._connect() as db:
@@ -126,7 +145,7 @@ class ExternalObjects:
         """Lossless projection of actual records; never a write authority."""
         with self._connect() as db:
             db.row_factory = sqlite3.Row
-            return {'format_version': 1, **{table: [dict(row) for row in
+            return {'format_version': 2, **{table: [dict(row) for row in
                 db.execute('SELECT * FROM ' + table + ' ORDER BY rowid')]
                 for table in ('prs', 'issues', 'comments', 'issue_events', 'api_requests')}}
 
@@ -204,9 +223,7 @@ class SyntheticGitHub:
         elif tail.startswith('pulls/'):
             result = self._pr(int(tail.split('/')[1]))
         elif tail.startswith('issues/'):
-            issue = int(tail.split('/')[1]); pr = self.objects.pr(issue)
-            result = {'number': issue, 'node_id': 'synthetic-issue-' + str(issue),
-                      'state': pr['state'] if pr else self.objects.issue_state(issue)}
+            result = self.objects.issue(int(tail.split('/')[1]))
         else:
             raise ValueError('Unsupported physical object: ' + endpoint)
         self._record('GET', endpoint, {}, result)
@@ -236,6 +253,7 @@ class SyntheticGitHub:
             number = self.objects.next_number()
             source, target = 'refs/heads/' + body['head'], 'refs/heads/' + body['base']
             self.objects.put_pr({'number': number, 'state': 'open', 'title': body['title'], 'body': body['body'],
+                'updated_at': datetime.now(timezone.utc).isoformat(),
                 'user': {'login': actor}, 'head': {'ref': body['head'], 'sha': refs[source], 'repo': {'full_name': self.repository}},
                 'base': {'ref': body['base'], 'sha': refs[target], 'repo': {'full_name': self.repository}},
                 'merged': False, 'merge_commit_sha': None, 'merged_by': None})
@@ -250,12 +268,16 @@ class SyntheticGitHub:
                     sha=body['sha'], merge_method=body['merge_method'],
                     commit_title=body['commit_title'], commit_message=body['commit_message'])
                 self.physical.fetch(merged)
-                pr.update(state='closed', merged=True, merge_commit_sha=merged, merged_by={'login': actor})
+                pr.update(merged=True, merge_commit_sha=merged, merged_by={'login': actor})
                 response = {'merged': True, 'sha': merged}
             else:
                 pr.update({key: body[key] for key in ('title', 'body') if key in body})
+                if any(key in body for key in ('title', 'body')):
+                    pr['updated_at'] = datetime.now(timezone.utc).isoformat()
                 response = {'number': number}
             self.objects.put_pr(pr)
+            if tail.endswith('/merge') or 'state' in body:
+                self.objects.set_state(number, 'closed' if tail.endswith('/merge') else body['state'], actor)
         elif tail.endswith('/comments'):
             response = {'id': self.objects.post_comment(int(tail.split('/')[1]), body['body'], actor)}
         elif tail.startswith('issues/') and method == 'PATCH':
