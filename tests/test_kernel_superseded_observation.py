@@ -100,7 +100,8 @@ def test_executor_preserves_unproved_or_upstream_read_errors(tmp_path, monkeypat
         with kernel.storage.transaction(write=False) as tx:
             assert not tx.rows('SELECT id FROM effects')
         import json
-        assert not any("--method" in json.loads(line) for line in _calls.read_text().splitlines())
+        assert not _calls.exists() or not any(
+            "--method" in json.loads(line) for line in _calls.read_text().splitlines())
         assert kernel.status("parent:1")["gates"] == []
         return
     with pytest.raises(type(error)) as raised:
