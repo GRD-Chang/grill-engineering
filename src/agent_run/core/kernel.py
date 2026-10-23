@@ -2747,7 +2747,9 @@ class Kernel:
                     or effect.operation in {"integrate", "run_branch", "publication_commit", "push", "pr_write", "merge"}
                     and not self._effect_base_current(job, row, world)):
                 raise KernelError("operation_boundary_changed")
-            if effect.operation == "pr_write" and not self._pr_write_current(run, job, world):
+            if effect.operation == "pr_write" and (not self._pr_write_current(run, job, world)
+                    or effect.pr_number is None and (world.pr is not None or world.source is None
+                                                     or world.source.sha != effect.after_sha)):
                 raise KernelError("pr_identity_changed")
             if effect.operation == "merge" and not self._merge_authority(tx, run, job, world):
                 raise KernelError("merge_authority_changed")
@@ -3955,6 +3957,14 @@ class Kernel:
             if not self._pr_write_current(run, job, world):
                 self._gate(tx, subject, "published_head_changed")
                 return Step("paused", subject, "pr_identity_changed")
+            if world.pr is not None and job["pr_number"] is None:
+                if world.pr.actor != self._publisher_actor(tx, run, world):
+                    self._gate(tx, subject, "published_head_changed")
+                    return Step("paused", subject, "pr_identity_changed")
+                # Bind only the new edit intent to a late owned create. The
+                # retired request retains its original number and payload.
+                tx.execute("UPDATE subjects SET pr_number=? WHERE id=?", (world.pr.number, subject))
+                job = self._job(tx, subject)
             attempt = tx.one("SELECT result_id FROM attempts WHERE id=?", (job["publication_attempt"],))
             narrative = json.loads(tx.get(attempt["result_id"], subject))
             old = None if world.pr is None else {"title": world.pr.title, "body": world.pr.body}

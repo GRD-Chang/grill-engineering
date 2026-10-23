@@ -149,6 +149,11 @@ class RemoteEffects:
             return replace(fresh, disposition="third") if fresh.disposition == "target" and fresh != observed else fresh
         if observed.disposition != "prior":
             return observed
+        if (effect.operation == "pr_write" and effect.pr_number is None
+                and (observed.pr is not None or observed.raw.get("target_head") != effect.base.sha)):
+            # Readback may settle an absent old create after a target append;
+            # it does not authorize another POST against that changed target.
+            return replace(observed, disposition="third")
         if self.actor() != effect.actor:
             raise KernelError("remote_actor_changed")
         operation = effect.operation
@@ -164,13 +169,23 @@ class RemoteEffects:
                         self.git_writes.push(effect.source_ref, expected, after))
         elif operation == "pr_write":
             body = {"title": _text(effect.payload["title"]), "body": _text(effect.payload["body"])}
+            write_authority = authorize
             if effect.pr_number is None:
                 endpoint, method = f"repos/{self.repository}/pulls", "POST"
                 body.update(head=effect.source_ref.removeprefix("refs/heads/"),
                             base=effect.target_ref.removeprefix("refs/heads/"))
+                def current_create() -> None:
+                    authorize()
+                    fresh = self._reconcile(effect)
+                    if fresh.disposition != "prior" or fresh.pr is not None or fresh.raw != observed.raw:
+                        raise KernelError("pr_boundary_changed")
+                    # No adapter read may follow the final Core check before
+                    # the physical POST; Stop can commit during reconciliation.
+                    authorize()
+                write_authority = current_create
             else:
                 endpoint, method = f"repos/{self.repository}/pulls/{effect.pr_number}", "PATCH"
-            response = self._write(endpoint, method, body, authorize)
+            response = self._write(endpoint, method, body, write_authority)
         elif operation == "merge":
             message = _text(effect.payload["commit_message"])
             title, _, message_body = message.partition("\n")
@@ -728,7 +743,8 @@ class RemoteEffects:
         if data is None:
             source, target = self._remote_head(effect.source_ref), self._remote_head(effect.target_ref)
             return EffectResult("prior" if effect.operation == "pr_write" and effect.pr_number is None
-                and source == effect.after_sha and target == effect.base.sha else "third")
+                and source == effect.after_sha and target is not None and self._ancestor(effect.base.sha, target)
+                else "third", raw={"pr_absent": True, "source_head": source, "target_head": target})
         pr = self._pr(data)
         if pr.actor is None or pr.head_repository is None:
             return EffectResult("unknown", pr=pr, raw={"diagnostic": "PR identity is not observable"})
