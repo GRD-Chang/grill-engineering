@@ -57,10 +57,11 @@ GitHub CLI 不在自动 APT 补装范围：Ubuntu 24.04 原生源中的 gh 2.45.
 软件源候选不可用、版本仍不兼容或包安装失败时按实际错误处理，不能视为执行就绪。
 
 上述范围是自动准备策略，模拟工具测试只验证分支与授权边界，不是完整平台支持证明。
-本轮宿主证据：Ubuntu 24.04 x86_64，CPython 3.11.16、Git 2.43.0、bubblewrap 0.9.0。
-真实 `bwrap --die-with-parent --ro-bind / / --dev /dev --unshare-pid --proc /proc -- /bin/true` 成功；
-`systemctl --user show-environment` 返回 `Failed to connect to bus: Connection refused`，因此 user systemd 未就绪。
-未调用真实模型；完整执行兼容性、Debian 13 与 aarch64 尚未验证，不宣称完整宿主通过。
+须在实际目标宿主验证：可联系版本 254+ 的 user systemd manager、可用的 `systemd-run`，
+以及 bubblewrap 所需 mount/device/PID namespace。工具在 PATH 上不等于具备这些执行能力。
+Runner 的 Python 须实际加载包含 WAL-reset 修复的 SQLite：3.51.3 及以上，或官方回补
+3.50.7–3.50.x / 3.44.6–3.44.x，见[状态存储](agents/state-storage.md#sqlite-运行库与资源生命周期)。
+重新安装 Runner 不会升级旧 Run 协议，也不能证明该宿主已通过完整交付验收。
 
 | 缺项 | 处理与复查 |
 | --- | --- |
@@ -71,6 +72,9 @@ GitHub CLI 不在自动 APT 补装范围：Ubuntu 24.04 原生源中的 gh 2.45.
 
 Setup 成功后的短命 systemd 探针用于检查真实执行能力。不要通过关闭全机防护、替换 init 或绕过隔离来通过检查。
 `doctor` 只读检查，不安装或修复；也不证明 Skills 可用、项目测试通过或全部仓库权限满足。
+检查 JSON 的 `status`、`installation_readiness` 和 `execution_readiness`，不能仅凭退出码 0 判断就绪。
+当前 GitHub 检查仍探测宿主 `gh auth status`，不能代替独立所选 Runner PAT/App 来源的验证；
+将这项诊断局限与实际所选来源的证据分别记录。
 
 ## 目标仓库接入
 
@@ -78,7 +82,7 @@ Setup 成功后的短命 systemd 探针用于检查真实执行能力。不要�
 
 | 检查项 | 完成条件 |
 | --- | --- |
-| 认证与仓库身份 | `codex login status`、`gh auth status` 有效；Git 提交身份与目标 `OWNER/REPO` 正确，宿主 gh 有目标仓库发布所需的写权限 |
+| 认证与仓库身份 | Codex 登录有效，Git 提交身份与目标 `OWNER/REPO` 正确；分别验证 Runner/Worker 所选 host/PAT/App 来源，程序端须有交付写权限。`gh auth status` 只验证宿主来源，不代表所有配置身份 |
 | Skills | 实际运行 Codex 的用户可发现并读取 `implement`、`code-review`、它们引用的 Skills 及项目要求的其他 Skills。Runner 不附带它们；缺失时按 [Matt Skills](https://github.com/mattpocock/skills) 的当前说明准备，已有同名内容先检查并复用 |
 | 项目环境 | 编译、测试和运行依赖已就绪；从配置好项目 PATH/虚拟环境的终端启动，Runner 的 Python 环境不能替代它 |
 | CI | 已有 PR workflow 时，核对其 base 分支覆盖默认分支和 `agent-run/**`，并检查两类分支的必需检查规则；确认无必需检查也可运行，但不报告为 CI 通过 |

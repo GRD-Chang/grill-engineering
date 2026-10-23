@@ -30,6 +30,7 @@ agent-run run <parent-issue> --repo OWNER/REPO
 ```
 
 Runner develops in an independent clone of the remote and leaves your local checkout unchanged. You can continue the same repository and Parent task from different directories.
+Complete the [host and repository prerequisites](docs/install.en.md) first. The command starts automatic work and returns an operation receipt; it does not confirm completed delivery or grant final approval. Follow the [one-command flow and recovery reference](docs/agent-run.md#一条命令推进-ticket-交付).
 
 The main workflow:
 
@@ -51,6 +52,8 @@ flowchart TD
 Individual tickets can look correct while the combined feature still fails. After all tickets are
 integrated, another agent checks the whole feature against the original requirements. Any problems
 go back to a development agent for fixes and another verification pass.
+
+Development and repair use bounded allowances. Ticket review has a configured final-round fallback and optional CI review; a fallback is not a passed review. Whole-Parent acceptance and approval of the current final PR remain required. Pending or unknown checks do not count as passing.
 
 When human input is needed, the run pauses and saves its work. The final PR is merged into the default
 branch after the maintainer reviews and approves it. See the [run reference](docs/agent-run.md) for

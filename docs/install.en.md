@@ -56,10 +56,8 @@ Missing privileges require administrator action; authentication requires user lo
 Unavailable or incompatible candidates and package-manager failures must be resolved; they do not establish execution readiness.
 
 This is the automatic preparation policy. Fake-tool tests verify policy and authorization branches, not platform support.
-Host evidence for this change: Ubuntu 24.04 x86_64, CPython 3.11.16, Git 2.43.0, and bubblewrap 0.9.0.
-The real `bwrap --die-with-parent --ro-bind / / --dev /dev --unshare-pid --proc /proc -- /bin/true` probe succeeded.
-`systemctl --user show-environment` returned `Failed to connect to bus: Connection refused`; user systemd is not ready.
-No real model was invoked. Full execution compatibility, Debian 13, and aarch64 remain unverified; this is not full host acceptance.
+Verify the actual target host: the user systemd manager must be reachable and version 254+, `systemd-run` must be available, and bubblewrap must be able to create the required mount/device/PID namespaces. A tool appearing on PATH does not prove these capabilities.
+The Runner's Python must load SQLite with the WAL-reset fix: 3.51.3 or later, or the official backports 3.50.7–3.50.x / 3.44.6–3.44.x. See [state storage](agents/state-storage.md#sqlite-运行库与资源生命周期). An older Run is not upgraded by reinstalling the Runner.
 
 | Missing requirement | Action and verification |
 | --- | --- |
@@ -70,6 +68,7 @@ No real model was invoked. Full execution compatibility, Debian 13, and aarch64 
 
 Setup's short-lived systemd probe checks actual execution capability. Preserve host protections and isolation when resolving failures; do not replace init or disable system-wide protections to pass the probe.
 `doctor` is read-only: it neither installs nor repairs anything, and does not establish that Skills work, project tests pass, or all repository permissions are sufficient.
+Read the JSON `status`, `installation_readiness` and `execution_readiness`; the command returns exit code 0 after printing an issues report too. Its current GitHub check probes host `gh auth status`, so it is not verification of the separately selected Runner PAT/App source. Record that diagnostic limitation alongside the actual source-specific evidence.
 
 ## Target repository setup
 
@@ -77,20 +76,20 @@ Read the target repository's `AGENTS.md` and confirm that the required content h
 
 | Check | Completion criterion |
 | --- | --- |
-| Authentication and repository identity | `codex login status` and `gh auth status` succeed; Git commit identity and target `OWNER/REPO` are correct; host gh has the write permissions needed for publication |
+| Authentication and repository identity | Codex login is valid; Git commit identity and target `OWNER/REPO` are correct. Verify Runner and Worker against their separately selected host/PAT/App sources; Runner needs delivery write permissions. `gh auth status` checks the host source, not every configured identity |
 | Skills | The user running Codex can discover and read `implement`, `code-review`, their referenced Skills, and any other Skills required by the project. Runner does not bundle them. Follow the current [Matt Skills instructions](https://github.com/mattpocock/skills) when missing; inspect and reuse existing Skills with the same name |
 | Project environment | Build, test, and runtime dependencies are ready. Start from a shell with the project's PATH/virtual environment configured; Runner's Python environment does not replace it |
 | CI | If PR workflows exist, verify that their base-branch filters cover the default branch and `agent-run/**`; check required-check rules for both. Runs may proceed with no required checks, but do not describe that as CI passing |
 
 ### GitHub authentication: no App required by default
 
-Runner currently uses the host's authenticated `gh` for reading, cloning and publishing. That identity needs the permissions required by the delivery workflow. Workers default to host when no source is configured; select host or a PAT reference through `settings show/configure`. Explicit selection takes priority over an existing App profile.
+Runner and Worker independently select host, PAT or App through `settings show/configure`; both default to host. They share credential definitions. Runner's selection covers reading, cloning, publishing and remote Git, and needs the permissions required by the delivery workflow. See [user defaults](user-defaults.md#github-身份).
 
-If the host is not logged in, the operator should run `gh auth login`, then verify the login with `gh auth status`. Selecting a PAT for Workers does not replace the host authentication required by Runner.
+For host, the operator logs in with `gh auth login` and verifies with `gh auth status`. Runner PAT/App does not require an additional host login. Selecting credentials only for Worker does not change Runner's source.
 
-Host/PAT Workers use native `gh` without a local command allowlist. Credentials determine GitHub capabilities; role instructions still prohibit self-publication or self-approval, and Controller approval and Publisher responsibilities remain unchanged. PAT values are read from exactly one environment-variable or file reference, never stored in Run snapshots. A Run freezes its source and reference; updating defaults does not change an existing Run. Repair the same reference and explicitly resume after a credential failure; there is no fallback to host.
+Host/PAT/App Workers use native `gh` without a local command allowlist. Credentials determine GitHub capabilities; role instructions still prohibit self-publication or self-approval, and Controller approval and Publisher responsibilities remain unchanged. PAT values are read from exactly one environment-variable or file reference, never stored in Run snapshots. A Run freezes its source and reference; updating defaults does not change an existing Run. Repair the same reference and explicitly resume after a credential failure; there is no fallback to host.
 
-Existing App users retain the current read-only proxy and renewal behavior during this transition. App native access and Runner PAT/App selection are not implemented in this stage. See [GitHub identity](agent-run.md#github-身份) and [personal settings](user-defaults.md) for configuration. Queries do not issue credentials or display secrets.
+App metadata is managed by settings. App defaults to the permissions and repositories already granted to its installation; Worker can independently narrow it to read-only or the current repository. Runner uses the full installation grant. Signing and renewal are shared, with separate credential instances; updates reach later native gh and program API/Git calls. Existing standalone App metadata has an explicit settings migration command; this is not a Run protocol migration. See [GitHub identity](agent-run.md#github-身份) and [personal settings](user-defaults.md) for configuration. Queries do not issue credentials or display secrets.
 See [permission boundaries](agent-run.md#权限边界) for the distinction between credential capabilities and delivery responsibilities.
 
 Run `agent-run doctor --json` and `agent-run settings show` to check the environment, selected models, reasoning effort, and run limits.

@@ -10,7 +10,7 @@ Status、History、CLI 和通知投影从已提交事实派生，不另存展示
 
 | 事实或输出 | 当前维护归属 |
 | --- | --- |
-| 定位、唯一候选选择与命令分流 | [`cli/main.py`](../../src/agent_run/cli/main.py)、[`storage/tasks.py`](../../src/agent_run/storage/tasks.py) |
+| 定位、唯一候选选择与命令分流 | [`cli/selection.py`](../../src/agent_run/cli/selection.py)、[`cli/main.py`](../../src/agent_run/cli/main.py)、[`cli/lifecycle.py`](../../src/agent_run/cli/lifecycle.py)；Task 位置记录由 [`storage/tasks.py`](../../src/agent_run/storage/tasks.py) 维护 |
 | status/history/settings 的同源只读文档 | [`queries/run.py`](../../src/agent_run/queries/run.py) 的 `read` |
 | 交付对象、gate、预算、候选、PR、当前工作及人工待办 | `queries.run._subject`、`queries.read_facts.read_boundaries`；结构见 [`queries/model.py`](../../src/agent_run/queries/model.py) |
 | 原始调用、Thread/Profile 和物理输出关联 | `queries.run._attempt`、`_invocations`、`queries.execution.recorded_profile` |

@@ -12,10 +12,10 @@
 `native-task-locations/<task-fingerprint>.json` 只保存该 Task 的 Run ID 和数据库路径，
 不复制生命周期状态；替换与占用判断仍由 Core 决定。
 
-[`state_preflight.py`](../../src/agent_run/storage/preflight.py) 以只读连接检查现有数据库。
+[`storage.preflight`](../../src/agent_run/storage/preflight.py) 以只读连接检查现有数据库。
 旧 JSON/v6、早期 native v17/v18、来源封印及导入状态明确拒绝，
 保留原文件、Candidate、工作区和成果，不升级、不转换、不双写，也不直接续接。
-[`legacy_admission.py`](../../src/agent_run/storage/admission.py) 只检查旧 Task 占用及拒绝条件，
+[`storage.admission`](../../src/agent_run/storage/admission.py) 只检查旧 Task 占用及拒绝条件，
 不解释或转移旧工作。拒绝不授权清除旧 Task、封印或历史数据。
 
 `Storage.create` 排他创建新文件，拒绝接管已有数据库或遗留 sidecar。
@@ -24,7 +24,7 @@
 
 ## 事实的唯一归属
 
-[`storage.py`](../../src/agent_run/storage/sqlite.py) 的 `SCHEMA` 是表和列的实现依据：
+[`storage.sqlite`](../../src/agent_run/storage/sqlite.py) 的 `SCHEMA` 是表和列的实现依据：
 
 | 事实 | 当前关系 |
 | --- | --- |
@@ -75,7 +75,7 @@ Final Run PR 的远端内容仍为 PR Narrative 与单条原地更新的 Agent R
 实际长度及额度，再读取并核对摘要。现行接口不包含旧 `load_*`、
 `sqlite_change_job_queries` 或 `sqlite_query_rows` 模块。
 
-公开查询由 [`query.read`](../../src/agent_run/queries/run.py) 在同一只读快照中组织
+公开查询由 [`queries.run.read`](../../src/agent_run/queries/run.py) 在同一只读快照中组织
 status、history 和冻结 settings。history 使用 `after`/`limit`、事件位置和 `has_more`
 显式分页；查询不会把部分结果伪装成完整历史，也不会回填业务事实或通知记录。
 未读取的历史不能因空列表而被清除，查询结果与显示字段不授予保存或执行权限。
@@ -87,14 +87,14 @@ OperationRunner 将读回证据交给 Core 核验和消费，数据库提交不�
 
 ## 实现中的资源界限
 
-界限来自 `storage.py` 的常量及 Core 对准确记录的检查，不从源码行数或测试总耗时推导。
+界限来自 `storage.sqlite` 的常量及 Core 对准确记录的检查，不从源码行数或测试总耗时推导。
 
 | 位置 | 当前界限及检查 |
 | --- | --- |
 | 材料 `MATERIAL_LIMIT` | 单份 4 MiB；核验类型、长度、拥有者和摘要 |
 | Core 当前记录 `CURRENT_LIMIT` | 256 KiB；由 Core 的当前事实/操作 token 检查使用 |
 | `Transaction.rows` | 每次至多 128 行；同一事务累计至多 65,536 行、32 MiB 读取 |
-| 公开响应 | `query.py` 按实际编码结果检查 32 MiB 上限 |
+| 公开响应 | `queries.run` 按实际编码结果检查 32 MiB 上限 |
 | 主库 `DATABASE_LIMIT` | 256 MiB；事务边界检查页面数乘页面大小 |
 | 库及 sidecar `PHYSICAL_LIMIT` | DB/WAL/SHM 合计 1 GiB；事务边界检查实际大小 |
 

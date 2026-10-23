@@ -1,24 +1,27 @@
 # Run 选择与定位
 
-Run 的身份读取由 `run_selection.py` 维护，CLI 负责参数解析、命令准入、Action 附着和结果呈现。
+Run 的身份读取由 [`cli.selection`](../../src/agent_run/cli/selection.py) 维护，CLI 负责参数解析和结果呈现，Core 负责命令准入。
 这是一条只读边界：发现候选不会创建受管目录、登记 Locator、修复状态或接受 Action。
 
 | 责任 | 维护位置 |
 | --- | --- |
-| Repository 对应的受管 checkout 与 state 路径、目录所有权 | `managed_workspace.py`；CLI 上下文推断使用 `workspace_cli.py` |
-| 有界索引的格式、登记与准确 Run ID 定位 | `run_locator.py` |
-| 索引与持久身份核对、已知受管目录补查、候选诊断、准确状态读取、修改目标的目录绑定 | `run_selection.py` |
-| Parent 参数解析、按命令筛选候选、Resume/Mutation 已接受 Action 附着 | `cli.py` |
-| Action 准入、Receipt、generation 与执行恢复 | 现有 `run_lifecycle.py`、Task Control 与 Executor |
+| Repository 对应的受管 clone 与 state 路径、目录所有权 | [`adapters.workspace`](../../src/agent_run/adapters/workspace.py) |
+| Task → Run ID / 数据库位置记录的读写 | [`storage.tasks`](../../src/agent_run/storage/tasks.py)；替换决定由 Core 作出 |
+| 有界受管目录发现、位置记录与数据库身份核对、唯一候选选择 | `cli.selection._candidates` / `_select`，[`queries.run`](../../src/agent_run/queries/run.py) 的 `discover` / `task_published` |
+| 查询参数及输出、Parent 或准确 Run ID 的生命周期分流 | [`cli.main`](../../src/agent_run/cli/main.py)、[`cli.lifecycle`](../../src/agent_run/cli/lifecycle.py) |
+| Action 准入、Receipt、执行代次与恢复 | [`core.kernel`](../../src/agent_run/core/kernel.py)；生命周期层负责准确 Host 附着和交接 |
 
-`status`、`history` 和设置预览的准确 Run 查询使用 `load_exact_run`；准确 Run 的生命周期命令使用同一个
-`load_selected_state` 核验文件名与 Run ID、支持的状态合同及显式 Repository。只读查询保留可展示的旧状态，
-修改仍要求当前合同。两者不能因共享读取而共享修改权限。
+`status`、`history` 从当前 v19 数据库读取；准确 Run ID、Repository、Parent、数据库位置及
+Task 发布记录须一致。旧 JSON/v6、native v17/v18 不提供兼容查询或恢复。
+读取和修改不能因共享定位而共享权限。
 
-Parent 查询与生命周期命令使用 `selector_records`：读取 Locator，并补查已知受管目录中未登记的 Run。
-补查不覆盖已有索引；无关失效记录只有在身份足以证明无关时才能排除。匹配或未知身份的失效记录仍需显式定位，
-多个匹配候选不按时间猜测。查询允许显式 state directory；修改必须绑定当前受管 checkout 的准确 state directory。
+候选来自数据主目录下的受管 state 目录和 `native-task-locations/` 的 Task 位置记录，
+不遍历用户 clone、工作区或安装目录。位置记录不保存另一份业务状态，查询不补写记录。
+Parent 查询优先使用该 Task 已发布的 Run；省略 Parent 时只选择唯一未终止候选。
+多个匹配候选不按时间猜测。显式 `--repo` 查询须同时指定 `--parent` 或准确 Run ID，
+`runs --repo` 可列出候选。查询允许显式 state directory；生命周期修改还须核验受管 state 目录及准确 Task 绑定。
 
-命令特有规则继续由 CLI 维护：Resume 可附着已接受且正在推进的 Action，Stop/Abandon 在没有 active 候选时
-可选择非 active Run。准入后的 Receipt、退出码、握手、环境载体、Runner lease 和 generation 检查不属于定位层，
+生命周期位置参数接受 Parent 编号或完整 Run ID；`resume --ticket N` 选择准确局部暂停对象。
+附着原 Host 不代表新请求已应用，须读取回执的请求动作及应用事实。
+准入后的 Receipt、退出码、握手、环境载体、Runner lease 和 generation 检查不属于定位层，
 不能因早期选择成功而省略。

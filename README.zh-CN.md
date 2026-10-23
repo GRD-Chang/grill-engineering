@@ -30,6 +30,8 @@ agent-run run <parent-issue> --repo OWNER/REPO
 ```
 
 Runner 独立克隆远端代码进行开发，用户本地仓库保持不变。相同仓库和 Parent 的任务可从不同目录继续。
+先完成[宿主与仓库接入检查](docs/install.md)。命令启动自动推进，返回的是操作回执，
+不代表交付完成，也不授予最终合并批准。各阶段与恢复入口见[一条命令流程](docs/agent-run.md#一条命令推进-ticket-交付)。
 
 下面是主要流程：
 
@@ -50,6 +52,10 @@ flowchart TD
 
 每个 Ticket 单独完成，不代表合在一起就能正常工作。所以最后还会对照最初的需求，
 验收整个功能。发现问题后，同样交回开发 Agent 修复，再验收修复结果。
+
+开发和修复使用有界额度。Ticket 普通审核存在配置规定的末轮 fallback，CI 审核可选；
+fallback 不能称为审核通过。完整 Parent 验收和当前最终 PR 的人工批准仍必需，
+pending 或 unknown 检查不能当作通过。
 
 需要人工处理时，任务会暂停并保存已有工作。最终 PR 由维护者审阅和批准后合入主分支。
 具体的运行和恢复规则见[运行说明](docs/agent-run.md)。
