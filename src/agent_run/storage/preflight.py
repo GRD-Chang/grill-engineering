@@ -57,12 +57,14 @@ def read_state(path: Path) -> Iterator[sqlite3.Connection]:
             raise UnsupportedState(path, "uncertain_state")
         for suffix in ("-wal", "-shm", "-journal"):
             sidecar = Path(str(path) + suffix)
-            if sidecar.is_symlink():
+            try:
+                metadata = sidecar.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                # SQLite's last connection can remove its WAL/SHM normally.
+                # Only an absent sidecar is optional; the database is not.
+                continue
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or suffix == "-journal" and metadata.st_size:
                 raise UnsupportedState(path, "uncertain_state")
-            if sidecar.exists():
-                metadata = sidecar.stat()
-                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or suffix == "-journal" and metadata.st_size:
-                    raise UnsupportedState(path, "uncertain_state")
         db = sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True,
                              isolation_level=None, timeout=1.0)
     except (OSError, sqlite3.Error) as error:
