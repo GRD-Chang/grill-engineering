@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterable
 from functools import partial
 import json
 import os
@@ -12,7 +13,7 @@ import sys
 from typing import Any, Literal, NoReturn, Sequence
 
 from agent_run.cli_messages import personal_language as _personal_language
-from agent_run.messages import error_detail
+from agent_run.messages import error_detail, text
 from agent_run.git_errors import GitError
 from agent_run.github import GitHubReadError
 from agent_run.runner_lease import RunnerLeaseError
@@ -31,13 +32,33 @@ from .task_location import read_task_bindings
 from .state_preflight import UnsupportedState
 
 
-class _Parser(argparse.ArgumentParser):
+class _HelpFormatter(argparse.HelpFormatter):
     def __init__(self, *args: Any, language: str, **kwargs: Any) -> None:
         self.language = language
         super().__init__(*args, **kwargs)
+
+    def _format_usage(self, usage: str | None, actions: Iterable[argparse.Action],
+                      groups: Iterable[argparse._MutuallyExclusiveGroup], prefix: str | None) -> str:
+        return super()._format_usage(usage, actions, groups,
+            text("cli.usage_prefix", language=self.language) if prefix is None else prefix)
+
+
+class _Parser(argparse.ArgumentParser):
+    def __init__(self, *args: Any, language: str, **kwargs: Any) -> None:
+        self.language = language
+        kwargs.setdefault("formatter_class", partial(_HelpFormatter, language=language))
+        super().__init__(*args, **kwargs)
+        for action in self._actions:
+            if isinstance(action, argparse._HelpAction):
+                action.help = text("cli.help_option", language=language)
         if language == "zh":
             self._positionals.title = "位置参数"
             self._optionals.title = "选项"
+
+    def _check_value(self, action: argparse.Action, value: Any) -> None:
+        if action.choices is not None and value not in action.choices:
+            self.error(text("cli.invalid_choice", language=self.language,
+                argument=action.dest, value=repr(value), choices=", ".join(map(repr, action.choices))))
 
     def error(self, message: str) -> NoReturn:
         self.print_usage(sys.stderr)
@@ -320,7 +341,9 @@ def main(arguments: Sequence[str] | None = None) -> int:
         error_candidates = error.candidates if isinstance(error, QueryError) else []
         state_diagnostic = (error.diagnostic() if isinstance(error, UnsupportedState)
                             else error.state_diagnostic if isinstance(error, QueryError) else None)
-        diagnostic = state_diagnostic or {"code": diagnostic_code, "message": str(error)}
+        missing_run_hint = (text("cli.error.run_locator_missing", language=language)
+                            if isinstance(error, QueryError) and diagnostic_code == "run_locator_missing" else None)
+        diagnostic = state_diagnostic or {"code": diagnostic_code, "message": missing_run_hint or str(error)}
         error_output: dict[str, Any] = {"result": "error", "status": "command_failed",
                   "diagnostics": [diagnostic]}
         if state_diagnostic is not None:
@@ -333,7 +356,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             print(json.dumps(error_output, ensure_ascii=False, sort_keys=True))
         else:
             prefix = "命令未应用" if language == "zh" else "Command not applied"
-            print(safe_text(f"{prefix}: {diagnostic_code}\n{error_detail(error, language)}"))
+            print(safe_text(f"{prefix}: {diagnostic_code}\n{missing_run_hint or error_detail(error, language)}"))
             if state_diagnostic is not None:
                 print(safe_text(f"{diagnostic['path']}\n{diagnostic['recovery_hint']}"))
             for error_candidate in error_candidates:

@@ -1095,5 +1095,9 @@
   "presentation.history.ticket_ci_usage": "CI window {window}: cumulative development at round start {used}/{limit}",
   "cli.parent_ci_development_limit_help": "Cumulative CI Development allowance for both Parent paths (default 3)",
   "cli.settings.field.parent_ci_development_limit": "Parent CI Development allowance",
-  "presentation.status.ci_development_usage": "CI window {window}: cumulative development {used}/{limit}"
+  "presentation.status.ci_development_usage": "CI window {window}: cumulative development {used}/{limit}",
+  "cli.usage_prefix": "usage: ",
+  "cli.help_option": "show this help message and exit",
+  "cli.invalid_choice": "argument {argument}: invalid choice: {value} (choose from {choices})",
+  "cli.error.run_locator_missing": "No matching Run was found. First inspect existing Runs with agent-run runs --repo OWNER/NAME; if this Parent has no Runner workspace yet, start it with agent-run run PARENT --repo OWNER/NAME."
 }

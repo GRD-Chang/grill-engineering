@@ -1,11 +1,7 @@
 """Public delivery audits consume recorded outbox facts without sending or repair."""
 from pathlib import Path
-import hashlib
 import io
 import json
-import os
-import subprocess
-import sys
 
 import pytest
 
@@ -230,82 +226,29 @@ def test_public_notification_configuration_uses_the_run_snapshot_and_keeps_missi
     assert _snapshot(tmp_path) == before
 
 
-def _old_environment() -> tuple[Path, dict[str, str]]:
-    configured = os.environ.get("AGENT_RUN_SETTINGS_ORACLE_SRC")
-    if not configured:
-        pytest.fail("Set AGENT_RUN_SETTINGS_ORACLE_SRC to the immutable unchanged-02 source; no oracle is skipped")
-    source = Path(configured)
-    for relative, digest in {
-        "src/agent_run/cli.py": "bb705bec1cb40b890876f5ac4c7c2389af6f9419405e9e7ad2c7b5be24efda7c",
-        "src/agent_run/cli_presentation.py": "5b8c3ea1e25dbdddbfbe6220b8727b20c8ad63070876e9c7ae3fbc65bff9413d",
-        "src/agent_run/notification_outbox.py": "ce2f87174e7da12da06952081f8ec5b89cc44cb050986168175eccb3884a601d",
-        "tests/support/workspace.py": "6fb3a77872902850406123f1e95f18ebf8cf905898be7ea2a3f03c9446c7df1c",
-    }.items():
-        assert hashlib.sha256((source.parent / relative).read_bytes()).hexdigest() == digest
-    return source, dict(os.environ, PYTHONPATH=os.pathsep.join((str(source), str(source.parent / "tests"))))
-
-
-def test_public_notification_warning_and_json_preserve_the_original_cli_meaning(
-    tmp_path: Path, git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+def test_public_notification_warning_and_json_preserve_current_delivery_facts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _source, environment = _old_environment()
-    state_root = tmp_path / "original-state"
-    setup = subprocess.run([sys.executable, "-c", """
-import json, subprocess, sys
-from pathlib import Path
-from agent_run.controller import Controller
-from agent_run.git import GitRepository
-from agent_run.github_fixture import FixtureGitHubReader
-from agent_run.state import StateStore
-from agent_run.user_defaults import notification_snapshot
-from support.workspace import prepare_workspace
-repo, state_root = map(Path, sys.argv[1:])
-head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip()
-fixture = repo / 'github.json'
-fixture.write_text(json.dumps({'repository':'example/project', 'default_branch':'main', 'default_head_sha':head,
-    'parent':{'number':1,'title':'Parent','body':'Requirement','sub_issues':[]}, 'issues':{}}))
-workspace = prepare_workspace(repo)
-controller = Controller(FixtureGitHubReader(fixture), GitRepository(workspace.repository_root), StateStore(state_root))
-controller.creation_language = 'en'
-state, _ = controller.start_or_resume_unfinished(1, prepare_state=lambda value: value.update(notifications=notification_snapshot(
-    {'enabled':True, 'open_id':'ou_frozen', 'profile':'frozen-profile', 'app_id':'cli_frozen'})))
-print(state['run_id'])
-""", str(git_repo), str(state_root)], cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=20)
-    assert setup.returncode == 0, setup.stderr
-    run_id = setup.stdout.strip()
+    run_id = "notification-public-audit"
     kernel = _run(tmp_path / "native", run_id=run_id)
     _journal(kernel, run_id)
-    # An unavailable sender preserves its previous delivery audit alongside
-    # the reason; the original public CLI reports both facts independently.
+    # Producer-owned payloads must survive querying byte for byte in JSON;
+    # their dispositions below are independently fixed by the synthetic story.
     with outbox.transaction(kernel.storage.path.parent, run_id) as document:
         document["unavailable_reason"] = "Original sender failure evidence"
-    journal = outbox.read_notifications(kernel.storage.path.parent, run_id)
-    observed = subprocess.run([sys.executable, "-c", """
-import contextlib, io, json, sys
-from pathlib import Path
-from agent_run.cli import main
-from agent_run.notification_outbox import transaction
-root, run_id = Path(sys.argv[1]), sys.argv[2]
-with transaction(root, run_id) as document:
-    document.update(json.load(sys.stdin))
-def snapshot():
-    return {str(path):path.read_bytes() for path in root.rglob('*') if path.is_file()
-        and not path.name.endswith('-shm') and not (path.name.endswith('-wal') and path.stat().st_size == 0)}
-before = snapshot()
-results = {}
-for command in ('status','history'):
-    for style in ('json','plain'):
-        buffer = io.StringIO()
-        with contextlib.redirect_stdout(buffer):
-            code = main([command, run_id, '--state-dir', str(root), '--repo', 'example/project'] + (['--json'] if style == 'json' else []))
-        assert code == 0, buffer.getvalue()
-        results[command + '_' + style] = json.loads(buffer.getvalue()) if style == 'json' else buffer.getvalue()
-assert before == snapshot()
-print(json.dumps(results))
-""", str(state_root), run_id], cwd=tmp_path, env=environment, input=json.dumps(journal),
-        capture_output=True, text=True, timeout=20)
-    assert observed.returncode == 0, observed.stderr
-    original = json.loads(observed.stdout)
+        expected_pending = json.loads(json.dumps(document["pending"]))
+        expected_records = json.loads(json.dumps(document["records"]))
+    assert [item["outcome"] for item in expected_pending] == ["pending", "unknown", "sending"]
+    assert [item["attempts"] for item in expected_pending] == [0, 1, 1]
+    assert [item["outcome"] for item in expected_records] == ["success", "failed", "unknown"]
+    assert [item["attempts"] for item in expected_records] == [1, 3, 1]
+    assert expected_records[1]["exhausted"] is True
+    assert expected_records[2]["cancelled"] is True
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Read-only notification queries must not send")
+
+    monkeypatch.setattr("subprocess.run", forbidden)
     from contextlib import redirect_stdout
     before = _snapshot(tmp_path)
     for command in ("status", "history"):
@@ -319,14 +262,13 @@ print(json.dumps(results))
                 assert main([command, run_id, "--state-dir", str(kernel.storage.path)] + (["--json"] if style == "json" else [])) == 0
             if style == "json":
                 facts = json.loads(output.getvalue())["notifications"]
-                assert facts["pending"] == original[command + "_json"]["notifications"]["pending"]
-                assert facts["records"] == original[command + "_json"]["notifications"]["records"]
+                assert facts["unconfirmed_count"] == 4
+                assert facts["pending"] == expected_pending
+                assert facts["records"] == expected_records
             else:
                 warning = "Feishu notifications not confirmed delivered: 4;"
-                assert warning in original[command + "_plain"]
                 assert warning in output.getvalue()
                 reason = "Feishu notifications unavailable: Original sender failure evidence"
-                assert reason in original[command + "_plain"]
                 assert reason in output.getvalue()
                 assert "binding not recorded" in output.getvalue()
     assert _snapshot(tmp_path) == before

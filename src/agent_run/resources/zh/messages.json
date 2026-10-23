@@ -1095,5 +1095,9 @@
   "presentation.history.ticket_ci_usage": "CI 窗口 {window}：本轮启动时累计开发 {used}/{limit}",
   "cli.parent_ci_development_limit_help": "两种 Parent 的累计 CI 开发额度（默认 3）",
   "cli.settings.field.parent_ci_development_limit": "Parent CI 开发额度",
-  "presentation.status.ci_development_usage": "CI 窗口 {window}：累计开发 {used}/{limit}"
+  "presentation.status.ci_development_usage": "CI 窗口 {window}：累计开发 {used}/{limit}",
+  "cli.usage_prefix": "用法: ",
+  "cli.help_option": "显示帮助并退出",
+  "cli.invalid_choice": "参数 {argument} 的无效选项：{value}（可选：{choices}）",
+  "cli.error.run_locator_missing": "找不到匹配的 Run。请先用 agent-run runs --repo OWNER/NAME 核对已有 Run；若尚未创建此 Parent 的 Runner 工作区，请用 agent-run run PARENT --repo OWNER/NAME 启动。"
 }

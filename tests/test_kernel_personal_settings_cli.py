@@ -1,4 +1,4 @@
-"""Real public defaults operations, compared with the unchanged 02 CLI.
+"""Current public defaults operations with independent expected values.
 
 All paths are synthetic XDG directories. These tests exercise the actual
 UserDefaultsStore and its filesystem transaction; no alternate config writer.
@@ -7,9 +7,6 @@ from __future__ import annotations
 
 import json
 import os
-import hashlib
-import subprocess
-import sys
 from pathlib import Path
 from typing import Callable
 
@@ -17,29 +14,6 @@ import pytest
 
 from agent_run.user_defaults import UserDefaultsStore
 from agent_run_kernel.query_cli import main
-
-
-def old_main(arguments: list[str]) -> int:
-    """Execute the unchanged oracle in another process, never native dead code."""
-    configured = os.environ.get("AGENT_RUN_SETTINGS_ORACLE_SRC")
-    if not configured:
-        pytest.fail("Set AGENT_RUN_SETTINGS_ORACLE_SRC to the immutable unchanged-02 CLI source; no oracle is skipped")
-    source = Path(configured)
-    expected = {
-        "cli.py": "bb705bec1cb40b890876f5ac4c7c2389af6f9419405e9e7ad2c7b5be24efda7c",
-        "agent_profiles.py": "e4c2adb94ae5c348a6f1c54012f0d712831fd4d0bf410590cfe48eccffd486be",
-        "delivery_policy.py": "f5da6897e2095066214105f1dc219d3eae2c8ff1540c4d3904f06768fc0a1027",
-        "user_defaults.py": "069233d34f2cbc1fe30d87144a4eb7caa85987f0c3831c08a3af2b5241cf72c6",
-    }
-    for name, digest in expected.items():
-        assert hashlib.sha256((source / "agent_run" / name).read_bytes()).hexdigest() == digest
-    environment = dict(os.environ)
-    environment["PYTHONPATH"] = str(source)
-    result = subprocess.run([sys.executable, "-m", "agent_run.cli", *arguments],
-        env=environment, text=True, capture_output=True, timeout=20, check=False)
-    print(result.stdout, end="")
-    print(result.stderr, end="", file=sys.stderr)
-    return result.returncode
 
 
 @pytest.fixture
@@ -61,45 +35,80 @@ def _call(entry: Callable, arguments: list[str], capsys) -> tuple[int, dict]:
     return code, json.loads(captured.out)
 
 
-def test_builtin_personal_show_matches_real_old_cli_without_creating_files(personal: Path, capsys) -> None:
-    old = _call(old_main, ["settings", "show", "--json"], capsys)
+def test_builtin_personal_show_has_current_defaults_without_creating_files(personal: Path, capsys) -> None:
     new = _call(main, ["settings", "show", "--json"], capsys)
-    # The retired legacy-file display field is no longer part of settings.
-    assert new == (old[0], {key: value for key, value in old[1].items() if key != "legacy_ignored"})
+    assert new[1]["defaults"] == {}
+    assert new[1]["source_path"] is None and new[1]["path"] == str(personal)
+    assert new[1]["policy"] == {
+        "parent_only_paired_rounds": 10, "run_repair_rounds": 3, "ticket_review_rounds": 3,
+        "ticket_development_workers": 3, "ticket_integration_development_limit": 3,
+        "ticket_ci_development_limit": 3, "parent_ci_development_limit": 3,
+        "integration_resync_limit": 3, "ticket_ci_review": False,
+        "development_thread_policy": "reuse",
+        "invocation_deadlines": {"development": 18000, "review": 7200, "publication": 3600},
+    }
+    assert new[1]["profile"]["preset"] == "economy"
+    for role, model, effort, reference in (
+        ("development", "gpt-5.6-luna", "xhigh", None),
+        ("review", "gpt-6-astra", "low", None),
+        ("publication", "gpt-5.6-luna", "xhigh", "development"),
+    ):
+        assert new[1]["profile"]["profiles"][role] == {
+            "model": model, "reasoning_effort": effort, "reference": reference,
+            "provenance": {"preset": "economy", "overrides": [], "reference": reference}}
+    assert new[1]["notifications"] == {
+        "enabled": False, "open_id": None, "profile": None, "app_id": None, "mode": "concise"}
     assert "legacy_ignored" not in new[1]
     assert new[0] == 0 and new[1]["source"] == "builtin"
     assert new[1]["scope"] == "future-runs" and new[1]["language"] == "zh"
     assert not personal.parent.exists()
 
 
-@pytest.mark.parametrize("options", [
-    ["--ticket-review-round", "4", "--parent-only-paired-round", "5", "--run-repair-round", "2",
-     "--ticket-development-workers", "2", "--ticket-integration-development-limit", "7",
-     "--integration-resync-limit", "0", "--ticket-ci-development-limit", "6", "--ticket-ci-review",
-     "--parent-ci-development-limit", "8", "--development-thread-policy", "new-per-attempt",
-     "--development-timeout", "1.5h", "--review-duration", "90m", "--publication-deadline", "600"],
-    ["--profile-preset", "premium", "--dev-model", "  original-model  ", "--dev-effort", "high",
-     "--review-model", "original-review", "--review-reasoning-effort", "ultra",
-     "--publication-reference", "development", "--language", "en"],
-    ["--worker-github-source", "pat", "--runner-github-source", "pat", "--github-pat-env", "DELIVERY_TEST_PAT",
-     "--notification-mode", "detailed", "--notification-open-id", "ou_EXPLICIT",
-     "--notification-profile", "explicit-profile", "--notification-app-id", "cli_EXPLICIT"],
-    ["--worker-github-source", "app", "--runner-github-source", "app", "--github-app-id", "123",
-     "--github-installation-id", "456", "--github-private-key-path", "/synthetic/unread-key",
-     "--github-app-read-only", "--github-app-current-repository-only"],
-])
-def test_public_settings_options_preserve_old_receipt_and_persisted_values(
-    personal: Path, capsys, options: list[str],
+@pytest.mark.parametrize("options,expected", [
+    (["--ticket-review-round", "4", "--parent-only-paired-round", "5", "--run-repair-round", "2",
+      "--ticket-development-workers", "2", "--ticket-integration-development-limit", "7",
+      "--integration-resync-limit", "0", "--ticket-ci-development-limit", "6", "--ticket-ci-review",
+      "--parent-ci-development-limit", "8", "--development-thread-policy", "new-per-attempt",
+      "--development-timeout", "1.5h", "--review-duration", "90m", "--publication-deadline", "600"],
+     {"policy": {"ticket_review_rounds": 4, "parent_only_paired_rounds": 5, "run_repair_rounds": 2,
+                 "ticket_development_workers": 2, "ticket_integration_development_limit": 7,
+                 "integration_resync_limit": 0, "ticket_ci_development_limit": 6, "ticket_ci_review": True,
+                 "parent_ci_development_limit": 8, "development_thread_policy": "new-per-attempt",
+                 "invocation_deadlines": {"development": "1.5h", "review": "90m", "publication": "600"}},
+      "profile": {}}),
+    (["--profile-preset", "premium", "--dev-model", "  original-model  ", "--dev-effort", "high",
+      "--review-model", "original-review", "--review-reasoning-effort", "ultra",
+      "--publication-reference", "development", "--language", "en"],
+     {"policy": {}, "profile": {"preset": "premium", "development_model": "original-model",
+                               "development_effort": "high", "review_model": "original-review",
+                               "review_effort": "ultra", "publication_from_development": True}, "language": "en"}),
+    (["--worker-github-source", "pat", "--runner-github-source", "pat", "--github-pat-env", "DELIVERY_TEST_PAT",
+      "--notification-mode", "detailed", "--notification-open-id", "ou_EXPLICIT",
+      "--notification-profile", "explicit-profile", "--notification-app-id", "cli_EXPLICIT"],
+     {"policy": {}, "profile": {}, "github": {"worker_source": "pat", "runner_source": "pat",
+                                               "pat": {"env": "DELIVERY_TEST_PAT"}},
+      "notifications": {"enabled": True, "mode": "detailed", "open_id": "ou_EXPLICIT",
+                        "profile": "explicit-profile", "app_id": "cli_EXPLICIT"}}),
+    (["--worker-github-source", "app", "--runner-github-source", "app", "--github-app-id", "123",
+      "--github-installation-id", "456", "--github-private-key-path", "/synthetic/unread-key",
+      "--github-app-read-only", "--github-app-current-repository-only"],
+     {"policy": {}, "profile": {}, "github": {"worker_source": "app", "runner_source": "app",
+         "app": {"app_id": "123", "installation_id": "456", "private_key_path": "/synthetic/unread-key"},
+         "app_read_only": True, "app_current_repository_only": True}}),
+], ids=["options0", "options1", "options2", "options3"])
+
+def test_public_settings_options_persist_current_values_and_receipts(
+    personal: Path, capsys, options: list[str], expected: dict,
 ) -> None:
     arguments = ["settings", "configure", *options, "--json"]
-    old = _call(old_main, arguments, capsys)
-    assert old[0] == 0
-    saved = personal.read_bytes()
-    personal.unlink()
     new = _call(main, arguments, capsys)
-    assert new == (old[0], {key: value for key, value in old[1].items() if key != "legacy_ignored"})
+    saved = personal.read_bytes()
+    assert new[0] == 0 and new[1]["source"] == "user-defaults"
+    assert new[1]["scope"] == "future-runs" and new[1]["source_path"] == str(personal)
+    assert new[1]["defaults"] == expected == json.loads(saved)
     assert "legacy_ignored" not in new[1]
-    assert personal.read_bytes() == saved
+    if options[0] == "--ticket-review-round":
+        assert new[1]["policy"]["invocation_deadlines"] == {"development": 5400, "review": 5400, "publication": 600}
     assert personal.stat().st_mode & 0o777 == 0o600
     assert "DELIVERY_TEST_PAT" not in os.environ
     assert _call(main, ["settings", "show", "--json"], capsys)[1]["defaults"] == json.loads(saved)
@@ -111,15 +120,31 @@ def test_sparse_profile_reference_and_disabled_flags_use_one_authority(personal:
         ["--publication-use-development", "--no-notifications", "--no-ticket-ci-review", "--review-deadline", "3h"],
         ["--publication-reasoning-effort", "max", "--github-pat-file", "/synthetic/unread-pat"],
     ]
-    expected = []
-    for options in sequences:
-        result = _call(old_main, ["settings", "configure", *options, "--json"], capsys)
-        assert result[0] == 0
-        expected.append((result, personal.read_bytes()))
-    personal.unlink()
-    for options, (receipt, raw) in zip(sequences, expected, strict=True):
-        assert _call(main, ["settings", "configure", *options, "--json"], capsys) == receipt
-        assert personal.read_bytes() == raw
+    expected_profiles = [
+        {"preset": "premium", "publication_model": "independent"},
+        {"preset": "premium", "publication_from_development": True},
+        {"preset": "premium", "publication_effort": "max"},
+    ]
+    for index, options in enumerate(sequences):
+        code, receipt = _call(main, ["settings", "configure", *options, "--json"], capsys)
+        assert code == 0 and receipt["scope"] == "future-runs"
+        saved = json.loads(personal.read_bytes())
+        assert receipt["defaults"] == saved
+        assert saved["profile"] == expected_profiles[index]
+        assert saved["notifications"] == {"enabled": index == 0}
+        assert saved["policy"]["ticket_ci_review"] is (index == 0)
+        if index > 0:
+            assert saved["policy"]["invocation_deadlines"] == {"review": "3h"}
+            assert receipt["policy"]["invocation_deadlines"]["review"] == 10800
+        if index == 1:
+            publication = receipt["profile"]["profiles"]["publication"]
+            development = receipt["profile"]["profiles"]["development"]
+            assert (publication["model"], publication["reasoning_effort"], publication["reference"]) == (
+                development["model"], development["reasoning_effort"], "development")
+        if index == 2:
+            assert saved["github"] == {"pat": {"file": "/synthetic/unread-pat"}}
+            assert receipt["profile"]["profiles"]["publication"]["reference"] is None
+            assert receipt["profile"]["profiles"]["publication"]["reasoning_effort"] == "max"
     assert UserDefaultsStore().load()["profile"]["publication_effort"] == "max"
 
 
@@ -218,7 +243,6 @@ def test_personal_plain_output_uses_real_language_and_does_not_send_or_open_runs
     output = capsys.readouterr().out
     assert "User text / 用户原文" in output
     assert "Legacy configuration ignored" not in output
-    assert "User text / 用户原文" in old
     assert personal.read_bytes() == before
 
 

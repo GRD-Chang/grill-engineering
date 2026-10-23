@@ -87,7 +87,7 @@ def test_unreadable_override_reports_error(tmp_path: Path, language: str) -> Non
 def test_output_repair_preview_is_read_only_and_snapshot_is_required_when_supplied(
     tmp_path: Path, capsys,
 ) -> None:
-    from agent_run.cli import main
+    from agent_run_kernel.query_cli import main
     from agent_run.prompt_context import structured_output_repair_prompt
 
     request = {"output_name": "Development result", "contract_error": "字段缺失"}
@@ -108,7 +108,7 @@ def test_output_repair_preview_is_read_only_and_snapshot_is_required_when_suppli
 
 @pytest.mark.parametrize("failure", ["invalid_utf8", "broken_symlink", "fifo", "missing_builtin", "empty", "oversized"])
 def test_resource_read_errors_reach_public_cli(tmp_path: Path, capsys, monkeypatch, failure: str) -> None:
-    from agent_run.cli import main
+    from agent_run_kernel.query_cli import main
 
     directory = prompt_resources.personal_method_directory()
     directory.mkdir(parents=True)
@@ -162,7 +162,7 @@ def test_help_and_explicit_preview_survive_invalid_personal_config(tmp_path: Pat
 
 @pytest.mark.parametrize("language", ["zh", "en"])
 def test_language_methods_are_independent_and_preview_matches(tmp_path: Path, language: str) -> None:
-    from agent_run.cli import main
+    from agent_run_kernel.query_cli import main
 
     assert main(["settings", "configure", "--language", language, "--json"]) == 0
     other = "en" if language == "zh" else "zh"
@@ -266,15 +266,14 @@ def test_legacy_files_are_preserved_and_sources_are_explicit(tmp_path: Path, lan
 
 
 def test_preview_and_diff_do_not_execute_workers_or_write_runs(tmp_path: Path, monkeypatch, capsys) -> None:
-    from agent_run.cli import main
-    from agent_run.codex import CodexCliBackend
-    from agent_run.state import StateStore
+    from agent_run_kernel.query_cli import main
+    from agent_run_kernel.storage import Storage
 
     def forbidden(*args, **kwargs):
         pytest.fail("Prompt inspection must not execute a Worker or persist Run state")
 
-    monkeypatch.setattr(CodexCliBackend, "_invoke", forbidden)
-    monkeypatch.setattr(StateStore, "save_run", forbidden)
+    monkeypatch.setattr("agent_run_kernel.codex_execution.execute_selected_codex", forbidden)
+    monkeypatch.setattr(Storage, "transaction", forbidden)
     request_file = tmp_path / "request.json"
     request_file.write_text(json.dumps({"task_issue_url": "https://example.invalid/2"}))
     assert main(["prompts", "diff", "--json"]) == 0
