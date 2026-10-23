@@ -526,7 +526,14 @@ def test_final_observation_proves_real_current_completions_into_remote_run_befor
     completed = scenario.kernel.source_status()["completions"]
     assert len(completed) == 1 and completed[0]["subject"] == "ticket:2"
     assert scenario.kernel.source_status()["final_subject"] is None
+    published_run = scenario.port.remote_commit("refs/heads/run")
+    assert published_run is not None and published_run.sha == completed[0]["merge_sha"]
+    # Publication advances the separate physical remote, not the observer's
+    # local ref. Import the real completed head before forking this fixture.
+    scenario.port.git.run("fetch", "--no-tags", str(scenario.port.physical.remote),
+                          "refs/heads/run:refs/heads/run")
     initial_run = scenario.port.git.commit("refs/heads/run")
+    assert initial_run == published_run
     default = scenario.port.git.commit("refs/heads/main")
     remote = tmp_path / "final-origin.git"
     scenario.port.git.run("init", "--bare", str(remote))
