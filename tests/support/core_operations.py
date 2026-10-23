@@ -13,6 +13,7 @@ from agent_run.model import AgentCall, CreationInputs, Delivery, DeliveryKind, E
 from agent_run.core.kernel import Kernel
 from agent_run.core.operation_contract import DeliveryFacts, DeliveryRead, OperationBinding, OperationPorts
 from agent_run.core.operation_runner import OperationRunner
+from agent_run.contracts.write_authority import WriteAuthority
 
 
 if TYPE_CHECKING:
@@ -47,7 +48,7 @@ class ReadOnlyPorts:
     def inspect(self, resources: tuple[ResourceWitness, ...]) -> tuple[ResourceInspection, ...]:
         raise AssertionError("This read-only fixture cannot inspect physical resources")
 
-    def execute(self, effect: Effect, authorize: Callable[[], None]) -> EffectResult:
+    def execute(self, effect: Effect, authorize: WriteAuthority) -> EffectResult:
         raise AssertionError(f"This read-only fixture cannot execute {effect.operation}")
 
     def reconcile(self, effect: Effect) -> EffectResult:

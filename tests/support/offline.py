@@ -15,6 +15,7 @@ import subprocess
 from typing import Any, Callable, Mapping, Sequence, TypeVar
 
 from agent_run.contracts.agent_profiles import resolve_profiles
+from agent_run.contracts.write_authority import WriteAuthority, admit_write
 from agent_run.errors import bounded_error
 from agent_run.errors import GitHubReadError
 from agent_run.config.resources import resolve_resources
@@ -234,7 +235,7 @@ class OfflinePort:
         return RemoteEffects(self.git.root, repository, runner_identity={"source": "host"},
                              remote=self.remote_name, api=api, git_writes=git_writes)
 
-    def execute(self, effect: Effect, authorize: Callable[[], None] | None = None) -> EffectResult | None:
+    def execute(self, effect: Effect, authorize: WriteAuthority) -> EffectResult | None:
         if effect.operation in _SHARED_REMOTE:
             def written(position: int, response: Mapping[str, Any], result: subprocess.CompletedProcess[str]) -> None:
                 with sqlite3.connect(self.database) as db:
@@ -244,16 +245,13 @@ class OfflinePort:
                 if result.returncode == 0 and effect.operation in self.lose_response:
                     self.lose_response.remove(effect.operation)
                     raise GitHubReadError('write_response_unavailable', effect.operation + ' took effect; response lost')
-            return self._remote(effect.repository, written).execute(effect, authorize or (lambda: None))
+            return self._remote(effect.repository, written).execute(effect, authorize)
         operation = effect.operation
         payload = effect.payload
-        git = LocalGit(self.git.root, authorize)
-        git.env = self.git.env.copy()
         if operation in LocalEffects.OPERATIONS:
-            result = self.local.execute(effect, authorize or (lambda: None))
+            result = self.local.execute(effect, authorize)
         elif operation == "issue_link":
-            if authorize is not None:
-                authorize()
+            admit_write(authorize)
             with sqlite3.connect(self.database) as db:
                 db.execute("INSERT OR IGNORE INTO links VALUES (?,?,?,?)", (payload["issue"], payload["ref"], payload["source_head"], effect.effect_id))
             result = EffectResult("target", raw={"acknowledged_status": "linked"})
@@ -349,7 +347,7 @@ class _ScenarioPorts:
     def inspect(self, resources: tuple[ResourceWitness, ...]) -> tuple[ResourceInspection, ...]:
         return _physical_read(lambda: self.scenario.port.inspect_resources(resources))
 
-    def execute(self, effect: Effect, authorize: Callable[[], None]) -> EffectResult:
+    def execute(self, effect: Effect, authorize: WriteAuthority) -> EffectResult:
         try:
             result = self.scenario.port.execute(effect, authorize)
         except EffectReadError as error:
