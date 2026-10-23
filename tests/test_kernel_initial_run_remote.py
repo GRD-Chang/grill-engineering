@@ -1,4 +1,6 @@
 """Actual source observation feeds the original first Run-ref empty CAS."""
+
+from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.core.operation_runner import observe_control
 from pathlib import Path
 from dataclasses import replace
@@ -45,11 +47,14 @@ def test_real_empty_run_ref_is_observed_and_created_before_a_ticket_workspace(tm
         assert effect.operation == "run_branch"
         sent.append(effect)
 
-        def original_authority():
-            authorize()
-            authorized.append(effect.effect_id)
+        def prepare_original():
+            final_admission = authorize.prepare()
+            def original_authority():
+                final_admission()
+                authorized.append(effect.effect_id)
+            return original_authority
 
-        actual = execute(effect, original_authority)
+        actual = execute(effect, WriteAuthority(prepare_original))
         assert actual.disposition == "target" and actual.commit == seed.base
         raise OSError("Original Run-ref CAS completed but its reply was lost")
 

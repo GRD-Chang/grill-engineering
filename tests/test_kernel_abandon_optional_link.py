@@ -27,7 +27,7 @@ def test_original_executor_abandons_with_its_optional_link_still_indeterminate(
 
             def interrupt_link(effect, authorize):
                 assert effect.operation == "issue_link" and effect.subject == "ticket:3"
-                authorize()
+                authorize.prepare()()
                 captured.append((kernel, effect))
                 raise OSError("Original optional display call interrupted before its write")
 

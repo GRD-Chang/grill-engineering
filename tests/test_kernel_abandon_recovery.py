@@ -28,7 +28,7 @@ def recovery_effect(tmp_path: Path, operation: str, monkeypatch: pytest.MonkeyPa
 
     def interrupt(effect, authorize):
         if effect.operation == operation:
-            authorize()
+            authorize.prepare()()
             sent.append(effect)
             if response is not None:
                 return response(effect, authorize, execute)

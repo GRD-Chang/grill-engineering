@@ -1,4 +1,6 @@
 """An unchanged original PR description still needs current write authority."""
+
+from agent_run.contracts.write_authority import WriteAuthority
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -24,6 +26,7 @@ def test_exact_original_pr_edit_noop_authorizes_and_rechecks_live_anchors(
                      before_sha=revised.sha, after_sha=revised.sha, candidate=revised,
                      payload={"title": original.title, "body": original.body,
                               "prior": {"title": original.title, "body": original.body}})
+    prepared: list[str] = []
     authorized: list[str] = []
 
     def move_base() -> None:
@@ -37,6 +40,9 @@ def test_exact_original_pr_edit_noop_authorizes_and_rechecks_live_anchors(
         authorized.append(mode)
         if mode == "stopped":
             raise KernelError("executor_fenced")
+
+    def prepare():
+        prepared.append(mode)
         if mode == "changed_base":
             move_base()
         elif mode == "changed_head":
@@ -49,6 +55,7 @@ def test_exact_original_pr_edit_noop_authorizes_and_rechecks_live_anchors(
             current = json.loads(state.read_text())
             current["prs"][0]["user"]["login"] = "foreign-author"
             state.write_text(json.dumps(current))
+        return authorize
 
     # Reconciliation is a pure observation, even before this effect dispatches.
     assert port.reconcile(effect).disposition == "target"
@@ -56,14 +63,15 @@ def test_exact_original_pr_edit_noop_authorizes_and_rechecks_live_anchors(
         move_base()
     if mode == "stopped":
         with pytest.raises(KernelError, match="executor_fenced"):
-            port.execute(effect, authorize)
+            port.execute(effect, WriteAuthority(prepare))
     else:
-        result = port.execute(effect, authorize)
+        result = port.execute(effect, WriteAuthority(prepare))
         assert result.disposition == ("target" if mode == "current" else "third")
         if mode == "current":
             assert result.pr is not None and result.pr.number == original.number and result.pr.head == revised
             assert port.reconcile(effect) == result
     assert authorized == ([] if mode == "stale_base" else [mode])
+    assert prepared == ([] if mode == "stale_base" else [mode])
     observed_calls = [json.loads(line) for line in calls.read_text().splitlines()]
     writes = [call for call in observed_calls if "--method" in call]
     assert len(writes) == 1 and "POST" in writes[0] and writes[0][1].endswith("/pulls")

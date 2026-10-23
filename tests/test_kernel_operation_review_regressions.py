@@ -9,6 +9,8 @@ exit status. They never replace a CompletedProcess or forge write_returncode.
 """
 from __future__ import annotations
 
+from agent_run.contracts.write_authority import WriteAuthority
+
 from collections.abc import Callable
 import json
 import os
@@ -157,16 +159,19 @@ raise SystemExit(response.returncode)
     observed: list[tuple[Effect, EffectResult | ReadUnavailable]] = []
     grants: list[str] = []
 
-    def execute_original(effect: Effect, authorize: Callable[[], None]) -> EffectResult:
+    def execute_original(effect: Effect, authorize: WriteAuthority) -> EffectResult:
         if effect.operation != "push":
             return execute(effect, authorize)
 
-        def current_grant() -> None:
-            authorize()
-            grants.append(effect.effect_id)
+        def prepare_grant():
+            final_admission = authorize.prepare()
+            def current_grant() -> None:
+                final_admission()
+                grants.append(effect.effect_id)
+            return current_grant
 
         try:
-            result = native.execute(effect, current_grant)
+            result = native.execute(effect, WriteAuthority(prepare_grant))
         except ReadUnavailable as error:
             observed.append((effect, error))
             raise

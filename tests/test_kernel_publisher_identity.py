@@ -117,15 +117,15 @@ def test_actual_publisher_is_frozen_and_rechecked_before_each_remote_write(
     assert effect.actor == "actual-runner"
     scenario.publisher["actor"] = "different-account"
     with pytest.raises(KernelError, match="publisher_identity_changed"):
-        boundary.authorize()
+        boundary.authorize.prepare()()
     scenario.publisher["actor"] = "actual-runner"
-    boundary.authorize()
+    boundary.authorize.prepare()()
     scenario.publisher["actor"] = "different-account"
     with pytest.raises(KernelError, match="publisher_identity_changed"):
-        boundary.authorize()
+        boundary.authorize.prepare()()
     scenario.publisher["actor"] = "actual-runner"
-    boundary.authorize()
-    scenario.port.execute(effect)  # Complete the physical request already authorized above.
+    boundary.authorize.prepare()()
+    scenario.port.execute(effect, boundary.authorize)
     assert scenario.runner().run_once().kind == "progress"
     assert scenario.runner().run_once().kind == "progress"
     scenario.publisher["actor"] = "different-account"
@@ -154,7 +154,7 @@ def test_close_inherits_only_the_confirmed_original_comment_receipt(
         def written(effect, authorize):
             if effect.operation == "completion_comment":
                 assert effect == comment
-                authorize()
+                authorize.prepare()()
                 return EffectResult("target", raw={"close_intent": intent})
             return execute(effect, authorize)
 
@@ -208,7 +208,7 @@ def test_rearmed_close_settles_the_original_late_write_without_dispatching_again
     boundary = capture_effect(scenario, monkeypatch, "close")
     close = boundary.effect
     assert close.operation == "close"
-    boundary.authorize()
+    boundary.authorize.prepare()()
     prior = scenario.port.reconcile(close)
     assert prior.disposition == "prior"
     assert scenario.runner().run_once().kind == "progress"
@@ -216,7 +216,7 @@ def test_rearmed_close_settles_the_original_late_write_without_dispatching_again
     assert rearmed.effect_id == close.effect_id
     assert rearmed.dispatch_serial == 2
     # The original dispatched request completes after its earlier prior read.
-    scenario.port.execute(close)
+    scenario.port.execute(close, boundary.authorize)
     target = scenario.port.reconcile(rearmed)
     assert target.disposition == "target"
     assert scenario.runner().run_once().kind == "progress"

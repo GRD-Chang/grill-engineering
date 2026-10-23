@@ -9,6 +9,8 @@ that three new Scenario runs are an old/new same-input differential execution.
 """
 from __future__ import annotations
 
+from agent_run.contracts.write_authority import WriteAuthority
+
 from pathlib import Path
 import json
 from dataclasses import replace
@@ -68,7 +70,7 @@ def test_completed_delivery_retires_only_its_recorded_resources(
     actual_execute = scenario.port.execute
     retired: list[Effect] = []
 
-    def execute(effect: Effect, authorize: Callable[[], None] | None = None) -> EffectResult | None:
+    def execute(effect: Effect, authorize: WriteAuthority) -> EffectResult | None:
         if effect.operation in CLEANUP_OPERATIONS:
             # Cleanup cannot be used as a substitute for durable business closeout.
             fresh = Kernel(scenario.port.root / "kernel.sqlite3")
@@ -133,10 +135,10 @@ def test_foreign_remote_head_keeps_completed_delivery_and_original_cleanup_inten
     attempts: list[Effect] = []
     foreign_heads: list[str] = []
 
-    def execute(effect: Effect, authorize: Callable[[], None] | None = None) -> EffectResult | None:
+    def execute(effect: Effect, authorize: WriteAuthority) -> EffectResult | None:
         if effect.operation == "cleanup_remote_ref":
             assert authorize is not None
-            authorize()  # Preserve the original race after durable dispatch.
+            authorize.prepare()()  # Preserve the original race after durable dispatch.
             assert not attempts
             attempts.append(effect)
             assert scenario.kernel.status(scenario.delivery.key)["phase"] == "complete"
@@ -198,10 +200,10 @@ def test_dirty_checkout_keeps_completed_delivery_and_blocks_later_resource_delet
     actual_execute = scenario.port.execute
     attempts: list[Effect] = []
 
-    def execute(effect: Effect, authorize: Callable[[], None] | None = None) -> EffectResult | None:
+    def execute(effect: Effect, authorize: WriteAuthority) -> EffectResult | None:
         if effect.operation in CLEANUP_OPERATIONS:
             assert authorize is not None
-            authorize()  # The original completed-delivery cut is already sent.
+            authorize.prepare()()  # The original completed-delivery cut is already sent.
             attempts.append(effect)
             assert effect.operation == "cleanup_worktree"
             assert scenario.kernel.status(scenario.delivery.key)["phase"] == "complete"
@@ -254,20 +256,23 @@ def test_optional_issue_link_lost_ack_is_not_replayed_or_promoted_by_readback(
     actual_execute = scenario.port.execute
     attempts: list[Effect] = []
 
-    def execute(effect: Effect, authorize: Callable[[], None] | None = None) -> EffectResult | None:
+    def execute(effect: Effect, authorize: WriteAuthority) -> EffectResult | None:
         if effect.operation == "issue_link":
             attempts.append(effect)
             assert effect.payload["issue"] == scenario.delivery.issue
             assert effect.payload["ref"] == scenario.delivery.source_ref
             original_authorize = authorize
 
-            def dispatched() -> None:
+            def prepare_dispatched():
                 assert original_authorize is not None
-                original_authorize()
-                before = Kernel(scenario.port.root / "kernel.sqlite3").status(scenario.delivery.key)
-                assert before["issue_link"]["state"] == "indeterminate"
+                final_admission = original_authorize.prepare()
+                def dispatched() -> None:
+                    final_admission()
+                    before = Kernel(scenario.port.root / "kernel.sqlite3").status(scenario.delivery.key)
+                    assert before["issue_link"]["state"] == "indeterminate"
+                return dispatched
 
-            authorize = dispatched
+            authorize = WriteAuthority(prepare_dispatched)
         return actual_execute(effect, authorize)
 
     monkeypatch.setattr(scenario.port, "execute", execute)

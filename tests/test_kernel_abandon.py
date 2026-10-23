@@ -136,7 +136,7 @@ def test_abandon_continuation_settles_the_original_sent_intent_before_fresh_insp
 
     def interrupt_retirement(effect, authorize):
         if effect.operation == "retire_pr":
-            authorize()
+            authorize.prepare()()
             sent.append(effect)
             raise OSError("Original retirement interrupted before its physical write")
         return execute(effect, authorize)

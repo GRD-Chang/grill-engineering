@@ -1,4 +1,6 @@
 """Remote effects through real bare Git and an isolated stateful gh executable."""
+
+from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.core.operation_runner import OperationRunner
 from dataclasses import replace
 import json
@@ -74,12 +76,12 @@ def test_publish_uses_exact_remote_lease_and_does_not_repeat_a_lost_response(tmp
         "raise SystemExit(result.returncode)\n")
     wrapper.chmod(0o755)
     authorized = []
-    result = port.execute(effect, lambda: authorized.append(effect.effect_id))
+    result = port.execute(effect, WriteAuthority(lambda: lambda: authorized.append(effect.effect_id)))
     assert result.disposition == "target" and result.commit == effect.candidate
     assert authorized == ["push-1"] and result.raw["write_returncode"] == 1
     assert len(pushes.read_text().splitlines()) == 1
     assert git.run("ls-remote", "--refs", "origin", effect.source_ref).stdout.split()[0] == effect.after_sha
-    again = port.execute(effect, lambda: pytest.fail("target readback must not authorize another write"))
+    again = port.execute(effect, WriteAuthority(lambda: lambda: pytest.fail("target readback must not authorize another write")))
     assert again == port.reconcile(effect) and again.disposition == "target"
 
 
@@ -89,11 +91,11 @@ def test_publish_never_adopts_an_external_remote_head_or_bypasses_current_guard(
     def stopped():
         raise KernelError("executor_fenced")
     with pytest.raises(KernelError, match="executor_fenced"):
-        port.execute(effect, stopped)
+        port.execute(effect, WriteAuthority(lambda: stopped))
     assert port.reconcile(effect).disposition == "prior"
     foreign = git.make_commit(effect.base.tree, (effect.before_sha,), "foreign remote actor")
     git.run("push", "origin", foreign.sha + ":" + effect.source_ref)
-    assert port.execute(effect, lambda: pytest.fail("third value must not be overwritten")).disposition == "third"
+    assert port.execute(effect, WriteAuthority(lambda: lambda: pytest.fail("third value must not be overwritten"))).disposition == "third"
     assert git.run("ls-remote", "--refs", "origin", effect.source_ref).stdout.split()[0] == foreign.sha
 
 
@@ -111,26 +113,26 @@ def _pr_effect(effect):
 
 
 def _publish_pr(port, effect):
-    assert port.execute(effect, lambda: None).disposition == "target"
+    assert port.execute(effect, WriteAuthority(lambda: lambda: None)).disposition == "target"
     effect = _pr_effect(effect)
-    result = port.execute(effect, lambda: None)
+    result = port.execute(effect, WriteAuthority(lambda: lambda: None))
     assert result.disposition == "target" and result.pr.number == 17
     return effect, result.pr
 
 
 def test_pr_ack_loss_and_narrative_update_reconcile_exact_original_identity(tmp_path, monkeypatch):
     port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
-    assert port.execute(push, lambda: None).disposition == "target"
+    assert port.execute(push, WriteAuthority(lambda: lambda: None)).disposition == "target"
     pr = _pr_effect(push)
     _change(state, lose_operation="pr")
-    result = port.execute(pr, lambda: None)
+    result = port.execute(pr, WriteAuthority(lambda: lambda: None))
     assert result.disposition == "target" and result.pr.title == "Original title"
     assert result.pr.body == "Original narrative\r\n中文" and result.pr.head_repository == "example/project"
     assert result.raw["write_returncode"] == 1
-    assert port.execute(pr, lambda: pytest.fail("must only read original PR")).disposition == "target"
+    assert port.execute(pr, WriteAuthority(lambda: lambda: pytest.fail("must only read original PR"))).disposition == "target"
     update = replace(pr, effect_id="edit-1", pr_number=17,
         payload={"title": "Updated title", "body": "Updated body", "prior": {"title": result.pr.title, "body": result.pr.body}})
-    assert port.execute(update, lambda: None).pr.body == "Updated body"
+    assert port.execute(update, WriteAuthority(lambda: lambda: None)).pr.body == "Updated body"
     actual = [json.loads(line) for line in calls.read_text().splitlines()]
     assert sum("POST" in c and c[1].endswith("/pulls") for c in actual) == 1
     assert sum("PATCH" in c for c in actual) == 1
@@ -145,12 +147,12 @@ def test_written_pr_target_settles_after_base_append_without_another_write(tmp_p
     document = json.loads(state.read_text())
     document["prs"][0]["base"]["sha"] = later.sha
     state.write_text(json.dumps(document))
-    readback = port.execute(effect, lambda: pytest.fail("written original target needs no new write authority"))
+    readback = port.execute(effect, WriteAuthority(lambda: lambda: pytest.fail("written original target needs no new write authority")))
     assert readback.disposition == "target" and readback.pr.number == original.number
     assert readback.pr.base.sha == later.sha and readback.pr.head == original.head
     update = replace(effect, effect_id="new-narrative", pr_number=original.number,
         payload={"title": "Next title", "body": "Next narrative", "prior": {"title": original.title, "body": original.body}})
-    assert port.execute(update, lambda: pytest.fail("new write still needs original base")).disposition == "third"
+    assert port.execute(update, WriteAuthority(lambda: lambda: pytest.fail("new write still needs original base"))).disposition == "third"
     actual = [json.loads(line) for line in calls.read_text().splitlines()]
     assert sum("--method" in c for c in actual) == 1
 
@@ -158,11 +160,11 @@ def test_written_pr_target_settles_after_base_append_without_another_write(tmp_p
 @pytest.mark.parametrize("lost_response", [True, False], ids=["failed-command", "successful-command"])
 def test_lost_write_response_and_failed_readback_retain_both_observed_outcomes(tmp_path, monkeypatch, lost_response):
     port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
-    assert port.execute(push, lambda: None).disposition == "target"
+    assert port.execute(push, WriteAuthority(lambda: lambda: None)).disposition == "target"
     pr = _pr_effect(push)
     _change(state, lose_operation="pr" if lost_response else None, read_error_after_write=True)
     with pytest.raises(ReadUnavailable) as failed:
-        port.execute(pr, lambda: None)
+        port.execute(pr, WriteAuthority(lambda: lambda: None))
     assert failed.value.code == "remote_read_failed"
     assert failed.value.write_returncode == (1 if lost_response else None)
     if lost_response:
@@ -171,7 +173,7 @@ def test_lost_write_response_and_failed_readback_retain_both_observed_outcomes(t
         assert failed.value.write_diagnostic == ""
     _change(state, read_error=False)
     assert port.reconcile(pr).disposition == "target"
-    assert port.execute(pr, lambda: pytest.fail("original PR write must not repeat")).disposition == "target"
+    assert port.execute(pr, WriteAuthority(lambda: lambda: pytest.fail("original PR write must not repeat"))).disposition == "target"
     actual = [json.loads(line) for line in calls.read_text().splitlines()]
     assert sum("--method" in call for call in actual) == 1
 
@@ -187,7 +189,7 @@ def test_pr_foreign_original_facts_cannot_be_overwritten_or_replaced(tmp_path, m
     elif field == "title": pr["title"] = "Unrelated external narrative"
     else: pr["state"] = "closed"
     state.write_text(json.dumps(document))
-    assert port.execute(effect, lambda: pytest.fail("foreign PR must not be edited")).disposition == "third"
+    assert port.execute(effect, WriteAuthority(lambda: lambda: pytest.fail("foreign PR must not be edited"))).disposition == "third"
     assert len(json.loads(state.read_text())["prs"]) == 1
 
 
@@ -199,7 +201,7 @@ def test_original_merge_ack_loss_settles_after_later_target_append(tmp_path, mon
     merge = replace(push, effect_id="merge-1", operation="merge", pr_number=pr.number,
         payload={"method": method, "parents": parents, "commit_message": "Reviewed merge\nOriginal body"})
     _change(state, lose_operation="merge")
-    result = port.execute(merge, lambda: None)
+    result = port.execute(merge, WriteAuthority(lambda: lambda: None))
     assert result.disposition == "target" and result.raw["write_returncode"] == 1
     assert result.commit.tree == push.candidate.tree
     assert result.raw["parents"] == parents and result.pr.merged == result.commit
@@ -208,7 +210,7 @@ def test_original_merge_ack_loss_settles_after_later_target_append(tmp_path, mon
         original = document["prs"][0][field]
         document["prs"][0][field] = None
         state.write_text(json.dumps(document))
-        assert port.execute(merge, lambda: pytest.fail("unobservable actor cannot authorize a write")).disposition == "unknown"
+        assert port.execute(merge, WriteAuthority(lambda: lambda: pytest.fail("unobservable actor cannot authorize a write"))).disposition == "unknown"
         document["prs"][0][field] = original
     state.write_text(json.dumps(document))
     git.run("fetch", "origin", result.commit.sha)
@@ -217,7 +219,7 @@ def test_original_merge_ack_loss_settles_after_later_target_append(tmp_path, mon
     document = json.loads(state.read_text())
     document["prs"][0]["base"]["sha"] = later.sha
     state.write_text(json.dumps(document))
-    resumed = port.execute(merge, lambda: pytest.fail("unknown merge must not merge twice"))
+    resumed = port.execute(merge, WriteAuthority(lambda: lambda: pytest.fail("unknown merge must not merge twice")))
     assert resumed.disposition == "target" and resumed.commit == result.commit
     assert resumed.raw["target_head"] == later.sha and resumed.raw["live_pr_base"] == later.sha
     assert resumed.pr.base.sha == parents[0] == push.base.sha
@@ -230,7 +232,8 @@ def test_remote_cas_still_preserves_third_head_appearing_at_dispatch(tmp_path, m
     foreign = git.make_commit(effect.base.tree, (effect.before_sha,), "concurrent remote writer")
     def race():
         git.run("push", "origin", foreign.sha + ":" + effect.source_ref)
-    result = port.execute(effect, race)
+        return lambda: None
+    result = port.execute(effect, WriteAuthority(race))
     assert result.disposition == "third" and result.raw["write_returncode"] != 0
     assert result.raw["remote_head"] == foreign.sha
 
@@ -240,7 +243,7 @@ def test_close_uses_original_comment_watermark_and_rejects_reopened_or_foreign_i
     comment = replace(effect, effect_id="comment-1", operation="completion_comment", after_sha=None, pr_number=17,
         payload={"issue": 2, "merge_sha": effect.after_sha, "gate_mode": "reviewed", "kind": "ticket"})
     _change(state, lose_operation="comment")
-    result = port.execute(comment, lambda: None)
+    result = port.execute(comment, WriteAuthority(lambda: lambda: None))
     assert result.disposition == "target" and result.raw["write_returncode"] == 1
     assert result.raw["close_intent"]["baseline_event_id"] == 0
     assert "PR #17; Run Branch commit" in result.raw["close_intent"]["comment_body"]
@@ -248,23 +251,23 @@ def test_close_uses_original_comment_watermark_and_rejects_reopened_or_foreign_i
     close = replace(comment, effect_id="close-1", operation="close",
         payload={"issue": 2, "merge_sha": effect.after_sha, "kind": "ticket", "close_intent": result.raw["close_intent"]})
     _change(state, lose_operation="close")
-    result = port.execute(close, lambda: None)
+    result = port.execute(close, WriteAuthority(lambda: lambda: None))
     assert result.disposition == "target" and result.raw["event"]["id"] == 1
-    assert port.execute(close, lambda: pytest.fail("observed original close is read-only")).disposition == "target"
+    assert port.execute(close, WriteAuthority(lambda: lambda: pytest.fail("observed original close is read-only"))).disposition == "target"
     document = json.loads(state.read_text())
     document["events"][0]["actor"] = None
     state.write_text(json.dumps(document))
-    assert port.execute(close, lambda: pytest.fail("unknown transition actor cannot write")).disposition == "unknown"
+    assert port.execute(close, WriteAuthority(lambda: lambda: pytest.fail("unknown transition actor cannot write"))).disposition == "unknown"
     document["events"][0]["actor"] = {"login": "publisher"}
     document["comments"][0]["user"] = None
     state.write_text(json.dumps(document))
-    assert port.execute(close, lambda: pytest.fail("unknown comment author cannot write")).disposition == "unknown"
-    assert port.execute(comment, lambda: pytest.fail("unknown comment author cannot be replaced")).disposition == "unknown"
+    assert port.execute(close, WriteAuthority(lambda: lambda: pytest.fail("unknown comment author cannot write"))).disposition == "unknown"
+    assert port.execute(comment, WriteAuthority(lambda: lambda: pytest.fail("unknown comment author cannot be replaced"))).disposition == "unknown"
     document["comments"][0]["user"] = {"login": "publisher"}
     document["events"].append({"id": 2, "event": "reopened", "actor": {"login": "external"}, "created_at": "2026-10-21T10:02:00Z"})
     document["issue_state"] = "open"
     state.write_text(json.dumps(document))
-    assert port.execute(close, lambda: pytest.fail("do not reclose external reopen")).disposition == "third"
+    assert port.execute(close, WriteAuthority(lambda: lambda: pytest.fail("do not reclose external reopen"))).disposition == "third"
     actual = [json.loads(line) for line in calls.read_text().splitlines()]
     assert sum("POST" in c for c in actual) == 1 and sum("PATCH" in c for c in actual) == 1
 
@@ -272,10 +275,10 @@ def test_close_uses_original_comment_watermark_and_rejects_reopened_or_foreign_i
 def test_unknown_reads_and_unbound_close_never_authorize_a_write(tmp_path, monkeypatch):
     port, _git, effect, state, calls = _fixture(tmp_path, monkeypatch)
     close = replace(effect, operation="close", payload={"issue": 2, "merge_sha": effect.after_sha})
-    assert port.execute(close, lambda: pytest.fail("no persisted close intent")).disposition == "unknown"
+    assert port.execute(close, WriteAuthority(lambda: lambda: pytest.fail("no persisted close intent"))).disposition == "unknown"
     _change(state, read_error=True)
     for read in (lambda: port.reconcile(_pr_effect(effect)),
-                 lambda: port.execute(_pr_effect(effect), lambda: pytest.fail("unknown cannot write"))):
+                 lambda: port.execute(_pr_effect(effect), WriteAuthority(lambda: lambda: pytest.fail("unknown cannot write")))):
         with pytest.raises(ReadUnavailable) as failure:
             read()
         assert failure.value.code == "remote_read_failed"
@@ -287,17 +290,17 @@ def test_selected_runner_actor_change_cannot_dispatch_original_effect(tmp_path, 
     port, _git, effect, state, _calls = _fixture(tmp_path, monkeypatch)
     _change(state, actor="different-login")
     with pytest.raises(KernelError, match="remote_actor_changed"):
-        port.execute(effect, lambda: pytest.fail("actor mismatch must precede authorization"))
+        port.execute(effect, WriteAuthority(lambda: lambda: pytest.fail("actor mismatch must precede authorization")))
 
 
 def test_optional_issue_link_ack_loss_is_not_readback_success_or_an_automatic_retry(tmp_path, monkeypatch):
     port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
-    assert port.execute(push, lambda: None).disposition == "target"
+    assert port.execute(push, WriteAuthority(lambda: lambda: None)).disposition == "target"
     link = replace(push, effect_id="link-1", operation="issue_link", before_sha=push.after_sha,
         payload={"issue": 2, "ref": push.source_ref, "source_head": push.after_sha})
     _change(state, lose_operation="issue_link")
     authorized = []
-    result = port.execute(link, lambda: authorized.append("link"))
+    result = port.execute(link, WriteAuthority(lambda: lambda: authorized.append("link")))
     assert result.disposition == "unknown" and result.raw["display"] == "indeterminate"
     assert json.loads(state.read_text())["links"] == [{"ref": "delivery", "sha": push.after_sha}]
     # Actual linked branch exists, but it cannot prove a lost acknowledgement.
@@ -309,10 +312,10 @@ def test_optional_issue_link_ack_loss_is_not_readback_success_or_an_automatic_re
 
 def test_optional_issue_link_keeps_exact_successful_graphql_acknowledgement(tmp_path, monkeypatch):
     port, _git, push, state, _calls = _fixture(tmp_path, monkeypatch)
-    assert port.execute(push, lambda: None).disposition == "target"
+    assert port.execute(push, WriteAuthority(lambda: lambda: None)).disposition == "target"
     link = replace(push, effect_id="link-1", operation="issue_link", before_sha=push.after_sha,
         payload={"issue": 2, "ref": push.source_ref, "source_head": push.after_sha})
-    result = port.execute(link, lambda: None)
+    result = port.execute(link, WriteAuthority(lambda: lambda: None))
     assert result.disposition == "target" and result.raw["display"] == "linked"
     assert result.raw["acknowledgement"]["data"]["createLinkedBranch"]["linkedBranch"]["ref"] == {
         "name": "delivery", "target": {"oid": push.after_sha}}
@@ -368,7 +371,7 @@ def test_real_issue_ack_stays_optional_and_once_across_kernel_reopen(tmp_path, m
 
 def test_remote_cleanup_uses_selected_runner_transport_and_original_head(tmp_path, monkeypatch):
     port, git, push, _state, _calls = _fixture(tmp_path, monkeypatch)
-    assert port.execute(push, lambda: None).disposition == "target"
+    assert port.execute(push, WriteAuthority(lambda: lambda: None)).disposition == "target"
     real_git = shutil.which("git")
     log = tmp_path / "git-environment.jsonl"
     transport = tmp_path / "transport-bin"
@@ -390,10 +393,14 @@ def test_remote_cleanup_uses_selected_runner_transport_and_original_head(tmp_pat
     selected = RemoteEffects(port.root, port.repository, runner_identity=identity)
     cleanup = replace(push, effect_id="cleanup-1", operation="cleanup_remote_ref", before_sha=push.after_sha, after_sha=None,
         payload={"remote": "origin", "branch_ref": push.source_ref, "expected_head": push.after_sha, "github_identity": identity})
-    authorized = []
-    result = selected.execute(cleanup, lambda: authorized.append("delete"))
+    prepared, authorized = [], []
+    def prepare_delete():
+        prepared.append("delete")
+        return lambda: authorized.append("delete")
+    result = selected.execute(cleanup, WriteAuthority(prepare_delete))
     # Cleanup authorizes the intent; Git rechecks immediately before spawning.
     assert result.disposition == "target" and authorized == ["delete", "delete"]
+    assert prepared == ["delete", "delete"]
     assert git.run("show-ref", "--verify", "--hash", push.source_ref).stdout.strip() == push.after_sha
     observed = [json.loads(line) for line in log.read_text().splitlines()]
     def verb(row):
@@ -402,7 +409,7 @@ def test_remote_cleanup_uses_selected_runner_transport_and_original_head(tmp_pat
     remote = [row for row in observed if verb(row) in {"ls-remote", "push"}]
     assert remote and all(row["token"] == "frozen-synthetic-test-token" and int(row["config"]) > 0 for row in remote)
     assert sum(verb(row) == "push" for row in remote) == 1
-    assert selected.execute(cleanup, lambda: pytest.fail("absence needs no delete authority")).disposition == "target"
+    assert selected.execute(cleanup, WriteAuthority(lambda: lambda: pytest.fail("absence needs no delete authority"))).disposition == "target"
 
 
 def _source_kernel(tmp_path, port, push):

@@ -4,6 +4,8 @@ Function bodies and local helpers are retained from the fixed 259acd4 baseline.
 """
 from __future__ import annotations
 
+from agent_run.contracts.write_authority import WriteAuthority
+
 import base64
 import json
 from pathlib import Path
@@ -126,7 +128,7 @@ def test_remote_merge_readback_returns_integrated_sha(
     parents = [push.base.sha, push.after_sha]
     merge = replace(push, effect_id="merge-readback", operation="merge", pr_number=pr.number,
                     payload={"method": "merge", "parents": parents, "commit_message": "Reviewed merge"})
-    assert port.execute(merge, lambda: None).disposition == "target"
+    assert port.execute(merge, WriteAuthority(lambda: lambda: None)).disposition == "target"
     remote = LocalGit(tmp_path / "origin.git")
     integrated = remote.commit(target_ref)
     before = len(calls.read_text().splitlines())

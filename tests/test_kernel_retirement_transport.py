@@ -1,4 +1,6 @@
 """The original Core Action retires its PR through actual GitHub transport I/O."""
+
+from agent_run.contracts.write_authority import WriteAuthority
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -79,12 +81,16 @@ def test_original_requeue_action_closes_once_after_real_remote_ack_loss(
             effects.append(effect)
             assert effect.payload["retirement_intent"]["control_action"] == effect.payload["control_action"]
 
-            def guarded():
-                authorize()
+            def prepare_guard():
+                final_admission = authorize.prepare()
                 observed_calls = [json.loads(line) for line in calls.read_text().splitlines()]
-                authorizations.append(sum("--method" in call for call in observed_calls))
+                write_count = sum("--method" in call for call in observed_calls)
+                def guarded():
+                    final_admission()
+                    authorizations.append(write_count)
+                return guarded
 
-            result = remote.execute(effect, guarded)
+            result = remote.execute(effect, WriteAuthority(prepare_guard))
             results.append(result)
             return result
 
@@ -105,7 +111,7 @@ def test_original_requeue_action_closes_once_after_real_remote_ack_loss(
     assert kernel.status(subject)["generation"] == 1
     assert runner.run_once().kind == "progress"
     assert kernel.status(subject)["generation"] == 2
-    again = remote.execute(effect, lambda: pytest.fail("The original closed receipt must remain read-only"))
+    again = remote.execute(effect, WriteAuthority(lambda: lambda: pytest.fail("The original closed receipt must remain read-only")))
     assert again.disposition == "target" and again.pr == result.pr
     actual = [json.loads(line) for line in calls.read_text().splitlines()]
     writes = [call for call in actual if "--method" in call]

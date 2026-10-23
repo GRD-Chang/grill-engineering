@@ -1,5 +1,7 @@
 """Creation defaults become native facts; existing Threads never read new defaults."""
 
+from agent_run.contracts.write_authority import WriteAuthority
+
 from dataclasses import replace
 import json
 import os
@@ -190,10 +192,13 @@ raise SystemExit(response.returncode)
     def execute_original(effect, authorize):
         if effect.operation != "push":
             return execute(effect, authorize)
-        def current_grant():
-            authorize()
-            grants.append(effect.effect_id)
-        result = native.execute(effect, current_grant)
+        def prepare_grant():
+            final_admission = authorize.prepare()
+            def current_grant():
+                final_admission()
+                grants.append(effect.effect_id)
+            return current_grant
+        result = native.execute(effect, WriteAuthority(prepare_grant))
         observed.append((effect, result))
         return result
 

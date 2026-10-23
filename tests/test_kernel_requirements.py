@@ -401,7 +401,7 @@ def test_original_final_approval_reconciles_before_parent_requirement_refresh(tm
             return execute(effect, authorize)
         sent.append(effect)
         if outcome in {"prior", "third"}:
-            authorize()
+            authorize.prepare()()
             if outcome == "third":
                 third = scenario.port.external_remote_append(effect.source_ref,
                     {"third.txt": "Another actor's work\n"}, "approved-third")
