@@ -52,7 +52,7 @@ def test_managed_revision_feedback_reaches_real_development_review_and_publicati
     scenario.development_count = scenario.review_count = scenario.publication_count = 0
     subject = scenario.delivery.key
     assert scenario.run().kind == "approval"
-    original_pr = scenario.port.pull_request(subject)
+    original_pr = scenario.port.pull_request_by_ref(scenario.kernel.delivery(subject).source_ref, scenario.kernel.delivery(subject).target_ref)
     assert original_pr is not None
     feedback = "revision-render-proof: preserve default-branch compatibility."
     assert kernel.control_host(request, "revise", "maintainer-revision", subject=subject,
@@ -76,7 +76,7 @@ def test_managed_revision_feedback_reaches_real_development_review_and_publicati
     monkeypatch.setattr(scenario, "agent", agent)
     assert scenario.run().kind == "approval"
     assert roles == ["development", "review", "publication"]
-    revised_pr = scenario.port.pull_request(subject)
+    revised_pr = scenario.port.pull_request_by_ref(scenario.kernel.delivery(subject).source_ref, scenario.kernel.delivery(subject).target_ref)
     assert revised_pr is not None and revised_pr.number == original_pr.number
     assert revised_pr.head != original_pr.head
     assert kernel.active_host_action() == "start"

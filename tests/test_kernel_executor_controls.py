@@ -35,7 +35,7 @@ def test_native_executor_consumes_the_original_control_action_with_fresh_source_
             break
     else:
         raise AssertionError("The original delivery never published its PR")
-    prior = scenario.port.pull_request(subject)
+    prior = scenario.port.pull_request_by_ref(scenario.kernel.delivery(subject).source_ref, scenario.kernel.delivery(subject).target_ref)
     assert prior is not None and prior.actor is not None
     original = kernel.delivery(subject)
     if control_kind == "requeue":

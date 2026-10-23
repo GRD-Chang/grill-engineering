@@ -15,18 +15,20 @@ from test_kernel_requirements import independent_source
 from test_kernel_operation_review_host import _NoNotifications
 
 
-def gated_host(tmp_path):
+def gated_host(tmp_path, monkeypatch):
     s = GraphScenario(tmp_path / "graph", independent_source())
     subjects = tuple(f"ticket:{n}" for n in s.requirements.parent.sub_issue_numbers)
-    s.port.force_read["workspace"] = "third"
-    for _ in range(16):
-        assert s.step().call is None
-        if all(s.kernel.status(sub)["gates"] == ["write_conflict"] for sub in subjects):
-            break
-    else:
-        raise AssertionError("Original workspace intents did not reach conflict")
+    reconcile = s.port.reconcile
+    with monkeypatch.context() as conflict:
+        conflict.setattr(s.port, "reconcile", lambda effect:
+            EffectResult("third") if effect.operation == "workspace" else reconcile(effect))
+        for _ in range(16):
+            assert s.step().call is None
+            if all(s.kernel.status(sub)["gates"] == ["write_conflict"] for sub in subjects):
+                break
+        else:
+            raise AssertionError("Original workspace intents did not reach conflict")
     originals = tuple(dict(s.kernel.status(sub)["pending_write"], subject=sub) for sub in subjects)
-    s.port.force_read.clear()
     admit(s, tmp_path)
     return s, originals
 
@@ -54,7 +56,7 @@ def state_of(s, original):
 
 
 def test_readwait_defers_without_consuming_and_second_intent_is_observed(tmp_path, monkeypatch):
-    s, originals = gated_host(tmp_path)
+    s, originals = gated_host(tmp_path, monkeypatch)
     now = [100.25]
     s.kernel.clock = lambda: now[0]
     runner = s.runner()
@@ -86,7 +88,7 @@ def test_readwait_defers_without_consuming_and_second_intent_is_observed(tmp_pat
 
 
 def test_original_sent_read_finishing_after_deadline_keeps_original_wait(tmp_path, monkeypatch):
-    s, originals = gated_host(tmp_path)
+    s, originals = gated_host(tmp_path, monkeypatch)
     now = [100.25]
     s.kernel.clock = lambda: now[0]
     runner = s.runner()
@@ -115,7 +117,7 @@ def test_original_sent_read_finishing_after_deadline_keeps_original_wait(tmp_pat
 
 
 def test_prior_observation_does_not_rearm_or_write_and_other_intent_finishes(tmp_path, monkeypatch):
-    s, originals = gated_host(tmp_path)
+    s, originals = gated_host(tmp_path, monkeypatch)
     now = [100.25]
     s.kernel.clock = lambda: now[0]
     runner = s.runner()
@@ -178,7 +180,7 @@ def test_approval_source_cas_is_deferred_without_consuming_the_observation(tmp_p
 
 
 def test_sent_unknown_read_after_public_stop_adds_no_new_gate(tmp_path, monkeypatch):
-    s, originals = gated_host(tmp_path)
+    s, originals = gated_host(tmp_path, monkeypatch)
     runner = s.runner()
 
     def physical(effect):
@@ -218,7 +220,7 @@ def test_approval_initial_observation_keeps_original_change_gates(tmp_path, monk
 
 
 def test_formal_host_readwait_observes_second_before_retrying_first(tmp_path, monkeypatch):
-    s, originals = gated_host(tmp_path)
+    s, originals = gated_host(tmp_path, monkeypatch)
     now = [100.25]
     s.kernel.clock = lambda: now[0]
     ports = s.runner().ports

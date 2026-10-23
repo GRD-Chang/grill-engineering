@@ -75,4 +75,4 @@ def test_managed_final_requeue_reaccepts_current_run_without_a_repair_pr_or_budg
     assert kernel.status(subject)["budgets"]["integration"]["reviews_used"] == before["budgets"]["integration"]["reviews_used"] + 1
     final_prs = [write for write in scenario.port.writes() if write["subject"] == subject and write["operation"] == "pr_write"]
     assert len(final_prs) == 1
-    assert scenario.port.pull_request(subject).source_ref == original.source_ref
+    assert scenario.port.pull_request_by_ref(scenario.kernel.delivery(subject).source_ref, scenario.kernel.delivery(subject).target_ref).source_ref == original.source_ref

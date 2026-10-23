@@ -7,7 +7,7 @@ import pytest
 
 from agent_run.model import Commit, Delivery, DeliveryKind, Policy, Requirements, RunSpec
 from agent_run.core.kernel import Kernel
-from agent_run.model import Checks, Issue, ParentIssue
+from agent_run.model import Checks, EffectResult, Issue, ParentIssue
 from agent_run.errors import KernelError
 from support.offline import GraphScenario
 from agent_run.core.operation_contract import ReadUnavailable
@@ -167,12 +167,18 @@ def drive_until(s, runner, predicate):
 
 def test_lost_merge_response_records_original_readback_before_any_source_read(tmp_path):
     s, ports, runner = setup(tmp_path, dependent=True)
+    now = [100.25]
+    s.kernel.clock = lambda: now[0]
     s.port.lose_response.add("merge")
-    lost = drive_until(s, runner, lambda step: step.reason == "original_write_readback_required")
+    lost = drive_until(s, runner, lambda step: step.subject is not None
+        and (pending := s.kernel.status(step.subject)["pending_write"]) is not None
+        and pending["operation"] == "merge" and pending["status"] == "sent")
     original = s.kernel.status(lost.subject)["pending_write"]
     assert original["status"] == "sent" and original["operation"] == "merge"
     assert s.kernel.status(lost.subject)["holds_integration"]
     reads = ports.reads
+    assert lost.kind == "waiting" and lost.retry_at is not None
+    now[0] = lost.retry_at
     polled = runner.run_once()
     assert polled.kind == "progress" and ports.reads == reads
     assert s.kernel.status(lost.subject)["pending_write"]["id"] == original["id"]
@@ -181,11 +187,20 @@ def test_lost_merge_response_records_original_readback_before_any_source_read(tm
                for row in s.kernel.history(lost.subject))
 
 
-def test_unknown_original_write_quiesces_and_keeps_integration_owner(tmp_path):
+def test_unknown_original_write_quiesces_and_keeps_integration_owner(tmp_path, monkeypatch):
     s, ports, runner = setup(tmp_path, dependent=True)
+    now = [100.25]
+    s.kernel.clock = lambda: now[0]
     s.port.lose_response.add("merge")
-    lost = drive_until(s, runner, lambda step: step.reason == "original_write_readback_required")
-    s.port.force_read["merge"] = "unknown"
+    lost = drive_until(s, runner, lambda step: step.subject is not None
+        and (pending := s.kernel.status(step.subject)["pending_write"]) is not None
+        and pending["operation"] == "merge" and pending["status"] == "sent")
+    original = s.kernel.status(lost.subject)["pending_write"]
+    reconcile = ports.reconcile
+    monkeypatch.setattr(ports, "reconcile", lambda effect:
+        EffectResult("unknown") if effect.effect_id == original["id"] else reconcile(effect))
+    assert lost.kind == "waiting" and lost.retry_at is not None
+    now[0] = lost.retry_at
     assert runner.run_once().kind == "paused"
     assert s.kernel.status(lost.subject)["gates"] == ["write_result_unknown"]
     assert s.kernel.status(lost.subject)["holds_integration"]

@@ -225,7 +225,7 @@ def test_managed_revision_opens_a_new_repair_cycle_and_updates_the_original_pr(t
     before = kernel.status(subject)
     old_budget = before["budgets"]["integration"]
     assert old_budget["developments_used"] == 1
-    old_pr = scenario.port.pull_request(subject)
+    old_pr = scenario.port.pull_request_by_ref(scenario.kernel.delivery(subject).source_ref, scenario.kernel.delivery(subject).target_ref)
     assert old_pr is not None
     feedback = "\n请补充默认分支兼容性。\r\n"
     assert kernel.control_host(request, "revise", "maintainer-revision", subject=subject,
@@ -245,7 +245,7 @@ def test_managed_revision_opens_a_new_repair_cycle_and_updates_the_original_pr(t
     assert call.context["repair_source"] == "human_revision" and call.context["human_feedback"] == feedback
     kernel.receive(call, scenario.agent(call))
     assert scenario.run().kind == "approval"
-    revised_pr = scenario.port.pull_request(subject)
+    revised_pr = scenario.port.pull_request_by_ref(scenario.kernel.delivery(subject).source_ref, scenario.kernel.delivery(subject).target_ref)
     assert revised_pr is not None and revised_pr.number == old_pr.number and revised_pr.head != old_pr.head
     assert kernel.status(subject)["budgets"]["integration"]["developments_used"] == 1
     with kernel.storage.transaction(write=False) as tx:

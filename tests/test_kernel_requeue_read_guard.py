@@ -28,7 +28,7 @@ def pending_requeue(tmp_path: Path) -> tuple[GraphScenario, CoreOperations]:
             break
     else:
         raise AssertionError("The original Ticket never published its real PR")
-    assert scenario.port.pull_request("ticket:2").state == "OPEN"
+    assert scenario.port.pull_request_by_ref(scenario.kernel.delivery("ticket:2").source_ref, scenario.kernel.delivery("ticket:2").target_ref).state == "OPEN"
     scenario.requirements = replace(source, issues=tuple(
         replace(issue, body="Clarified original requirement") if issue.number == 2 else issue
         for issue in source.issues))
@@ -63,7 +63,7 @@ def test_pending_requeue_can_read_and_keep_one_bounded_read_outage(
     writes = scenario.port.writes()
     # Observation accepts the exact pending Action's facts without writing.
     world = operations.runner.observe("ticket:2")
-    assert world.pr == scenario.port.pull_request("ticket:2")
+    assert world.pr == scenario.port.pull_request_by_ref(scenario.kernel.delivery("ticket:2").source_ref, scenario.kernel.delivery("ticket:2").target_ref)
     monkeypatch.setattr(operations.runner.ports, "source", read_outage)
     scenario.kernel.clock = lambda: 100.25
     waiting = operations.once()

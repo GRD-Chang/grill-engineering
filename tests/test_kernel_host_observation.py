@@ -48,11 +48,13 @@ def test_managed_activation_reads_the_original_sent_target_once(tmp_path, monkey
     assert scenario.run().kind == "waiting"
     pending = kernel.status(scenario.delivery.key)["pending_write"]
     assert pending["operation"] == "push" and pending["status"] == "sent"
-    scenario.port.force_read["push"] = "third"
-    now[0] = 105.25
     runner = scenario.runner()
-    assert runner.run_once().kind == "paused"
-    scenario.port.force_read.clear()
+    reconcile = scenario.port.reconcile
+    with monkeypatch.context() as conflict:
+        conflict.setattr(scenario.port, "reconcile", lambda effect:
+            EffectResult("third") if effect.operation == "push" else reconcile(effect))
+        now[0] = 105.25
+        assert runner.run_once().kind == "paused"
     assert runner.state().disposition == "quiescent"
     reads = []
     reconcile = runner.ports.reconcile

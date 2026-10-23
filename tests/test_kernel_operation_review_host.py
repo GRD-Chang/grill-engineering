@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 import agent_run.runtime.executor as executor
-from agent_run.model import DeliveryKind
+from agent_run.model import DeliveryKind, EffectResult
 from agent_run.errors import KernelError
 from agent_run.model import Execution, HostObservation
 from support.offline import Scenario
@@ -38,9 +38,12 @@ def test_direct_claim_quiesces_at_unknown_push_and_resume_reads_its_original(
     assert scenario.run().kind == "waiting"
     original = kernel.status(scenario.delivery.key)["pending_write"]
     assert original["operation"] == "push" and original["status"] == "sent"
-    scenario.port.force_read["push"] = "unknown"
-    now[0] = 106.25
-    assert scenario.run().kind == "paused"
+    reconcile = scenario.port.reconcile
+    with monkeypatch.context() as unknown:
+        unknown.setattr(scenario.port, "reconcile", lambda effect:
+            EffectResult("unknown") if effect.operation == "push" else reconcile(effect))
+        now[0] = 106.25
+        assert scenario.run().kind == "paused"
     assert kernel.status(scenario.delivery.key)["gates"] == ["write_result_unknown"]
     assert scenario.runner().state().disposition == "quiescent"
     with kernel.storage.transaction(write=False) as tx:
@@ -60,7 +63,6 @@ def test_direct_claim_quiesces_at_unknown_push_and_resume_reads_its_original(
                         lambda *a, **kw: pytest.fail("Original push recovery allocates no Agent"))
     # This fixture has a direct Core claim, not an admitted native Host. Its
     # passive state never activates an operational poll or grants a fresh write.
-    scenario.port.force_read.clear()
     runner = scenario.runner()
     with monkeypatch.context() as passive:
         passive.setattr(runner.ports, "source", lambda *a: pytest.fail("passive state reads no source"))
@@ -105,19 +107,37 @@ def test_public_run_reads_a_restored_third_push_before_conflict_resume(
     """
     scenario = Scenario(tmp_path / "third", DeliveryKind.PARENT_ONLY)
     kernel = scenario.kernel
-    scenario.port.force_read["push"] = "third"
-    for _ in range(48):
-        scenario.step()
-        if kernel.status(scenario.delivery.key)["gates"] == ["write_conflict"]:
-            break
-    else:
-        raise AssertionError("The original push never reached its physical third observation")
+    reconcile = scenario.port.reconcile
+    execute = scenario.port.execute
+    conflicting_pushes = []
+
+    def conflict_after_real_write(effect, authorize=None):
+        result = execute(effect, authorize)
+        if effect.operation != "push":
+            return result
+        foreign = scenario.port.external_remote_append(effect.source_ref,
+            {"independent-actor.txt": "A distinct external ref value\n"}, "third-push")
+        conflicting_pushes.append((effect, foreign))
+        return reconcile(effect)
+
+    with monkeypatch.context() as conflict:
+        conflict.setattr(scenario.port, "execute", conflict_after_real_write)
+        for _ in range(48):
+            scenario.step()
+            if kernel.status(scenario.delivery.key)["gates"] == ["write_conflict"]:
+                break
+        else:
+            raise AssertionError("The original push never reached its physical third observation")
     original = kernel.status(scenario.delivery.key)["pending_write"]
     assert original["operation"] == "push" and original["status"] == "sent"
     assert kernel.status(scenario.delivery.key)["gates"] == ["write_conflict"]
-    # The scripted external observation now exposes the original exact target.
-    # The physical push already happened once, and is never replayed here.
-    scenario.port.force_read.clear()
+    # The external actor restores the exact original target. This is a CAS in
+    # the private remote fixture, never a replay of the Core's original intent.
+    assert len(conflicting_pushes) == 1
+    effect, foreign = conflicting_pushes[0]
+    restored = scenario.port.physical.push(effect.source_ref, foreign.sha, effect.after_sha)
+    assert restored.returncode == 0
+    assert scenario.port.remote_refs()[effect.source_ref] == effect.after_sha
     with pytest.raises(KernelError, match="unresolved_write_conflict"):
         kernel.control("resume", "premature-conflict-resume", subject=scenario.delivery.key)
     with kernel.storage.transaction(write=False) as tx:

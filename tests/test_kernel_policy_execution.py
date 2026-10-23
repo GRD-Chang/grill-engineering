@@ -89,7 +89,7 @@ def test_resync_charges_only_external_completed_snapshots_and_resume_only_renews
         assert renewed["budgets"] == before["budgets"]
         assert scenario.run().kind == "approval"
         assert scenario.kernel.status(scenario.delivery.key)["resync"]["used"] == 1
-        assert scenario.port.pull_request(scenario.delivery.key).number == initial["pr_number"]
+        assert scenario.port.pull_request_by_ref(scenario.kernel.delivery(scenario.delivery.key).source_ref, scenario.kernel.delivery(scenario.delivery.key).target_ref).number == initial["pr_number"]
 
 
 def test_external_changes_during_open_integration_share_the_free_snapshot(tmp_path: Path) -> None:

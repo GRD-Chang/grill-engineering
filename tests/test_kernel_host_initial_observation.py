@@ -42,17 +42,19 @@ def test_admitted_run_does_not_starve_later_gated_intent_behind_unknown(
     assert len(subjects) == 2
     # Each independent Ticket's real workspace operation succeeds physically,
     # while its response/readback reports a third value. No Agent is needed.
-    scenario.port.force_read["workspace"] = "third"
-    for _ in range(12):
-        step = scenario.step()
-        assert step.call is None
-        if all(kernel.status(subject)["gates"] == ["write_conflict"] for subject in subjects):
-            break
-    else:
-        raise AssertionError("Both original workspace intents must reach their conflict gates")
+    reconcile = scenario.port.reconcile
+    with monkeypatch.context() as conflict:
+        conflict.setattr(scenario.port, "reconcile", lambda effect:
+            EffectResult("third") if effect.operation == "workspace" else reconcile(effect))
+        for _ in range(12):
+            step = scenario.step()
+            assert step.call is None
+            if all(kernel.status(subject)["gates"] == ["write_conflict"] for subject in subjects):
+                break
+        else:
+            raise AssertionError("Both original workspace intents must reach their conflict gates")
     originals = tuple(kernel.status(subject)["pending_write"] for subject in subjects)
     assert all(item["operation"] == "workspace" and item["status"] == "sent" for item in originals)
-    scenario.port.force_read.clear()
     writes = scenario.port.writes()
     _admit(scenario, tmp_path)
     readbacks: list[str] = []
