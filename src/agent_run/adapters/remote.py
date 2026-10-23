@@ -147,8 +147,10 @@ class RemoteEffects:
                 raise KernelError("remote_actor_changed")
             final_admission = authorize.prepare()
             fresh = self._current_pr_edit(effect, self._reconcile(effect))
+            if fresh != observed:
+                return replace(fresh, disposition="third") if fresh.disposition == "target" else fresh
             final_admission()
-            return replace(fresh, disposition="third") if fresh.disposition == "target" and fresh != observed else fresh
+            return fresh
         if observed.disposition != "prior":
             return observed
         if (effect.operation == "pr_write" and effect.pr_number is None
