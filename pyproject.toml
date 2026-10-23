@@ -28,7 +28,7 @@ include = ["agent_run", "agent_run.*"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
-pythonpath = ["src"]
+pythonpath = ["tests"]
 testpaths = ["tests"]
 tmp_path_retention_policy = "failed"
 tmp_path_retention_count = 1

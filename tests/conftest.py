@@ -8,8 +8,13 @@ from pathlib import Path
 import pytest
 
 from support.environment import _apply_test_environment, _inherited_git_override, _user_environment
+from support.installed_runtime import require_current_installation
 
 pytest_plugins = ("support.sharding",)
+
+
+def pytest_configure() -> None:
+    require_current_installation()
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:

@@ -159,7 +159,7 @@ print(json.dumps({"run_id": run_id}))
     })
     environment.update(git_overrides)
     before = {path.relative_to(host): path.read_bytes() for path in host.rglob("*") if path.is_file()}
-    environment["PYTHONPATH"] = os.pathsep.join([str(project / "src"), str(project / "tests")])
+    environment["PYTHONPATH"] = str(project / "tests")
     environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     git_trace = tmp_path / "git-trace.jsonl"
     environment["GIT_TRACE2_EVENT"] = str(git_trace)
