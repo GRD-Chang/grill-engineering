@@ -135,7 +135,7 @@ def test_effort_keeps_closed_partial_unknown_segments_and_original_thread_config
     assert all(config["rounds"] == 1 for config in configs.values())
     from agent_run.queries.run import read
     query = read(scenario.kernel.storage.path, "history").data
-    first_output = query["agent_invocations"][0]["outputs"][0]
+    first_output = query["history"]["attempts"][0]["invocations"][0]["outputs"][0]
     assert first_output["elapsed_seconds"] is None and first_output["recorded_execution_seconds"] == 2
 
 

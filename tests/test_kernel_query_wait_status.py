@@ -85,7 +85,7 @@ def test_public_checks_status_reads_the_original_committed_wait(
         assert main([command, scenario.spec.run_id, '--state-dir', str(scenario.kernel.storage.path), '--json']) == 0
         document = json.loads(capsys.readouterr().out)
         assert document['status'] == status
-        assert document['gate'] == ('required_checks' if status == 'waiting_checks' else None)
+        assert any(window['kind'] == 'required_checks' for window in document['supervision_windows']) == (status == 'waiting_checks')
         recorded, = document['supervision_windows']
         assert (recorded['kind'], recorded['started_at'], recorded['deadline']) == (wait_kind, first_seen, first_seen + budget)
         assert recorded['timed_out'] is False

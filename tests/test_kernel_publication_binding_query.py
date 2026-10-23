@@ -45,14 +45,17 @@ def test_publication_query_keeps_semantic_role_and_original_development_profile(
             status = query.read(scenario.kernel.storage.path, "status")
             history = query.read(scenario.kernel.storage.path, "history").data
             settings = query.read(scenario.kernel.storage.path, "settings").data
-            invocation = next(row for row in history["agent_invocations"] if row["id"] == call.invocation_id)
+            invocation = next(row for attempt in history["history"]["attempts"] for row in attempt["invocations"] if row["id"] == call.invocation_id)
             assert invocation["role"] == "publication" and invocation["binding_role"] == "development"
             assert invocation["thread"] == development.thread_id
             assert invocation["model"] == "original-development" and invocation["effort"] == "high"
             assert invocation["profile_reference"] is None
             assert invocation["profile_revision"] == development.profile_revision
-            assert status.data["worker"]["role"] == "publication"
-            assert status.data["worker"]["model"] == "original-development"
+            subject = next(row for row in status.data["subjects"] if row["subject"] == status.data["focus_subject"])
+            pending = subject["pending_attempt"]
+            current = next(row for row in pending["invocations"] if row["id"] == pending["current_invocation"])
+            assert pending["role"] == "publication"
+            assert current["model"] == "original-development"
             assert settings["profile"]["profiles"]["development"]["model"] == "future-development"
             binding = next(row for row in settings["bindings"] if row["thread_identity"] == development.thread_id)
             assert binding["role"] == "development" and binding["model"] == "original-development"
@@ -77,7 +80,7 @@ def test_publication_query_keeps_semantic_role_and_original_development_profile(
     assert len(observations) == 1
     before = _snapshot(tmp_path)
     history = query.read(scenario.kernel.storage.path, "history").data
-    assert history["summary"]["rounds"] == {
+    assert history["history"]["rounds"] == {
         ("ticket" if kind == "ticket" else "parent") + "_" + role: 1
         for role in ("development", "review", "publication")}
     events = _project(scenario.kernel, "detailed")

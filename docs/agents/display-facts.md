@@ -10,25 +10,29 @@ Status、History、CLI 和通知投影从已提交事实派生，不另存展示
 
 | 事实或输出 | 当前维护归属 |
 | --- | --- |
-| 定位、唯一候选选择与命令分流 | [`query_cli.py`](../../src/agent_run/cli/main.py)、[`task_location.py`](../../src/agent_run/storage/tasks.py) |
-| status/history/settings 的同源只读文档 | [`query.py`](../../src/agent_run/queries/run.py) 的 `read` |
-| 交付对象、gate、预算、候选、PR、当前工作及人工待办 | `query._subject`、`_status_fields`、`_operator_actions`、`_multi_ticket` |
-| 原始调用、Thread/Profile 和物理输出关联 | `query._invocations`、`execution_facts.recorded_profile` |
-| 原始审计与分页历史 | `query._native_history`、`_control_history`、`_resume_history` |
-| Worker 活动段与累计 effort | [`execution_facts.py`](../../src/agent_run/queries/execution.py) 的 `activity`、`execution_facts` |
-| JSON、plain、Rich 与 settings 文案 | [`query_render.py`](../../src/agent_run/cli/render.py) 的 `render`、`render_settings` |
-| 已提交通知事件、里程碑与 Resume 结果 | [`notification_events.py`](../../src/agent_run/notifications/event_projection.py) |
-| 通知的当前 gate/完成边界与过时进展过滤 | `query.notification_boundaries`、[`notification_progress.py`](../../src/agent_run/notifications/progress.py) |
-| 事件观察、outbox 和实际投递 | [`notifications.py`](../../src/agent_run/notifications/sender.py) 的 `NativeNotifications`，以及 `agent_run.storage.notification_outbox` / `adapters.notification_transport` |
+| 定位、唯一候选选择与命令分流 | [`cli/main.py`](../../src/agent_run/cli/main.py)、[`storage/tasks.py`](../../src/agent_run/storage/tasks.py) |
+| status/history/settings 的同源只读文档 | [`queries/run.py`](../../src/agent_run/queries/run.py) 的 `read` |
+| 交付对象、gate、预算、候选、PR、当前工作及人工待办 | `queries.run._subject`、`queries.read_facts.read_boundaries`；结构见 [`queries/model.py`](../../src/agent_run/queries/model.py) |
+| 原始调用、Thread/Profile 和物理输出关联 | `queries.run._attempt`、`_invocations`、`queries.execution.recorded_profile` |
+| 原始审计与分页历史 | `queries.run._native_history`、`_control_history`、`_resume_progress` |
+| Worker 活动段与累计 effort | [`queries/execution.py`](../../src/agent_run/queries/execution.py) 的 `activity`、`execution_facts` |
+| JSON、plain、Rich 与 settings 文案 | [`cli/render.py`](../../src/agent_run/cli/render.py) 的 `render`、`render_settings` |
+| 已提交通知事件、里程碑与 Resume 结果 | [`notifications/event_projection.py`](../../src/agent_run/notifications/event_projection.py) |
+| 通知的当前 gate/完成边界与过时进展过滤 | `queries.read_facts.read_boundaries`、[`notifications/progress.py`](../../src/agent_run/notifications/progress.py) |
+| 事件观察、outbox 和实际投递 | [`notifications/sender.py`](../../src/agent_run/notifications/sender.py) 的 `NativeNotifications`，以及 `agent_run.storage.notification_outbox` / `adapters.notification_transport` |
 
 `QueryDocument` 是显示结果，不是另一套可保存或推进的 Run。
-当前 `scheduler.activity`、调用 `live_status` 和 Ticket `execution_activity` 在缺少实时证明时为
-`unknown`；查询不探测或恢复 Host，不能由持久 `running` 记录推断进程仍存活。
+`executor_control.live_status` 与 Invocation 的 `live_status` 为 `unknown`；查询不探测或恢复
+Host，不能由持久 `running` 记录推断进程仍存活。`scheduling` 保存实际席位、并发上限、
+集成持有者及两条 FIFO；不再另造 scheduler 或 Ticket 活性镜像。
 通知观察者与 Host 的真实活动证据分别核验，不由显示布局倒推执行许可。
 
 ## 原始工作与历史
 
-`subjects` 指向当前 Attempt、适用 Review、检查与写入事实。
+`subjects` 保存当前对象的 gate、预算、候选、PR、依赖、适用 Review、检查与写入事实。
+`focus_subject` 仅引用其中一个对象，不复制当前 Worker 或预算。`pending_attempt` 使用真实当前
+Attempt；其 `current_invocation` 指针在 `invocations` 中定位当前调用，不能以最后一条记录替代。
+当前与历史 Attempt 共用 `result` 和 `invocations[].outputs[]` 结构。
 Attempt、Invocation、Thread、Profile Revision 和物理输出通过准确身份关联；
 `invocation_outputs` 的 `raw_id`、`start_evidence`、dispatch/exit 字段及活动事件供查询核验，
 不以旧 `pending_semantic_attempt.returned_result` 的快照结构重建当前工作。
@@ -37,9 +41,14 @@ Attempt、Invocation、Thread、Profile Revision 和物理输出通过准确身�
 Human Blocker/blocked Review 仍保留准确角色和恢复条件。展示只读取该事实，
 不能清除返回、改变预算或放行 currentness。失败恢复不因一次显示读取重新调用 Reviewer 或扣预算。
 
-history 按 `history.position` 顺序读取原事件，`after`/`limit` 与
-`history_page.next_after/has_more` 明确表示分页范围。事件携带原材料、Generation、
-Attempt/Invocation、控制 Action 与 Resume 审计的准确关联。
+每次 status/history 查询在一个只读事务内读取当前概览；history 在该事务中附加 `history` 页。
+`history.events` 按原事件的 `position` 排序，是 JSON 与人类输出共同使用的唯一事件流。
+`after`/`limit` 与 `history.after/next_after/has_more` 明确表示分页范围。先选事件页，再读取其
+Attempt/Invocation、Effect、控制 Action 与原材料闭包；当前概览不能替代这些历史身份。
+`history.attempts[].invocations[].outputs[]` 保留每次物理输出与原始返回，
+`history.effects/effect_failures` 保留写入操作与实际失败，`history.rounds` 按本页 Attempt 闭包
+统计领域角色轮次。`history.actions[].resume` 记录原 Action 的应用、successor 与准确目标进展；
+`latest_resume` 是当前最近 Resume Action，包含相同结构，不由本页末条事件猜测。
 不能以当前 Run 状态补造已裁剪的历史、结束时间、预算或验收结论。
 原始 Review Context、文案 Attempt 与批准事实不随当前证据失效而改写。
 
@@ -49,7 +58,7 @@ Attempt/Invocation、控制 Action 与 Resume 审计的准确关联。
 `activity` 仅累计可配对的活动区间；缺少边界、重复启动或尚未退出时标记计时不完整，
 保留可证明的 `recorded_execution_seconds`，不从观察中断或后继启动时刻补造终点。
 
-调用 `process_span_seconds` 是已记录进程启动至退出的跨度，不能代替 Agent 活动耗时。
+物理输出的 `process_span_seconds` 是已记录进程启动至退出的跨度，不能代替 Agent 活动耗时。
 `elapsed_seconds`、`execution_timing_complete` 与各输出的活动事实分别展示；
 真实 Thread/Profile 绑定及已记录轮次不会因计时不完整而抹去。
 Worker 进程登记不代表已放行。bootstrap gate 放行后的独立事件才开启执行段，
@@ -62,8 +71,8 @@ plain、Rich 与通知分别消费这些事实，缺少完整证据时不把未�
 ## 外部写入、CI 与批准的展示
 
 正式写入中断的对账沿用 [ADR 0022](../adr/0022-publication-write-reconciliation.md)。
-`subjects[].pending_writes` 来自未收口的 `effects`；
-`multi_ticket.tickets[].pending_write` 是其单项投影，`holds_integration` 来自当前集成持有者。
+`subjects[].pending_writes` 来自未收口的 `effects`；`scheduling.integration_holder` 保存实际
+集成持有者，不再另存单项 pending-write 或 holds-integration 投影。
 发布暂停不表示写入失败或未发生，查询不能清除意图、释放席位或替代远端核验。
 历史操作和失败证据由 `effects`、`effect_failures` 与原事件关联，不复制旧 Job 写入快照。
 
@@ -83,7 +92,7 @@ Status/History 只读展示当前额度和续期历史，不补造旧内外层�
 ## 通知与验证入口
 
 通知的 concise/detailed 选择、occurrence/dedupe、outbox、Ledger 和 transport
-由通知模块负责；`NativeNotifications` 消费已提交事件与 `notification_boundaries`，
+由通知模块负责；`NativeNotifications` 消费已提交事件与 `read_boundaries`，
 不调用 Kernel 推进业务，也不从渲染后的 Status 文案推断新业务事实。
 查询入口不接入发送过程，投递 receipt 不能作为工作结果、审核或执行授权。
 

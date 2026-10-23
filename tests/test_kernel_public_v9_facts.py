@@ -91,7 +91,7 @@ def test_query_retains_physical_output_raw_and_actual_activity_without_recountin
     assert operations.once().kind == 'progress'
     before = _durable(tmp_path)
     data = read(kernel.storage.path, 'history').data
-    invocation = data['agent_invocations'][0]
+    invocation = data['history']['attempts'][0]['invocations'][0]
     assert invocation['id'] == first.invocation_id
     outputs = invocation['outputs']
     assert [output['ordinal'] for output in outputs] == [0, 1]
@@ -101,10 +101,10 @@ def test_query_retains_physical_output_raw_and_actual_activity_without_recountin
     assert outputs[0]['elapsed_seconds'] == 0.5
     assert outputs[1]['elapsed_seconds'] is None
     assert [(event['active'], event['observed_at']) for event in outputs[0]['activity']] == [(True, 100.25), (False, 100.75)]
-    assert len(data['output_attempts']) == 2
-    budget = next(row for row in data['budget_windows'] if row['purpose'] == 'requirements' and row['current'])
+    assert sum(len(invocation['outputs']) for attempt in data['history']['attempts'] for invocation in attempt['invocations']) == 2
+    budget = next(row for row in [budget for subject in data['subjects'] for budget in subject['budgets']] if row['purpose'] == 'requirements' and row['current'])
     assert budget['developments_used'] == 1
-    returned = [event for event in data['timeline'] if event['kind'] == 'raw_returned']
+    returned = [event for event in data['history']['events'] if event['kind'] == 'raw_returned']
     assert [event['phase'] for event in returned] == ['development', 'development']
     assert data['subjects'][0]['phase'] == 'candidate'
     assert _durable(tmp_path) == before
@@ -116,13 +116,13 @@ def test_publication_actual_failure_is_not_dispatch_count_or_erased_by_successfu
     scenario, effect = _actual_publication_push(tmp_path, monkeypatch, 7)
     before = _durable(tmp_path)
     data = read(scenario.kernel.storage.path, 'history').data
-    failures = data['publication_operation_retries']
+    failures = data['history']['effect_failures']
     assert len(failures) == 1 and failures[0]['operation'] == 'push'
     assert failures[0]['effect'] == effect.effect_id and failures[0]['dispatch_serial'] == 1
     assert failures[0]['evidence']['returncode'] == 7
     assert "actual transport command exited nonzero" in failures[0]['evidence']['message']
-    assert sum(operation['attempts'] for operation in data['effect_operations']) > len(failures)
-    assert next(row for row in data['effect_operations'] if row['id'] == effect.effect_id)['status'] == 'observed'
+    assert sum(operation['attempts'] for operation in data['history']['effects']) > len(failures)
+    assert next(row for row in data['history']['effects'] if row['id'] == effect.effect_id)['status'] == 'observed'
     assert _durable(tmp_path) == before
 
 
@@ -136,21 +136,21 @@ def test_publication_unknown_response_diagnostic_remains_public_after_successful
     pending = scenario.kernel.status(scenario.delivery.key)["pending_write"]
     assert pending is not None and pending["operation"] == "pr_write" and pending["status"] == "sent"
     diagnostic = {"code": "write_response_unavailable", "message": "pr_write took effect; response lost"}
-    assert read(scenario.kernel.storage.path, 'history').data['supervision']['latest_observation'] == diagnostic
+    assert read(scenario.kernel.storage.path, 'history').data['supervision_windows'][0]['latest_observation'] == diagnostic
     assert unresolved.retry_at is not None
     now[0] = unresolved.retry_at
     assert scenario.run().kind == 'approval'
     before = _durable(tmp_path)
     data = read(scenario.kernel.storage.path, 'history').data
-    failures = data['publication_operation_retries']
+    failures = data['history']['effect_failures']
     assert failures == []  # Unknown response is not a proved nonzero command exit.
-    assert sum(operation['attempts'] for operation in data['effect_operations']) > len(failures)
+    assert sum(operation['attempts'] for operation in data['history']['effects']) > len(failures)
     assert scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref) is not None
-    operation = next(row for row in data['effect_operations'] if row['id'] == pending['id'])
+    operation = next(row for row in data['history']['effects'] if row['id'] == pending['id'])
     assert operation['attempts'] == 1 and operation['status'] == 'confirmed'
     assert sum(row['operation'] == 'pr_write' for row in scenario.port.writes()) == 1
-    ci = next(row for row in data['budget_windows'] if row['purpose'] == 'ci' and row['current'])
-    assert ci['review_limit'] is None and data['ci_recovery']['review_required'] is True
+    ci = next(row for row in [budget for subject in data['subjects'] for budget in subject['budgets']] if row['purpose'] == 'ci' and row['current'])
+    assert ci['review_limit'] is None and bool(ci['review_required']) is True
     assert _durable(tmp_path) == before
     # Immutable storage alone is insufficient: the public audit must still make
     # the original uncertainty diagnosable after the exact intent is consumed.
@@ -165,8 +165,8 @@ def test_zero_resync_gate_exposes_actual_window_and_explicit_resume_without_rene
     assert scenario.run().kind == 'paused'
     before = _durable(tmp_path)
     data = read(scenario.kernel.storage.path, 'status').data
-    assert data['integration_resync']['limit'] == 0 and data['integration_resync']['used'] == 0
-    assert data['integration_resync']['window'] == 1 and data['integration_resync']['open'] is False
+    assert data['subjects'][0]['integration_resync']['limit'] == 0 and data['subjects'][0]['integration_resync']['used'] == 0
+    assert data['subjects'][0]['integration_resync']['window'] == 1 and data['subjects'][0]['integration_resync']['open'] is False
     action = next(item for item in data['operator_actions'] if item['reason'] == 'integration_resync_exhausted')
     assert action['operation'] == 'resume' and action['action']['command'] == 'resume'
     assert _durable(tmp_path) == before
@@ -182,9 +182,9 @@ def test_resume_application_receipt_does_not_claim_start_before_the_bound_succes
     kernel.receive(first, b'{"result_kind":"human_blocker","summary":null,"human_blockers":["Need original decision"]}')
     assert operations.once().kind == 'paused'
     assert kernel.control('resume', 'exact-response', subject='ticket', message='Original response') == 'applied'
-    before_start = read(kernel.storage.path, 'history').data['agent_resumes'][0]
-    assert before_start['status'] == 'applied' and before_start['started_at'] is None
-    assert before_start['successor_invocations'] == []
+    before_start = next(action for action in read(kernel.storage.path, 'history').data['history']['actions'] if action['kind'] == 'resume')
+    assert before_start['status'] == 'applied' and before_start['resume']['started_at'] is None
+    assert before_start['resume']['successor_invocations'] == []
     successor = operations.once().call
     assert successor is not None and kernel.dispatch_agent(successor)
     kernel.bind_thread(successor, 'real-resumed-thread')
@@ -192,8 +192,8 @@ def test_resume_application_receipt_does_not_claim_start_before_the_bound_succes
     kernel.agent_started(successor, process)
     before = _durable(tmp_path)
     data = read(kernel.storage.path, 'history').data
-    resumed = data['agent_resumes'][0]
-    assert resumed['successor_invocations'] == [successor.invocation_id]
-    assert resumed['started_at'] == 100.0 and resumed['payload']['message'] == 'Original response'
+    resumed = next(action for action in data['history']['actions'] if action['kind'] == 'resume')
+    assert resumed['resume']['successor_invocations'] == [successor.invocation_id]
+    assert resumed['resume']['started_at'] == 100.0 and resumed['payload']['message'] == 'Original response'
     assert successor.attempt_id == first.attempt_id
     assert _durable(tmp_path) == before

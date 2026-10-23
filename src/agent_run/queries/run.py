@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
@@ -15,12 +14,13 @@ from agent_run.storage.notification_outbox import read_notifications
 
 from agent_run.queries.execution import activity, recorded_profile
 from agent_run.queries.resume_facts import resume_facts
+from agent_run.queries.model import HistoryPage, RunStatus
 from agent_run.errors import KernelError
 from agent_run.model import Role, artifact
 from agent_run.storage.sqlite import QUERY_LIMIT, Storage, Transaction
 from agent_run.storage.preflight import UnsupportedState, require_supported_state
 from agent_run.storage.tasks import read_task, task_path
-from agent_run.queries.read_facts import QueryError as QueryError, all_rows as _all, material as _material, timestamp as _timestamp, read_header as _header, public_phase as _public_phase, public_status as _public_status, read_boundaries
+from agent_run.queries.read_facts import QueryError as QueryError, all_rows as _all, material as _material, timestamp as _timestamp, read_header as _header, public_phase as _public_phase, read_boundaries
 
 
 @dataclass(frozen=True)
@@ -175,14 +175,19 @@ def _invocations(tx: Transaction, subject: str, attempt: str | None = None) -> l
             output.pop("process_identity")
             output.pop("start_evidence")
         row["outputs"] = outputs
-        row["output_repairs"] = len(outputs) - 1
-        row["output_ordinal"] = outputs[-1]["ordinal"]
-        for field in ("raw_id", "raw_return", "dispatch_state", "started_at", "returned_at", "exited_at", "exit_code", "process_span_seconds"):
-            row[field] = outputs[-1][field]
         row["elapsed_seconds"] = (sum(output["elapsed_seconds"] for output in outputs)
                                   if all(output["elapsed_seconds"] is not None for output in outputs) else None)
         row["live_status"] = "unknown"
     return result
+
+
+def _attempt(tx: Transaction, record: sqlite3.Row) -> dict[str, Any]:
+    """One native Attempt representation for current pointers and historical closure."""
+    attempt = dict(record)
+    attempt["result"] = _material(tx, attempt["result_id"], attempt["subject"])
+    attempt["invocations"] = _invocations(tx, attempt["subject"], attempt["id"])
+    attempt.pop("context_id")
+    return attempt
 
 
 def _effect_failures(tx: Transaction, subject: str | None = None, *, effect: str | None = None) -> list[dict[str, Any]]:
@@ -213,10 +218,7 @@ def _subject(tx: Transaction, job: dict[str, Any], boundary: Mapping[str, Any]) 
     budgets = _all(tx, "SELECT * FROM budgets WHERE subject=? ORDER BY purpose,window", (subject,))
     pending = None
     if job["current_attempt"]:
-        pending = dict(tx.one("SELECT * FROM attempts WHERE id=? AND subject=?", (job["current_attempt"], subject)))
-        pending["result"] = _material(tx, pending["result_id"], subject)
-        pending["invocations"] = _invocations(tx, subject, pending["id"])
-        pending.pop("context_id")
+        pending = _attempt(tx, tx.one("SELECT * FROM attempts WHERE id=? AND subject=?", (job["current_attempt"], subject)))
     review = None
     if job["review_attempt"]:
         attempt = tx.one("SELECT * FROM attempts WHERE id=? AND subject=?", (job["review_attempt"], subject))
@@ -237,49 +239,9 @@ def _subject(tx: Transaction, job: dict[str, Any], boundary: Mapping[str, Any]) 
             "ci_evidence": _material(tx, job["ci_failure"], subject),
             "gates": boundary["gates"], "budgets": budgets, "pending_attempt": pending, "review": review, "required_checks": checks,
             "integration_resync": _resync(tx, subject), "effect_failures": _effect_failures(tx, subject),
-            "pending_writes": effects, "delivery_cleanup": boundary["delivery_cleanup"]}
-
-
-def _status_fields(run: Mapping[str, Any], subjects: list[dict[str, Any]]) -> dict[str, Any]:
-    active = [job for job in subjects if job["phase"] not in {"complete", "abandoned"}]
-    selected = next((job for job in subjects if job["subject"] == run["integration_holder"]), None)
-    if selected is None:
-        completed_final = next((job for job in subjects
-            if job["kind"] == "final_run" and job["phase"] == "complete"), None)
-        selected = active[0] if len(active) == 1 else completed_final
-    invocation = None
-    attempt = None if selected is None else selected["pending_attempt"]
-    if attempt and attempt["invocations"]:
-        invocation = next((row for row in attempt["invocations"] if row["id"] == attempt["current_invocation"]), None)
-    worker = None
-    if invocation and attempt and selected and invocation["raw_id"] is None and invocation["exited_at"] is None:
-        worker = {"role": attempt["role"], "attempt": attempt["ordinal"], "thread_id": invocation["thread"],
-                  "phase": _public_phase(selected["phase"]), "model": invocation["model"], "effort": invocation["effort"],
-                  "live_status": "unknown", "dispatch_state": invocation["dispatch_state"]}
-    current = [] if selected is None else [budget for budget in selected["budgets"] if budget["current"]]
-    ordinary = next((row for row in current if row["purpose"] == ("integration" if selected and selected["kind"] == "final_run" else "requirements")), None)
-    integration = next((row for row in current if row["purpose"] == "integration"
-                        and row["developments_used"] > 0), None)
-    ci = next((row for row in current if row["purpose"] == "ci"), None)
-    review_budget = None if ordinary is None else {
-        "window": ordinary["window"], "development_attempts": ordinary["developments_used"],
-        "development_limit": ordinary["development_limit"], "reviewer_invocations": ordinary["reviews_used"],
-        "reviewer_limit": ordinary["review_limit"], "candidate_sha": selected["candidate_sha"] if selected else None,
-        "pr_number": selected["pr_number"] if selected else None, "final_ci_fix_used": None, "final_ci_fix_limit": None, "checkpoint_reason": None}
-    return {"active_ticket": selected["issue"] if selected and selected["kind"] == "ticket" else None,
-            "worker": worker, "run_repair": None, "candidate_sha": selected["candidate_sha"] if selected else None,
-            "pr_number": selected["pr_number"] if selected else None, "review_budget": review_budget,
-            "integration_resync": selected["integration_resync"] if selected else None,
-            "integration_development": None if integration is None else {"window": integration["window"], "used": integration["developments_used"], "limit": integration["development_limit"], "renewals": None},
-            "ci_recovery": None if ci is None else {"window": ci["window"], "developments_used": ci["developments_used"],
-                "development_limit": ci["development_limit"], "reviewer_invocations": ci["reviews_used"],
-                "review_required": bool(ci["review_required"]), "failure_evidence": selected["ci_evidence"] if selected else None},
-            "agent_invocation": invocation, "semantic_agent_attempt": attempt,
-            "output_attempt": None if invocation is None else {"invocation_started_at": invocation["started_at"], "attempt_count": len(invocation["outputs"]), "repairs_used": invocation["output_repairs"]},
-            "budget_window": attempt["window"] if attempt else ordinary["window"] if ordinary else None,
-            "publication_operation_retry": selected["effect_failures"] if selected else [], "latest_resume": None, "lifecycle_action": None,
-            "scope_change": run["blocked"] if run["blocked"] == "unsupported_scope_change" else None,
-            "abandonment": None, "supervision": None}
+            "pending_writes": effects, "delivery_cleanup": boundary["delivery_cleanup"],
+            "blocked_by": [row[0] for row in tx.all("SELECT s.issue FROM dependencies d JOIN subjects s ON s.id=d.predecessor "
+                "WHERE d.subject=? AND s.phase!='complete' ORDER BY s.issue", (subject,))]}
 
 
 def _next_action(run: Mapping[str, Any], actions: list[dict[str, Any]], status: str,
@@ -300,93 +262,6 @@ def _next_action(run: Mapping[str, Any], actions: list[dict[str, Any]], status: 
     return f"agent-run status {run['parent_issue']} --repo {run['repository']}"
 
 
-def _progress(data: Mapping[str, Any]) -> dict[str, Any]:
-    subjects = data["subjects"]
-    current = [job for job in subjects if job["phase"] not in {"complete", "abandoned"}]
-    job = current[0] if len(current) == 1 else None
-    current_object = (f"Ticket #{job['issue']}" if job and job["kind"] == "ticket" else
-                      f"Parent Issue #{job['issue']}" if job and job["kind"] == "parent_only" else
-                      "Final Run" if job else "Delivery Run")
-    tickets = [owner for owner in subjects if owner["kind"] == "ticket"]
-    return {"repository": data["repository"], "parent": {"number": data["parent"]["number"], "title": data["parent"]["title"]},
-            "status": data["status"], "phase": data["phase"], "current_object": current_object,
-            "current_agent": data["worker"], "execution_activity": "unknown",
-            "scheduler": {"activity": "unknown", "failure": None}, "elapsed_seconds": data["elapsed_seconds"],
-            "ticket_progress": {"completed": sum(owner["phase"] == "complete" for owner in tickets), "total": len(tickets)},
-            "round_progress": data["review_budget"], "integration_development": data["integration_development"],
-            "integration_resync": data["integration_resync"], "ci_recovery": data["ci_recovery"],
-            "run_repair": data["run_repair"], "next_action": data["next_action"],
-            "conclusion": None, "findings": [] if job is None or job["review"] is None else review_findings(job["review"]["artifact"])}
-
-
-def _history_views(data: Mapping[str, Any], subjects: list[dict[str, Any]], events: list[dict[str, Any]],
-                   attempts: list[dict[str, Any]]) -> dict[str, Any]:
-    owners = {job["subject"]: job for job in subjects}
-    rounds: dict[str, int] = {}
-    for attempt in attempts:
-        job = owners[attempt["subject"]]
-        prefix = {"ticket": "ticket", "parent_only": "parent", "final_run": "run"}[job["kind"]]
-        key = prefix + "_" + attempt["role"]
-        rounds[key] = rounds.get(key, 0) + 1
-    projected = []
-    for event in events:
-        job = owners[event["subject"]]
-        moment = event["created_at"]
-        snapshot = event["status"]
-        event_status = None
-        if snapshot is not None and event["phase"] is not None:
-            observed = {"kind": job["kind"], "phase": event["phase"],
-                        "gates": [{"code": code} for code in snapshot["gates"]]}
-            event_status = _public_status(snapshot, [observed], event["phase"] in {"complete", "abandoned"})
-        projected.append({"at": datetime.fromtimestamp(moment, UTC).isoformat() if moment is not None else None,
-            "kind": event["kind"], "object": f"Ticket #{job['issue']}" if job["kind"] == "ticket" else f"Parent Issue #{job['issue']}" if job["kind"] == "parent_only" else "Final Run",
-            "subject": job["subject"], "generation": event["generation"], "identity": event["identity"],
-            "phase": _public_phase(event["phase"]) if event["phase"] is not None else None,
-            "purpose": event["purpose"], "status": event_status, "status_snapshot": snapshot, "role": None, "round": None,
-            "details": [] if event["evidence"] is None else [event["evidence"]]})
-    return {"events": projected, "execution_activity": "unknown",
-            "scheduler": {"activity": "unknown", "failure": None}, "multi_ticket": data["multi_ticket"],
-            "summary": {"rounds": rounds, "elapsed_seconds": data["elapsed_seconds"]}, "time_zone": "UTC"}
-
-
-def _multi_ticket(tx: Transaction, run: Mapping[str, Any], subjects: list[dict[str, Any]],
-                  scheduling: Mapping[str, Any]) -> dict[str, Any] | None:
-    tickets = [job for job in subjects if job["kind"] == "ticket"]
-    if not tickets:
-        return None
-    active = {row["subject"] for row in scheduling["active"]}
-    work_positions = {key: position for position, key in enumerate(scheduling["work_fifo"], 1)}
-    integration_positions = {key: position for position, key in enumerate(scheduling["integration_fifo"], 1)}
-    views = []
-    for job in tickets:
-        budgets = {row["purpose"]: row for row in job["budgets"] if row["current"]}
-        required = budgets.get("requirements", {})
-        ci = budgets.get("ci", {})
-        integration = budgets.get("integration", {})
-        checks = job["required_checks"]
-        blockers = _all(tx, "SELECT s.issue FROM dependencies d JOIN subjects s ON s.id=d.predecessor WHERE d.subject=? AND s.phase!='complete' ORDER BY s.issue", (job["subject"],))
-        views.append({"ticket_number": job["issue"], "phase": _public_phase(job["phase"]),
-            "blocked_by": [row["issue"] for row in blockers], "blocked_reason": job["gates"][0]["code"] if job["gates"] else None,
-            "execution_activity": "unknown", "has_work_slot": job["subject"] in active,
-            "holds_integration": run["integration_holder"] == job["subject"],
-            "work_queue_position": work_positions.get(job["subject"]), "queue_position": integration_positions.get(job["subject"]),
-            "invocation": job["pending_attempt"]["invocations"][-1] if job["pending_attempt"] and job["pending_attempt"]["invocations"] else None,
-            "pending_write": job["pending_writes"][0] if job["pending_writes"] else None,
-            "required_checks": None if checks is None else {"head_sha": checks["head_sha"], "pr_number": checks["pr_number"],
-                "result": checks["result"], "evidence": checks["evidence"]},
-            "usage": {"development_attempts": required.get("developments_used"), "development_limit": required.get("development_limit"),
-                "reviewer_invocations": required.get("reviews_used"), "review_limit": required.get("review_limit"),
-                "ci_developments_used": ci.get("developments_used"), "ci_development_limit": ci.get("development_limit"),
-                "integration_development_used": integration.get("developments_used"), "integration_development_limit": integration.get("development_limit"),
-                "integration_resync_used": job["integration_resync"]["used"], "integration_resync_limit": job["integration_resync"]["limit"]},
-            "pause_requested": None, "resume_accepted": None, "stop_wait_reason": None,
-            "supervision": job.get("supervision"), "supervision_windows": job.get("supervision_windows", []),
-            "recovery_action": None})
-    return {"executor_activity": "unknown", "work_concurrency_limit": run["concurrency"],
-            "work_slots_active": len(active), "integration_holder": run["integration_holder"],
-            "integration_queue": scheduling["integration_fifo"], "tickets": views}
-
-
 def _control_history(tx: Transaction, *, identities: Sequence[str] | None = None) -> list[dict[str, Any]]:
     actions = (_all(tx, "SELECT * FROM actions WHERE kind='resume' ORDER BY rowid DESC LIMIT 1")
                if identities is None else
@@ -396,10 +271,11 @@ def _control_history(tx: Transaction, *, identities: Sequence[str] | None = None
         owner = action["subject"] or first_owner
         action["payload"] = _material(tx, action["payload_id"], owner)
         action["receipt"] = _material(tx, action["receipt_id"], owner)
+    _resume_progress(tx, actions)
     return actions
 
 
-def _resume_history(tx: Transaction, control: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _resume_progress(tx: Transaction, control: list[dict[str, Any]]) -> None:
     """Display original acceptance and the shared exact-target outcome facts."""
     resumes: list[dict[str, Any]] = []
     applications = []
@@ -415,14 +291,13 @@ def _resume_history(tx: Transaction, control: list[dict[str, Any]]) -> list[dict
                               (action["id"], action["receipt_id"]))
         if application:
             applications.append(application[0])
-        resumes.append({"action_id": action["id"], "subject": action["subject"], "status": action["status"],
-                        "payload": action["payload"], "receipt": receipt,
-                        "applied": isinstance(receipt, Mapping) and receipt.get("applied") is True,
-                        "successor_invocations": [row["id"] for row in successors],
-                        "started_at": _timestamp(started), "progress": None})
+        action["resume"] = {"applied": isinstance(receipt, Mapping) and receipt.get("applied") is True,
+                            "successor_invocations": [row["id"] for row in successors],
+                            "started_at": _timestamp(started), "progress": None}
+        resumes.append(action)
     if not resumes or not applications:
-        return resumes
-    by_action = {row["action_id"]: row for row in resumes}
+        return
+    by_action = {row["id"]: row["resume"] for row in resumes}
     # This is a candidate read, not a second Resume interpretation. Only the
     # shared reader decides whether a proof belongs to the original Action.
     # Archived status bodies/phase copy are never needed by that reader.
@@ -436,7 +311,6 @@ def _resume_history(tx: Transaction, control: list[dict[str, Any]]) -> list[dict
         facts = resume_facts(tx, dict(row))
         if facts and facts["action_id"] in by_action:
             by_action[facts["action_id"]]["progress"] = facts
-    return resumes
 
 
 def _resume_waits(run: Mapping[str, Any], subjects: list[dict[str, Any]],
@@ -505,8 +379,8 @@ def _frozen_settings(tx: Transaction, run: Mapping[str, Any]) -> dict[str, Any]:
             "unavailable_facts": [key for key in ("worker_identity", "runner_identity", "notifications", "prompt_resources", "provenance")
                                   if inputs.get(key) is None]}
 
-def _native_history(tx: Transaction, current: Mapping[str, Any], subjects: list[dict[str, Any]], *,
-                    after: int, limit: int | None) -> dict[str, Any]:
+def _native_history(tx: Transaction, subjects: list[dict[str, Any]], *,
+                    after: int, limit: int | None) -> HistoryPage:
     events = (_all(tx, "SELECT * FROM history WHERE position>? ORDER BY position", (after,)) if limit is None else
               [dict(row) for row in tx.rows("SELECT * FROM history WHERE position>? ORDER BY position LIMIT ?", (after, limit))])
     identities = list(dict.fromkeys(event["identity"] for event in events))
@@ -522,25 +396,20 @@ def _native_history(tx: Transaction, current: Mapping[str, Any], subjects: list[
     attempt_ids = {row[0] for identity in identities for row in tx.rows(
         "SELECT id FROM attempts WHERE id=? UNION SELECT attempt FROM invocations WHERE id=?",
         (identity, identity)) if row[0] is not None}
-    attempts = [dict(tx.one("SELECT * FROM attempts WHERE id=?", (identity,))) for identity in sorted(attempt_ids)]
+    attempts = [_attempt(tx, tx.one("SELECT * FROM attempts WHERE id=?", (identity,))) for identity in sorted(attempt_ids)]
+    owners = {job["subject"]: job for job in subjects}
+    rounds: dict[str, int] = {}
     for attempt in attempts:
-        attempt["artifact"] = _material(tx, attempt["result_id"], attempt["subject"])
-        attempt.pop("context_id")
-        attempt.update({"attempt_id": attempt["id"], "work_subject": attempt["subject"], "budget_window": attempt["window"]})
-    invocations = [invocation for attempt in attempts for invocation in _invocations(tx, attempt["subject"], attempt["id"])]
-    control = _control_history(tx, identities=identities)
-    resumes = _resume_history(tx, control)
-    result = {"timeline": events, "timeline_continuation": [], "semantic_agent_attempts": attempts,
-        "agent_invocations": invocations,
-        "publication_operation_retries": [failure for identity in identities for failure in _effect_failures(tx, effect=identity)],
-        "effect_operations": [dict(row) for identity in sorted(identities) for row in tx.rows(
-            "SELECT id,subject,operation,attempts,status FROM effects WHERE id=?", (identity,))],
-        "budget_windows": [budget for job in subjects for budget in job["budgets"]],
-        "output_attempts": [dict(output, subject=invocation["subject"]) for invocation in invocations for output in invocation["outputs"]],
-        "agent_resumes": resumes, "resume_audit": resumes, "actions": control,
-        "history_page": {"after": after, "next_after": next_after, "has_more": has_more}}
-    result.update(_history_views(current, subjects, events, attempts))
-    return result
+        prefix = {"ticket": "ticket", "parent_only": "parent", "final_run": "run"}[owners[attempt["subject"]]["kind"]]
+        key = prefix + "_" + attempt["role"]
+        rounds[key] = rounds.get(key, 0) + 1
+    return {"events": events, "attempts": attempts, "time_zone": "UTC",
+            "effect_failures": [failure for identity in identities for failure in _effect_failures(tx, effect=identity)],
+            "effects": [dict(row) for identity in sorted(identities) for row in tx.rows(
+                "SELECT id,subject,operation,attempts,status FROM effects WHERE id=?", (identity,))],
+            "actions": _control_history(tx, identities=identities), "rounds": rounds,
+            "after": after, "next_after": next_after, "has_more": has_more}
+
 
 
 def read(path: Path, kind: Literal["status", "history", "settings"], *, after: int = 0, limit: int | None = None,
@@ -564,21 +433,16 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
                 if len(json.dumps(settings, ensure_ascii=False, allow_nan=False).encode()) > QUERY_LIMIT:
                     raise QueryError("query_limit", "Public response exceeds its bounded limit")
                 return QueryDocument("settings", language, settings)
-            boundaries = read_boundaries(tx, time.time())
+            now = time.time()
+            boundaries = read_boundaries(tx, now)
             by_subject = {job["subject"]: job for job in boundaries["subjects"]}
             subjects = [_subject(tx, job, by_subject[job["id"]]) for job in _all(tx, "SELECT * FROM subjects ORDER BY id")]
             windows = boundaries["supervision_windows"]
             for subject in subjects:
                 subject_windows = [window for window in windows if window["subject"] == subject["subject"]]
                 subject["supervision_windows"] = subject_windows
-                subject["supervision"] = subject_windows[0] if len(subject_windows) == 1 else None
             abandonment = boundaries["abandonment"]
             actions = boundaries["actions"]
-            owners = {job["subject"]: job for job in subjects}
-            for action in actions:
-                pending = owners[action["subject"]]["pending_attempt"] if action["subject"] in owners else None
-                action["trigger_invocation"] = (pending["invocations"][-1] if pending and pending["invocations"]
-                                                and action["reason"] == "human_blocker" else None)
             title = tx.rows("SELECT title,body FROM requirement_versions WHERE issue=? AND revision=?", (run["parent_issue"], run["parent_revision"]))
             active = [job for job in subjects if job["phase"] not in {"complete", "abandoned"}]
             complete = boundaries["is_terminal"]
@@ -586,9 +450,15 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
             created = _timestamp(run.get("created_at"))
             closed = tx.rows("SELECT max(h.created_at) FROM history h JOIN effects e ON e.id=h.identity WHERE h.kind='effect_consumed' AND e.operation='close'")
             end = _timestamp(closed[0][0]) if complete and closed else None
-            elapsed_end = end if complete else time.time()
+            elapsed_end = end if complete else now
             elapsed = elapsed_end - created if created is not None and elapsed_end is not None and elapsed_end >= created else None
-            data: dict[str, Any] = {"run_id": run["id"], "repository": run["repository"],
+            focused: dict[str, Any] | None = next((job for job in subjects if job["subject"] == run["integration_holder"]), None)
+            if focused is None:
+                if len(active) == 1:
+                    focused = active[0]
+                else:
+                    focused = next((job for job in subjects if job["kind"] == "final_run" and job["phase"] == "complete"), None)
+            data: RunStatus = {"run_id": run["id"], "repository": run["repository"],
                 "parent": {"number": run["parent_issue"], "title": title[0][0] if title else None,
                            "body": title[0][1] if title else None, "revision": run["parent_revision"]},
                 "status": status, "phase": status if abandonment is not None else _public_phase(active[0]["phase"]) if len(active) == 1 else "parallel" if active else
@@ -596,34 +466,27 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
                 "created_at": created, "elapsed_seconds": elapsed, "repository_root": location["repository_root"],
                 "parent_revision": run["parent_revision"], "graph_revision": run["graph_revision"],
                 "policy_snapshot": json.loads(run["policy"]),
-                "subjects": subjects, "operator_actions": actions, "operator_action": actions[0] if actions else None,
-                "next_action": actions[0]["action"] if actions else "observe" if active else None,
+                "subjects": subjects, "operator_actions": actions,
+                "focus_subject": focused["subject"] if focused else None,
+                "next_action": _next_action(run, actions, status, boundaries["delivery_cleanup"]),
+                "delivery_cleanup": boundaries["delivery_cleanup"], "supervision_windows": windows,
+                "latest_resume": None, "resume_waits": [], "abandonment": abandonment, "unavailable_facts": [],
                 "diagnostics": [], "notifications": _notification_facts(tx, run, path),
-                "executor_control": {"owner": run["executor"], "epoch": run["epoch"], "stopped": bool(run["stopped"]), "live_status": "unknown"},
-                "scheduling": {"active": _all(tx, "SELECT id,subject,invocation FROM leases ORDER BY subject"),
+                "executor_control": {"owner": run["executor"], "epoch": run["epoch"], "stopped": bool(run["stopped"]), "blocked": run["blocked"], "live_status": "unknown"},
+                "scheduling": {"concurrency": run["concurrency"], "integration_holder": run["integration_holder"],
+                               "active": _all(tx, "SELECT id,subject,invocation FROM leases ORDER BY subject"),
                                "work_fifo": [row["subject"] for row in _all(tx, "SELECT subject FROM work_queue ORDER BY ready")],
                                "integration_fifo": [row["subject"] for row in _all(tx, "SELECT subject FROM integration_queue ORDER BY ready")]}}
-            data.update(_status_fields(run, subjects))
-            data["delivery_cleanup"] = boundaries["delivery_cleanup"]
-            run_windows = [window for window in windows if window["subject"] is None]
-            data["supervision"] = run_windows[0] if len(run_windows) == 1 else windows[0] if len(windows) == 1 else None
-            data["supervision_windows"] = windows
             control = _control_history(tx)
-            resumes = _resume_history(tx, control)
-            data["latest_resume"] = resumes[-1] if resumes else None
+            data["latest_resume"] = control[0] if control else None
             data["resume_waits"] = _resume_waits(run, subjects, data["scheduling"]["active"])
-            data["abandonment"] = abandonment
-            data["multi_ticket"] = _multi_ticket(tx, run, subjects, data["scheduling"])
-            data["next_action"] = _next_action(run, actions, status, data["delivery_cleanup"])
-            data["progress"] = _progress(data)
-            data["gate"] = "required_checks" if status == "waiting_checks" else None
             data["unavailable_facts"] = ["host_liveness", "host_activity_segments", "notifications.journal_binding"]
             if data["notifications"]["journal_state"] != "available":
                 data["unavailable_facts"].append("notifications")
             if data["notifications"]["configuration"] is None:
                 data["unavailable_facts"].append("notifications.configuration")
             if kind == "history":
-                data.update(_native_history(tx, data, subjects, after=after, limit=limit))
+                data["history"] = _native_history(tx, subjects, after=after, limit=limit)
             if len(json.dumps(data, ensure_ascii=False, allow_nan=False).encode()) > QUERY_LIMIT:
                 raise QueryError("query_limit", "Public response exceeds its bounded limit")
             return QueryDocument(kind, language, data)

@@ -48,14 +48,14 @@ def test_wait_deadline_does_not_invent_a_timeout_and_keeps_all_scopes(tmp_path, 
     monkeypatch.setattr(query.time, "time", lambda: 200.5)
     first = read_only(kernel, tmp_path).data
     assert len(first["supervision_windows"]) == 2
-    assert first["supervision"] is None  # Independent real Ticket scopes have no guessed current window.
+    assert "supervision" not in first  # Independent real Ticket scopes have no guessed current window.
     for window in first["supervision_windows"]:
         assert window["started_at"] == 100.25 and window["deadline"] == 700.25
         assert window["remaining_seconds"] == 499 and window["retry_count"] == 1
         assert window["next_retry_at"] == 105.25 and not window["timed_out"]
         assert window["scope"]["subject"] == window["subject"]
-    ticket = next(item for item in first["multi_ticket"]["tickets"] if item["ticket_number"] == 2)
-    assert ticket["supervision"]["latest_observation"]["message"] == "Original Ticket outage"
+    ticket = next(item for item in first["subjects"] if item["issue"] == 2)
+    assert ticket["supervision_windows"][0]["latest_observation"]["message"] == "Original Ticket outage"
     monkeypatch.setattr(query.time, "time", lambda: 900)
     expired_clock = read_only(kernel, tmp_path).data
     assert all(window["remaining_seconds"] == 0 and not window["timed_out"] for window in expired_clock["supervision_windows"])
@@ -83,7 +83,7 @@ def test_run_timeout_renders_original_evidence_and_resumes_only_after_core_appli
     monkeypatch.setattr(query.time, "time", lambda: 900)
     document = read_only(kernel, tmp_path)
     data = document.data
-    window = data["supervision"]
+    window = data["supervision_windows"][0]
     command = "agent-run resume 1 --repo example/project"
     assert data["status"] == "supervision_timeout" and data["next_action"] == command
     assert window["timed_out"] and window["remaining_seconds"] == 0
@@ -98,16 +98,13 @@ def test_run_timeout_renders_original_evidence_and_resumes_only_after_core_appli
         render(document, style=style, details=False, stream=output)
         assert command in output.getvalue() and "Original failure / 原始问题" in output.getvalue()
     history = read_only(kernel, tmp_path, "history").data
-    assert history["supervision"] == window
-    # timeline is the complete machine audit; events is its human projection.
-    paused, = [event for event in history["timeline"] if event["kind"] == "paused"
+    assert history["supervision_windows"][0] == window
+    # The original event is also the human renderer's sole source; there is no second audit projection.
+    paused, = [event for event in history["history"]["events"] if event["kind"] == "paused"
                and isinstance(event["evidence"], dict)
                and event["evidence"].get("scope_id") == window["scope_id"]]
     assert paused["identity"] == "supervision_timeout" and paused["evidence"] == window["timeout"]
-    projected, = [event for event in history["events"] if event["kind"] == paused["kind"]
-                  and event["identity"] == paused["identity"] and event["subject"] == paused["subject"]
-                  and event["generation"] == paused["generation"]]
-    assert projected["details"] == [paused["evidence"]]
+    assert paused["status"] is not None and paused["generation"] >= 1
     assert kernel.control("stop", "retire-original-executor") == "applied"
     kernel.confirm_executor_exit(execution)
     assert kernel.control("resume", "explicit-original-resume") == "applied"
@@ -116,7 +113,7 @@ def test_run_timeout_renders_original_evidence_and_resumes_only_after_core_appli
     fresh = OperationRunner(kernel, replacement, lambda binding: operations.runner.ports)
     kernel.clock = lambda: 800
     assert fresh.run_once().retry_at == 805
-    assert read_only(kernel, tmp_path).data["supervision"]["started_at"] == 800
+    assert read_only(kernel, tmp_path).data["supervision_windows"][0]["started_at"] == 800
 
 
 def test_ticket_timeout_keeps_sibling_waits_and_exact_target_resume(tmp_path, monkeypatch):
@@ -138,7 +135,7 @@ def test_ticket_timeout_keeps_sibling_waits_and_exact_target_resume(tmp_path, mo
     data = read_only(kernel, tmp_path).data
     windows = {window["subject"]: window for window in data["supervision_windows"]}
     assert windows["ticket:2"]["timed_out"] and not windows["ticket:3"]["timed_out"]
-    assert data["supervision"] is None  # No guessed current window across independent Tickets.
+    assert "supervision" not in data  # No guessed current window across independent Tickets.
     assert data["status"] == "active"
     assert data["next_action"] == "agent-run resume 1 --repo example/repository --ticket 2"
     assert data["operator_actions"][0]["evidence"]["failure_evidence"]["supervision_windows"] == [windows["ticket:2"]]
@@ -153,7 +150,7 @@ def test_required_checks_projection_keeps_the_original_45_minute_window(tmp_path
     scenario.kernel.clock = lambda: 100
     assert scenario.run().reason == "required_checks"
     monkeypatch.setattr(query.time, "time", lambda: 340.5)
-    window = read_only(scenario.kernel, tmp_path).data["supervision"]
+    window = read_only(scenario.kernel, tmp_path).data["supervision_windows"][0]
     assert window["kind"] == "required_checks"
     assert window["deadline"] == 2800 and window["remaining_seconds"] == 2459
     assert not window["timed_out"]

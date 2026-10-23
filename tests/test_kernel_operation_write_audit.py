@@ -77,11 +77,11 @@ def test_publication_unknown_response_diagnostic_remains_public_after_successful
     now[0] = 105.25
     assert scenario.run().kind == "approval"
     public = read(scenario.kernel.storage.path, "history").data
-    events = [event for event in public["timeline"] if event.get("evidence") == {
+    events = [event for event in public["history"]["events"] if event.get("evidence") == {
         "code": "write_response_unavailable", "message": "pr_write took effect; response lost"}]
     assert len(events) == 1
     assert pending["id"] in events[0]["identity"]
-    assert public["publication_operation_retries"] == []
+    assert public["history"]["effect_failures"] == []
     assert sum(write["operation"] == "pr_write" for write in scenario.port.writes()) == 1
     with scenario.kernel.storage.transaction(write=False) as tx:
         assert not tx.rows("SELECT subject FROM waits")

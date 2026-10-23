@@ -184,12 +184,12 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
         yield f"{copy['timeout_resume']}: {window['timeout_resume_action']}"
     latest = data.get("latest_resume")
     if isinstance(latest, Mapping):
-        progress = latest.get("progress")
+        progress = latest["resume"]["progress"]
         outcome = progress.get("resume_outcome") if isinstance(progress, Mapping) else None
-        label = copy.get("resume_" + str(outcome), copy["resume_applied"] if latest["applied"] else copy["resume_unconfirmed"])
+        label = copy.get("resume_" + str(outcome), copy["resume_applied"] if latest["resume"]["applied"] else copy["resume_unconfirmed"])
         owner = next((job for job in data["subjects"] if job["subject"] == latest["subject"]), None)
         target = f"#{owner['issue']}" if owner else copy["global"]
-        yield f"{copy['resume_label']}: {latest['action_id']} — {target} — {label}"
+        yield f"{copy['resume_label']}: {latest['id']} — {target} — {label}"
         if isinstance(progress, Mapping) and progress.get("reason_code"):
             reason = str(progress["reason_code"])
             yield terms.get(reason, reason)
@@ -215,7 +215,7 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
             yield f"{label}: {copy.get(pending['role'], pending['role'])} #{pending['ordinal']}"
             for invocation in pending["invocations"]:
                 yield f"  {copy['model']}: {invocation['model']} | {copy['effort']}: {invocation['effort']}"
-                if invocation["started_at"] is not None:
+                if invocation["outputs"][-1]["started_at"] is not None:
                     yield f"  {copy['started']}"
                 yield f"  {copy['duration']}: {invocation['elapsed_seconds'] if invocation['elapsed_seconds'] is not None else copy['incomplete']}"
         for budget in job["budgets"]:
@@ -231,12 +231,13 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
                 yield f"{copy['findings']}: {finding}"
     if document.kind == "history":
         yield copy["history"]
-        attempts = {row["id"]: row for row in data["semantic_agent_attempts"]}
-        invocations = {row["id"]: row for row in data["agent_invocations"]}
+        history = data["history"]
+        attempts = {row["id"]: row for row in history["attempts"]}
+        invocations = {row["id"]: row for attempt in history["attempts"] for row in attempt["invocations"]}
         shown: set[str] = set()
         milestones = {"source_refreshed", "final_activated", "role_consumed", "paused", "human_response", "control_applied",
                       "checks_observed", "ci_failed", "effect_consumed", "generation_requeued", "budget_renewed", "resource_retired", "cleanup_pending"}
-        for event in data["timeline"]:
+        for event in history["events"]:
             if not details and event["kind"] not in milestones:
                 continue
             invocation = invocations.get(event["identity"])
@@ -256,15 +257,15 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
                 for finding in review_findings(evidence):
                     yield f"{copy['findings']}: {finding if details or len(finding) <= 1000 else finding[:1000] + ' [truncated; --details]'}"
         if details:
-            for attempt in data["semantic_agent_attempts"]:
+            for attempt in history["attempts"]:
                 yield f"{attempt['subject']} {copy.get(attempt['role'], attempt['role'])} #{attempt['ordinal']}: {attempt['status']}"
-                if attempt["artifact"] is not None:
-                    yield _body(attempt["artifact"])
-            for invocation in data["agent_invocations"]:
-                yield f"{invocation['attempt']} — {copy['model']}: {invocation['model']} | {copy['effort']}: {invocation['effort']}"
-                yield f"  {copy['duration']}: {copy['incomplete']}"
-        if data["history_page"]["has_more"]:
-            yield f"{copy['more']}: --after {data['history_page']['next_after']}"
+                if attempt["result"] is not None:
+                    yield _body(attempt["result"])
+                for invocation in attempt["invocations"]:
+                    yield f"{invocation['attempt']} — {copy['model']}: {invocation['model']} | {copy['effort']}: {invocation['effort']}"
+                    yield f"  {copy['duration']}: {copy['incomplete']}"
+        if history["has_more"]:
+            yield f"{copy['more']}: --after {history['next_after']}"
 
 
 def render(document: QueryDocument, *, style: Literal["json", "plain", "rich"], details: bool, stream: TextIO) -> None:

@@ -95,13 +95,13 @@ def test_valid_large_queue_dependency_set_and_default_history_are_not_truncated(
     document = query.read(kernel.storage.path, "status").data
     assert document["scheduling"]["work_fifo"] == [job.key for job in independent[1:]]
     assert len(document["scheduling"]["work_fifo"]) == 129
-    ticket = next(item for item in document["multi_ticket"]["tickets"] if item["ticket_number"] == 999)
+    ticket = next(item for item in document["subjects"] if item["issue"] == 999)
     assert ticket["blocked_by"] == [job.issue for job in independent[:129]]
     history = query.read(kernel.storage.path, "history").data
-    assert len(history["timeline"]) >= 260
-    assert history["history_page"]["has_more"] is False
+    assert len(history["history"]["events"]) >= 260
+    assert history["history"]["has_more"] is False
     first = query.read(kernel.storage.path, "history", limit=17).data
-    assert len(first["timeline"]) == 17 and first["history_page"]["has_more"] is True
+    assert len(first["history"]["events"]) == 17 and first["history"]["has_more"] is True
     assert _snapshot(tmp_path) == before
 
 
@@ -155,8 +155,8 @@ def test_latest_resume_distinguishes_application_from_the_target_start_and_ignor
     assert main(_arguments(kernel, "status", "--json")) == 0
     document = json.loads(capsys.readouterr().out)
     latest = document["latest_resume"]
-    assert latest["action_id"] == "resume-target-2" and latest["subject"] == "ticket:2"
-    assert latest["status"] == "applied" and latest["progress"] is None
+    assert latest["id"] == "resume-target-2" and latest["subject"] == "ticket:2"
+    assert latest["status"] == "applied" and latest["resume"]["progress"] is None
     for style in ("plain", "rich"):
         stream = StringIO()
         render(query.read(kernel.storage.path, "status"), style=style, details=False, stream=stream)
@@ -164,7 +164,7 @@ def test_latest_resume_distinguishes_application_from_the_target_start_and_ignor
         assert "applied; target progress not yet observed" in stream.getvalue()
     history = query.read(kernel.storage.path, "history").data
     assert history["latest_resume"] == latest
-    assert history["agent_resumes"][-1] == latest
+    assert [action for action in history["history"]["actions"] if action["kind"] == "resume"][-1] == latest
     assert _snapshot(tmp_path) == before
 
     kernel.agent_exited(sibling, sibling_process, 0)
@@ -175,22 +175,22 @@ def test_latest_resume_distinguishes_application_from_the_target_start_and_ignor
     before = _snapshot(tmp_path)
     latest = query.read(kernel.storage.path, "status").data["latest_resume"]
     assert latest["status"] == "applied"
-    assert latest["progress"]["resume_outcome"] == "started"
-    assert latest["progress"]["action_id"] == "resume-target-2"
-    assert latest["progress"]["work_subject"] == "ticket:2"
-    assert latest["progress"]["invocation_id"] == target.invocation_id
-    assert latest["progress"]["invocation_id"] != sibling.invocation_id
+    assert latest["resume"]["progress"]["resume_outcome"] == "started"
+    assert latest["resume"]["progress"]["action_id"] == "resume-target-2"
+    assert latest["resume"]["progress"]["work_subject"] == "ticket:2"
+    assert latest["resume"]["progress"]["invocation_id"] == target.invocation_id
+    assert latest["resume"]["progress"]["invocation_id"] != sibling.invocation_id
     assert _snapshot(tmp_path) == before
     kernel.agent_exited(target, target_process, 2, failure_kind="fatal")
     before = _snapshot(tmp_path)
     failed = query.read(kernel.storage.path, "status")
-    assert failed.data["latest_resume"]["progress"]["resume_outcome"] == "failed"
-    assert failed.data["latest_resume"]["progress"]["work_subject"] == "ticket:2"
-    assert failed.data["latest_resume"]["progress"]["reason_code"] == "execution_failed"
+    assert failed.data["latest_resume"]["resume"]["progress"]["resume_outcome"] == "failed"
+    assert failed.data["latest_resume"]["resume"]["progress"]["work_subject"] == "ticket:2"
+    assert failed.data["latest_resume"]["resume"]["progress"]["reason_code"] == "execution_failed"
     stream = StringIO()
     render(failed, style="plain", details=False, stream=stream)
     assert "Target execution failed" in stream.getvalue()
-    assert query.read(kernel.storage.path, "history").data["agent_resumes"][-1] == failed.data["latest_resume"]
+    assert [action for action in query.read(kernel.storage.path, "history").data["history"]["actions"] if action["kind"] == "resume"][-1] == failed.data["latest_resume"]
     assert _snapshot(tmp_path) == before
 
 
@@ -223,8 +223,8 @@ def test_status_reports_the_original_worker_exit_wait_without_inventing_an_accep
     render(document, style="plain", details=False, stream=stream)
     assert "Worker exit not yet confirmed: #2" in stream.getvalue()
     history = query.read(kernel.storage.path, "history").data
-    assert history["agent_resumes"] == []
-    assert not any(action["id"] == "rejected-resume-2" for action in history["actions"])
+    assert [action for action in history["history"]["actions"] if action["kind"] == "resume"] == []
+    assert not any(action["id"] == "rejected-resume-2" for action in history["history"]["actions"])
     assert _snapshot(tmp_path) == before
     kernel.agent_exited(call, process, -15)
     assert query.read(kernel.storage.path, "status").data["resume_waits"] == []
@@ -254,15 +254,15 @@ def test_current_status_and_one_history_page_do_not_load_unrelated_archived_snap
     before = _snapshot(tmp_path)
     assert main(_arguments(kernel, "status", "--json")) == 0
     current = json.loads(capsys.readouterr().out)
-    assert current["latest_resume"]["action_id"] == "original-resume"
-    assert current["latest_resume"]["progress"] is None
+    assert current["latest_resume"]["id"] == "original-resume"
+    assert current["latest_resume"]["resume"]["progress"] is None
     assert current["operator_actions"][0]["reason"] == "operator_stopped"
     assert len(json.dumps(current).encode()) < 128 * 1024
     assert main(_arguments(kernel, "history", "--json", "--after", str(after), "--limit", "1")) == 0
     page = json.loads(capsys.readouterr().out)
-    assert len(page["timeline"]) == 1 and page["timeline"][0]["position"] == after + 1
-    assert page["history_page"]["has_more"] is True
-    assert page["latest_resume"]["action_id"] == "original-resume"
+    assert len(page["history"]["events"]) == 1 and page["history"]["events"][0]["position"] == after + 1
+    assert page["history"]["has_more"] is True
+    assert page["latest_resume"]["id"] == "original-resume"
     assert _snapshot(tmp_path) == before
 
 
@@ -283,17 +283,23 @@ def test_json_query_reads_actual_binding_and_raw_without_advancing_or_mutating(
     assert main(_arguments(kernel, "status", "--json")) == 0
     output = json.loads(capsys.readouterr().out)
     job = output["subjects"][0]
+    assert output["focus_subject"] == "ticket:2"
+    assert output["scheduling"]["concurrency"] == 3
+    assert output["scheduling"]["integration_holder"] is None
+    assert not {"worker", "multi_ticket", "progress", "review_budget", "agent_invocation"} & output.keys()
     assert output["run_id"] == "run-query"
     assert output["repository"] == "example/project"
     assert output["operator_actions"][0]["scope"] == "local"
     assert output["operator_actions"][0]["action"]["command"] == "resume"
     assert output["operator_actions"][0]["action"]["ticket_number"] == 2
-    assert output["operator_actions"][0]["trigger_invocation"]["model"] == "recorded-development-model"
+    assert output["operator_actions"][0]["subject"] == job["subject"]
     pending = job["pending_attempt"]
+    current = next(row for row in pending["invocations"] if row["id"] == pending["current_invocation"])
+    assert current["model"] == "recorded-development-model"
     assert pending["result"]["human_blockers"] == ["Need the original decision / 保留原文"]
     invocation = pending["invocations"][0]
     assert invocation["model"] == "recorded-development-model" and invocation["effort"] == "high"
-    assert invocation["started_at"] is None and invocation["elapsed_seconds"] is None
+    assert invocation["outputs"][-1]["started_at"] is None and invocation["elapsed_seconds"] is None
     assert invocation["live_status"] == "unknown"
     used = {row["purpose"]: row["developments_used"] for row in job["budgets"] if row["current"]}
     assert used["requirements"] == 1
@@ -316,10 +322,12 @@ def test_local_human_boundary_does_not_present_its_sibling_as_globally_paused(tm
     action = document["operator_actions"][0]
     assert action["scope"] == "local" and action["run_paused"] is False
     assert action["action"]["ticket_number"] == 2
-    peer = next(job for job in document["multi_ticket"]["tickets"] if job["ticket_number"] == 3)
-    assert peer["has_work_slot"] is True
-    assert peer["invocation"]["id"] == call.invocation_id
-    assert peer["execution_activity"] == "unknown"
+    peer = next(job for job in document["subjects"] if job["issue"] == 3)
+    assert any(lease["subject"] == peer["subject"] for lease in document["scheduling"]["active"])
+    pending = peer["pending_attempt"]
+    invocation = next(row for row in pending["invocations"] if row["id"] == pending["current_invocation"])
+    assert invocation["id"] == call.invocation_id
+    assert invocation["live_status"] == "unknown"
     assert _snapshot(tmp_path) == before
 
 
@@ -459,7 +467,8 @@ def test_invalid_personal_defaults_do_not_override_or_block_existing_run(
     before = _snapshot(tmp_path)
     assert main(_arguments(kernel, "status", "--json")) == 0
     document = json.loads(capsys.readouterr().out)
-    assert document["worker"] is None
+    assert document["focus_subject"] == "ticket:2"
+    assert document["subjects"][0]["pending_attempt"]["invocations"][0]["outputs"][-1]["raw_id"] is not None
     invocation = document["subjects"][0]["pending_attempt"]["invocations"][0]
     assert invocation["model"] == "recorded-development-model"
     assert query.read(kernel.storage.path, "status").language == "en"
@@ -489,15 +498,15 @@ def test_history_keeps_raw_feedback_and_pages_without_losing_events(tmp_path: Pa
     kernel.control("resume", "original-response", subject="ticket:2", message="保持原文\r\nDo exactly this.\n")
     before = _snapshot(tmp_path)
     document = query.read(kernel.storage.path, "history")
-    response = next(event for event in document.data["timeline"] if event["kind"] == "human_response")
+    response = next(event for event in document.data["history"]["events"] if event["kind"] == "human_response")
     assert response["evidence"] == "保持原文\r\nDo exactly this.\n"
-    action = next(row for row in document.data["actions"] if row["id"] == "original-response")
+    action = next(row for row in document.data["history"]["actions"] if row["id"] == "original-response")
     assert action["status"] == "applied"
     assert action["payload"]["message"] == "保持原文\r\nDo exactly this.\n"
     assert action["receipt"]["applied"] is True
-    assert document.data["resume_audit"][0]["action_id"] == "original-response"
-    assert document.data["agent_resumes"][0]["started_at"] is None
-    assert document.data["summary"]["rounds"]["ticket_development"] == 1
+    assert action["id"] == "original-response"
+    assert action["resume"]["started_at"] is None
+    assert document.data["history"]["rounds"]["ticket_development"] == 1
     reads: set[str] = set()
     original_get = Transaction.get
 
@@ -514,14 +523,14 @@ def test_history_keeps_raw_feedback_and_pages_without_losing_events(tmp_path: Pa
         reads.clear()
         page = query.read(kernel.storage.path, "history", after=after, limit=2).data
         assert (response["material_id"] in reads) == any(
-            event["position"] == response["position"] for event in page["timeline"])
-        observed.extend(event["position"] for event in page["timeline"])
-        after = page["history_page"]["next_after"]
-        if not page["history_page"]["has_more"]:
+            event["position"] == response["position"] for event in page["history"]["events"])
+        observed.extend(event["position"] for event in page["history"]["events"])
+        after = page["history"]["next_after"]
+        if not page["history"]["has_more"]:
             break
     else:
         raise AssertionError("bounded history never reached its recorded end")
-    assert observed == [event["position"] for event in document.data["timeline"]]
+    assert observed == [event["position"] for event in document.data["history"]["events"]]
     assert len(observed) == len(set(observed))
     assert main(_arguments(kernel, "history", "--plain", "--details")) == 0
     assert "Do exactly this." in capsys.readouterr().out
@@ -616,28 +625,33 @@ def test_public_delivery_boundaries_match_observed_02_meanings(
         approval = query.read(scenario.kernel.storage.path, "status").data
         assert approval["phase"] == "ready_for_approval"
         assert approval["next_action"] == "agent-run approve 1 --repo example/repository"
-        assert approval["active_ticket"] is None
-        assert approval["review_budget"] is not None
+        focused = next(job for job in approval["subjects"] if job["subject"] == approval["focus_subject"])
+        assert focused["kind"] != "ticket"
+        assert any(budget["current"] and budget["purpose"] ==
+                   ("integration" if focused["kind"] == "final_run" else "requirements")
+                   for budget in focused["budgets"])
         assert _snapshot(tmp_path) == before
     assert scenario.run(approve=True).kind == "complete"
     before = _snapshot(tmp_path)
     document = query.read(scenario.kernel.storage.path, "status").data
     assert document["phase"] == completed_phase
-    assert document["active_ticket"] is None
-    assert (document["review_budget"] is not None) == (kind == DeliveryKind.FINAL_RUN)
+    focused = next((job for job in document["subjects"] if job["subject"] == document["focus_subject"]), None)
+    assert focused is None or focused["kind"] != "ticket"
+    assert (focused is not None and any(budget["current"] and budget["purpose"] == "integration"
+            for budget in focused["budgets"])) == (kind == DeliveryKind.FINAL_RUN)
     assert document["next_action"] == ("agent-run status 1 --repo example/repository"
                                        if kind == DeliveryKind.TICKET else "无")
     assert document["delivery_cleanup"]["status"] == "completed"
     assert all(subject["phase"] == "complete" for subject in document["subjects"])
     if kind != DeliveryKind.PARENT_ONLY:
         assert [record["subject"] for record in scenario.kernel.source_status()["completions"]] == ["ticket:2"]
-    assert document["progress"]["status"] == document["status"]
-    assert document["progress"]["phase"] == completed_phase
+    assert "progress" not in document
+    assert document["phase"] == completed_phase
     history = query.read(scenario.kernel.storage.path, "history").data
     prefix = {DeliveryKind.TICKET: "ticket", DeliveryKind.PARENT_ONLY: "parent", DeliveryKind.FINAL_RUN: "run"}[kind]
-    assert history["summary"]["rounds"][prefix + "_publication"] == 1
-    assert history["summary"]["rounds"][prefix + "_review"] == 1
-    assert history["events"] and history["events"][0]["at"]
-    assert history["scheduler"]["activity"] == "unknown"
-    assert history["execution_activity"] != "running"
+    assert history["history"]["rounds"][prefix + "_publication"] == 1
+    assert history["history"]["rounds"][prefix + "_review"] == 1
+    assert history["history"]["events"] and history["history"]["events"][0]["created_at"]
+    assert history["executor_control"]["live_status"] == "unknown"
+    assert all(invocation["live_status"] != "running" for attempt in history["history"]["attempts"] for invocation in attempt["invocations"])
     assert _snapshot(tmp_path) == before

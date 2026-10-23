@@ -161,7 +161,7 @@ Actions job 的准确 head、完成状态与原始日志提供证据，不再读
 平台、取消或未知类别的真实失败也可调查；pending、unknown、身份不匹配和证据尚未收敛继续有界监督。
 两种 Parent 必须取得当前整体 Review，成果改变重新验证 CI 与人工批准。
 
-`status` 和 `history` 默认输出便于人阅读的摘要；加入 `--json` 可获得稳定的机器可读输出。处于
+`status` 和 `history` 默认输出便于人阅读的摘要；加入 `--json` 可获得当前 native 机器可读输出。处于
 外部等待或监督超时时，两种格式均显示等待种类、对象、head/base、窗口开始与截止、剩余时间、
 重试次数、脱敏的最新观测，以及超时后的唯一恢复操作。Lifecycle Action 已应用且 Executor 完成
 握手后，发起 CLI 可以返回；后续轮询与自动推进由独立 Run Executor Session 承担，不依赖原终端
@@ -171,16 +171,22 @@ Attempt 绑定当时的 Review Budget Window，Publication Attempt 则不绑定�
 初始 Invocation、同 Thread 的 Output Repair、进程失败后的 successor Invocation、Human Blocker Resume
 以及显式 `--new-thread`；这些恢复都沿用同一 Attempt ID 和领域计数，不能重新获得预算。
 Publication Invocation 在首个 Codex 进程启动前写入状态；`thread.started` 会在进程仍运行时
-立即保存。`history --json` 的 `agent_invocations` 保留每次调用的 Work Subject、Generation、
-输入指纹、Currentness Boundary、模式、requested/reported Thread、Output Attempt 数量、时间和
-有界错误；`semantic_agent_attempts`、`output_attempts`、`budget_windows` 与
-`publication_operation_retries` 分别展示语义工作、输出修复、预算和外部发布操作重试，不把这些
-层级混成一个计数。每次公共 `resume` 另存独立授权事件；`status --json` 的 `latest_resume` 显示
-最近一次，`history --json` 的 `agent_resumes` 显示每次授权的原因、Thread、Attempt 与 successor
-关联，`resume_audit` 则显示总数和滚动摘要。基础 Resume 授权审计保留每次 Resume 的完整小型事实且
-不限制次数；独立的不可变 Human Response 审计按 Resume identity 保留维护者消息，统一 `events`
-投影在 JSON 中保留完整响应，普通文本只显示确定性截断的摘要。审计不保存原始错误文本、Prompt、transcript 或
-Acceptance Artifact。
+立即保存。`status --json` 的 `subjects[].pending_attempt` 和 `history --json` 的
+`history.attempts[]` 使用同一 native Attempt 结构：`result` 保存原结果，`invocations[]` 保留
+准确调用、Thread/Profile 绑定与恢复关联，`outputs[]` 保留各次物理输出的原始返回、dispatch/exit
+事实与活动计时。当前调用始终由 Attempt 的 `current_invocation` 定位，不能以最新记录替代。
+领域预算位于 `subjects[].budgets`，实际发布失败位于 `history.effect_failures`，操作派发计数位于
+`history.effects`；这些不同层级不能混成一个计数。当前焦点由 `focus_subject` 引用，席位、
+并发上限和两条 FIFO 位于 `scheduling`，不再复制 Worker、Ticket usage 或 progress 镜像。
+
+每次公共 `resume` 另存独立授权事件。`latest_resume` 显示当前最近的原 Action；
+`history.actions[]` 保留所选历史页关联的原 Action、payload 与 receipt，其 `resume` 字段记录
+是否已应用、successor Invocation、启动与准确目标进展，不能把已应用解释为目标已启动。
+不可变 Human Response 按 Resume identity 保留维护者消息，`history.events[].evidence` 保留完整响应，
+普通文本只显示确定性截断的摘要。历史事件只有这一条流，按原 `position` 排序；
+`history.after/next_after/has_more` 表示分页范围，`history.rounds` 统计本页 Attempt 闭包的领域轮次。
+当前概览与历史页在同一只读事务中读取，不将当前状态补作历史结论。
+控制审计不另存 Prompt、transcript 或 Acceptance Artifact；原工作结果通过准确 Attempt 关联读取。
 Ticket、Parent-only 和 Run Repair
 的 Development、Fresh Acceptance 与 Publication 都使用同一 Invocation seam：非法结构化输出会在
 同一 Thread、只读 checkout 中使用角色化短格式 Prompt 最多修复两次，且不增加领域 attempt。进程异常只在
