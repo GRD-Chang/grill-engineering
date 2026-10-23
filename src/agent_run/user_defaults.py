@@ -142,7 +142,6 @@ def _merge_profile(current: Mapping[str, Any], supplied: Mapping[str, Any]) -> d
 class UserDefaultsStore:
     def __init__(self, path: Path | None = None) -> None:
         self.path = path if path is not None else self.default_path()
-        self.legacy_path = self.path.with_name("delivery-policy.json")
 
     @staticmethod
     def default_path() -> Path:
@@ -153,16 +152,16 @@ class UserDefaultsStore:
             raise UserDefaultsError(reason) from error
 
     def _read(self) -> tuple[dict[str, Any], str]:
-        path = self.path if self.path.exists() else self.legacy_path
+        path = self.path
         if not path.exists():
             return {}, "builtin"
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
-            document = _document(raw if path == self.path else {"policy": raw})
+            document = _document(raw)
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, UserDefaultsError) as error:
             reason = error.args[0] if error.args and isinstance(error.args[0], ErrorMessage) else str(error)
             raise UserDefaultsError(error_message("defaults.read_error", path=path, reason=reason)) from error
-        return document, "user-defaults" if path == self.path else "legacy-delivery-policy"
+        return document, "user-defaults"
 
     def load(self) -> dict[str, Any]:
         return self._read()[0]
@@ -213,8 +212,7 @@ class UserDefaultsStore:
         return {
             "result": "settings",
             "path": str(self.path), "source": source,
-            "source_path": str(self.legacy_path if source == "legacy-delivery-policy" else self.path) if source != "builtin" else None,
-            "legacy_ignored": source == "user-defaults" and self.legacy_path.exists(),
+            "source_path": str(self.path) if source == "user-defaults" else None,
             "defaults": document,
             "policy": policy, "policy_sources": policy_sources,
             "profile": resolved, "profile_sources": sources,

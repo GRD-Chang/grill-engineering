@@ -64,7 +64,9 @@ def _call(entry: Callable, arguments: list[str], capsys) -> tuple[int, dict]:
 def test_builtin_personal_show_matches_real_old_cli_without_creating_files(personal: Path, capsys) -> None:
     old = _call(old_main, ["settings", "show", "--json"], capsys)
     new = _call(main, ["settings", "show", "--json"], capsys)
-    assert new == old
+    # The retired legacy-file display field is no longer part of settings.
+    assert new == (old[0], {key: value for key, value in old[1].items() if key != "legacy_ignored"})
+    assert "legacy_ignored" not in new[1]
     assert new[0] == 0 and new[1]["source"] == "builtin"
     assert new[1]["scope"] == "future-runs" and new[1]["language"] == "zh"
     assert not personal.parent.exists()
@@ -95,7 +97,8 @@ def test_public_settings_options_preserve_old_receipt_and_persisted_values(
     saved = personal.read_bytes()
     personal.unlink()
     new = _call(main, arguments, capsys)
-    assert new == old
+    assert new == (old[0], {key: value for key, value in old[1].items() if key != "legacy_ignored"})
+    assert "legacy_ignored" not in new[1]
     assert personal.read_bytes() == saved
     assert personal.stat().st_mode & 0o777 == 0o600
     assert "DELIVERY_TEST_PAT" not in os.environ
@@ -159,19 +162,25 @@ def test_public_configure_preserves_original_on_atomic_storage_failure(
     assert not list(personal.parent.glob("*.tmp"))
 
 
-def test_personal_legacy_policy_query_and_explicit_save_preserve_old_materials(personal: Path, capsys) -> None:
+def test_personal_settings_preserve_old_policy_materials_without_import_or_old_routes(personal: Path, capsys) -> None:
     personal.parent.mkdir(parents=True)
     legacy = personal.with_name("delivery-policy.json")
     legacy.write_text(json.dumps({"ticket_review_rounds": 7, "review_deadline": "3h"}))
     original = legacy.read_bytes()
     code, result = _call(main, ["settings", "show", "--json"], capsys)
-    assert code == 0 and result["source"] == "legacy-delivery-policy"
+    assert code == 0 and result["source"] == "builtin"
+    assert result["defaults"] == {} and "legacy_ignored" not in result
     assert not personal.exists() and legacy.read_bytes() == original
     assert _call(main, ["settings", "configure", "--language", "en", "--json"], capsys)[0] == 0
-    assert UserDefaultsStore().load()["policy"]["ticket_review_rounds"] == 7
+    assert UserDefaultsStore().load() == {"language": "en", "policy": {}, "profile": {}}
     assert legacy.read_bytes() == original
-    assert _call(main, ["policy", "show"], capsys)[1]["user_defaults"]["ticket_review_rounds"] == 7
-    assert _call(main, ["policy", "configure", "--ticket-review-rounds", "8"], capsys)[0] == 0
+    before = personal.read_bytes()
+    for arguments in (["policy", "show"], ["policy", "configure", "--ticket-review-rounds", "8"]):
+        assert main(arguments) == 2
+        rejected = capsys.readouterr()
+        assert "policy" in rejected.err and rejected.out == ""
+        assert personal.read_bytes() == before and legacy.read_bytes() == original
+    assert _call(main, ["settings", "configure", "--ticket-review-rounds", "8", "--json"], capsys)[0] == 0
     assert UserDefaultsStore().load()["policy"]["ticket_review_rounds"] == 8
     assert legacy.read_bytes() == original
 
@@ -203,12 +212,12 @@ def test_personal_plain_output_uses_real_language_and_does_not_send_or_open_runs
     def forbidden(*_args, **_kwargs):
         raise AssertionError("Personal settings attempted Run/online work")
 
-    assert old_main(["settings", "show"]) == 0
-    old = capsys.readouterr().out
     monkeypatch.setattr("agent_run_kernel.query_cli._candidates", forbidden)
     monkeypatch.setattr("subprocess.run", forbidden)
     assert main(["settings", "show"]) == 0
-    assert capsys.readouterr().out == old
+    output = capsys.readouterr().out
+    assert "User text / 用户原文" in output
+    assert "Legacy configuration ignored" not in output
     assert "User text / 用户原文" in old
     assert personal.read_bytes() == before
 

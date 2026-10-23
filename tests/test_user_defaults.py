@@ -9,28 +9,27 @@ from agent_run.agent_profiles import resolve_profiles
 from agent_run.user_defaults import UserDefaultsError, UserDefaultsStore
 
 
-def test_read_only_builtin_and_legacy_migration(tmp_path: Path) -> None:
+@pytest.mark.parametrize("old_contents", ['{"ticket_review_rounds":7}', 'broken old JSON'])
+def test_only_current_defaults_are_read_and_old_policy_materials_are_preserved(tmp_path: Path, old_contents: str) -> None:
     store = UserDefaultsStore(tmp_path / "config" / "user-defaults.json")
     assert store.describe()["source"] == "builtin"
     assert not store.path.parent.exists()
     store.path.parent.mkdir()
-    legacy = {
-        "ticket_review_rounds": 7,
-        "parent_only_paired_rounds": 4,
-        "run_repair_rounds": 2,
-        "development_thread_policy": "new-per-attempt",
-        "invocation_deadlines": {"development": "11m", "review": "3h"},
-    }
-    store.legacy_path.write_text(json.dumps(legacy))
-    original = store.legacy_path.read_bytes()
-    assert store.describe()["source"] == "legacy-delivery-policy"
+    legacy = store.path.with_name("delivery-policy.json")
+    legacy.write_text(old_contents)
+    original = legacy.read_bytes()
+    shown = store.describe()
+    assert shown["source"] == "builtin" and shown["source_path"] is None
+    assert shown["defaults"] == {} and "legacy_ignored" not in shown
     assert not store.path.exists()
     result = store.configure(profile={"preset": "premium"})
-    assert result["policy"]["ticket_review_rounds"] == 7
-    assert result["legacy_ignored"] is True
-    assert json.loads(store.path.read_text())["policy"] == legacy
-    assert store.legacy_path.read_bytes() == original
-    store.legacy_path.write_text("broken")
+    assert result["defaults"] == {"profile": {"preset": "premium"}}
+    assert "legacy_ignored" not in result
+    assert json.loads(store.path.read_text()) == result["defaults"]
+    assert legacy.read_bytes() == original
+    store.configure(policy={"ticket_review_rounds": 8})
+    assert store.describe()["policy"]["ticket_review_rounds"] == 8
+    assert legacy.read_bytes() == original
     assert store.describe()["source"] == "user-defaults"
 
 

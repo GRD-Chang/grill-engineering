@@ -285,8 +285,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         if parsed.command == "doctor":
             from agent_run.doctor import run as diagnose
             return diagnose(as_json=parsed.as_json)
-        if parsed.command in {"settings", "policy"}:
-            if parsed.command == "settings" and parsed.settings_command == "show" and (parsed.run_id is not None or parsed.parent is not None):
+        if parsed.command == "settings":
+            if parsed.settings_command == "show" and (parsed.run_id is not None or parsed.parent is not None):
                 candidate = _select(parsed, _candidates(parsed))[0]
                 if candidate.get("language") in {"zh", "en"}:
                     language = candidate["language"]
@@ -296,7 +296,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 language = document.language
             else:
                 settings = personal_settings.execute(parsed)
-            render_settings(settings, as_json=parsed.command == "policy" or parsed.as_json, stream=sys.stdout)
+            render_settings(settings, as_json=parsed.as_json, stream=sys.stdout)
             return 0
         selected = _select(parsed, _candidates(parsed))
         if parsed.command == "runs":

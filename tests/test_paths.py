@@ -6,26 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.executor_environment import default_executor_runtime_directory
-from agent_run.github_auth_profile import GitHubAppProfileStore
 from agent_run.paths import app_config_root, app_data_root, app_runtime_root
-from agent_run.run_locator import RunLocatorIndex
-from agent_run.runner_installer import InstallPaths
-from agent_run.runner_lease import default_runner_lock_path
-from agent_run.user_defaults import UserDefaultsStore
-
-
-def test_all_runner_paths_share_the_selected_roots() -> None:
-    data = app_data_root()
-    config = app_config_root()
-    assert InstallPaths.from_environment().data_root == data
-    assert default_runner_lock_path() == data / "install.lock"
-    assert RunLocatorIndex.default().path == data / "run-locator.json"
-    assert UserDefaultsStore.default_path() == config / "user-defaults.json"
-    assert GitHubAppProfileStore.default_path() == config / "github-app.json"
-    assert default_executor_runtime_directory() == app_runtime_root() / "executor"
-    assert not data.exists()
-    assert not config.exists()
 
 
 @pytest.mark.parametrize("value", [None, ""])

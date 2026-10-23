@@ -106,14 +106,6 @@ def add_parsers(commands: Any, language: str) -> None:
     for name in ("open-id", "profile", "app-id"):
         configure.add_argument(f"--notification-{name}", help=text("settings.notification_binding_help", language=language))
     configure.add_argument("--json", action="store_true", dest="as_json")
-    policy = commands.add_parser("policy", language=language, help=text("cli.policy_help", language=language))
-    policy.add_argument("--json", action="store_true", dest="as_json")
-    policy_commands = policy.add_subparsers(dest="policy_command")
-    policy_show = policy_commands.add_parser("show", language=language, help=text("cli.policy_show_help", language=language))
-    policy_show.add_argument("--json", action="store_true", dest="as_json")
-    policy_configure = policy_commands.add_parser("configure", language=language, help=text("cli.policy_configure_help", language=language))
-    _policy_options(policy_configure, language)
-    policy_configure.add_argument("--json", action="store_true", dest="as_json")
 
 
 def _policy_values(parsed: argparse.Namespace) -> dict[str, Any]:
@@ -128,11 +120,6 @@ def _policy_values(parsed: argparse.Namespace) -> dict[str, Any]:
 
 def execute(parsed: argparse.Namespace) -> dict[str, Any]:
     store = UserDefaultsStore()
-    if parsed.command == "policy":
-        result = store.configure(policy=_policy_values(parsed)) if parsed.policy_command == "configure" else store.describe()
-        result["result"] = "configured" if parsed.policy_command == "configure" else "policy"
-        result["user_defaults"] = result["defaults"].get("policy", {})
-        return result
     if parsed.settings_command == "show":
         if parsed.run_id is not None or parsed.parent is not None:
             raise QueryError("run_locator_invalid", "Select a canonical Run before reading its frozen configuration")
