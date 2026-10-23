@@ -12,7 +12,7 @@ from agent_run.runtime.execution import execute
 from agent_run.runtime.executor import _make_ports
 from support.core_operations import CoreOperations
 from agent_run.errors import KernelError
-from agent_run.model import ReadWait
+from agent_run.model import ReadWait, Step
 from test_kernel_remote_effects import _fixture, _publish_pr, _source_kernel
 from test_kernel_worker_source_windows import _allocated_worker, RAW
 
@@ -35,7 +35,8 @@ def test_executor_waits_for_real_pr_and_remote_ref_observations_to_converge(tmp_
 
     step = operations.once()
 
-    assert step.kind == "waiting" and step.call is None and step.effect is None
+    assert isinstance(step, Step)
+    assert step.kind == "waiting" and step.call is None
     assert step.retry_at == now + 5
     assert kernel.operation_state().wake_at == step.retry_at
     assert kernel.status("parent:1")["gates"] == []

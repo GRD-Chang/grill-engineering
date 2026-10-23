@@ -8,6 +8,7 @@ import pytest
 from agent_run.errors import GitHubReadError
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
+from agent_run.model import Step
 from agent_run.adapters.source import read_requirements
 from support.core_operations import CoreOperations
 from test_kernel_remote_effects import _change, _fixture, _source_kernel
@@ -66,7 +67,10 @@ def test_executor_discards_a_source_read_superseded_during_real_external_io(tmp_
     assert failures == []
     assert len(outcomes) == 1 and outcomes[0].kind == "waiting"
     assert outcomes[0].reason == "automatic_step_superseded"
-    assert outcomes[0].call is None and outcomes[0].effect is None
+    assert isinstance(outcomes[0], Step)
+    assert outcomes[0].call is None
+    with kernel.storage.transaction(write=False) as tx:
+        assert not tx.rows('SELECT id FROM effects')
     assert current["observed_parent_revision"] != before["observed_parent_revision"]
     assert kernel.source_status() == current
     monkeypatch.setattr(external, "read_requirements", read_requirements)
@@ -91,7 +95,12 @@ def test_executor_preserves_unproved_or_upstream_read_errors(tmp_path, monkeypat
     if isinstance(error, GitHubReadError):
         step = operations.once()
         assert step.kind == "waiting" and step.reason == "github_convergence"
-        assert step.call is None and step.effect is None
+        assert isinstance(step, Step)
+        assert step.call is None
+        with kernel.storage.transaction(write=False) as tx:
+            assert not tx.rows('SELECT id FROM effects')
+        import json
+        assert not any("--method" in json.loads(line) for line in _calls.read_text().splitlines())
         assert kernel.status("parent:1")["gates"] == []
         return
     with pytest.raises(type(error)) as raised:

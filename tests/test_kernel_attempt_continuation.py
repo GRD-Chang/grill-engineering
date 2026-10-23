@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
 import pytest
-from agent_run.model import Commit, Delivery, DeliveryKind
+from agent_run.model import Commit, Delivery, DeliveryKind, Step
 from agent_run.core.kernel import Kernel
 from agent_run.core import kernel as core_bindings
 from agent_run.errors import KernelError
@@ -126,12 +126,14 @@ def test_native_invocation_with_unproven_exit_cannot_consume_or_dispatch(tmp_pat
     step = operations.once()
     # The shared selector already sees the native Invocation exit barrier; it need not
     # enter a private subject transition to rediscover the same waiting reason.
-    assert (step.kind, step.call, step.effect) == ('waiting', None, None)
+    assert isinstance(step, Step)
+    assert (step.kind, step.call) == ('waiting', None)
     state = operations.runner.state()
     assert (state.disposition, state.active, state.wake_at) == ('waiting', (previous.lease_id,), previous.deadline_at)
     assert kernel.status('ticket:2')['phase'] == 'development'
     assert kernel.status('ticket:2')['pending_return'] is has_raw
     with kernel.storage.transaction(write=False) as tx:
+        assert not tx.rows('SELECT id FROM effects')
         assert tx.one('SELECT count(*) FROM invocations')[0] == 1
         assert tx.one('SELECT count(*) FROM leases')[0] == 1
         prior = load_continuation(tx, attempt_id).prior
@@ -158,9 +160,11 @@ def test_first_native_capacity_continuation_preserves_existing_not_before(tmp_pa
     kernel, execution, operations, attempt_id, previous = _native_boundary(tmp_path, failure_kind='capacity')
     kernel.clock = lambda: 129.0
     waiting = operations.once()
-    assert (waiting.kind, waiting.retry_at, waiting.call, waiting.effect) == ('waiting', 130.0, None, None)
+    assert isinstance(waiting, Step)
+    assert (waiting.kind, waiting.retry_at, waiting.call) == ('waiting', 130.0, None)
     assert operations.runner.state().wake_at == 130.0
     with kernel.storage.transaction(write=False) as tx:
+        assert not tx.rows('SELECT id FROM effects')
         assert tx.one('SELECT count(*) FROM invocations')[0] == 1
     kernel.clock = lambda: 130.0
     call = operations.once().call
@@ -222,7 +226,10 @@ def test_local_resume_new_thread_keeps_format_period_and_old_invocation_binding(
     waiting = operations.once()
     # Global selection waits on the durable lease rather than advancing this
     # selected subject merely to rediscover its private agent_running reason.
-    assert (waiting.kind, waiting.call, waiting.effect) == ('waiting', None, None)
+    assert isinstance(waiting, Step)
+    assert (waiting.kind, waiting.call) == ('waiting', None)
+    with kernel.storage.transaction(write=False) as tx:
+        assert not tx.rows('SELECT id FROM effects')
     assert operations.runner.state().active == (call.lease_id,)
     kernel.bind_thread(call, 'replacement-backend')
     next_process = {**process, 'pid': 91, 'pgid': 91, 'start_token': 'replacement-start'}
@@ -264,7 +271,10 @@ def test_concurrent_first_native_allocation_has_one_lease_and_stop_only_settles_
     kernel.receive(call, wire_json({'result_kind': 'development', 'summary': 'Durable late result.', 'human_blockers': None}))
     before = kernel.status('ticket:2')
     stopped = operations.once()
-    assert (stopped.kind, stopped.reason, stopped.call, stopped.effect) == ('paused', 'executor_fenced', None, None)
+    assert isinstance(stopped, Step)
+    assert (stopped.kind, stopped.reason, stopped.call) == ('paused', 'executor_fenced', None)
+    with kernel.storage.transaction(write=False) as tx:
+        assert not tx.rows('SELECT id FROM effects')
     assert kernel.status('ticket:2') == before
     assert kernel.status('ticket:2')['pending_return'] is True
     assert kernel.status('ticket:2')['budgets']['requirements']['developments_used'] == 1
