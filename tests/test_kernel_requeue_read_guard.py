@@ -118,9 +118,8 @@ def test_requeue_read_permission_never_opens_other_work(tmp_path: Path, blocked:
         observe_control(kernel, "ticket:2", scenario.make_ports)
         assert kernel.source_status()["blocked"] == "unsupported_scope_change"
     subject = "ticket:3" if blocked == "sibling" else "ticket:2"
-    token = kernel._begin_automatic_step(execution, subject, cleanup=blocked == "cleanup")
     with pytest.raises(KernelError, match="automatic_step_paused"):
-        kernel._guard_automatic_step(token, execution)
+        kernel.begin_observation(subject, execution=execution, cleanup=blocked == "cleanup")
     assert_original_boundary(scenario, writes)
 
 

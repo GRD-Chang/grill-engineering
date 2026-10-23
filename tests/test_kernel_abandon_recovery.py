@@ -9,6 +9,7 @@ import pytest
 from agent_run.errors import KernelError
 from agent_run.model import Effect, EffectResult, Execution, HostObservation
 from agent_run.queries.run import read
+from agent_run.core.operation_contract import EffectIO
 from test_kernel_abandon import managed_abandon_scenario
 from support.core_operations import CoreOperations
 
@@ -55,6 +56,10 @@ def test_unproven_sent_recovery_never_replays_and_uses_original_read_window(
     now = [1000.25]
     kernel.clock = lambda: now[0]
     original_writes = scenario.port.writes()
+    request = kernel.next_work(scenario.execution)
+    assert isinstance(request, EffectIO) and request.kind == "readback"
+    assert request.effect == effect
+    token = request.token
     for disposition in ("prior", "unknown"):
         scenario.port.read_faults.clear()
         if disposition == "unknown":
@@ -70,9 +75,8 @@ def test_unproven_sent_recovery_never_replays_and_uses_original_read_window(
             wait = tx.one("SELECT * FROM waits WHERE subject=?", (effect.subject,))
             assert wait["started_at"] == 1000.25 and wait["deadline"] == 1600.25
         assert scenario.port.writes() == original_writes
-    # Internal guard consumer assertions supplement the public port story;
-    # these calls allocate no work and never stand in for a runner transition.
-    token = kernel._begin_automatic_step(scenario.execution, effect.subject)
+    # The real selected readback supplied its token before the read window
+    # opened. Internal guard assertions allocate no additional work.
     assert kernel._guard_automatic_step(token, scenario.execution, readback=effect).kind == "waiting"
     assert kernel._guard_automatic_step(token, scenario.execution, after_read=True, readback=effect) is None
     now[0] = 1600.25
@@ -129,7 +133,7 @@ def test_unproven_sent_recovery_never_replays_and_uses_original_read_window(
 
 
 def test_abandon_read_wait_preserves_action_scope_without_bypassing_ordinary_stop(tmp_path: Path) -> None:
-    """Internal token consumer unit: superseded scope, stop and guard semantics.
+    """Core read-request consumer: superseded scope, stop and guard semantics.
 
     The public runner recovery/physical-port integration is exercised above;
     this test deliberately inspects its internal read-wait protocol only.
@@ -137,7 +141,7 @@ def test_abandon_read_wait_preserves_action_scope_without_bypassing_ordinary_sto
     scenario, request = managed_abandon_scenario(tmp_path)
     assert scenario.run().kind == "complete"
     kernel = scenario.kernel
-    before_abandon = kernel._begin_automatic_step(scenario.execution, scenario.delivery.key)
+    before_abandon = kernel.begin_observation(scenario.delivery.key, execution=scenario.execution).fence
     kernel.control("stop", "retain-subject-stop", subject=scenario.delivery.key)
     assert kernel.control_host(request, "abandon", "original-abandon",
         resource_inspections=scenario.port.inspect_resources(kernel.generation_resources())) == "pending"
@@ -145,7 +149,7 @@ def test_abandon_read_wait_preserves_action_scope_without_bypassing_ordinary_sto
         "github_recovery_observation_pending", "Previous business scope").reason == "observation_superseded"
     with kernel.storage.transaction(write=False) as tx:
         assert not tx.rows("SELECT * FROM waits")
-    token = kernel._begin_automatic_step(scenario.execution, scenario.delivery.key)
+    token = kernel.begin_observation(scenario.delivery.key, execution=scenario.execution).fence
     assert kernel.source_status()["abandonment"] == {"action": "original-abandon", "status": "pending"}
     assert kernel.status(scenario.delivery.key)["gates"] == ["operator_stopped"]
     assert read(kernel.storage.path, "status").data["status"] == "abandonment_pending"
@@ -159,7 +163,7 @@ def test_abandon_read_wait_preserves_action_scope_without_bypassing_ordinary_sto
         kernel._wait_for_read(token, replace(scenario.execution, epoch=scenario.execution.epoch + 1),
                              "github_recovery_observation_pending", "Foreign Executor")
     ordinary, _ = managed_abandon_scenario(tmp_path / "ordinary")
-    before_stop = ordinary.kernel._begin_automatic_step(ordinary.execution, ordinary.delivery.key)
+    before_stop = ordinary.kernel.begin_observation(ordinary.delivery.key, execution=ordinary.execution).fence
     ordinary.kernel.control("stop", "ordinary-local-stop", subject=ordinary.delivery.key)
     assert ordinary.kernel._wait_for_read(before_stop, ordinary.execution,
         "github_recovery_observation_pending", "Ordinary Stop").kind == "paused"
@@ -176,7 +180,7 @@ def test_explicit_abandon_continuation_clears_only_its_run_scoped_timeout(tmp_pa
                         resource_inspections=scenario.port.inspect_resources(kernel.generation_resources()))
     now = [1000.25]
     kernel.clock = lambda: now[0]
-    token = kernel._begin_automatic_step(scenario.execution)
+    token = kernel.begin_observation(None, execution=scenario.execution).fence
     assert kernel._wait_for_read(token, scenario.execution, "github_recovery_observation_pending", "Run read").kind == "waiting"
     now[0] = 1600.25
     assert kernel._wait_for_read(token, scenario.execution, "github_recovery_observation_pending", "Run read").reason == "supervision_timeout"
@@ -193,7 +197,7 @@ def test_explicit_abandon_continuation_clears_only_its_run_scoped_timeout(tmp_pa
     assert kernel.observe_host(continuation, HostObservation("running", continuation.unit_name, "continued", "/continued", "boot",
                                                            43, "continued-start", usage_ready=True)) == "running"
     execution = Execution(continuation.run_id, continuation.owner, continuation.epoch)
-    token = kernel._begin_automatic_step(execution)
+    token = kernel.begin_observation(None, execution=execution).fence
     assert kernel._wait_for_read(token, execution, "github_recovery_observation_pending", "Original Run read").retry_at == 1605.25
 
 
