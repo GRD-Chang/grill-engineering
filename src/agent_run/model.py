@@ -435,9 +435,3 @@ class Repository:
 def same_repository(left: object, right: object) -> bool:
     """GitHub owner/name is case-insensitive; retain its display spelling."""
     return isinstance(left, str) and isinstance(right, str) and left.lower() == right.lower()
-
-
-@dataclass(frozen=True)
-class DeliveryGraph:
-    parent: ParentIssue
-    issues: dict[int, Issue]

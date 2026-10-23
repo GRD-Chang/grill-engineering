@@ -10,39 +10,9 @@ from urllib.parse import urlparse
 from agent_run.adapters.auth.runner_transport import runner_options
 from agent_run.adapters.github_commands import run_read_command
 from agent_run.runtime.git_command import git_environment
-from agent_run.model import DeliveryGraph, Repository
+from agent_run.model import Requirements, Repository
 from agent_run.errors import GitHubReadError
 from agent_run.model import Blocker, Issue, ParentIssue
-
-
-class MergeOutcomeUnknownError(RuntimeError):
-    """A merge write may have succeeded, but GitHub has not converged yet."""
-
-
-def _merge_identity_matches(
-    live: dict[str, Any],
-    *,
-    expected_head_sha: str,
-    expected_head_branch: str | None,
-    expected_head_repository: str | None,
-    expected_base_branch: str | None,
-    expected_base_sha: str | None,
-    expected_base_repository: str | None,
-) -> bool:
-    """Check the complete PR identity supplied to a merge authority."""
-
-    expected = {
-        "head_sha": expected_head_sha,
-        "head_branch": expected_head_branch,
-        "head_repository": expected_head_repository,
-        "base_branch": expected_base_branch,
-        "base_sha": expected_base_sha,
-        "base_repository": expected_base_repository,
-    }
-    return all(
-        value is None or live.get(key) == value
-        for key, value in expected.items()
-    )
 
 
 class GhGitHubReader:
@@ -84,60 +54,14 @@ class GhGitHubReader:
         )
         return self._repository
 
-    def delivery_graph(self, parent_number: int) -> DeliveryGraph:
+    def requirements(self, parent_number: int) -> Requirements:
         repository = self.repository()
         owner, name = repository.name_with_owner.split("/", 1)
         parent, ordered_numbers = self._read_parent(owner, name, parent_number)
         issues = {
             number: self._read_issue(owner, name, number) for number in ordered_numbers
         }
-        return DeliveryGraph(parent=parent, issues=issues)
-
-    def live_pull_request(self, pr_number: int) -> dict[str, Any]:
-        repository = self.repository()
-        data = self._gh_json(
-            "pr", "view", str(pr_number), "--repo", repository.name_with_owner,
-            "--json", "state,headRefName,headRefOid,headRepository,baseRefName,baseRefOid,mergeCommit",
-        )
-        merge_commit = data.get("mergeCommit")
-        integrated_sha = (
-            merge_commit.get("oid")
-            if isinstance(merge_commit, dict)
-            else None
-        )
-        result: dict[str, Any] = {
-            "state": _string(data, "state"),
-            "head_branch": _string(data, "headRefName"),
-            "head_sha": _string(data, "headRefOid"),
-            "head_repository": _string(_mapping(data, "headRepository"), "nameWithOwner"),
-            "base_branch": _string(data, "baseRefName"),
-            "base_sha": _string(data, "baseRefOid"),
-            "base_repository": repository.name_with_owner,
-            "integrated_sha": integrated_sha,
-        }
-        head_sha = result["head_sha"]
-        if isinstance(integrated_sha, str) and isinstance(head_sha, str):
-            integrated = self._commit_metadata(repository.name_with_owner, integrated_sha)
-            head = self._commit_metadata(repository.name_with_owner, head_sha)
-            result.update(
-                {
-                    "head_tree": head["tree"],
-                    "integrated_tree": integrated["tree"],
-                    "integrated_parents": integrated["parents"],
-                }
-            )
-        return result
-
-    def _commit_metadata(self, repository: str, sha: str) -> dict[str, Any]:
-        data = self._gh_json("api", f"repos/{repository}/git/commits/{sha}")
-        tree = _mapping(data, "tree")
-        parents = data.get("parents")
-        if not isinstance(parents, list):
-            raise GitHubReadError("github_invalid_response", "commit parents must be an array")
-        return {
-            "tree": _string(tree, "sha"),
-            "parents": [_string(_as_mapping(parent), "sha") for parent in parents],
-        }
+        return Requirements(parent, tuple(issues.values()))
 
     def _read_parent(
         self, owner: str, name: str, parent_number: int

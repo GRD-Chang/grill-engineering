@@ -23,7 +23,6 @@ from agent_run.adapters.github import GhGitHubReader
 from agent_run.adapters.auth.app import GitHubCredentialError, _CancellableHTTPSHandler, _SigningProcessRegistry, _create_app_jwt, mint_installation_credential
 from agent_run.config.github_app import GitHubAppProfile
 from agent_run.adapters.github_commands import MAX_COMMAND_OUTPUT_BYTES, run_read_command
-from agent_run.model import Repository
 
 
 def test_github_reader_retries_transient_timeout(
@@ -111,46 +110,42 @@ def test_github_reader_derives_repository_hint_from_origin(
     assert GhGitHubReader(working_directory=git_repo).repository_hint() == expected
 
 
-def test_github_reader_live_pull_request_returns_integrated_sha(
-    monkeypatch: pytest.MonkeyPatch,
+def test_remote_merge_readback_returns_integrated_sha(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    reader = GhGitHubReader("example/project")
-    monkeypatch.setattr(
-        reader,
-        "repository",
-        lambda: Repository("example/project", "main", "default-sha"),
-    )
-    calls: list[tuple[str, ...]] = []
+    from dataclasses import replace
+    from agent_run.adapters.git_objects import LocalGit
+    from test_kernel_remote_effects import _fixture, _publish_pr
 
-    def fake_json(*arguments: str) -> dict[str, object]:
-        calls.append(arguments)
-        if arguments[:1] == ("api",):
-            sha = arguments[1].rsplit("/", 1)[-1]
-            return {
-                "tree": {"sha": f"{sha}-tree"},
-                "parents": [{"sha": "parent-a"}, {"sha": "parent-b"}],
-            }
-        return {
-            "state": "MERGED",
-            "headRefName": "agent-run-repair/run-1",
-            "headRefOid": "head-sha",
-            "headRepository": {"nameWithOwner": "example/project"},
-            "baseRefName": "agent-run/run-1",
-            "baseRefOid": "integrated-sha",
-            "mergeCommit": {"oid": "integrated-sha"},
-        }
+    port, git, push, _state, calls = _fixture(tmp_path, monkeypatch)
+    source_ref = "refs/heads/agent-run-repair/run-1"
+    target_ref = "refs/heads/agent-run/run-1"
+    git.run("push", "origin", push.base.sha + ":" + source_ref, push.base.sha + ":" + target_ref)
+    push = replace(push, source_ref=source_ref, target_ref=target_ref)
+    _original, pr = _publish_pr(port, push)
+    parents = [push.base.sha, push.after_sha]
+    merge = replace(push, effect_id="merge-readback", operation="merge", pr_number=pr.number,
+                    payload={"method": "merge", "parents": parents, "commit_message": "Reviewed merge"})
+    assert port.execute(merge, lambda: None).disposition == "target"
+    remote = LocalGit(tmp_path / "origin.git")
+    integrated = remote.commit(target_ref)
+    before = len(calls.read_text().splitlines())
 
-    monkeypatch.setattr(reader, "_gh_json", fake_json)
+    readback = port.reconcile(merge)
+    live = readback.pr
 
-    live = reader.live_pull_request(12)
-
-    assert live["integrated_sha"] == "integrated-sha"
-    assert live["head_branch"] == "agent-run-repair/run-1"
-    assert live["head_repository"] == live["base_repository"] == "example/project"
-    assert live["head_tree"] == "head-sha-tree"
-    assert live["integrated_tree"] == "integrated-sha-tree"
-    assert live["integrated_parents"] == ["parent-a", "parent-b"]
-    assert "mergeCommit" in calls[0][-1]
+    assert readback.disposition == "target" and readback.commit.sha == integrated.sha
+    assert live.number == pr.number and live.state == "MERGED"
+    assert live.source_ref.removeprefix("refs/heads/") == "agent-run-repair/run-1"
+    assert live.head_repository == live.repository == "example/project"
+    assert live.head.tree == push.candidate.tree
+    assert live.merged.tree == integrated.tree
+    assert readback.raw["parents"] == parents
+    assert remote.run("rev-list", "--parents", "-n", "1", integrated.sha).stdout.split()[1:] == parents
+    assert live.base.sha == parents[0]
+    observed = [json.loads(line) for line in calls.read_text().splitlines()][before:]
+    assert any(command[:2] == ["api", f"repos/example/project/git/commits/{integrated.sha}"] for command in observed)
+    assert not any("--method" in command or "--input" in command for command in observed)
 
 
 def test_github_reader_retries_transient_http_status(

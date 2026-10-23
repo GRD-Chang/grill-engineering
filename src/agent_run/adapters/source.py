@@ -31,8 +31,7 @@ def read_requirements(reader: GhGitHubReader, parent_number: int) -> Requirement
     if type(parent_number) is not int or parent_number < 1:
         raise ValueError('Parent Issue number must be a positive integer')
     validate_identity_snapshot(reader.runner_identity)
-    graph = reader.delivery_graph(parent_number)
-    return Requirements(graph.parent, tuple(graph.issues.values()))
+    return reader.requirements(parent_number)
 
 
 def read_remote_heads(root: Path, source_ref: str, target_ref: str, *,
