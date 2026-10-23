@@ -73,6 +73,7 @@ def test_original_merge_readback_distinguishes_server_commit_from_partial_local_
         assert scenario.port.remote_commit(effect.target_ref) == before
         assert scenario.port.ref_commit(effect.target_ref) != before
         assert scenario.port.pull_request_by_ref(effect.source_ref, effect.target_ref).state == "OPEN"
+        assert scenario.port.reconcile(effect).disposition == "prior"
         readback = scenario.port.reconcile
 
         def unavailable_readback(original):
