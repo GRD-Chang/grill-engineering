@@ -1,0 +1,124 @@
+"""Review repair inputs retain the active work budget and original CI facts."""
+import json
+from pathlib import Path
+
+from agent_run.core.prompts.role import render_role_prompt
+from agent_run.model import DeliveryKind, Policy, Role, wire_json
+from support.core_operations import CoreOperations, scripted_return
+from support.offline import Scenario, review_result
+from tests.test_kernel_publication_threads import next_call
+
+
+FINDING = 'LATEST_CI_REVIEW_FINDING_7e281: repair the newly reviewed CI behavior.'
+
+
+def budgets(scenario):
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        return {row['purpose']: dict(row) for row in tx.rows(
+            'SELECT * FROM budgets WHERE subject=? AND current=1 ORDER BY purpose', (scenario.delivery.key,))}
+
+
+def test_ci_review_findings_reach_next_development_with_original_ci_and_budget(tmp_path: Path) -> None:
+    scenario = Scenario(tmp_path / 'scenario', DeliveryKind.TICKET,
+                        checks=('fail', 'none'), reviews=('pass', 'fail', 'pass'),
+                        policy=Policy(ticket_ci_review=True, ticket_ci_developments=3))
+    kernel, subject = scenario.kernel, scenario.delivery.key
+    runner = scenario.runner()
+    first_ci = None
+    first_budget = None
+    failed_review = None
+    for _ in range(160):
+        step = runner.run_once()
+        call = step.call
+        if call is None:
+            assert step.kind not in {'paused', 'waiting', 'approval', 'complete'}, step
+            continue
+        if call.role == Role.DEVELOPMENT and call.purpose == 'ci':
+            if first_ci is None:
+                first_ci, first_budget = call, budgets(scenario)
+                assert call.context['repair_source'] == 'required_checks'
+                assert call.context['ci_evidence']['result'] == 'fail'
+                assert call.context['ci_evidence']['logs'] == 'Raw synthetic failed job log'
+                assert 'acceptance_artifact' not in call.context
+                assert 'Raw synthetic failed job log' in render_role_prompt(call)
+            else:
+                assert first_budget is not None and failed_review is not None
+                with kernel.storage.transaction(write=False) as tx:
+                    job = tx.one('SELECT last_failure,ci_failure,review_attempt FROM subjects WHERE id=?', (subject,))
+                    latest = json.loads(tx.get(job['last_failure'], subject))
+                    original = json.loads(tx.get(job['ci_failure'], subject))
+                    assert job['review_attempt'] == failed_review.attempt_id
+                now = budgets(scenario)
+                assert FINDING in json.dumps(latest)
+                assert call.context['ci_evidence'] == original == first_ci.context['ci_evidence']
+                assert now['ci']['window'] == first_budget['ci']['window']
+                assert now['ci']['development_limit'] == first_budget['ci']['development_limit'] == 3
+                assert now['ci']['developments_used'] == first_budget['ci']['developments_used'] + 1 == 2
+                assert now['ci']['reviews_used'] == first_budget['ci']['reviews_used'] + 1 == 1
+                assert {key: value for key, value in now.items() if key != 'ci'} == {
+                    key: value for key, value in first_budget.items() if key != 'ci'}
+                assert call.execution == first_ci.execution == failed_review.execution
+                assert call.thread_id == first_ci.thread_id != failed_review.thread_id
+                assert call.reported_thread == first_ci.reported_thread
+                assert call.attempt_id not in {first_ci.attempt_id, failed_review.attempt_id}
+                assert call.invocation_id != first_ci.invocation_id
+                prompt = render_role_prompt(call)
+                assert FINDING in json.dumps(call.context) and FINDING in prompt
+                assert call.context['acceptance_artifact'] == latest
+                assert call.context['repair_source'] == 'acceptance' and call.context['work_source'] == 'ci'
+                assert 'Raw synthetic failed job log' in prompt
+                return
+        runner.authorize_agent(call)
+        raw = json.loads(scenario.agent(call))
+        if call.role == Role.REVIEW and call.purpose == 'ci':
+            assert raw['checks']['spec']['status'] == 'fail'
+            raw['checks']['spec']['findings'] = [FINDING]
+            raw['checks']['spec']['evidence'] = 'Reviewed the exact CI candidate in its validation checkout.'
+            failed_review = call
+        kernel.receive(call, wire_json(raw))
+    raise AssertionError('No second CI Development in the normal bounded workflow')
+
+
+def test_non_ci_review_failure_keeps_acceptance_input_and_requirement_budget(tmp_path: Path) -> None:
+    scenario = Scenario(tmp_path / 'scenario', DeliveryKind.TICKET, reviews=('fail', 'pass'))
+    kernel = scenario.kernel
+    operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
+    development = next_call(scenario, Role.DEVELOPMENT)
+    before = budgets(scenario)
+    scripted_return(kernel, operations.runner, development, scenario.agent)
+    review = next_call(scenario, Role.REVIEW)
+    scripted_return(kernel, operations.runner, review, scenario.agent)
+    repair = next_call(scenario, Role.DEVELOPMENT)
+    assert repair.purpose == 'requirements' and repair.context['repair_source'] == 'acceptance'
+    assert repair.context['acceptance_artifact'] == review_result('fail')
+    assert 'ci_evidence' not in repair.context
+    prompt = render_role_prompt(repair)
+    assert 'Raw synthetic failed job log' not in prompt
+    for finding in review_result('fail')['checks']['spec']['findings']:
+        assert finding in prompt
+    assert repair.thread_id == development.thread_id != review.thread_id
+    assert repair.attempt_id not in {development.attempt_id, review.attempt_id}
+    after = budgets(scenario)
+    assert after['ci'] == before['ci'] and after['integration'] == before['integration']
+    assert after['requirements']['window'] == before['requirements']['window']
+    assert after['requirements']['development_limit'] == before['requirements']['development_limit']
+    assert after['requirements']['developments_used'] == before['requirements']['developments_used'] + 1 == 2
+    assert after['requirements']['reviews_used'] == before['requirements']['reviews_used'] + 1 == 1
+
+
+def test_passing_ci_review_publishes_without_an_extra_repair_or_new_window(tmp_path: Path) -> None:
+    scenario = Scenario(tmp_path / 'scenario', DeliveryKind.TICKET, checks=('fail', 'none'),
+                        reviews=('pass',), policy=Policy(ticket_ci_review=True, ticket_ci_developments=3))
+    assert scenario.run().kind == 'complete'
+    calls = [call for call in scenario.role_calls if call['purpose'] == 'ci']
+    assert [call['role'] for call in calls] == ['development', 'review', 'publication']
+    assert all(call['repair_source'] == 'required_checks' for call in calls)
+    current = budgets(scenario)
+    assert current['ci']['window'] == 1 and current['ci']['development_limit'] == 3
+    assert current['ci']['developments_used'] == current['ci']['reviews_used'] == 1
+    assert current['requirements']['developments_used'] == current['requirements']['reviews_used'] == 1
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        reviewed = tx.rows("SELECT result_id FROM attempts WHERE subject=? AND purpose='ci' AND role='review'",
+                           (scenario.delivery.key,))
+        assert len(reviewed) == 1
+        assert json.loads(tx.get(reviewed[0]['result_id'], scenario.delivery.key)) == review_result('pass')

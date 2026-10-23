@@ -3644,8 +3644,9 @@ class Kernel:
             tx.execute("UPDATE subjects SET review_attempt=? WHERE id=?", (attempt["id"], subject))
             if outcome == "fail":
                 tx.execute("UPDATE subjects SET last_failure=? WHERE id=?", (attempt["result_id"], subject))
-                source = ("required_checks" if job["purpose"] == Purpose.CI else "integration"
-                          if job["purpose"] == Purpose.INTEGRATION and job["repair_source"] == "integration" else "acceptance")
+                # Review Findings drive repair input; purpose retains the active budget.
+                source = ("integration" if job["purpose"] == Purpose.INTEGRATION
+                          and job["repair_source"] == "integration" else "acceptance")
                 tx.execute("UPDATE subjects SET repair_source=? WHERE id=?", (source, subject))
                 phase = "development"
                 self._release_integration(tx, subject)
