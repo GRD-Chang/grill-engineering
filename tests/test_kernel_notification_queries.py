@@ -2,6 +2,7 @@
 from pathlib import Path
 import io
 import json
+import time
 
 import pytest
 
@@ -11,6 +12,8 @@ from agent_run.user_defaults import UserDefaultsStore
 from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, RunSpec
 from agent_run_kernel.configuration import freeze_creation
 from agent_run_kernel.query_cli import main
+from agent_run_kernel.read_facts import read_boundaries
+from agent_run_kernel.storage import Transaction
 
 
 def _snapshot(root: Path) -> dict[str, bytes]:
@@ -78,7 +81,7 @@ def test_notification_boundary_reader_keeps_ticket_completion_distinct_from_the_
     assert query.read(scenario.kernel.storage.path, "status").data["status"] == "run_acceptance_pending"
     monkeypatch.setattr(query, "read_notifications", lambda *_a, **_kw: pytest.fail("Boundary facts must not read a journal"))
     with scenario.kernel.storage.transaction(write=False) as tx:
-        ticket_only = query.notification_boundaries(tx, scenario.kernel.storage.path)
+        ticket_only = read_boundaries(tx, time.time())
     assert ticket_only["is_terminal"] is False
     assert ticket_only["status"] == "run_acceptance_pending"
     assert ticket_only["closures"] == []
@@ -91,19 +94,26 @@ def test_notification_boundary_reader_keeps_ticket_completion_distinct_from_the_
         raise AssertionError("Actual Ticket Completion did not admit Final")
     scenario.select(final)  # Observer focus only; every operation still uses Core's global selector.
     assert scenario.run().kind == "approval"
-    with scenario.kernel.storage.transaction(write=False) as tx:
-        approval = query.notification_boundaries(tx, scenario.kernel.storage.path)
+    with monkeypatch.context() as lightweight:
+        lightweight.setattr(Transaction, "get", lambda *_a, **_kw: pytest.fail("Approval boundaries must not expand audit material"))
+        with scenario.kernel.storage.transaction(write=False) as tx:
+            approval = read_boundaries(tx, time.time())
     assert approval["is_terminal"] is False and approval["closures"] == []
+    assert approval["actions"][0]["reason"] == "final_approval"
+    assert approval["actions"][0]["subject"] == final
     assert scenario.run(approve=True).kind == "complete"
     before = _snapshot(tmp_path)
     with scenario.kernel.storage.transaction(write=False) as tx:
-        completed = query.notification_boundaries(tx, scenario.kernel.storage.path)
+        completed = read_boundaries(tx, time.time())
         effect = tx.one("SELECT id,receipt_id,pr_number FROM effects WHERE subject=? AND operation='close' AND status='confirmed'", (final,))
         receipt = json.loads(tx.get(effect["receipt_id"], final))
+        closure_receipts = [{**closure, "receipt": json.loads(tx.get(closure["receipt_id"], closure["subject"]))}
+                            for closure in completed["closures"]]
     assert completed["status"] == "completed" and completed["is_terminal"] is True
     assert completed["abandonment"] is None
     assert completed["delivery_cleanup"]["status"] == "completed"
-    assert completed["closures"] == [{"subject": final, "generation": scenario.kernel.status(final)["generation"],
+    assert all("receipt" not in closure for closure in completed["closures"])
+    assert closure_receipts == [{"subject": final, "generation": scenario.kernel.status(final)["generation"],
         "effect_id": effect["id"], "receipt_id": effect["receipt_id"], "receipt": receipt, "pr_number": effect["pr_number"]}]
     assert _snapshot(tmp_path) == before
 
@@ -120,14 +130,14 @@ def test_notification_boundary_reader_returns_the_original_abandon_action_until_
     assert scenario.kernel.control("abandon", "original-abandon", resource_inspections=inspections) == "pending"
     monkeypatch.setattr(query, "read_notifications", lambda *_a, **_kw: pytest.fail("Boundary facts must not read a journal"))
     with scenario.kernel.storage.transaction(write=False) as tx:
-        pending = query.notification_boundaries(tx, scenario.kernel.storage.path)
+        pending = read_boundaries(tx, time.time())
     assert pending["status"] == "abandonment_pending" and pending["is_terminal"] is False
     assert pending["abandonment"] == {"action": "original-abandon", "status": "pending"}
     assert pending["actions"] == [] and pending["closures"] == []
     assert scenario.run().kind == "complete"
     before = _snapshot(tmp_path)
     with scenario.kernel.storage.transaction(write=False) as tx:
-        completed = query.notification_boundaries(tx, scenario.kernel.storage.path)
+        completed = read_boundaries(tx, time.time())
     assert completed["status"] == "abandoned" and completed["is_terminal"] is True
     assert completed["abandonment"] == {"action": "original-abandon", "status": "complete"}
     assert completed["closures"] == []

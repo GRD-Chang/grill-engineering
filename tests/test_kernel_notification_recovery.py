@@ -17,7 +17,7 @@ def test_healthy_observation_recovers_the_original_sender(tmp_path: Path, monkey
     kernel = _kernel(tmp_path)
     delivered = Event()
     sent: list[str] = []
-    original = notifications.notification_boundaries
+    original = notifications.read_boundaries
 
     def unavailable(*_args: Any, **_kwargs: Any) -> Any:
         raise OSError("notification read temporarily unavailable")
@@ -27,12 +27,12 @@ def test_healthy_observation_recovers_the_original_sender(tmp_path: Path, monkey
         delivered.set()
         return {"outcome": "success", "reason": None}
 
-    monkeypatch.setattr(notifications, "notification_boundaries", unavailable)
+    monkeypatch.setattr(notifications, "read_boundaries", unavailable)
     observer = notifications.NativeNotifications(kernel.storage.path, tmp_path, transport=transport)
     try:
         assert observer.failure_reason is not None
         assert sent == []
-        monkeypatch.setattr(notifications, "notification_boundaries", original)
+        monkeypatch.setattr(notifications, "read_boundaries", original)
         if recovery_request == "business":
             observer.observe_committed()
             assert delivered.wait(3)
@@ -156,7 +156,7 @@ def test_claim_commit_tail_failure_is_known_unsent_and_does_not_block_sender(tmp
 def test_inflight_cancel_finishes_before_the_requested_recovery(tmp_path: Path, monkeypatch) -> None:
     kernel = _kernel(tmp_path)
     started, cancelled, release, returned = Event(), Event(), Event(), Event()
-    original = notifications.notification_boundaries
+    original = notifications.read_boundaries
     calls: list[str] = []
 
     def unavailable(*_args: Any, **_kwargs: Any) -> Any:
@@ -182,10 +182,10 @@ def test_inflight_cancel_finishes_before_the_requested_recovery(tmp_path: Path, 
         assert started.wait(3)
         kernel.control("stop", "current-local-gate", subject="native-ticket")
         observer.observe_committed()
-        monkeypatch.setattr(notifications, "notification_boundaries", unavailable)
+        monkeypatch.setattr(notifications, "read_boundaries", unavailable)
         observer.observe_committed()
         assert cancelled.wait(3)
-        monkeypatch.setattr(notifications, "notification_boundaries", original)
+        monkeypatch.setattr(notifications, "read_boundaries", original)
         observer.observe_committed()  # Request, not permission to clear old cancellation.
         assert observer.cancel.is_set() and len(calls) == 1
         release.set()
@@ -199,14 +199,14 @@ def test_inflight_cancel_finishes_before_the_requested_recovery(tmp_path: Path, 
         assert len(calls) == 2
     finally:
         release.set()
-        monkeypatch.setattr(notifications, "notification_boundaries", original)
+        monkeypatch.setattr(notifications, "read_boundaries", original)
         observer.close(drain=False)
 
 
 def test_fatal_close_wins_over_a_late_healthy_recovery_read(tmp_path: Path, monkeypatch) -> None:
     kernel = _kernel(tmp_path)
     entered, release = Event(), Event()
-    original = notifications.notification_boundaries
+    original = notifications.read_boundaries
     calls: list[str] = []
 
     def unavailable(*_args: Any, **_kwargs: Any) -> Any:
@@ -221,11 +221,11 @@ def test_fatal_close_wins_over_a_late_healthy_recovery_read(tmp_path: Path, monk
         calls.append("sent")
         return {"outcome": "success", "reason": None}
 
-    monkeypatch.setattr(notifications, "notification_boundaries", unavailable)
+    monkeypatch.setattr(notifications, "read_boundaries", unavailable)
     observer = notifications.NativeNotifications(kernel.storage.path, tmp_path, transport=transport)
     try:
         assert observer.failure_reason is not None
-        monkeypatch.setattr(notifications, "notification_boundaries", healthy_but_delayed)
+        monkeypatch.setattr(notifications, "read_boundaries", healthy_but_delayed)
         observer.observe_committed()
         assert entered.wait(3)
         observer.close(drain=False)

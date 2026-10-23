@@ -27,7 +27,7 @@ from agent_run.process_binding import _process_start_token
 from .execution_facts import execution_facts
 from .event_projection import event_state, project_event, resume_facts
 from .notification_progress import obsolete_progress
-from .query import notification_boundaries
+from .read_facts import material, read_boundaries
 from .storage import Storage, Transaction
 
 
@@ -107,7 +107,7 @@ class NativeNotifications:
     def _gate_slot(subject: str | None, generation: int | None, reason: str) -> str:
         return hashlib.sha256(json.dumps([subject, generation, reason]).encode()).hexdigest()
 
-    def _terminal_event(self, view: dict[str, Any]) -> dict[str, Any] | None:
+    def _terminal_event(self, tx: Transaction, view: dict[str, Any]) -> dict[str, Any] | None:
         """Describe a committed lifecycle result, without granting completion."""
         if not view["is_terminal"]:
             return None
@@ -122,7 +122,7 @@ class NativeNotifications:
         if view["status"] != "completed":
             return None
         closures = view["closures"]
-        if len(closures) != 1 or closures[0]["receipt"].get("disposition") != "target":
+        if len(closures) != 1 or material(tx, closures[0]["receipt_id"], closures[0]["subject"]).get("disposition") != "target":
             raise ValueError("completed notification has no unique original close receipt")
         closed = closures[0]
         number = closed["pr_number"]
@@ -169,8 +169,8 @@ class NativeNotifications:
         with self.storage.transaction(write=False) as tx:
             if not self._same_binding(*self._run(tx)):
                 raise ValueError("notification Run or recipient binding changed")
-            view = notification_boundaries(tx, self.database)
-            terminal = self._terminal_event(view)
+            view = read_boundaries(tx, time.time())
+            terminal = self._terminal_event(tx, view)
             if terminal is not None and view["status"] == "completed":
                 closure = view["closures"][0]
                 original = tx.one("SELECT * FROM history WHERE kind='effect_consumed' AND identity=? AND material_id=?",
@@ -450,7 +450,7 @@ class NativeNotifications:
                         with self.storage.transaction(write=False) as tx:
                             if not self._same_binding(*self._run(tx)):
                                 raise ValueError("notification Run or recipient binding changed")
-                            self._compress_progress(tx, document, notification_boundaries(tx, self.database), added=True)
+                            self._compress_progress(tx, document, read_boundaries(tx, time.time()), added=True)
                 with self.condition:
                     self.condition.notify_all()
                 self._more = more

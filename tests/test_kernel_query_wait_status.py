@@ -1,6 +1,7 @@
 """Public waiting status follows the recorded wait, without running Core."""
 from dataclasses import replace
 import json
+import time
 
 import pytest
 
@@ -9,6 +10,7 @@ from agent_run_kernel import query
 from support.offline import Scenario
 from agent_run_kernel.operation_runner import OperationRunner, ReadUnavailable
 from agent_run_kernel.query_cli import main
+from agent_run_kernel.read_facts import read_boundaries
 from tests.test_kernel_query_cli import _snapshot
 
 
@@ -87,5 +89,5 @@ def test_public_checks_status_reads_the_original_committed_wait(
         assert recorded['timed_out'] is False
         assert document['operator_actions'] == []
     with scenario.kernel.storage.transaction(write=False) as tx:
-        assert query.notification_boundaries(tx, scenario.kernel.storage.path)['status'] == status
+        assert read_boundaries(tx, time.time())['status'] == status
     assert _snapshot(tmp_path) == before

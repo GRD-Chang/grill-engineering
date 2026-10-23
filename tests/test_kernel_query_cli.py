@@ -479,7 +479,9 @@ def test_machine_data_is_independent_of_run_language_and_history_details(
     assert json.loads(capsys.readouterr().out) == ordinary
 
 
-def test_history_keeps_raw_feedback_and_pages_without_losing_events(tmp_path: Path, capsys) -> None:
+def test_history_keeps_raw_feedback_and_pages_without_losing_events(tmp_path: Path, capsys, monkeypatch) -> None:
+    from agent_run_kernel.storage import Transaction
+
     kernel = _create(tmp_path)
     _human(kernel)
     kernel.control("resume", "original-response", subject="ticket:2", message="保持原文\r\nDo exactly this.\n")
@@ -494,10 +496,23 @@ def test_history_keeps_raw_feedback_and_pages_without_losing_events(tmp_path: Pa
     assert document.data["resume_audit"][0]["action_id"] == "original-response"
     assert document.data["agent_resumes"][0]["started_at"] is None
     assert document.data["summary"]["rounds"]["ticket_development"] == 1
+    reads: set[str] = set()
+    original_get = Transaction.get
+
+    def recorded_get(tx, identity, subject):
+        reads.add(identity)
+        return original_get(tx, identity, subject)
+
+    monkeypatch.setattr(Transaction, "get", recorded_get)
+    query.read(kernel.storage.path, "status")
+    assert response["material_id"] not in reads
     observed: list[int] = []
     after = 0
     for _ in range(20):
+        reads.clear()
         page = query.read(kernel.storage.path, "history", after=after, limit=2).data
+        assert (response["material_id"] in reads) == any(
+            event["position"] == response["position"] for event in page["timeline"])
         observed.extend(event["position"] for event in page["timeline"])
         after = page["history_page"]["next_after"]
         if not page["history_page"]["has_more"]:
