@@ -11,7 +11,7 @@ import sqlite3
 import pytest
 
 from agent_run_kernel import Checks, Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, RunSpec, World
-from agent_run_kernel.offline import Scenario, review_result
+from support.offline import Scenario, review_result
 from agent_run_kernel.model import wire_json
 from support.core_operations import CoreOperations, native_agent_fixture, scripted_return
 from support.effect_boundary import EffectBoundary, effect_boundary
@@ -297,7 +297,7 @@ def test_explicit_final_publication_reuse_requires_lazy_current_authority(tmp_pa
 
 @pytest.mark.parametrize("operation", ["validation_cleanup", "cleanup_worktree", "cleanup_local_ref"])
 def test_original_absent_local_cleanup_requires_lazy_authority(tmp_path: Path, monkeypatch, operation: str) -> None:
-    from agent_run_kernel.offline import GraphScenario
+    from support.offline import GraphScenario
     from test_kernel_requirements import independent_source
 
     scenario = GraphScenario(tmp_path / "scenario", independent_source())

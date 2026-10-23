@@ -7,7 +7,7 @@ import pytest
 from agent_run_kernel import Kernel, KernelError, Requirements
 from agent_run_kernel.effects import LocalGit
 from agent_run_kernel.model import Role
-from agent_run_kernel.offline import GraphScenario
+from support.offline import GraphScenario
 from test_kernel_requirements import native_input
 from test_kernel_remote_effects import EffectBoundary, effect_boundary
 from support.core_operations import CoreOperations, scripted_return

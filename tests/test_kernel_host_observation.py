@@ -5,7 +5,7 @@ import pytest
 
 from agent_run_kernel import DeliveryKind, EffectResult, KernelError, Policy
 from agent_run_kernel.model import Execution, HostObservation, Issue, ObservationSuperseded, ParentIssue, Requirements
-from agent_run_kernel.offline import GraphScenario, Scenario
+from support.offline import GraphScenario, Scenario
 from agent_run_kernel.query import read
 from agent_run_kernel.operation_runner import ReadUnavailable
 

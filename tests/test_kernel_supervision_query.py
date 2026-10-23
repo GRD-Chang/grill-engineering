@@ -6,7 +6,7 @@ import pytest
 
 from agent_run_kernel import DeliveryKind, Kernel, Issue, ParentIssue, Requirements
 from agent_run_kernel import query
-from agent_run_kernel.offline import GraphScenario, Scenario
+from support.offline import GraphScenario, Scenario
 from agent_run_kernel.operation_runner import ReadUnavailable
 from support.core_operations import CoreOperations
 from agent_run_kernel.query_render import render

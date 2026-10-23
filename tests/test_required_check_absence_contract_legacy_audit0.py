@@ -147,7 +147,7 @@ from pathlib import Path
 from dataclasses import replace, asdict
 from agent_run.github import GhGitHubReader
 from agent_run_kernel import Issue, ParentIssue, Requirements, Kernel
-from agent_run_kernel.offline import GraphScenario
+from support.offline import GraphScenario
 from agent_run_kernel.source_reading import read_required_check_facts, normalize_required_checks
 from agent_run_kernel.query_cli import main
 req = json.load(sys.stdin)

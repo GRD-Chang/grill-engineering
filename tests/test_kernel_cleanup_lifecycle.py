@@ -17,7 +17,7 @@ from typing import Callable
 import pytest
 
 from agent_run_kernel import DeliveryKind, Effect, EffectResult, Kernel
-from agent_run_kernel.offline import GraphScenario, OfflinePort, Scenario
+from support.offline import GraphScenario, OfflinePort, Scenario
 from test_kernel_requirements import independent_source
 from support.core_operations import CoreOperations, final_scenario
 

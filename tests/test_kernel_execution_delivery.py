@@ -9,7 +9,7 @@ import pytest
 
 from agent_run_kernel import DeliveryKind
 from agent_run_kernel.execution import execute
-from agent_run_kernel.offline import Scenario
+from support.offline import Scenario
 from support.core_operations import CoreOperations, final_scenario
 
 

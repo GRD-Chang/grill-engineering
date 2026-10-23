@@ -13,7 +13,7 @@ from agent_run.user_defaults import UserDefaultsStore
 from agent_run_kernel import DeliveryKind, Kernel, RunSpec
 from agent_run_kernel.configuration import freeze_creation
 from agent_run_kernel.notifications import NativeNotifications
-from agent_run_kernel.offline import GraphScenario, Scenario
+from support.offline import GraphScenario, Scenario
 from test_kernel_requirements import independent_source
 
 

@@ -1,5 +1,5 @@
 """A queued integration waiter cannot starve its owner's original readback."""
-from agent_run_kernel.offline import GraphScenario
+from support.offline import GraphScenario
 from test_kernel_requirements import independent_source
 
 

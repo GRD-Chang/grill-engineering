@@ -10,7 +10,7 @@ from agent_run.user_defaults import UserDefaultsStore
 from agent_run_kernel import DeliveryKind, Kernel, KernelError
 from agent_run_kernel.configuration import freeze_creation
 from agent_run_kernel.model import Effect, EffectResult
-from agent_run_kernel.offline import Scenario
+from support.offline import Scenario
 from test_kernel_remote_effects import EffectBoundary, effect_boundary
 
 

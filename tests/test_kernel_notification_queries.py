@@ -72,7 +72,7 @@ def test_notification_boundary_reader_keeps_ticket_completion_distinct_from_the_
     tmp_path: Path, monkeypatch,
 ) -> None:
     from agent_run_kernel import Issue, ParentIssue, Requirements
-    from agent_run_kernel.offline import GraphScenario
+    from support.offline import GraphScenario
     from agent_run_kernel import query
 
     scenario = GraphScenario(tmp_path / "delivery", Requirements(
@@ -117,7 +117,7 @@ def test_notification_boundary_reader_returns_the_original_abandon_action_until_
 ) -> None:
     from agent_run_kernel import query
     from agent_run_kernel.local_effects import LocalEffects
-    from agent_run_kernel.offline import Scenario
+    from support.offline import Scenario
 
     scenario = Scenario(tmp_path / "abandon", DeliveryKind.PARENT_ONLY)
     inspections = LocalEffects(scenario.port.git).inspect_resources(scenario.kernel.generation_resources())

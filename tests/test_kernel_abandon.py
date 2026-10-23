@@ -8,7 +8,7 @@ import pytest
 
 from agent_run_kernel import KernelError
 from agent_run_kernel.model import DeliveryKind, Execution, HostLaunch, HostObservation, ResourceInspection
-from agent_run_kernel.offline import GraphScenario, Scenario
+from support.offline import GraphScenario, Scenario
 from test_kernel_requirements import independent_source
 from support.core_operations import CoreOperations, scripted_return
 

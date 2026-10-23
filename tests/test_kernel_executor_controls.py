@@ -9,7 +9,7 @@ from agent_run_kernel import Policy
 from agent_run_kernel.executor import _make_ports
 from support.core_operations import CoreOperations
 from agent_run_kernel.model import Execution, HostObservation
-from agent_run_kernel.offline import GraphScenario
+from support.offline import GraphScenario
 from test_kernel_remote_effects import _fixture
 from test_kernel_requirements import independent_source
 

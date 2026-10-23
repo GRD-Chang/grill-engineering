@@ -6,7 +6,7 @@ import sys
 
 from agent_run_kernel import Delivery, DeliveryKind, Kernel, RunSpec
 from agent_run_kernel.model import ParentIssue, Requirements
-from agent_run_kernel.offline import Scenario, fixture_inputs
+from support.offline import Scenario, fixture_inputs
 from test_kernel_remote_effects import _fixture
 
 

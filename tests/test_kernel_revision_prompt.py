@@ -8,7 +8,7 @@ from agent_run.user_defaults import UserDefaultsStore
 from agent_run_kernel import AgentCall, Issue, Kernel, ParentIssue, Policy, Requirements
 from agent_run_kernel.configuration import freeze_creation
 from agent_run_kernel.model import Execution, HostObservation
-from agent_run_kernel.offline import GraphScenario
+from support.offline import GraphScenario
 from agent_run_kernel.role_prompt import render_role_prompt
 from support.core_operations import CoreOperations, scripted_return
 

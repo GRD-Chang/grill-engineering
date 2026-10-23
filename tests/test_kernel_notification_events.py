@@ -9,7 +9,7 @@ import pytest
 from agent_run_kernel import AgentCall, DeliveryKind, Issue, Kernel, ParentIssue, Requirements, Role, Step
 from agent_run_kernel.model import wire_json
 from agent_run_kernel.notification_events import events
-from agent_run_kernel.offline import GraphScenario, Scenario
+from support.offline import GraphScenario, Scenario
 
 
 def _project(kernel: Kernel, mode: str) -> list[dict[str, Any]]:

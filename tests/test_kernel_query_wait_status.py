@@ -6,7 +6,7 @@ import pytest
 
 from agent_run_kernel import Checks, DeliveryKind, Kernel
 from agent_run_kernel import query
-from agent_run_kernel.offline import Scenario
+from support.offline import Scenario
 from agent_run_kernel.operation_runner import OperationRunner, ReadUnavailable
 from agent_run_kernel.query_cli import main
 from tests.test_kernel_query_cli import _snapshot

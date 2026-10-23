@@ -11,7 +11,7 @@ from agent_run_kernel import Role
 from agent_run_kernel.artifact_contract import role_schema
 from agent_run_kernel.codex_execution import _CodexCapture
 from agent_run_kernel.model import ParentIssue, Requirements, wire_json
-from agent_run_kernel.offline import GraphScenario, review_result
+from support.offline import GraphScenario, review_result
 
 
 def publication(body="Recorded validation and user impact."):

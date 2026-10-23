@@ -9,7 +9,7 @@ import pytest
 from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, Policy, Requirements, RunSpec
 from agent_run_kernel.model import Checks, Issue, ParentIssue
 from agent_run_kernel.model import KernelError
-from agent_run_kernel.offline import GraphScenario
+from support.offline import GraphScenario
 from agent_run_kernel.operation_runner import DeliveryFacts
 from agent_run_kernel.operation_runner import ReadUnavailable
 from agent_run_kernel.query import read

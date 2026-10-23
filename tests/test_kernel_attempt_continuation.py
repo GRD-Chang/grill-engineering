@@ -11,7 +11,7 @@ from agent_run_kernel.attempt_continuation import (
 )
 from agent_run_kernel.model import wire_json
 from agent_run_kernel.model import Issue, ParentIssue, Requirements
-from agent_run_kernel.offline import GraphScenario, fixture_inputs
+from support.offline import GraphScenario, fixture_inputs
 from support.core_operations import CoreOperations, ReadOnlyPorts
 from agent_run_kernel.operation_runner import DeliveryFacts
 from agent_run_kernel.storage import PROTOCOL

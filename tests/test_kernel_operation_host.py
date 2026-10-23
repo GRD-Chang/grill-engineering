@@ -8,7 +8,7 @@ import pytest
 from agent_run_kernel import executor
 from agent_run_kernel.execution import ProcessExitUnknown
 from agent_run_kernel.model import AgentCall, Execution, Profile, Purpose, Role, Step
-from agent_run_kernel.offline import fixture_inputs
+from support.offline import fixture_inputs
 from agent_run_kernel.operation_runner import OperationBinding, OperationState
 
 

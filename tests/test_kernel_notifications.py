@@ -19,7 +19,7 @@ from agent_run.user_defaults import UserDefaultsStore
 from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, Issue, ParentIssue, Requirements, RunSpec, World
 from agent_run_kernel.configuration import freeze_creation
 from agent_run_kernel.notifications import NativeNotifications
-from agent_run_kernel.offline import OfflinePort, Scenario
+from support.offline import OfflinePort, Scenario
 from agent_run_kernel.operation_runner import DeliveryFacts
 from support.core_operations import CoreOperations, ReadOnlyPorts
 

@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 
 from agent_run_kernel import DeliveryKind
-from agent_run_kernel.offline import Scenario
+from support.offline import Scenario
 
 
 def test_standalone_final_repair_reopen_approval_and_close_preserve_the_original_story(tmp_path: Path) -> None:

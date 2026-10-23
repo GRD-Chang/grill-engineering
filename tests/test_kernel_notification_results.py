@@ -6,7 +6,7 @@ import pytest
 from support.core_operations import CoreOperations, scripted_return
 from agent_run_kernel import Issue, ParentIssue, Requirements
 from agent_run_kernel.model import wire_json
-from agent_run_kernel.offline import GraphScenario
+from support.offline import GraphScenario
 from test_kernel_notification_events import _project, _recorded_agents
 
 

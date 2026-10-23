@@ -14,7 +14,7 @@ from agent_run_kernel.operation_runner import ReadUnavailable
 from agent_run_kernel.execution import execute
 from agent_run_kernel.executor import _make_ports
 from support.core_operations import CoreOperations
-from agent_run_kernel.offline import GraphScenario
+from support.offline import GraphScenario
 from agent_run_kernel.remote_effects import RemoteEffects
 from agent_run_kernel.source_reading import read_requirements
 from test_kernel_remote_effects import _fixture

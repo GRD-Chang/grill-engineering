@@ -9,7 +9,7 @@ from agent_run_kernel import Issue, ParentIssue, Requirements, Role
 from agent_run_kernel.model import KernelError, wire_json
 from agent_run.notification_event_facts import event_envelope
 from agent_run_kernel.notification_progress import obsolete_progress
-from agent_run_kernel.offline import GraphScenario
+from support.offline import GraphScenario
 from test_kernel_notification_events import _project, _recorded_agents
 
 

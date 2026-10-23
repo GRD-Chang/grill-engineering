@@ -7,7 +7,7 @@ import pytest
 
 from agent_run_kernel import DeliveryKind, KernelError, Policy
 from agent_run_kernel.model import Execution, HostObservation
-from agent_run_kernel.offline import GraphScenario, Scenario
+from support.offline import GraphScenario, Scenario
 from agent_run_kernel.model import Issue, ParentIssue, Requirements
 from support.core_operations import CoreOperations
 

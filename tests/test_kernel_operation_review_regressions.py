@@ -20,7 +20,7 @@ import pytest
 
 from agent_run_kernel import DeliveryKind, Effect, EffectResult, Requirements
 from agent_run_kernel.model import Issue, ParentIssue
-from agent_run_kernel.offline import GraphScenario, LostResponse, Scenario
+from support.offline import GraphScenario, LostResponse, Scenario
 from agent_run_kernel.operation_runner import ReadUnavailable
 from agent_run_kernel.query import read
 from agent_run_kernel.remote_effects import RemoteEffects

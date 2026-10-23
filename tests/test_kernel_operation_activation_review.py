@@ -9,7 +9,7 @@ import pytest
 from agent_run_kernel.model import EffectResult, Execution, HostObservation
 from agent_run_kernel import DeliveryKind, Policy
 from agent_run_kernel import executor
-from agent_run_kernel.offline import GraphScenario, Scenario
+from support.offline import GraphScenario, Scenario
 from agent_run_kernel.operation_runner import ReadUnavailable
 from test_kernel_requirements import independent_source
 from test_kernel_operation_review_host import _NoNotifications

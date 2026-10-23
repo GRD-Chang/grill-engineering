@@ -11,7 +11,7 @@ import pytest
 
 from agent_run_kernel import DeliveryKind, KernelError, executor
 from agent_run_kernel.model import Execution, HostObservation
-from agent_run_kernel.offline import Scenario
+from support.offline import Scenario
 
 
 class _NoNotifications:

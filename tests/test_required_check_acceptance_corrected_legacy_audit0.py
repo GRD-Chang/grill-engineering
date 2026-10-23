@@ -57,7 +57,7 @@ print(json.dumps({'before': before, 'after': after, 'probes': probes,
 '''
 
 NATIVE_TRANSITIONS = NATIVE_PREFIX + r'''
-from agent_run_kernel.offline import _physical_read
+from support.offline import _physical_read
 later_payload = payload.pop('_later')
 
 def snapshot():
@@ -299,7 +299,7 @@ base_make = s.make_ports''').replace(
     'if facts.pr is not None and facts.pr.state == "OPEN":',
 ).replace('expected_head_sha=request.check_head',
           'expected_head_sha=request.check_head or facts.source.sha') + r'''
-from agent_run_kernel.offline import _physical_read
+from support.offline import _physical_read
 after_approval = payload.pop('_after_approval', None)
 
 def boundary():
@@ -435,7 +435,7 @@ NATIVE_AGGREGATION_ACCEPTANCE = NATIVE_PREFIX.replace(
     'observations.append(asdict(checks))',
     'observations.append(asdict(checks))\n            captured_readers.append((reader, pr.number, request.check_head))',
 ) + r'''
-from agent_run_kernel.offline import _physical_read
+from support.offline import _physical_read
 from agent_run.github import GitHubReadError
 captured_readers = []
 for _ in range(80):

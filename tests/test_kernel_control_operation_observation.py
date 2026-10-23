@@ -10,7 +10,7 @@ from agent_run.user_defaults import UserDefaultsStore
 from agent_run_kernel import Kernel, KernelError
 from agent_run_kernel import lifecycle_cli
 from agent_run_kernel.model import DeliveryKind, Execution, ObservationSuperseded
-from agent_run_kernel.offline import Scenario
+from support.offline import Scenario
 from agent_run_kernel.operation_runner import ReadUnavailable
 from agent_run_kernel.query_cli import _parser
 from agent_run_kernel.remote_effects import RemoteEffects

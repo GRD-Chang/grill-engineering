@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from agent_run_kernel import Issue, Kernel, KernelError, ParentIssue, Requirements
-from agent_run_kernel.offline import GraphScenario
+from support.offline import GraphScenario
 from agent_run_kernel.operation_runner import ReadUnavailable
 from support.core_operations import CoreOperations, scripted_return
 

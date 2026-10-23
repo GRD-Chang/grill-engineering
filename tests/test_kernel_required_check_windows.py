@@ -4,7 +4,7 @@ from dataclasses import replace
 import pytest
 
 from agent_run_kernel import Checks, DeliveryKind, Kernel
-from agent_run_kernel.offline import Scenario
+from support.offline import Scenario
 from agent_run_kernel.operation_runner import ReadUnavailable
 
 

@@ -10,7 +10,7 @@ import pytest
 
 from agent_run_kernel import DeliveryKind, Policy, executor
 from agent_run_kernel.model import EffectResult, Execution, HostObservation
-from agent_run_kernel.offline import GraphScenario, Scenario
+from support.offline import GraphScenario, Scenario
 from test_kernel_requirements import independent_source
 
 

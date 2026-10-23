@@ -15,7 +15,7 @@ from agent_run_kernel.operation_runner import DeliveryFacts, DeliveryRead, Opera
 
 
 if TYPE_CHECKING:
-    from agent_run_kernel.offline import GraphScenario
+    from support.offline import GraphScenario
 
 
 def scripted_return(kernel: Kernel, runner: OperationRunner, call: AgentCall,
@@ -66,7 +66,7 @@ def native_agent_fixture(path: Path, spec: RunSpec) -> tuple[Kernel, ReadOnlyPor
     real Completion target required by native Ticket creation; it cannot run
     that delivery or authorize physical effects through ReadOnlyPorts.
     """
-    from agent_run_kernel.offline import fixture_inputs
+    from support.offline import fixture_inputs
 
     assert not any(item.kind == DeliveryKind.FINAL_RUN for item in spec.deliveries)
     first = spec.deliveries[0]
@@ -94,7 +94,7 @@ def final_scenario(root: Path, *, policy: Policy | None = None,
     The preparatory Ticket uses successful fixture Agents/checks. Only after
     Core admits Final do the requested Final Agent/check scripts start.
     """
-    from agent_run_kernel.offline import GraphScenario
+    from support.offline import GraphScenario
 
     source = Requirements(ParentIssue(1, 'Parent', 'Deliver the original behavior.', (2,)), (
         Issue(2, 'Ticket', 'Implement the original behavior.', 'OPEN', frozenset({'ready-for-agent'})),

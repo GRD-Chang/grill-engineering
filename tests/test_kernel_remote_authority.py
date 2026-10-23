@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from agent_run_kernel import DeliveryKind, Effect, Kernel
-from agent_run_kernel.offline import LostResponse, Scenario
+from support.offline import LostResponse, Scenario
 from test_kernel_remote_effects import EffectBoundary, effect_boundary
 
 

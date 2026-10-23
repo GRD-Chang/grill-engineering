@@ -14,7 +14,7 @@ import pytest
 from agent_run_kernel import AgentCall, Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, Profile, RunSpec
 from agent_run_kernel.codex_execution import execute_codex
 from agent_run_kernel.execution import ProcessExit
-from agent_run_kernel.offline import fixture_inputs, review_result
+from support.offline import fixture_inputs, review_result
 from agent_run.agent_profiles import resolve_profiles
 from support.core_operations import CoreOperations, ReadOnlyPorts, final_scenario, native_agent_fixture
 

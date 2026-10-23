@@ -7,7 +7,7 @@ import pytest
 
 from agent_run_kernel import Issue, ParentIssue, Requirements
 from agent_run_kernel.effects import LocalGit
-from agent_run_kernel.offline import GraphScenario
+from support.offline import GraphScenario
 from test_kernel_workspace_allocation import workspace_intent
 from test_kernel_remote_effects import EffectBoundary, effect_boundary
 from support.core_operations import CoreOperations

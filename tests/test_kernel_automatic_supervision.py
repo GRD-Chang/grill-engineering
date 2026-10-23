@@ -6,7 +6,7 @@ import pytest
 
 from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, RunSpec
 from agent_run_kernel.model import Issue, ParentIssue, ReadWait, Requirements
-from agent_run_kernel.offline import GraphScenario, Scenario, fixture_inputs
+from support.offline import GraphScenario, Scenario, fixture_inputs
 from agent_run_kernel.operation_runner import DeliveryFacts, ReadUnavailable
 from agent_run_kernel.query import read
 from support.core_operations import CoreOperations, ReadOnlyPorts, scripted_return

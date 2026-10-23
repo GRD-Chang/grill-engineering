@@ -321,7 +321,7 @@ def test_optional_issue_link_keeps_exact_successful_graphql_acknowledgement(tmp_
 def test_real_issue_ack_stays_optional_and_once_across_kernel_reopen(tmp_path, monkeypatch, mode):
     from agent_run_kernel import Kernel
     from agent_run_kernel.model import Issue, ParentIssue, Requirements
-    from agent_run_kernel.offline import GraphScenario
+    from support.offline import GraphScenario
     from test_kernel_operation_runner import Ports, settle_agent
     _port, _git, _push, state, calls = _fixture(tmp_path, monkeypatch)
     _change(state, actor="offline-publisher", lose_operation="issue_link" if mode == "ack-lost" else None,
@@ -504,7 +504,7 @@ def test_observe_rejects_a_real_old_source_read_when_new_requirements_commit_fir
 
 def test_final_observation_proves_real_current_completions_into_remote_run_before_activation(tmp_path, monkeypatch):
     from agent_run_kernel.model import Issue, ParentIssue, Requirements
-    from agent_run_kernel.offline import GraphScenario
+    from support.offline import GraphScenario
     _port, _git, _push, state, calls = _fixture(tmp_path, monkeypatch)
     source = Requirements(ParentIssue(1, "Parent", "Whole requirement", (2,)),
                           (Issue(2, "Ticket", "Whole ticket", "OPEN", frozenset({"ready-for-agent"})),))

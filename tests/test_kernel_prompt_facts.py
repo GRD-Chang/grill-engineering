@@ -8,7 +8,7 @@ import pytest
 from support.core_operations import CoreOperations, scripted_return, final_scenario
 from agent_run_kernel import AgentCall, DeliveryKind, Policy, Role, Step
 from agent_run_kernel.model import wire_json
-from agent_run_kernel.offline import Scenario, review_result
+from support.offline import Scenario, review_result
 
 
 def next_call(scenario: Scenario, role: Role) -> AgentCall:

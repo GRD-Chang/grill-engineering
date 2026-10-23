@@ -17,7 +17,7 @@ from agent_run_kernel.execution import execute
 from agent_run_kernel.model import Requirements
 from support.core_operations import CoreOperations, ReadOnlyPorts, native_agent_fixture
 from agent_run_kernel.operation_runner import DeliveryFacts
-from agent_run_kernel.offline import fixture_inputs
+from support.offline import fixture_inputs
 from agent_run.process_cleanup import child_subreaper
 
 

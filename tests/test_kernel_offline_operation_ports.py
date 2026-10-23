@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from agent_run_kernel import DeliveryKind, Effect, KernelError
-from agent_run_kernel.offline import Scenario
+from support.offline import Scenario
 from agent_run_kernel.operation_runner import DeliveryRead, OperationBinding, OperationPorts, ReadUnavailable
 
 

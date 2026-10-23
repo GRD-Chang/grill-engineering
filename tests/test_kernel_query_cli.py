@@ -15,7 +15,7 @@ from agent_run.agent_profiles import resolve_profiles
 from agent_run_kernel import Blocker, Commit, Delivery, DeliveryKind, Issue, Kernel, ParentIssue, Policy, Profile, Requirements, RunSpec
 from agent_run_kernel import query
 from agent_run_kernel.query_cli import main
-from agent_run_kernel.offline import Scenario, fixture_inputs
+from support.offline import Scenario, fixture_inputs
 from agent_run_kernel.operation_runner import DeliveryFacts, OperationRunner
 from support.core_operations import CoreOperations, ReadOnlyPorts
 
@@ -564,7 +564,7 @@ def test_public_delivery_boundaries_match_observed_02_meanings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: DeliveryKind, completed_phase: str,
 ) -> None:
     from agent_run_kernel import Issue, ParentIssue, Requirements
-    from agent_run_kernel.offline import GraphScenario
+    from support.offline import GraphScenario
 
     # The former isolated Scenario had no original workspace ownership effect;
     # its three cleanup-pending failures remain in the 742c evidence. Use actual

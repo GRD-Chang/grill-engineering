@@ -8,7 +8,7 @@ from agent_run.prompt_resources import RESOURCE_KEYS
 from agent_run.user_defaults import UserDefaultsStore
 from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, Policy, RunSpec, Issue, ParentIssue, Requirements
 from agent_run_kernel.configuration import freeze_creation
-from agent_run_kernel.offline import Scenario
+from support.offline import Scenario
 from agent_run_kernel.query import read
 from agent_run_kernel.query_cli import main
 from agent_run_kernel.operation_runner import DeliveryFacts

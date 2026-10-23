@@ -2,7 +2,7 @@
 import pytest
 
 from agent_run_kernel import executor
-from agent_run_kernel.offline import GraphScenario
+from support.offline import GraphScenario
 from test_kernel_host_observation import admit_scenario
 from test_kernel_operation_runner import Ports
 from test_kernel_requirements import independent_source

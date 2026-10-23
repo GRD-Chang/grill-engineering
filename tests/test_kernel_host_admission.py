@@ -13,7 +13,7 @@ import pytest
 from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, ParentIssue, Requirements, RunSpec
 from agent_run_kernel.model import Execution, HostObservation
 from support.core_operations import CoreOperations, ReadOnlyPorts, native_agent_fixture
-from agent_run_kernel.offline import GraphScenario, Scenario
+from support.offline import GraphScenario, Scenario
 from agent_run_kernel.storage import Transaction
 
 

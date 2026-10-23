@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, RunSpec
-from agent_run_kernel.offline import Scenario
+from support.offline import Scenario
 from support.core_operations import CoreOperations, native_agent_fixture, final_scenario
 
 

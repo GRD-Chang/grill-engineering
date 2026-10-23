@@ -9,7 +9,7 @@ import pytest
 
 from agent_run_kernel import Kernel, KernelError
 from agent_run_kernel.model import Blocker, Issue, ParentIssue, Requirements
-from agent_run_kernel.offline import GraphScenario
+from support.offline import GraphScenario
 from agent_run_kernel.operation_runner import ReadUnavailable
 from support.core_operations import CoreOperations
 

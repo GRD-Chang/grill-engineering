@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, KernelError, Policy, Requirements, RunSpec, World
-from agent_run_kernel.offline import GraphScenario
+from support.offline import GraphScenario
 from agent_run_kernel.model import Effect, Execution, HostObservation
 from support.core_operations import CoreOperations, scripted_return
 
