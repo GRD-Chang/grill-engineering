@@ -189,3 +189,57 @@ def test_large_configured_scalar_values_keep_validation() -> None:
     snapshot["invocation_deadlines"]["review"] = 10**400
     with pytest.raises(DeliveryPolicyError):
         resolve_delivery_policy(user_defaults=snapshot)
+
+
+def test_sparse_sources_convert_only_winning_values_without_mutating_inputs() -> None:
+    class SupersededDuration(float):
+        def __float__(self) -> float:
+            raise AssertionError("An overridden duration must not be converted")
+
+    defaults = {
+        "ticket_review_rounds": None,
+        "development_thread_policy": "invalid",
+        "invocation_deadlines": {"review": SupersededDuration(10), "publication": "2m"},
+    }
+    overrides = {
+        "ticket_review_round": 4,
+        "development_thread_policy": "reuse",
+        "ticket_ci_review": False,
+        "integration_resync_limit": 0,
+        "review_deadline": "1.5s",
+    }
+    policy = resolve_delivery_policy(user_defaults=defaults, command_overrides=overrides)
+    assert policy.ticket_rounds == 4 and policy.new_thread_per_development is False
+    assert policy.ticket_ci_review is False and policy.resync_limit == 0
+    assert policy.invocation_deadlines == {"development": 18000.0, "review": 1.5, "publication": 120.0}
+    assert defaults["ticket_review_rounds"] is None
+    assert defaults["development_thread_policy"] == "invalid"
+    assert isinstance(defaults["invocation_deadlines"]["review"], SupersededDuration)
+    assert defaults["invocation_deadlines"]["publication"] == "2m"
+    assert overrides["review_deadline"] == "1.5s" and "invocation_deadlines" not in overrides
+
+
+@pytest.mark.parametrize("defaults, message", [
+    ({"unexpected": 1}, "unknown Delivery Policy option"),
+    ({"invocation_deadlines": {"other": "1s"}}, "unknown Delivery Policy deadline role"),
+    ({"ticket_review_round": 2, "ticket_review_rounds": 3}, "is duplicated"),
+    ({"review_deadline": "1s", "invocation_deadlines": {"review": "2s"}}, "is duplicated"),
+], ids=["unknown-option", "unknown-role", "option-alias-conflict", "deadline-alias-conflict"])
+def test_overrides_do_not_hide_invalid_source_structure(defaults, message) -> None:
+    with pytest.raises(DeliveryPolicyError, match=message):
+        resolve_delivery_policy(user_defaults=defaults, command_overrides={
+            "ticket_review_rounds": 4, "review_deadline": "3s",
+        })
+
+
+def test_sparse_null_overrides_preserve_explicit_false_zero_and_deadlines() -> None:
+    policy = resolve_delivery_policy(user_defaults={
+        "ticket_ci_review": False, "integration_resync_limit": 0,
+        "invocation_deadlines": {"review": "7s"},
+    }, command_overrides={"ticket_ci_review": None, "integration_resync_limit": None,
+                          "invocation_deadlines": {"review": None}})
+    assert policy.ticket_ci_review is False and policy.resync_limit == 0
+    assert policy.review_deadline_seconds == 7
+    with pytest.raises(DeliveryPolicyError):
+        resolve_delivery_policy(user_defaults={"ticket_review_rounds": None},
+                                command_overrides={"ticket_review_rounds": None})

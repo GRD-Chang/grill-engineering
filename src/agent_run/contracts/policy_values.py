@@ -16,21 +16,6 @@ if TYPE_CHECKING:
     from agent_run.model import Policy
 
 
-_POLICY_KEYS = frozenset(
-    {
-        "ticket_development_workers",
-        "parent_only_paired_rounds",
-        "run_repair_rounds",
-        "ticket_review_rounds",
-        "integration_resync_limit",
-        "ticket_integration_development_limit",
-        "ticket_ci_development_limit",
-        "ticket_ci_review",
-        "parent_ci_development_limit",
-        "development_thread_policy",
-        "invocation_deadlines",
-    }
-)
 _DEADLINE_KEYS = frozenset({"development", "review", "publication"})
 _DEADLINE_FIELDS = ("development", "review", "publication")
 _DURATION_PATTERN = re.compile(
@@ -53,22 +38,24 @@ def resolve_delivery_policy(
 
     from agent_run.model import Policy
 
+    sources: tuple[tuple[Mapping[str, Any] | None, bool], ...]
     if isinstance(user_defaults, Policy):
-        overrides = normalize_policy_overrides(
-            {} if command_overrides is None else command_overrides, ignore_none=True,
-        )
-        return replace(user_defaults, **_policy_changes(overrides))
-    values = default_delivery_policy().snapshot()
-    values["invocation_deadlines"] = dict(values["invocation_deadlines"])
-    for source, raw, ignore_none in (
-        ("user defaults", user_defaults, False),
-        ("command overrides", command_overrides, True),
-    ):
+        base = user_defaults
+        sources = ((command_overrides, True),)
+    else:
+        base = default_delivery_policy()
+        sources = ((user_defaults, False), (command_overrides, True))
+    values: dict[str, Any] = {}
+    deadlines: dict[str, Any] = {}
+    for raw, ignore_none in sources:
         if raw is None:
             continue
         normalized = normalize_policy_overrides(raw, ignore_none=ignore_none)
-        _merge_policy_values(values, normalized, source)
-    return _policy_from_values(values)
+        deadlines.update(normalized.pop("invocation_deadlines", {}))
+        values.update(normalized)
+    # Preserve source precedence before converting any values, including durations.
+    values["invocation_deadlines"] = deadlines
+    return replace(base, **_policy_changes(values))
 
 
 def normalize_policy_overrides(
@@ -153,53 +140,8 @@ def normalize_policy_overrides(
     return normalized
 
 
-def _merge_policy_values(
-    target: dict[str, Any], source: Mapping[str, Any], source_name: str
-) -> None:
-    if set(source) - _POLICY_KEYS:
-        raise DeliveryPolicyError(error_message('policy.error.unknown_fields', audit=f"{source_name} contains unknown policy fields", source_name=source_name))
-    for key, value in source.items():
-        if key == "invocation_deadlines":
-            if not isinstance(value, Mapping):
-                raise DeliveryPolicyError(error_message('policy.error.deadlines_object', audit=f"{source_name} deadlines must be an object", source_name=source_name))
-            target["invocation_deadlines"].update(value)
-        else:
-            target[key] = value
-
-
-def _policy_from_values(values: Mapping[str, Any]) -> Policy:
-    deadlines = values.get("invocation_deadlines")
-    if not isinstance(deadlines, Mapping):
-        raise DeliveryPolicyError(error_message('policy.error.invocation_object', audit="invocation_deadlines must be an object"))
-    if set(deadlines) - _DEADLINE_KEYS:
-        raise DeliveryPolicyError(error_message('policy.error.invocation_role', audit="invocation_deadlines contains an unknown role"))
-    required = _DEADLINE_KEYS - set(deadlines)
-    if required:
-        raise DeliveryPolicyError(
-            "invocation_deadlines is missing: " + ", ".join(sorted(required))
-        )
-    return _policy_with_deadlines(values, deadlines)
-
-
-def _policy_with_deadlines(
-    values: Mapping[str, Any], deadlines: Mapping[str, Any],
-) -> Policy:
-    """Construct after the caller has checked its required deadline fields."""
-    from agent_run.model import Policy
-
-    new_thread = _new_thread_per_development(values.get("development_thread_policy", "reuse"))
-    native_values: dict[str, Any] = {field: values.get(key) for key, field in POLICY_VALUE_FIELDS.items()}
-    return Policy(
-        **native_values,
-        new_thread_per_development=new_thread,
-        development_deadline_seconds=_positive_duration(deadlines["development"], "development deadline"),
-        review_deadline_seconds=_positive_duration(deadlines["review"], "review deadline"),
-        publication_deadline_seconds=_positive_duration(deadlines["publication"], "publication deadline"),
-    )
-
-
 def _policy_changes(values: Mapping[str, Any]) -> dict[str, Any]:
-    """Convert only explicit, normalized options for an existing frozen owner."""
+    """Convert explicit, normalized options to native Policy fields."""
     changes = {field: values[key] for key, field in POLICY_VALUE_FIELDS.items() if key in values}
     if "development_thread_policy" in values:
         changes["new_thread_per_development"] = _new_thread_per_development(values["development_thread_policy"])
