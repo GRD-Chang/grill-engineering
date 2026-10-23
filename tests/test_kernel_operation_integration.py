@@ -1,4 +1,5 @@
 """Actual Core operation runner through Host; Agent and GitHub are synthetic."""
+from agent_run_kernel.operation_runner import OperationRunner
 import pytest
 
 from agent_run_kernel import executor
@@ -64,7 +65,7 @@ def test_host_real_core_original_merge_readback_final_approval_and_cleanup(tmp_p
     final = scenario.kernel.source_status()["final_subject"]
     assert final is not None and scenario.kernel.status(final)["phase"] == "approval"
     assert len(scenario.kernel.source_status()["completions"]) == 2
-    runner = scenario.kernel.operation_runner(scenario.execution, lambda binding: ports)
+    runner = OperationRunner(scenario.kernel, scenario.execution, lambda binding: ports)
     scenario.kernel.control("approve", "approve-final", subject=final, world=runner.observe(final))
     assert executor.run(scenario.kernel, scenario.execution, {}) == 0
     with scenario.kernel.storage.transaction(write=False) as tx:
@@ -136,7 +137,7 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
     ports = Ports(scenario)
     now = [100.25]
     scenario.kernel.clock = lambda: now[0]
-    runner = scenario.kernel.operation_runner(scenario.execution, lambda binding: ports)
+    runner = OperationRunner(scenario.kernel, scenario.execution, lambda binding: ports)
     for _ in range(80):
         if scenario.kernel.status("ticket:3")["phase"] == "checks":
             break
@@ -218,7 +219,7 @@ def test_real_core_future_failure_and_raw_cannot_release_unknown_process(tmp_pat
         executor.run(scenario.kernel, scenario.execution, {})
     assert len(selected) == 1
     call = selected[0]
-    runner = scenario.kernel.operation_runner(scenario.execution, lambda binding: ports)
+    runner = OperationRunner(scenario.kernel, scenario.execution, lambda binding: ports)
     assert not runner.worker_settled(call)
     assert scenario.kernel.status(call.subject)["pending_return"]
     assert call.lease_id in runner.state().active

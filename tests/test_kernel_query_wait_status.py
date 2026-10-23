@@ -71,8 +71,8 @@ def test_public_checks_status_reads_the_original_committed_wait(
         raise AssertionError('A read-only query attempted Core observation or advancement')
 
     monkeypatch.setattr(Kernel, '__init__', forbidden)
-    monkeypatch.setattr(Kernel, 'operation_runner', forbidden)
-    monkeypatch.setattr(Kernel, 'observe_control', forbidden)
+    monkeypatch.setattr(Kernel, 'begin_observation', forbidden)
+    monkeypatch.setattr(Kernel, 'accept_requirements', forbidden)
     for method in ('__init__', 'run_once', 'observe', 'state'):
         monkeypatch.setattr(OperationRunner, method, forbidden)
     # Reading beyond the deadline cannot manufacture Core's timeout gate.

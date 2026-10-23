@@ -1,4 +1,5 @@
 """A nonzero physical write remains audited when exact readback succeeds."""
+from agent_run_kernel.operation_runner import OperationRunner
 import json
 from pathlib import Path
 import shutil
@@ -31,7 +32,7 @@ def test_actual_nonzero_push_is_audited_once_despite_target_readback(tmp_path, m
         language="en", repository_root=str(git.root), inputs=fixture_inputs())
     kernel = Kernel.create(tmp_path / "kernel.sqlite3", spec, requirements=source)
     execution = kernel.claim_executor("physical-owner")
-    runner = kernel.operation_runner(execution, lambda binding: port)
+    runner = OperationRunner(kernel, execution, lambda binding: port)
     agents = Scenario(tmp_path / "agents", DeliveryKind.PARENT_ONLY)
     agents.kernel, agents.port.git = kernel, git
     for _ in range(60):

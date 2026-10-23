@@ -5,6 +5,7 @@ Its scripts control external outcomes, never internal kernel transitions.
 """
 
 from __future__ import annotations
+from agent_run_kernel.operation_runner import observe_control
 
 from dataclasses import asdict, replace
 import json
@@ -510,13 +511,13 @@ class Scenario:
         return self.port.writes()[getattr(self, "observation_start", 0):]
 
     def world(self) -> World:
-        return self.kernel.observe_control(self.delivery.key, self.make_ports)
+        return observe_control(self.kernel, self.delivery.key, self.make_ports)
 
     def make_ports(self, binding: OperationBinding) -> OperationPorts:
         return _ScenarioPorts(self, binding)
 
     def runner(self) -> OperationRunner:
-        return self.kernel.operation_runner(self.execution, self.make_ports)
+        return OperationRunner(self.kernel, self.execution, self.make_ports)
 
     def agent(self, call: AgentCall) -> bytes:
         delivery = self.kernel.delivery(call.subject)

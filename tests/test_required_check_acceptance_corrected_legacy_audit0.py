@@ -300,6 +300,7 @@ base_make = s.make_ports''').replace(
 ).replace('expected_head_sha=request.check_head',
           'expected_head_sha=request.check_head or facts.source.sha') + r'''
 from support.offline import _physical_read
+from agent_run_kernel.operation_runner import observe_control
 after_approval = payload.pop('_after_approval', None)
 
 def boundary():
@@ -318,7 +319,7 @@ initial_status = s.kernel.status(s.delivery.key)
 grant_before_external_change = None
 if after_approval is not None:
     assert initial_status['phase'] == 'approval'
-    approval_world = s.kernel.observe_control(s.delivery.key, s.make_ports)
+    approval_world = observe_control(s.kernel, s.delivery.key, s.make_ports)
     with s.kernel.storage.transaction(write=False) as tx:
         original_checks = tx.one('SELECT checks_id FROM subjects WHERE id=?', (s.delivery.key,))[0]
         original_material = tx.one('SELECT material_id FROM checks WHERE id=?', (original_checks,))[0]

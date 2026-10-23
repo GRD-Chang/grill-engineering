@@ -1,4 +1,5 @@
 """Real pending starts its checks window; later uncertainty preserves it."""
+from agent_run_kernel.operation_runner import OperationRunner
 from dataclasses import replace
 
 import pytest
@@ -81,7 +82,7 @@ def test_checks_keep_the_first_absolute_window_across_observation_and_restart(
     assert kernel.status(subject)["pending_attempt"] is None
     reopened = Kernel(kernel.storage.path)
     reopened.clock = lambda: now[0]
-    runner = reopened.operation_runner(scenario.execution, selected)
+    runner = OperationRunner(reopened, scenario.execution, selected)
     if expected_window[1] > 700.25:
         now[0] = 700.25
         step = runner.run_once()

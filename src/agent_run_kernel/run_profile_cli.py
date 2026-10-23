@@ -29,7 +29,7 @@ def add_parser(commands: Any, language: str) -> None:
 
 
 def execute(parsed: argparse.Namespace) -> int:
-    from .query_cli import _candidates, _select
+    from .cli_selection import _candidates, _select
 
     selection = argparse.Namespace(**vars(parsed))
     selection.parent = None

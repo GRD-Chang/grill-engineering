@@ -21,7 +21,8 @@ from .host_adapter import SystemdHost
 from .execution import ProcessExitUnknown
 from .kernel import Kernel
 from .model import AgentCall, Execution, KernelError, Step
-from .operation_runner import OperationBinding, OperationRunner
+from .operation_contract import OperationBinding
+from .operation_runner import OperationRunner
 from .native_host import managed_host_environment
 from .remote_effects import RemoteEffects
 from .role_prompt import render_role_prompt
@@ -79,7 +80,7 @@ def _make_ports(binding: OperationBinding) -> RemoteEffects:
 def run(kernel: Kernel, execution: Execution, environment: Mapping[str, str]) -> int:
     """Supervise physical calls and one bounded Core operation independently."""
     from .notifications import NativeNotifications
-    runner: OperationRunner = kernel.operation_runner(execution, _make_ports)
+    runner: OperationRunner = OperationRunner(kernel, execution, _make_ports)
     runner.activate_observation()
     driver = _Executor(kernel, runner, environment)
     state = runner.state()

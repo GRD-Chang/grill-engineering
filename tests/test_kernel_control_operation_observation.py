@@ -1,4 +1,5 @@
 """Manual managed controls share Core observation without an Executor claim."""
+from agent_run_kernel.operation_runner import OperationRunner, observe_control
 from dataclasses import replace
 import json
 import os
@@ -29,7 +30,7 @@ def test_control_observation_never_claims_executor_or_allocates_work(tmp_path, m
         owner = tuple(tx.one("SELECT executor,epoch FROM runs"))
         counts = tuple(tx.one("SELECT (SELECT count(*) FROM attempts),(SELECT count(*) FROM leases)"))
     monkeypatch.setattr(kernel, "claim_executor", lambda *a, **kw: pytest.fail("observation must not claim"))
-    world = kernel.observe_control("ticket:3", lambda binding: ports)
+    world = observe_control(kernel, "ticket:3", lambda binding: ports)
     assert world.target == ports.scenario.port.remote_commit("refs/heads/run")
     after = kernel.status("ticket:3")
     assert after["phase"] == before["phase"] == "workspace"
@@ -60,7 +61,7 @@ def test_control_observation_rejects_changes_during_physical_reads(tmp_path, cha
 
     ports.delivery = changed
     with pytest.raises(ObservationSuperseded, match="automatic_step_superseded"):
-        kernel.observe_control("ticket:3", lambda binding: ports)
+        observe_control(kernel, "ticket:3", lambda binding: ports)
 
 
 def test_control_read_failure_is_a_cli_error_without_a_work_wait_or_claim(tmp_path):
@@ -71,7 +72,7 @@ def test_control_read_failure_is_a_cli_error_without_a_work_wait_or_claim(tmp_pa
 
     ports.source = unavailable
     with pytest.raises(KernelError, match="github_read_failed"):
-        scenario.kernel.observe_control("ticket:3", lambda binding: ports)
+        observe_control(scenario.kernel, "ticket:3", lambda binding: ports)
     with scenario.kernel.storage.transaction(write=False) as tx:
         assert not tx.rows("SELECT id FROM attempts")
         assert not tx.rows("SELECT id FROM leases")
@@ -109,7 +110,7 @@ def managed_approval(tmp_path, monkeypatch, *, tickets):
     assert kernel.observe_host(request, replace(observed, usage_ready=True)) == "running"
     execution = Execution(request.run_id, request.owner, request.epoch)
     physical = RemoteEffects(Path(spec.repository_root), spec.repository, runner_identity=spec.inputs.runner_identity)
-    runner = kernel.operation_runner(execution, lambda binding: physical)
+    runner = OperationRunner(kernel, execution, lambda binding: physical)
     # This existing fake Agent only makes files/raw bytes. All source, Git, PR,
     # Completion and operation decisions above/below remain production paths.
     agents = Scenario(tmp_path / "agents", DeliveryKind.PARENT_ONLY)

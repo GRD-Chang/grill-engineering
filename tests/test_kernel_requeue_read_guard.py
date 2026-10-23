@@ -1,4 +1,5 @@
 """Pending requeue reads retain their Action, deadline and write boundaries."""
+from agent_run_kernel.operation_runner import observe_control
 from dataclasses import replace
 from pathlib import Path
 
@@ -29,7 +30,7 @@ def pending_requeue(tmp_path: Path) -> tuple[GraphScenario, CoreOperations]:
     scenario.requirements = replace(source, issues=tuple(
         replace(issue, body="Clarified original requirement") if issue.number == 2 else issue
         for issue in source.issues))
-    world = kernel.observe_control("ticket:2", scenario.make_ports)
+    world = observe_control(kernel, "ticket:2", scenario.make_ports)
     assert kernel.source_status()["blocked"] == "requeue_required"
     original = kernel.delivery("ticket:2")
     replacement = replace(original, source_ref=original.source_ref + "-g2", base=world.target,
@@ -112,7 +113,7 @@ def test_requeue_read_permission_never_opens_other_work(tmp_path: Path, blocked:
             parent=replace(scenario.requirements.parent, sub_issue_numbers=(2, 3, 4)),
             issues=(*scenario.requirements.issues,
                     Issue(4, "New scope", "Another delivery", "OPEN", frozenset({"ready-for-agent"}))))
-        kernel.observe_control("ticket:2", scenario.make_ports)
+        observe_control(kernel, "ticket:2", scenario.make_ports)
         assert kernel.source_status()["blocked"] == "unsupported_scope_change"
     subject = "ticket:3" if blocked == "sibling" else "ticket:2"
     token = kernel._begin_automatic_step(execution, subject, cleanup=blocked == "cleanup")
@@ -140,7 +141,7 @@ def test_requeue_read_is_bound_to_the_same_action_after_external_io(
             scenario.requirements = replace(scenario.requirements, issues=tuple(
                 replace(issue, body="Another clarification during the read") if issue.number == 2 else issue
                 for issue in scenario.requirements.issues))
-            world = kernel.observe_control("ticket:2", scenario.make_ports)
+            world = observe_control(kernel, "ticket:2", scenario.make_ports)
             # Core itself supersedes the stale Action before a new public
             # requeue is accepted. Neither operation may retire the original PR.
             ended = scenario.runner().run_once(agent_capacity=0)

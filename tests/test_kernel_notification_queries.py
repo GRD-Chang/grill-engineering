@@ -147,8 +147,8 @@ def test_public_notification_query_keeps_pending_retry_and_delivery_facts_withou
         raise AssertionError("A notification query attempted sending, locking or repair")
 
     from agent_run_kernel.operation_runner import OperationRunner
-    monkeypatch.setattr(Kernel, "operation_runner", forbidden)
-    monkeypatch.setattr(Kernel, "observe_control", forbidden)
+    monkeypatch.setattr(Kernel, "begin_observation", forbidden)
+    monkeypatch.setattr(Kernel, "accept_requirements", forbidden)
     for method in ("__init__", "run_once", "observe", "authorize_agent", "worker_settled", "state"):
         monkeypatch.setattr(OperationRunner, method, forbidden)
     monkeypatch.setattr(outbox, "transaction", forbidden)

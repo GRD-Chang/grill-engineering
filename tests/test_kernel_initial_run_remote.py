@@ -1,4 +1,5 @@
 """Actual source observation feeds the original first Run-ref empty CAS."""
+from agent_run_kernel.operation_runner import observe_control
 from pathlib import Path
 from dataclasses import replace
 import json
@@ -90,7 +91,7 @@ def test_existing_pr_with_missing_remote_target_remains_an_inconsistent_observat
     git.run("push", "origin", ":" + run_ref)
     before = len(calls.read_text().splitlines())
     with pytest.raises(KernelError) as error:
-        kernel.observe_control("parent:1", lambda binding: port)
+        observe_control(kernel, "parent:1", lambda binding: port)
     assert error.value.code == "github_observation_pending"
     observations = [json.loads(line) for line in calls.read_text().splitlines()][before:]
     assert not any("--method" in call for call in observations)

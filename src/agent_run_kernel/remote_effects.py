@@ -36,7 +36,7 @@ from .source_reading import (read_remote_heads, read_requirements, read_required
 from .storage import MATERIAL_LIMIT
 
 if TYPE_CHECKING:
-    from .operation_runner import DeliveryFacts, DeliveryRead
+    from .operation_contract import DeliveryFacts, DeliveryRead
 
 
 class EffectReadError(GitHubReadError):
@@ -56,7 +56,7 @@ def _operation_errors(method: Callable[_Arguments, _Result]) -> Callable[_Argume
     """Translate physical transport failures at the Core port boundary only."""
     @wraps(method)
     def invoke(*args: _Arguments.args, **kwargs: _Arguments.kwargs) -> _Result:
-        from .operation_runner import ReadUnavailable
+        from .operation_contract import ReadUnavailable
         try:
             return method(*args, **kwargs)
         except GitHubReadError as error:
@@ -564,7 +564,7 @@ class RemoteEffects:
     @_operation_errors
     def delivery(self, request: DeliveryRead) -> DeliveryFacts:
         """Read exact Core-supplied refs and immutable ancestry anchors."""
-        from .operation_runner import DeliveryFacts
+        from .operation_contract import DeliveryFacts
         source_sha, target_sha = read_remote_heads(self.root, request.source_ref, request.target_ref,
                                                   runner_identity=self.identity, remote=self.remote)
         source = None if source_sha is None else self._commit(source_sha)[0]

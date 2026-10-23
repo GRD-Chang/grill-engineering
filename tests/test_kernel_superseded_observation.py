@@ -1,4 +1,5 @@
 """Only a proved obsolete source operation may yield to the Core runner."""
+from agent_run_kernel.operation_runner import OperationRunner
 from dataclasses import replace
 from threading import Event, Thread, current_thread
 
@@ -55,7 +56,7 @@ def test_executor_discards_a_source_read_superseded_during_real_external_io(tmp_
     try:
         assert reached.wait(10), "real source read reached the barrier"
         _change(state, source_body="New authoritative requirement")
-        current_runner = kernel.operation_runner(runner.execution, lambda binding: port)
+        current_runner = OperationRunner(kernel, runner.execution, lambda binding: port)
         current_runner.observe("parent:1")
         current = kernel.source_status()
     finally:

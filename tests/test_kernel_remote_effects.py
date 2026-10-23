@@ -1,4 +1,5 @@
 """Remote effects through real bare Git and an isolated stateful gh executable."""
+from agent_run_kernel.operation_runner import OperationRunner
 from dataclasses import replace
 import json
 import os
@@ -341,7 +342,7 @@ def test_real_issue_ack_stays_optional_and_once_across_kernel_reopen(tmp_path, m
         return selected.execute(effect, authorize)
     monkeypatch.setattr(ports, "execute", execute)
     def finish_ticket():
-        runner = scenario.kernel.operation_runner(scenario.execution, lambda binding: ports)
+        runner = OperationRunner(scenario.kernel, scenario.execution, lambda binding: ports)
         for _ in range(100):
             status = scenario.kernel.status("ticket:2")
             if status["phase"] == "complete" and status["resource_cleanup"]["state"] == "complete":
@@ -444,7 +445,7 @@ def test_observe_uses_real_requirements_remote_commits_and_required_ci_facts(tmp
     previous_calls = len(calls.read_text().splitlines())
     monkeypatch.setattr(kernel, "source_status", lambda: pytest.fail("must use this refresh receipt, never latest global status"))
     execution = kernel.claim_executor("source-observer")
-    runner = kernel.operation_runner(execution, lambda binding: port)
+    runner = OperationRunner(kernel, execution, lambda binding: port)
     world = runner.observe("parent:1")
     assert world.parent_revision == receipt["observed_parent_revision"] and world.graph_revision == receipt["observed_graph_revision"]
     assert world.revision == world.parent_revision and world.completion_revision == "no-tickets"
@@ -472,7 +473,7 @@ def test_observe_rejects_a_real_old_source_read_when_new_requirements_commit_fir
     kernel = _source_kernel(tmp_path, port, push)
     before = kernel.source_status()
     execution = kernel.claim_executor("source-observer")
-    runner = kernel.operation_runner(execution, lambda binding: port)
+    runner = OperationRunner(kernel, execution, lambda binding: port)
     reached, release = Event(), Event()
     failures = []
     def delayed(reader, parent):
@@ -510,7 +511,7 @@ def test_final_observation_proves_real_current_completions_into_remote_run_befor
                           (Issue(2, "Ticket", "Whole ticket", "OPEN", frozenset({"ready-for-agent"})),))
     scenario = GraphScenario(tmp_path / "graph", source)
     from test_kernel_operation_runner import Ports, settle_agent
-    runner = scenario.kernel.operation_runner(scenario.execution, lambda binding: Ports(scenario))
+    runner = OperationRunner(scenario.kernel, scenario.execution, lambda binding: Ports(scenario))
     for _ in range(100):
         step = runner.run_once()
         if step.call is not None:
@@ -547,7 +548,7 @@ def test_final_observation_proves_real_current_completions_into_remote_run_befor
     selected = RemoteEffects(scenario.port.git.root, "example/project", runner_identity={"source": "host"}, remote="offline-remote")
     role_calls = list(scenario.role_calls)
     before_calls = len(calls.read_text().splitlines()) if calls.exists() else 0
-    runner = scenario.kernel.operation_runner(scenario.execution, lambda binding: selected)
+    runner = OperationRunner(scenario.kernel, scenario.execution, lambda binding: selected)
     world = runner.observe(None)
     assert world.source == latest and world.target == default
     assert (completed[0]["merge_sha"], latest.sha) in world.ancestry

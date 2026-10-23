@@ -10,189 +10,43 @@ No Receipt, persisted cursor, or alternative current Run crosses this seam.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
 from threading import RLock
-from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Protocol
+from typing import TYPE_CHECKING, Callable
 from dataclasses import asdict
 import json
 
 from agent_run.error_safety import bounded_error
 
 
-from .model import (AgentCall, Checks, Commit, CreationInputs, Effect, EffectResult,
-                    Execution, KernelError, PullRequest, ReadWait, Requirements, ResourceInspection,
-                    ResourceWitness, Step, World, wire_json)
+from .model import AgentCall, Effect, EffectResult, Execution, KernelError, ReadWait, Step, World, wire_json
+from .operation_contract import (OperationBinding, OperationPorts, OperationState, ReadUnavailable,
+                                 ReadFence, RequirementsRead, DeliveryRead, DeliveryFacts)
+from .kernel import _ApprovalRead, _ObservationPass, _SentRead
 
 if TYPE_CHECKING:
     from .kernel import Kernel
 
 
-class ReadUnavailable(RuntimeError):
-    """Port read failure; optional fields are an actual write response only."""
-    def __init__(self, code: str, message: str, *, write_returncode: int | None = None,
-                 write_diagnostic: str = "") -> None:
-        super().__init__(message)
-        self.code, self.message = code, message
-        self.write_returncode, self.write_diagnostic = write_returncode, write_diagnostic
+def _read_observation(kernel: Kernel, ports: OperationPorts, request: RequirementsRead) -> tuple[World, ReadFence]:
+    source = ports.source(request.parent_number)
+    delivery = kernel.accept_requirements(request, source)
+    facts = ports.delivery(delivery.query)
+    return kernel.accept_delivery(delivery, facts)
 
 
-@dataclass(frozen=True)
-class OperationBinding:
-    repository_root: Path
-    repository: str
-    parent_number: int
-    inputs: CreationInputs
-    hidden_paths: tuple[Path, ...] = ()
-    hidden_environment: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class DeliveryRead:
-    source_ref: str
-    target_ref: str
-    pr_number: int | None
-    anchors: tuple[str, ...]
-    check_head: str | None = None
-    read_pr: bool = True
-
-
-@dataclass(frozen=True)
-class DeliveryFacts:
-    target: Commit | None
-    source: Commit | None
-    pr: PullRequest | None = None
-    checks: Checks | None = None
-    ancestry: tuple[tuple[str, str], ...] = ()
-    publisher_actor: str | None = None
-    publisher_identity: Mapping[str, Any] | None = None
-
-
-@dataclass(frozen=True)
-class OperationState:
-    concurrency: int
-    active: tuple[str, ...]  # Durable lease identities, never Future completion.
-    cancel: tuple[str, ...]  # The same lease identity space as active.
-    wake_at: float | None  # Absolute time in Kernel.clock's domain.
-    disposition: Literal["ready", "waiting", "quiescent", "complete"]
-
-
-@dataclass(frozen=True)
-class _SentRead:
-    effect_id: str
-    dispatch_serial: int
-    subject: str
-    generation: int
-
-
-@dataclass(frozen=True)
-class _ApprovalRead:
-    subject: str
-    generation: int
-    boundary: tuple[str | int | None, ...]
-
-
-@dataclass
-class _ObservationPass:
-    execution: Execution
-    action_id: str
-    pending: list[_SentRead | _ApprovalRead]
-    lock: RLock = field(default_factory=RLock, repr=False)
-
-    def complete(self, member: _SentRead | _ApprovalRead) -> None:
-        with self.lock:
-            if member in self.pending:
-                self.pending.remove(member)
-
-    def defer(self, member: _SentRead | _ApprovalRead) -> None:
-        with self.lock:
-            if member in self.pending:
-                self.pending.remove(member)
-                self.pending.append(member)
-
-
-class OperationPorts(Protocol):
-    """Physical reads/writes only; no Core SQL, refresh or World construction."""
-
-    def source(self, parent_number: int) -> Requirements: ...
-    def delivery(self, request: DeliveryRead) -> DeliveryFacts: ...
-    def inspect(self, resources: tuple[ResourceWitness, ...]) -> tuple[ResourceInspection, ...]: ...
-    def execute(self, effect: Effect, authorize: Callable[[], None]) -> EffectResult: ...
-    def reconcile(self, effect: Effect) -> EffectResult: ...
-    def prepare_publication(self, effect: Effect) -> Mapping[str, Any]: ...
-    def prepare_retirement(self, effect: Effect) -> Mapping[str, Any]: ...
-
-
-def observe_operation(kernel: Kernel, binding: OperationBinding, ports: OperationPorts,
-                      subject: str | None, *, execution: Execution | None = None,
-                      cleanup: bool = False) -> tuple[World, str]:
-    """One fact assembly for automatic work and manual controls.
-
-    Manual observation owns no Executor or lease. It still rejects a source,
-    delivery or Executor epoch changed while physical reads were in flight.
-    """
-    if execution is None:
-        with kernel.storage.transaction(write=False) as tx:
-            token = kernel._operation_token(tx, subject, cleanup)
-    else:
-        token = kernel._begin_automatic_step(execution, subject, cleanup=cleanup)
-        waiting = kernel._guard_automatic_step(token, execution)
-        if waiting is not None:
-            raise ReadWait(waiting)
-    source = ports.source(binding.parent_number)
-    if execution is not None:
-        waiting = kernel._finish_operation_read(token, execution)
-        if waiting is not None:
-            raise ReadWait(waiting)
-    with kernel.storage.transaction() as tx:
-        kernel._check_operation(tx, token, execution)
-        kernel._refresh(tx, source)
-        token = kernel._operation_token(tx, subject, cleanup)
-        run = tx.one("SELECT * FROM runs")
-        if subject is None:
-            job = tx.one("SELECT * FROM final_target")
-            records = tx.all("SELECT c.* FROM completions c JOIN subjects s ON s.id=c.subject AND s.generation=c.generation WHERE s.phase='complete' ORDER BY s.issue")
-            anchors = {row["merge_sha"] for row in records}
-        else:
-            job = kernel._job(tx, subject)
-            anchors = {job[key] for key in ("base_sha", "source_sha", "candidate_sha", "integrated_sha") if job[key] is not None}
-            for row in tx.rows("SELECT source_sha,target_sha FROM integration_snapshots WHERE subject=? ORDER BY window DESC LIMIT 1", (subject,)):
-                anchors.update(value for value in row if value is not None)
-            if job["review_attempt"] is not None:
-                review = tx.one("SELECT context_id FROM attempts WHERE id=?", (job["review_attempt"],))
-                context = json.loads(tx.get(review[0], subject))
-                if "review_context" in context:
-                    anchors.add(context["review_context"]["full_range"]["candidate_sha"])
-        request = DeliveryRead(job["source_ref"], job["target_ref"], job["pr_number"] if subject is not None else None,
-                               tuple(sorted(anchors)), job["source_sha"] if subject is not None and job["phase"] == "checks" else None,
-                               subject is not None)
-    facts = ports.delivery(request)
-    if execution is not None:
-        waiting = kernel._finish_operation_read(token, execution)
-        if waiting is not None:
-            raise ReadWait(waiting)
-    with kernel.storage.transaction(write=False) as tx:
-        kernel._check_operation(tx, token, execution)
-        run = tx.one("SELECT * FROM runs")
-        revision, completion = run["observed_parent_revision"], "no-tickets"
-        if subject is not None:
-            job = kernel._job(tx, subject)
-            if job["kind"] == "ticket":
-                revision = tx.one("SELECT revision FROM issue_facts WHERE issue=?", (job["issue"],))[0]
-            completion = job["completion_revision"]
-        if facts.pr is not None and facts.pr.state == "OPEN" and (
-                facts.source != facts.pr.head or facts.target != facts.pr.base
-                or facts.checks is not None and (facts.checks.pr_number != facts.pr.number or facts.checks.head_sha != facts.pr.head.sha)):
-            raise ReadUnavailable("github_observation_pending", "PR, refs and checks have not converged")
-        return World(run["observed_parent_revision"], run["observed_graph_revision"], revision, facts.target,
-                     facts.source, facts.pr, facts.checks, completion, facts.ancestry,
-                     facts.publisher_actor, facts.publisher_identity), token
+def observe_control(kernel: Kernel, subject: str, make_ports: Callable[[OperationBinding], OperationPorts]) -> World:
+    """Explicit physical observation for control; public queries never call it."""
+    ports = make_ports(kernel.operation_binding())
+    try:
+        return _read_observation(kernel, ports, kernel.begin_observation(subject))[0]
+    except ReadUnavailable as error:
+        raise KernelError(error.code, error.message) from error
 
 
 class OperationRunner:
-    """Factory: kernel.operation_runner(execution, make_ports).
+    """Physical driver: OperationRunner(kernel, execution, make_ports).
 
-    Core obtains the frozen binding, then calls make_ports(binding); Host never
+    Core seals the binding; this driver calls make_ports(binding). Host never
     pre-reads Core SQL or substitutes future defaults. Host runs at most one
     run_once Future in its independent I/O pool. A
     bootstrap authorization reads inline in the Agent thread, never queues back
@@ -210,7 +64,7 @@ class OperationRunner:
     def __init__(self, kernel: Kernel, execution: Execution,
                  make_ports: Callable[[OperationBinding], OperationPorts]) -> None:
         self.kernel, self.execution = kernel, execution
-        self.binding = kernel._operation_binding(execution)
+        self.binding = kernel.operation_binding(execution)
         self.ports = make_ports(self.binding)
         self._observation: _ObservationPass | None = None
         self._activation_lock = RLock()
@@ -232,26 +86,19 @@ class OperationRunner:
     def observe(self, subject: str | None) -> World:
         return self._observe(subject)[0]
 
-    def _observe(self, subject: str | None, *, cleanup: bool = False) -> tuple[World, str]:
-        return observe_operation(self.kernel, self.binding, self.ports, subject,
-                                 execution=self.execution, cleanup=cleanup)
+    def _observe(self, subject: str | None, *, cleanup: bool = False) -> tuple[World, ReadFence]:
+        request = self.kernel.begin_observation(subject, execution=self.execution, cleanup=cleanup)
+        return _read_observation(self.kernel, self.ports, request)
 
     def authorize_agent(self, call: AgentCall) -> None:
         if call.execution != self.execution:
             raise KernelError("invocation_binding")
-        with self.kernel.storage.transaction(write=False) as tx:
-            self.kernel._agent_authority(tx, call)
-            original = self.kernel._operation_token(tx, call.subject)
+        request = self.kernel.begin_observation(call.subject, execution=self.execution, call=call)
         try:
-            world, token = self._observe(call.subject)
+            world, fence = _read_observation(self.kernel, self.ports, request)
         except ReadUnavailable as error:
-            raise ReadWait(self.kernel._wait_for_read(original, self.execution, error.code, error.message)) from error
-        with self.kernel.storage.transaction() as tx:
-            self.kernel._check_operation(tx, token, self.execution)
-            run, job = self.kernel._owned(tx, call.subject, self.execution)
-            if not self.kernel._current(tx, job, run, world):
-                raise KernelError("agent_authority_changed")
-            self.kernel._agent_authority(tx, call)
+            raise ReadWait(self.kernel._wait_for_read(request.fence, self.execution, error.code, error.message)) from error
+        self.kernel.authorize_agent_observation(call, world, fence)
 
     def worker_settled(self, call: AgentCall) -> bool:
         with self.kernel.storage.transaction(write=False) as tx:
@@ -376,17 +223,10 @@ class OperationRunner:
                     world, token = self._observe(effect.subject)
                 except ReadUnavailable as error:
                     raise ReadWait(kernel._wait_for_read(read_token, execution, error.code, error.message)) from error
-                with kernel.storage.transaction(write=False) as tx:
-                    kernel._check_operation(tx, token, execution)
-                    status = tx.one("SELECT status FROM effects WHERE id=?", (effect.effect_id,))[0]
+                prepared = kernel.effect_observation_prepared(effect, token)
                 resources = kernel.effect_resources(effect)
                 inspections = None if resources is None else self.ports.inspect(resources)
-                waiting = kernel._finish_operation_read(token, execution)
-                if waiting is not None:
-                    raise ReadWait(waiting)
-                if status == "prepared" and not kernel._dispatch(effect, execution, world, resource_inspections=inspections, token=token):
-                    raise KernelError("operation_cancelled")
-                kernel._guard_effect(effect, execution, world, resource_inspections=inspections, token=token)
+                kernel.authorize_effect_observation(effect, world, token, prepared=prepared, inspections=inspections)
             try:
                 result = self.ports.execute(effect, authorize)
             except ReadUnavailable as error:
@@ -413,6 +253,6 @@ class OperationRunner:
         self._record_readback(effect, result)
         settled = kernel._reconcile(effect, result, execution)
         if settled.kind == "observe":
-            world, token = self._observe(effect.subject)
-            settled = kernel._reconcile(effect, result, execution, world, token=token)
+            world, observed = self._observe(effect.subject)
+            settled = kernel._reconcile(effect, result, execution, world, token=observed)
         return settled

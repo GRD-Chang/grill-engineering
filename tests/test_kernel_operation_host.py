@@ -54,12 +54,12 @@ def test_host_dispatches_call_then_polls_independent_io_and_requires_durable_exi
     class Core:
         storage = SimpleNamespace(path=tmp_path / "unused.sqlite")
         clock = staticmethod(time.monotonic)
-        def operation_runner(self, selected, make_ports):
-            assert selected == execution
-            port = make_ports(binding)
-            assert port.root == binding.repository_root and port.identity == binding.inputs.runner_identity
-            assert port.remote == binding.inputs.repository_remote
-            return Runner()
+    def make_runner(core, selected, make_ports):
+        assert selected == execution
+        port = make_ports(binding)
+        assert port.root == binding.repository_root and port.identity == binding.inputs.runner_identity
+        assert port.remote == binding.inputs.repository_remote
+        return Runner()
 
     def execute(_kernel, selected, **kwargs):
         assert selected == call
@@ -83,6 +83,7 @@ def test_host_dispatches_call_then_polls_independent_io_and_requires_durable_exi
         def close(self, **_kwargs):
             pass
 
+    monkeypatch.setattr(executor, "OperationRunner", make_runner)
     monkeypatch.setattr(executor, "render_role_prompt", lambda _call: "frozen prompt")
     monkeypatch.setattr("agent_run_kernel.codex_execution.execute_selected_codex", execute)
     monkeypatch.setattr("agent_run_kernel.notifications.NativeNotifications", Notifications)

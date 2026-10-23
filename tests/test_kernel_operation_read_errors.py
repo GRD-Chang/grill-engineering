@@ -1,4 +1,5 @@
 """Physical read outages become Core waits without importing concrete adapters."""
+from agent_run_kernel.operation_runner import OperationRunner
 import os
 from pathlib import Path
 import subprocess
@@ -45,7 +46,7 @@ def test_bootstrap_read_outage_retains_original_wait_and_lease(tmp_path):
     assert second.value.retry_at == first.value.retry_at
     s.kernel = Kernel(s.kernel.storage.path)
     s.kernel.clock = lambda: now[0]
-    runner = s.kernel.operation_runner(s.execution, lambda binding: ports)
+    runner = OperationRunner(s.kernel, s.execution, lambda binding: ports)
     now[0] = 700.25
     with pytest.raises(ReadWait) as expired:
         runner.authorize_agent(call)
@@ -71,7 +72,7 @@ def test_source_read_window_survives_stop_and_a_proven_executor_handoff(tmp_path
     s.kernel.confirm_executor_exit(s.execution)
     s.kernel.control("resume", "resume-same-read")
     s.execution = s.kernel.claim_executor("replacement-reader")
-    runner = s.kernel.operation_runner(s.execution, lambda binding: ports)
+    runner = OperationRunner(s.kernel, s.execution, lambda binding: ports)
     assert runner.run_once().kind == "waiting"
     with s.kernel.storage.transaction(write=False) as tx:
         wait = tx.one("SELECT started_at,deadline,retry_count FROM waits")

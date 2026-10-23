@@ -237,7 +237,7 @@ def test_personal_plain_output_uses_real_language_and_does_not_send_or_open_runs
     def forbidden(*_args, **_kwargs):
         raise AssertionError("Personal settings attempted Run/online work")
 
-    monkeypatch.setattr("agent_run_kernel.query_cli._candidates", forbidden)
+    monkeypatch.setattr("agent_run_kernel.cli_selection._candidates", forbidden)
     monkeypatch.setattr("subprocess.run", forbidden)
     assert main(["settings", "show"]) == 0
     output = capsys.readouterr().out

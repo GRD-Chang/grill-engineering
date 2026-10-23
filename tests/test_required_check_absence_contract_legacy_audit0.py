@@ -196,7 +196,8 @@ window = status.get('read_waits')
 approval_error = None
 if req.get('approve') and kind == 'parent':
     try:
-        s.kernel.control('approve', 'audit-approval', subject=s.delivery.key, world=s.kernel.observe_control(s.delivery.key, s.make_ports))
+        from agent_run_kernel.operation_runner import observe_control
+        s.kernel.control('approve', 'audit-approval', subject=s.delivery.key, world=observe_control(s.kernel, s.delivery.key, s.make_ports))
     except Exception as error:
         approval_error = getattr(error, 'code', str(error))
 from agent_run_kernel import query as query_clock

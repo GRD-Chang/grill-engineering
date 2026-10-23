@@ -274,8 +274,8 @@ def test_json_query_reads_actual_binding_and_raw_without_advancing_or_mutating(
     def forbidden(*_args, **_kwargs):
         raise AssertionError("A query attempted to advance business work")
 
-    monkeypatch.setattr(Kernel, "operation_runner", forbidden)
-    monkeypatch.setattr(Kernel, "observe_control", forbidden)
+    monkeypatch.setattr(Kernel, "begin_observation", forbidden)
+    monkeypatch.setattr(Kernel, "accept_requirements", forbidden)
     for method in ("__init__", "run_once", "observe", "authorize_agent", "worker_settled", "state"):
         monkeypatch.setattr(OperationRunner, method, forbidden)
     assert main(_arguments(kernel, "status", "--json")) == 0

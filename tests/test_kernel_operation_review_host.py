@@ -155,26 +155,7 @@ def test_public_run_reads_a_restored_third_push_before_conflict_resume(
     monkeypatch.setattr("agent_run_kernel.notifications.NativeNotifications", _NoNotifications)
     monkeypatch.setattr("agent_run_kernel.codex_execution.execute_selected_codex",
                         lambda *a, **kw: pytest.fail("Original push readback needs no Agent"))
-    if hasattr(kernel, "operation_runner"):
-        monkeypatch.setattr(executor, "_make_ports", scenario.make_ports)
-    else:
-        # Historical I/O shape only: no selector, transition or fake receipt.
-        class HistoricalRemote:
-            def __init__(self, *_arguments, **_options):
-                self.git = scenario.port.git
-
-            def observe(self, selected_kernel, subject):
-                assert selected_kernel is kernel and subject == scenario.delivery.key
-                return scenario.world()
-
-            def execute(self, effect, authorize):
-                acknowledgment = scenario.port.execute(effect, authorize)
-                return acknowledgment if effect.operation == "issue_link" else self.reconcile(effect)
-
-            def reconcile(self, effect):
-                return scenario.port.reconcile(effect)
-
-        monkeypatch.setattr(executor, "RemoteEffects", HistoricalRemote)
+    monkeypatch.setattr(executor, "_make_ports", scenario.make_ports)
 
     assert executor.run(kernel, scenario.execution, {}) == 0
     # A normal explicit run must accept this late target as observation only.

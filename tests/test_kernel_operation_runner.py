@@ -1,4 +1,5 @@
 """Public Core operation seam: selection, bounded I/O and durable settlement."""
+from agent_run_kernel.operation_runner import OperationRunner, observe_control
 from pathlib import Path
 from dataclasses import replace
 
@@ -48,7 +49,7 @@ def setup(tmp_path, *, concurrency=1, dependent=False):
     source = Requirements.from_wire(native_input()["initial_requirements"]) if dependent else independent_source()
     s = GraphScenario(tmp_path / "graph", source, policy=Policy(concurrency=concurrency))
     ports = Ports(s)
-    return s, ports, s.kernel.operation_runner(s.execution, lambda binding: ports)
+    return s, ports, OperationRunner(s.kernel, s.execution, lambda binding: ports)
 
 
 @pytest.mark.parametrize("ready", [True, False])
@@ -202,7 +203,7 @@ def test_read_outage_poll_and_restart_keep_original_deadline(tmp_path):
     assert runner.state().disposition == "waiting"
     s.kernel = Kernel(s.kernel.storage.path)
     s.kernel.clock = lambda: now[0]
-    runner = s.kernel.operation_runner(s.execution, lambda binding: ports)
+    runner = OperationRunner(s.kernel, s.execution, lambda binding: ports)
     now[0] = 700.25
     assert runner.run_once().reason == "supervision_timeout"
     assert runner.state().disposition == "quiescent"
@@ -232,7 +233,7 @@ def test_binding_factory_runs_after_core_fixes_frozen_inputs(tmp_path):
         assert binding.inputs.runner_identity == {"source": "host"}
         seen.append(binding)
         return Ports(s)
-    runner = s.kernel.operation_runner(s.execution, make_ports)
+    runner = OperationRunner(s.kernel, s.execution, make_ports)
     assert seen == [runner.binding]
     assert runner.binding.repository_root == s.port.git.root.resolve()
 
@@ -295,7 +296,7 @@ def test_ready_fifo_is_preserved_while_host_has_no_new_agent_slot(tmp_path):
     assert s.kernel.status("ticket:4")["budgets"] == before
     settle_agent(s, runner, first.call)
     s.kernel = Kernel(s.kernel.storage.path)
-    runner = s.kernel.operation_runner(s.execution, lambda binding: ports)
+    runner = OperationRunner(s.kernel, s.execution, lambda binding: ports)
     second = drive_until(s, runner, lambda step: step.call is not None)
     assert second.call.subject == "ticket:4"
 
@@ -304,7 +305,7 @@ def test_explicit_approval_poll_observes_target_append_without_background_pollin
     source = Requirements(ParentIssue(1, "Parent", "Original Parent requirement", ()), ())
     s = GraphScenario(tmp_path / "parent", source, policy=Policy(resync_limit=0))
     ports = Ports(s)
-    runner = s.kernel.operation_runner(s.execution, lambda binding: ports)
+    runner = OperationRunner(s.kernel, s.execution, lambda binding: ports)
     drive_until(s, runner, lambda step: s.kernel.status("parent:1")["phase"] == "approval")
     assert runner.state().disposition == "quiescent"
     unchanged = runner.run_once()
@@ -335,7 +336,7 @@ def test_sent_merge_can_settle_a_late_readback_without_new_write_or_attempt(tmp_
                           (Issue(2, "Ticket", "Ticket requirement", "OPEN", frozenset({"ready-for-agent"})),))
     s = GraphScenario(tmp_path / "graph", source)
     ports = Ports(s)
-    runner = s.kernel.operation_runner(s.execution, lambda binding: ports)
+    runner = OperationRunner(s.kernel, s.execution, lambda binding: ports)
     execute, reconcile = ports.execute, ports.reconcile
     sent = []
 
@@ -381,7 +382,7 @@ def test_original_approved_prior_merge_continues_new_review_without_a_new_contro
                           (Issue(2, "Ticket", "Ticket requirement", "OPEN", frozenset({"ready-for-agent"})),))
     s = GraphScenario(tmp_path / "graph", source)
     ports = Ports(s)
-    runner = s.kernel.operation_runner(s.execution, lambda binding: ports)
+    runner = OperationRunner(s.kernel, s.execution, lambda binding: ports)
     for _ in range(120):
         step = runner.run_once()
         if step.call is not None:
@@ -414,7 +415,7 @@ def test_original_approved_prior_merge_continues_new_review_without_a_new_contro
     assert runner.run_once().kind == "progress"
     assert s.kernel.source_status()["blocked"] == "final_refresh"
     with pytest.raises(KernelError, match="final_approval_noncancellable"):
-        s.kernel.control("requeue", "cannot-replace-approval", subject="final:1", world=s.kernel.observe_control("final:1", lambda binding: ports))
+        s.kernel.control("requeue", "cannot-replace-approval", subject="final:1", world=observe_control(s.kernel, "final:1", lambda binding: ports))
     assert runner.state().disposition == "ready"
     for _ in range(80):
         step = runner.run_once()
@@ -436,7 +437,7 @@ def test_cleanup_records_foreign_observation_and_keeps_absence_admission(tmp_pat
                           (Issue(2, "Ticket", "Ticket requirement", "OPEN", frozenset({"ready-for-agent"})),))
     s = GraphScenario(tmp_path / "graph", source)
     ports = Ports(s)
-    runner = s.kernel.operation_runner(s.execution, lambda binding: ports)
+    runner = OperationRunner(s.kernel, s.execution, lambda binding: ports)
     execute = ports.execute
     inspected = []
     foreign = []

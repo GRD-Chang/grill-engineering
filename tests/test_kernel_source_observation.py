@@ -1,4 +1,5 @@
 """Real read/commit interleavings cannot publish mixed source observations."""
+from agent_run_kernel.operation_runner import OperationRunner
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
@@ -45,7 +46,7 @@ def test_late_source_read_cannot_reopen_a_newly_observed_external_blocker(tmp_pa
         try:
             assert reading.wait(10), "original source read never started"
             scenario.requirements = new
-            fresh_runner = kernel.operation_runner(scenario.execution, scenario.make_ports)
+            fresh_runner = OperationRunner(kernel, scenario.execution, scenario.make_ports)
             fresh_runner.observe("ticket:2")
             fresh = kernel.source_status()
             assert fresh["remaining"] == {"ticket:2": "blocked_by_open_issues"}
@@ -95,7 +96,7 @@ def test_refresh_returns_its_own_receipt_when_another_read_commits_after_it(tmp_
             first_receipt = Kernel(kernel.storage.path).source_status()
             assert first_receipt["frontier"] == ["ticket:2"] and first_receipt["remaining"] == {}
             scenario.requirements = new
-            other = Kernel(kernel.storage.path).operation_runner(scenario.execution, scenario.make_ports)
+            other = OperationRunner(Kernel(kernel.storage.path), scenario.execution, scenario.make_ports)
             other.observe("ticket:2")
             newer = Kernel(kernel.storage.path).source_status()
             release.set()
@@ -124,7 +125,7 @@ def test_graph_world_keeps_the_receipt_from_its_own_source_read(tmp_path: Path, 
 
     def another_source_during_delivery(request):
         scenario.requirements = newer
-        other = scenario.kernel.operation_runner(scenario.execution, scenario.make_ports)
+        other = OperationRunner(scenario.kernel, scenario.execution, scenario.make_ports)
         other.observe("ticket:2")
         return delivery(request)
 

@@ -1,4 +1,5 @@
 """Real source callbacks retain one call and one launch across concurrent reads."""
+from agent_run_kernel.operation_runner import OperationRunner
 from dataclasses import replace
 import json
 import os
@@ -109,7 +110,7 @@ def test_worker_source_callback_preserves_authority_and_exact_process_settlement
         port = operations.runner.ports
         assert isinstance(port, RemoteEffects)
         current = RemoteEffects(port.root, port.repository, runner_identity=port.identity, remote=port.remote)
-        world = kernel.operation_runner(scenario.execution, lambda binding: current).observe(call.subject)
+        world = OperationRunner(kernel, scenario.execution, lambda binding: current).observe(call.subject)
         if change == "requirement":
             original = kernel.delivery(call.subject)
             replacement = replace(original, source_ref=original.source_ref + "-g2", base=world.target,

@@ -123,7 +123,7 @@ def final_scenario(root: Path, *, policy: Policy | None = None,
 class CoreOperations:
     def __init__(self, kernel: Kernel, execution: Execution,
                  make_ports: Callable[[OperationBinding], OperationPorts]) -> None:
-        self.runner = kernel.operation_runner(execution, make_ports)
+        self.runner = OperationRunner(kernel, execution, make_ports)
         self.steps: list[Step] = []
 
     def once(self, *, agent_capacity: int = 1) -> Step:

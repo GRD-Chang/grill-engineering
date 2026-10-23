@@ -1,4 +1,5 @@
 """Real Core operations retain the original bounded supervision contract."""
+from agent_run_kernel.operation_runner import OperationRunner
 from dataclasses import replace
 from pathlib import Path
 
@@ -105,7 +106,7 @@ def test_read_deadline_survives_successful_reads_diagnostics_siblings_and_restar
     assert window["started_at"] == 100.25 and window["deadline"] == 700.25
     reopened = Kernel(kernel.storage.path)
     reopened.clock = lambda: 700.25
-    runner = reopened.operation_runner(execution, lambda binding: ports)
+    runner = OperationRunner(reopened, execution, lambda binding: ports)
     expired = runner.run_once()
     assert (expired.kind, expired.reason) == ("paused", "supervision_timeout")
     assert reopened.status("ticket:2")["gates"] == ["supervision_timeout"]
@@ -157,7 +158,7 @@ def test_before_final_timeout_is_run_scoped_and_requires_original_executor_exit(
     kernel.control("resume", "explicit-resume")
     assert kernel.source_status()["blocked"] is None
     replacement = kernel.claim_executor("replacement")
-    fresh = kernel.operation_runner(replacement, lambda binding: operations.runner.ports)
+    fresh = OperationRunner(kernel, replacement, lambda binding: operations.runner.ports)
     assert fresh.run_once().retry_at == 705
 
 
@@ -192,7 +193,7 @@ def test_checks_read_error_reuses_the_original_45_minute_window(tmp_path: Path, 
     assert window["started_at"] == 100 and window["deadline"] == 2800
     reopened = Kernel(scenario.kernel.storage.path)
     reopened.clock = lambda: 2800
-    runner = reopened.operation_runner(scenario.execution, lambda binding: operations.runner.ports)
+    runner = OperationRunner(reopened, scenario.execution, lambda binding: operations.runner.ports)
     assert runner.run_once().reason == "supervision_timeout"
 
 

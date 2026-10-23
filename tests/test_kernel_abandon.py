@@ -1,4 +1,5 @@
 """Managed abandonment retains exact recovery obligations and authority."""
+from agent_run_kernel.operation_runner import OperationRunner
 
 import json
 from dataclasses import replace
@@ -221,7 +222,7 @@ def test_abandon_original_cap_ends_before_a_managed_continuation(tmp_path: Path)
     continuation = kernel.admit_host("continue-cleanup", kind="abandon", continuation_of="original-abandon",
         command=("native-host",), environment_carrier=tmp_path / "carrier", preflight=lambda: None)
     with pytest.raises(KernelError, match="executor_fenced"):
-        kernel.operation_runner(original, scenario.make_ports).observe(scenario.delivery.key)
+        OperationRunner(kernel, original, scenario.make_ports).observe(scenario.delivery.key)
     assert kernel.dispatch_host(continuation)
     assert kernel.observe_host(continuation, HostObservation("running", continuation.unit_name, "new", "/new-host", "boot",
                                                            43, "new-start", usage_ready=True)) == "running"

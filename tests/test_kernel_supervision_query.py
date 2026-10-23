@@ -1,4 +1,5 @@
 """Public supervision reads the original scoped Core waits without authorizing them."""
+from agent_run_kernel.operation_runner import OperationRunner
 from dataclasses import replace
 from io import StringIO
 
@@ -111,7 +112,7 @@ def test_run_timeout_renders_original_evidence_and_resumes_only_after_core_appli
     assert kernel.control("resume", "explicit-original-resume") == "applied"
     assert read_only(kernel, tmp_path).data["supervision_windows"] == []
     replacement = kernel.claim_executor("replacement")
-    fresh = kernel.operation_runner(replacement, lambda binding: operations.runner.ports)
+    fresh = OperationRunner(kernel, replacement, lambda binding: operations.runner.ports)
     kernel.clock = lambda: 800
     assert fresh.run_once().retry_at == 805
     assert read_only(kernel, tmp_path).data["supervision"]["started_at"] == 800

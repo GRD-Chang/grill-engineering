@@ -17,6 +17,7 @@ from typing import Any, TYPE_CHECKING
 from agent_run.messages import error_message, text
 
 from . import personal_settings
+from .operation_runner import observe_control
 from .model import Commit, Delivery, DeliveryKind, HostObservation, Requirements, ResourceInspection, RunSpec, World
 
 if TYPE_CHECKING:
@@ -248,7 +249,7 @@ def execute(parsed: argparse.Namespace) -> dict[str, Any]:
     from .host_adapter import SystemdHost, HostUnavailable
     from .kernel import Kernel
     from .model import KernelError
-    from .query_cli import _candidates, _select
+    from .cli_selection import _candidates, _select
     from .remote_effects import RemoteEffects
 
     if parsed.command not in {"run", "resume", "approve", "stop", "revise", "requeue", "abandon"}:
@@ -382,7 +383,7 @@ def execute(parsed: argparse.Namespace) -> dict[str, Any]:
             remote = inputs.get("repository_remote")
             if not isinstance(remote, str) or not remote:
                 raise KernelError("creation_repository_remote_required")
-            world = kernel.observe_control(subject, lambda binding: RemoteEffects(
+            world = observe_control(kernel, subject, lambda binding: RemoteEffects(
                 binding.repository_root, binding.repository,
                 runner_identity=binding.inputs.runner_identity, remote=remote))
             if parsed.command == "requeue":
