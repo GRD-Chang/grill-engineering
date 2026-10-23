@@ -15,7 +15,7 @@ def test_raw_source_management_and_probes_without_installed_package(tmp_path: Pa
     source.mkdir()
     for name in ("install.sh", "setup.sh"):
         shutil.copy2(project / name, source / name)
-    shutil.copytree(project / "src/agent_run", source / "src/agent_run",
+    shutil.copytree(project / "src", source / "src",
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     interpreter = tmp_path / "python"
     venv.EnvBuilder(with_pip=False).create(interpreter)

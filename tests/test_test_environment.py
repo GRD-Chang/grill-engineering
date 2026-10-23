@@ -49,13 +49,13 @@ def test_pytest_isolates_each_case_and_cli_from_host_state(tmp_path: Path) -> No
     suite.mkdir()
     shutil.copyfile(project / "tests/conftest.py", suite / "conftest.py")
     (suite / "test_isolation.py").write_text(
-        '''import os
+        '''import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 import pytest
-from agent_run.run_locator import RunLocatorIndex
-from support.seeding import seed_run, write_fixture
-from support.cli import run_cli, stdout_json
+from agent_run_kernel.task_location import read_task_bindings
 from support.environment import _assert_python_and_git_environment
 
 @pytest.mark.parametrize("case", ["first", "second"])
@@ -64,7 +64,7 @@ def test_case(git_repo, tmp_path, monkeypatch, case):
     for key in ("HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
                 "XDG_CACHE_HOME", "XDG_RUNTIME_DIR"):
         assert Path(os.environ[key]).is_relative_to(tmp_path), key
-    assert not RunLocatorIndex.default().entries()
+    assert not list(read_task_bindings())
     assert (git_repo / "README.md").read_text() == "# fixture\\n"
     assert not (git_repo / "previous-case").exists()
     assert subprocess.check_output(["git", "config", "user.name"], cwd=git_repo, text=True).strip() == "Agent Run Tests"
@@ -80,15 +80,35 @@ def test_case(git_repo, tmp_path, monkeypatch, case):
         explicit.setenv("GIT_CONFIG_VALUE_0", case)
         assert subprocess.check_output(["git", "config", "isolation.injected"], cwd=git_repo, text=True).strip() == case
     assert "GIT_CONFIG_COUNT" not in os.environ
-    fixture = write_fixture(git_repo / "github.json", issues={})
-    started = seed_run(git_repo, fixture)
+    # Seed through the public native creation API in a real child process.
+    creation = """
+import json, sys
+from pathlib import Path
+from agent_run.managed_workspace import ManagedWorkspace
+from agent_run_kernel import Delivery, DeliveryKind, Kernel, ParentIssue, Requirements, RunSpec
+from agent_run_kernel.effects import LocalGit
+repository = Path(sys.argv[1])
+run_id = "isolation-" + sys.argv[2]
+base = LocalGit(repository).commit("HEAD")
+delivery = Delivery("parent:1", DeliveryKind.PARENT_ONLY, 1, "requirement", base,
+                    "refs/heads/isolated", "refs/heads/main")
+spec = RunSpec(run_id, "example/project", 1, "parent", "graph", (delivery,),
+               language="en", repository_root=str(repository))
+managed = ManagedWorkspace.for_repository(spec.repository)
+Kernel.create_task(managed.state_root / run_id / "kernel.sqlite3", spec,
+                   requirements=Requirements(ParentIssue(1, "Parent", "Isolated requirement"), ()))
+print(json.dumps({"run_id": run_id}))
+"""
+    started = subprocess.run([sys.executable, "-c", creation, str(git_repo), case],
+                             cwd=git_repo, text=True, capture_output=True, timeout=20)
     assert started.returncode == 0, started.stderr
-    run_id = stdout_json(started)["run_id"]
-    assert [entry["run_id"] for entry in RunLocatorIndex.default().entries()] == [run_id]
-    # Outside the checkout the subprocess must find the helper's index.
-    result = run_cli(tmp_path, fixture, "status", run_id, "--json")
+    run_id = json.loads(started.stdout)["run_id"]
+    assert [identity for identity, _path in read_task_bindings()] == [run_id]
+    # Outside the checkout the public subprocess finds the native Task binding.
+    result = subprocess.run([sys.executable, "-m", "agent_run", "status", run_id, "--json"],
+                            cwd=tmp_path, text=True, capture_output=True, timeout=20)
     assert result.returncode == 0, result.stderr
-    assert stdout_json(result)["run_id"] == run_id
+    assert json.loads(result.stdout)["run_id"] == run_id
     (git_repo / "README.md").write_text("changed by this case")
     (git_repo / "previous-case").touch()
     subprocess.run(["git", "config", "user.name", "Changed User"], cwd=git_repo, check=True)
