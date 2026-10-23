@@ -75,9 +75,12 @@ def validate_identity_snapshot(raw: object) -> dict[str, Any]:
     if source == "pat":
         return {"source": source, "pat": normalize_github_config({"pat": raw["pat"]})["pat"]}
     if source == "app":
-        return resolve_worker_identity({"worker_source": "app", "app": raw["app_profile"],
-                                        "app_read_only": raw["app_read_only"],
-                                        "app_current_repository_only": raw["app_current_repository_only"]})
+        config = normalize_github_config({"worker_source": "app", "app": raw["app_profile"],
+                                          "app_read_only": raw["app_read_only"],
+                                          "app_current_repository_only": raw["app_current_repository_only"]})
+        return {"source": "app", "app_profile": config["app"],
+                "app_read_only": config["app_read_only"],
+                "app_current_repository_only": config["app_current_repository_only"]}
     return {"source": source}
 
 
