@@ -145,7 +145,7 @@ def test_publication_unknown_response_diagnostic_remains_public_after_successful
     failures = data['publication_operation_retries']
     assert failures == []  # Unknown response is not a proved nonzero command exit.
     assert sum(operation['attempts'] for operation in data['effect_operations']) > len(failures)
-    assert scenario.port.pull_request(scenario.delivery.key) is not None
+    assert scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref) is not None
     operation = next(row for row in data['effect_operations'] if row['id'] == pending['id'])
     assert operation['attempts'] == 1 and operation['status'] == 'confirmed'
     assert sum(row['operation'] == 'pr_write' for row in scenario.port.writes()) == 1

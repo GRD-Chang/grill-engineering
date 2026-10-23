@@ -20,7 +20,7 @@ import pytest
 
 from agent_run.model import DeliveryKind, Effect, EffectResult, Requirements
 from agent_run.model import Issue, ParentIssue
-from support.offline import GraphScenario, LostResponse, Scenario
+from support.offline import GraphScenario, Scenario
 from agent_run.core.operation_contract import ReadUnavailable
 from agent_run.queries.run import read
 from agent_run.adapters.remote import RemoteEffects
@@ -112,10 +112,7 @@ def test_actual_native_push_status_is_audited_once_independently_of_its_readback
     scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
     now = [100.25]
     scenario.kernel.clock = lambda: now[0]
-    bare = tmp_path / "actual-origin.git"
-    scenario.port.git.run("init", "--bare", str(bare))
-    scenario.port.git.run("remote", "add", "review-origin", str(bare))
-    scenario.port.git.run("push", "review-origin", scenario.initial.sha + ":refs/heads/main")
+    bare = scenario.port.physical.remote
     real_git = shutil.which("git")
     assert real_git is not None
     binary = tmp_path / "bin"
@@ -133,11 +130,11 @@ import json,subprocess,sys
 from pathlib import Path
 marker,trace=Path({str(marker)!r}),Path({str(trace)!r})
 arguments=sys.argv[1:]
-if arguments and arguments[0]=='ls-remote' and 'review-origin' in arguments and marker.exists():
+if arguments and arguments[0]=='ls-remote' and {str(bare)!r} in arguments and marker.exists():
     print('independent local readback outage',file=sys.stderr)
     raise SystemExit(9)
 response=subprocess.run([{real_git!r},*arguments])
-if arguments[:2]==['push','review-origin']:
+if arguments[:2]==['push',{str(bare)!r}]:
     actual_exit={command_exit} if response.returncode==0 else response.returncode
     with trace.open('a') as output:
         output.write(json.dumps({{'arguments':arguments,'inner_git_returncode':response.returncode,
@@ -154,7 +151,7 @@ raise SystemExit(response.returncode)
     for variable in ("GH_TOKEN", "GITHUB_TOKEN"):
         monkeypatch.delenv(variable, raising=False)
     native = RemoteEffects(scenario.port.git.root, scenario.spec.repository,
-                           runner_identity={"source": "host"}, remote="review-origin")
+                           runner_identity={"source": "host"}, remote=str(bare))
     runner = scenario.runner()
     execute, reconcile = runner.ports.execute, runner.ports.reconcile
     observed: list[tuple[Effect, EffectResult | ReadUnavailable]] = []
@@ -225,19 +222,24 @@ def test_offline_lost_response_is_unknown_without_an_observed_command_failure(
     scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
     scenario.kernel.clock = lambda: 100.25
     scenario.port.lose_response.add("pr_write")
-    execute = scenario.port.execute
+    make_ports = scenario.make_ports
     physical_exceptions: list[tuple[str, str, int | None]] = []
 
-    def capture(effect, authorize):
-        try:
-            return execute(effect, authorize)
-        except LostResponse as error:
-            physical_exceptions.append((type(error).__name__, str(error), getattr(error, "write_returncode", None)))
-            raise
+    def capture_ports(binding):
+        ports = make_ports(binding)
+        execute = ports.execute
+        def capture(effect, authorize):
+            try:
+                return execute(effect, authorize)
+            except ReadUnavailable as error:
+                physical_exceptions.append((type(error).__name__, str(error), getattr(error, "write_returncode", None)))
+                raise
 
-    monkeypatch.setattr(scenario.port, "execute", capture)
+        ports.execute = capture
+        return ports
+    monkeypatch.setattr(scenario, "make_ports", capture_ports)
     step = scenario.run()
-    assert physical_exceptions == [("LostResponse", "pr_write took effect; response lost", None)]
+    assert physical_exceptions == [("ReadUnavailable", "pr_write took effect; response lost", None)]
     assert (step.kind, step.reason) == ("waiting", "github_convergence")
     pending = scenario.kernel.status(scenario.delivery.key)["pending_write"]
     assert pending["operation"] == "pr_write" and pending["status"] == "sent"

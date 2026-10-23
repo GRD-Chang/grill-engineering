@@ -345,18 +345,47 @@ def test_original_absent_local_cleanup_requires_lazy_authority(tmp_path: Path, m
 @pytest.mark.parametrize("disposition", ["prior", "target", "third", "unknown"])
 def test_unknown_write_branches_preserve_intent_and_resume_only_original_outcome(tmp_path: Path, monkeypatch, disposition: str) -> None:
     scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET)
+    now = [100.25]
+    if disposition in {"third", "unknown"}:
+        scenario.kernel.clock = lambda: now[0]
     held = advance_to_effect(scenario, monkeypatch, "pr_write", sent=True)
     effect = held.effect
     if disposition != "prior":
         scenario.port.execute(effect, held.authorize)
-    if disposition in {"third", "unknown"}:
-        scenario.port.force_read["pr_write"] = disposition
-    scenario.step()
+    if disposition == "third":
+        from support.offline_api import SyntheticGitHub
+        original_pr = scenario.port.pull_request_by_ref(effect.source_ref, effect.target_ref)
+        assert original_pr is not None
+        api = SyntheticGitHub(scenario.port.git, scenario.port.database, effect.repository,
+            physical=scenario.port.physical, written=lambda *args: None, read_faults=set(), actor="external-editor")
+        api.write(f"repos/{effect.repository}/pulls/{original_pr.number}", "PATCH",
+                  {"title": original_pr.title + " externally edited"})
+    elif disposition == "unknown":
+        from support.offline_api import SyntheticGitHub
+        readback, read_objects = scenario.port.reconcile, SyntheticGitHub.list
+
+        def unavailable_identity(api, endpoint):
+            rows = read_objects(api, endpoint)
+            return [{**row, "user": None} for row in rows] if "/pulls?" in endpoint else rows
+
+        def read_without_identity(original):
+            with monkeypatch.context() as identity_outage:
+                identity_outage.setattr(SyntheticGitHub, "list", unavailable_identity)
+                return readback(original)
+
+        monkeypatch.setattr(scenario.port, "reconcile", read_without_identity)
+    unresolved = scenario.step()
     if disposition in {"third", "unknown"}:
         assert scenario.kernel.status(scenario.delivery.key)["pending_write"]["status"] == "sent"
         assert scenario.kernel.status(scenario.delivery.key)["holds_integration"]
         assert sum(write["operation"] == "pr_write" for write in scenario.port.writes()) == 1
-        del scenario.port.force_read["pr_write"]
+        if disposition == "third":
+            api.write(f"repos/{effect.repository}/pulls/{original_pr.number}", "PATCH",
+                      {"title": original_pr.title, "body": original_pr.body})
+        else:
+            monkeypatch.setattr(scenario.port, "reconcile", readback)
+        if unresolved.retry_at is not None:
+            now[0] = unresolved.retry_at
         scenario.step()
         scenario.kernel.control("resume", "resume-exact-write", subject=scenario.delivery.key)
     assert scenario.run().kind == "complete"
@@ -437,7 +466,9 @@ def test_real_git_conflict_returns_to_integration_development_without_internal_p
     if kind == DeliveryKind.FINAL_RUN:
         assert scenario.port.writes()[:len(historical_writes)] == historical_writes
         assert sum(write["operation"] == "pr_write" for write in historical_writes) == 1
-    assert scenario.port.git.run("show", f"{scenario.delivery.target_ref}:{file_name}").stdout == "Resolved complete content\n"
+    target = scenario.port.remote_commit(scenario.delivery.target_ref)
+    assert target is not None
+    assert scenario.port.git.run("show", f"{target.sha}:{file_name}").stdout == "Resolved complete content\n"
 
 
 def test_successor_git_write_rechecks_stop_after_previous_git_operation(tmp_path: Path, monkeypatch) -> None:

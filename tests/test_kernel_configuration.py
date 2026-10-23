@@ -14,7 +14,8 @@ from agent_run.config.defaults import UserDefaultsStore
 from agent_run.model import Commit, Delivery, DeliveryKind, Effect, EffectResult, RunSpec
 from agent_run.core.kernel import Kernel
 from agent_run.config.creation import freeze_creation
-from support.offline import LostResponse, Scenario
+from agent_run.core.operation_contract import ReadUnavailable
+from support.offline import Scenario
 from agent_run.queries.run import read
 from agent_run.adapters.remote import RemoteEffects
 from support.core_operations import CoreOperations, native_agent_fixture, scripted_return
@@ -149,10 +150,7 @@ def _actual_publication_push(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     are confined to a local bare repository; gh may only return the fixture actor.
     """
     scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
-    bare = tmp_path / "audit-origin.git"
-    scenario.port.git.run("init", "--bare", str(bare))
-    scenario.port.git.run("remote", "add", "audit-origin", str(bare))
-    scenario.port.git.run("push", "audit-origin", scenario.initial.sha + ":refs/heads/main")
+    bare = scenario.port.physical.remote
     real_git = shutil.which("git")
     assert real_git is not None
     binary = tmp_path / "bin"
@@ -168,7 +166,7 @@ import json,subprocess,sys
 from pathlib import Path
 arguments=sys.argv[1:]
 response=subprocess.run([{real_git!r},*arguments])
-if arguments[:2]==['push','audit-origin']:
+if arguments[:2]==['push',{str(bare)!r}]:
     actual_exit={command_exit} if response.returncode==0 else response.returncode
     with Path({str(trace)!r}).open('a') as output:
         output.write(json.dumps({{'arguments':arguments,'inner_git_returncode':response.returncode,
@@ -183,7 +181,7 @@ raise SystemExit(response.returncode)
     for variable in ("GH_TOKEN", "GITHUB_TOKEN"):
         monkeypatch.delenv(variable, raising=False)
     native = RemoteEffects(scenario.port.git.root, scenario.spec.repository,
-                           runner_identity={"source": "host"}, remote="audit-origin")
+                           runner_identity={"source": "host"}, remote=str(bare))
     runner = scenario.runner()
     execute = runner.ports.execute
     observed: list[tuple[Effect, EffectResult]] = []
@@ -243,16 +241,21 @@ def test_publication_unknown_response_retains_the_original_intent_without_invent
     now = [100.25]
     scenario.kernel.clock = lambda: now[0]
     scenario.port.lose_response.add("pr_write")
-    execute = scenario.port.execute
+    make_ports = scenario.make_ports
     exceptions = []
-    def capture(effect, authorize):
-        try:
-            return execute(effect, authorize)
-        except LostResponse as error:
-            exceptions.append((effect.effect_id, effect.dispatch_serial,
-                               getattr(error, "write_returncode", None)))
-            raise
-    monkeypatch.setattr(scenario.port, "execute", capture)
+    def capture_ports(binding):
+        ports = make_ports(binding)
+        execute = ports.execute
+        def capture(effect, authorize):
+            try:
+                return execute(effect, authorize)
+            except ReadUnavailable as error:
+                exceptions.append((effect.effect_id, effect.dispatch_serial,
+                                   getattr(error, "write_returncode", None)))
+                raise
+        ports.execute = capture
+        return ports
+    monkeypatch.setattr(scenario, "make_ports", capture_ports)
     unresolved = scenario.run()
     assert unresolved.kind == "waiting" and unresolved.reason == "github_convergence"
     pending = scenario.kernel.status(scenario.delivery.key)["pending_write"]
@@ -263,7 +266,7 @@ def test_publication_unknown_response_retains_the_original_intent_without_invent
     assert unresolved.retry_at is not None
     now[0] = unresolved.retry_at
     assert scenario.run().kind == "approval"
-    assert scenario.port.pull_request(scenario.delivery.key) is not None
+    assert scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref) is not None
     assert sum(row["operation"] == "pr_write" for row in scenario.port.writes()) == 1
     with scenario.kernel.storage.transaction(write=False) as tx:
         failures = tx.rows("SELECT e.operation,e.subject,f.* FROM effect_failures f JOIN effects e ON e.id=f.effect")

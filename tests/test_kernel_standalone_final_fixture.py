@@ -13,7 +13,10 @@ def test_standalone_final_repair_reopen_approval_and_close_preserve_the_original
     assert history['raw_backend_calls'] == {'development': 1, 'review': 1, 'publication': 1}
     assert history['final']['phase'] == 'complete'
     assert history['completion']['subject'] == 'ticket:2'
-    assert history['completion']['review_attempt'] is not None and history['completion']['pr_number'] == 1
+    assert history['completion']['review_attempt'] is not None
+    original_prs = scenario.port.objects.pulls()
+    assert len(original_prs) == 1 and original_prs[0]['merged'] is True
+    assert history['completion']['pr_number'] == original_prs[0]['number']
     assert scenario.role_calls == []
     assert (scenario.development_count, scenario.review_count, scenario.publication_count) == (0, 0, 0)
     assert scenario.kernel.source_status()['final_subject'] == 'final:1'

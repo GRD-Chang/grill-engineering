@@ -97,10 +97,11 @@ def test_real_role_processes_feed_all_three_deliveries(tmp_path: Path, kind: Del
         else ["development", "review", "publication"]
     )
     assert all(int(pid) != os.getpid() for _, pid in observed)
-    target = scenario.port.git.commit(scenario.delivery.target_ref)
+    target = scenario.port.remote_commit(scenario.delivery.target_ref)
+    assert target is not None
     assert scenario.port.git.run("show", f"{target.sha}:child-delivery.txt").stdout == _CONTENT
     assert "validation.tmp" not in scenario.port.git.run("ls-tree", "-r", "--name-only", target.sha).stdout.splitlines()
-    pr = scenario.port.pull_request(scenario.delivery.key)
+    pr = scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref)
     assert pr is not None and pr.state == "MERGED"
     assert pr.title == "feat: deliver the child implementation" and pr.body == header + _BODY
     assert scenario.kernel.status(scenario.delivery.key)["phase"] == "complete"
