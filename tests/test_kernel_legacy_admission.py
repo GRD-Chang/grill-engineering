@@ -129,7 +129,7 @@ def test_native_admission_refuses_the_original_v6_task_owner(
     task = TaskKey(workspace, spec.repository, spec.parent_issue)
     with old_owner(unchanged_v6_source, workspace, state, disposition) as original:
         before = hashlib.sha256((state / "state.sqlite3").read_bytes()).hexdigest()
-        with pytest.raises(KernelError, match="legacy_requires_offline_migration"):
+        with pytest.raises(KernelError, match="unsupported_state") as refused:
             if entry == "open":
                 Kernel.open_task(task)
             elif entry == "create":
@@ -138,6 +138,9 @@ def test_native_admission_refuses_the_original_v6_task_owner(
                 assert kernel is not None
                 kernel.admit_host("native-start", kind="run", command=("native-host",),
                     environment_carrier=tmp_path / "carrier", preflight=lambda: None)
+        assert refused.value.code == "unsupported_state"
+        assert refused.value.protocol == "sqlite-work-records-v6"
+        assert refused.value.path == (state / "state.sqlite3").absolute()
         assert hashlib.sha256((state / "state.sqlite3").read_bytes()).hexdigest() == before
         with locked_task(task) as location:
             assert read_task(location) is None

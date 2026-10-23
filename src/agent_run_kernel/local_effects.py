@@ -4,9 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 import json
-import os
 from pathlib import Path
-import stat
 import subprocess
 import tempfile
 from typing import Any
@@ -97,8 +95,7 @@ class LocalEffects:
         if (self.owned_root is None or owned != str(self.owned_root)
                 or not self.owned_root.is_absolute() or self.owned_root.resolve() != self.owned_root):
             raise KernelError("foreign_local_checkout")
-        if (effect.operation == "cleanup_local_ref"
-                or effect.operation == "cleanup_worktree" and "source_uuid" in effect.payload):
+        if effect.operation == "cleanup_local_ref":
             common = effect.payload.get("common_git_dir")
             if (not isinstance(common, str) or not common or "\0" in common
                     or not Path(common).is_absolute() or Path(common).resolve() != Path(common)):
@@ -106,21 +103,6 @@ class LocalEffects:
             actual = self.git.run("rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
             if Path(actual).resolve() != Path(common):
                 raise KernelError("foreign_local_checkout")
-            if "source_uuid" in effect.payload:
-                original = effect.payload["source_uuid"]
-                if (not isinstance(original, str) or len(original) != 32
-                        or any(character not in "0123456789abcdef" for character in original)):
-                    raise KernelError("foreign_local_checkout")
-                descriptor = os.open(Path(common) / "agent-run-checkout-id",
-                                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-                with os.fdopen(descriptor, "rb") as marker:
-                    physical = os.fstat(marker.fileno())
-                    if (not stat.S_ISREG(physical.st_mode) or physical.st_nlink != 1
-                            or physical.st_size != 33 or marker.read(34) != original.encode("ascii") + b"\n"):
-                        raise KernelError("foreign_local_checkout")
-                symbolic = self.git.run("symbolic-ref", "-q", effect.source_ref, check=False)
-                if symbolic.returncode != 1:
-                    raise KernelError("foreign_local_checkout" if symbolic.returncode == 0 else "local_read_failed")
         if effect.operation != "validation_cleanup":
             return effect
         return replace(effect, payload={**effect.payload,
@@ -231,12 +213,6 @@ class LocalEffects:
     def reconcile(self, effect: Effect) -> EffectResult:
         """Observe original physical facts without using response receipts as proof."""
         try:
-            prebuilt = None
-            if "prebuilt_workspace" in effect.payload:
-                from .migration_run_ownership import authenticate_prebuilt_workspace
-                prebuilt = authenticate_prebuilt_workspace(self.git, effect)
-                if prebuilt is None:
-                    raise KernelError("foreign_local_checkout")
             if effect.operation == "inspect_resources":
                 return self._resource_result(effect)
             if effect.operation == "cleanup_local_ref":
@@ -246,19 +222,17 @@ class LocalEffects:
             checkout, head = self._checkout(effect)
             if effect.operation in {"workspace", "validation_checkout"}:
                 expected = effect.before_sha if effect.operation == "workspace" else effect.payload["reviewed_commit"]
-                initial = (prebuilt["workspace_oid"] if prebuilt is not None
-                           and prebuilt["before_head"] is not None and prebuilt["checkout_status"] == [] else None)
                 if effect.operation == "workspace" and effect.payload["create_ref"]:
                     refs = self.git.run("for-each-ref", "--format=%(refname) %(objectname)", effect.source_ref).stdout.splitlines()
                     if refs and refs != [f"{effect.source_ref} {expected}"]:
                         return EffectResult("third")
                     if not refs:
-                        return EffectResult("prior" if head in {None, initial, expected} else "third")
+                        return EffectResult("prior" if head in {None, expected} else "third")
                 if head is None:
                     return EffectResult("prior")
                 if head == expected:
                     return EffectResult("target", self.git.commit(head))
-                return EffectResult("prior" if initial is not None and head == initial else "third")
+                return EffectResult("third")
             if head is None:
                 return EffectResult("unknown")
             if effect.operation == "candidate":
@@ -320,8 +294,6 @@ class LocalEffects:
                     writer.run("update-ref", effect.source_ref, expected, "0" * len(expected))
             if head is None:
                 writer.run("worktree", "add", "--detach", str(checkout), expected)
-            elif effect.operation == "workspace" and "prebuilt_workspace" in effect.payload and head != expected:
-                writer.run("switch", "--detach", "--no-overwrite-ignore", "--no-recurse-submodules", expected, cwd=checkout)
         elif effect.operation == "candidate":
             writer.candidate(checkout, effect.before_sha, effect.effect_id, tuple(effect.payload["parents"]))
         elif effect.operation == "integrate":

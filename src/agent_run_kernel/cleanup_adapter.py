@@ -184,26 +184,11 @@ def _abandon_resource(effect: Effect) -> ResourceWitness | None:
     return resource
 
 
-def _resource_worktree(git: LocalGit, resource: ResourceWitness, *, allow_dirty: bool = False
-                       ) -> tuple[Path, Path, Path, str, str] | None:
+def _resource_worktree(resource: ResourceWitness) -> tuple[Path, Path, Path, str, str] | None:
     paths = _worktree_paths((resource.checkout, resource.owned_root, resource.common_git_dir))
     if paths is None:
         return None
-    expected = resource.head_sha
-    if resource.prebuilt_workspace is not None:
-        # Ownership also imports our read helper; keep this dependency local.
-        from .migration_run_ownership import authenticate_prebuilt_resource
-        binding = authenticate_prebuilt_resource(git, resource, allow_dirty=allow_dirty)
-        if binding is None:
-            raise KernelError("foreign_local_checkout")
-        if paths[0].exists():
-            expected = _read(git, "rev-parse", "--verify", "HEAD", cwd=paths[0]).stdout.strip()
-            allowed = {resource.head_sha}
-            if binding["before_head"] is not None:
-                allowed.add(binding["workspace_oid"])
-            if expected not in allowed:
-                raise KernelError("foreign_local_checkout")
-    return (*paths, resource.source_ref, expected)
+    return (*paths, resource.source_ref, resource.head_sha)
 
 
 def inspect_worktree(git: LocalGit, effect: Effect) -> EffectResult:
@@ -211,13 +196,9 @@ def inspect_worktree(git: LocalGit, effect: Effect) -> EffectResult:
     try:
         discard = effect.operation == "abandon_worktree" and effect.payload.get("discard_worktree") is True
         resource = _abandon_resource(effect) if effect.operation == "abandon_worktree" else None
-        prebuilt = resource is not None and resource.prebuilt_workspace is not None
-        identity = (_resource_worktree(git, resource, allow_dirty=discard)
-                    if prebuilt and resource is not None else _worktree(effect))
+        identity = _worktree(effect)
         observed = _inspect_worktree(git, identity,
                                     check_dirty=effect.operation != "validation_cleanup" and not discard)
-        if prebuilt and identity is not None and observed.disposition == "prior":
-            observed = replace(observed, raw={**observed.raw, "head": identity[-1]})
         if resource is not None:
             return replace(observed, raw={**observed.raw, "resource": resource_wire(resource)})
         return observed
@@ -232,7 +213,7 @@ def inspect_resource(git: LocalGit, resource: ResourceWitness) -> ResourceInspec
     if not _valid_resource(resource):
         return ResourceInspection(resource, "foreign", reason="invalid_worktree_identity")
     try:
-        identity = _resource_worktree(git, resource, allow_dirty=True)
+        identity = _resource_worktree(resource)
         if identity is None:
             return ResourceInspection(resource, "foreign", reason="invalid_worktree_identity")
     except KernelError as error:

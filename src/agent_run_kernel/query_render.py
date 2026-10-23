@@ -165,9 +165,6 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
             yield f"{run['repository']} Parent #{run['parent']} {run['run_id']}"
             yield f"  {run['repository_root'] or copy['unknown']} | {stamp or copy['unknown']} ({zone}) | {', '.join(run['phases'])}"
         return
-    if "original_source" in data:
-        yield from _original_lines(data, document.language, details, history=document.kind == "history")
-        return
     yield f"{copy['run']}: {data['repository']} Parent #{data['parent']['number']}"
     if data["parent"]["title"]:
         yield data["parent"]["title"]
@@ -232,8 +229,6 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
             for finding in review_findings(review["artifact"]):
                 yield f"{copy['findings']}: {finding}"
     if document.kind == "history":
-        if "original" in data:
-            yield from _original_lines(data["original"], document.language, details, history=True)
         yield copy["history"]
         attempts = {row["id"]: row for row in data["semantic_agent_attempts"]}
         invocations = {row["id"]: row for row in data["agent_invocations"]}
@@ -267,65 +262,6 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
             for invocation in data["agent_invocations"]:
                 yield f"{invocation['attempt']} — {copy['model']}: {invocation['model']} | {copy['effort']}: {invocation['effort']}"
                 yield f"  {copy['duration']}: {copy['incomplete']}"
-        if data["history_page"]["has_more"]:
-            yield f"{copy['more']}: --after {data['history_page']['next_after']}"
-
-
-def _original_lines(data: Mapping[str, Any], language: str, details: bool, *, history: bool) -> Iterator[str]:
-    copy, terms = _COPY[language], _TERMS[language]
-    yield "原始运行记录（只读历史来源）" if language == "zh" else "Original Run records (read-only source)"
-    yield f"{copy['run']}: {data['repository']} Parent #{data['parent']['number']}"
-    if data["parent"]["title"]:
-        yield data["parent"]["title"]
-    yield f"{copy['status']}: {terms.get(data['status'], data['status'])} | {copy['phase']}: {terms.get(data['phase'], data['phase'])}"
-    stamp, zone = _time(data["created_at"])
-    yield f"{stamp or copy['unknown']} [{zone}]"
-    yield copy["unknown_live"]
-    for gate in data["recorded_gates"]:
-        job = next((job for job in data["recorded_jobs"] if job["job_id"] == gate["job_id"]), None)
-        if job is None:
-            continue
-        target = job.get("value_ticket_number") or data["parent"]["number"]
-        reason = gate["reason"] or gate["public_phase"]
-        yield f"{copy['gates']}: #{target} — {terms.get(reason, reason)}"
-    for item in data["current_findings"]:
-        value = item["value"]
-        findings = review_findings(value)
-        if not findings:
-            findings = [str(part) for part in value] if isinstance(value, list) else [
-                str(value.get("message", value.get("code", value))) if isinstance(value, Mapping) else str(value)]
-        for finding in findings:
-            yield f"{copy['findings']}: {finding}"
-    if data["agent_invocations"]:
-        invocation = data["agent_invocations"][-1]
-        role = invocation.get("role")
-        yield f"{copy['agent']}: {copy.get(role, role)} | {copy['model']}: {invocation.get('model')} | {copy['effort']}: {invocation.get('reasoning_effort')}"
-    if history:
-        attempts = {attempt["attempt_id"]: attempt for attempt in data["semantic_agent_attempts"]}
-        shown = set()
-        for event in data["events"]:
-            facts = event["facts"]
-            identity = facts.get("semantic_attempt_id")
-            if identity in attempts and identity not in shown:
-                attempt = attempts[identity]
-                shown.add(identity)
-                role = attempt["role"]
-                yield f"{attempt['work_subject']} {copy.get(role, role)} #{attempt['ordinal']}"
-            stamp, zone = _time(event["created_at"])
-            kind = facts.get("kind")
-            target = f"#{facts['ticket']}" if facts.get("ticket") else "Run"
-            yield f"{stamp or copy['unknown']} [{zone}] {target} {terms.get(kind, kind)}"
-            for field in ("human_blockers", "external_wait_reason"):
-                if facts.get(field) is not None:
-                    value = _body(facts[field])
-                    yield value if details or len(value) <= 1000 else value[:1000] + " [truncated; --details]"
-            if details:
-                yield _body(facts)
-        if details:
-            for raw in data["raw_returns"].values():
-                yield _body(raw["value"])
-            for response in data["human_feedback"]:
-                yield _body(response["value"])
         if data["history_page"]["has_more"]:
             yield f"{copy['more']}: --after {data['history_page']['next_after']}"
 

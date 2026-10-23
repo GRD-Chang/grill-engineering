@@ -14,6 +14,7 @@ from agent_run_kernel.model import Issue, ParentIssue, Requirements
 from agent_run_kernel.offline import GraphScenario, fixture_inputs
 from support.core_operations import CoreOperations, ReadOnlyPorts
 from agent_run_kernel.operation_runner import DeliveryFacts
+from agent_run_kernel.storage import PROTOCOL
 from test_kernel_exploration import ticket_spec
 
 
@@ -42,6 +43,12 @@ def test_human_resume_uses_attempt_input_and_binding_without_charging_again(tmp_
     second = operations.until(lambda step: step.call is not None).call
     assert second is not None and second.attempt_id == first.attempt_id
     with kernel.storage.transaction(write=False) as tx:
+        assert tx.one("SELECT protocol FROM meta")[0] == PROTOCOL == "independent-delivery-kernel-v19"
+        references = {row["from"]: (row["table"], row["to"])
+                      for row in tx.execute("PRAGMA foreign_key_list(attempts)")}
+        assert references["thread_id"] == ("threads", "id")
+        assert references["opening_id"] == ("material", "id")
+        assert tx.execute("PRAGMA foreign_key_check").fetchone() is None
         facts = load_continuation(tx, first.attempt_id)
         attempt = tx.one("SELECT thread_id,opening_id,context_id FROM attempts WHERE id=?", (first.attempt_id,))
     assert facts.thread_id == attempt["thread_id"] == second.thread_id

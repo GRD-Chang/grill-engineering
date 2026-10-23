@@ -15,12 +15,11 @@ from typing import Any, Literal, Mapping, Sequence
 from agent_run.task_identity import TaskKey
 from agent_run.notification_outbox import read_notifications
 
-from . import original_query
 from .execution_facts import activity, recorded_profile
 from .notification_events import resume_facts
 from .model import KernelError, Role, artifact
-from .migration_records import record_reference
 from .storage import QUERY_LIMIT, Storage, Transaction
+from .state_preflight import UnsupportedState, require_supported_state
 from .task_location import read_task, task_path
 
 
@@ -32,10 +31,19 @@ class QueryDocument:
 
 
 class QueryError(ValueError):
-    def __init__(self, code: str, detail: str, *, candidates: Sequence[Mapping[str, Any]] = ()) -> None:
+    def __init__(self, code: str, detail: str, *, candidates: Sequence[Mapping[str, Any]] = (),
+                 state_diagnostic: Mapping[str, Any] | None = None) -> None:
         self.code = code
         self.candidates = list(candidates)
+        self.state_diagnostic = state_diagnostic
         super().__init__(detail)
+
+
+def _state_error(path: Path, error: Exception) -> QueryError:
+    code = error.code if isinstance(error, KernelError) and error.code in {"query_limit", "storage_limit"} else "incompatible_run_state"
+    return QueryError(code, f"Cannot interpret Run state at {path}: {error}. "
+                      "Only the current native format is supported. Preserve the state and use a "
+                      "Runner matching the authoritative database for inspection; do not rewrite its Task pointer or fences.")
 
 
 def _all(tx: Transaction, sql: str, values: Sequence[Any] = ()) -> list[dict[str, Any]]:
@@ -115,12 +123,15 @@ def _header(tx: Transaction, path: Path) -> dict[str, Any]:
 
 def header(path: Path) -> dict[str, Any]:
     try:
+        require_supported_state(path)
         with Storage(path).transaction(write=False) as tx:
             return _header(tx, path)
+    except UnsupportedState:
+        raise
     except KernelError as error:
-        raise QueryError(error.code if error.code in {"query_limit", "storage_limit"} else "incompatible_run_state", str(error)) from error
+        raise _state_error(path, error) from error
     except (sqlite3.Error, OSError, ValueError, KeyError, TypeError) as error:
-        raise QueryError("incompatible_run_state", str(error)) from error
+        raise _state_error(path, error) from error
 
 
 def task_binding(task: TaskKey) -> tuple[str, Path] | None:
@@ -172,19 +183,25 @@ def discover(root: Path, *, published: Mapping[Path, str] | None = None,
                 continue
             raise QueryError("run_locator_conflict", f"Symbolic database path: {path}")
         try:
-            original = original_query.protocol(path)
-            found = (original_query.headers(path, run_id=run_id, repository=repository, parent=parent)
-                     if original else [header(path)])
+            candidate = header(path)
+        except UnsupportedState as error:
+            if expected is None:
+                raise
+            # Keep the publication's known identity without reading an
+            # unsupported database to infer any additional Run facts.
+            raise QueryError(error.code, str(error), state_diagnostic=error.diagnostic(), candidates=[{
+                "run_id": expected, "database": str(path), "state_dir": str(path.parent),
+                "repository": repository, "parent": parent, "repository_root": None,
+            }]) from error
         except (ValueError, sqlite3.Error, OSError, KernelError, KeyError, TypeError) as error:
             if published is not None and expected is None:
                 continue
             if isinstance(error, QueryError):
                 raise
             raise QueryError("incompatible_run_state", str(error)) from error
-        for candidate in found:
-            if expected is not None and candidate["run_id"] != expected:
-                raise QueryError("run_locator_conflict", f"Task publication names a different Run: {path}")
-            candidates.append(candidate)
+        if expected is not None and candidate["run_id"] != expected:
+            raise QueryError("run_locator_conflict", f"Task publication names a different Run: {path}")
+        candidates.append(candidate)
         if published is None and len(candidates) > 256:
             raise QueryError("query_limit", "Too many local candidates; provide --state-dir")
     return candidates
@@ -752,39 +769,6 @@ def notification_boundaries(tx: Transaction, path: Path) -> dict[str, Any]:
             "highwater": tx.one("SELECT coalesce(max(position),0) FROM history")[0]}
 
 
-def read(path: Path, kind: Literal["status", "history", "settings"], *, after: int = 0, limit: int | None = None,
-         expected_run: str | None = None, expected_repository: str | None = None) -> QueryDocument:
-    """Select original read facts or current native facts; neither grants control."""
-    if after < 0 or (limit is not None and not 1 <= limit <= 128):
-        raise QueryError("query_limit", "History requires after >= 0 and limit between 1 and 128")
-    try:
-        if original_query.protocol(path):
-            if kind == "settings":
-                raise QueryError("recovery_materials_missing", "Original records are available through status and history")
-            with original_query.connection(path) as db:
-                if expected_run is None:
-                    rows = db.execute("SELECT run_id FROM runs LIMIT 2").fetchall()
-                    if len(rows) != 1:
-                        raise QueryError("run_locator_conflict", "Select an exact original Run")
-                    expected_run = rows[0][0]
-                reader = original_query.OriginalRecords(db, path, expected_run)
-                data = original_query.document(reader, path, history=kind == "history", after=after, limit=limit or 128)
-            if expected_repository is not None and data["repository"].lower() != expected_repository:
-                raise QueryError("run_locator_conflict", "Original Run and repository do not match")
-            if len(json.dumps(data, ensure_ascii=False).encode()) > QUERY_LIMIT:
-                raise QueryError("query_limit", "Original query exceeds byte limit")
-            return QueryDocument(kind, data["language"], data)
-        with Storage(path).transaction(write=False) as tx:
-            imported = kind != "settings" and record_reference(tx) is not None
-        records = original_query.ImportedRecords(Storage(path)) if imported and kind != "settings" else None
-        return _read_native(path, kind, after=after, limit=limit, expected_run=expected_run,
-                            expected_repository=expected_repository, records=records)
-    except QueryError:
-        raise
-    except (ValueError, sqlite3.Error, OSError, KeyError, TypeError, KernelError) as error:
-        raise QueryError("incompatible_run_state", str(error)) from error
-
-
 def _native_history(tx: Transaction, current: Mapping[str, Any], subjects: list[dict[str, Any]], *,
                     after: int, limit: int | None) -> dict[str, Any]:
     events = (_all(tx, "SELECT * FROM history WHERE position>? ORDER BY position", (after,)) if limit is None else
@@ -823,12 +807,13 @@ def _native_history(tx: Transaction, current: Mapping[str, Any], subjects: list[
     return result
 
 
-def _read_native(path: Path, kind: Literal["status", "history", "settings"], *, after: int = 0, limit: int | None = None,
-                 expected_run: str | None = None, expected_repository: str | None = None,
-                 records: original_query.ImportedRecords | None = None) -> QueryDocument:
+def read(path: Path, kind: Literal["status", "history", "settings"], *, after: int = 0, limit: int | None = None,
+         expected_run: str | None = None, expected_repository: str | None = None) -> QueryDocument:
+    """Read native facts without granting control or interpreting other formats."""
     if after < 0 or (limit is not None and not 1 <= limit <= 128):
         raise QueryError("query_limit", "History requires after >= 0 and an optional limit between 1 and 128")
     try:
+        require_supported_state(path)
         with Storage(path).transaction(write=False) as tx:
             location = _header(tx, path)
             run = dict(tx.one("SELECT * FROM runs"))
@@ -894,33 +879,16 @@ def _read_native(path: Path, kind: Literal["status", "history", "settings"], *, 
                 data["unavailable_facts"].append("notifications")
             if data["notifications"]["configuration"] is None:
                 data["unavailable_facts"].append("notifications.configuration")
-            # Original Task imports prepend archived slots. Copied imports already
-            # retain those business events in native history; do not repeat them.
-            # Select the page before reading either evidence closure.
-            original_count = 0
-            remaining = limit
-            if records is not None and not (kind == "history" and records.native_history):
-                original_count = records.count('run_timeline_slots')
-                original = original_query.document(records, path, history=kind == "history",
-                    after=min(after, original_count), limit=limit or 128)
-                data["original"] = original
-                remaining = (0 if original["history_page"]["has_more"] else
-                             (limit or 128) - len(original["events"]))
             if kind == "history":
-                data.update(_native_history(tx, data, subjects, after=max(0, after-original_count), limit=remaining))
-                if records is not None and not records.native_history:
-                    old_page = data["original"]["history_page"]
-                    native_page = data["history_page"]
-                    next_after = (original_count + native_page["next_after"] if remaining else
-                                  after + len(data["original"]["events"]))
-                    data["history_page"] = {"after": after, "next_after": next_after,
-                        "has_more": old_page["has_more"] or native_page["has_more"]}
+                data.update(_native_history(tx, data, subjects, after=after, limit=limit))
             if len(json.dumps(data, ensure_ascii=False, allow_nan=False).encode()) > QUERY_LIMIT:
                 raise QueryError("query_limit", "Public response exceeds its bounded limit")
             return QueryDocument(kind, language, data)
     except QueryError:
         raise
+    except UnsupportedState:
+        raise
     except KernelError as error:
-        raise QueryError(error.code if error.code in {"query_limit", "storage_limit"} else "incompatible_run_state", str(error)) from error
+        raise _state_error(path, error) from error
     except (sqlite3.Error, OSError, ValueError, KeyError, TypeError) as error:
-        raise QueryError("incompatible_run_state", str(error)) from error
+        raise _state_error(path, error) from error

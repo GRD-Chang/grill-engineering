@@ -139,29 +139,6 @@ def bind_attempt_continuation(tx: Transaction, attempt_id: str, basis: AttemptCo
                (basis.thread_id, material, basis.context_id, attempt_id))
 
 
-def backfill_native_continuation(tx: Transaction, attempt: sqlite3.Row) -> None:
-    """One-version upgrade reads exact native records; never decode old imports."""
-    calls = tx.rows("SELECT * FROM invocations WHERE attempt=? ORDER BY rowid DESC LIMIT 1", (attempt['id'],))
-    if not calls:
-        if attempt['current_invocation'] is not None:
-            raise KernelError('continuation_upgrade_missing_native')
-        tx.get(attempt['context_id'], attempt['subject'])
-        return  # No physical binding to infer. Preserve the row without granting one.
-    invocation = (tx.one("SELECT * FROM invocations WHERE id=? AND attempt=?", (attempt['current_invocation'], attempt['id']))
-                  if attempt['current_invocation'] is not None else calls[0])
-    output = tx.one("SELECT context_id FROM invocation_outputs WHERE invocation=? ORDER BY ordinal DESC LIMIT 1", (invocation['id'],))
-    current = tx.one('SELECT current_attempt FROM subjects WHERE id=?', (attempt['subject'],))[0]
-    context_id = output['context_id'] if current == attempt['id'] else attempt['context_id']
-    if current == attempt['id']:
-        _context(tx, attempt, invocation['thread'], context_id)
-    else:
-        _thread(tx, attempt, invocation['thread'])
-        tx.get(context_id, attempt['subject'])  # Preserve historical context; never rebuild it.
-    material = tx.put(attempt['subject'], 'attempt_continuation_opening', wire_json(asdict(ContinuationOpening())))
-    tx.execute("UPDATE attempts SET thread_id=?,opening_id=?,context_id=? WHERE id=?",
-               (invocation['thread'], material, context_id, attempt['id']))
-
-
 def load_continuation(tx: Transaction, attempt_id: str) -> ContinuationFacts:
     attempt = tx.one("SELECT * FROM attempts WHERE id=?", (attempt_id,))
     if attempt['thread_id'] is None or attempt['opening_id'] is None:

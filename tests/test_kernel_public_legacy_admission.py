@@ -33,7 +33,7 @@ def test_public_run_refuses_the_original_unknown_v6_task_before_creation_or_laun
         assert main(["run", "1", "--repo", "example/project", "--json"]) == 2
         result = json.loads(capsys.readouterr().out)
         assert result["result"] == "error"
-        assert result["diagnostics"][0]["code"] == "legacy_requires_offline_migration"
+        assert result["diagnostics"][0]["code"] == "unsupported_state"
         assert hashlib.sha256((workspace.state_root / "state.sqlite3").read_bytes()).hexdigest() == before
         assert read_task(task_path(task)) is None
         assert list(workspace.state_root.glob("*/kernel.sqlite3")) == []

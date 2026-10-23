@@ -7,18 +7,12 @@ import pytest
 
 from agent_run_kernel import Issue, ParentIssue, Requirements
 from agent_run_kernel.effects import LocalGit
-from agent_run_kernel import migration_run_ownership
 from agent_run_kernel.offline import GraphScenario
 from test_kernel_workspace_allocation import workspace_intent
 from test_kernel_remote_effects import EffectBoundary, effect_boundary
 from support.core_operations import CoreOperations
 
 
-@pytest.fixture(autouse=True)
-def ordinary_native_source_port(monkeypatch):
-    # This is a native fixture with no import proof. The frozen source port's
-    # production implementation is pending; only its no-proof answer is mocked.
-    monkeypatch.setattr(migration_run_ownership, "prebuilt_workspace_binding", lambda *args: None, raising=False)
 
 
 @pytest.mark.parametrize("control", ["abandon", "source-change"])

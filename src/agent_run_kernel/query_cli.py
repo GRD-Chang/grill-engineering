@@ -28,6 +28,7 @@ from . import personal_settings
 from .query import QueryDocument, QueryError, discover, read, task_binding, task_published
 from .query_render import render, render_settings, safe_text
 from .task_location import read_task_bindings
+from .state_preflight import UnsupportedState
 
 
 class _Parser(argparse.ArgumentParser):
@@ -150,7 +151,6 @@ def _candidates(parsed: argparse.Namespace) -> list[dict[str, Any]]:
     published: dict[Path, str] | None = None
     repository: str | None = None
     selected_task: TaskKey | None = None
-    original_routes: list[dict[str, Any]] = []
     if parsed.state_dir is not None:
         roots = [parsed.state_dir]
     elif getattr(parsed, "data_root", None) is not None:
@@ -160,20 +160,6 @@ def _candidates(parsed: argparse.Namespace) -> list[dict[str, Any]]:
         if repository is None and not getattr(parsed, "run_id", None):
             repository = _cwd_repository()
         roots = _managed_state_roots(repository)
-        from .original_query import locator_entries
-        try:
-            for route in locator_entries(app_data_root() / "run-locator.json",
-                    run_id=getattr(parsed, "run_id", None), repository=repository, parent=parsed.parent):
-                directory = Path(route["state_dir"])
-                if not directory.exists():
-                    raise QueryError("run_locator_stale", f"Original Run state is missing: {directory}")
-                original_routes.append(route)
-                if directory not in roots:
-                    roots.append(directory)
-        except (ValueError, OSError) as error:
-            if isinstance(error, QueryError):
-                raise
-            raise QueryError("run_locator_invalid", str(error)) from error
         published = {}
         base = app_data_root() / "repositories"
         if repository is not None and parsed.parent is not None:
@@ -219,19 +205,6 @@ def _candidates(parsed: argparse.Namespace) -> list[dict[str, Any]]:
         for candidate in discover(root, published=published, run_id=getattr(parsed, "run_id", None),
                                   repository=repository or (_repository(parsed.repo) if parsed.repo else None),
                                   parent=parsed.parent):
-            original = candidate.get("original_source")
-            if original is not None:
-                routes = [route for route in original_routes if route["run_id"] == candidate["run_id"]
-                          and Path(route["state_dir"]).resolve() == Path(candidate["state_dir"]).resolve()]
-                for route in routes:
-                    if (route.get("repository") is not None and
-                            (_repository(route["repository"]) != candidate["repository"].lower()
-                             or route["parent_number"] != candidate["parent"])):
-                        raise QueryError("run_locator_conflict", "Original locator and Run identities differ")
-                if len({route["repository_root"] for route in routes}) > 1:
-                    raise QueryError("run_locator_conflict", "Original locator names different clones")
-                if routes:
-                    candidate["repository_root"] = routes[0]["repository_root"]
             if published is not None:
                 exact = getattr(parsed, "run_id", None)
                 if (selected_task is not None and Path(candidate["database"]).resolve() in published
@@ -243,22 +216,11 @@ def _candidates(parsed: argparse.Namespace) -> list[dict[str, Any]]:
                         or (parsed.parent is not None and candidate["parent"] != parsed.parent)
                         or (exact and candidate["run_id"] != exact)):
                     continue
-                if original is None and not task_published(candidate) and not candidate["is_terminal"]:
+                if not task_published(candidate) and not candidate["is_terminal"]:
                     continue
             result[(str(Path(candidate["database"]).resolve()), candidate["run_id"])] = candidate
             if len(result) > 256:
                 raise QueryError("query_limit", "Too many local candidates; provide --state-dir")
-    # A retired original and its published native target are the same routing
-    # lineage. Explicit state selection still permits reading the original copy.
-    for route in original_routes:
-        if not any(item["run_id"] == route["run_id"] and Path(item["state_dir"]).resolve()
-                   == Path(route["state_dir"]).resolve() for item in result.values()):
-            raise QueryError("run_locator_stale", "Original locator cannot be verified against its Run")
-    for key, candidate in list(result.items()):
-        target = candidate.get("original_source", {}).get("target_database")
-        native = result.get((str(Path(target).resolve()), candidate["run_id"])) if target else None
-        if original_routes and native is not None and task_published(native):
-            del result[key]
     return list(result.values())
 
 
@@ -356,8 +318,15 @@ def main(arguments: Sequence[str] | None = None) -> int:
         language = getattr(parsed, "_run_language", language)
         diagnostic_code = "execution_readiness" if isinstance(error, HostUnavailable) else str(getattr(error, "code", "command_failed"))
         error_candidates = error.candidates if isinstance(error, QueryError) else []
+        state_diagnostic = (error.diagnostic() if isinstance(error, UnsupportedState)
+                            else error.state_diagnostic if isinstance(error, QueryError) else None)
+        diagnostic = state_diagnostic or {"code": diagnostic_code, "message": str(error)}
         error_output: dict[str, Any] = {"result": "error", "status": "command_failed",
-                  "diagnostics": [{"code": diagnostic_code, "message": str(error)}]}
+                  "diagnostics": [diagnostic]}
+        if state_diagnostic is not None:
+            error_output["selection"] = {key: str(value) if isinstance(value, Path) else value
+                for key in ("run_id", "repo", "parent", "state_dir", "data_root")
+                if (value := getattr(parsed, key, None)) is not None}
         if error_candidates:
             error_output["candidates"] = error_candidates
         if parsed.as_json:
@@ -365,9 +334,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
         else:
             prefix = "命令未应用" if language == "zh" else "Command not applied"
             print(safe_text(f"{prefix}: {diagnostic_code}\n{error_detail(error, language)}"))
+            if state_diagnostic is not None:
+                print(safe_text(f"{diagnostic['path']}\n{diagnostic['recovery_hint']}"))
             for error_candidate in error_candidates:
                 root = error_candidate["repository_root"] or ("未记录" if language == "zh" else "Not recorded")
-                print(safe_text(f"{error_candidate['repository']} Parent #{error_candidate['parent']} {error_candidate['run_id']} {root} [{error_candidate['state_dir']}]"))
+                scope = (f"{error_candidate['repository']} Parent #{error_candidate['parent']} "
+                         if error_candidate["repository"] is not None and error_candidate["parent"] is not None else "")
+                print(safe_text(f"{scope}{error_candidate['run_id']} {root} [{error_candidate['state_dir']}]"))
         return 2
     except KeyboardInterrupt:
         return 130

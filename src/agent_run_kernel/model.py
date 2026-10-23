@@ -346,7 +346,6 @@ class ResourceWitness:
     common_git_dir: str
     source_ref: str
     head_sha: str
-    prebuilt_workspace: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -358,10 +357,7 @@ class ResourceInspection:
 
 
 def resource_wire(resource: ResourceWitness) -> dict[str, Any]:
-    value = asdict(resource)
-    if resource.prebuilt_workspace is None:
-        del value["prebuilt_workspace"]
-    return value
+    return asdict(resource)
 
 
 def inspection_wire(inspection: ResourceInspection) -> dict[str, Any]:
