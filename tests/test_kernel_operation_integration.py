@@ -202,15 +202,15 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
     monkeypatch.setattr('agent_run.notifications.sender.NativeNotifications', Notifications)
     def expired(_signum, _frame):
         raise TimeoutError("CI/Agent concurrency story exceeded its 30-second watchdog")
+    if signal.getitimer(signal.ITIMER_REAL) != (0.0, 0.0):
+        raise RuntimeError("CI/Agent concurrency watchdog requires an inactive ITIMER_REAL")
     previous_handler = signal.signal(signal.SIGALRM, expired)
-    previous_timer = signal.setitimer(signal.ITIMER_REAL, 30)
     try:
+        signal.setitimer(signal.ITIMER_REAL, 30)
         assert executor.run(scenario.kernel, scenario.execution, {}) == 0
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous_handler)
-        if previous_timer != (0.0, 0.0):
-            signal.setitimer(signal.ITIMER_REAL, *previous_timer)
     assert entered.is_set() and polled.is_set()
     assert scenario.kernel.status(scenario.kernel.source_status()["final_subject"])["phase"] == "approval"
 
