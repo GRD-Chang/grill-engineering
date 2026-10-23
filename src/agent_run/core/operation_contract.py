@@ -6,7 +6,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Callable, Literal, Mapping, Protocol
 
-from .model import (Checks, Commit, CreationInputs, Effect, EffectResult, Execution,
+from agent_run.model import (Checks, Commit, CreationInputs, Effect, EffectResult, Execution,
                     PullRequest, Requirements, ResourceInspection, ResourceWitness, World)
 
 class ReadUnavailable(RuntimeError):

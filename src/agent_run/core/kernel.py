@@ -19,22 +19,23 @@ from typing import Any, Callable, Literal, Mapping
 from threading import RLock
 from uuid import uuid4
 
-from agent_run.agent_profiles import ProfileOverrides, resolve_profiles, validate_profile_options
-from agent_run.github_identity import validate_identity_snapshot
-from agent_run.prompt_resources import validate_resources
-from agent_run.task_identity import TaskKey
+from agent_run.contracts.agent_profiles import ProfileOverrides, resolve_profiles, validate_profile_options
+from agent_run.contracts.identity import validate_identity_snapshot
+from agent_run.contracts.prompt import validate_resources
+from agent_run.contracts.task import TaskKey
 
-from .model import (
-    AgentCall, Checks, Commit, CreationInputs, DeliveryKind, Effect, EffectResult, Execution, HostLaunch, HostObservation, KernelError, ObservationSuperseded,
+from agent_run.model import (
+    AgentCall, Checks, Commit, CreationInputs, DeliveryKind, Effect, EffectResult, Execution, HostLaunch, HostObservation,
     Delivery, Policy, Profile, PullRequest, Purpose, Requirements, ResourceInspection, ResourceWitness, Role, RunSpec, Step, World, ReadWait, artifact, inspection_wire, resource_wire, review_outcome, wire_json,
 )
-from .storage import CURRENT_LIMIT, Storage, Transaction
-from .attempt_continuation import (AttemptContinuationBasis, ContinuationFacts, ContinuationOpening,
+from agent_run.errors import KernelError, ObservationSuperseded
+from agent_run.storage.sqlite import CURRENT_LIMIT, Storage, Transaction
+from agent_run.core.attempt_continuation import (AttemptContinuationBasis, ContinuationFacts, ContinuationOpening,
                                    bind_attempt_continuation, load_continuation)
-from .configuration import checkpoint_policy
-from .task_location import bind_task, read_task
-from .legacy_admission import locked_admission
-from .operation_contract import (OperationBinding, OperationState, ReadUnavailable, ReadFence,
+from agent_run.contracts.policy_values import checkpoint_policy
+from agent_run.storage.tasks import bind_task, read_task
+from agent_run.storage.admission import locked_admission
+from agent_run.core.operation_contract import (OperationBinding, OperationState, ReadUnavailable, ReadFence,
                                  RequirementsRead, DeliveryObservation, DeliveryRead, DeliveryFacts,
                                  _SentRead, _ApprovalRead, _ObservationPass, Work, PrepareIO, EffectIO, ObserveIO, IORequest, IOResult)
 
@@ -511,7 +512,7 @@ class Kernel:
         if isinstance(request, EffectIO) and isinstance(result, EffectResult):
             returncode = result.raw.get("write_returncode")
             if type(returncode) is int and returncode != 0:
-                from agent_run.error_safety import bounded_error
+                from agent_run.errors import bounded_error
                 self.observe_effect_failure(request.effect, {"returncode": returncode,
                     "message": bounded_error(str(result.raw.get("write_diagnostic", "")))})
             if request.kind == "readback" or request.effect.operation != "issue_link":
@@ -569,7 +570,7 @@ class Kernel:
         return step
 
     def fail_work(self, work: Work, error: ReadWait | ReadUnavailable | KernelError | OSError, *, request: IORequest | None = None) -> Step:
-        from agent_run.error_safety import bounded_error
+        from agent_run.errors import bounded_error
         if isinstance(request, EffectIO) and request.kind == "execute":
             if isinstance(error, ReadUnavailable) and error.write_returncode not in (None, 0):
                 self.observe_effect_failure(request.effect, {"returncode": error.write_returncode,
@@ -2281,7 +2282,7 @@ class Kernel:
 
     def _wait_for_read(self, token: str | ReadFence, execution: Execution, code: str, message: str, *, readback: Effect | None = None) -> Step:
         """Persist one original read outage; successful reads alone never renew it."""
-        from agent_run.error_safety import bounded_error
+        from agent_run.errors import bounded_error
 
         value = self._automatic_token(token)
         scope, subject = value["scope"], value["scope"]["subject"]

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from agent_run.prompt_resources import bind_resources, resource
+from agent_run.config.resources import bind_resources, resource
 
 
 def pretty(value: object) -> str:

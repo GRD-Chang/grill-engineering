@@ -4,14 +4,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_run.development_prompts import development_prompt
-from agent_run.messages import validate_language
-from agent_run.prompt_context import pretty, structured_output_repair_prompt
-from agent_run.prompt_resources import validate_resources
-from agent_run.publication_prompts import publication_prompt
-from agent_run.reviewer_prompts import review_prompt
+from agent_run.core.prompts.development import development_prompt
+from agent_run.contracts.copy import validate_language
+from agent_run.core.prompts.context import pretty, structured_output_repair_prompt
+from agent_run.contracts.prompt import validate_resources
+from agent_run.core.prompts.publication import publication_prompt
+from agent_run.core.prompts.review import review_prompt
 
-from .model import AgentCall, DeliveryKind, KernelError, Purpose, Role
+from agent_run.model import AgentCall, DeliveryKind, Purpose, Role
+from agent_run.errors import KernelError
 
 
 def render_role_prompt(call: AgentCall) -> str:

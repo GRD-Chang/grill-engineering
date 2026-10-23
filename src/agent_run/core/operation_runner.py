@@ -16,13 +16,14 @@ import json
 
 
 
-from .model import AgentCall, Effect, EffectResult, Execution, KernelError, ReadWait, Step, World
-from .operation_contract import (OperationBinding, OperationPorts, OperationState, ReadUnavailable,
+from agent_run.model import AgentCall, Effect, EffectResult, Execution, ReadWait, Step, World
+from agent_run.errors import KernelError
+from agent_run.core.operation_contract import (OperationBinding, OperationPorts, OperationState, ReadUnavailable,
                                  ReadFence, RequirementsRead, DeliveryRead, DeliveryFacts,
                                  _ObservationPass, PrepareIO, EffectIO, ObserveIO, IOResult)
 
 if TYPE_CHECKING:
-    from .kernel import Kernel
+    from agent_run.core.kernel import Kernel
 
 
 def _read_observation(kernel: Kernel, ports: OperationPorts, request: RequirementsRead) -> tuple[World, ReadFence]:

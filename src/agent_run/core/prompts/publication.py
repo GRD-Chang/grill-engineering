@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_run.prompt_resources import bind_resources, resource
+from agent_run.config.resources import bind_resources, resource
 
-from agent_run.prompt_context import (
+from agent_run.core.prompts.context import (
     human_continuation,
     pretty,
     task_brief,
