@@ -1,13 +1,12 @@
-"""Attempt-owned input and binding, plus certified opening execution facts.
+"""Attempt-owned native input and binding; execution facts come from Invocations.
 
 Opening facts are immutable history, not current work or dispatch authority.
 The current result and Invocation still belong to the existing Attempt row.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import json
-import math
 import sqlite3
 from typing import Any, Mapping
 
@@ -34,18 +33,9 @@ class PriorExecution:
 
 
 @dataclass(frozen=True)
-class ContinuationOpening:
-    provenance_id: str | None = None
-    ordinary_used: int = 0
-    capacity_count: int = 0
-    prior: PriorExecution | None = None
-
-
-@dataclass(frozen=True)
 class AttemptContinuationBasis:
     thread_id: str
     context_id: str
-    opening: ContinuationOpening
 
 
 @dataclass(frozen=True)
@@ -87,49 +77,23 @@ def _context(tx: Transaction, attempt: sqlite3.Row, thread_id: str, context_id: 
     return context
 
 
-def _opening(tx: Transaction, attempt: sqlite3.Row, value: ContinuationOpening) -> None:
-    if (type(value.ordinary_used) is not int or value.ordinary_used not in (0, 1)
-            or type(value.capacity_count) is not int or value.capacity_count < 0):
+_NATIVE_OPENING = wire_json({"provenance_id": None, "ordinary_used": 0, "capacity_count": 0, "prior": None})
+
+
+def validate_native_opening(body: bytes) -> None:
+    """Accept exactly the native writer's bytes, without decoding imported facts."""
+    if body != _NATIVE_OPENING:
         raise KernelError('continuation_opening')
-    if value.provenance_id is None:
-        if value != ContinuationOpening():
-            raise KernelError('continuation_provenance_missing')
-        return
-    provenance = json.loads(tx.get(value.provenance_id, attempt['subject']))
-    if (not isinstance(provenance, dict) or provenance.get('attempt') != attempt['id']
-            or any(provenance.get(key) != attempt[key] for key in ('subject', 'generation', 'role', 'purpose', 'window'))):
-        raise KernelError('continuation_provenance_missing')
-    prior = value.prior
-    if prior is None:
-        raise KernelError('continuation_exit_missing')
-    if (prior.invocation_id is not None or prior.lease_id is not None or prior.status not in {'returned', 'interrupted'}
-            or type(prior.ordinal) is not int or not 0 <= prior.ordinal <= 2
-            or prior.dispatch_state not in {'exited', 'unavailable', 'unknown', 'allocated'}
-            or prior.failure_kind not in {None, 'ordinary', 'capacity', 'fatal'}
-            or prior.exit_code is not None and type(prior.exit_code) is not int
-            or any(type(number) not in (int, float) or not math.isfinite(number)
-                   for number in (prior.deadline_seconds, prior.deadline_at))
-            or prior.deadline_seconds <= 0
-            or prior.recovery_ready_at is not None and (type(prior.recovery_ready_at) not in (int, float)
-                or not math.isfinite(prior.recovery_ready_at))
-            or prior.failure_kind == 'capacity' and prior.recovery_ready_at is None):
-        raise KernelError('continuation_opening')
-    for material in (prior.raw_id, prior.process_identity, prior.start_evidence):
-        if material is not None:
-            tx.get(material, attempt['subject'])
 
 
 def bind_attempt_continuation(tx: Transaction, attempt_id: str, basis: AttemptContinuationBasis) -> None:
-    """Bind certified facts once, without choosing work, charging or allocating."""
+    """Bind native input once, without choosing work, charging or allocating."""
     attempt = tx.one("SELECT * FROM attempts WHERE id=?", (attempt_id,))
     _context(tx, attempt, basis.thread_id, basis.context_id)
-    _opening(tx, attempt, basis.opening)
-    if basis.opening.provenance_id is None and (attempt['status'] != 'allocated' or attempt['result_id'] is not None
+    if (attempt['status'] != 'allocated' or attempt['result_id'] is not None
             or attempt['outcome'] is not None or attempt['accounted'] or attempt['resume_action'] is not None):
-        raise KernelError('continuation_provenance_missing')
-    if attempt['result_id'] is not None and (basis.opening.prior is None or basis.opening.prior.raw_id != attempt['result_id']):
-        raise KernelError('continuation_return_changed')
-    material = tx.put(attempt['subject'], 'attempt_continuation_opening', wire_json(asdict(basis.opening)))
+        raise KernelError('continuation_already_started')
+    material = tx.put(attempt['subject'], 'attempt_continuation_opening', _NATIVE_OPENING)
     if attempt['thread_id'] is not None or attempt['opening_id'] is not None:
         if (attempt['thread_id'], attempt['opening_id'], attempt['context_id']) != (basis.thread_id, material, basis.context_id):
             raise KernelError('continuation_already_bound')
@@ -145,14 +109,8 @@ def load_continuation(tx: Transaction, attempt_id: str) -> ContinuationFacts:
     if attempt['thread_id'] is None or attempt['opening_id'] is None:
         raise KernelError('continuation_basis_missing')
     context = _context(tx, attempt, attempt['thread_id'], attempt['context_id'])
-    data = json.loads(tx.get(attempt['opening_id'], attempt['subject']))
-    try:
-        data['prior'] = None if data['prior'] is None else PriorExecution(**data['prior'])
-        opening = ContinuationOpening(**data)
-    except (KeyError, TypeError) as error:
-        raise KernelError('continuation_opening') from error
-    _opening(tx, attempt, opening)
-    prior = opening.prior
+    validate_native_opening(tx.get(attempt['opening_id'], attempt['subject']))
+    prior = None
     if attempt['current_invocation'] is not None:
         row = tx.one("SELECT i.*,o.* FROM invocations i JOIN invocation_outputs o ON o.invocation=i.id "
                      "WHERE i.id=? AND i.attempt=? ORDER BY ordinal DESC LIMIT 1", (attempt['current_invocation'], attempt_id))
@@ -165,5 +123,4 @@ def load_continuation(tx: Transaction, attempt_id: str) -> ContinuationFacts:
                     "FROM invocations WHERE attempt=?", (attempt_id,))
     ordinal = tx.one("SELECT coalesce(max(o.ordinal),0) FROM invocation_outputs o JOIN invocations i ON i.id=o.invocation "
                      "WHERE i.attempt=?", (attempt_id,))[0]
-    return ContinuationFacts(attempt['thread_id'], context, prior, opening.ordinary_used + counts[0],
-        opening.capacity_count + counts[1], max(ordinal, 0 if opening.prior is None else opening.prior.ordinal))
+    return ContinuationFacts(attempt['thread_id'], context, prior, counts[0], counts[1], ordinal)

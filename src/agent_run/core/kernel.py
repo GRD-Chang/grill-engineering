@@ -30,7 +30,7 @@ from agent_run.model import (
 )
 from agent_run.errors import KernelError, ObservationSuperseded
 from agent_run.storage.sqlite import CURRENT_LIMIT, Storage, Transaction
-from agent_run.core.attempt_continuation import (AttemptContinuationBasis, ContinuationFacts, ContinuationOpening,
+from agent_run.core.attempt_continuation import (AttemptContinuationBasis, ContinuationFacts,
                                    bind_attempt_continuation, load_continuation)
 from agent_run.contracts.policy_values import checkpoint_policy
 from agent_run.storage.tasks import bind_task, read_task
@@ -3398,7 +3398,7 @@ class Kernel:
                              Role.PUBLICATION: policy.publication_deadline_seconds}[role])
         deadline_at = previous.deadline_at if retain_period and previous is not None else allocated_at + deadline_seconds
         if pending is None:
-            bind_attempt_continuation(tx, attempt_id, AttemptContinuationBasis(thread_id, context_id, ContinuationOpening()))
+            bind_attempt_continuation(tx, attempt_id, AttemptContinuationBasis(thread_id, context_id))
         owned_period = (retain_period and previous is not None and previous.invocation_id is not None
                         and bool(tx.rows("SELECT id FROM invocations WHERE id=? AND executor=? AND epoch=? AND thread=?",
                                          (previous.invocation_id, execution.owner, execution.epoch, thread_id))))

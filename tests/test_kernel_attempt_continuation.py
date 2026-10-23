@@ -2,13 +2,13 @@
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-import json
 
 import pytest
 from agent_run.model import Commit, Delivery, DeliveryKind
 from agent_run.core.kernel import Kernel
+from agent_run.core import kernel as core_bindings
 from agent_run.errors import KernelError
-from agent_run.core.attempt_continuation import AttemptContinuationBasis, ContinuationOpening, bind_attempt_continuation, load_continuation
+from agent_run.core.attempt_continuation import load_continuation, validate_native_opening
 from agent_run.model import wire_json
 from agent_run.model import Issue, ParentIssue, Requirements
 from support.offline import GraphScenario, fixture_inputs
@@ -18,7 +18,16 @@ from agent_run.storage.preflight import PROTOCOL
 from test_kernel_exploration import ticket_spec
 
 
-def test_human_resume_uses_attempt_input_and_binding_without_charging_again(tmp_path: Path) -> None:
+def test_human_resume_uses_attempt_input_and_binding_without_charging_again(tmp_path: Path, monkeypatch) -> None:
+    bind = core_bindings.bind_attempt_continuation
+    bound = []
+
+    def retry_native_binding(tx, attempt_id, basis):
+        bind(tx, attempt_id, basis)
+        bind(tx, attempt_id, basis)  # Exact native retry, before Invocation allocation.
+        bound.append(attempt_id)
+
+    monkeypatch.setattr(core_bindings, "bind_attempt_continuation", retry_native_binding)
     source = Requirements(ParentIssue(1, "Parent", "Original requirement", (2,)), (
         Issue(2, "Ticket", "Implement the original requirement", "OPEN", frozenset({"ready-for-agent"})),
     ))
@@ -42,6 +51,7 @@ def test_human_resume_uses_attempt_input_and_binding_without_charging_again(tmp_
     kernel.control("resume", "answer", subject="ticket:2", message="Keep it.\r\n", new_thread=True)
     second = operations.until(lambda step: step.call is not None).call
     assert second is not None and second.attempt_id == first.attempt_id
+    assert bound == [first.attempt_id]
     with kernel.storage.transaction(write=False) as tx:
         assert tx.one("SELECT protocol FROM meta")[0] == PROTOCOL == "independent-delivery-kernel-v19"
         references = {row["from"]: (row["table"], row["to"])
@@ -51,6 +61,8 @@ def test_human_resume_uses_attempt_input_and_binding_without_charging_again(tmp_
         assert tx.execute("PRAGMA foreign_key_check").fetchone() is None
         facts = load_continuation(tx, first.attempt_id)
         attempt = tx.one("SELECT thread_id,opening_id,context_id FROM attempts WHERE id=?", (first.attempt_id,))
+        assert tx.get(attempt["opening_id"], first.subject) == wire_json({
+            "provenance_id": None, "ordinary_used": 0, "capacity_count": 0, "prior": None})
     assert facts.thread_id == attempt["thread_id"] == second.thread_id
     assert facts.context["human_responses"] == ["Keep it.\r\n"]
     assert facts.context["prior_human_blockers"] == ["Choose the original formatting."]
@@ -79,13 +91,9 @@ def _read_operations(kernel, execution, source):
     return CoreOperations(kernel, execution, lambda binding: ports)
 
 
-def _canonical_boundary(tmp_path: Path, *, ordinary_used: bool = False, malformed: bool = False,
+def _native_boundary(tmp_path: Path, *, ordinary_used: bool = False, malformed: bool = False,
                         failure_kind: str = 'ordinary', exit_proven: bool = True, return_body: bytes | None = None):
-    """Install actual native-produced facts in an empty unpublished Core DB.
-
-    Only immutable materials and semantic identity cross the seam. No source
-    Invocation, lease, action, gate, or prepared database is manufactured.
-    """
+    """Reach the boundary through native allocation/return/exit in one Run."""
     spec, requirements = _native_spec(tmp_path)
     spec = replace(spec, policy=replace(spec.policy, development_deadline_seconds=7))
     source = Kernel.create(tmp_path / "source.sqlite3", spec, requirements=requirements)
@@ -108,82 +116,52 @@ def _canonical_boundary(tmp_path: Path, *, ordinary_used: bool = False, malforme
         if index == 0 and ordinary_used:
             call = source_operations.once().call
             assert call is not None
-    with source.storage.transaction(write=False) as tx:
-        attempt = dict(tx.one("SELECT * FROM attempts WHERE id=?", (call.attempt_id,)))
-        thread = dict(tx.one("SELECT * FROM threads WHERE id=?", (call.thread_id,)))
-        materials = [dict(row) for row in tx.all("SELECT * FROM material")]
-        facts = load_continuation(tx, call.attempt_id)
-        budget = tx.one("SELECT developments_used,reviews_used FROM budgets WHERE subject='ticket:2' AND purpose='requirements'")
-    target = Kernel.create(tmp_path / "target.sqlite3", spec, requirements=requirements)
-    target.clock = lambda: 100.0
-    with target.storage.transaction() as tx:
-        for material in materials:
-            assert tx.put(material['subject'], material['purpose'], material['body']) == material['id']
-        tx.execute("INSERT INTO threads(id,subject,role,profile_revision,backend_id) VALUES (?,?,?,?,?)",
-                   tuple(thread[key] for key in ('id', 'subject', 'role', 'profile_revision', 'backend_id')))
-        # Initial installation of a semantic Attempt, never rewriting an old DB.
-        attempt.update(current_invocation=None, thread_id=None, opening_id=None)
-        tx.execute("INSERT INTO attempts (" + ','.join(attempt) + ") VALUES (" + ','.join('?' for _ in attempt) + ")", tuple(attempt.values()))
-        tx.execute("UPDATE subjects SET current_attempt=? WHERE id='ticket:2'", (call.attempt_id,))
-        tx.execute("UPDATE budgets SET developments_used=?,reviews_used=? WHERE subject='ticket:2' AND purpose='requirements'",
-                   tuple(budget))
-        provenance = tx.put('ticket:2', 'certified_continuation', wire_json({
-            'attempt': call.attempt_id, **{key: attempt[key] for key in ('subject', 'generation', 'role', 'purpose', 'window')},
-            'source_execution': call.invocation_id}))
-        assert facts.prior is not None
-        prior = replace(facts.prior, invocation_id=None, lease_id=None)
-        if not exit_proven:
-            prior = replace(prior, status='interrupted', dispatch_state='unknown')
-        opening = ContinuationOpening(provenance, facts.ordinary_used, facts.capacity_count, prior)
-        basis = AttemptContinuationBasis(call.thread_id, attempt['context_id'], opening)
-        bind_attempt_continuation(tx, call.attempt_id, basis)
-        bind_attempt_continuation(tx, call.attempt_id, basis)  # Exact retry is idempotent.
-    execution = target.claim_executor('target-executor')
-    return target, execution, _read_operations(target, execution, requirements), call.attempt_id
+    return source, owner, source_operations, call.attempt_id, call
 
 
 @pytest.mark.parametrize('has_raw', [False, True])
-def test_opening_with_unproven_exit_cannot_consume_or_dispatch(tmp_path: Path, has_raw: bool) -> None:
+def test_native_invocation_with_unproven_exit_cannot_consume_or_dispatch(tmp_path: Path, has_raw: bool) -> None:
     raw = wire_json({'result_kind': 'development', 'summary': 'Durable before exit.', 'human_blockers': None}) if has_raw else None
-    kernel, execution, operations, attempt_id = _canonical_boundary(tmp_path, exit_proven=False, return_body=raw)
+    kernel, execution, operations, attempt_id, previous = _native_boundary(tmp_path, exit_proven=False, return_body=raw)
     step = operations.once()
-    # The shared selector already sees the Opening exit barrier; it need not
+    # The shared selector already sees the native Invocation exit barrier; it need not
     # enter a private subject transition to rediscover the same waiting reason.
     assert (step.kind, step.call, step.effect) == ('waiting', None, None)
     state = operations.runner.state()
-    assert (state.disposition, state.active, state.wake_at) == ('waiting', (), None)
+    assert (state.disposition, state.active, state.wake_at) == ('waiting', (previous.lease_id,), previous.deadline_at)
     assert kernel.status('ticket:2')['phase'] == 'development'
     assert kernel.status('ticket:2')['pending_return'] is has_raw
     with kernel.storage.transaction(write=False) as tx:
-        assert tx.one('SELECT count(*) FROM invocations')[0] == 0
-        assert tx.one('SELECT count(*) FROM leases')[0] == 0
+        assert tx.one('SELECT count(*) FROM invocations')[0] == 1
+        assert tx.one('SELECT count(*) FROM leases')[0] == 1
         prior = load_continuation(tx, attempt_id).prior
-        assert prior is not None and prior.dispatch_state == 'unknown'
+        assert prior is not None and prior.dispatch_state == 'started'
+        assert prior.invocation_id == previous.invocation_id
         assert (prior.raw_id is not None) is has_raw
 
 
-def test_first_native_explicit_continuation_does_not_refund_opening_recovery(tmp_path: Path) -> None:
-    kernel, execution, operations, attempt_id = _canonical_boundary(tmp_path, ordinary_used=True)
+def test_native_explicit_continuation_does_not_refund_ordinary_recovery(tmp_path: Path) -> None:
+    kernel, execution, operations, attempt_id, previous = _native_boundary(tmp_path, ordinary_used=True)
     assert operations.once().reason == 'execution_recovery_unavailable'
     kernel.control('resume', 'continue-exact-attempt', subject='ticket:2')
     call = operations.once().call
     assert call is not None and call.attempt_id == attempt_id and call.mode == 'resume'
     with kernel.storage.transaction(write=False) as tx:
-        invocation = tx.one('SELECT * FROM invocations')
+        invocation = tx.one('SELECT * FROM invocations WHERE id=?', (call.invocation_id,))
         facts = load_continuation(tx, attempt_id)
-    assert invocation['predecessor'] is None and invocation['recovery_kind'] == 'explicit'
+    assert invocation['predecessor'] == previous.invocation_id and invocation['recovery_kind'] == 'explicit'
     assert facts.ordinary_used == 1
     assert kernel.status('ticket:2')['budgets']['requirements']['developments_used'] == 1
 
 
 def test_first_native_capacity_continuation_preserves_existing_not_before(tmp_path: Path) -> None:
-    kernel, execution, operations, attempt_id = _canonical_boundary(tmp_path, failure_kind='capacity')
+    kernel, execution, operations, attempt_id, previous = _native_boundary(tmp_path, failure_kind='capacity')
     kernel.clock = lambda: 129.0
     waiting = operations.once()
     assert (waiting.kind, waiting.retry_at, waiting.call, waiting.effect) == ('waiting', 130.0, None, None)
     assert operations.runner.state().wake_at == 130.0
     with kernel.storage.transaction(write=False) as tx:
-        assert tx.one('SELECT count(*) FROM invocations')[0] == 0
+        assert tx.one('SELECT count(*) FROM invocations')[0] == 1
     kernel.clock = lambda: 130.0
     call = operations.once().call
     assert call is not None and call.attempt_id == attempt_id and call.deadline_at == 137.0
@@ -192,7 +170,7 @@ def test_first_native_capacity_continuation_preserves_existing_not_before(tmp_pa
 
 
 def test_format_period_crossing_executor_exit_uses_a_real_new_invocation(tmp_path: Path) -> None:
-    kernel, execution, operations, attempt_id = _canonical_boundary(tmp_path, malformed=True)
+    kernel, execution, operations, attempt_id, previous = _native_boundary(tmp_path, malformed=True)
     first = operations.once().call
     assert first is not None
     assert kernel.dispatch_agent(first)
@@ -257,7 +235,7 @@ def test_local_resume_new_thread_keeps_format_period_and_old_invocation_binding(
 
 @pytest.mark.parametrize('expired', [False, True])
 def test_first_native_format_step_keeps_its_period_unless_explicitly_resumed(tmp_path: Path, expired: bool) -> None:
-    kernel, execution, operations, attempt_id = _canonical_boundary(tmp_path, malformed=True)
+    kernel, execution, operations, attempt_id, previous = _native_boundary(tmp_path, malformed=True)
     kernel.clock = lambda: 108.0 if expired else 106.0
     if expired:
         assert operations.once().reason == 'invocation_deadline_exceeded'
@@ -268,11 +246,11 @@ def test_first_native_format_step_keeps_its_period_unless_explicitly_resumed(tmp
     assert call.deadline_at == (115.0 if expired else 107.0)
     assert call.context['readonly'] is True and call.context['contract_error']
     with kernel.storage.transaction(write=False) as tx:
-        assert tx.one('SELECT predecessor FROM invocations')[0] is None
+        assert tx.one('SELECT predecessor FROM invocations WHERE id=?', (call.invocation_id,))[0] == (previous.invocation_id if expired else None)
 
 
 def test_concurrent_first_native_allocation_has_one_lease_and_stop_only_settles_raw(tmp_path: Path) -> None:
-    kernel, execution, operations, attempt_id = _canonical_boundary(tmp_path)
+    kernel, execution, operations, attempt_id, previous = _native_boundary(tmp_path)
     with ThreadPoolExecutor(max_workers=2) as pool:
         steps = list(pool.map(lambda _: operations.once(), range(2)))
     calls = [step.call for step in steps if step.kind == 'agent']
@@ -280,7 +258,7 @@ def test_concurrent_first_native_allocation_has_one_lease_and_stop_only_settles_
     call = calls[0]
     assert call.attempt_id == attempt_id
     with kernel.storage.transaction(write=False) as tx:
-        assert tx.one('SELECT count(*) FROM invocations')[0] == 1
+        assert tx.one('SELECT count(*) FROM invocations')[0] == 2
         assert tx.one('SELECT count(*) FROM leases')[0] == 1
     kernel.control('stop', 'stop-new-native')
     kernel.receive(call, wire_json({'result_kind': 'development', 'summary': 'Durable late result.', 'human_blockers': None}))
@@ -290,3 +268,19 @@ def test_concurrent_first_native_allocation_has_one_lease_and_stop_only_settles_
     assert kernel.status('ticket:2') == before
     assert kernel.status('ticket:2')['pending_return'] is True
     assert kernel.status('ticket:2')['budgets']['requirements']['developments_used'] == 1
+
+
+@pytest.mark.parametrize("changed", [
+    {"provenance_id": "certified-source"}, {"ordinary_used": 1}, {"capacity_count": 1},
+    {"prior": {}}, {"ordinary_used": False}, {"capacity_count": 0.0}, {"extra": "ignored"},
+])
+def test_non_native_opening_is_rejected_without_installation(changed) -> None:
+    body = wire_json({"provenance_id": None, "ordinary_used": 0, "capacity_count": 0, "prior": None} | changed)
+    with pytest.raises(KernelError, match="continuation_opening"):
+        validate_native_opening(body)
+
+
+def test_opening_does_not_discard_duplicate_imported_fields() -> None:
+    body = b'{"capacity_count":0,"ordinary_used":0,"prior":{},"prior":null,"provenance_id":null}'
+    with pytest.raises(KernelError, match="continuation_opening"):
+        validate_native_opening(body)
