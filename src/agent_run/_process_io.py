@@ -32,6 +32,7 @@ def pump(
     process: subprocess.Popen[bytes], *, stdout: TailOutput | None = None,
     stderr: TailOutput | None = None,
     check: Callable[[], bool], input_data: bytes | None = None, ignore_read_errors: bool = False,
+    stop_at_eof: bool = False,
 ) -> None:
     """Pump pipes until EOF and leader exit, or until the owner ends draining.
 
@@ -39,6 +40,7 @@ def pump(
     group, raise a deadline error, or end a bounded post-exit drain. No pipe
     observation here proves descendant exit or authorizes another operation.
     Each output collector must correspond to an actual pipe, or both are None.
+    stop_at_eof leaves any post-EOF process waiting to the caller.
     """
     pending = memoryview(input_data or b"")
     with selectors.DefaultSelector() as selector:
@@ -55,7 +57,7 @@ def pump(
                 selector.register(process.stdin, selectors.EVENT_WRITE)
             else:
                 process.stdin.close()
-        while selector.get_map() or process.poll() is None:
+        while selector.get_map() or (not stop_at_eof and process.poll() is None):
             if not check():
                 return
             for key, _ in selector.select(timeout=0.05):

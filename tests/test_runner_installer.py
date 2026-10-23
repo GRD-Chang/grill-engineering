@@ -82,6 +82,85 @@ def test_build_output_timeout_cleans_process(
     assert started[0].stdout is not None and started[0].stdout.closed
 
 
+def test_build_output_retains_only_the_merged_diagnostic_tail() -> None:
+    limit = runner_installer._MAX_BUILD_OUTPUT_BYTES
+    baseline = runner_installer.capture_process_scope()
+    process = subprocess.Popen(
+        [sys.executable, '-c',
+         f"import os\nos.write(1, b'x' * {limit + 100})\nos.write(2, b'err-tail')"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
+    )
+    try:
+        assert runner_installer._read_build_output(
+            process, adopted_baseline=baseline,
+        ) == b'x' * (limit - 8) + b'err-tail'
+        assert process.returncode == 0
+    finally:
+        if process.poll() is None:
+            runner_installer._terminate_process_group(process, adopted_baseline=baseline)
+        process.stdout.close()
+
+
+def test_git_status_detects_clean_and_changed_local_source(git_repo: Path) -> None:
+    assert runner_installer._git_has_changes(git_repo) is False
+    (git_repo / 'new-source.py').write_text('changed = True\n')
+    assert runner_installer._git_has_changes(git_repo) is True
+
+
+@pytest.mark.parametrize('behavior', ['first_byte', 'nonzero', 'read_timeout', 'eof_timeout'])
+def test_git_status_first_byte_deadlines_and_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, behavior: str,
+) -> None:
+    executable = tmp_path / 'git'
+    program = 'import os, signal\n'
+    if behavior == 'first_byte':
+        program += "os.write(1, b'x')\nsignal.pause()\n"
+    elif behavior == 'nonzero':
+        program += 'raise SystemExit(7)\n'
+    else:
+        if behavior == 'eof_timeout':
+            program += 'os.close(1)\n'
+        program += 'signal.pause()\n'
+    executable.write_text(f'#!{sys.executable}\n' + program)
+    executable.chmod(0o700)
+    monkeypatch.setenv('PATH', str(tmp_path))
+    started = []
+    waits = []
+    cleanups = []
+    original_popen = subprocess.Popen
+    original_cleanup = runner_installer._terminate_process_group
+
+    def start(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        started.append(process)
+        original_wait = process.wait
+
+        def wait(timeout=None):
+            waits.append(timeout)
+            return original_wait(timeout=timeout)
+
+        process.wait = wait
+        return process
+
+    def cleanup(process, **kwargs):
+        try:
+            if not cleanups:
+                assert process.stdout.closed == (behavior == 'nonzero')
+        finally:
+            cleanups.append(process)
+            original_cleanup(process, **kwargs)
+
+    monkeypatch.setattr(runner_installer.subprocess, 'Popen', start)
+    monkeypatch.setattr(runner_installer, '_terminate_process_group', cleanup)
+    assert runner_installer._git_has_changes(tmp_path) is (
+        True if behavior == 'first_byte' else None
+    )
+    assert started[0].poll() is not None
+    assert started[0].stdout.closed
+    if behavior == 'eof_timeout':
+        assert 3 in waits  # EOF starts the original independent exit window.
+
+
 @pytest.mark.parametrize("child_code", [
     "import time; time.sleep(60)",
     "import os\nwhile True: os.write(1, b'backend progress' * 512)",

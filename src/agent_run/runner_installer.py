@@ -8,7 +8,6 @@ import json
 import os
 import platform
 import re
-import selectors
 import signal
 import shutil
 import subprocess
@@ -28,7 +27,7 @@ if __package__ in (None, ""):
     sys.dont_write_bytecode = True
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent_run._process_io import CompleteOutput, pump
+from agent_run._process_io import CompleteOutput, TailOutput, pump
 from agent_run.paths import app_data_root
 from agent_run.process_cleanup import (
     capture_process_scope,
@@ -500,28 +499,21 @@ def _read_build_output(
     """Drain pip output with bounded memory; never persist or echo backend text."""
     assert process.stdout is not None
     deadline = time.monotonic() + _BUILD_TIMEOUT_SECONDS
-    output = bytearray()
+    output = TailOutput(_MAX_BUILD_OUTPUT_BYTES)
     parent_finished = False
+
+    def check() -> bool:
+        nonlocal parent_finished
+        if not parent_finished and process.poll() is not None:
+            # Backends may retain or write pipes after their parent exits.
+            _terminate_process_group(process, adopted_baseline=adopted_baseline)
+            parent_finished = True
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired("pip install", _BUILD_TIMEOUT_SECONDS)
+        return True
+
     try:
-        with selectors.DefaultSelector() as selector:
-            selector.register(process.stdout, selectors.EVENT_READ)
-            while selector.get_map():
-                if not parent_finished and process.poll() is not None:
-                    # Backends may leave children holding or writing stdout.
-                    # Stop them, then drain the finite buffered pip diagnostics.
-                    _terminate_process_group(process, adopted_baseline=adopted_baseline)
-                    parent_finished = True
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise subprocess.TimeoutExpired("pip install", _BUILD_TIMEOUT_SECONDS)
-                if not selector.select(timeout=min(remaining, 0.1)):
-                    continue
-                chunk = os.read(process.stdout.fileno(), 4096)
-                if not chunk:
-                    selector.unregister(process.stdout)
-                    continue
-                output.extend(chunk)
-                del output[:-_MAX_BUILD_OUTPUT_BYTES]
+        pump(process, stdout=output, check=check)
         process.wait(timeout=max(0, deadline - time.monotonic()))
     except subprocess.TimeoutExpired as error:
         raise InstallerError(
@@ -531,7 +523,7 @@ def _read_build_output(
         raise InstallerError(
             "读取包构建输出阶段失败；请检查宿主进程与文件描述符资源后重试；新版未激活"
         ) from error
-    return bytes(output)
+    return bytes(output.data)
 
 
 def _build_failure_message(output: bytes, return_code: int) -> str:
@@ -754,30 +746,39 @@ def _git_has_changes(source: Path) -> bool | None:
         )
     except OSError:
         return None
-    output = process.stdout
-    if output is None:
+    stream = process.stdout
+    if stream is None:
         process.wait()
         return None
+    output = TailOutput(1)
+    deadline = time.monotonic() + 3
+    cleaned = False
+
+    def cleanup() -> None:
+        nonlocal cleaned
+        if not cleaned:
+            cleaned = True
+            _terminate_process_group(process, adopted_baseline=adopted_baseline)
+
+    def check() -> bool:
+        if output.data:
+            return False
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired("git status", 3)
+        return True
+
     try:
-        with selectors.DefaultSelector() as selector:
-            selector.register(output, selectors.EVENT_READ)
-            if not selector.select(timeout=3):
-                _terminate_process_group(process)
-                return None
-            if os.read(output.fileno(), 1):
-                _terminate_process_group(process)
-                return True
-        try:
-            return False if process.wait(timeout=3) == 0 else None
-        except subprocess.TimeoutExpired:
-            _terminate_process_group(process)
-            return None
+        pump(process, stdout=output, check=check, stop_at_eof=True)
+        if output.data:
+            cleanup()
+            return True
+        return False if process.wait(timeout=3) == 0 else None
     except (OSError, subprocess.SubprocessError):
-        _terminate_process_group(process)
+        cleanup()
         return None
     finally:
-        output.close()
-        _terminate_process_group(process, adopted_baseline=adopted_baseline)
+        stream.close()
+        cleanup()
 
 
 def _write_manifest(snapshot: Path, manifest: dict[str, object]) -> None:

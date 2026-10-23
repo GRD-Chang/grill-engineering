@@ -92,7 +92,7 @@ def test_killed_original_host_notice_is_exact_current_and_business_read_only(tmp
             child.kill()
             assert child.wait(timeout=3) == -9
             before = kernel.storage.path.read_bytes()
-            from agent_run_kernel.host_exit_notifications import host_exit_notice, host_exit_current, host_exit_event
+            from agent_run_kernel.host_exit_facts import host_exit_notice, host_exit_current, host_exit_event
             notice = host_exit_notice(kernel.storage.path, "original", handoff.receipt,
                                       service_result="signal", exit_code="killed", exit_status="KILL",
                                       invocation_id="1" * 32)
@@ -162,7 +162,7 @@ def test_startup_exit_requires_exact_manager_identity_when_readiness_was_never_r
     tmp_path: Path, monkeypatch,
 ) -> None:
     import subprocess
-    from agent_run_kernel.host_exit_notifications import host_exit_notice, host_exit_current
+    from agent_run_kernel.host_exit_facts import host_exit_notice, host_exit_current
     from test_kernel_host_adapter import controlled_manager
     from test_kernel_notifications import _kernel
 
