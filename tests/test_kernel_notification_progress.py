@@ -9,6 +9,7 @@ from agent_run_kernel import Issue, ParentIssue, Requirements, Role
 from agent_run_kernel.model import KernelError, wire_json
 from agent_run.notification_event_facts import event_envelope
 from agent_run_kernel.notification_progress import obsolete_progress
+from agent_run_kernel.event_projection import event_state, project_event
 from support.offline import GraphScenario
 from test_kernel_notification_events import _project, _recorded_agents
 
@@ -33,6 +34,12 @@ def test_recovery_keeps_the_live_original_round_instead_of_its_finished_predeces
         assert live[0]["attempt_id"] == call.attempt_id
         before = scenario.kernel.storage.path.read_bytes()
         with scenario.kernel.storage.transaction(write=False) as tx:
+            row = dict(tx.one("SELECT * FROM history WHERE position=?", (live[0]["source_position"],)))
+            projected, = project_event(tx, row, event_state(tx), "detailed")
+            assert projected.content == live[0] and projected.applicable is True
+            assert projected.matches(live[0])
+            assert not projected.matches(dict(live[0], attempt_id="foreign-attempt"))
+            assert not projected.matches(dict(live[0], generation=live[0]["generation"] + 1))
             assert obsolete_progress(tx, pending, "detailed", current_boundary=False) == finished
         assert pending == original
         assert scenario.kernel.storage.path.read_bytes() == before
@@ -247,6 +254,11 @@ def test_original_repair_and_formal_promotion_follow_current_generation_and_appr
             assert planned is not None and active and active[0]["id"] == planned["id"]
             with scenario.kernel.storage.transaction(write=False) as tx:
                 assert obsolete_progress(tx, [active[0], promotion], "concise", current_boundary=False) == {planned["id"]}
+                original = dict(tx.one("SELECT * FROM history WHERE kind='role_consumed' AND identity=?",
+                                       (promotion["attempt_id"],)))
+                suppressed, = project_event(tx, original, event_state(tx), "detailed")
+                assert not suppressed.visible and suppressed.applicable is False
+                assert obsolete_progress(tx, [suppressed.content], "detailed", current_boundary=False) == {suppressed.content["id"]}
             break
         assert step.kind not in {"paused", "waiting", "approval"}, step
     else:

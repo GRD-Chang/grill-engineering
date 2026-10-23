@@ -16,7 +16,7 @@ from agent_run.task_identity import TaskKey
 from agent_run.notification_outbox import read_notifications
 
 from .execution_facts import activity, recorded_profile
-from .notification_events import resume_facts
+from .event_projection import resume_facts
 from .model import KernelError, Role, artifact
 from .storage import QUERY_LIMIT, Storage, Transaction
 from .state_preflight import UnsupportedState, require_supported_state

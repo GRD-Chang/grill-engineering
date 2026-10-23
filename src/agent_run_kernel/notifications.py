@@ -25,7 +25,7 @@ from agent_run.notification_transport import send
 from agent_run.process_binding import _process_start_token
 
 from .execution_facts import execution_facts
-from .notification_events import events as history_events, resume_facts
+from .event_projection import event_state, project_event, resume_facts
 from .notification_progress import obsolete_progress
 from .query import notification_boundaries
 from .storage import Storage, Transaction
@@ -72,20 +72,15 @@ class NativeNotifications:
 
     @staticmethod
     def _run(tx: Transaction) -> tuple[str, tuple[str, int], dict[str, Any], dict[str, Any]]:
-        run = tx.one("SELECT id,repository,parent_issue,parent_revision,language,created_at FROM runs")
-        inputs = tx.one("SELECT subject,material_id FROM run_inputs WHERE run_id=?", (run["id"],))
+        state = event_state(tx)
+        inputs = tx.one("SELECT subject,material_id FROM run_inputs WHERE run_id=?", (state["run_id"],))
         value = json.loads(tx.get(inputs["material_id"], inputs["subject"]))
         if not isinstance(value, dict) or not isinstance(value.get("notifications"), dict):
             raise ValueError("notification configuration is not a frozen Run input")
         config = value["notifications"]
-        if config.get("enabled") is True and run["language"] not in {"zh", "en"}:
+        if config.get("enabled") is True and state["language"] not in {"zh", "en"}:
             raise ValueError("enabled notification requires a known Run language")
-        title = tx.rows("SELECT title FROM requirement_versions WHERE issue=? AND revision=?",
-                        (run["parent_issue"], run["parent_revision"]))
-        state = {"run_id": run["id"], "repository": run["repository"],
-                 "parent": {"number": run["parent_issue"], "title": title[0][0] if title else ""},
-                 "language": run["language"], "created_at": run["created_at"]}
-        return run["id"], (run["repository"], run["parent_issue"]), config, state
+        return state["run_id"], (state["repository"], state["parent"]["number"]), config, state
 
     def _same_binding(self, run_id: str, binding: tuple[str, int],
                       config: dict[str, Any], state: dict[str, Any]) -> bool:
@@ -104,7 +99,8 @@ class NativeNotifications:
                               "FROM history WHERE position>? ORDER BY position LIMIT 16", (after,), limit=16)
             events: list[dict[str, Any]] = []
             for row in history:
-                events.extend(history_events(tx, dict(row), state, self.config.get("mode", "concise")))
+                events.extend(projected.content for projected in project_event(
+                    tx, dict(row), state, self.config.get("mode", "concise")) if projected.visible)
             return events, len(history) == 16, history[-1]["position"] if history else after
 
     @staticmethod

@@ -1,5 +1,6 @@
-"""Read-only notification projection of committed native history facts."""
+"""Read-only event content and applicability from original committed facts."""
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 from typing import Any
@@ -9,6 +10,39 @@ from agent_run.messages import selected_language, text
 
 from .execution_facts import execution_facts
 from .storage import Transaction
+
+
+@dataclass(frozen=True)
+class EventProjection:
+    content: dict[str, Any]
+    applicable: bool | None
+    visible: bool = True
+
+    def matches(self, event: Mapping[str, Any]) -> bool:
+        binding = "failed_review_attempt" if "failed_review_attempt" in self.content else "attempt_id"
+        return all(event.get(key) == self.content.get(key) for key in (
+            "id", "kind", "source_position", "source_material_id", "work_subject", "generation",
+            binding, "resume_id", "previous_approval_position"))
+
+
+def event_state(tx: Transaction) -> dict[str, Any]:
+    run = tx.one("SELECT id,repository,parent_issue,parent_revision,language,created_at FROM runs")
+    title = tx.rows("SELECT title FROM requirement_versions WHERE issue=? AND revision=?",
+                    (run["parent_issue"], run["parent_revision"]))
+    return {"run_id": run["id"], "repository": run["repository"],
+            "parent": {"number": run["parent_issue"], "title": title[0][0] if title else ""},
+            "language": run["language"], "created_at": run["created_at"]}
+
+
+def _live_attempt(tx: Transaction, subject: str, generation: int, attempt: str) -> bool:
+    return bool(tx.rows("SELECT a.id FROM subjects s JOIN attempts a ON a.id=s.current_attempt "
+                        "JOIN invocations i ON i.id=a.current_invocation JOIN leases l ON l.invocation=i.id "
+                        "JOIN invocation_outputs o ON o.invocation=i.id AND o.lease=l.id "
+                        "WHERE s.id=? AND s.generation=? AND a.id=? AND a.result_id IS NULL "
+                        "AND o.ordinal=(SELECT max(ordinal) FROM invocation_outputs WHERE invocation=i.id) "
+                        "AND o.dispatch_state='started' AND o.process_identity IS NOT NULL "
+                        "AND o.started_at IS NOT NULL AND o.exited_at IS NULL",
+                        (subject, generation, attempt)))
 
 
 def _subject_facts(tx: Transaction, subject: Mapping[str, Any], revision: str,
@@ -22,7 +56,7 @@ def _subject_facts(tx: Transaction, subject: Mapping[str, Any], revision: str,
 
 
 def _started(tx: Transaction, row: Mapping[str, Any], subject: Mapping[str, Any],
-             state: dict[str, Any], mode: str) -> list[dict[str, Any]]:
+             state: dict[str, Any], mode: str) -> list[EventProjection]:
     matches = tx.rows("SELECT a.*,o.started_at,o.dispatch_state,o.exit_code FROM invocations i JOIN attempts a ON a.id=i.attempt "
                       "JOIN invocation_outputs o ON o.invocation=i.id "
                       "WHERE i.id=? AND a.subject=? AND a.generation=? AND o.process_identity=? "
@@ -36,6 +70,7 @@ def _started(tx: Transaction, row: Mapping[str, Any], subject: Mapping[str, Any]
                    (row["subject"], row["generation"], attempt["id"]))[0]
     if first != row["position"]:
         return []  # Resuming or correcting the same Attempt is not a new role start.
+    applicable = _live_attempt(tx, row["subject"], row["generation"], attempt["id"])
     started_at = datetime.fromtimestamp(attempt["started_at"], UTC).isoformat()
     if subject["kind"] == "final_run":
         if attempt["role"] == "review":
@@ -43,8 +78,8 @@ def _started(tx: Transaction, row: Mapping[str, Any], subject: Mapping[str, Any]
                                   "JOIN attempts a ON a.id=i.attempt WHERE h.subject=? "
                                   "AND h.kind='worker_started' AND a.role='review'", (row["subject"],))[0]
             if first_review == row["position"]:
-                return [event_envelope(state, "acceptance_started", state["run_id"],
-                                       event_copy(state, "acceptance_started"), attempt_id=attempt["id"], started_at=started_at)]
+                return [EventProjection(event_envelope(state, "acceptance_started", state["run_id"],
+                                       event_copy(state, "acceptance_started"), attempt_id=attempt["id"], started_at=started_at), applicable)]
         failed = _first_repair(tx, row["subject"])
         if (attempt["role"] == "development" and failed is not None
                 and attempt["generation"] == failed["generation"] and row["position"] > failed["position"]):
@@ -58,7 +93,7 @@ def _started(tx: Transaction, row: Mapping[str, Any], subject: Mapping[str, Any]
             if (first_repair == row["position"] and context.get("generation") == failed["generation"]
                     and evidence is not None and context.get(evidence) == json.loads(tx.get(failed["material_id"], row["subject"]))):
                 live = attempt["dispatch_state"] == "started" and attempt["exit_code"] is None
-                return [_repair_event(state, live, row["subject"], failed, attempt["id"])]
+                return [_repair_event(tx, subject, state, live, failed, attempt["id"])]
     first_subject = tx.one("SELECT min(position) FROM history WHERE subject=? AND kind='worker_started'",
                            (row["subject"],))[0]
     if (first_subject == row["position"] and attempt["role"] == "development"
@@ -67,8 +102,8 @@ def _started(tx: Transaction, row: Mapping[str, Any], subject: Mapping[str, Any]
         facts = _subject_facts(tx, subject, subject["revision"], state)
         name = facts.get("task_title") or state["parent"]["title"] or f"#{subject['issue']}"
         identity = f"ticket:{subject['issue']}" if kind == "ticket_started" else f"parent-only:{state['run_id']}"
-        return [event_envelope(state, kind, identity, event_copy(state, kind, title=name),
-                               attempt_id=attempt["id"], started_at=started_at, **facts)]
+        return [EventProjection(event_envelope(state, kind, identity, event_copy(state, kind, title=name),
+                               attempt_id=attempt["id"], started_at=started_at, **facts), applicable)]
     if mode != "detailed":
         return []
     facts = _subject_facts(tx, subject, attempt["revision"], state)
@@ -78,9 +113,9 @@ def _started(tx: Transaction, row: Mapping[str, Any], subject: Mapping[str, Any]
              else event_copy(state, "review_ticket_start", title=name) if role == "review" and facts
              else event_copy(state, "review_start") if role == "review"
              else event_copy(state, "publication_ticket_start" if facts else "publication_start"))
-    return [event_envelope(state, "stage_start", attempt["id"], title, started_at=started_at,
+    return [EventProjection(event_envelope(state, "stage_start", attempt["id"], title, started_at=started_at,
                            phase=event_copy(state, "role_" + role), role=role, round=attempt["ordinal"],
-                           attempt_id=attempt["id"], work_subject=row["subject"], generation=row["generation"], **facts)]
+                           attempt_id=attempt["id"], work_subject=row["subject"], generation=row["generation"], **facts), applicable)]
 
 
 def _first_repair(tx: Transaction, subject: str) -> dict[str, Any] | None:
@@ -91,36 +126,41 @@ def _first_repair(tx: Transaction, subject: str) -> dict[str, Any] | None:
     return dict(rows[0]) if rows else None
 
 
-def _repair_event(state: dict[str, Any], live: bool, subject: str, failure: Mapping[str, Any], attempt_id: str | None = None) -> dict[str, Any]:
-    return event_envelope(state, "acceptance_repair", state["run_id"],
+def _repair_event(tx: Transaction, subject: Mapping[str, Any], state: dict[str, Any], live: bool,
+                  failure: Mapping[str, Any], attempt_id: str | None = None) -> EventProjection:
+    applicable = (subject["generation"] == failure["generation"]
+                  and subject["repair_source"] in {"acceptance", "integration"}
+                  and subject["last_failure"] == failure["material_id"] and not tx.rows(
+                      "SELECT position FROM history WHERE subject=? AND generation=? AND kind='acceptance_promoted' AND position>? LIMIT 1",
+                      (subject["id"], failure["generation"], failure["position"])))
+    return EventProjection(event_envelope(state, "acceptance_repair", state["run_id"],
                           event_copy(state, "acceptance_repair_active" if live else "acceptance_repair_planned"),
-                          "orange", live=live, work_subject=subject, generation=failure["generation"],
+                          "orange", live=live, work_subject=subject["id"], generation=failure["generation"],
                           source_position=failure["position"], source_material_id=failure["material_id"],
-                          failed_review_attempt=failure["identity"], attempt_id=attempt_id or failure["identity"])
+                          failed_review_attempt=failure["identity"], attempt_id=attempt_id or failure["identity"]), applicable)
 
 
 def _consumed(tx: Transaction, row: Mapping[str, Any], subject: Mapping[str, Any],
-              state: dict[str, Any], mode: str) -> list[dict[str, Any]]:
+              state: dict[str, Any], mode: str) -> list[EventProjection]:
     attempt = dict(tx.one("SELECT * FROM attempts WHERE id=? AND subject=? AND generation=? AND result_id=?",
                           (row["identity"], row["subject"], row["generation"], row["material_id"])))
     if subject["kind"] == "final_run":
         failed = _first_repair(tx, row["subject"])
         if failed is not None and failed["position"] == row["position"]:
-            return [_repair_event(state, False, row["subject"], failed)]
+            return [_repair_event(tx, subject, state, False, failed)]
     if mode != "detailed":
         return []
     role = attempt["role"]
     # A formal promotion is a separate committed fact. Its milestone replaces
     # this same Review result when both are visible in the original snapshot.
-    if role == "review" and tx.rows("SELECT position FROM history WHERE subject=? AND generation=? "
-                                    "AND kind='acceptance_promoted' AND identity=? LIMIT 1",
-                                    (row["subject"], row["generation"], attempt["id"])):
-        return []
-    return _result(tx, row, subject, state, attempt, human=False)
+    promoted = role == "review" and bool(tx.rows("SELECT position FROM history WHERE subject=? AND generation=? "
+                                                "AND kind='acceptance_promoted' AND identity=? LIMIT 1",
+                                                (row["subject"], row["generation"], attempt["id"])))
+    return _result(tx, row, subject, state, attempt, human=False, visible=not promoted)
 
 
 def _human(tx: Transaction, row: Mapping[str, Any], subject: Mapping[str, Any],
-           state: dict[str, Any], mode: str) -> list[dict[str, Any]]:
+           state: dict[str, Any], mode: str) -> list[EventProjection]:
     if mode != "detailed" or row["identity"] != "human_blocker" or row["material_id"] is None:
         return []
     # Resume can clear result_id and replace current_invocation. The original
@@ -134,7 +174,7 @@ def _human(tx: Transaction, row: Mapping[str, Any], subject: Mapping[str, Any],
 
 
 def _result(tx: Transaction, row: Mapping[str, Any], subject: Mapping[str, Any],
-            state: dict[str, Any], attempt: Mapping[str, Any], *, human: bool) -> list[dict[str, Any]]:
+            state: dict[str, Any], attempt: Mapping[str, Any], *, human: bool, visible: bool = True) -> list[EventProjection]:
     role = attempt["role"]
     result = json.loads(tx.get(row["material_id"], row["subject"]))
     facts = _subject_facts(tx, subject, attempt["revision"], state)
@@ -166,30 +206,33 @@ def _result(tx: Transaction, row: Mapping[str, Any], subject: Mapping[str, Any],
                                        language=selected_language(state)))
     effort = execution_facts(tx, row, attempt_id=attempt["id"])
     duration = effort.pop("execution_seconds", None)
-    return [event_envelope(state, "stage_end", [attempt["id"], outcome, False, checks], title,
+    return [EventProjection(event_envelope(state, "stage_end", [attempt["id"], outcome, False, checks], title,
                            "yellow" if human else "orange" if status_code == "review_failed" else "green",
                            phase=event_copy(state, "role_" + role), role=role, round=attempt["ordinal"],
                            attempt_id=attempt["id"], work_subject=row["subject"], generation=row["generation"],
                            checks=checks, status_code=status_code, summary=summary, findings_count=len(findings),
                            next_step=event_copy(state, "human_next") if human else event_copy(state, "repair_next") if status_code == "review_failed" else "",
-                           duration_seconds=duration, **effort, **facts)]
+                           duration_seconds=duration, **effort, **facts), None if human else False, visible)]
 
 
-def _project(tx: Transaction, row: Mapping[str, Any], state: dict[str, Any], mode: str) -> list[dict[str, Any]]:
+def _project(tx: Transaction, row: Mapping[str, Any], state: dict[str, Any], mode: str) -> list[EventProjection]:
     """Project this original history record without changing its source facts."""
     if row["kind"] not in {"worker_started", "role_consumed", "paused", "effect_consumed", "acceptance_promoted", "boundary_update"}:
         return []
-    subject = dict(tx.one("SELECT id,kind,issue,revision FROM subjects WHERE id=?", (row["subject"],)))
+    subject = dict(tx.one("SELECT * FROM subjects WHERE id=?", (row["subject"],)))
     if row["kind"] == "boundary_update":
         previous = tx.rows("SELECT position,phase FROM history WHERE subject=? AND generation=? AND position<? "
                            "AND phase IS NOT NULL ORDER BY position DESC LIMIT 1",
                            (row["subject"], row["generation"], row["position"]))
         if subject["kind"] == "ticket" or not previous or previous[0]["phase"] != "approval":
             return []
-        return [event_envelope(state, "approval_update", [row["subject"], row["generation"], row["position"]],
+        latest = tx.one("SELECT max(position) FROM history WHERE subject=? AND generation=? AND kind='boundary_update'",
+                        (row["subject"], row["generation"]))[0]
+        applicable = subject["generation"] == row["generation"] and latest == row["position"] and subject["phase"] == row["phase"]
+        return [EventProjection(event_envelope(state, "approval_update", [row["subject"], row["generation"], row["position"]],
                                event_copy(state, "approval_update"), "orange",
                                summary=event_copy(state, "approval_update_summary"),
-                               previous_approval_position=previous[0]["position"])]
+                               previous_approval_position=previous[0]["position"]), applicable)]
     if row["kind"] == "worker_started":
         return _started(tx, row, subject, state, mode)
     if row["kind"] == "role_consumed":
@@ -207,11 +250,13 @@ def _project(tx: Transaction, row: Mapping[str, Any], state: dict[str, Any], mod
                     review["expected_tree"], review["revision"], review["graph_revision"]]
         effort = execution_facts(tx, row, attempt_id=review["id"])
         duration = effort.pop("execution_seconds", None)
-        return [event_envelope(state, "acceptance_passed", identity,
+        applicable = (subject["generation"] == row["generation"] and subject["review_attempt"] == review["id"]
+                      and subject["integrated_sha"] == promotion["promoted_sha"] and subject["integrated_tree"] == promotion["promoted_tree"])
+        return [EventProjection(event_envelope(state, "acceptance_passed", identity,
                                event_copy(state, "parent_acceptance_passed" if subject["kind"] == "parent_only" else "acceptance_passed"),
                                "green", summary=event_copy(state, "acceptance_passed_summary"),
                                attempt_id=review["id"], round=review["ordinal"],
-                               phase=event_copy(state, "role_review"), duration_seconds=duration, **effort)]
+                               phase=event_copy(state, "role_review"), duration_seconds=duration, **effort), applicable)]
     if mode == "detailed":
         original = tx.rows("SELECT payload_id FROM effects WHERE id=? AND subject=? AND generation=? "
                            "AND operation='pr_write' AND status='confirmed' AND receipt_id=?",
@@ -227,17 +272,17 @@ def _project(tx: Transaction, row: Mapping[str, Any], state: dict[str, Any], mod
                     or type(pr.get("number")) is not int or pr["number"] <= 0):
                 return []
             number = pr["number"]
-            return [event_envelope(state, "pr_created", number, event_copy(state, "pr_created", number=number), "green",
+            return [EventProjection(event_envelope(state, "pr_created", number, event_copy(state, "pr_created", number=number), "green",
                                    summary=event_copy(state, "pr_summary"),
-                                   url=f"https://github.com/{pr['repository']}/pull/{number}")]
+                                   url=f"https://github.com/{pr['repository']}/pull/{number}"), False)]
     if subject["kind"] == "ticket" and tx.rows("SELECT generation FROM completions WHERE subject=? AND generation=? AND close_effect=?",
                                              (row["subject"], row["generation"], row["identity"])):
         facts = _subject_facts(tx, subject, subject["revision"], state)
         effort = execution_facts(tx, row)
         total = effort.pop("execution_seconds", None)
-        return [event_envelope(state, "ticket_completed", [str(subject["issue"]), row["generation"]],
+        return [EventProjection(event_envelope(state, "ticket_completed", [str(subject["issue"]), row["generation"]],
                                event_copy(state, "ticket_completed", title=facts["task_title"]), "green",
-                               total_seconds=total, **effort, **facts)]
+                               total_seconds=total, **effort, **facts), False)]
     return []
 
 
@@ -331,26 +376,30 @@ def resume_facts(tx: Transaction, row: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _resumed(tx: Transaction, row: Mapping[str, Any], state: dict[str, Any],
-             ordinary: list[dict[str, Any]]) -> list[dict[str, Any]]:
+             ordinary: list[EventProjection]) -> list[EventProjection]:
     facts = resume_facts(tx, row)
     if not facts:
         return ordinary
     if facts["resume_outcome"] != "started":
         return []  # The exact existing Gate owns the failure/human card and these facts.
-    if ordinary and ordinary[0]["kind"] not in {"stage_start", "acceptance_repair"}:
-        ordinary[0].update(facts)
-        ordinary[0]["summary"] = event_copy(state, "resume_started") + event_copy(state, "separator") + ordinary[0].get("summary", "")
+    if ordinary and ordinary[0].content["kind"] not in {"stage_start", "acceptance_repair"}:
+        content = ordinary[0].content
+        content.update(facts)
+        content["summary"] = event_copy(state, "resume_started") + event_copy(state, "separator") + content.get("summary", "")
         return ordinary
     summary = "resume_worker_started_summary" if row["kind"] == "worker_started" else "resume_controller_check_summary" if row["kind"] == "checks_observed" else "resume_controller_progress_summary"
-    return [event_envelope(state, "resume", facts["resume_id"], event_copy(state, "resume_started"),
-                           "blue", summary=event_copy(state, summary), **facts)]
+    applicable = _live_attempt(tx, row["subject"], row["generation"], facts["attempt_id"]) if row["kind"] == "worker_started" else False
+    return [EventProjection(event_envelope(state, "resume", facts["resume_id"], event_copy(state, "resume_started"),
+                           "blue", summary=event_copy(state, summary), **facts), applicable)]
 
 
-def events(tx: Transaction, row: Mapping[str, Any], state: dict[str, Any], mode: str) -> list[dict[str, Any]]:
-    """Project at most one event, retaining the original committed source anchor."""
-    result = _project(tx, row, state, mode)
-    result = _resumed(tx, row, state, result)
-    for event in result:
+def project_event(tx: Transaction, row: Mapping[str, Any], state: dict[str, Any], mode: str) -> list[EventProjection]:
+    """Project one visible event and keep suppressed original facts for rechecks."""
+    ordinary = _project(tx, row, state, mode)
+    result = _resumed(tx, row, state, [item for item in ordinary if item.visible])
+    result.extend(item for item in ordinary if not item.visible)
+    for projected in result:
+        event = projected.content
         event.setdefault("source_position", row["position"])
         event.setdefault("source_material_id", row["material_id"])
         event.setdefault("work_subject", row["subject"])

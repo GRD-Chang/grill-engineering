@@ -209,7 +209,7 @@ def test_whole_resume_without_an_invocation_fk_requires_original_stop_and_actual
 
 @pytest.mark.parametrize("outcome", ["failed", "human_action"])
 def test_resume_failure_and_human_result_bind_the_original_gate_without_a_second_card(tmp_path, monkeypatch, outcome):
-    import agent_run_kernel.notification_events as projection
+    import agent_run_kernel.event_projection as projection
 
     scenario = GraphScenario(tmp_path, Requirements(
         ParentIssue(1, "Parent", "Original scope", (2,)),
@@ -235,7 +235,7 @@ def test_resume_failure_and_human_result_bind_the_original_gate_without_a_second
         assert facts["resume_generation"] == 1 and facts["source_position"] == row["position"]
         assert facts["source_material_id"] == row["material_id"] and facts["reason_code"] == row["identity"]
         state = {"run_id": "offline-run", "repository": "example/project", "parent": {"number": 1, "title": "Parent"}, "language": "zh"}
-        assert projection.events(tx, row, state, "detailed") == []  # Root's exact existing Gate owns this result.
+        assert projection.project_event(tx, row, state, "detailed") == []  # Root's exact existing Gate owns this result.
 
 
 def test_query_rejects_out_of_calendar_recorded_activity_with_public_diagnostic(tmp_path):

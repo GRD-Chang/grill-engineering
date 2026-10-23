@@ -8,7 +8,7 @@ import pytest
 
 from agent_run_kernel import AgentCall, DeliveryKind, Issue, Kernel, ParentIssue, Requirements, Role, Step
 from agent_run_kernel.model import wire_json
-from agent_run_kernel.notification_events import events
+from agent_run_kernel.event_projection import project_event
 from support.offline import GraphScenario, Scenario
 
 
@@ -21,8 +21,8 @@ def _project(kernel: Kernel, mode: str) -> list[dict[str, Any]]:
                  "parent": {"number": run["parent_issue"], "title": title[0][0] if title else ""},
                  "language": run["language"], "created_at": run["created_at"]}
         frozen = deepcopy(state)
-        result = [event for row in tx.all("SELECT * FROM history ORDER BY position")
-                  for event in events(tx, dict(row), state, mode)]
+        result = [projected.content for row in tx.all("SELECT * FROM history ORDER BY position")
+                  for projected in project_event(tx, dict(row), state, mode) if projected.visible]
         assert state == frozen
         return result
 
