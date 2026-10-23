@@ -449,7 +449,8 @@ def prepare_creation(parent: int, repository: str | None, *, source_directory: P
     """
     from dataclasses import replace
     from uuid import uuid4
-    from agent_run.github import GhGitHubReader, GitHubReadError
+    from agent_run.github import GhGitHubReader
+    from agent_run.git_errors import GitHubReadError
     from agent_run.github_retry import run_read_command
     from agent_run.git_output import run_git
     from agent_run.managed_workspace import ManagedWorkspace, read_git_identity

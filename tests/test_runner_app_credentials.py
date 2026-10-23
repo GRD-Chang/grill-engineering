@@ -10,7 +10,7 @@ import pytest
 
 from agent_run import runner_credentials
 from agent_run.credential_lifecycle import ReadCredential
-from agent_run.github import GitHubReadError
+from agent_run.git_errors import GitHubReadError
 from agent_run.github_identity import GitHubIdentityError, resolve_runner_identity, resolve_worker_identity
 from agent_run.runner_credentials import runner_credential_scope
 from agent_run.runner_transport import runner_environment, runner_git_environment

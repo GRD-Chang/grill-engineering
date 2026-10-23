@@ -13,7 +13,7 @@ from typing import Any, Literal, NoReturn, Sequence
 from agent_run.cli_messages import personal_language as _personal_language
 from agent_run.messages import error_detail, text
 from agent_run.git_errors import GitError
-from agent_run.github import GitHubReadError
+from agent_run.git_errors import GitHubReadError
 from agent_run.runner_lease import RunnerLeaseError
 
 from .model import KernelError

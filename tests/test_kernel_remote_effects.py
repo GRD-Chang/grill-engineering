@@ -9,7 +9,7 @@ import sys
 
 import pytest
 
-from agent_run.github import GitHubReadError
+from agent_run.git_errors import GitHubReadError
 from agent_run_kernel.effects import LocalGit
 from agent_run_kernel.model import Effect, Execution, KernelError
 from agent_run_kernel.remote_effects import RemoteEffects

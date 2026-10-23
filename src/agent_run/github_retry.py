@@ -9,6 +9,7 @@ from pathlib import Path
 
 from agent_run.runner_transport import runner_options
 from agent_run.bounded_command import capture_command
+from agent_run.error_safety import redact_transport_output
 
 
 MAX_READ_ATTEMPTS = 3
@@ -80,7 +81,7 @@ def _run_bounded_command(
     runner_identity: Mapping[str, Any] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     from agent_run.runner_transport import (
-        runner_environment, runner_git_environment, redact_transport_output,
+        runner_environment, runner_git_environment,
     )
 
     environment = (runner_git_environment(runner_identity, cwd=cwd) if arguments[0] == "git"

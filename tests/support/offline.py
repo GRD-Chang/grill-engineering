@@ -16,7 +16,7 @@ from typing import Any, Callable, Mapping, Sequence, TypeVar
 
 from agent_run.agent_profiles import resolve_profiles
 from agent_run.error_safety import bounded_error
-from agent_run.github import GitHubReadError
+from agent_run.git_errors import GitHubReadError
 from agent_run.prompt_resources import resolve_resources
 
 from agent_run_kernel.effects import LocalGit

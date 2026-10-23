@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+from collections.abc import Mapping
 import json
 import re
 
@@ -220,3 +222,11 @@ def _truncate(value: str) -> str:
     return value.encode("utf-8")[:_MAX_ERROR_BYTES].decode(
         "utf-8", errors="ignore"
     )
+
+
+def redact_transport_output(value: str, environment: Mapping[str, str]) -> str:
+    token = environment.get("GH_TOKEN")
+    if token:
+        for secret in (token, base64.b64encode(f"x-access-token:{token}".encode()).decode()):
+            value = value.replace(secret, "[REDACTED]")
+    return value

@@ -5,7 +5,7 @@ from threading import Event, Thread, current_thread
 
 import pytest
 
-from agent_run.github import GitHubReadError
+from agent_run.git_errors import GitHubReadError
 from agent_run_kernel import Kernel
 from agent_run_kernel.model import KernelError
 from agent_run_kernel.source_reading import read_requirements

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.github import GitHubReadError
+from agent_run.git_errors import GitHubReadError
 from agent_run_kernel import DeliveryKind, Requirements
 from agent_run_kernel.model import ReadWait, Step
 from support.offline import OfflinePort, Scenario

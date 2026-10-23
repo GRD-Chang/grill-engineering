@@ -11,7 +11,7 @@ import subprocess
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from agent_run.github import GitHubReadError
+from agent_run.git_errors import GitHubReadError
 from agent_run_kernel.effects import LocalGit
 from .offline_git import OfflineGit
 

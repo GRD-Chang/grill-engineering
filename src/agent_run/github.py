@@ -11,14 +11,8 @@ from agent_run.runner_transport import runner_options
 from agent_run.github_retry import run_read_command
 from agent_run.git_output import git_environment
 from agent_run.models import DeliveryGraph, Repository
+from agent_run.git_errors import GitHubReadError
 from agent_run_kernel.model import Blocker, Issue, ParentIssue
-
-
-class GitHubReadError(RuntimeError):
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(message)
-        self.code = code
-        self.message = message
 
 
 class MergeOutcomeUnknownError(RuntimeError):

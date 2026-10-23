@@ -14,7 +14,7 @@ import urllib.error
 import pytest
 
 from agent_run import github_auth, runner_credentials
-from agent_run.github import GitHubReadError
+from agent_run.git_errors import GitHubReadError
 from agent_run.runner_credentials import RunnerCredentialError, runner_credential_scope
 from agent_run.runner_transport import runner_environment
 

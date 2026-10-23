@@ -11,7 +11,8 @@ import re
 import subprocess
 from typing import Any, Mapping
 
-from agent_run.github import GhGitHubReader, GitHubReadError
+from agent_run.github import GhGitHubReader
+from agent_run.git_errors import GitHubReadError
 from agent_run.github_retry import run_read_command
 
 from .storage import MATERIAL_LIMIT

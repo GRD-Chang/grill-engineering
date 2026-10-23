@@ -17,7 +17,8 @@ from tempfile import NamedTemporaryFile
 from typing import Any, NoReturn, ParamSpec, Protocol, TYPE_CHECKING, TypeVar
 from urllib.parse import urlencode
 
-from agent_run.github import GhGitHubReader, GitHubReadError
+from agent_run.github import GhGitHubReader
+from agent_run.git_errors import GitHubReadError
 from agent_run.error_safety import bounded_error
 from agent_run.github_identity import validate_identity_snapshot
 from agent_run.github_retry import run_read_command, run_write_command

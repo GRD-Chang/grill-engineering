@@ -7,11 +7,11 @@ import subprocess
 import time
 from functools import lru_cache
 from collections.abc import Mapping
-from typing import Any
 from pathlib import Path
 
 from agent_run.git_errors import GitError
 from agent_run._process_io import CompleteOutput, TailOutput, pump
+from agent_run.error_safety import redact_transport_output
 
 
 MAX_GIT_OUTPUT_BYTES = 1024 * 1024
@@ -46,7 +46,6 @@ def git_environment(environment: Mapping[str, str] | None = None) -> dict[str, s
 
 def run_git(
     arguments: list[str], *, cwd: Path, input: str | None = None,
-    runner_identity: Mapping[str, Any] | None = None,
     timeout: float | None = None,
     environment: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
@@ -60,20 +59,11 @@ def run_git(
     while command[:1] in (["-C"], ["-c"]):
         command = command[2:]
     remote = bool(command and command[0] in {"clone", "fetch", "push", "pull", "ls-remote"})
-    if environment is not None:
-        if runner_identity is not None:
-            raise GitError("Explicit Git environment cannot override a selected Runner identity")
-        environment = dict(environment)
-    elif remote:
-        from agent_run.runner_transport import runner_git_environment
-        environment = runner_git_environment(runner_identity, cwd=cwd)
-    else:
-        environment = git_environment()
+    environment = dict(environment) if environment is not None else git_environment()
     selected_environment = environment
 
     def safe_output(value: str) -> str:
         if remote:
-            from agent_run.runner_transport import redact_transport_output
             return redact_transport_output(value, selected_environment)
         return value
 

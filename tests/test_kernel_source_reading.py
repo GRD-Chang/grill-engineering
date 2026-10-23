@@ -6,7 +6,8 @@ import sys
 
 import pytest
 
-from agent_run.github import GhGitHubReader, GitHubReadError
+from agent_run.github import GhGitHubReader
+from agent_run.git_errors import GitHubReadError
 from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, RunSpec
 from agent_run_kernel.source_reading import read_requirements
 

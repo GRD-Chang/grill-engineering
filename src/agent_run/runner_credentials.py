@@ -23,7 +23,7 @@ class RunnerCredentialError(GitHubIdentityError):
 def _credential_failure(message: str, authorization_failed: bool) -> Exception:
     if authorization_failed:
         return RunnerCredentialError(message)
-    from agent_run.github import GitHubReadError
+    from agent_run.git_errors import GitHubReadError
 
     return GitHubReadError("runner_credential_unavailable", message)
 

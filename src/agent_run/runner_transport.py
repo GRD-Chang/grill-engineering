@@ -1,7 +1,6 @@
 """Per-command Runner credentials; no process-wide login or Git configuration."""
 from __future__ import annotations
 
-import base64
 import re
 from collections.abc import Mapping
 from pathlib import Path
@@ -74,11 +73,3 @@ def runner_git_environment(
         environment[f"GIT_CONFIG_KEY_{index}"] = key
         environment[f"GIT_CONFIG_VALUE_{index}"] = value
     return environment
-
-
-def redact_transport_output(value: str, environment: Mapping[str, str]) -> str:
-    token = environment.get("GH_TOKEN")
-    if token:
-        for secret in (token, base64.b64encode(f"x-access-token:{token}".encode()).decode()):
-            value = value.replace(secret, "[REDACTED]")
-    return value
