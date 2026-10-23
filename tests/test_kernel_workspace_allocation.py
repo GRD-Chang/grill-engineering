@@ -8,6 +8,7 @@ from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.model import Requirements
 from agent_run.adapters.git_objects import LocalGit
+from agent_run.contracts.write_authority import FinalAdmission, WriteAuthority
 from agent_run.model import Role
 from support.offline import GraphScenario
 from test_kernel_requirements import native_input
@@ -127,13 +128,16 @@ def test_new_workspace_never_resets_a_foreign_preexisting_ticket_ref(tmp_path: P
         assert current == effect
         calls.append(current)
 
-        def guarded():
-            authorizations.append(current.effect_id)
-            authorize()
+        def prepare() -> FinalAdmission:
+            final_admission = authorize.prepare()
+            def guarded() -> None:
+                final_admission()
+                authorizations.append(current.effect_id)
+            return guarded
 
         inside_workspace = True
         try:
-            return execute(current, guarded)
+            return execute(current, WriteAuthority(prepare))
         finally:
             inside_workspace = False
 

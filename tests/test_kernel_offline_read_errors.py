@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from agent_run.errors import GitHubReadError
+from agent_run.contracts.write_authority import FinalAdmission, WriteAuthority
 from agent_run.model import DeliveryKind, Requirements
 from agent_run.model import ReadWait, Step
 from support.offline import OfflinePort, Scenario
@@ -26,11 +27,11 @@ def test_authorization_wait_crosses_the_physical_adapter_without_a_write_or_fake
     effect = held.value.effect
     before = scenario.port.writes()
     waiting = ReadWait(Step('waiting', scenario.delivery.key, 'source_unavailable', retry_at=105.25))
-    def authorize() -> None:
+    def prepare() -> FinalAdmission:
         raise waiting
     ports = scenario.make_ports(scenario.runner().binding)
     with pytest.raises(ReadWait) as observed:
-        ports.execute(effect, authorize)
+        ports.execute(effect, WriteAuthority(prepare))
     assert observed.value is waiting
     assert scenario.port.writes() == before
     assert scenario.port.pull_request_by_ref(effect.source_ref, effect.target_ref) is None

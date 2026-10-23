@@ -115,10 +115,10 @@ def test_stop_between_dispatch_and_write_does_not_invent_a_command_failure(
         if effect.operation != "candidate":
             return original(effect, authorize)
         selected.append(effect)
-        authorize()
+        authorize.prepare()()
         kernel.control("stop", "operator-stop")
         try:
-            authorize()
+            authorize.prepare()()
         except KernelError as denied:
             assert denied.code == "executor_fenced"
             raise

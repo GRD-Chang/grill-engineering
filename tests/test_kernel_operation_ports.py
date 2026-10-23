@@ -5,6 +5,7 @@ import json
 import pytest
 
 from agent_run.errors import KernelError
+from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.model import ResourceWitness
 from agent_run.core.operation_contract import DeliveryRead, OperationPorts
 from agent_run.adapters.remote import RemoteEffects
@@ -41,10 +42,10 @@ def test_local_operation_port_preserves_witness_guard_and_original_readback(git_
     def stopped():
         raise KernelError("executor_fenced")
     with pytest.raises(KernelError, match="executor_fenced"):
-        ports.execute(work, stopped)
+        ports.execute(work, WriteAuthority(lambda: stopped))
     assert ports.reconcile(work).disposition == "prior"
     authorized = []
-    result = ports.execute(work, lambda: authorized.append(work.effect_id))
+    result = ports.execute(work, WriteAuthority(lambda: lambda: authorized.append(work.effect_id)))
     assert authorized and result.disposition == "target"
     assert result.commit.sha == witness["expected_sha"]
     assert git.run("cat-file", "commit", result.commit.sha).stdout == witness["raw_commit"]

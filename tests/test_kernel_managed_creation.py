@@ -410,7 +410,7 @@ def test_public_busy_checkpoint_resume_applies_policy_to_the_original_host(
         def failed_candidate(effect, authorize):
             if effect.operation != "candidate":
                 return execute(effect, authorize)
-            authorize()  # Core dispatches and guards this exact fixture failure.
+            authorize.prepare()()  # Core dispatches and guards this exact fixture failure.
             return EffectResult("failure", base, raw={"head": base.sha, "reason": "candidate_integrity"})
         monkeypatch.setattr(operations.runner.ports, "execute", failed_candidate)
         assert operations.once().kind == "progress"

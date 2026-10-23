@@ -5,6 +5,7 @@ from agent_run.model import Effect, Execution, ResourceWitness
 from agent_run.adapters.git_objects import LocalGit
 from agent_run.adapters.local_git import LocalEffects
 from agent_run.model import resource_wire
+from agent_run.contracts.write_authority import FinalAdmission, WriteAuthority
 
 
 def test_resource_preflight_distinguishes_owned_dirty_absent_and_foreign_without_writes(
@@ -55,12 +56,12 @@ def test_resource_inspection_effect_authorizes_before_its_fresh_read(git_repo: P
                      "resources": [resource_wire(resource)]}, Execution("run", "executor", 1))
     authorized: list[str] = []
 
-    def authorize() -> None:
-        authorized.append("original-action")
+    def prepare() -> FinalAdmission:
         (checkout / "arrived-before-inspection.txt").write_text("Preserve this fresh work.\n")
+        return lambda: authorized.append("original-action")
 
     local = LocalEffects(git, owned_root=owned)
-    result = local.execute(effect, authorize)
+    result = local.execute(effect, WriteAuthority(prepare))
     assert result.disposition == "target"
     assert authorized == ["original-action"]
     assert result.raw["resources"] == [{"resource": resource_wire(resource), "disposition": "dirty",

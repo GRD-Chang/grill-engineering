@@ -16,6 +16,7 @@ from agent_run.model import Effect, Execution
 from agent_run.errors import KernelError
 from agent_run.adapters.git_objects import LocalGit
 from agent_run.adapters.local_git import LocalEffects
+from agent_run.contracts.write_authority import WriteAuthority
 
 
 def publication(git_repo: Path, tmp_path: Path) -> tuple[LocalGit, LocalEffects, Effect]:
@@ -69,7 +70,7 @@ def test_publication_replays_original_object_bytes_after_reopen(
     observed = reopened.reconcile(effect)
     assert observed.disposition == ("target" if crash_boundary == "checkout_reset" else "prior")
     calls: list[str] = []
-    result = reopened.execute(effect, lambda: calls.append("authorized"))
+    result = reopened.execute(effect, WriteAuthority(lambda: lambda: calls.append("authorized")))
     assert result.disposition == "target" and result.commit is not None
     assert result.commit.sha == witness["expected_sha"]
     assert git.parents(result.commit.sha) == tuple(effect.payload["parents"])
@@ -95,11 +96,11 @@ def test_local_delivery_resumes_exact_integration_and_retires_owned_resources(
     workspace = intent("workspace", create_ref=True)
     guarded: list[str] = []
     assert local.reconcile(workspace).disposition == "prior"
-    assert local.execute(workspace, lambda: guarded.append("workspace")).disposition == "target"
+    assert local.execute(workspace, WriteAuthority(lambda: lambda: guarded.append("workspace"))).disposition == "target"
     assert git.commit(workspace.source_ref) == base and checkout.is_dir()
     (checkout / "development.txt").write_text("accepted work\n")
     candidate_effect = intent("candidate", parents=[base.sha])
-    candidate = local.execute(candidate_effect, lambda: guarded.append("candidate")).commit
+    candidate = local.execute(candidate_effect, WriteAuthority(lambda: lambda: guarded.append("candidate"))).commit
     assert candidate is not None and git.parents(candidate.sha) == (base.sha,)
     assert local.reconcile(candidate_effect).commit == candidate
     # A token is not authority for additional or reordered parents.
@@ -109,11 +110,11 @@ def test_local_delivery_resumes_exact_integration_and_retires_owned_resources(
     assert local.reconcile(candidate_effect).disposition == "third"
     git.run("reset", "--hard", candidate.sha, cwd=checkout)
     review = intent("validation_checkout", checkout=str(checkout.parent / "review-original"), reviewed_commit=candidate.sha)
-    assert local.execute(review, lambda: guarded.append("review")).commit == candidate
+    assert local.execute(review, WriteAuthority(lambda: lambda: guarded.append("review"))).commit == candidate
     assert git.run("status", "--porcelain", cwd=Path(review.payload["checkout"])).stdout == ""
     (Path(review.payload["checkout"]) / "validation.tmp").write_text("temporary validation output\n")
     review_cleanup = replace(review, operation="validation_cleanup", before_sha=candidate.sha)
-    assert local.execute(review_cleanup, lambda: guarded.append("review_cleanup")).disposition == "target"
+    assert local.execute(review_cleanup, WriteAuthority(lambda: lambda: guarded.append("review_cleanup"))).disposition == "target"
     assert not Path(review.payload["checkout"]).exists()
     # Independent source and target edits require the original two ordered merges.
     (git_repo / "source.txt").write_text("source work\n")
@@ -137,7 +138,7 @@ def test_local_delivery_resumes_exact_integration_and_retires_owned_resources(
     observed = local.reconcile(integration)
     assert observed.disposition == "prior" and observed.commit == middle
     assert snapshot() == before
-    integrated = local.execute(integration, lambda: guarded.append("integration"))
+    integrated = local.execute(integration, WriteAuthority(lambda: lambda: guarded.append("integration")))
     assert integrated.disposition == "target" and integrated.commit is not None
     assert git.parents(integrated.commit.sha) == (middle.sha, target.sha)
     assert git.parents(middle.sha) == (candidate.sha, source.sha)
@@ -147,15 +148,15 @@ def test_local_delivery_resumes_exact_integration_and_retires_owned_resources(
     assert local.reconcile(integration) == integrated
     assert snapshot() == before
     foreign_identity = replace(integration, payload={**integration.payload, "common_git_dir": str(tmp_path)})
-    assert local.execute(foreign_identity, lambda: pytest.fail("foreign checkout must not dispatch")).disposition == "third"
+    assert local.execute(foreign_identity, WriteAuthority(lambda: lambda: pytest.fail("foreign checkout must not dispatch"))).disposition == "third"
     cleanup = intent("cleanup_worktree", expected_head=integrated.commit.sha, branch_ref=seed.source_ref)
     (checkout / "keep-my-work.txt").write_text("not disposable\n")
-    assert local.execute(cleanup, lambda: pytest.fail("dirty delivery must survive")).disposition == "third"
+    assert local.execute(cleanup, WriteAuthority(lambda: lambda: pytest.fail("dirty delivery must survive"))).disposition == "third"
     (checkout / "keep-my-work.txt").unlink()
-    assert local.execute(cleanup, lambda: guarded.append("cleanup")).disposition == "target"
+    assert local.execute(cleanup, WriteAuthority(lambda: lambda: guarded.append("cleanup"))).disposition == "target"
     assert not checkout.exists()
     ref_cleanup = intent("cleanup_local_ref", expected_head=base.sha, branch_ref=seed.source_ref)
-    assert local.execute(ref_cleanup, lambda: guarded.append("ref_cleanup")).disposition == "target"
+    assert local.execute(ref_cleanup, WriteAuthority(lambda: lambda: guarded.append("ref_cleanup"))).disposition == "target"
     assert git.run("for-each-ref", "--format=%(refname)", seed.source_ref).stdout == ""
     assert set(guarded) == {"workspace", "candidate", "review", "review_cleanup", "integration", "cleanup", "ref_cleanup"}
 
@@ -168,13 +169,13 @@ def test_publication_distinguishes_unreadable_object_from_conflict_and_revoked_w
     effect = replace(effect, payload={**effect.payload, "publication_commit_intent": witness})
     wrong = replace(effect, payload={**effect.payload, "publication_commit_intent": {
         **witness, "raw_commit": witness["raw_commit"].replace("Publish the reviewed change", "Unrelated publication")}})
-    assert local.execute(wrong, lambda: pytest.fail("conflicting bytes cannot dispatch")).disposition == "third"
+    assert local.execute(wrong, WriteAuthority(lambda: lambda: pytest.fail("conflicting bytes cannot dispatch"))).disposition == "third"
 
     def revoked() -> None:
         raise KernelError("executor_fenced")
 
     with pytest.raises(KernelError, match="executor_fenced"):
-        local.execute(effect, revoked)
+        local.execute(effect, WriteAuthority(lambda: revoked))
     assert git.run("cat-file", "--batch-check", input_text=witness["expected_sha"] + "\n").stdout.endswith(" missing\n")
     assert git.run("rev-parse", "HEAD", cwd=Path(effect.payload["checkout"])).stdout.strip() == effect.before_sha
     # Fail the actual Git command at its process boundary; all earlier checkout
@@ -191,7 +192,7 @@ def test_publication_distinguishes_unreadable_object_from_conflict_and_revoked_w
     git.env["PATH"] = str(commands) + os.pathsep + git.env["PATH"]
     unavailable = LocalEffects(git, owned_root=tmp_path / "work")
     assert unavailable.reconcile(effect).disposition == "unknown"
-    assert unavailable.execute(effect, lambda: pytest.fail("unknown read cannot authorize replay")).disposition == "unknown"
+    assert unavailable.execute(effect, WriteAuthority(lambda: lambda: pytest.fail("unknown read cannot authorize replay"))).disposition == "unknown"
 
 
 def test_local_git_uses_bounded_capture_and_its_explicit_environment(tmp_path: Path) -> None:

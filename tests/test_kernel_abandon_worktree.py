@@ -9,6 +9,7 @@ from agent_run.errors import KernelError
 from agent_run.adapters.git_objects import LocalGit
 from agent_run.adapters.local_git import LocalEffects
 from agent_run.model import resource_wire
+from agent_run.contracts.write_authority import FinalAdmission, WriteAuthority
 
 
 def _original(git_repo: Path, tmp_path: Path):
@@ -47,7 +48,7 @@ def test_abandon_worktree_preserves_foreign_or_unsaved_work_and_requires_origina
                      "discard_worktree": case == "discard"}, Execution("run", "executor", 1))
     authorized: list[str] = []
     local = LocalEffects(git, owned_root=Path(resource.owned_root))
-    result = local.execute(effect, lambda: authorized.append("original-action"))
+    result = local.execute(effect, WriteAuthority(lambda: lambda: authorized.append("original-action")))
     if case in {"clean", "discard", "absent"}:
         assert result.disposition == "target"
         assert result.raw["resource"] == resource_wire(resource)
@@ -74,12 +75,15 @@ def test_abandon_absent_checkout_rechecks_after_authorization(git_repo: Path, tm
                     Execution("run", "executor", 1))
     authorized: list[str] = []
 
-    def authorize() -> None:
-        authorized.append("original-action")
+    prepared: list[str] = []
+    def prepare() -> FinalAdmission:
+        prepared.append("original-action")
         checkout.mkdir()
         (checkout / "foreign.txt").write_text("Preserve newly arrived directory.\n")
+        return lambda: authorized.append("original-action")
 
     with pytest.raises(KernelError, match="local_effect_boundary_changed"):
-        LocalEffects(git, owned_root=Path(resource.owned_root)).execute(effect, authorize)
-    assert authorized == ["original-action"]
+        LocalEffects(git, owned_root=Path(resource.owned_root)).execute(effect, WriteAuthority(prepare))
+    assert prepared == ["original-action"]
+    assert authorized == []
     assert (checkout / "foreign.txt").read_text() == "Preserve newly arrived directory.\n"

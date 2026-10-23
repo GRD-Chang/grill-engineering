@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+from agent_run.contracts.write_authority import FinalAdmission, WriteAuthority
 
 from agent_run.model import DeliveryKind, Effect
 from agent_run.errors import KernelError
@@ -57,10 +58,14 @@ def test_delivery_adapter_reads_real_refs_and_scripted_checks_without_world_vers
     effect = Effect('external-pr', 'ticket:2', 'pr_write', scenario.spec.repository,
         scenario.delivery.target_ref, 'refs/heads/main', base.sha, first.sha, first, base,
         None, 'offline-publisher', {'title': 'Independent PR', 'body': 'Observed external body.'}, scenario.execution)
-    authorized = []
-    acknowledgement = port.execute(effect, lambda: authorized.append(True))
-    # Recheck authority after readback, immediately before the single POST.
-    assert authorized == [True, True] and acknowledgement is not None
+    prepared, authorized = [], []
+    def prepare() -> FinalAdmission:
+        prepared.append(True)
+        return lambda: authorized.append(True)
+    acknowledgement = port.execute(effect, WriteAuthority(prepare))
+    # Preparation grants nothing; final admission follows exact readback before the single POST.
+    assert prepared == [True]
+    assert authorized == [True] and acknowledgement is not None
     assert sum(row['operation'] == 'pr_write' for row in port.writes()) == 1
     assert acknowledgement.pr is not None
     request = DeliveryRead(effect.source_ref, effect.target_ref, acknowledgement.pr.number, (base.sha,))

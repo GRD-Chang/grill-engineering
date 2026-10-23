@@ -128,7 +128,7 @@ def sent_workspaces(tmp_path, *, count=2, execute=True):
         if execute:
             assert physical(effect, authorize).disposition == "target"
         else:
-            authorize()  # The request was admitted; its transport has not applied it.
+            authorize.prepare()()  # The request was admitted; its transport has not applied it.
         sent.append(effect)
         return EffectResult("unknown")
 

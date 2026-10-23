@@ -36,7 +36,7 @@ def tickets(root: Path) -> tuple[Kernel, ReadOnlyPorts]:
 
         def execute(self, effect, authorize):
             assert effect.operation == 'candidate'
-            authorize()
+            authorize.prepare()()
             return EffectResult('failure', base, raw={'head': 'base', 'reason': 'candidate_integrity'})
 
     return kernel, TicketPorts(ports.requirements, ports.source_ref, ports.target_ref, ports.facts)

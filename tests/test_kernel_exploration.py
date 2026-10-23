@@ -12,6 +12,7 @@ import pytest
 
 from agent_run.model import Checks, Commit, Delivery, DeliveryKind, Policy, RunSpec, World
 from agent_run.core.kernel import Kernel
+from agent_run.contracts.write_authority import FinalAdmission, WriteAuthority
 from agent_run.errors import KernelError
 from support.offline import Scenario, review_result
 from agent_run.model import wire_json
@@ -228,15 +229,18 @@ def test_noop_integration_requires_current_dispatch_before_consuming_exact_candi
     if boundary == "stopped":
         scenario.kernel.control("stop", "stop-before-noop")
 
-    def authorize() -> None:
-        held.authorize()
+    def prepare() -> FinalAdmission:
+        final_admission = held.authorize.prepare()
         if boundary == "checkout_changed":
             (Path(effect.payload["checkout"]) / "concurrent-work.txt").write_text("Preserve this work.\n")
+        return final_admission
+
+    authority = WriteAuthority(prepare)
 
     if boundary != "current":
         with pytest.raises(KernelError, match=("executor_fenced" if boundary == "stopped"
                                               else "local_effect_boundary_changed")):
-            local.execute(effect, authorize)
+            local.execute(effect, authority)
         assert scenario.kernel.status(effect.subject)["phase"] == "integration"
         history = [event["kind"] for event in scenario.kernel.history(effect.subject)
                    if event["identity"] == effect.effect_id]
@@ -249,7 +253,7 @@ def test_noop_integration_requires_current_dispatch_before_consuming_exact_candi
         else:
             assert (Path(effect.payload["checkout"]) / "concurrent-work.txt").read_text() == "Preserve this work.\n"
         return
-    result = local.execute(effect, authorize)
+    result = local.execute(effect, authority)
     assert result == observed
     assert scenario.kernel.status(effect.subject)["pending_write"]["status"] == "sent"
     assert local.reconcile(effect) == observed
@@ -318,7 +322,7 @@ def test_original_absent_local_cleanup_requires_lazy_authority(tmp_path: Path, m
         git.run("update-ref", "-d", effect.source_ref, effect.payload["expected_head"])
         for field in ("owned_root", "common_git_dir"):
             foreign = replace(effect, payload={**effect.payload, field: str(tmp_path / "foreign")})
-            assert scenario.port.local.execute(foreign, lambda: pytest.fail("foreign resource cannot dispatch")).disposition == "third"
+            assert scenario.port.local.execute(foreign, WriteAuthority(lambda: lambda: pytest.fail("foreign resource cannot dispatch"))).disposition == "third"
     else:
         git.run("worktree", "remove", "--force", effect.payload["checkout"])
     local = scenario.port.local
@@ -476,18 +480,24 @@ def test_successor_git_write_rechecks_stop_after_previous_git_operation(tmp_path
     held = advance_to_effect(scenario, monkeypatch, "candidate", sent=True)
     effect = held.effect
     guards = 0
+    admissions = []
 
-    def authorize() -> None:
+    def prepare() -> FinalAdmission:
         nonlocal guards
         guards += 1
         if guards == 2:
             scenario.kernel.control("stop", "stop-after-git-add")
-        held.authorize()
+        final_admission = held.authorize.prepare()
+        def admitted() -> None:
+            final_admission()
+            admissions.append(effect.effect_id)
+        return admitted
 
     before = scenario.port.git.commit(scenario.delivery.base.sha)
     with pytest.raises(KernelError, match="executor_fenced|operation_cancelled"):
-        scenario.port.execute(effect, authorize)
+        scenario.port.execute(effect, WriteAuthority(prepare))
     assert guards == 2
+    assert admissions == [effect.effect_id]
     assert scenario.port.git.run("rev-parse", "HEAD", cwd=Path(scenario.delivery.checkout)).stdout.strip() == before.sha
     assert not any(write["operation"] == "candidate" for write in scenario.port.writes())
 

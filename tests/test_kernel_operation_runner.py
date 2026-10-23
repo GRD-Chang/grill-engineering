@@ -1,5 +1,6 @@
 """Public Core operation seam: selection, bounded I/O and durable settlement."""
 from agent_run.core.operation_runner import OperationRunner, observe_control
+from agent_run.contracts.write_authority import WriteAuthority
 from pathlib import Path
 from dataclasses import replace
 
@@ -413,7 +414,7 @@ def test_original_approved_prior_merge_continues_new_review_without_a_new_contro
 
     def interrupted(effect, authorize):
         if effect.subject == "final:1" and effect.operation == "merge":
-            authorize()
+            authorize.prepare()()
             sent.append(effect)
             raise OSError("Original merge was interrupted before remote application")
         return execute(effect, authorize)
@@ -470,7 +471,7 @@ def test_cleanup_records_foreign_observation_and_keeps_absence_admission(tmp_pat
             s.port.git.run("update-ref", effect.source_ref, other.sha, expected)
         else:
             s.port.git.run("update-ref", "-d", effect.source_ref, expected)
-        guard = authorize if external_change == "absent" else lambda: pytest.fail("A foreign observation cannot authorize a write")
+        guard = authorize if external_change == "absent" else WriteAuthority(lambda: lambda: pytest.fail("A foreign observation cannot authorize a write"))
         return s.port.local.execute(effect, guard)
 
     ports.execute = changed
