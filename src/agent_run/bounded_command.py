@@ -5,9 +5,10 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
-import threading
 import time
 from dataclasses import dataclass
+
+from ._process_io import TailOutput, pump
 
 
 @dataclass(frozen=True)
@@ -27,69 +28,41 @@ def capture_command(
     child's process group is terminated; escaped descendants are not inferred
     from unrelated processes owned by the caller.
     """
-    stdout = bytearray()
-    stderr = bytearray()
-
-    stop_readers = threading.Event()
-
-    def drain(stream: object, destination: bytearray) -> None:
-        fileno = getattr(stream, "fileno", None)
-        if not callable(fileno):
-            return
-        try:
-            descriptor = fileno()
-            os.set_blocking(descriptor, False)
-            deadline: float | None = None
-            while True:
-                if stop_readers.is_set():
-                    # Drain buffered output, but escaped pipe holders cannot
-                    # extend cleanup indefinitely by keeping the pipe open.
-                    if deadline is None:
-                        deadline = time.monotonic() + 0.1
-                    if time.monotonic() >= deadline:
-                        return
-                try:
-                    chunk = os.read(descriptor, 64 * 1024)
-                except BlockingIOError:
-                    if deadline is not None:
-                        return
-                    stop_readers.wait(0.05)
-                    continue
-                if not chunk:
-                    return
-                destination.extend(chunk)
-                if len(destination) > max_output:
-                    del destination[:-max_output]
-        except OSError:
-            return
-
-    assert process.stdout is not None
-    assert process.stderr is not None
-    readers = (
-        threading.Thread(target=drain, args=(process.stdout, stdout), daemon=True),
-        threading.Thread(target=drain, args=(process.stderr, stderr), daemon=True),
-    )
+    stdout, stderr = TailOutput(max_output), TailOutput(max_output)
+    deadline = time.monotonic() + timeout
+    drain_deadline: float | None = None
     timed_out = False
+    group_signalled = False
+
+    def terminate() -> int:
+        nonlocal group_signalled
+        if not group_signalled:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            # A later wait/drain failure cannot re-signal a recycled PGID.
+            group_signalled = True
+        return process.wait()
+
+    def check() -> bool:
+        nonlocal timed_out, drain_deadline
+        if drain_deadline is None:
+            exited = process.poll() is not None
+            if exited or time.monotonic() >= deadline:
+                timed_out = not exited
+                terminate()
+                # Escaped pipe holders cannot prolong this owned-group cleanup.
+                drain_deadline = time.monotonic() + 0.1
+        return drain_deadline is None or time.monotonic() < drain_deadline
+
     try:
-        for reader in readers:
-            reader.start()
-        returncode = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
+        pump(process, stdout=stdout, stderr=stderr, check=check, ignore_read_errors=True)
     finally:
-        # A successful command may leave descendants holding the output pipes.
-        # Close the owned group on every path before waiting for EOF readers.
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        cleanup_returncode = process.wait()
-        if timed_out:
-            returncode = cleanup_returncode
-        stop_readers.set()
-        for reader in readers:
-            if reader.ident is not None:
-                reader.join()
-        process.stdout.close()
-        process.stderr.close()
-    return CommandCapture(returncode, bytes(stdout), bytes(stderr), timed_out)
+            returncode = terminate()
+        finally:
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+    return CommandCapture(returncode, bytes(stdout.data), bytes(stderr.data), timed_out)

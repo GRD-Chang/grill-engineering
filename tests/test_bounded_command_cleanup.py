@@ -8,10 +8,45 @@ from pathlib import Path
 import pytest
 
 
+@pytest.mark.parametrize('wait_fails', [False, True])
+def test_capture_signals_group_once_even_when_wait_fails(
+    monkeypatch: pytest.MonkeyPatch, wait_fails: bool,
+) -> None:
+    from agent_run.bounded_command import capture_command
+
+    process = subprocess.Popen(
+        [sys.executable, '-c', "print('completed', flush=True)"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+    )
+    process.wait()  # Ordinary completed child; no PID reuse is constructed.
+    signals = []
+    monkeypatch.setattr(os, 'killpg', lambda *args: signals.append(args))
+    original_wait = process.wait
+    waits = 0
+
+    def wait(timeout=None):
+        nonlocal waits
+        waits += 1
+        if wait_fails and waits == 1:
+            raise RuntimeError('injected wait failure after group signal')
+        return original_wait(timeout=timeout)
+
+    monkeypatch.setattr(process, 'wait', wait)
+    if wait_fails:
+        with pytest.raises(RuntimeError, match='wait failure after group signal'):
+            capture_command(process, timeout=1, max_output=128)
+    else:
+        result = capture_command(process, timeout=1, max_output=128)
+        assert result.returncode == 0 and result.stdout == b'completed\n'
+    assert len(signals) == 1
+    assert process.stdout.closed and process.stderr.closed
+
+
 _PROBE = r'''
-import ctypes, os, select, signal, subprocess, sys, threading
+import ctypes, os, select, signal, subprocess, sys, threading, selectors
 from pathlib import Path
 from agent_run.github_retry import _run_bounded_command
+from agent_run.git_output import run_git
 from agent_run_kernel.host_adapter import HostUnavailable, SystemdHost
 
 assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0  # Own and reap fixture orphans.
@@ -56,15 +91,11 @@ try:
         baseline_fds = set(os.listdir('/proc/self/fd'))
         spawned = []
         original_start = threading.Thread.start
-        starts = 0
-        def start(reader):
-            global starts
-            starts += 1
-            if starts == 2:
-                raise RuntimeError("can't start new thread")
-            return original_start(reader)
-        if outcome == 'reader_start_failure':
-            threading.Thread.start = start
+        original_selector = selectors.DefaultSelector
+        def failed_selector():
+            raise RuntimeError("can't create pipe selector")
+        if outcome == 'capture_setup_failure':
+            selectors.DefaultSelector = failed_selector
         def spawn(*args, **kwargs):
             process = real_popen(*args, **kwargs)
             spawned.append(process)
@@ -77,18 +108,16 @@ try:
             finally:
                 os.close(ready)
             original_start(guard)
-            if outcome in {'timeout', 'exception'}:
-                original_wait = process.wait
+            if outcome == 'exception':
+                original_poll = process.poll
                 injected = False
-                def wait(timeout=None):
+                def poll():
                     nonlocal injected
                     if not injected:
                         injected = True
-                        if outcome == 'timeout':
-                            raise subprocess.TimeoutExpired(args[0], timeout)
-                        raise RuntimeError('injected wait failure')
-                    return original_wait(timeout=timeout)
-                process.wait = wait
+                        raise RuntimeError('injected poll failure')
+                    return original_poll()
+                process.poll = poll
             return process
         subprocess.Popen = spawn
         child = None
@@ -98,11 +127,19 @@ try:
             guard_fired.set()
             if (sample / 'child.pid').exists():
                 os.kill(int((sample / 'child.pid').read_text()), signal.SIGKILL)
-        guard = threading.Timer(3, rescue)
+        # Systemd's real five-second command deadline precedes cleanup; keep
+        # the original three-second rescue allowance after that deadline.
+        guard = threading.Timer(8 if helper == 'systemd' and outcome == 'timeout' else 3, rescue)
         try:
             arguments = [sys.executable, '-c', command, str(sample), outcome, 'escaped' if escaped else 'owned']
+            if helper == 'git':
+                program = sample / 'pipe_holder.py'
+                program.write_text(command)
+                arguments = ['git', '-c', 'alias.holder=!' + sys.executable + ' ' + str(program),
+                             'holder', str(sample), outcome, 'owned']
             try:
-                result = (_run_bounded_command(arguments, cwd=sample, timeout=30)
+                result = (run_git(arguments, cwd=sample, timeout=5) if helper == 'git' else
+                          _run_bounded_command(arguments, cwd=sample, timeout=0.05 if outcome == 'timeout' else 30)
                           if helper == 'github' else SystemdHost(
                               systemctl='unused-fixture', systemd_run='unused-fixture',
                               environment=os.environ)._run(arguments))
@@ -115,11 +152,11 @@ try:
                     assert helper == 'systemd' and outcome == 'timeout'
                     assert str(error) == 'Bounded user systemd observation was unavailable'
                 else:
-                    assert outcome in {'exception', 'reader_start_failure'}
-                    assert str(error) == ("can't start new thread" if outcome == 'reader_start_failure'
-                                          else 'injected wait failure')
+                    assert outcome in {'exception', 'capture_setup_failure'}
+                    assert str(error) == ("can't create pipe selector" if outcome == 'capture_setup_failure'
+                                          else 'injected poll failure')
             else:
-                assert outcome not in {'exception', 'reader_start_failure'}
+                assert outcome not in {'exception', 'capture_setup_failure'}
                 stdout = result.stdout.decode() if helper == 'systemd' else result.stdout
                 stderr = result.stderr.decode() if helper == 'systemd' else result.stderr
                 assert stdout == 'normal output\n'
@@ -148,7 +185,7 @@ try:
             if guard.ident is not None:
                 guard.join()
             subprocess.Popen = real_popen
-            threading.Thread.start = original_start
+            selectors.DefaultSelector = original_selector
             for process in spawned:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -176,10 +213,19 @@ finally:
 @pytest.mark.skipif(not hasattr(os, 'pidfd_open'), reason='requires Linux pidfd')
 @pytest.mark.parametrize('escape', ['owned', 'escaped'])
 @pytest.mark.parametrize('helper', ['github', 'systemd'])
-@pytest.mark.parametrize('outcome', ['normal', 'timeout', 'exception', 'reader_start_failure'])
+@pytest.mark.parametrize('outcome', ['normal', 'timeout', 'exception', 'capture_setup_failure'])
 def test_bounded_commands_reap_descendants_and_readers(
     tmp_path: Path, helper: str, outcome: str, escape: str,
 ) -> None:
+    _check_cleanup(tmp_path, helper, outcome, escape)
+
+
+@pytest.mark.skipif(not hasattr(os, 'pidfd_open'), reason='requires Linux pidfd')
+def test_git_reaps_pipe_holders_after_leader_exit(tmp_path: Path) -> None:
+    _check_cleanup(tmp_path, 'git', 'normal', 'owned')
+
+
+def _check_cleanup(tmp_path: Path, helper: str, outcome: str, escape: str) -> None:
     environment = os.environ.copy()
     environment['PYTHONPATH'] = str(Path(__file__).parents[1] / 'src')
     environment['PYTHONDONTWRITEBYTECODE'] = '1'

@@ -99,7 +99,9 @@ def test_both_git_pipes_are_drained_with_bounded_buffers(git_repo: Path, monkeyp
             super().extend(value)
             self.maximum = max(self.maximum, len(self))
 
-    monkeypatch.setattr(git_output, "bytearray", MeasuredBuffer, raising=False)
+    from agent_run import _process_io
+
+    monkeypatch.setattr(_process_io, "bytearray", MeasuredBuffer, raising=False)
     program = git_repo / "noisy.py"
     program.write_text(
         "import os\nfor _ in range(1024):\n"
@@ -159,6 +161,50 @@ def test_non_utf8_git_data_is_rejected(git_repo: Path) -> None:
         run_git(["git", "-c", "alias.invalid=!python3 invalid.py", "invalid"], cwd=git_repo)
 
 
+def test_git_stdin_and_both_outputs_make_progress_before_deadline(git_repo: Path) -> None:
+    program = git_repo / "duplex.py"
+    program.write_text(
+        "import os, sys\n"
+        "os.write(1, b'o' * 262144)\nos.write(2, b'e' * 262144)\n"
+        "data = sys.stdin.buffer.read()\n"
+        "print(len(data), flush=True)\n"
+        "os.write(2, b'last diagnostic')\n"
+    )
+    result = run_git(["git", "-c", "alias.duplex=!python3 duplex.py", "duplex"],
+                     cwd=git_repo, input="x" * 500000, timeout=5)
+    assert result.returncode == 0
+    assert result.stdout == "o" * 262144 + "500000\n"
+    assert result.stderr.endswith("last diagnostic")
+    assert len(result.stderr.encode()) <= 64 * 1024
+
+
+def test_git_deadline_retains_diagnostics_and_reaps_child(git_repo: Path, monkeypatch) -> None:
+    from agent_run import git_output
+
+    processes = []
+    real_popen = subprocess.Popen
+
+    def start(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(git_output.subprocess, "Popen", start)
+    program = git_repo / "blocked.py"
+    program.write_text(
+        "import os, signal\nos.write(1, b'partial output')\n"
+        "os.write(2, b'last diagnostic')\nsignal.pause()\n"
+    )
+    with pytest.raises(GitError, match="timed out") as error:
+        run_git(["git", "-c", "alias.blocked=!python3 blocked.py", "blocked"],
+                cwd=git_repo, timeout=1)
+    assert error.value.evidence["stdout"] == "partial output"
+    assert error.value.evidence["stderr"] == "last diagnostic"
+    assert error.value.evidence["timeout_seconds"] == 1
+    assert len(processes) == 1 and processes[0].poll() is not None
+    assert processes[0].stdout.closed and processes[0].stderr.closed
+
+
 def test_selector_creation_failure_reaps_git(git_repo: Path, monkeypatch) -> None:
     from agent_run import git_output
 
@@ -174,7 +220,9 @@ def test_selector_creation_failure_reaps_git(git_repo: Path, monkeypatch) -> Non
         raise OSError("injected selector failure")
 
     monkeypatch.setattr(git_output.subprocess, "Popen", start)
-    monkeypatch.setattr(git_output.selectors, "DefaultSelector", failed_selector)
+    from agent_run import _process_io
+
+    monkeypatch.setattr(_process_io.selectors, "DefaultSelector", failed_selector)
     with pytest.raises(OSError, match="selector failure"):
         run_git(["git", "status"], cwd=git_repo)
     assert len(processes) == 1

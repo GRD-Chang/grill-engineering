@@ -6,7 +6,6 @@ import fcntl
 import json
 import os
 import re
-import selectors
 import shutil
 import subprocess
 import tempfile
@@ -15,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from agent_run._process_io import TailOutput, pump
 from agent_run.messages import error_message
 from agent_run.git_errors import GitError
 from agent_run.git_output import git_environment, run_git
@@ -235,36 +235,34 @@ def _command(
         )
     except OSError as error:
         raise ManagedWorkspaceError(error_message("workspace.error.start_failed")) from error
-    output = {"stdout": bytearray(), "stderr": bytearray()}
+    stdout, stderr = TailOutput(16384), TailOutput(16384)
     deadline = time.monotonic() + timeout
+    cleaned = False
     assert process.stdout is not None and process.stderr is not None
+
+    def check() -> bool:
+        nonlocal cleaned
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired(arguments, timeout)
+        if not cleaned and process.poll() is not None:
+            cleaned = True
+            terminate_process_group(process)
+        return True
+
     try:
-        with selectors.DefaultSelector() as selector:
-            for stream, name in ((process.stdout, "stdout"), (process.stderr, "stderr")):
-                os.set_blocking(stream.fileno(), False)
-                selector.register(stream, selectors.EVENT_READ, name)
-            while selector.get_map():
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise ManagedWorkspaceError(error_message("workspace.error.timeout"))
-                for key, _ in selector.select(timeout=min(remaining, 0.1)):
-                    chunk = os.read(key.fd, 16384)
-                    if not chunk:
-                        selector.unregister(key.fileobj)
-                        continue
-                    output[key.data].extend(chunk)
-                    del output[key.data][:-16384]
-                if selector.get_map() and process.poll() is not None:
-                    terminate_process_group(process)
-            process.wait(timeout=max(0.001, deadline - time.monotonic()))
+        pump(process, stdout=stdout, stderr=stderr, check=check)
+        process.wait(timeout=max(0.001, deadline - time.monotonic()))
     except subprocess.TimeoutExpired as error:
         raise ManagedWorkspaceError(error_message("workspace.error.timeout")) from error
     finally:
-        terminate_process_group(process)
-        process.stdout.close()
-        process.stderr.close()
+        try:
+            if not cleaned:
+                terminate_process_group(process)
+        finally:
+            process.stdout.close()
+            process.stderr.close()
     if process.returncode != 0:
-        diagnostic = output["stderr"].decode("utf-8", errors="replace").lower()
+        diagnostic = stderr.data.decode("utf-8", errors="replace").lower()
         reason_key = "workspace.error.access"
         for needle, message_key in (
             ("repository not found", "workspace.error.not_found"),
@@ -282,4 +280,4 @@ def _command(
             "workspace.error.command_failed", returncode=process.returncode,
             reason=error_message(reason_key),
         ))
-    return output["stdout"].decode("utf-8")
+    return stdout.data.decode("utf-8")
