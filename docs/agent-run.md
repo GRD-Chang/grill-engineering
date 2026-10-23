@@ -73,12 +73,11 @@ agent-run history <run-id> --details
 Delivery Policy 的取值优先级是内置默认值、用户级默认值、单次命令覆盖；仓库内容不能覆盖
 操作者的个人成本策略。统一个人文件为 `$XDG_CONFIG_HOME/agent-run/user-defaults.json`
 （未设置时为 `~/.config/agent-run/user-defaults.json`）。完整字段、直接编辑、模型与推理强度、
-引用关系及兼容说明见[个人运行默认配置](user-defaults.md)。推荐 `settings show/configure`；
-旧 `policy` 命令指向同一文件：
+引用关系及错误处理见[个人运行默认配置](user-defaults.md)。个人设置统一使用 `settings show/configure`：
 
 ```bash
-agent-run policy show
-agent-run policy configure --ticket-review-rounds 3 --parent-only-paired-rounds 10 --run-repair-rounds 3 --parent-ci-development-limit 3 --review-deadline 2h
+agent-run settings show
+agent-run settings configure --ticket-review-rounds 3 --parent-only-paired-rounds 10 --run-repair-rounds 3 --parent-ci-development-limit 3 --review-deadline 2h
 agent-run run <parent-issue> --ticket-review-rounds 1 --development-deadline 30m
 ```
 

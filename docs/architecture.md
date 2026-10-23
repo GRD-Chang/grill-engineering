@@ -1,6 +1,6 @@
 # 当前运行架构
 
-本页是现行源码架构概览，基于已合入的 `09d1c88a6445d6ef39e95061ec6e4cbb3a1f69b7`。
+本页是现行源码架构概览，基于已合入的 `19a79c217468d7c7a2502f68324af2f093a6992e`。
 实现职责以本页及链接源码为准；ADR、带日期的研究与 handoff 保留其决策和验证时点，
 其中旧模块名、协议及实验入口不代表当前支持。
 
@@ -67,7 +67,7 @@ Task 位置记录位于数据主目录的 `native-task-locations/`，只绑定 R
 每次真实外部写入前仍经过 Core 的当下授权检查，未知结果沿同一 intent 读回，
 数据库提交、展示状态和 Agent 报告均不能代替真实外部结果或进程退出证据。
 
-## 测试支撑与尚待会合的候选
+## 已合入的测试支撑与配置归属
 
 合成 GitHub、脚本 Agent 和独立 Git world 已随 Node B `09d1c88` 归位到
 `tests/support`：`offline.py` 组织场景，`offline_api.py` 提供原始合成 API 记录，
@@ -77,10 +77,17 @@ Task 位置记录位于数据主目录的 `native-task-locations/`，只绑定 R
 不另算业务后继、预算或授权；它们不是产品的 offline 用户入口。
 此归位不表示整个仓库净删除了同等实现，也不单凭生产目录行数推导整体复杂度或运行预算。
 
-旧 single-policy（`b163`）和旧 Agent（`a324`）退休仍是尚未合入的候选。
-当前创建和显式窗口续期仍经 `configuration` 调用
-`agent_run.delivery_policy.resolve_delivery_policy`，`personal_settings` 仍注册 `policy` 命令；
-相关 `agent_run` 叶模块不在本说明中提前标记为删除。
-集成后以实际源码校准这些配置/类型归属，不由候选报告推断实现已经完成。
+single-policy（`b163`）与旧 Agent（`a324`）退休已随 Node C `19a79c2` 合入。
+个人设置统一使用 `settings show/configure`；`UserDefaultsStore` 只读取当前
+`user-defaults.json`，旧 `delivery-policy.json` 不读取、导入、改写或删除。
+旧 `policy` 命令、旧快照 parser 与显示分支已退出。
+创建与显式窗口续期仍经 `configuration` 调用
+[`resolve_delivery_policy`](../src/agent_run/delivery_policy.py)，
+归一化当前配置并返回唯一的 [`model.Policy`](../src/agent_run_kernel/model.py)；
+这个解析叶不是已退休的第二套策略模型。Run 冻结值、明确覆盖与后继窗口的归属保持原合同。
+
+`agent_run/agent_fixture.py`、`agent_run/agents.py`、`agent_run/revisions.py`
+及相应专属旧 consumer 已退出。正式 Agent 调用继续由 `executor` / `codex_execution`
+执行 Core 分配的工作并保存准确 Thread、返回和退出证据；测试脚本 Agent 仍属于测试支撑。
 
 以上是源码状态区分，不是运行验收结论；历史通过数不自动成为当前提交的全量验证结果。

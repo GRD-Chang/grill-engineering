@@ -2,11 +2,9 @@ from __future__ import annotations
 
 """User-level Delivery Policy resolution and immutable Run snapshots."""
 
-import math
 import re
 from collections.abc import Mapping
 from dataclasses import replace
-from functools import lru_cache
 
 from agent_run.messages import error_message
 from agent_run.policy_contract import DeliveryPolicyError as DeliveryPolicyError
@@ -17,7 +15,6 @@ if TYPE_CHECKING:
     from agent_run_kernel.model import Policy
 
 
-DELIVERY_POLICY_PROTOCOL = 9
 _POLICY_KEYS = frozenset(
     {
         "ticket_development_workers",
@@ -34,16 +31,7 @@ _POLICY_KEYS = frozenset(
     }
 )
 _DEADLINE_KEYS = frozenset({"development", "review", "publication"})
-_LEGACY_POLICY_KEYS = _POLICY_KEYS - {"development_thread_policy"}
-_POLICY_SCALAR_FIELDS = (
-    "parent_only_paired_rounds", "run_repair_rounds", "ticket_review_rounds",
-    "ticket_development_workers", "integration_resync_limit",
-    "ticket_integration_development_limit", "ticket_ci_development_limit",
-    "ticket_ci_review", "parent_ci_development_limit", "development_thread_policy",
-)
 _DEADLINE_FIELDS = ("development", "review", "publication")
-_PolicyScalar = bool | int | float | str
-_PolicyCacheKey = tuple[tuple[type[object], _PolicyScalar], ...]
 _DURATION_PATTERN = re.compile(
     r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([smhd]?)\s*$", re.IGNORECASE
 )
@@ -162,65 +150,6 @@ def normalize_policy_overrides(
     if deadlines:
         normalized["invocation_deadlines"] = deadlines
     return normalized
-
-
-def parse_policy_snapshot(value: object) -> Policy:
-    """Parse the complete canonical state snapshot without applying defaults."""
-
-    if not isinstance(value, Mapping) or set(value) not in (
-        _POLICY_KEYS, _LEGACY_POLICY_KEYS
-    ):
-        raise DeliveryPolicyError("Policy Snapshot has an invalid field set")
-    deadlines = value.get("invocation_deadlines")
-    if not isinstance(deadlines, Mapping) or set(deadlines) != _DEADLINE_KEYS:
-        raise DeliveryPolicyError("Policy Snapshot deadlines have an invalid field set")
-    key = _policy_cache_key(value, deadlines)
-    if key is not None:
-        return _cached_policy(key)
-    return _policy_with_deadlines(value, deadlines)
-
-
-def _policy_cache_key(
-    values: Mapping[str, Any], deadlines: Mapping[str, Any],
-) -> _PolicyCacheKey | None:
-    # Custom mappings/values retain their original access and validation path.
-    # Bound retained scalar sizes as well as the number of successful entries.
-    if type(values) is not dict or type(deadlines) is not dict:
-        return None
-    if any(type(field) is not str for field in values) or any(
-        type(field) is not str for field in deadlines
-    ):
-        return None
-    scalars = tuple(values.get(field, "reuse") for field in _POLICY_SCALAR_FIELDS) + tuple(
-        deadlines[field] for field in _DEADLINE_FIELDS
-    )
-    key: list[tuple[type[object], _PolicyScalar]] = []
-    for scalar in scalars:
-        scalar_type = type(scalar)
-        if scalar_type is str:
-            if len(scalar) > 128:
-                return None
-        elif scalar_type is int:
-            if scalar.bit_length() > 64:
-                return None
-        elif scalar_type is float:
-            if not math.isfinite(scalar):
-                return None
-        elif scalar_type is not bool:
-            return None
-        key.append((scalar_type, scalar))
-    # Python compares bool/int/float values equal; retain each exact type.
-    return tuple(key)
-
-
-@lru_cache(maxsize=128)
-def _cached_policy(key: _PolicyCacheKey) -> Policy:
-    scalar_count = len(_POLICY_SCALAR_FIELDS)
-    values = dict(zip(_POLICY_SCALAR_FIELDS, (scalar for _, scalar in key[:scalar_count])))
-    deadlines = dict(zip(_DEADLINE_FIELDS, (scalar for _, scalar in key[scalar_count:])))
-    # lru_cache retains only successful immutable results, never exceptions or
-    # the caller's mutable snapshot. Shape checks still run before every hit.
-    return _policy_with_deadlines(values, deadlines)
 
 
 def _merge_policy_values(

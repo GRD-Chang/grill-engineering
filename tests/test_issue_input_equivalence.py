@@ -126,22 +126,3 @@ def test_pr_actor_narrative_and_exact_foreign_or_deleted_head_facts_are_unchange
     assert actual == expected and after_calls == before_calls
     assert len(after_calls) == 3
     assert actual["value"] == data["pull_request"]
-
-
-def test_shared_fixture_graph_index_and_revision_consumer_still_match(original_source, tmp_path):
-    fixture = tmp_path / "fixture.json"
-    fixture.write_text(json.dumps({
-        "parent": {"number": 1, "title": "Parent", "body": "原始需求", "sub_issues": [9, 3],
-                   "sub_issue_order_reliable": False},
-        "issues": {str(number): {"number": number, "title": f"Issue {number}", "body": "Original body",
-            "state": "OPEN", "labels": ["ready-for-agent"],
-            "blocked_by": [{"number": 99, "state": "CLOSED"}]} for number in (9, 3)},
-    }))
-    before = fixture.read_bytes()
-    log = tmp_path / "unused-transport-log"
-    expected, old_calls = _observe(original_source, tmp_path, "example/project", "fixture", log)
-    actual, new_calls = _observe(Path(__file__).resolve().parents[1] / "src", tmp_path, "example/project", "fixture", log)
-    assert actual == expected and new_calls == old_calls == []
-    assert actual["value"]["order"] == [9, 3]
-    assert actual["value"]["graph"]["parent"]["sub_issue_order_reliable"] is False
-    assert fixture.read_bytes() == before

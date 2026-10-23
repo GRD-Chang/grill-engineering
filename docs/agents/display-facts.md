@@ -90,5 +90,5 @@ Status/History 只读展示当前额度和续期历史，不补造旧内外层�
 现有代码核查入口包括 `tests/test_kernel_query_cli.py`、
 `tests/test_kernel_notification_events.py`、`tests/test_kernel_notifications.py`。
 共享测试支撑从 `tests/support` 导入，不从测试用例模块导入构造器。
-测试 world 的已合入归位及其余候选状态见架构概览；这里的模块映射不宣称未合入候选已完成，
-也不表示上述测试已经重新执行。
+测试 world 与当前配置归属见架构概览；这里的模块映射不表示上述测试已经重新执行，
+也不替代正式验收结果。

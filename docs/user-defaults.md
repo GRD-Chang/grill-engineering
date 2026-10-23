@@ -213,9 +213,9 @@ agent-run resume 228 --ticket-review-rounds 4 --development-deadline 6h
 
 `configure <Run>` 仍仅创建该 Run 的新 Profile Revision，影响之后新建的 Thread；已有 Thread、Resume 和 Output Repair 保持绑定。`resume` 只有在预算检查点才接受显式策略覆盖，并以 Run 当前快照补齐未覆盖字段；普通恢复不会更换策略或新增预算。各旧窗口保存自己的策略与用量。开发会话策略不能通过 `resume` 覆盖。
 
-## 兼容与错误处理
+## 配置来源与错误处理
 
-无新文件时，只读兼容旧 `delivery-policy.json`，查询的 `source` 为 `legacy-delivery-policy`。首次通过任一配置命令保存时，将全部旧有效策略保留到新文件。新文件存在后它是唯一权威，旧文件不再参与解析；查询 `legacy_ignored` 明示这一点，可以自行归档旧文件。旧 `policy show/configure` 命令保留，指向同一新文件，不维护另一套默认。
+个人配置只读取 `user-defaults.json`。文件不存在时使用内置默认值，不读取旧 `delivery-policy.json`，也不自动导入、修改或删除其中的值。`settings show/configure` 是个人设置的正式入口；旧 `policy show/configure` 路由已退出。当前文件中的稀疏覆盖只影响未来创建的 Run；已有 Run 和后续预算窗口继续使用其冻结策略，显式检查点覆盖以该冻结值补齐未提供字段。
 
 策略和模型中的未知字段、null、非法值及文件损坏 JSON 均明确报错，诊断含文件或配置项；不静默恢复默认、不覆盖损坏文件。CLI 更新加文件锁，先完整校验再原子替换；并发 CLI 更新保留彼此未修改字段。写入失败恢复原配置并清理临时文件；若底层存储连回滚也拒绝，错误会报告保留的恢复备份。手工编辑请保存完整 JSON，避免与 CLI 同时写入；外部编辑器不参与 CLI 锁。
 

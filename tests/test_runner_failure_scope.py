@@ -13,9 +13,6 @@ from agent_run import runner_credentials
 from agent_run.credential_lifecycle import ReadCredential
 from agent_run.github import GitHubReadError
 from agent_run.github_auth import GitHubCredentialError
-from agent_run.operator_gate import has_run_operator_gate, operator_gate_identity_is_consistent, run_failure_diagnostic
-from agent_run.operator_action_facts import operator_action_facts
-from agent_run.run_driver import DirectRunOperations, RunDriver
 from agent_run.runner_credentials import RunnerCredentialError, runner_credential_scope
 from agent_run.runner_transport import runner_environment
 
@@ -119,73 +116,10 @@ def test_expired_runner_token_retains_renewal_failure_scope(
     assert not credential.lifecycle._expiry_thread.is_alive()
 
 
-@pytest.mark.parametrize("reason", ["runner_credential_failed", "command_failed"])
-def test_only_confirmed_runner_gate_can_coexist_with_ticket_human_gate(reason: str) -> None:
-    paused = {"ticket_number": 2, "phase": "blocked", "blocked_reason": "agent_requires_human"}
-    active = {"ticket_number": 3, "phase": "developing"}
-    state = {
-        "status": "execution_failed", "terminal_kind": "execution_failed",
-        "ticket_jobs": {"2": paused, "3": active}, "active_ticket_job": active,
-        "frontier": [3], "ticket_integration_holder": None, "ticket_integration_queue": [],
-        "diagnostics": [{"code": reason, "operator_gate": {
-            "work_subject": "ticket:3", "action_kind": "execution_failure",
-            "phase": "developing", "reason": reason,
-        }}],
-    }
-    assert has_run_operator_gate(state)
-    assert operator_gate_identity_is_consistent(state) is (reason == "runner_credential_failed")
 
 
-@pytest.mark.parametrize("reason", ["command_failed", "runner_credential_failed"])
-@pytest.mark.parametrize("local_reason", ["ticket_paused", "review_budget_exhausted", "agent_requires_human", "effective_revision_mismatch"])
-def test_explicit_run_failure_preserves_independent_local_gates(
-    reason: str, local_reason: str,
-) -> None:
-    paused = {"ticket_number": 3, "phase": "blocked", "blocked_reason": local_reason}
-    completed = {"ticket_number": 2, "phase": "completed"}
-    state = {
-        "run_id": "r1", "status": "execution_failed", "terminal_kind": "execution_failed",
-        "ticket_jobs": {"2": completed, "3": paused}, "active_ticket_job": completed,
-        "frontier": [], "ticket_integration_holder": None, "ticket_integration_queue": [],
-    }
-    state["diagnostics"] = [run_failure_diagnostic(state, code=reason, message="Shared failure")]
-    assert has_run_operator_gate(state)
-    assert operator_gate_identity_is_consistent(state)
-    expected = {("run:r1", "global")}
-    if local_reason != "effective_revision_mismatch":
-        expected.add(("ticket:3", "local"))
-    assert {(item["work_subject"], item["scope"]) for item in operator_action_facts(state)} == expected
-    state["active_ticket_job"] = paused
-    assert operator_gate_identity_is_consistent(state)
-    assert has_run_operator_gate(state)
-    assert {(item["work_subject"], item["scope"]) for item in operator_action_facts(state)} == expected
 
 
-def test_driver_records_runner_failure_with_explicit_shared_identity() -> None:
-    state: dict[str, Any] = {"run_id": "run-1", "status": "active", "diagnostics": []}
-    calls: list[tuple[str, str, bool]] = []
-
-    class States:
-        def load_current_run(self, _run_id: str) -> dict[str, Any]:
-            return state
-
-    class Controller:
-        def record_execution_failure(
-            self, run_id: str, message: str, *, runner_credential_failure: bool = False,
-        ) -> bool:
-            calls.append((run_id, message, runner_credential_failure))
-            state.update(status="execution_failed")
-            return True
-
-    def fail(*_args: Any) -> None:
-        raise RunnerCredentialError("shared credential is invalid")
-
-    operations = SimpleNamespace(
-        controller=Controller(), classify=DirectRunOperations.classify, dispatch=fail,
-    )
-    result = RunDriver(operations=operations, states=States(), supervisor=object()).advance(state)  # type: ignore[arg-type]
-    assert result["status"] == "execution_failed"
-    assert calls == [("run-1", "shared credential is invalid", True)]
 
 
 def test_expiry_during_inflight_renewal_does_not_prove_authorization_loss(
