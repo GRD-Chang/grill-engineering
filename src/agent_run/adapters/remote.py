@@ -164,9 +164,11 @@ class RemoteEffects:
             expected = self._expected_remote(effect)
             command = ["git", "push", self.remote, f"{after}:{effect.source_ref}",
                        f"--force-with-lease={effect.source_ref}:{expected or ''}"]
-            authorize()
-            response = (run_write_command(command, cwd=self.root, runner_identity=self.identity) if self.git_writes is None else
-                        self.git_writes.push(effect.source_ref, expected, after))
+            if self.git_writes is None:
+                response = run_write_command(command, authorize=authorize, cwd=self.root, runner_identity=self.identity)
+            else:
+                authorize()
+                response = self.git_writes.push(effect.source_ref, expected, after)
         elif operation == "pr_write":
             body = {"title": _text(effect.payload["title"]), "body": _text(effect.payload["body"])}
             write_authority = authorize
@@ -377,13 +379,13 @@ class RemoteEffects:
         intent = self._retirement_intent(effect)
 
         def guard() -> None:
-            authorize()
             fresh = self.reconcile(effect)
             # Reconciliation already proves the original identity and any
             # append-only base movement. The original marker must stay exact.
             if (fresh.disposition != "prior"
                     or fresh.raw.get("close_intent") != observed.raw.get("close_intent")):
                 raise KernelError("retirement_boundary_changed")
+            authorize()
 
         if observed.raw.get("close_intent") is None:
             self._write(self._retirement_path(effect) + "/comments", "POST", {"body": intent["comment_body"]}, guard)
@@ -542,9 +544,9 @@ class RemoteEffects:
             raise KernelError("remote_actor_changed")
 
         def guard() -> None:
-            authorize()
             if self.reconcile(effect) != observed:
                 raise KernelError("ticket_recovery_boundary_changed")
+            authorize()
 
         response = self._write(self._issue_path(effect) + "/comments", "POST",
                                {"body": self._recovery_body(effect)}, guard)
@@ -556,12 +558,12 @@ class RemoteEffects:
             return observed
 
         def guard() -> None:
-            authorize()
             fresh = self.reconcile(effect)
             if (fresh.disposition != observed.disposition
                     or (fresh.disposition == "target" and not self._same_recovery_event(
                         fresh.raw["reopened_event"], observed.raw["reopened_event"]))):
                 raise KernelError("ticket_recovery_boundary_changed")
+            authorize()
 
         if observed.disposition == "target":
             # First dispatch still needs authority; sent reconciliation is read-only.
@@ -946,9 +948,8 @@ class RemoteEffects:
         with NamedTemporaryFile(prefix="agent-run-write-", suffix=".json") as stream:
             stream.write(data)
             stream.flush()
-            authorize()
             return run_write_command(["gh", "api", endpoint, "--method", method, "--input", stream.name],
-                                     cwd=self.root, runner_identity=self.identity)
+                                     authorize=authorize, cwd=self.root, runner_identity=self.identity)
 
 
 def _login(value: Any) -> str | None:

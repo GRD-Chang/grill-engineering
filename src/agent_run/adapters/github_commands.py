@@ -51,14 +51,16 @@ def run_read_command(
 
 
 def run_write_command(
-    arguments: list[str], *, cwd: Path | None = None,
+    arguments: list[str], *, authorize: Callable[[], None], cwd: Path | None = None,
     runner_identity: Mapping[str, Any] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    """Prepare credentials, then authorize once at the command-start boundary."""
     try:
         return _run_bounded_command(
             arguments,
             cwd=cwd,
             timeout=READ_TIMEOUT_SECONDS,
+            before_start=authorize,
             **runner_options(runner_identity),
         )
     except subprocess.TimeoutExpired as error:
@@ -79,6 +81,7 @@ def _text(value: bytes | str | None) -> str:
 def _run_bounded_command(
     arguments: list[str], *, cwd: Path | None, timeout: int,
     runner_identity: Mapping[str, Any] | None = None,
+    before_start: Callable[[], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     from agent_run.adapters.auth.runner_transport import (
         runner_environment, runner_git_environment,
@@ -86,6 +89,9 @@ def _run_bounded_command(
 
     environment = (runner_git_environment(runner_identity, cwd=cwd) if arguments[0] == "git"
                    else runner_environment(runner_identity))
+    if before_start is not None:
+        # No credential preparation or remote observation after this callback.
+        before_start()
     process = subprocess.Popen(
         arguments,
         cwd=cwd,

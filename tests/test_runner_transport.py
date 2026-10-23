@@ -58,14 +58,14 @@ def test_transport_redacts_failed_and_timed_out_output(
     result = run_write_command(
         [sys.executable, "-c", "import os,sys; print(os.environ['GH_TOKEN']); "
          "print(os.environ['GH_TOKEN'], file=sys.stderr); sys.exit(1)"],
-        runner_identity=identity,
+        runner_identity=identity, authorize=lambda: None,
     )
     assert result.returncode == 1
     assert result.stdout == result.stderr == "[REDACTED]\n"
     monkeypatch.setattr('agent_run.adapters.github_commands.READ_TIMEOUT_SECONDS', 0.1)
     result = run_write_command(
         [sys.executable, "-c", "import os,time; print(os.environ['GH_TOKEN'], flush=True); time.sleep(5)"],
-        runner_identity=identity,
+        runner_identity=identity, authorize=lambda: None,
     )
     assert result.returncode == 1
     assert "test-secret" not in result.stdout + result.stderr
