@@ -11,7 +11,7 @@ import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .storage import Transaction
+from agent_run.storage.sqlite import Transaction
 
 
 class QueryError(ValueError):

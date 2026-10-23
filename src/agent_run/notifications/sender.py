@@ -17,18 +17,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from agent_run import notification_outbox as outbox
-from agent_run.error_safety import bounded_error
-from agent_run.notification_cards import card
-from agent_run.notification_event_facts import event_copy, event_envelope
-from agent_run.notification_transport import send
-from agent_run.process_binding import _process_start_token
+from agent_run.storage import notification_outbox as outbox
+from agent_run.errors import bounded_error
+from agent_run.notifications.cards import card
+from agent_run.notifications.envelope import event_copy, event_envelope
+from agent_run.adapters.notification_transport import send
+from agent_run.runtime.process_identity import _process_start_token
 
-from .execution_facts import execution_facts
-from .event_projection import event_state, project_event, resume_facts
-from .notification_progress import obsolete_progress
-from .read_facts import material, read_boundaries
-from .storage import Storage, Transaction
+from agent_run.queries.execution import execution_facts
+from agent_run.notifications.event_projection import event_state, project_event
+from agent_run.queries.resume_facts import resume_facts
+from agent_run.notifications.progress import obsolete_progress
+from agent_run.queries.read_facts import material, read_boundaries
+from agent_run.storage.sqlite import Storage, Transaction
 
 
 CLOSE_TIMEOUT_SECONDS = 60.0
@@ -374,12 +375,12 @@ class NativeNotifications:
                 outbox.cancel_item(document, item, "original Host exit no longer current")
 
     def _exit_current(self, event: Mapping[str, Any]) -> bool:
-        from .host_exit_facts import host_exit_current
+        from agent_run.queries.host_exit import host_exit_current
         evidence = event.get("exit_evidence")
         return isinstance(evidence, dict) and host_exit_current(self.database, evidence)
 
     def _observe_exit_notice(self) -> bool:
-        from .host_exit_facts import host_exit_event
+        from agent_run.notifications.event_projection import host_exit_event
         assert self.exit_notice is not None
         event = host_exit_event(self.database, self.exit_notice)
         validity = self._exit_validity()
@@ -558,7 +559,7 @@ class NativeNotifications:
                                 options["is_current"] = lambda: self._exit_current(exit_event)
                             result = self.transport(self.config, card(event), identity, self.cancel, **options)
                         except Exception as error:
-                            from .host_exit_facts import HostExitUnavailable
+                            from agent_run.queries.host_exit import HostExitUnavailable
                             if event["kind"] == "executor_exit" and isinstance(error, HostExitUnavailable):
                                 result = {"outcome": "failed", "reason": bounded_error(str(error)), "not_sent": True}
                             else:

@@ -5,7 +5,7 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
-from agent_run.messages import text
+from agent_run.contracts.copy import text
 
 
 def _text(value: object, limit: int = 260) -> str:

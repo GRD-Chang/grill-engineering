@@ -14,14 +14,13 @@ import shutil
 import sqlite3
 from typing import Any
 
-from agent_run.notification_event_facts import event_copy, event_envelope
-from agent_run.task_identity import TaskKey
+from agent_run.contracts.task import TaskKey
 
-from .kernel import Kernel
-from .host_adapter import HostUnavailable, SystemdHost
-from .model import KernelError
-from .native_host import _BOOT, _digest, _runner_witness
-from .task_location import read_task, task_path
+from agent_run.core.kernel import Kernel
+from agent_run.adapters.systemd import HostUnavailable, SystemdHost
+from agent_run.errors import KernelError
+from agent_run.runtime.handoff import _BOOT, _digest, _runner_witness
+from agent_run.storage.tasks import read_task, task_path
 
 
 _RESULTS = {"signal", "core-dump", "oom-kill", "exit-code", "timeout", "success"}
@@ -129,21 +128,3 @@ def host_exit_notice(database: Path, action_id: str, receipt: Mapping[str, Any],
                   "service_result": service_result, "exit_code": exit_code, "exit_status": exit_status,
                   "observed_at": datetime.now(UTC).isoformat()}
     return notice if host_exit_current(database, notice) else None
-
-
-def host_exit_event(database: Path, notice: Mapping[str, Any]) -> dict[str, Any] | None:
-    """Use the original notification envelope and stable Host exit identity."""
-    if not host_exit_current(database, notice):
-        return None
-    with Kernel(database).storage.transaction(write=False) as tx:
-        run = tx.one("SELECT id,repository,parent_issue,parent_revision,language,created_at FROM runs")
-        title = tx.rows("SELECT title FROM requirement_versions WHERE issue=? AND revision=?",
-                        (run["parent_issue"], run["parent_revision"]))
-        state = {"run_id": run["id"], "repository": run["repository"], "language": run["language"],
-                 "created_at": run["created_at"],
-                 "parent": {"number": run["parent_issue"], "title": title[0][0] if title else ""}}
-    return event_envelope(state, "executor_exit", [notice["action_id"], notice["epoch"], notice["nonce"], notice["runner"]],
-                          event_copy(state, "executor_exit"), "red", important=True,
-                          generation=notice["epoch"], exit_evidence=dict(notice),
-                          summary=event_copy(state, "executor_exit_summary"),
-                          next_step=event_copy(state, "execution_next"))

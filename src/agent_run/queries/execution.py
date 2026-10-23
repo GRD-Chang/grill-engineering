@@ -5,7 +5,7 @@ import json
 import math
 from typing import Any
 
-from .storage import Transaction
+from agent_run.storage.sqlite import Transaction
 
 
 def activity(tx: Transaction, invocation: str, ordinal: int, subject: str,

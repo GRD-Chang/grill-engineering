@@ -10,18 +10,17 @@ import sqlite3
 import time
 from typing import Any, Literal, Mapping, Sequence
 
-from agent_run.task_identity import TaskKey
-from agent_run.notification_outbox import read_notifications
+from agent_run.contracts.task import TaskKey
+from agent_run.storage.notification_outbox import read_notifications
 
-from .execution_facts import activity, recorded_profile
-from .event_projection import resume_facts
-from .model import KernelError, Role, artifact
-from .storage import QUERY_LIMIT, Storage, Transaction
-from .state_preflight import UnsupportedState, require_supported_state
-from .task_location import read_task, task_path
-from .read_facts import (QueryError as QueryError, all_rows as _all, material as _material, timestamp as _timestamp,
-                         read_header as _header, public_phase as _public_phase, public_status as _public_status,
-                         read_boundaries)
+from agent_run.queries.execution import activity, recorded_profile
+from agent_run.queries.resume_facts import resume_facts
+from agent_run.errors import KernelError
+from agent_run.model import Role, artifact
+from agent_run.storage.sqlite import QUERY_LIMIT, Storage, Transaction
+from agent_run.storage.preflight import UnsupportedState, require_supported_state
+from agent_run.storage.tasks import read_task, task_path
+from agent_run.queries.read_facts import QueryError as QueryError, all_rows as _all, material as _material, timestamp as _timestamp, read_header as _header, public_phase as _public_phase, public_status as _public_status, read_boundaries
 
 
 @dataclass(frozen=True)
@@ -480,8 +479,8 @@ def _notification_facts(tx: Transaction, run: Mapping[str, Any], path: Path) -> 
 
 
 def _frozen_settings(tx: Transaction, run: Mapping[str, Any]) -> dict[str, Any]:
-    from agent_run.github_identity import describe_identity
-    from agent_run.messages import text
+    from agent_run.contracts.identity import describe_identity
+    from agent_run.contracts.copy import text
 
     profiles = recorded_profile(tx, run["profile_revision"])
     rows = tx.rows("SELECT * FROM run_inputs WHERE run_id=?", (run["id"],))

@@ -6,7 +6,7 @@ import json
 import re
 from typing import Any
 
-from agent_run.messages import selected_language, text
+from agent_run.contracts.copy import selected_language, text
 
 
 def event_copy(state: dict[str, Any], key: str, **values: object) -> str:
