@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,101 @@ import pytest
 from agent_run.runner_installer import _runtime_identity
 from support.environment import _user_environment as _isolated_environment
 from test_kernel_doctor_cli import _file_snapshot
+
+
+@pytest.mark.parametrize("mode", ["discard", "discard_input", "stdout", "merged"])
+@pytest.mark.parametrize("overflow", [False, True])
+def test_doctor_probe_stream_policy_and_cleanup_order(
+    monkeypatch: pytest.MonkeyPatch, mode: str, overflow: bool,
+) -> None:
+    from agent_run import doctor
+
+    processes = []
+    order = []
+    original_popen, original_cleanup = subprocess.Popen, doctor._terminate_process_group
+
+    def start(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    def cleanup(process, **kwargs):
+        order.append("cleanup")
+        if process.stdout is not None:
+            assert not process.stdout.closed
+        original_cleanup(process, **kwargs)
+
+    monkeypatch.setattr(doctor.subprocess, "Popen", start)
+    monkeypatch.setattr(doctor, "_terminate_process_group", cleanup)
+    monkeypatch.setattr(doctor, "_COMMAND_TIMEOUT_SECONDS", 1)
+    capture = mode in {"stdout", "merged"}
+    program = "import os, sys, signal\n"
+    if mode != "discard":
+        program += "assert sys.stdin.buffer.read() == b'ping'\n"
+    if overflow:
+        program += f"os.write({2 if mode == 'merged' else 1}, b'x' * 9)\n"
+        if capture:
+            program += "signal.pause()\n"
+    else:
+        program += "os.write(1, b'ping')\nos.write(2, b'note')\n"
+    arguments = [sys.executable, "-c", program]
+    if capture:
+        result = doctor._run_bounded_output_probe(
+            arguments, input_data=b'ping', max_output_bytes=8,
+            timeout_seconds=1, merge_stderr=mode == "merged",
+        )
+        assert result == ((None, False, b'') if overflow else
+                          (0, False, b'pingnote' if mode == "merged" else b'ping'))
+    else:
+        assert doctor._run_bounded_probe(
+            arguments, input_data=b'ping' if mode == "discard_input" else None,
+        ) == (0, False)
+    order.append("returned")
+    assert order == ["cleanup", "returned"]
+    assert processes[0].poll() is not None
+    assert all(stream is None or stream.closed for stream in
+               (processes[0].stdin, processes[0].stdout, processes[0].stderr))
+
+
+@pytest.mark.parametrize("capture", [False, True])
+def test_doctor_probe_early_stdin_close_keeps_result_and_reaps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capture: bool,
+) -> None:
+    from agent_run import doctor
+
+    ready = tmp_path / "closed"
+    processes = []
+    original_popen = subprocess.Popen
+
+    def start(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        processes.append(process)
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not ready.exists():
+            process.kill()
+            process.wait()
+            raise AssertionError("probe did not close its pipes")
+        return process
+
+    monkeypatch.setattr(doctor.subprocess, "Popen", start)
+    monkeypatch.setattr(doctor, "_COMMAND_TIMEOUT_SECONDS", 0.05)
+    program = (
+        "import os, signal\nfrom pathlib import Path\n"
+        "os.close(0)\nos.close(1)\nos.close(2)\n"
+        f"Path({str(ready)!r}).write_text('closed')\nsignal.pause()\n"
+    )
+    arguments = [sys.executable, "-c", program]
+    if capture:
+        assert doctor._run_bounded_output_probe(
+            arguments, input_data=b'ping', timeout_seconds=0.05,
+        ) == (None, False, b'')
+    else:
+        assert doctor._run_bounded_probe(arguments, input_data=b'ping') == (None, True)
+    assert processes[0].poll() is not None
+    assert all(stream is None or stream.closed for stream in
+               (processes[0].stdin, processes[0].stdout, processes[0].stderr))
 
 
 @pytest.mark.parametrize(

@@ -6,7 +6,7 @@ from pathlib import Path
 import stat
 from typing import Any
 
-from agent_run.messages import ErrorMessage, error_message, validate_language
+from agent_run.messages import DEFAULT_LANGUAGE, ErrorMessage, error_message, validate_language
 
 from agent_run.paths import app_config_root
 from agent_run.internal_prompt_text import INTERNAL_KEYS, internal_resources
@@ -19,10 +19,7 @@ RESOURCE_KEYS = MARKDOWN_KEYS + INTERNAL_KEYS
 
 
 def selected_language(language: str | None = None) -> str:
-    if language is None:
-        from agent_run.user_defaults import UserDefaultsStore
-        language = UserDefaultsStore().language()
-    return validate_language(language)
+    return validate_language(DEFAULT_LANGUAGE if language is None else language)
 
 
 def personal_method_directory(language: str | None = None) -> Path:

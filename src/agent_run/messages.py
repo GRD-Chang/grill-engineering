@@ -39,13 +39,9 @@ def text(key: str, *, language: str = DEFAULT_LANGUAGE, **values: object) -> str
     return _catalog(language)[key].format(**values)
 
 
-def selected_language(state: dict[str, object] | None = None) -> str:
-    """Use a Run's fixed language, or personal defaults when no Run is involved."""
-    if state is not None:
-        return validate_language(state.get("language"))
-    from agent_run.user_defaults import UserDefaultsStore
-
-    return UserDefaultsStore().language()
+def selected_language(state: dict[str, object]) -> str:
+    """Select only a Run's frozen language; missing or invalid values fail."""
+    return validate_language(state.get("language"))
 
 # Human rendering is scoped to one query. Machine projections and background
 # notification decisions keep their explicit/default language outside this scope.

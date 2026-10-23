@@ -6,10 +6,10 @@ UserDefaultsStore remains the sole personal-file validator and atomic writer.
 from __future__ import annotations
 
 import argparse
+from functools import partial
 from pathlib import Path
 from typing import Any
 
-from agent_run.cli_messages import personal_language
 from agent_run.github_identity import add_identity_options, identity_overrides
 from agent_run.messages import text
 from agent_run.user_defaults import UserDefaultsStore
@@ -28,46 +28,46 @@ _POSITIVE_POLICY = (
 )
 
 
-def _positive(value: str) -> int:
+def _positive(value: str, *, language: str) -> int:
     try:
         number = int(value)
         if number > 0:
             return number
     except ValueError:
         pass
-    raise argparse.ArgumentTypeError(text("cli.positive_integer", language=personal_language()))
+    raise argparse.ArgumentTypeError(text("cli.positive_integer", language=language))
 
 
-def _nonnegative(value: str) -> int:
+def _nonnegative(value: str, *, language: str) -> int:
     try:
         number = int(value)
         if number >= 0:
             return number
     except ValueError:
         pass
-    raise argparse.ArgumentTypeError(text("cli.nonnegative_integer", language=personal_language()))
+    raise argparse.ArgumentTypeError(text("cli.nonnegative_integer", language=language))
 
 
-def _duration(value: str) -> str:
+def _duration(value: str, *, language: str) -> str:
     if not value.strip():
-        raise argparse.ArgumentTypeError(text("cli.positive_duration", language=personal_language()))
+        raise argparse.ArgumentTypeError(text("cli.positive_duration", language=language))
     return value  # The existing policy leaf validates units, finiteness and positivity.
 
 
 def _policy_options(parser: argparse.ArgumentParser, language: str, *, allow_thread_policy: bool = True) -> None:
     for key, alias, message in _POSITIVE_POLICY:
         options = ("--" + key.replace("_", "-"),) + ((alias,) if alias else ())
-        parser.add_argument(*options, dest=key, type=_positive, help=text("cli." + message, language=language))
+        parser.add_argument(*options, dest=key, type=partial(_positive, language=language), help=text("cli." + message, language=language))
     if allow_thread_policy:
         parser.add_argument("--development-thread-policy", choices=("reuse", "new-per-attempt"),
                             help=text("cli.thread_policy_help", language=language))
-    parser.add_argument("--integration-resync-limit", type=_nonnegative,
+    parser.add_argument("--integration-resync-limit", type=partial(_nonnegative, language=language),
                         help=text("cli.integration_resync_limit_help", language=language))
     parser.add_argument("--ticket-ci-review", action=argparse.BooleanOptionalAction, default=None,
                         help=text("cli.ticket_ci_review_help", language=language))
     for role, label in (("development", "Development"), ("review", "Review"), ("publication", "Publication")):
         parser.add_argument(f"--{role}-deadline", f"--{role}-duration", f"--{role}-timeout", dest=f"{role}_deadline",
-                            type=_duration, help=text("cli.deadline_help", language=language, role=label))
+                            type=partial(_duration, language=language), help=text("cli.deadline_help", language=language, role=label))
 
 
 
@@ -89,7 +89,7 @@ def add_parsers(commands: Any, language: str) -> None:
     actions = settings.add_subparsers(dest="settings_command", required=True)
     show = actions.add_parser("show", language=language, help=text("settings.show_help", language=language))
     show.add_argument("--run", dest="run_id", help=text("settings.run_help", language=language))
-    show.add_argument("--parent", type=_positive, help=text("settings.parent_help", language=language))
+    show.add_argument("--parent", type=partial(_positive, language=language), help=text("settings.parent_help", language=language))
     show.add_argument("--repo", help=text("cli.repo_help", language=language))
     show.add_argument("--state-dir", type=Path, help=text("cli.state_dir_help", language=language))
     show.add_argument("--json", action="store_true", dest="as_json")

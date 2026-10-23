@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping
 from dataclasses import replace
+from functools import partial
 import os
 import stat
 from pathlib import Path
@@ -68,12 +69,12 @@ def add_parsers(commands: Any, language: str) -> None:
     for command in ("run", "resume", "approve", "requeue", "revise", "stop", "abandon"):
         child = commands.add_parser(command, language=language, help=text(f"cli.{command}_help", language=language))
         child.add_argument("parent" if command == "run" else "run_id",
-                           type=personal_settings._positive if command == "run" else str)
+                           type=partial(personal_settings._positive, language=language) if command == "run" else str)
         child.add_argument("--repo", help=text("cli.repo_help", language=language))
         child.add_argument("--state-dir", type=Path, help=text("cli.state_dir_help", language=language))
         child.add_argument("--json", action="store_true", dest="as_json")
         if command in {"resume", "stop"}:
-            child.add_argument("--ticket", type=personal_settings._positive,
+            child.add_argument("--ticket", type=partial(personal_settings._positive, language=language),
                                help=text(f"cli.{command}_ticket_help", language=language))
         if command in {"resume", "revise"}:
             child.add_argument("--message", required=command == "revise",
@@ -238,7 +239,7 @@ def _run(parsed: argparse.Namespace, *, manager: SystemdHost,
     return result
 
 
-def execute(parsed: argparse.Namespace) -> dict[str, Any]:
+def execute(parsed: argparse.Namespace, *, language: str) -> dict[str, Any]:
     """Locate an exact managed Run and submit through sole Kernel admission."""
     import json
     import os
@@ -269,7 +270,7 @@ def execute(parsed: argparse.Namespace) -> dict[str, Any]:
         selection = argparse.Namespace(**vars(parsed))
         selection.parent = None
         if selection.run_id.isdecimal():
-            selection.parent = personal_settings._positive(selection.run_id)
+            selection.parent = personal_settings._positive(selection.run_id, language=language)
             selection.run_id = None
         candidate = _select(selection, _candidates(selection))[0]
         database = Path(candidate["database"]).resolve()

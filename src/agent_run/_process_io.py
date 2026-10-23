@@ -29,7 +29,8 @@ class CompleteOutput(TailOutput):
 
 
 def pump(
-    process: subprocess.Popen[bytes], *, stdout: TailOutput, stderr: TailOutput,
+    process: subprocess.Popen[bytes], *, stdout: TailOutput | None = None,
+    stderr: TailOutput | None = None,
     check: Callable[[], bool], input_data: bytes | None = None, ignore_read_errors: bool = False,
 ) -> None:
     """Pump pipes until EOF and leader exit, or until the owner ends draining.
@@ -37,11 +38,15 @@ def pump(
     check runs at most 50 ms apart while waiting. It may terminate the owned
     group, raise a deadline error, or end a bounded post-exit drain. No pipe
     observation here proves descendant exit or authorizes another operation.
+    Each output collector must correspond to an actual pipe, or both are None.
     """
     pending = memoryview(input_data or b"")
     with selectors.DefaultSelector() as selector:
         for stream, output in ((process.stdout, stdout), (process.stderr, stderr)):
-            assert stream is not None
+            if stream is None and output is None:
+                continue
+            if stream is None or output is None:
+                raise ValueError("A pipe and its collector must be selected together")
             os.set_blocking(stream.fileno(), False)
             selector.register(stream, selectors.EVENT_READ, output)
         if process.stdin is not None and input_data is not None:

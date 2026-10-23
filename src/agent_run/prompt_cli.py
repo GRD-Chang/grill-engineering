@@ -9,8 +9,8 @@ import sys
 from typing import Any
 
 from agent_run import prompt_resources
-from agent_run.cli_messages import personal_language
-from agent_run.messages import text
+from agent_run.messages import text, validate_language
+from agent_run.user_defaults import UserDefaultsStore
 from agent_run.development_prompts import development_prompt
 from agent_run.prompt_context import structured_output_repair_prompt
 from agent_run.publication_prompts import publication_continuation_prompt, publication_prompt
@@ -46,8 +46,7 @@ def _legacy_notice(details: dict[str, Any], language: str) -> str:
     return text("prompts.legacy_notice", language=language, mapping=mapping)
 
 
-def add_parser(commands: Any) -> None:
-    language = personal_language()
+def add_parser(commands: Any, language: str) -> None:
     def message(key: str) -> str:
         return text(f"prompts.{key}", language=language)
     parser = commands.add_parser("prompts", help=message("help"))
@@ -68,9 +67,11 @@ def execute(parsed: argparse.Namespace) -> int:
     if parsed.prompts_command == "preview":
         request = json.loads(parsed.request.read_text(encoding="utf-8"))
         if not isinstance(request, dict):
-            raise ValueError(text("prompts.request_object", language=prompt_resources.selected_language()))
+            raise ValueError(text("prompts.request_object", language=UserDefaultsStore().language()))
         frozen = "_prompt_resources" in request
-        language = prompt_resources.selected_language(request.get("language"))
+        language = (UserDefaultsStore().language() if request.get("language") is None
+                    else validate_language(request["language"]))
+        request = {**request, "language": language}
         details = _configuration_details(language)
         if not frozen:
             request["_prompt_resources"] = prompt_resources.resolve_resources(language)
@@ -89,7 +90,7 @@ def execute(parsed: argparse.Namespace) -> int:
                 for name, source in result["sources"].items():
                     print(f"{name}: {source}", file=sys.stderr)
     else:
-        language = prompt_resources.selected_language()
+        language = UserDefaultsStore().language()
         directory = prompt_resources.personal_method_directory(language)
         defaults = prompt_resources.builtin_resources(language)
         if parsed.prompts_command == "init":

@@ -6,14 +6,13 @@ import json
 import os
 import platform
 import re
-import selectors
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, cast
 
+from agent_run._process_io import CompleteOutput, pump
 from agent_run.user_defaults import UserDefaultsStore
 from agent_run.github_auth_profile import GitHubAppProfileStore
 from agent_run.runner_installer import (
@@ -194,36 +193,10 @@ def _bubblewrap_check() -> dict[str, object]:
 def _run_bounded_probe(
     arguments: list[str], *, input_data: bytes | None = None
 ) -> tuple[int | None, bool]:
-    process: subprocess.Popen[Any] | None = None
-    adopted_baseline = capture_process_scope()
-    try:
-        process = subprocess.Popen(
-            arguments,
-            stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        if input_data is None:
-            returncode = process.wait(timeout=_COMMAND_TIMEOUT_SECONDS)
-            _terminate_process_group(process, adopted_baseline=adopted_baseline)
-            return returncode, False
-        process.communicate(input=input_data, timeout=_COMMAND_TIMEOUT_SECONDS)
-        returncode = process.returncode
-        _terminate_process_group(process, adopted_baseline=adopted_baseline)
-        return returncode, False
-    except subprocess.TimeoutExpired:
-        if process is not None:
-            _terminate_process_group(process, adopted_baseline=adopted_baseline)
-        return None, True
-    except (OSError, subprocess.SubprocessError):
-        if process is not None:
-            _terminate_process_group(process, adopted_baseline=adopted_baseline)
-        return None, False
-    except BaseException:
-        if process is not None:
-            _terminate_process_group(process, adopted_baseline=adopted_baseline)
-        raise
+    code, timed_out, _ = _probe_command(
+        arguments, input_data=input_data, timeout_seconds=_COMMAND_TIMEOUT_SECONDS,
+    )
+    return code, timed_out
 
 
 def _github_check() -> dict[str, object]:
@@ -355,67 +328,62 @@ def _run_bounded_output_probe(
     merge_stderr: bool = False,
 ) -> tuple[int | None, bool, bytes]:
     """Run a tiny probe while keeping captured output and descendants bounded."""
+    return _probe_command(
+        arguments, input_data=input_data, max_output_bytes=max_output_bytes,
+        timeout_seconds=timeout_seconds, merge_stderr=merge_stderr,
+    )
 
-    process: subprocess.Popen[Any] | None = None
-    stdout = None
-    output = bytearray()
+
+def _probe_command(
+    arguments: list[str], *, input_data: bytes | None,
+    timeout_seconds: float, max_output_bytes: int | None = None, merge_stderr: bool = False,
+) -> tuple[int | None, bool, bytes]:
+    class ProbeOutput(CompleteOutput):
+        def feed(self, chunk: bytes) -> None:
+            super().feed(chunk)
+            if self.overflow:
+                raise OverflowError("Diagnostic probe output exceeds its limit")
+
+    process: subprocess.Popen[bytes] | None = None
+    output = ProbeOutput(max_output_bytes) if max_output_bytes is not None else None
     adopted_baseline = capture_process_scope()
     try:
         process = subprocess.Popen(
-            arguments,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
+            arguments, stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE if output is not None else subprocess.DEVNULL,
             stderr=subprocess.STDOUT if merge_stderr else subprocess.DEVNULL,
             start_new_session=True,
         )
-        stdout = process.stdout
-        if process.stdin is None or stdout is None:
-            return None, False, b""
-        process.stdin.write(input_data)
-        process.stdin.close()
+        if output is not None:
+            assert process.stdin is not None and input_data is not None
+            process.stdin.write(input_data)
+            process.stdin.close()
         deadline = time.monotonic() + timeout_seconds
-        with selectors.DefaultSelector() as selector:
-            selector.register(stdout, selectors.EVENT_READ)
-            while selector.get_map():
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    _terminate_process_group(process, adopted_baseline=adopted_baseline)
-                    return None, True, b""
-                events = selector.select(timeout=remaining)
-                if not events:
-                    _terminate_process_group(process, adopted_baseline=adopted_baseline)
-                    return None, True, b""
-                for key, _mask in events:
-                    stream = cast(Any, key.fileobj)
-                    chunk = os.read(stream.fileno(), 4096)
-                    if not chunk:
-                        selector.unregister(stream)
-                        continue
-                    output.extend(chunk)
-                    if len(output) > max_output_bytes:
-                        _terminate_process_group(process, adopted_baseline=adopted_baseline)
-                        return None, False, b""
+
+        def check() -> bool:
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(arguments, timeout_seconds)
+            return True
+
+        pump(process, stdout=output, check=check,
+             input_data=input_data if output is None else None)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            _terminate_process_group(process, adopted_baseline=adopted_baseline)
-            return None, True, b""
-        try:
-            returncode = process.wait(timeout=remaining)
-        except subprocess.TimeoutExpired:
-            _terminate_process_group(process, adopted_baseline=adopted_baseline)
-            return None, True, b""
-        return returncode, False, bytes(output)
-    except (OSError, subprocess.SubprocessError):
-        if process is not None:
-            _terminate_process_group(process, adopted_baseline=adopted_baseline)
+            raise subprocess.TimeoutExpired(arguments, timeout_seconds)
+        returncode = process.wait(timeout=remaining)
+        return returncode, False, output.finish() if output is not None else b""
+    except subprocess.TimeoutExpired:
+        return None, True, b""
+    except (OSError, subprocess.SubprocessError, OverflowError):
         return None, False, b""
     finally:
         if process is not None:
-            _terminate_process_group(process, adopted_baseline=adopted_baseline)
-        if process is not None and process.stdin is not None:
-            process.stdin.close()
-        if stdout is not None:
-            stdout.close()
+            try:
+                _terminate_process_group(process, adopted_baseline=adopted_baseline)
+            finally:
+                for stream in (process.stdin, process.stdout, process.stderr):
+                    if stream is not None:
+                        stream.close()
 
 
 def _check_is_ok(value: object) -> bool:

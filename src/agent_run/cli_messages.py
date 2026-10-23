@@ -2,15 +2,15 @@
 from __future__ import annotations
 
 from agent_run.messages import (
-    DEFAULT_LANGUAGE, selected_language, text,
+    DEFAULT_LANGUAGE, text,
     error_message as error_message, error_detail as error_detail,
 )
-from agent_run.user_defaults import UserDefaultsError
+from agent_run.user_defaults import UserDefaultsError, UserDefaultsStore
 
 
 def personal_language() -> str:
     try:
-        return selected_language()
+        return UserDefaultsStore().language()
     except (UserDefaultsError, OSError):
         # Invalid personal settings must still permit help and existing Run access.
         return DEFAULT_LANGUAGE

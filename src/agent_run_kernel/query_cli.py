@@ -91,7 +91,7 @@ def _parser(language: str) -> argparse.ArgumentParser:
     from . import run_profile_cli
     run_profile_cli.add_parser(commands, language)
     from agent_run import prompt_cli
-    prompt_cli.add_parser(commands)
+    prompt_cli.add_parser(commands, language)
     from .lifecycle_cli import add_parsers
     add_parsers(commands, language)
     return parser
@@ -113,7 +113,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return prompt_cli.execute(parsed)
         if parsed.command in {"run", "resume", "approve", "requeue", "revise", "stop", "abandon"}:
             from .lifecycle_cli import execute
-            output = execute(parsed)
+            output = execute(parsed, language=language)
             language = output.pop("language", language)
             if parsed.as_json:
                 print(json.dumps(output, ensure_ascii=False, sort_keys=True))

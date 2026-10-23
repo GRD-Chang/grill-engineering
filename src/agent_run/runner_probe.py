@@ -25,6 +25,7 @@ from agent_run.process_cleanup import (
 )
 from agent_run.runner_runtime import RuntimeTreeError, find_runtime_package
 from agent_run.prompt_resources import read_builtin_resource
+from agent_run.user_defaults import UserDefaultsStore
 
 
 PROBE_TIMEOUT_SECONDS = 120.0
@@ -89,7 +90,8 @@ class RunnerProbeBackend:
                 "-",
             ]
             try:
-                prompt = read_builtin_resource("context/probe", package)
+                language = UserDefaultsStore().language()
+                prompt = read_builtin_resource("context/probe", package, language=language)
             except ValueError as error:
                 raise RunnerProbeError(str(error)) from error
             process: subprocess.Popen[str] | None = None
