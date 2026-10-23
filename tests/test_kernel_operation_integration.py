@@ -128,8 +128,10 @@ def test_bootstrap_source_outage_keeps_original_call_and_bounded_read_wait(tmp_p
 
 def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, monkeypatch):
     from dataclasses import replace
+    import signal
     import threading
     from agent_run.model import Checks, Policy
+    from support.offline_api import SyntheticGitHub
     source = independent_source()
     source = replace(source, issues=tuple(replace(issue, state="CLOSED") if issue.number == 4 else issue for issue in source.issues))
     scenario = GraphScenario(tmp_path / "concurrent", source, policy=Policy(concurrency=1))
@@ -159,7 +161,14 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
         raise AssertionError("first Ticket did not reach normal CI")
     # Reopening the independent external Ticket makes fresh work eligible;
     # only Core interprets it and decides when to allocate its call.
+    api = SyntheticGitHub(scenario.port.git, scenario.port.database, scenario.spec.repository,
+        physical=scenario.port.physical, written=lambda *args: None, read_faults=set())
+    endpoint = f"repos/{scenario.spec.repository}/issues/4"
+    assert api.object(endpoint)["state"] == "closed"
+    reopened = api.write(endpoint, "PATCH", {"state": "open"})
+    assert reopened.returncode == 0 and api.object(endpoint)["state"] == "open"
     scenario.requirements = independent_source()
+    assert next(issue for issue in ports.source(1).issues if issue.number == 4).state == "OPEN"
     now[0] = 105.25
     entered, polled = threading.Event(), threading.Event()
     delivery = ports.delivery
@@ -191,7 +200,17 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
             kernel.agent_exited(call, process, 0)
     monkeypatch.setattr('agent_run.runtime.codex.execute_selected_codex', execute)
     monkeypatch.setattr('agent_run.notifications.sender.NativeNotifications', Notifications)
-    assert executor.run(scenario.kernel, scenario.execution, {}) == 0
+    def expired(_signum, _frame):
+        raise TimeoutError("CI/Agent concurrency story exceeded its 30-second watchdog")
+    previous_handler = signal.signal(signal.SIGALRM, expired)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, 30)
+    try:
+        assert executor.run(scenario.kernel, scenario.execution, {}) == 0
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer != (0.0, 0.0):
+            signal.setitimer(signal.ITIMER_REAL, *previous_timer)
     assert entered.is_set() and polled.is_set()
     assert scenario.kernel.status(scenario.kernel.source_status()["final_subject"])["phase"] == "approval"
 
