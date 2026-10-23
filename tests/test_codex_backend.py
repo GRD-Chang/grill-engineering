@@ -3,7 +3,8 @@ from agent_run.worker_sandbox import _BoundedJsonlStream
 
 
 def test_jsonl_stream_uses_fixed_chunks_and_keeps_thread_and_error_tail() -> None:
-    stream = _BoundedJsonlStream(capture_bytes=4096, line_bytes=1024)
+    lines: list[str] = []
+    stream = _BoundedJsonlStream(line_bytes=1024, on_line=lines.append)
     stream.feed(b'{"type":"thread.started","thread_id":"thread-189"}\n')
     noise_chunk = b"noise" * 1000
     for _ in range(500):
@@ -13,7 +14,7 @@ def test_jsonl_stream_uses_fixed_chunks_and_keeps_thread_and_error_tail() -> Non
     )
     stream.finish()
 
-    captured = stream.text()
+    captured = '\n'.join(lines)
     assert "thread-189" in captured
     assert "bounded failure" in captured
     assert len(captured.encode("utf-8")) <= 4096

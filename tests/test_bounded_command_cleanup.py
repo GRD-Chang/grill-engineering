@@ -12,7 +12,7 @@ _PROBE = r'''
 import ctypes, os, select, signal, subprocess, sys, threading
 from pathlib import Path
 from agent_run.github_retry import _run_bounded_command
-from agent_run.systemd_executor_host import _run_bounded
+from agent_run_kernel.host_adapter import HostUnavailable, SystemdHost
 
 assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0  # Own and reap fixture orphans.
 helper, outcome, root = sys.argv[1], sys.argv[2], Path(sys.argv[3])
@@ -103,23 +103,29 @@ try:
             arguments = [sys.executable, '-c', command, str(sample), outcome, 'escaped' if escaped else 'owned']
             try:
                 result = (_run_bounded_command(arguments, cwd=sample, timeout=30)
-                          if helper == 'github' else _run_bounded(arguments, max_output=1024))
+                          if helper == 'github' else SystemdHost(
+                              systemctl='unused-fixture', systemd_run='unused-fixture',
+                              environment=os.environ)._run(arguments))
             except subprocess.TimeoutExpired as error:
                 assert helper == 'github' and outcome == 'timeout'
                 assert isinstance(error.stdout, str) and isinstance(error.stderr, str)
                 assert 'normal output' in error.stdout and 'error tail' in error.stderr
             except RuntimeError as error:
-                assert outcome in {'exception', 'reader_start_failure'}
-                assert str(error) == ("can't start new thread" if outcome == 'reader_start_failure'
-                                      else 'injected wait failure')
+                if isinstance(error, HostUnavailable):
+                    assert helper == 'systemd' and outcome == 'timeout'
+                    assert str(error) == 'Bounded user systemd observation was unavailable'
+                else:
+                    assert outcome in {'exception', 'reader_start_failure'}
+                    assert str(error) == ("can't start new thread" if outcome == 'reader_start_failure'
+                                          else 'injected wait failure')
             else:
                 assert outcome not in {'exception', 'reader_start_failure'}
-                assert result.stdout == 'normal output\n'
-                assert 'error tail' in result.stderr
-                if outcome == 'normal':
-                    assert result.returncode == 0
-                else:
-                    assert result.returncode != 0 and 'systemd helper timed out' in result.stderr
+                stdout = result.stdout.decode() if helper == 'systemd' else result.stdout
+                stderr = result.stderr.decode() if helper == 'systemd' else result.stderr
+                assert stdout == 'normal output\n'
+                assert 'error tail' in stderr
+                assert outcome == 'normal'
+                assert result.returncode == 0
             guard.cancel()
             guard.join()
             assert not guard_fired.is_set(), 'output readers needed external rescue'

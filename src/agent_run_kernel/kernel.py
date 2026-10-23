@@ -3651,7 +3651,10 @@ class Kernel:
             attempt = tx.one("SELECT result_id FROM attempts WHERE id=?", (job["publication_attempt"],))
             narrative = json.loads(tx.get(attempt["result_id"], subject))
             parents = [job["source_sha"]]
-            if (job["kind"] == DeliveryKind.PARENT_ONLY and target.sha != job["source_sha"]
+            # Rebuilding the reviewed tree must not discard its target ancestry;
+            # otherwise a resolved conflict becomes a conflicting PR again.
+            if (job["kind"] in {DeliveryKind.TICKET, DeliveryKind.PARENT_ONLY}
+                    and target.sha != job["source_sha"]
                     and (target.sha, job["source_sha"]) not in world.ancestry):
                 parents.append(target.sha)
             return self._prepare_effect(tx, run, job, execution, world, "publication_commit", before=job["source_sha"],

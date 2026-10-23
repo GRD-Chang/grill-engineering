@@ -1,8 +1,6 @@
 """Public Core operation seam: selection, bounded I/O and durable settlement."""
 from pathlib import Path
 from dataclasses import replace
-from contextlib import closing
-import sqlite3
 
 import pytest
 
@@ -10,7 +8,6 @@ from agent_run_kernel import Commit, Delivery, DeliveryKind, Kernel, Policy, Req
 from agent_run_kernel.model import Checks, Issue, ParentIssue
 from agent_run_kernel.model import KernelError
 from support.offline import GraphScenario
-from agent_run_kernel.operation_runner import DeliveryFacts
 from agent_run_kernel.operation_runner import ReadUnavailable
 from agent_run_kernel.query import read
 from test_kernel_requirements import independent_source, native_input
@@ -25,29 +22,17 @@ class Ports:
         self.reads += 1
         s = self.scenario
         assert parent_number == s.requirements.parent.number
-        with closing(sqlite3.connect(s.port.database)) as db:
-            closed = {row[0] for row in db.execute("SELECT issue FROM closed")}
-        return replace(s.requirements, issues=tuple(replace(issue,
-            state="CLOSED" if issue.number in closed else issue.state,
-            blocked_by=tuple(replace(blocker, state="CLOSED") if blocker.number in closed else blocker for blocker in issue.blocked_by))
-            for issue in s.requirements.issues))
+        return s.port.source(s.requirements, parent_number)
 
     def delivery(self, request):
         s = self.scenario
-        source, target = s.port.remote_commit(request.source_ref), s.port.remote_commit(request.target_ref)
-        subject = next(item.key for item in s.spec.deliveries if item.source_ref == request.source_ref)
-        pr = s.port.pull_request(subject, request.source_ref) if request.read_pr else None
-        checks = None if pr is None else Checks(pr.number, pr.head.sha, "none")
-        ancestry = tuple((before, after.sha) for before in request.anchors for after in (source, target)
-                         if after is not None and s.port.git.is_ancestor(before, after.sha))
-        return DeliveryFacts(target, source, pr, checks, ancestry, "offline-publisher", s.spec.inputs.runner_identity)
+        return s.port.delivery(request, ('none',), [], publisher_identity=s.spec.inputs.runner_identity)
 
     def inspect(self, resources):
         return self.scenario.port.inspect_resources(resources)
 
     def execute(self, effect, authorize):
-        acknowledgement = self.scenario.port.execute(effect, authorize)
-        return acknowledgement if effect.operation == "issue_link" else self.reconcile(effect)
+        return self.scenario.port.execute(effect, authorize)
 
     def reconcile(self, effect):
         return self.scenario.port.reconcile(effect)
