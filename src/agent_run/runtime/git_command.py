@@ -99,11 +99,13 @@ def run_git(
                       "timeout_seconds": timeout},
         ) from timeout_error
     finally:
-        _kill_group(process.pid)
-        process.wait()
-        for stream in (process.stdout, process.stderr, process.stdin):
-            if stream is not None:
-                stream.close()
+        try:
+            _kill_group(process.pid)
+            process.wait()
+        finally:
+            for stream in (process.stdout, process.stderr, process.stdin):
+                if stream is not None:
+                    stream.close()
     error = safe_output(stderr.data.decode("utf-8", errors="replace"))
     # Replacement decoding may expand invalid bytes; the diagnostic is byte bounded too.
     encoded = error.encode()

@@ -11,6 +11,39 @@ from agent_run.errors import GitError
 from agent_run.runtime.git_command import run_git
 
 
+def test_git_wait_failure_still_closes_all_owned_pipes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import errno
+    from types import SimpleNamespace
+    from agent_run.runtime import git_command
+
+    def failed_wait(**kwargs):
+        raise OSError("injected wait failure")
+
+    streams = [(tmp_path / name).open("w+b") for name in ("stdin", "stdout", "stderr")]
+    descriptors = [stream.fileno() for stream in streams]
+    try:
+        process = SimpleNamespace(
+            pid=900000001, stdin=streams[0], stdout=streams[1], stderr=streams[2],
+            wait=failed_wait,
+        )
+        monkeypatch.setattr(git_command.subprocess, "Popen", lambda *a, **k: process)
+        monkeypatch.setattr(git_command, "pump", lambda *a, **k: None)
+        # This failure-path check sends no signal to any actual process or group.
+        monkeypatch.setattr(git_command.os, "killpg", lambda *a: None)
+        with pytest.raises(OSError, match="injected wait failure"):
+            run_git(["git", "--version"], cwd=tmp_path, input="input")
+        assert all(stream.closed for stream in streams)
+        for descriptor in descriptors:
+            with pytest.raises(OSError) as closed:
+                os.fstat(descriptor)
+            assert closed.value.errno == errno.EBADF
+    finally:
+        for stream in streams:
+            stream.close()
+
+
 def test_git_reads_ignore_inherited_shallow_file_but_keep_repository_boundary(
     git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
