@@ -9,7 +9,7 @@ Final Run PR 保留 PR Narrative 与一条原地更新的 Agent Run Status；不
 
 本上下文描述以结构化 Agent 工作结果驱动、由确定性程序控制外部写入的自动交付流程。
 
-Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付，见[个人运行默认配置](docs/user-defaults.md)。Development Thread Policy 按轮新会话模式仍是后继任务。
+Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付，见[个人运行默认配置](docs/user-defaults.md)。Development Thread Policy 已支持 `reuse` 与 `new-per-attempt`，在 Run 创建时从个人默认与显式覆盖解析并固定，已有 Run 不热切换。
 
 持续多线监督已接入：开发或审核长调用期间，当前集成 Ticket 的 CI、合入和收尾独立推进；并发为 1 也保留监督。统一 Ticket 工作额度与持久 FIFO 动态补位已接入；单票立即 Stop 已接入同一 Worker 监督和持久租约；运行中定向 Resume 已接入同一 Executor 与 FIFO，见 [ADR 0019](docs/adr/0019-ticket-work-concurrency-and-supervision.md)。下文这些术语描述目标合同。
 
@@ -34,8 +34,8 @@ Prompt、CLI 帮助与设置、操作回执、Status/History（plain、Rich 与�
 ## Language
 
 **Retained Work（保留的当前工作）**:
-暂停条件与业务进度分别解释：现有 `human_blocker_phase`、`execution_resume_phase`、`pause_resume_phase` 保存继续阶段，`blocked_reason` 与原始证据保存人工门禁；Job 的暂停阶段是调度边界，不能代替继续阶段。`pending_semantic_attempt` 与集成现场保存实际角色、用途、Generation 和工作身份，Invocation 保存 Thread 与执行事实。`work_facts` 从这些权威记录派生继续阶段、角色与身份，供 resume、status/history 共同使用，不另存展示状态或第二套工作状态机。
-完整 Parent 集成 Development 虽保存在 `run_acceptance`，实际身份是 `run-integration:<run_id>`；新线程和 message 作用于原 Development 工作及 Generation，不变成 Reviewer 调用、正式需求或批准。`agent_execution` 共用会话准备、Invocation 关联、角色调用与返回保存；返回在当前 Semantic Attempt 的 `returned_result` 中先持久化，阶段再消费角色产物并决定业务后继。成功返回在重载、`--new-thread` 和后续远端读取失败后仍复用；Human Blocker 返回仅在明确人工继续时清除，保留同一 Attempt、用途和 Generation。完成归档去掉返回缓存，沿用角色产物和有界历史。已保存开发结果先由程序集成检查、提交与对账消费；未知外部写入保持原意图，不能由新线程请求推定未发生。各 Ticket 独立保留成果和人工门禁，active 只选择当前对象。
+暂停条件与业务进度分别解释：`subjects.phase` / `purpose` 保存当前工作阶段与用途，`gates` 保存对象门禁及原始证据，`runs.stopped` / `blocked` 保存 Run 级控制边界；暂停不能代替或丢失继续阶段。`subjects.generation` / `current_attempt` 与 `attempts`、`invocations`、Thread 绑定及集成材料保留实际角色、用途、Generation 和工作身份。只读查询从这些权威关系派生继续工作，供 resume、status/history 使用，不另存展示状态或第二套工作状态机。
+完整 Parent 的集成开发由其 `final_run` subject 及准确用途、Attempt 和角色记录承载；存储归属不表示当前角色是 Reviewer。新线程和 message 作用于原 Development 工作及 Generation，不变成 Reviewer 调用、正式需求或批准。共同调用链准备会话、关联 Invocation、执行角色并保存返回；原始物理输出通过 `invocation_outputs` 关联材料保留，语义返回由 `attempts.result_id` 关联材料先持久化，原阶段再消费角色产物并决定业务后继。成功返回在重载、`--new-thread` 和后续远端读取失败后仍复用；Human Blocker 返回仅在明确人工继续时解除当前返回绑定，保留同一 Attempt、用途和 Generation。消费后保留原产物及有界历史关联。已保存开发结果先由程序集成检查、提交与对账消费；未知外部写入保持原意图，不能由新线程请求推定未发生。各 Ticket 独立保留成果和人工门禁，查询焦点只引用当前对象。
 _Avoid_: 按存储容器选角色、以 blocked 丢失继续阶段、重复调用已返回结果的 Agent、以 message 放行其他对象
 
 **Review Context（审核上下文）**:
@@ -181,7 +181,7 @@ Run 创建时从个人默认与显式覆盖解析并固定：`reuse`（默认）
 _Avoid_: 每次进程启动新会话、每张 Ticket 新会话、单次人工替换 Thread、Reviewer Thread 策略
 
 **Change Job Record（变更任务记录）**:
-Controller 私有保存的 Change Job 身份、Development Thread 身份、Revision Snapshot、Git 基线、Attempt、PR、预算和幂等状态。Ticket Job、Parent-only Delivery 与 Run Repair Job 共用执行与结果记录骨架，分别保留适用的交付生命周期，各自特有数据位于明确的 job-specific 部分；Ticket Job Record 按 Ticket 身份持久保存，并与当前 `active_ticket_job` 指针分离，Controller refresh 可以切换 active，但不得删除仍属于 Parent Ticket Set 的 blocked 或 completed Job。Job-local `blocked_reason` 保存恢复授权所需的阻塞原因；顶层 diagnostics 只是可重建的当前展示，Controller refresh 会从未解除的 deterministic blocker 幂等重建 blocked 投影。Controller 在任何外部 mutation 前验证唯一规范结构；不符合时返回 `incompatible_run_state` 并要求重新创建或清理该 Run，不使用 schema 版本号、迁移器或兼容读取。Review Budget Window、CI Recovery Budget 与 Deterministic Ticket Fallback 采用同一次规范状态切换：旧 Run 不迁移、不推断剩余额度且不兼容读取，只有按新结构创建的 Run 才使用新策略。新 Run 的分支权限协议为 `branch_authority_protocol=3`，旧 Run 不兼容读取、不自动迁移或删除成果。固定预算归属协议为 `review_budget_protocol=2`，旧协议或 Repair Job 携带可变 Review/CI 预算的状态在继续前拒绝；拒绝不授权删除或迁移旧成果。该记录用于恢复与校验，不作为需要 Codex 理解或复述的任务输入。
+Controller 私有保存的交付对象身份、Development Thread 身份、Revision Snapshot、Git 基线、Attempt、PR、预算和幂等事实。Ticket、Parent-only 与 Final 由 `subjects` 及准确关联表保存各自生命周期；完整 Parent 的修复沿同一 Parent 对象持有额度，不另建可变 Repair 预算副本。对象按稳定身份和 Generation 保留，持久 FIFO、租约及集成单席选择当前工作，不使用 `active_ticket_job` 指针；切换工作不得删除仍属于 Parent Ticket Set 的 blocked 或 completed 对象。`gates` 及 Run 级控制记录保存恢复所需的门禁，查询从已提交事实派生诊断，不另存可变 blocked 投影。Controller 在任何外部 mutation 前验证准确身份、当前适用性与授权；唯一支持的状态协议为 `independent-delivery-kernel-v19`。旧 JSON/v6、native v17/v18、来源封印及导入状态明确拒绝，不兼容读取、不转换、不迁移、不推断剩余额度，不清除 Task 或删除既有 Candidate、工作区与成果。当前 Review、CI 与 Ticket Fallback 的事实使用 v19 的对象、用途、窗口及原证据关系；旧 `branch_authority_protocol` / `review_budget_protocol` 字段不构成当前准入条件。拒绝或缺损不授权重新创建、清理或猜测原 Run 的事实；该记录用于恢复与校验，不作为需要 Codex 理解或复述的任务输入。
 _Avoid_: Development Brief、Agent Artifact、PR 正文
 
 **Job Generation（任务世代）**:
@@ -807,9 +807,9 @@ _Avoid_: Invocation Resume、智能重试、独立持久 journal
 
 **Invocation Resume（调用恢复）**:
 调用层的续接动作，其业务含义必须区分 Business Resume 与 Execution Recovery；复用同一 Thread 或生成 successor Invocation 本身不表示授权了新的预算窗口。公开 `resume` 保持单一入口，本次恢复意图绑定准入时的准确暂停原因、对象与授权，不能因后续状态变化被重解释；自动执行续接不具有解除业务阻塞或开启预算窗口的权限。以下保留公开 `resume` 的承载关系，不能据此把两种语义合并。
-维护者以 `agent-run resume <parent-issue>` 为当前 `execution_failed` 或 Human Blocker Invocation 创建的
-successor Invocation。若失败 Invocation 属于一次已分配且尚未收口的 Development Attempt、Reviewer Invocation 或 Publication Attempt，Resume 只继续该语义 Attempt，不再次占用角色预算或增加 Attempt 计数，也不得接受 Delivery Policy 覆盖；这一原则与是否复用原 Thread 无关。每次 Resume 都是新的显式人工授权，系统保留其次数与失败原因供 `status`/`history` 审计，但不为同一 Semantic Agent Attempt 另设 Resume Budget 或硬上限。维护者中断活跃前台调用只表示将其暂停为可恢复的 `execution_failed`，不表示放弃 Attempt 或授权清理 Managed Development Checkout。对 Ticket 的 `modification_budget_exhausted`，维护者显式执行 Resume 会同时创建新的 Ticket Review Budget Window 与 Ticket Development Budget Window，；对 Run 或 Parent-only 的 `review_budget_exhausted`，Resume 创建对应的新 Review Budget Window 与代码修复预算窗口。只有这两类开启新预算窗口的 Resume 才能在 Run 已存策略上接受本次命令的 Delivery Policy 覆盖，不重新读取个人默认；旧窗口用量与策略保持不变。它仍是同一 Job Generation、按 Development Thread Policy 选择开发 Thread，保留 branch 与 PR，
-但不把新 Attempt 伪装成旧窗口的额外轮次。若检查点保留了尚需修改代码的准确失败证据，successor Invocation 必须先把该证据交给按 Development Thread Policy 选择的开发会话，产生新 Candidate 后才启动新窗口的 Reviewer 1；可修复 CI 失败通过独立 CI 恢复窗口处理，不得先审查未变化且已知 CI 失败的 Candidate。复用仍有效 Thread 时由 Controller 根据 Development、Repair、Reviewer 或 Publication 角色选择短 Prompt，只重发完成本轮所需的当前动态证据；模型不接收 Resume、`execution_failed`、预算窗口或状态流转说明，Reviewer 与定向 Repair 只保留当前职责所需的简短审查次数。策略为新开发轮选择新 Thread 或显式 `--new-thread` 时，以相应角色和任务模式的完整标准 Prompt 新开 Thread；同轮故障缺少可恢复 Thread 时保留明确失败，不能自动替换。Resume 成功与否不改变 Job Generation，且在 preflight 发现 Currentness Boundary 已 stale 时不启动 Codex，只进入 `requeue_required`。JSON 格式修复步骤因执行异常中断后，默认同 Thread Resume 只续接该次只读修复并继承已用次数，不重新开放开发任务。人工 Resume 不重置同一 Semantic Agent Attempt 已用的普通异常自动恢复额度；本次进程异常恢复不改变格式修复额度耗尽后的既有授权规则。
+维护者以 `agent-run resume <parent-issue>` 继续当前 `execution_failed` 或 Human Blocker 工作，需要 Agent 时创建 successor Invocation。若失败 Invocation 属于一次已分配且尚未收口的 Development、Reviewer 或 Publication Attempt，Resume 只继续该语义 Attempt，不再次占用角色预算或增加 Attempt 计数，也不得接受 Delivery Policy 覆盖；这一原则与是否复用原 Thread 无关。每次 Resume 都是新的显式人工授权，系统保留其次数与失败原因供 `status`/`history` 审计，但不为同一 Semantic Agent Attempt 另设 Resume Budget 或硬上限。Ctrl-C 或关闭发起终端只离开观察，后台 Host/Executor 继续推进；停止须使用公开 `stop`，不表示放弃 Attempt 或授权清理 Managed Development Checkout。
+预算耗尽检查点的显式 Resume 按准确 subject、purpose 和 gate 续期对应窗口，保留旧窗口用量与策略，不续期其他对象或用途。需求用途按该对象的开发/审核配额建立后继窗口；完整 Parent 集成用途只续期已耗尽的 Development 或 Reviewer 配额，另一项未耗尽用量保留；Ticket 与 Parent-only 集成用途保留累计用量并追加额度。CI 续期只开启对应 CI 开发窗口，Reviewer 次数保持累计，Ticket CI 审核策略与两种 Parent 必须 Review 的规则不变；新提交、失败版本或 PR 更新不自行重置累计额度。resync 额度独立处理。只有明确的开发、审核或 CI 预算耗尽门禁允许 Resume 在该对象已存策略上接受本次 Delivery Policy 覆盖，不重新读取个人默认；普通执行续接不接受覆盖或开启预算窗口。它仍是同一 Job Generation，按创建时固定的 Development Thread Policy 选择开发 Thread，保留 branch、PR 和原工作，不把新 Attempt 伪装成旧窗口的额外轮次。
+若检查点保留了尚需修改代码的准确失败证据，后继开发必须先把该证据交给按 Development Thread Policy 选择的开发会话，产生新 Candidate 后才启动新窗口的 Reviewer；真实 CI 失败通过独立 CI 开发用途处理，不先审查未修改且已知 CI 失败的 Candidate。复用仍有效 Thread 时由 Controller 根据 Development、Repair、Reviewer 或 Publication 角色选择短 Prompt，只重发完成本轮所需的当前动态证据；模型不接收 Resume、`execution_failed`、预算窗口或状态流转说明，Reviewer 与定向 Repair 只保留当前职责所需的简短审查次数。策略为新开发轮选择新 Thread 或显式 `--new-thread` 时，以相应角色和任务模式的完整标准 Prompt 新开 Thread；同轮故障缺少可恢复 Thread 时保留明确失败，不能自动替换。Resume 成功与否不改变 Job Generation；原需求或 currentness 已 stale 时不启动 Codex，按该对象的 Requeue 或重新验收边界处理，不以恢复消息接受正式需求或任务图变更。JSON 格式修复步骤因执行异常中断后，默认同 Thread Resume 只续接该次只读修复并继承已用次数，不重新开放开发任务。人工 Resume 不重置同一 Semantic Agent Attempt 已用的普通异常自动恢复额度；本次进程异常恢复不改变格式修复额度耗尽后的既有授权规则。未知外部写入仍先沿原 intent/receipt 对账；Resume 或 message 不替代绑定准确 PR/head/base、适用验收和 Required Checks 的最终人工批准。
 _Avoid_: Output Repair、Publisher/check 幂等恢复、隐式 Requeue
 
 **Business Resume（业务恢复）**:

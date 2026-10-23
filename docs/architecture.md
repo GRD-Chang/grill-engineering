@@ -6,8 +6,8 @@
 
 ## 正式入口与工作流
 
-安装后的 `agent-run`、`python -m agent_run` 和 `python -m agent_run.core`
-共同进入 [`cli.main.main`](../src/agent_run/cli/main.py)。
+安装后的 `agent-run` 与 `python -m agent_run` 共同进入
+[`cli.main.main`](../src/agent_run/cli/main.py)。
 生命周期命令由 [`cli.lifecycle`](../src/agent_run/cli/lifecycle.py) 注册，查询、个人设置和 Run Profile 分别分流，
 不通过合成场景启动用户任务。操作步骤见[安装指南](install.md)和[Agent 指南](agent-guide.md)。
 
