@@ -104,6 +104,10 @@ def test_default_discovery_ignores_unpublished_creation_but_exact_snapshot_stays
     assert [item["run_id"] for item in json.loads(capsys.readouterr().out)["runs"]] == ["published"]
     assert main(["status", "unpublished", "--state-dir", str(orphan.storage.path), "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["run_id"] == "unpublished"
+    assert main(["status", "--state-dir", str(shell), "--json"]) == 2
+    diagnostic = json.loads(capsys.readouterr().out)["diagnostics"][0]
+    assert diagnostic["code"] == "unsupported_state"
+    assert diagnostic["path"] == str(shell) and diagnostic["reason"] == "uncertain_state"
     assert published.storage.path.exists() and _snapshot(data) == before
 
 
@@ -122,7 +126,12 @@ def test_default_discovery_diagnoses_a_missing_published_database_without_repair
     before = _snapshot(data)
     assert main(["status", "--repo", "example/project", "--parent", "1", "--json"]) == 2
     output = json.loads(capsys.readouterr().out)
-    assert output["diagnostics"][0]["code"] == "incompatible_run_state"
+    diagnostic = output["diagnostics"][0]
+    assert diagnostic["code"] == "unsupported_state"
+    assert diagnostic["path"] == str(published.storage.path)
+    assert diagnostic["reason"] == "unreadable_state" and diagnostic["recovery_hint"]
+    assert output["selection"] == {"repo": "example/project", "parent": 1}
+    assert output["candidates"][0]["run_id"] == "published"
     assert not published.storage.path.exists() and _snapshot(data) == before
 
 
@@ -267,5 +276,13 @@ def test_exact_default_query_isolates_another_parents_bound_database_failure(
     assert main(["status", *arguments, "--repo", "example/project", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["run_id"] == "published"
     assert main(["status", "--parent", "9", "--repo", "example/project", "--json"]) == 2
-    assert json.loads(capsys.readouterr().out)["diagnostics"][0]["code"] == "incompatible_run_state"
+    output = json.loads(capsys.readouterr().out)
+    diagnostic = output["diagnostics"][0]
+    assert diagnostic["code"] == "unsupported_state"
+    assert diagnostic["path"] == str(other.storage.path)
+    assert diagnostic["reason"] == ("uncertain_state" if fault == "damaged" else "unreadable_state")
+    assert diagnostic["recovery_hint"] and output["selection"] == {"repo": "example/project", "parent": 9}
+    assert output["candidates"][0]["run_id"] == "other"
+    assert main(["runs", "--repo", "example/project", "--json"]) == 2
+    assert json.loads(capsys.readouterr().out)["diagnostics"][0]["path"] == str(other.storage.path)
     assert _snapshot(data) == before

@@ -185,6 +185,8 @@ def discover(root: Path, *, published: Mapping[Path, str] | None = None,
         try:
             candidate = header(path)
         except UnsupportedState as error:
+            if published is not None and expected is None:
+                continue
             if expected is None:
                 raise
             # Keep the publication's known identity without reading an
