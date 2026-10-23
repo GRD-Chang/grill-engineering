@@ -1,11 +1,9 @@
 """CLI resource selection without making Run operations depend on personal defaults."""
 from __future__ import annotations
 
-from agent_run.messages import (
-    DEFAULT_LANGUAGE, text,
-    error_message as error_message, error_detail as error_detail,
-)
-from agent_run.user_defaults import UserDefaultsError, UserDefaultsStore
+from agent_run.contracts.copy import DEFAULT_LANGUAGE, text
+from agent_run.errors import error_message as error_message, error_detail as error_detail
+from agent_run.config.defaults import UserDefaultsError, UserDefaultsStore
 
 
 def personal_language() -> str:

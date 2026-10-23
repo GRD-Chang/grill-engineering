@@ -8,7 +8,7 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-from agent_run.paths import app_config_root
+from agent_run.config.paths import app_config_root
 
 
 class GitHubAuthProfileError(ValueError):

@@ -12,10 +12,10 @@
 `native-task-locations/<task-fingerprint>.json` 只保存该 Task 的 Run ID 和数据库路径，
 不复制生命周期状态；替换与占用判断仍由 Core 决定。
 
-[`state_preflight.py`](../../src/agent_run_kernel/state_preflight.py) 以只读连接检查现有数据库。
+[`state_preflight.py`](../../src/agent_run/storage/preflight.py) 以只读连接检查现有数据库。
 旧 JSON/v6、早期 native v17/v18、来源封印及导入状态明确拒绝，
 保留原文件、Candidate、工作区和成果，不升级、不转换、不双写，也不直接续接。
-[`legacy_admission.py`](../../src/agent_run_kernel/legacy_admission.py) 只检查旧 Task 占用及拒绝条件，
+[`legacy_admission.py`](../../src/agent_run/storage/admission.py) 只检查旧 Task 占用及拒绝条件，
 不解释或转移旧工作。拒绝不授权清除旧 Task、封印或历史数据。
 
 `Storage.create` 排他创建新文件，拒绝接管已有数据库或遗留 sidecar。
@@ -24,7 +24,7 @@
 
 ## 事实的唯一归属
 
-[`storage.py`](../../src/agent_run_kernel/storage.py) 的 `SCHEMA` 是表和列的实现依据：
+[`storage.py`](../../src/agent_run/storage/sqlite.py) 的 `SCHEMA` 是表和列的实现依据：
 
 | 事实 | 当前关系 |
 | --- | --- |
@@ -75,7 +75,7 @@ Final Run PR 的远端内容仍为 PR Narrative 与单条原地更新的 Agent R
 实际长度及额度，再读取并核对摘要。现行接口不包含旧 `load_*`、
 `sqlite_change_job_queries` 或 `sqlite_query_rows` 模块。
 
-公开查询由 [`query.read`](../../src/agent_run_kernel/query.py) 在同一只读快照中组织
+公开查询由 [`query.read`](../../src/agent_run/queries/run.py) 在同一只读快照中组织
 status、history 和冻结 settings。history 使用 `after`/`limit`、事件位置和 `has_more`
 显式分页；查询不会把部分结果伪装成完整历史，也不会回填业务事实或通知记录。
 未读取的历史不能因空列表而被清除，查询结果与显示字段不授予保存或执行权限。

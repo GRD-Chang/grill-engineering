@@ -10,23 +10,17 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from agent_run.agent_profiles import (
-    DEFAULT_PRESET,
-    AgentProfileError,
-    ProfileOverrides,
-    resolve_profiles,
-)
-from agent_run.delivery_policy import (
-    DeliveryPolicyError,
-    normalize_policy_overrides,
-    resolve_delivery_policy,
-)
-from agent_run.github_identity import (
-    GitHubIdentityError, describe_identity, normalize_github_config, resolve_worker_identity, resolve_runner_identity,
-)
-from agent_run.github_auth_profile import GitHubAppProfileStore
-from agent_run.paths import app_config_root
-from agent_run.messages import DEFAULT_LANGUAGE, ErrorMessage, error_message, text, validate_language
+from agent_run.contracts.agent_profiles import DEFAULT_PRESET, ProfileOverrides, resolve_profiles
+from agent_run.errors import AgentProfileError
+from agent_run.errors import DeliveryPolicyError
+from agent_run.contracts.policy_values import normalize_policy_overrides, resolve_delivery_policy
+from agent_run.errors import GitHubIdentityError
+from agent_run.contracts.identity import describe_identity, normalize_github_config
+from agent_run.adapters.auth.identity import resolve_worker_identity, resolve_runner_identity
+from agent_run.config.github_app import GitHubAppProfileStore
+from agent_run.config.paths import app_config_root
+from agent_run.contracts.copy import DEFAULT_LANGUAGE, text, validate_language
+from agent_run.errors import ErrorMessage, error_message
 
 _PROFILE_KEYS = frozenset(
     {"preset", "publication_from_development"}

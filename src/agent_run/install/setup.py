@@ -12,10 +12,10 @@ import uuid
 # Keep this rule identical in installer, setup and compatibility probe.
 if __package__ in (None, ""):
     sys.dont_write_bytecode = True
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from agent_run.doctor import _run_bounded_output_probe
-from agent_run.process_cleanup import child_subreaper
+from agent_run.install.doctor import _run_bounded_output_probe
+from agent_run.runtime.process_cleanup import child_subreaper
 
 
 def _probe(arguments: list[str], *, timeout: float = 5) -> tuple[int | None, bytes]:

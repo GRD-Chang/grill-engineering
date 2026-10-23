@@ -8,13 +8,14 @@ import re
 import subprocess
 from typing import Any
 
-from agent_run.git_errors import GitError
-from agent_run.managed_workspace import ManagedWorkspace, normalize_repository
-from agent_run.paths import app_data_root
-from agent_run.task_identity import TaskKey
+from agent_run.errors import GitError
+from agent_run.adapters.workspace import ManagedWorkspace, normalize_repository
+from agent_run.config.paths import app_data_root
+from agent_run.contracts.task import TaskKey
 
-from .query import QueryError, discover, task_binding, task_published
-from .task_location import read_task_bindings
+from agent_run.queries.read_facts import QueryError
+from agent_run.queries.run import discover, task_binding, task_published
+from agent_run.storage.tasks import read_task_bindings
 
 
 def _repository(value: str) -> str:

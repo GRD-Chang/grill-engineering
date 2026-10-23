@@ -16,16 +16,12 @@ from typing import Any, Sequence
 # Keep this rule identical in installer, setup and compatibility probe.
 if __package__ in (None, ""):
     sys.dont_write_bytecode = True
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from agent_run.process_cleanup import (
-    capture_process_scope,
-    child_subreaper,
-    terminate_process_group,
-)
-from agent_run.runner_runtime import RuntimeTreeError, find_runtime_package
-from agent_run.prompt_resources import read_builtin_resource
-from agent_run.user_defaults import UserDefaultsStore
+from agent_run.runtime.process_cleanup import capture_process_scope, child_subreaper, terminate_process_group
+from agent_run.install.runtime_tree import RuntimeTreeError, find_runtime_package
+from agent_run.config.resources import read_builtin_resource
+from agent_run.config.defaults import UserDefaultsStore
 
 
 PROBE_TIMEOUT_SECONDS = 120.0
@@ -153,7 +149,7 @@ class RunnerProbeBackend:
 
 def main(arguments: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="python -m agent_run.runner_probe",
+        prog="python -m agent_run.install.probe",
         description="运行候选 Runner Snapshot 的 Compatibility Check",
     )
     parser.add_argument("candidate", help="候选 Snapshot 或 staging 环境路径")

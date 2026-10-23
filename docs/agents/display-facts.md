@@ -10,16 +10,16 @@ Status、History、CLI 和通知投影从已提交事实派生，不另存展示
 
 | 事实或输出 | 当前维护归属 |
 | --- | --- |
-| 定位、唯一候选选择与命令分流 | [`query_cli.py`](../../src/agent_run_kernel/query_cli.py)、[`task_location.py`](../../src/agent_run_kernel/task_location.py) |
-| status/history/settings 的同源只读文档 | [`query.py`](../../src/agent_run_kernel/query.py) 的 `read` |
+| 定位、唯一候选选择与命令分流 | [`query_cli.py`](../../src/agent_run/cli/main.py)、[`task_location.py`](../../src/agent_run/storage/tasks.py) |
+| status/history/settings 的同源只读文档 | [`query.py`](../../src/agent_run/queries/run.py) 的 `read` |
 | 交付对象、gate、预算、候选、PR、当前工作及人工待办 | `query._subject`、`_status_fields`、`_operator_actions`、`_multi_ticket` |
 | 原始调用、Thread/Profile 和物理输出关联 | `query._invocations`、`execution_facts.recorded_profile` |
 | 原始审计与分页历史 | `query._native_history`、`_control_history`、`_resume_history` |
-| Worker 活动段与累计 effort | [`execution_facts.py`](../../src/agent_run_kernel/execution_facts.py) 的 `activity`、`execution_facts` |
-| JSON、plain、Rich 与 settings 文案 | [`query_render.py`](../../src/agent_run_kernel/query_render.py) 的 `render`、`render_settings` |
-| 已提交通知事件、里程碑与 Resume 结果 | [`notification_events.py`](../../src/agent_run_kernel/notification_events.py) |
-| 通知的当前 gate/完成边界与过时进展过滤 | `query.notification_boundaries`、[`notification_progress.py`](../../src/agent_run_kernel/notification_progress.py) |
-| 事件观察、outbox 和实际投递 | [`notifications.py`](../../src/agent_run_kernel/notifications.py) 的 `NativeNotifications`，以及 `agent_run.notification_outbox` / `notification_transport` |
+| Worker 活动段与累计 effort | [`execution_facts.py`](../../src/agent_run/queries/execution.py) 的 `activity`、`execution_facts` |
+| JSON、plain、Rich 与 settings 文案 | [`query_render.py`](../../src/agent_run/cli/render.py) 的 `render`、`render_settings` |
+| 已提交通知事件、里程碑与 Resume 结果 | [`notification_events.py`](../../src/agent_run/notifications/event_projection.py) |
+| 通知的当前 gate/完成边界与过时进展过滤 | `query.notification_boundaries`、[`notification_progress.py`](../../src/agent_run/notifications/progress.py) |
+| 事件观察、outbox 和实际投递 | [`notifications.py`](../../src/agent_run/notifications/sender.py) 的 `NativeNotifications`，以及 `agent_run.storage.notification_outbox` / `adapters.notification_transport` |
 
 `QueryDocument` 是显示结果，不是另一套可保存或推进的 Run。
 当前 `scheduler.activity`、调用 `live_status` 和 Ticket `execution_activity` 在缺少实时证明时为

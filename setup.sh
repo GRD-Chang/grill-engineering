@@ -32,7 +32,7 @@ if command -v timeout >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 &&
 fi
 probe() {
     if [ "$probe_python" = yes ]; then
-        python3 "$SOURCE_DIR/src/agent_run/runner_setup.py" "$@"
+        python3 "$SOURCE_DIR/src/agent_run/install/setup.py" "$@"
     elif command -v timeout >/dev/null 2>&1; then
         timeout -k 1 5 "$@"
     else
@@ -172,4 +172,4 @@ if ! sh "$SOURCE_DIR/install.sh"; then
     exit 1
 fi
 # Replace the shell so signals reach the probe supervisor directly.
-exec python3 "$SOURCE_DIR/src/agent_run/runner_setup.py"
+exec python3 "$SOURCE_DIR/src/agent_run/install/setup.py"

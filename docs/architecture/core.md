@@ -1,7 +1,7 @@
 # Native delivery runtime
 
-The installed `agent-run` command and `python -m agent_run_kernel` both route to
-`query_cli.main`. Their command contract is defined by that parser and its
+The installed `agent-run` command and `python -m agent_run.core` both route to
+`agent_run.cli.main.main`. Their command contract is defined by that parser and its
 registered native lifecycle adapters; neither entry launches a synthetic world.
 
 `Kernel` owns transitions, authorization, immutable execution facts, budgets,

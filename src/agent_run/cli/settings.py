@@ -10,11 +10,11 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from agent_run.github_identity import add_identity_options, identity_overrides
-from agent_run.messages import text
-from agent_run.user_defaults import UserDefaultsStore
+from agent_run.cli.identity_options import add_identity_options, identity_overrides
+from agent_run.contracts.copy import text
+from agent_run.config.defaults import UserDefaultsStore
 
-from .query import QueryError
+from agent_run.queries.read_facts import QueryError
 
 
 _POSITIVE_POLICY = (

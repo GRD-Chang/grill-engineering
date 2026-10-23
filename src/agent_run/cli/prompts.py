@@ -8,13 +8,14 @@ from pathlib import Path
 import sys
 from typing import Any
 
-from agent_run import prompt_resources
-from agent_run.messages import text, validate_language
-from agent_run.user_defaults import UserDefaultsStore
-from agent_run.development_prompts import development_prompt
-from agent_run.prompt_context import structured_output_repair_prompt
-from agent_run.publication_prompts import publication_continuation_prompt, publication_prompt
-from agent_run.reviewer_prompts import review_continuation_prompt, review_prompt
+from agent_run.contracts.prompt import METHOD_NAMES, validate_resources
+from agent_run.config import resources as prompt_resources
+from agent_run.contracts.copy import text, validate_language
+from agent_run.config.defaults import UserDefaultsStore
+from agent_run.core.prompts.development import development_prompt
+from agent_run.core.prompts.context import structured_output_repair_prompt
+from agent_run.core.prompts.publication import publication_continuation_prompt, publication_prompt
+from agent_run.core.prompts.review import review_continuation_prompt, review_prompt
 
 
 LEGACY_METHODS = {
@@ -33,7 +34,7 @@ def _configuration_details(language: str) -> dict[str, Any]:
         if (directory / name).exists() or (directory / name).is_symlink()
     }
     sources = {}
-    for name in prompt_resources.METHOD_NAMES:
+    for name in METHOD_NAMES:
         path = directory / f"{name}.md"
         sources[path.name] = str(path) if path.exists() or path.is_symlink() else f"builtin/{language}/methods/{name}.md"
     return {"sources": sources, "legacy_files": legacy}
@@ -75,12 +76,12 @@ def execute(parsed: argparse.Namespace) -> int:
         details = _configuration_details(language)
         if not frozen:
             request["_prompt_resources"] = prompt_resources.resolve_resources(language)
-        prompt_resources.validate_resources(request["_prompt_resources"])
+        validate_resources(request["_prompt_resources"])
         prompt = _preview(request, parsed.role, parsed.continuation)
         result: dict[str, Any] = {"result": "prompt_preview", "role": parsed.role, "prompt": prompt}
         result.update(details)
         if frozen:
-            result["sources"] = {f"{name}.md": "request_snapshot" for name in prompt_resources.METHOD_NAMES}
+            result["sources"] = {f"{name}.md": "request_snapshot" for name in METHOD_NAMES}
         plain = prompt
         notice = _legacy_notice(details, language)
         if notice:
@@ -96,7 +97,7 @@ def execute(parsed: argparse.Namespace) -> int:
         if parsed.prompts_command == "init":
             directory.mkdir(parents=True, exist_ok=True)
             created, preserved = [], []
-            for name in prompt_resources.METHOD_NAMES:
+            for name in METHOD_NAMES:
                 path = directory / f"{name}.md"
                 try:
                     with path.open("x", encoding="utf-8") as stream:
@@ -115,7 +116,7 @@ def execute(parsed: argparse.Namespace) -> int:
         else:
             effective = prompt_resources.resolve_resources(language)
             differences = {}
-            for name in prompt_resources.METHOD_NAMES:
+            for name in METHOD_NAMES:
                 key = f"methods/{name}"
                 differences[f"{name}.md"] = "".join(difflib.unified_diff(
                     defaults[key].splitlines(keepends=True), effective[key].splitlines(keepends=True),

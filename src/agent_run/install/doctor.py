@@ -12,20 +12,12 @@ import sys
 import time
 from pathlib import Path
 
-from agent_run._process_io import CompleteOutput, pump
-from agent_run.user_defaults import UserDefaultsStore
-from agent_run.github_auth_profile import GitHubAppProfileStore
-from agent_run.runner_installer import (
-    InstallPaths,
-    InstallerError,
-    _read_active,
-)
-from agent_run_kernel.host_adapter import HostUnavailable, SystemdHost
-from agent_run.process_cleanup import (
-    capture_process_scope,
-    child_subreaper,
-    terminate_process_group as _terminate_process_group,
-)
+from agent_run.runtime.process_io import CompleteOutput, pump
+from agent_run.config.defaults import UserDefaultsStore
+from agent_run.config.github_app import GitHubAppProfileStore
+from agent_run.install.installer import InstallPaths, InstallerError, _read_active
+from agent_run.adapters.systemd import HostUnavailable, SystemdHost
+from agent_run.runtime.process_cleanup import capture_process_scope, child_subreaper, terminate_process_group as _terminate_process_group
 
 _COMMAND_TIMEOUT_SECONDS = 3
 _MAX_SIGNATURE_OUTPUT_BYTES = 4096

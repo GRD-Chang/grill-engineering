@@ -7,15 +7,16 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from agent_run.agent_profiles import AgentProfileError
-from agent_run.managed_workspace import workspace_for_root
-from agent_run.messages import error_message, text
+from agent_run.errors import AgentProfileError
+from agent_run.adapters.workspace import workspace_for_root
+from agent_run.errors import error_message
+from agent_run.contracts.copy import text
 
-from . import personal_settings
-from .execution_facts import recorded_profile
-from .kernel import Kernel
-from .model import KernelError
-from .query_render import safe_text
+from agent_run.cli import settings as personal_settings
+from agent_run.queries.execution import recorded_profile
+from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
+from agent_run.cli.render import safe_text
 
 
 def add_parser(commands: Any, language: str) -> None:
@@ -29,7 +30,7 @@ def add_parser(commands: Any, language: str) -> None:
 
 
 def execute(parsed: argparse.Namespace) -> int:
-    from .cli_selection import _candidates, _select
+    from agent_run.cli.selection import _candidates, _select
 
     selection = argparse.Namespace(**vars(parsed))
     selection.parent = None

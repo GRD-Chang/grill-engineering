@@ -10,20 +10,22 @@ from pathlib import Path
 import sys
 from typing import Any, Literal, NoReturn, Sequence
 
-from agent_run.cli_messages import personal_language as _personal_language
-from agent_run.messages import error_detail, text
-from agent_run.git_errors import GitError
-from agent_run.git_errors import GitHubReadError
-from agent_run.runner_lease import RunnerLeaseError
+from agent_run.cli.messages import personal_language as _personal_language
+from agent_run.errors import error_detail
+from agent_run.contracts.copy import text
+from agent_run.errors import GitError
+from agent_run.errors import GitHubReadError
+from agent_run.runtime.package_lease import RunnerLeaseError
 
-from .model import KernelError
-from .host_adapter import HostUnavailable
-from .native_host import HandoffError
+from agent_run.errors import KernelError
+from agent_run.adapters.systemd import HostUnavailable
+from agent_run.runtime.handoff import HandoffError
 
-from . import cli_selection, personal_settings
-from .query import QueryDocument, QueryError, read
-from .query_render import render, render_settings, safe_text
-from .state_preflight import UnsupportedState
+from agent_run.cli import selection as cli_selection, settings as personal_settings
+from agent_run.queries.run import QueryDocument, read
+from agent_run.queries.read_facts import QueryError
+from agent_run.cli.render import render, render_settings, safe_text
+from agent_run.storage.preflight import UnsupportedState
 
 
 class _HelpFormatter(argparse.HelpFormatter):
@@ -88,11 +90,11 @@ def _parser(language: str) -> argparse.ArgumentParser:
         help="只读运行环境诊断" if language == "zh" else "Read-only runtime diagnostics")
     doctor.add_argument("--json", action="store_true", dest="as_json")
     personal_settings.add_parsers(commands, language)
-    from . import run_profile_cli
+    from agent_run.cli import profiles as run_profile_cli
     run_profile_cli.add_parser(commands, language)
-    from agent_run import prompt_cli
+    from agent_run.cli import prompts as prompt_cli
     prompt_cli.add_parser(commands, language)
-    from .lifecycle_cli import add_parsers
+    from agent_run.cli.lifecycle import add_parsers
     add_parsers(commands, language)
     return parser
 
@@ -106,13 +108,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return int(error.code) if isinstance(error.code, int) else 2
     try:
         if parsed.command in {"configure", "config", "profile"}:
-            from . import run_profile_cli
+            from agent_run.cli import profiles as run_profile_cli
             return run_profile_cli.execute(parsed)
         if parsed.command == "prompts":
-            from agent_run import prompt_cli
+            from agent_run.cli import prompts as prompt_cli
             return prompt_cli.execute(parsed)
         if parsed.command in {"run", "resume", "approve", "requeue", "revise", "stop", "abandon"}:
-            from .lifecycle_cli import execute
+            from agent_run.cli.lifecycle import execute
             output = execute(parsed, language=language)
             language = output.pop("language", language)
             if parsed.as_json:
@@ -126,7 +128,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 print(safe_text(f"{label}: {output['run_id']} {output['status']} [{output['action_id']}] {host_label}: {output['host']}"))
             return 0
         if parsed.command == "doctor":
-            from agent_run.doctor import run as diagnose
+            from agent_run.install.doctor import run as diagnose
             return diagnose(as_json=parsed.as_json)
         if parsed.command == "settings":
             if parsed.settings_command == "show" and (parsed.run_id is not None or parsed.parent is not None):

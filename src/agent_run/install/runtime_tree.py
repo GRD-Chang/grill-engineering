@@ -32,21 +32,12 @@ def find_runtime_package(candidate: Path) -> Path:
         package.resolve().relative_to(candidate.resolve())
     except ValueError as error:
         raise RuntimeTreeError("candidate Runner runtime escapes its Snapshot") from error
-    for tree in runtime_packages(package):
-        for path in tree.rglob("*"):
-            if path.is_symlink():
-                try:
-                    path.resolve().relative_to(candidate.resolve())
-                except ValueError as error:
-                    raise RuntimeTreeError(
-                        "candidate Runner runtime contains a symlink outside its Snapshot"
-                    ) from error
+    for path in package.rglob("*"):
+        if path.is_symlink():
+            try:
+                path.resolve().relative_to(candidate.resolve())
+            except ValueError as error:
+                raise RuntimeTreeError(
+                    "candidate Runner runtime contains a symlink outside its Snapshot"
+                ) from error
     return package
-
-
-def runtime_packages(package: Path) -> tuple[Path, ...]:
-    """Own runtime trees; dependencies are outside the Runner content identity."""
-    native = package.with_name("agent_run_kernel")
-    if native.is_symlink() or native.exists() and not native.is_dir():
-        raise RuntimeTreeError("candidate Runner has an invalid runtime tree")
-    return (package, native) if native.is_dir() else (package,)

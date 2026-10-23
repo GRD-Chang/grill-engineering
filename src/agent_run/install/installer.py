@@ -25,21 +25,13 @@ from typing import Any, Iterator, Sequence
 # Keep this rule identical in installer, setup and compatibility probe.
 if __package__ in (None, ""):
     sys.dont_write_bytecode = True
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from agent_run._process_io import CompleteOutput, TailOutput, pump
-from agent_run.paths import app_data_root
-from agent_run.process_cleanup import (
-    capture_process_scope,
-    child_subreaper,
-    terminate_process_group as _terminate_process_group,
-)
-from agent_run.runner_runtime import RuntimeTreeError, find_runtime_package, runtime_packages
-from agent_run.runner_lease import (
-    RunnerLeaseBusy,
-    RunnerLeaseError,
-    runner_management_lease,
-)
+from agent_run.runtime.process_io import CompleteOutput, TailOutput, pump
+from agent_run.config.paths import app_data_root
+from agent_run.runtime.process_cleanup import capture_process_scope, child_subreaper, terminate_process_group as _terminate_process_group
+from agent_run.install.runtime_tree import RuntimeTreeError, find_runtime_package
+from agent_run.runtime.package_lease import RunnerLeaseBusy, RunnerLeaseError, runner_management_lease
 
 
 PATH_BLOCK_START = "# >>> agent-run managed PATH >>>"
@@ -562,7 +554,7 @@ def _run_candidate_probe(candidate: Path) -> None:
         adopted_baseline = capture_process_scope()
         try:
             process = subprocess.Popen(
-                [str(python), "-m", "agent_run.runner_probe", str(candidate)],
+                [str(python), "-m", "agent_run.install.probe", str(candidate)],
                 cwd=empty_directory,
                 env=probe_environment,
                 stdout=subprocess.PIPE,
@@ -657,32 +649,23 @@ def _runtime_package(candidate: Path) -> Path:
 
 def _runtime_identity(package: Path) -> str:
     digest = hashlib.sha256()
-    try:
-        trees = runtime_packages(package)
-    except RuntimeTreeError as error:
-        raise InstallerError(str(error)) from error
-    for tree in trees:
-        if tree != package:
-            # Preserve existing legacy-only Snapshot identities; native content
-            # and even an empty native tree extend that identity explicitly.
-            digest.update(b"\0Pagent_run_kernel\0")
-        for path in sorted(tree.rglob("*")):
-            if "__pycache__" in path.parts:
-                continue
-            relative = path.relative_to(tree).as_posix().encode("utf-8")
-            digest.update(relative)
-            digest.update(b"\0")
-            if path.is_symlink():
-                digest.update(b"L")
-                digest.update(os.readlink(path).encode("utf-8"))
-            elif path.is_file():
-                digest.update(b"F")
-                digest.update(path.read_bytes())
-            elif path.is_dir():
-                digest.update(b"D")
-            else:
-                raise InstallerError("runtime tree 包含不支持的文件类型")
-            digest.update(b"\0")
+    for path in sorted(package.rglob("*")):
+        if "__pycache__" in path.parts:
+            continue
+        relative = path.relative_to(package).as_posix().encode("utf-8")
+        digest.update(relative)
+        digest.update(b"\0")
+        if path.is_symlink():
+            digest.update(b"L")
+            digest.update(os.readlink(path).encode("utf-8"))
+        elif path.is_file():
+            digest.update(b"F")
+            digest.update(path.read_bytes())
+        elif path.is_dir():
+            digest.update(b"D")
+        else:
+            raise InstallerError("runtime tree 包含不支持的文件类型")
+        digest.update(b"\0")
     return f"sha256:{digest.hexdigest()}"
 
 

@@ -13,12 +13,12 @@ from pathlib import Path
 import sqlite3
 import sys
 
-from agent_run.runner_lease import runner_usage_lease
+from agent_run.runtime.package_lease import runner_usage_lease
 
-from .host_exit_facts import HostExitUnavailable, _abnormal, host_exit_notice
-from .kernel import Kernel
-from .model import HostLaunch
-from .native_host import read_exit_environment
+from agent_run.queries.host_exit import HostExitUnavailable, _abnormal, host_exit_notice
+from agent_run.core.kernel import Kernel
+from agent_run.model import HostLaunch
+from agent_run.runtime.handoff import read_exit_environment
 
 
 def exit_properties(database: Path, action_id: str, request: HostLaunch, runner_lock: Path,
@@ -39,8 +39,8 @@ def exit_properties(database: Path, action_id: str, request: HostLaunch, runner_
     if not database.is_absolute() or not runner_lock.is_absolute() or not Path(sys.executable).is_absolute():
         raise ValueError("An exact Host exit command is required")
     bootstrap = ("import sys;sys.path.insert(0,sys.argv[1]);"
-                 "from agent_run_kernel.host_exit_notifications import main;raise SystemExit(main(sys.argv[2:]))")
-    arguments = [sys.executable, "-I", "-c", bootstrap, str(Path(__file__).resolve().parents[1]),
+                 "from agent_run.cli.host_exit import main;raise SystemExit(main(sys.argv[2:]))")
+    arguments = [sys.executable, "-I", "-c", bootstrap, str(Path(__file__).resolve().parents[2]),
                  "--database", str(database), "--action", action_id, "--runner-lock", str(runner_lock)]
     library = environment.get("LD_LIBRARY_PATH", "")
     if "\0" in library:
@@ -78,7 +78,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                                       service_result=result, exit_code=code, exit_status=status,
                                       invocation_id=invocation)
             if notice is not None:
-                from .notifications import deliver_host_exit_notice
+                from agent_run.notifications.sender import deliver_host_exit_notice
                 deliver_host_exit_notice(args.database, args.database.parent, notice)
         return 0
     except (OSError, ValueError, RuntimeError, sqlite3.Error):

@@ -13,11 +13,11 @@ ROOT = Path(__file__).resolve().parent
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(ROOT / "src"))
 
-from agent_run.development_prompts import development_prompt
-from agent_run.prompt_context import structured_output_repair_prompt
-from agent_run.prompt_resources import resource, resolve_resources
-from agent_run.publication_prompts import publication_prompt
-from agent_run.reviewer_prompts import review_prompt
+from agent_run.core.prompts.development import development_prompt
+from agent_run.core.prompts.context import structured_output_repair_prompt
+from agent_run.config.resources import resource, resolve_resources
+from agent_run.core.prompts.publication import publication_prompt
+from agent_run.core.prompts.review import review_prompt
 
 
 def scenarios(parent_url: str, task_url: str) -> dict[str, tuple[str, str]]:

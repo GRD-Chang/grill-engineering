@@ -15,17 +15,18 @@ from pathlib import Path
 import re
 from typing import Any, TYPE_CHECKING
 
-from agent_run.messages import error_message, text
+from agent_run.errors import error_message
+from agent_run.contracts.copy import text
 
-from . import personal_settings
-from .operation_runner import observe_control
-from .model import Commit, Delivery, DeliveryKind, HostObservation, Requirements, ResourceInspection, RunSpec, World
+from agent_run.cli import settings as personal_settings
+from agent_run.core.operation_runner import observe_control
+from agent_run.model import Commit, Delivery, DeliveryKind, HostObservation, Requirements, ResourceInspection, RunSpec, World
 
 if TYPE_CHECKING:
-    from .kernel import Kernel
-    from .host_adapter import SystemdHost
-    from agent_run.user_defaults import UserDefaultsStore
-    from agent_run.agent_profiles import ProfileOverrides
+    from agent_run.core.kernel import Kernel
+    from agent_run.adapters.systemd import SystemdHost
+    from agent_run.config.defaults import UserDefaultsStore
+    from agent_run.contracts.agent_profiles import ProfileOverrides
 
 
 
@@ -87,7 +88,7 @@ def add_parsers(commands: Any, language: str) -> None:
         if command == "run":
             personal_settings._policy_options(child, language)
             personal_settings._profile_options(child, language)
-            from agent_run.github_identity import add_identity_options
+            from agent_run.cli.identity_options import add_identity_options
             add_identity_options(child, language)
             notify = child.add_mutually_exclusive_group()
             notify.add_argument("--notification-mode", choices=("concise", "detailed"), help=text("cli.notifications_help", language=language))
@@ -95,7 +96,7 @@ def add_parsers(commands: Any, language: str) -> None:
 
 
 def _runtime_directory(action_id: str, environment: Mapping[str, str]) -> Path:
-    from agent_run.paths import app_runtime_root
+    from agent_run.config.paths import app_runtime_root
     if not re.fullmatch(r"[A-Za-z0-9_-]+", action_id):
         raise ValueError("Expected an exact Action identity")
     root = app_runtime_root(environment)
@@ -123,8 +124,8 @@ def submit(kernel: Kernel, kind: str, *, action_id: str, command: tuple[str, ...
     Executor, including the original loader environment needed before imports.
     Unknown launch remains unknown; no foreground executor or retry is started.
     """
-    from agent_run.runner_lease import runner_usage_lease
-    from .native_host import prepare_handoff, launch_handoff
+    from agent_run.runtime.package_lease import runner_usage_lease
+    from agent_run.runtime.handoff import prepare_handoff, launch_handoff
     with runner_usage_lease(runner_lock) as terminal:
         manager.preflight()  # Before creating a carrier directory or accepting Action.
         directory = _runtime_directory(action_id, environment)
@@ -135,7 +136,7 @@ def submit(kernel: Kernel, kind: str, *, action_id: str, command: tuple[str, ...
                                     replacement=replacement,
                                     resource_inspections=resource_inspections, discard_worktree=discard_worktree,
                                     continuation_of=continuation_of)
-        from .host_exit_notifications import exit_properties
+        from agent_run.cli.host_exit import exit_properties
         properties = exit_properties(kernel.storage.path, action_id, request, runner_lock, environment)
         handoff = prepare_handoff(request, environment, runner_lock=runner_lock, terminal_lease=terminal)
         observed = launch_handoff(kernel, action_id, manager, handoff, exit_properties=properties)
@@ -155,8 +156,8 @@ def attach(kernel: Kernel, *, requested_action: str, manager: SystemdHost,
     Attaching does not apply the caller's new control request. A durable dispatch
     claim is never converted into permission to prepare another handoff or start.
     """
-    from agent_run.runner_lease import runner_usage_lease
-    from .native_host import prepare_handoff, launch_handoff, reconcile_handoff
+    from agent_run.runtime.package_lease import runner_usage_lease
+    from agent_run.runtime.handoff import prepare_handoff, launch_handoff, reconcile_handoff
     with runner_usage_lease(runner_lock) as terminal:
         action_id = kernel.active_host_action()
         if action_id is None:
@@ -167,7 +168,7 @@ def attach(kernel: Kernel, *, requested_action: str, manager: SystemdHost,
         if kernel.host_dispatched(action_id):
             observed = reconcile_handoff(kernel, action_id, manager)
         else:
-            from .host_exit_notifications import exit_properties
+            from agent_run.cli.host_exit import exit_properties
             properties = exit_properties(kernel.storage.path, action_id, request, runner_lock, environment)
             handoff = prepare_handoff(request, environment, runner_lock=runner_lock, terminal_lease=terminal)
             observed = launch_handoff(kernel, action_id, manager, handoff, exit_properties=properties)
@@ -180,7 +181,7 @@ def attach(kernel: Kernel, *, requested_action: str, manager: SystemdHost,
                 "host_unit": request.unit_name}
 
 def _active_runner() -> bool:
-    from agent_run.paths import app_data_root
+    from agent_run.config.paths import app_data_root
     active = (app_data_root() / "active" / "current").resolve()
     return Path(__file__).resolve().is_relative_to(active)
 
@@ -189,14 +190,14 @@ def _run(parsed: argparse.Namespace, *, manager: SystemdHost,
          environment: Mapping[str, str], runner_lock: Path) -> dict[str, Any]:
     """Freeze creation inputs outside the sole Core Task creation transaction."""
     from uuid import uuid4
-    from agent_run.github import GhGitHubReader
-    from agent_run.github_identity import identity_overrides
-    from agent_run.managed_workspace import ManagedWorkspace
-    from agent_run.task_identity import TaskKey
-    from agent_run.user_defaults import UserDefaultsStore
-    from .kernel import Kernel
-    from .model import KernelError
-    from .executor import command
+    from agent_run.adapters.github import GhGitHubReader
+    from agent_run.cli.identity_options import identity_overrides
+    from agent_run.adapters.workspace import ManagedWorkspace
+    from agent_run.contracts.task import TaskKey
+    from agent_run.config.defaults import UserDefaultsStore
+    from agent_run.core.kernel import Kernel
+    from agent_run.errors import KernelError
+    from agent_run.runtime.executor import command
 
     directory = Path.cwd()
     repository = parsed.repo or GhGitHubReader(working_directory=directory).repository_hint()
@@ -245,13 +246,13 @@ def execute(parsed: argparse.Namespace, *, language: str) -> dict[str, Any]:
     import os
     import shutil
     from uuid import uuid4
-    from agent_run.managed_workspace import workspace_for_root
-    from agent_run.runner_lease import default_runner_lock_path, runner_usage_lease
-    from .host_adapter import SystemdHost, HostUnavailable
-    from .kernel import Kernel
-    from .model import KernelError
-    from .cli_selection import _candidates, _select
-    from .remote_effects import RemoteEffects
+    from agent_run.adapters.workspace import workspace_for_root
+    from agent_run.runtime.package_lease import default_runner_lock_path, runner_usage_lease
+    from agent_run.adapters.systemd import SystemdHost, HostUnavailable
+    from agent_run.core.kernel import Kernel
+    from agent_run.errors import KernelError
+    from agent_run.cli.selection import _candidates, _select
+    from agent_run.adapters.remote import RemoteEffects
 
     if parsed.command not in {"run", "resume", "approve", "stop", "revise", "requeue", "abandon"}:
         raise KernelError("lifecycle_not_connected", parsed.command)
@@ -283,8 +284,8 @@ def execute(parsed: argparse.Namespace, *, language: str) -> dict[str, Any]:
             workspace = workspace_for_root(Path(run["repository_root"]))
             if not database.is_relative_to(workspace.state_root.resolve()):
                 raise KernelError("managed_state_identity")
-            from .task_location import read_task, task_path
-            from agent_run.task_identity import TaskKey
+            from agent_run.storage.tasks import read_task, task_path
+            from agent_run.contracts.task import TaskKey
             task = TaskKey(Path(run["repository_root"]), run["repository"], run["parent_issue"])
             if read_task(task_path(task)) != (run["id"], database):
                 raise KernelError("task_run_unpublished", "This database is not the published Run for its Task")
@@ -308,8 +309,8 @@ def execute(parsed: argparse.Namespace, *, language: str) -> dict[str, Any]:
                     "action_id": action_id, "action": "stop", "host": "unknown", "language": run["language"]}
         inspections = None
         if parsed.command == "abandon":
-            from .effects import LocalGit
-            from .local_effects import LocalEffects
+            from agent_run.adapters.git_objects import LocalGit
+            from agent_run.adapters.local_git import LocalEffects
             inspections = LocalEffects(LocalGit(workspace.repository_root)).inspect_resources(kernel.generation_resources())
 
             def abandon_receipt(host: str = "unknown") -> dict[str, Any]:
@@ -349,8 +350,8 @@ def execute(parsed: argparse.Namespace, *, language: str) -> dict[str, Any]:
             original["language"] = run["language"]
             return original
         if parsed.command == "requeue":
-            from agent_run.github import GhGitHubReader
-            from .source_reading import read_requirements
+            from agent_run.adapters.github import GhGitHubReader
+            from agent_run.adapters.source import read_requirements
             reader = GhGitHubReader(workspace.repository, working_directory=workspace.repository_root,
                                     runner_identity=inputs["runner_identity"])
             kernel.refresh(lambda: read_requirements(reader, run["parent_issue"]))
@@ -402,13 +403,13 @@ def execute(parsed: argparse.Namespace, *, language: str) -> dict[str, Any]:
             remote = inputs.get("repository_remote")
             if not isinstance(remote, str) or not remote:
                 raise KernelError("creation_repository_remote_required")
-            from agent_run.github import GhGitHubReader
-            from .source_reading import read_requirements
+            from agent_run.adapters.github import GhGitHubReader
+            from agent_run.adapters.source import read_requirements
             reader = GhGitHubReader(workspace.repository, working_directory=workspace.repository_root,
                                     runner_identity=inputs["runner_identity"])
             kernel.refresh(lambda: read_requirements(reader, run["parent_issue"]))
         # Root owns the selected Executor command, including sealed loader facts.
-        from .executor import command
+        from agent_run.runtime.executor import command
         action_id = uuid4().hex
         if original is not None:
             request = kernel.host_request(original["action_id"])
@@ -449,15 +450,16 @@ def prepare_creation(parent: int, repository: str | None, *, source_directory: P
     """
     from dataclasses import replace
     from uuid import uuid4
-    from agent_run.github import GhGitHubReader
-    from agent_run.git_errors import GitHubReadError
-    from agent_run.github_retry import run_read_command
-    from agent_run.git_output import run_git
-    from agent_run.managed_workspace import ManagedWorkspace, read_git_identity
-    from .configuration import freeze_creation
-    from .model import RunSpec, KernelError
-    from .remote_effects import RemoteEffects
-    from .source_reading import read_requirements
+    from agent_run.adapters.github import GhGitHubReader
+    from agent_run.errors import GitHubReadError
+    from agent_run.adapters.github_commands import run_read_command
+    from agent_run.runtime.git_command import run_git
+    from agent_run.adapters.workspace import ManagedWorkspace, read_git_identity
+    from agent_run.config.creation import freeze_creation
+    from agent_run.model import RunSpec
+    from agent_run.errors import KernelError
+    from agent_run.adapters.remote import RemoteEffects
+    from agent_run.adapters.source import read_requirements
     _require_github_host()
     selected = repository or GhGitHubReader(working_directory=source_directory).repository_hint()
     if selected is None:

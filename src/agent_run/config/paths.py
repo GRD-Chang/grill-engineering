@@ -6,7 +6,7 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 
-from agent_run.messages import error_message
+from agent_run.errors import error_message
 
 
 def _directory(
