@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 from typing import Any, Protocol
 
-from agent_run.git_errors import GitError
+from agent_run.errors import GitError
 
 
 class PublicationCommitGit(Protocol):

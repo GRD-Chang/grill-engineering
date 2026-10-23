@@ -11,15 +11,15 @@ import re
 import subprocess
 from typing import Any, Mapping
 
-from agent_run.github import GhGitHubReader
-from agent_run.git_errors import GitHubReadError
-from agent_run.github_retry import run_read_command
+from agent_run.adapters.github import GhGitHubReader
+from agent_run.errors import GitHubReadError
+from agent_run.adapters.github_commands import run_read_command
 
-from .storage import MATERIAL_LIMIT
-from .effects import LocalGit
-from agent_run.github_identity import validate_identity_snapshot
+from agent_run.storage.sqlite import MATERIAL_LIMIT
+from agent_run.adapters.git_objects import LocalGit
+from agent_run.contracts.identity import validate_identity_snapshot
 
-from .model import Checks, Requirements
+from agent_run.model import Checks, Requirements
 
 
 def read_requirements(reader: GhGitHubReader, parent_number: int) -> Requirements:

@@ -8,7 +8,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 
-from ._process_io import TailOutput, pump
+from agent_run.runtime.process_io import TailOutput, pump
 
 
 @dataclass(frozen=True)

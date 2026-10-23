@@ -15,10 +15,10 @@ from io import TextIOWrapper
 from pathlib import Path
 from typing import Iterator
 
-try:
-    from agent_run.paths import app_data_root
-except ModuleNotFoundError:  # pragma: no cover - source-tree installer
-    from paths import app_data_root  # type: ignore[import-not-found, no-redef]
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from agent_run.config.paths import app_data_root
 
 
 class RunnerLeaseError(RuntimeError):

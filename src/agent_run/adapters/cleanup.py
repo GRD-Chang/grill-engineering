@@ -12,8 +12,9 @@ from dataclasses import replace
 from pathlib import Path
 from time import monotonic
 
-from .effects import LocalGit
-from .model import Effect, EffectResult, KernelError, ResourceInspection, ResourceWitness, resource_wire
+from agent_run.adapters.git_objects import LocalGit
+from agent_run.model import Effect, EffectResult, ResourceInspection, ResourceWitness, resource_wire
+from agent_run.errors import KernelError
 
 
 def _result(disposition: str, reason: str, **facts: object) -> EffectResult:

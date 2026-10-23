@@ -19,15 +19,15 @@ import sys
 import time
 from typing import Any, TYPE_CHECKING
 
-from agent_run.process_binding import _process_start_token as _start_token
-from agent_run.runner_lease import RunnerLease, retain_lease_for_systemd_exit, runner_usage_lease
+from agent_run.runtime.process_identity import _process_start_token as _start_token
+from agent_run.runtime.package_lease import RunnerLease, retain_lease_for_systemd_exit, runner_usage_lease
 
-from .execution import _cgroup
-from .model import HostLaunch, HostObservation
+from agent_run.runtime.execution import _cgroup
+from agent_run.model import HostLaunch, HostObservation
 
 if TYPE_CHECKING:
-    from .host_adapter import SystemdHost
-    from .kernel import Kernel
+    from agent_run.adapters.systemd import SystemdHost
+    from agent_run.core.kernel import Kernel
 
 
 _LIMIT = 1024 * 1024
@@ -93,7 +93,7 @@ def _environment(value: object) -> dict[str, str]:
 
 def _runner_witness(runner_lock: Path) -> dict[str, Any]:
     held = runner_lock.stat()
-    return {"package_root": str(Path(__file__).resolve().parents[1]),
+    return {"package_root": str(Path(__file__).resolve().parents[2]),
             "python": sys.executable, "lock": str(runner_lock.resolve()),
             "device": held.st_dev, "inode": held.st_ino}
 
@@ -161,9 +161,9 @@ def prepare_handoff(
         read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
         # The already loaded package location is the trusted Runner source;
         # isolated Python ignores terminal PYTHONPATH and user site hooks.
-        bootstrap = "import sys;sys.path.insert(0,sys.argv[1]);from agent_run_kernel.native_host import _guardian;raise SystemExit(_guardian(sys.argv[2:]))"
+        bootstrap = "import sys;sys.path.insert(0,sys.argv[1]);from agent_run.runtime.handoff import _guardian;raise SystemExit(_guardian(sys.argv[2:]))"
         process = subprocess.Popen(
-            [sys.executable, "-I", "-c", bootstrap, str(Path(__file__).resolve().parents[1]),
+            [sys.executable, "-I", "-c", bootstrap, str(Path(__file__).resolve().parents[2]),
              str(carrier), json.dumps(receipt), str(terminal_lease.fileno()), str(write_fd)],
             pass_fds=(terminal_lease.fileno(), write_fd), start_new_session=True,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

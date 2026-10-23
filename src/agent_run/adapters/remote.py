@@ -17,27 +17,27 @@ from tempfile import NamedTemporaryFile
 from typing import Any, NoReturn, ParamSpec, Protocol, TYPE_CHECKING, TypeVar
 from urllib.parse import urlencode
 
-from agent_run.github import GhGitHubReader
-from agent_run.git_errors import GitHubReadError
-from agent_run.error_safety import bounded_error
-from agent_run.github_identity import validate_identity_snapshot
-from agent_run.github_retry import run_read_command, run_write_command
-from agent_run.runner_transport import runner_git_environment
+from agent_run.adapters.github import GhGitHubReader
+from agent_run.errors import GitHubReadError
+from agent_run.errors import bounded_error
+from agent_run.contracts.identity import validate_identity_snapshot
+from agent_run.adapters.github_commands import run_read_command, run_write_command
+from agent_run.adapters.auth.runner_transport import runner_git_environment
 
-from .cleanup_adapter import cleanup_remote_ref, inspect_remote_ref
+from agent_run.adapters.cleanup import cleanup_remote_ref, inspect_remote_ref
 
-from .effects import LocalGit
-from .model import ObservationSuperseded as ObservationSuperseded
-from .model import (Commit, Effect, EffectResult, KernelError, PullRequest, Requirements,
-                    ResourceInspection, ResourceWitness)
-from .local_effects import LocalEffects
-from .source_reading import (read_remote_heads, read_requirements, read_required_check_facts,
+from agent_run.adapters.git_objects import LocalGit
+from agent_run.errors import ObservationSuperseded as ObservationSuperseded
+from agent_run.model import Commit, Effect, EffectResult, PullRequest, Requirements, ResourceInspection, ResourceWitness
+from agent_run.errors import KernelError
+from agent_run.adapters.local_git import LocalEffects
+from agent_run.adapters.source import (read_remote_heads, read_requirements, read_required_check_facts,
                              normalize_required_checks)
 
-from .storage import MATERIAL_LIMIT
+from agent_run.storage.sqlite import MATERIAL_LIMIT
 
 if TYPE_CHECKING:
-    from .operation_contract import DeliveryFacts, DeliveryRead
+    from agent_run.core.operation_contract import DeliveryFacts, DeliveryRead
 
 
 class EffectReadError(GitHubReadError):
@@ -57,7 +57,7 @@ def _operation_errors(method: Callable[_Arguments, _Result]) -> Callable[_Argume
     """Translate physical transport failures at the Core port boundary only."""
     @wraps(method)
     def invoke(*args: _Arguments.args, **kwargs: _Arguments.kwargs) -> _Result:
-        from .operation_contract import ReadUnavailable
+        from agent_run.core.operation_contract import ReadUnavailable
         try:
             return method(*args, **kwargs)
         except GitHubReadError as error:
@@ -109,8 +109,8 @@ class RemoteEffects:
     def actor(self) -> str:
         """Resolve the selected Runner's actual login, not a fixture identity."""
         if self.identity["source"] == "app":
-            from agent_run.github_auth import resolve_app_login
-            from agent_run.github_auth_profile import GitHubAppProfile
+            from agent_run.adapters.auth.app import resolve_app_login
+            from agent_run.config.github_app import GitHubAppProfile
             profile = self.identity["app_profile"]
             return resolve_app_login(GitHubAppProfile(profile["app_id"], profile["installation_id"],
                                                      Path(profile["private_key_path"])))
@@ -565,7 +565,7 @@ class RemoteEffects:
     @_operation_errors
     def delivery(self, request: DeliveryRead) -> DeliveryFacts:
         """Read exact Core-supplied refs and immutable ancestry anchors."""
-        from .operation_contract import DeliveryFacts
+        from agent_run.core.operation_contract import DeliveryFacts
         source_sha, target_sha = read_remote_heads(self.root, request.source_ref, request.target_ref,
                                                   runner_identity=self.identity, remote=self.remote)
         source = None if source_sha is None else self._commit(source_sha)[0]

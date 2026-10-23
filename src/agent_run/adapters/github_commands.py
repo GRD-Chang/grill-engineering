@@ -7,9 +7,9 @@ from collections.abc import Callable, Mapping
 from typing import Any
 from pathlib import Path
 
-from agent_run.runner_transport import runner_options
-from agent_run.bounded_command import capture_command
-from agent_run.error_safety import redact_transport_output
+from agent_run.adapters.auth.runner_transport import runner_options
+from agent_run.runtime.command import capture_command
+from agent_run.errors import redact_transport_output
 
 
 MAX_READ_ATTEMPTS = 3
@@ -80,7 +80,7 @@ def _run_bounded_command(
     arguments: list[str], *, cwd: Path | None, timeout: int,
     runner_identity: Mapping[str, Any] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    from agent_run.runner_transport import (
+    from agent_run.adapters.auth.runner_transport import (
         runner_environment, runner_git_environment,
     )
 

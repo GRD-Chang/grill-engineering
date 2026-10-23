@@ -9,9 +9,9 @@ from functools import lru_cache
 from collections.abc import Mapping
 from pathlib import Path
 
-from agent_run.git_errors import GitError
-from agent_run._process_io import CompleteOutput, TailOutput, pump
-from agent_run.error_safety import redact_transport_output
+from agent_run.errors import GitError
+from agent_run.runtime.process_io import CompleteOutput, TailOutput, pump
+from agent_run.errors import redact_transport_output
 
 
 MAX_GIT_OUTPUT_BYTES = 1024 * 1024

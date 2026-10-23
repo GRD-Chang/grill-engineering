@@ -9,14 +9,15 @@ import subprocess
 import tempfile
 from typing import Any
 
-from agent_run.git_errors import GitError
-from agent_run.git_publication_commit import (
+from agent_run.errors import GitError
+from agent_run.adapters.publication_commit import (
     install_publication_commit, observe_publication_commit, prepare_publication_commit,
 )
 
-from .cleanup_adapter import cleanup_local_ref, cleanup_worktree, inspect_local_ref, inspect_resource, inspect_worktree
-from .effects import LocalGit
-from .model import Effect, EffectResult, KernelError, ResourceInspection, ResourceWitness, inspection_wire
+from agent_run.adapters.cleanup import cleanup_local_ref, cleanup_worktree, inspect_local_ref, inspect_resource, inspect_worktree
+from agent_run.adapters.git_objects import LocalGit
+from agent_run.model import Effect, EffectResult, ResourceInspection, ResourceWitness, inspection_wire
+from agent_run.errors import KernelError
 
 
 class LocalEffects:

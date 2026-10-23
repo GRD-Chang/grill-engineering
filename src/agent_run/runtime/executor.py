@@ -15,17 +15,18 @@ import threading
 import time
 from typing import Any
 
-from agent_run.error_safety import bounded_error
+from agent_run.errors import bounded_error
 
-from .host_adapter import SystemdHost
-from .execution import ProcessExitUnknown
-from .kernel import Kernel
-from .model import AgentCall, Execution, KernelError, Step
-from .operation_contract import OperationBinding
-from .operation_runner import OperationRunner
-from .native_host import managed_host_environment
-from .remote_effects import RemoteEffects
-from .role_prompt import render_role_prompt
+from agent_run.adapters.systemd import SystemdHost
+from agent_run.runtime.execution import ProcessExitUnknown
+from agent_run.core.kernel import Kernel
+from agent_run.model import AgentCall, Execution, Step
+from agent_run.errors import KernelError
+from agent_run.core.operation_contract import OperationBinding
+from agent_run.core.operation_runner import OperationRunner
+from agent_run.runtime.handoff import managed_host_environment
+from agent_run.adapters.remote import RemoteEffects
+from agent_run.core.prompts.role import render_role_prompt
 
 
 def command(database: Path, action: str, runner_lock: Path,
@@ -40,7 +41,7 @@ def command(database: Path, action: str, runner_lock: Path,
             or not action or len(action) > 256 or "\0" in action
             or not Path(sys.executable).is_absolute()):
         raise ValueError("An exact native Host command is required")
-    arguments = (sys.executable, "-m", "agent_run_kernel.executor", "--database", str(database),
+    arguments = (sys.executable, "-m", "agent_run.runtime.executor", "--database", str(database),
                  "--action", action, "--runner-lock", str(runner_lock))
     library = environment.get("LD_LIBRARY_PATH", "")
     if "\0" in library:
@@ -61,7 +62,7 @@ class _Executor:
             if self.kernel.dispatch_agent(call):
                 self.kernel.agent_unavailable(call, "worker_preparation_failed", {"error_type": type(error).__name__})
             return
-        from .codex_execution import execute_selected_codex
+        from agent_run.runtime.codex import execute_selected_codex
         binding = self.runner.binding
         # Keep the native credential/sandbox/process/raw/exit hooks. Bootstrap
         # authorization executes inline here, never in a successor pool task.
@@ -79,7 +80,7 @@ def _make_ports(binding: OperationBinding) -> RemoteEffects:
 
 def run(kernel: Kernel, execution: Execution, environment: Mapping[str, str]) -> int:
     """Supervise physical calls and one bounded Core operation independently."""
-    from .notifications import NativeNotifications
+    from agent_run.notifications.sender import NativeNotifications
     runner: OperationRunner = OperationRunner(kernel, execution, _make_ports)
     runner.activate_observation()
     driver = _Executor(kernel, runner, environment)

@@ -10,10 +10,11 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
-from agent_run.credential_lifecycle import ReadCredential, RenewableCredential, safe_http_status
-from agent_run.github_auth import _GitHubAppCredentialProvider
-from agent_run.github_auth_profile import GitHubAppProfile
-from agent_run.github_identity import GitHubIdentityError, native_github_environment, validate_worker_auth
+from agent_run.adapters.auth.credential_lifecycle import ReadCredential, RenewableCredential, safe_http_status
+from agent_run.adapters.auth.app import _GitHubAppCredentialProvider
+from agent_run.config.github_app import GitHubAppProfile
+from agent_run.errors import GitHubIdentityError
+from agent_run.adapters.auth.identity import native_github_environment, validate_worker_auth
 
 
 class RunnerCredentialError(GitHubIdentityError):
@@ -23,7 +24,7 @@ class RunnerCredentialError(GitHubIdentityError):
 def _credential_failure(message: str, authorization_failed: bool) -> Exception:
     if authorization_failed:
         return RunnerCredentialError(message)
-    from agent_run.git_errors import GitHubReadError
+    from agent_run.errors import GitHubReadError
 
     return GitHubReadError("runner_credential_unavailable", message)
 

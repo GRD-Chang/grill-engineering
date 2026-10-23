@@ -7,10 +7,11 @@ from pathlib import Path
 import subprocess
 from typing import Callable, Iterable
 
-from agent_run.git_errors import GitError
-from agent_run.git_output import run_git
+from agent_run.errors import GitError
+from agent_run.runtime.git_command import run_git
 
-from .model import Commit, KernelError
+from agent_run.model import Commit
+from agent_run.errors import KernelError
 
 
 class LocalGit:

@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 from typing import Callable
 
-from agent_run.credential_lifecycle import CredentialProvider, ReadCredential, RenewableCredential
+from agent_run.adapters.auth.credential_lifecycle import CredentialProvider, ReadCredential, RenewableCredential
 
 
 class NativeCredentialDelivery:

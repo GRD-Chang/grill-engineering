@@ -14,7 +14,7 @@ from pathlib import Path
 from threading import Event
 from typing import Any, Literal, TypedDict
 
-from .process_cleanup import terminate_process_group
+from agent_run.runtime.process_cleanup import terminate_process_group
 
 
 SEND_TIMEOUT_SECONDS = 10.0
@@ -42,12 +42,12 @@ def _run(argv: list[str], deadline: float, cancel: Event) -> _CommandResult:
         return _CommandResult(None, reason="通知发送已取消或超时")
     try:
         process = subprocess.Popen(
-            [sys.executable, "-m", "agent_run.notification_process",
+            [sys.executable, "-m", "agent_run.runtime.command_supervisor",
              str(max(0.0, deadline - time.monotonic())), *argv],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, start_new_session=True,
             env={**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, (
-                str(Path(__file__).resolve().parent.parent), os.environ.get("PYTHONPATH"),
+                str(Path(__file__).resolve().parents[2]), os.environ.get("PYTHONPATH"),
             )))},
         )
     except OSError:

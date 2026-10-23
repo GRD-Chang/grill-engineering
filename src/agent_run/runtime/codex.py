@@ -19,15 +19,15 @@ import threading
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Self
 
-from agent_run.error_safety import bounded_error
-from agent_run.worker_sandbox import _BoundedJsonlStream, WorkerSandboxError, bubblewrap_command, native_worker_environment
+from agent_run.errors import bounded_error
+from agent_run.runtime.sandbox import _BoundedJsonlStream, WorkerSandboxError, bubblewrap_command, native_worker_environment
 
-from .artifact_contract import role_schema
-from .execution import ProcessExit, _execute
-from .model import AgentCall
+from agent_run.contracts.artifact import role_schema
+from agent_run.runtime.execution import ProcessExit, _execute
+from agent_run.model import AgentCall
 
 if TYPE_CHECKING:
-    from .kernel import Kernel
+    from agent_run.core.kernel import Kernel
 
 
 _MAX_FINAL_BYTES = 1024 * 1024
@@ -169,7 +169,8 @@ class _CodexCapture:
                 os.close(descriptor)
             environment = native_worker_environment(self.source_environment, gh, host=False)
         else:
-            from agent_run.github_identity import native_github_environment, validate_identity_snapshot, validate_worker_auth
+            from agent_run.adapters.auth.identity import native_github_environment, validate_worker_auth
+            from agent_run.contracts.identity import validate_identity_snapshot
 
             self.identity = identity = validate_identity_snapshot(self.identity)
             repository = self.call.context["repository"]
@@ -179,10 +180,10 @@ class _CodexCapture:
                 host = self.source_environment.get("GH_HOST", "").strip()
                 if host and host.casefold() != "github.com":
                     raise WorkerSandboxError("Worker GitHub read host is not authorized")
-                from agent_run.git_output import git_environment
-                from agent_run.github_auth import _GitHubAppCredentialProvider
-                from agent_run.github_auth_profile import GitHubAppProfile
-                from agent_run.worker_credentials import NativeCredentialDelivery
+                from agent_run.runtime.git_command import git_environment
+                from agent_run.adapters.auth.app import _GitHubAppCredentialProvider
+                from agent_run.config.github_app import GitHubAppProfile
+                from agent_run.adapters.auth.worker_credentials import NativeCredentialDelivery
 
                 app = identity["app_profile"]
                 provider = _GitHubAppCredentialProvider(
@@ -221,7 +222,7 @@ class _CodexCapture:
             self.diagnostic = {"source": "host-cancellation", "error_type": "InterruptedError"}
             raise InterruptedError("Host execution cancelled")
         if self.credential_exhausted.is_set():
-            from agent_run.credential_lifecycle import WorkerCredentialError
+            from agent_run.adapters.auth.credential_lifecycle import WorkerCredentialError
 
             self.failure_kind = "fatal"
             self.diagnostic = {"source": "worker-credentials", "error_type": "CredentialExhausted"}

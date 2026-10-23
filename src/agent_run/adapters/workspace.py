@@ -14,12 +14,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from agent_run._process_io import TailOutput, pump
-from agent_run.messages import error_message
-from agent_run.git_errors import GitError
-from agent_run.git_output import git_environment, run_git
-from agent_run.paths import app_data_root
-from agent_run.process_cleanup import terminate_process_group
+from agent_run.runtime.process_io import TailOutput, pump
+from agent_run.errors import error_message
+from agent_run.errors import GitError
+from agent_run.runtime.git_command import git_environment, run_git
+from agent_run.config.paths import app_data_root
+from agent_run.runtime.process_cleanup import terminate_process_group
 
 _MARKER = ".agent-run-workspace.json"
 _CLONE_TIMEOUT_SECONDS = 15 * 60
@@ -223,7 +223,7 @@ def _command(
     arguments: list[str], cwd: Path, *, timeout: float = 30,
     runner_identity: Mapping[str, Any] | None = None,
 ) -> str:
-    from agent_run.runner_transport import runner_git_environment
+    from agent_run.adapters.auth.runner_transport import runner_git_environment
 
     environment = runner_git_environment(runner_identity, cwd=cwd) if runner_identity else git_environment()
     environment["GIT_TERMINAL_PROMPT"] = "0"

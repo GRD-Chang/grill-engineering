@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-from .process_cleanup import child_subreaper, terminate_process_group
+from agent_run.runtime.process_cleanup import child_subreaper, terminate_process_group
 
 
 def main() -> int:

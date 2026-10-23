@@ -15,15 +15,15 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable
 
-from agent_run.credential_lifecycle import (
+from agent_run.adapters.auth.credential_lifecycle import (
     ReadCredential,
     WORKER_CREDENTIAL_PROVIDER_OPERATION_TIMEOUT_SECONDS,
     safe_http_status,
 )
-from agent_run.process_cleanup import (
+from agent_run.runtime.process_cleanup import (
     terminate_process_group,
 )
-from agent_run.github_auth_profile import (
+from agent_run.config.github_app import (
     GitHubAppProfile, GitHubAppProfileStore, GitHubAuthProfileError,
 )
 

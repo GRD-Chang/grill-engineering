@@ -6,8 +6,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, TypedDict
 
-from agent_run.runner_credentials import runner_credential_environment
-from agent_run.git_errors import GitError
+from agent_run.adapters.auth.runner_credentials import runner_credential_environment
+from agent_run.errors import GitError
 
 
 class RunnerOptions(TypedDict, total=False):
@@ -19,7 +19,7 @@ def runner_options(identity: Mapping[str, Any] | None) -> RunnerOptions:
 
 
 def runner_environment(identity: Mapping[str, Any] | None) -> dict[str, str]:
-    from agent_run.git_output import git_environment
+    from agent_run.runtime.git_command import git_environment
 
     return runner_credential_environment(identity or {"source": "host"}, git_environment())
 
@@ -39,7 +39,7 @@ def runner_git_environment(
     # URL-scoped local entries can outrank generic resets. Reset every such
     # authentication key before installing the selected helper. This is a
     # bounded local query and does not consume Runner credentials recursively.
-    from agent_run.git_output import run_git
+    from agent_run.runtime.git_command import run_git
 
     local_config = run_git([
         "git", "config", "--local", "--includes", "--null", "--get-regexp",
