@@ -7,7 +7,7 @@ returned request. A raw return and its business consumption commit separately.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, replace
 from datetime import datetime
 import hashlib
 import json
@@ -35,43 +35,13 @@ from .configuration import checkpoint_policy
 from .task_location import bind_task, read_task
 from .legacy_admission import locked_admission
 from .operation_contract import (OperationBinding, OperationState, ReadUnavailable, ReadFence,
-                                 RequirementsRead, DeliveryObservation, DeliveryRead, DeliveryFacts)
+                                 RequirementsRead, DeliveryObservation, DeliveryRead, DeliveryFacts,
+                                 _SentRead, _ApprovalRead, _ObservationPass, Work, PrepareIO, EffectIO, ObserveIO, IORequest, IOResult)
 
 
 def identity() -> str:
     return uuid4().hex
 
-
-@dataclass(frozen=True)
-class _SentRead:
-    effect_id: str
-    dispatch_serial: int
-    subject: str
-    generation: int
-
-@dataclass(frozen=True)
-class _ApprovalRead:
-    subject: str
-    generation: int
-    boundary: tuple[str | int | None, ...]
-
-@dataclass
-class _ObservationPass:
-    execution: Execution
-    action_id: str
-    pending: list[_SentRead | _ApprovalRead]
-    lock: RLock = field(default_factory=RLock, repr=False)
-
-    def complete(self, member: _SentRead | _ApprovalRead) -> None:
-        with self.lock:
-            if member in self.pending:
-                self.pending.remove(member)
-
-    def defer(self, member: _SentRead | _ApprovalRead) -> None:
-        with self.lock:
-            if member in self.pending:
-                self.pending.remove(member)
-                self.pending.append(member)
 
 class Kernel:
     CLEANUP = ("cleanup_worktree", "cleanup_local_ref", "cleanup_remote_ref")
@@ -80,6 +50,8 @@ class Kernel:
     def __init__(self, path: Path) -> None:
         self.storage = Storage(path)
         self.clock: Callable[[], float] = time.time
+        self._observation: _ObservationPass | None = None
+        self._observation_lock = RLock()
 
     def operation_binding(self, execution: Execution | None = None) -> OperationBinding:
         """Frozen physical configuration; no source refresh or work admission."""
@@ -221,9 +193,11 @@ class Kernel:
             raise KernelError("managed_observation_required")
         return rows[0]
 
-    def _activate_observation(self, execution: Execution) -> _ObservationPass:
-        with self.storage.transaction(write=False) as tx:
+    def activate_observation(self, execution: Execution) -> _ObservationPass:
+        with self._observation_lock, self.storage.transaction(write=False) as tx:
             host = self._observation_host(tx, execution)
+            if self._observation is not None and (self._observation.execution, self._observation.action_id) == (execution, host["action_id"]):
+                return self._observation
             run = tx.one("SELECT * FROM runs")
             pending: list[_SentRead | _ApprovalRead] = [_SentRead(row["id"], row["attempts"], row["subject"], row["generation"])
                 for row in tx.all("SELECT id,attempts,subject,generation FROM effects WHERE status='sent' AND operation!='issue_link' ORDER BY rowid")]
@@ -231,7 +205,8 @@ class Kernel:
                 pending.extend(_ApprovalRead(job["id"], job["generation"], self._approval_boundary(run, job))
                     for job in tx.all("SELECT * FROM subjects WHERE kind!='ticket' AND phase='approval'")
                     if not job["validation_cleanup"] and not self._gates(tx, job["id"]) and self._pending_effect(tx, job["id"]) is None)
-            return _ObservationPass(execution, host["action_id"], pending)
+            self._observation = _ObservationPass(execution, host["action_id"], pending)
+            return self._observation
 
     def _observation_member(self, tx: Transaction, run: sqlite3.Row, observation: _ObservationPass | None,
                             subject: str | None = None) -> _SentRead | _ApprovalRead | None:
@@ -350,16 +325,16 @@ class Kernel:
         return None
 
     def _operation_choice(self, tx: Transaction, run: sqlite3.Row, *, agent_capacity: int = 1,
-                          poll_manual: bool = False, observation: _ObservationPass | None = None) -> tuple[str | None, bool] | None:
+                          poll_manual: bool = False, observation: _ObservationPass | None = None) -> tuple[str | None, bool, _SentRead | _ApprovalRead | None] | None:
         member = self._observation_member(tx, run, observation)
         if member is not None:
-            return member.subject, False
+            return member.subject, False, member
         agent_capacity = min(agent_capacity, max(0, run["concurrency"] - tx.one("SELECT count(*) FROM leases")[0]))
         abandoned = self._abandon_action(tx)
         if abandoned is not None:
             if self._abandon_wait(tx, abandoned) is not None:
                 return None
-            return tx.one("SELECT id FROM subjects ORDER BY rowid LIMIT 1")[0], False
+            return tx.one("SELECT id FROM subjects ORDER BY rowid LIMIT 1")[0], False, None
         order = [row[0] for table in ("work_queue", "integration_queue") for row in tx.all(f"SELECT subject FROM {table} ORDER BY ready")]
         order.extend(row[0] for row in tx.all("SELECT id FROM subjects ORDER BY rowid"))
         manual_poll = None
@@ -384,14 +359,14 @@ class Kernel:
                 # Like approval, an explicit poll can settle a late result;
                 # a manual gate does not advertise endless background work.
                 if poll_manual and manual_poll is None:
-                    manual_poll = (subject, cleanup)
+                    manual_poll = (subject, cleanup, None)
                 continue
             if (job["phase"] == "approval" and not job["validation_cleanup"] and job["refresh_revision"] is None
                     and not self._pending_effect(tx, subject) and self._pending_requeue(tx, subject) is None):
                 # An explicit operation call may poll the manual boundary once.
                 # Passive supervision must not advertise perpetual background work.
                 if poll_manual and manual_poll is None:
-                    manual_poll = (subject, False)
+                    manual_poll = (subject, False, None)
                 continue
             if not agent_capacity and job["phase"] in {"development", "review", "publish"} and not self._pending_effect(tx, subject):
                 # A ready return may still perform program work without a slot.
@@ -399,13 +374,13 @@ class Kernel:
                         not job["current_attempt"] or not tx.one("SELECT result_id FROM attempts WHERE id=?", (job["current_attempt"],))[0]) and tx.rows(
                         "SELECT subject FROM work_queue WHERE subject=?", (subject,)):
                     continue
-            return subject, cleanup
+            return subject, cleanup, None
         tickets = tx.all("SELECT * FROM subjects WHERE kind='ticket' ORDER BY issue")
         if (not run["stopped"] and not run["blocked"] and tickets
                 and tx.rows("SELECT id FROM final_target WHERE id NOT IN (SELECT id FROM subjects WHERE kind='final_run')")
                 and all(self._completion(tx, job) is not None for job in tickets)
                 and self._operation_wait(tx, run, None, False) is None):
-            return None, False
+            return None, False, None
         return manual_poll
 
     def _operation_wait(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool) -> float | None:
@@ -452,8 +427,185 @@ class Kernel:
                 return Step("paused", subject, error.code)
         return None
 
-    def operation_state(self) -> OperationState:
-        return self._operation_state()
+    def operation_state(self, observation: _ObservationPass | None = None) -> OperationState:
+        return self._operation_state(observation)
+
+    def next_work(self, execution: Execution, *, agent_capacity: int = 1,
+                  observation: _ObservationPass | None = None) -> Step | IORequest:
+        if observation is not None and observation.execution != execution:
+            raise KernelError("observation_binding")
+        with self.storage.transaction(write=False) as tx:
+            run = tx.one("SELECT * FROM runs")
+            try:
+                self._automatic_owned(tx, run, execution)
+            except KernelError as error:
+                if error.code != "executor_fenced":
+                    raise
+                return Step("paused", "", error.code)
+            choice = self._operation_choice(tx, run, agent_capacity=agent_capacity,
+                                            poll_manual=observation is None, observation=observation)
+            if choice is None:
+                state = self._operation_state(observation)
+                return Step(state.disposition, "", retry_at=state.wake_at)
+            subject, cleanup, member = choice
+            work = Work(execution, self._operation_token(tx, subject, cleanup), subject,
+                        cleanup, bool(agent_capacity), observation, member)
+            original = (self._effect(tx, tx.one("SELECT * FROM effects WHERE id=?", (member.effect_id,)), execution)
+                        if isinstance(member, _SentRead) else None)
+        try:
+            if original is not None:
+                waiting = self._guard_automatic_step(work.token, execution, readback=original)
+                if waiting is not None:
+                    raise ReadWait(waiting)
+                return EffectIO(work, original, "readback", work.token)
+            return self._advance_work(work)
+        except (ReadWait, ReadUnavailable, KernelError) as error:
+            return self.fail_work(work, error)
+
+    def _advance_work(self, work: Work, world: World | None = None, fence: ReadFence | None = None) -> Step | IORequest:
+        if work.subject is None:
+            if world is None:
+                return ObserveIO(work, self.begin_observation(None, execution=work.execution))
+            if world.source is None or world.target is None:
+                raise ReadUnavailable("final_source_missing", "The original remote Final refs are absent")
+            assert fence is not None
+            final = self._activate_final(work.execution, world.source, world.target, ancestry=world.ancestry, token=fence)
+            return self._complete_work(work, Step("progress", final, "final_activated"))
+        token = work.token if fence is None else fence
+        step = (self._advance_cleanup(work.subject, work.execution, world, token=token) if work.cleanup else
+                self._advance(work.subject, work.execution, world, allow_agent=work.allow_agent, token=token))
+        if world is None and step.kind == "observe":
+            work = replace(work, subject=step.subject)
+            return ObserveIO(work, self.begin_observation(step.subject, execution=work.execution, cleanup=work.cleanup))
+        if step.call is not None:
+            return step  # No later I/O or completion after allocating an AgentCall.
+        if step.effect is not None:
+            return self._effect_request(work, step.effect, reconcile=step.kind == "reconcile")
+        return self._complete_work(work, step)
+
+    def _effect_request(self, work: Work, effect: Effect, *, reconcile: bool = False) -> PrepareIO | EffectIO:
+        token = self._begin_automatic_step(work.execution, effect.subject)
+        if reconcile:
+            with self.storage.transaction(write=False) as tx:
+                sent = tx.one("SELECT status FROM effects WHERE id=?", (effect.effect_id,))[0] == "sent"
+            waiting = self._guard_automatic_step(token, work.execution, readback=effect if sent else None)
+            if waiting is not None:
+                raise ReadWait(waiting)
+            return EffectIO(work, effect, "readback", token)
+        if effect.operation == "publication_commit" and not effect.payload.get("reuse_sha") and not effect.payload.get("publication_commit_intent"):
+            return PrepareIO(work, effect, "publication", token)
+        if effect.operation == "retire_pr" and not effect.payload.get("retirement_intent"):
+            return PrepareIO(work, effect, "retirement", token)
+        return EffectIO(work, effect, "execute", token)
+
+    def _record_readback(self, effect: Effect, result: EffectResult) -> None:
+        with self.storage.transaction() as tx:
+            row = tx.one("SELECT * FROM effects WHERE id=?", (effect.effect_id,))
+            if self._effect(tx, row, effect.execution) != effect:
+                raise KernelError("effect_binding")
+            evidence = tx.put(effect.subject, "effect_readback", wire_json({"dispatch_serial": effect.dispatch_serial, "result": asdict(result)}))
+            self._event(tx, effect.subject, "effect_readback", effect.effect_id, evidence, generation=row["generation"])
+
+    def accept_work(self, request: IORequest, result: IOResult) -> Step | IORequest:
+        work = request.work
+        if isinstance(request, EffectIO) and isinstance(result, EffectResult):
+            returncode = result.raw.get("write_returncode")
+            if type(returncode) is int and returncode != 0:
+                from agent_run.error_safety import bounded_error
+                self.observe_effect_failure(request.effect, {"returncode": returncode,
+                    "message": bounded_error(str(result.raw.get("write_diagnostic", "")))})
+            if request.kind == "readback" or request.effect.operation != "issue_link":
+                self._record_readback(request.effect, result)
+        with self.storage.transaction(write=False) as tx:
+            self._automatic_owned(tx, tx.one("SELECT * FROM runs"), work.execution)
+        if isinstance(request, ObserveIO):
+            if not isinstance(result, tuple):
+                raise KernelError("observation_binding")
+            world, fence = result
+            if (fence.execution, fence.subject, fence.cleanup) != (
+                    work.execution, request.request.fence.subject, request.request.fence.cleanup):
+                raise KernelError("observation_binding")
+            if request.after is None:
+                work = replace(work, approval_observed=isinstance(work.member, _ApprovalRead))
+                return self._advance_work(work, world, fence)
+            prior = request.after
+            if isinstance(prior, PrepareIO):
+                if not isinstance(request.result, Mapping):
+                    raise KernelError("effect_binding")
+                effect = (self.attach_publication_commit(prior.effect, request.result, work.execution, world)
+                          if prior.kind == "publication" else self.attach_retirement(prior.effect, request.result, work.execution, world))
+                return EffectIO(work, effect, "execute", prior.token)
+            if not isinstance(request.result, EffectResult):
+                raise KernelError("effect_binding")
+            step = self._reconcile(prior.effect, request.result, work.execution, world, token=fence)
+            return self._complete_work(work, step)
+        if isinstance(request, PrepareIO):
+            if not isinstance(result, Mapping):
+                raise KernelError("effect_binding")
+            return ObserveIO(work, self.begin_observation(request.effect.subject, execution=work.execution), request, result)
+        if not isinstance(result, EffectResult):
+            raise KernelError("effect_binding")
+        effect = request.effect
+        if effect.operation == "issue_link" and request.kind == "execute":
+            self.acknowledge_link(effect, result)
+            return self._complete_work(work, Step("progress", effect.subject))
+        waiting = self._finish_operation_read(request.token, work.execution)
+        if waiting is not None:
+            raise ReadWait(waiting)
+        if isinstance(work.member, _SentRead) and result.disposition not in {"target", "unknown", "third"}:
+            assert work.observation is not None
+            work.observation.defer(work.member)
+            return self._wait_for_read(request.token, work.execution, "original_write_readback_pending",
+                "The original sent request has no final readback yet", readback=effect)
+        step = self._reconcile(effect, result, work.execution)
+        if step.kind == "observe":
+            return ObserveIO(work, self.begin_observation(effect.subject, execution=work.execution), request, result)
+        return self._complete_work(work, step)
+
+    def _complete_work(self, work: Work, step: Step) -> Step:
+        step = self._finish_automatic_step(work.token, work.execution, step)
+        if (isinstance(work.member, _SentRead) or work.approval_observed) and work.observation is not None and work.member is not None:
+            work.observation.complete(work.member)
+        return step
+
+    def fail_work(self, work: Work, error: ReadWait | ReadUnavailable | KernelError | OSError, *, request: IORequest | None = None) -> Step:
+        from agent_run.error_safety import bounded_error
+        if isinstance(request, EffectIO) and request.kind == "execute":
+            if isinstance(error, ReadUnavailable) and error.write_returncode not in (None, 0):
+                self.observe_effect_failure(request.effect, {"returncode": error.write_returncode,
+                    "message": bounded_error(error.write_diagnostic)})
+            if isinstance(error, OSError):
+                with self.storage.transaction(write=False) as tx:
+                    sent = tx.one("SELECT status FROM effects WHERE id=?", (request.effect.effect_id,))[0] == "sent"
+                if not sent:
+                    raise error
+                self.observe_effect_failure(request.effect, {"type": type(error).__name__, "message": bounded_error(str(error))})
+        elif isinstance(error, OSError):
+            raise error
+        with self.storage.transaction(write=False) as tx:
+            try:
+                self._automatic_owned(tx, tx.one("SELECT * FROM runs"), work.execution)
+            except KernelError as fenced:
+                if fenced.code != "executor_fenced":
+                    raise
+                return Step("paused", work.subject or "", fenced.code)
+        if isinstance(error, KernelError) and not isinstance(error, ReadWait) and error.code not in {
+                "automatic_step_superseded", "automatic_step_paused", "executor_fenced"}:
+            raise error
+        if work.observation is not None and work.member is not None:
+            work.observation.defer(work.member)
+        original = request.effect if isinstance(request, EffectIO) and isinstance(work.member, _SentRead) else None
+        if isinstance(error, ReadWait):
+            return error.step
+        if isinstance(error, ReadUnavailable):
+            token = request.token if isinstance(request, EffectIO) else work.token
+            return self._wait_for_read(token, work.execution, error.code, error.message, readback=original)
+        if isinstance(error, OSError):
+            assert isinstance(request, EffectIO)
+            return self._complete_work(work, Step("waiting", request.effect.subject, "original_write_readback_required"))
+        if work.member is not None and error.code == "automatic_step_superseded":
+            return self._wait_for_read(work.token, work.execution, error.code, str(error), readback=original)
+        return Step("waiting" if error.code == "automatic_step_superseded" else "paused", work.subject or "", error.code)
 
     def _operation_state(self, observation: _ObservationPass | None = None) -> OperationState:
         with self.storage.transaction(write=False) as tx:

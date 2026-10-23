@@ -1,12 +1,13 @@
 """Immutable physical read contracts; no SQL, scheduling or write authority."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from threading import RLock
 from typing import Any, Callable, Literal, Mapping, Protocol
 
 from .model import (Checks, Commit, CreationInputs, Effect, EffectResult, Execution,
-                    PullRequest, Requirements, ResourceInspection, ResourceWitness)
+                    PullRequest, Requirements, ResourceInspection, ResourceWitness, World)
 
 class ReadUnavailable(RuntimeError):
     """Port read failure; optional fields are an actual write response only."""
@@ -88,3 +89,74 @@ class RequirementsRead:
 class DeliveryObservation:
     fence: ReadFence
     query: DeliveryRead
+
+
+@dataclass(frozen=True)
+class _SentRead:
+    effect_id: str
+    dispatch_serial: int
+    subject: str
+    generation: int
+
+@dataclass(frozen=True)
+class _ApprovalRead:
+    subject: str
+    generation: int
+    boundary: tuple[str | int | None, ...]
+
+@dataclass
+class _ObservationPass:
+    execution: Execution
+    action_id: str
+    pending: list[_SentRead | _ApprovalRead]
+    lock: RLock = field(default_factory=RLock, repr=False)
+
+    def complete(self, member: _SentRead | _ApprovalRead) -> None:
+        with self.lock:
+            if member in self.pending:
+                self.pending.remove(member)
+
+    def defer(self, member: _SentRead | _ApprovalRead) -> None:
+        with self.lock:
+            if member in self.pending:
+                self.pending.remove(member)
+                self.pending.append(member)
+
+@dataclass(frozen=True)
+class Work:
+    execution: Execution
+    token: str
+    subject: str | None
+    cleanup: bool
+    allow_agent: bool
+    observation: _ObservationPass | None
+    member: _SentRead | _ApprovalRead | None
+    approval_observed: bool = False
+
+
+@dataclass(frozen=True)
+class PrepareIO:
+    work: Work
+    effect: Effect
+    kind: Literal["publication", "retirement"]
+    token: str
+
+
+@dataclass(frozen=True)
+class EffectIO:
+    work: Work
+    effect: Effect
+    kind: Literal["execute", "readback"]
+    token: str
+
+
+@dataclass(frozen=True)
+class ObserveIO:
+    work: Work
+    request: RequirementsRead
+    after: PrepareIO | EffectIO | None = None
+    result: Mapping[str, Any] | EffectResult | None = None
+
+
+IORequest = ObserveIO | PrepareIO | EffectIO
+IOResult = tuple[World, ReadFence] | Mapping[str, Any] | EffectResult
