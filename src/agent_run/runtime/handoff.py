@@ -50,6 +50,25 @@ class HostEnvironment:
     receipt: dict[str, Any]
 
 
+@contextmanager
+def handoff_scope(
+    request: HostLaunch, environment: Mapping[str, str], *, runner_lock: Path,
+    terminal_lease: RunnerLease,
+) -> Iterator[Handoff]:
+    """The creator reaps its one child on normal return and caller failure."""
+    handoff = prepare_handoff(request, environment, runner_lock=runner_lock, terminal_lease=terminal_lease)
+    try:
+        yield handoff
+    finally:
+        # The original startup deadline is never extended or cut short. Three
+        # seconds only bound exit/reaping after that deadline, not a new grant.
+        remaining = max(0, handoff.receipt["deadline"] - time.monotonic())
+        try:
+            handoff.process.wait(timeout=remaining + 3)
+        except subprocess.TimeoutExpired as error:
+            raise HandoffError("Guardian exit was not proven after its sealed deadline") from error
+
+
 def launch_handoff(kernel: Kernel, action_id: str, manager: SystemdHost, handoff: Handoff, *,
                    exit_properties: tuple[str, ...] = ()) -> HostObservation | None:
     """Persist the original guardian receipt before the sole authorized launch."""
@@ -362,14 +381,34 @@ def _guardian_exited(receipt: Mapping[str, Any]) -> bool:
         return False
     try:
         # Unlike a generic token-read failure, ENOENT in the original namespace
-        # proves this original process is gone. A matching zombie stays unknown.
+        # proves this original process is gone.
         Path(f"/proc/{guardian['pid']}/stat").read_bytes()
     except FileNotFoundError:
         return True
     except OSError:
         return False
     token = _start_token(guardian["pid"])
-    return token is not None and token != guardian["start_token"]
+    if token is None or token != guardian["start_token"]:
+        return token is not None
+    try:
+        descriptor = os.pidfd_open(guardian["pid"])
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    try:
+        # Bind the stable descriptor to the receipt, across pidfd_open's race.
+        # Readiness proves process exit even before its parent reaps it; this
+        # observer neither waits for nor reaps another creator's child.
+        if _start_token(guardian["pid"]) != guardian["start_token"]:
+            return False
+        observer = select.poll()
+        observer.register(descriptor, select.POLLIN)
+        return any(events & select.POLLIN for _, events in observer.poll(0))
+    except OSError:
+        return False
+    finally:
+        os.close(descriptor)
 
 
 def reconcile_handoff(kernel: Kernel, action_id: str, manager: SystemdHost) -> HostObservation:

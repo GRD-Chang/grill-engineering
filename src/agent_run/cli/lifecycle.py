@@ -125,7 +125,7 @@ def submit(kernel: Kernel, kind: str, *, action_id: str, command: tuple[str, ...
     Unknown launch remains unknown; no foreground executor or retry is started.
     """
     from agent_run.runtime.package_lease import runner_usage_lease
-    from agent_run.runtime.handoff import prepare_handoff, launch_handoff
+    from agent_run.runtime.handoff import handoff_scope, launch_handoff
     with runner_usage_lease(runner_lock) as terminal:
         manager.preflight()  # Before creating a carrier directory or accepting Action.
         directory = _runtime_directory(action_id, environment)
@@ -138,8 +138,8 @@ def submit(kernel: Kernel, kind: str, *, action_id: str, command: tuple[str, ...
                                     continuation_of=continuation_of)
         from agent_run.cli.host_exit import exit_properties
         properties = exit_properties(kernel.storage.path, action_id, request, runner_lock, environment)
-        handoff = prepare_handoff(request, environment, runner_lock=runner_lock, terminal_lease=terminal)
-        observed = launch_handoff(kernel, action_id, manager, handoff, exit_properties=properties)
+        with handoff_scope(request, environment, runner_lock=runner_lock, terminal_lease=terminal) as handoff:
+            observed = launch_handoff(kernel, action_id, manager, handoff, exit_properties=properties)
         with kernel.storage.transaction(write=False) as tx:
             action_status = tx.one("SELECT status FROM actions WHERE id=?", (action_id,))[0]
         return {"result": "accepted", "status": "action_" + action_status, "run_id": request.run_id,
@@ -157,7 +157,7 @@ def attach(kernel: Kernel, *, requested_action: str, manager: SystemdHost,
     claim is never converted into permission to prepare another handoff or start.
     """
     from agent_run.runtime.package_lease import runner_usage_lease
-    from agent_run.runtime.handoff import prepare_handoff, launch_handoff, reconcile_handoff
+    from agent_run.runtime.handoff import handoff_scope, launch_handoff, reconcile_handoff
     with runner_usage_lease(runner_lock) as terminal:
         action_id = kernel.active_host_action()
         if action_id is None:
@@ -170,8 +170,8 @@ def attach(kernel: Kernel, *, requested_action: str, manager: SystemdHost,
         else:
             from agent_run.cli.host_exit import exit_properties
             properties = exit_properties(kernel.storage.path, action_id, request, runner_lock, environment)
-            handoff = prepare_handoff(request, environment, runner_lock=runner_lock, terminal_lease=terminal)
-            observed = launch_handoff(kernel, action_id, manager, handoff, exit_properties=properties)
+            with handoff_scope(request, environment, runner_lock=runner_lock, terminal_lease=terminal) as handoff:
+                observed = launch_handoff(kernel, action_id, manager, handoff, exit_properties=properties)
         with kernel.storage.transaction(write=False) as tx:
             action = tx.one("SELECT kind,status FROM actions WHERE id=?", (action_id,))
         return {"result": "attached", "status": "action_" + action["status"], "run_id": request.run_id,
