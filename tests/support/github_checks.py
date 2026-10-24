@@ -1,6 +1,9 @@
 """Raw current-rollup responses for the existing isolated gh executables."""
 
 CHECK_ROLLUP_FAKE = r'''
+def fixture_prs(data):
+    return [data['pull_request']] if data.get('pull_request') else data.get('prs', [])
+
 def current_checks(data, fields):
     if data.get('rollup_http'):
         print('HTTP ' + str(data['rollup_http']), file=sys.stderr)
@@ -11,8 +14,20 @@ def current_checks(data, fields):
             print('HTTP ' + str(page['http']), file=sys.stderr)
             raise SystemExit(1)
         return page
-    pr = data.get('pull_request') or data['prs'][0]
+    matches = [pr for pr in fixture_prs(data) if pr['number'] == int(fields['number'])]
+    if len(matches) > 1:
+        raise ValueError('Duplicate fixture PR number')
+    if not matches:
+        return {'data': {'repository': {'pullRequest': None}}}
+    pr = matches[0]
     sha = pr['head']['sha']
+    nodes = fixture_check_nodes(data, sha)
+    return {'data': {'repository': {'pullRequest': {'number': pr['number'],
+        'headRefOid': sha, 'commits': {'nodes': [{'commit': {'oid': sha,
+        'statusCheckRollup': {'contexts': {'nodes': nodes,
+            'pageInfo': {'hasNextPage': False, 'endCursor': None}}}}}]}}}}}
+
+def fixture_check_nodes(data, sha):
     checks = data.get('checks', [])
     nodes = checks
     if isinstance(checks, list):
@@ -28,13 +43,21 @@ def current_checks(data, fields):
                 'checkSuite': {'id': 'suite-current', 'databaseId': 101, 'commit': {'oid': sha},
                     'app': {'databaseId': 1001},
                     'workflowRun': {'workflow': {'name': check.get('workflow', '')}}}})
-    return {'data': {'repository': {'pullRequest': {'number': int(fields['number']),
-        'headRefOid': sha, 'commits': {'nodes': [{'commit': {'oid': sha,
-        'statusCheckRollup': {'contexts': {'nodes': nodes,
-            'pageInfo': {'hasNextPage': False, 'endCursor': None}}}}}]}}}}}
+    return nodes
 '''
 
 LATEST_CHECK_FAKE = r'''
+def fixture_commit_nodes(data, head):
+    if 'rollup_pages' in data:
+        nodes = []
+        for page in data['rollup_pages'].values():
+            if 'data' in page and not page.get('errors'):
+                nodes.extend(page['data']['repository']['pullRequest']['commits']['nodes'][0]['commit']['statusCheckRollup']['contexts']['nodes'])
+        return nodes
+    if any(pr['head']['sha'] == head for pr in fixture_prs(data)):
+        return fixture_check_nodes(data, head)
+    return []
+
 def _latest_check_pages(data, endpoint):
     from urllib.parse import urlsplit, parse_qs
     parsed = urlsplit(endpoint)
@@ -46,15 +69,12 @@ def _latest_check_pages(data, endpoint):
             with open(os.environ['SOURCE_TEST_LOG']) as stream:
                 if sum('/check-suites?' in line for line in stream) > 1: return data['suite_pages_after']
         if 'suite_pages' in data: return data['suite_pages']
-        graph_pages = data.get('rollup_pages') or {'': current_checks(data, {'number':str((data.get('pull_request') or data['prs'][0])['number'])})}
         scope = {}
-        for page in graph_pages.values():
-            if 'data' not in page or page.get('errors'): continue
-            for node in page['data']['repository']['pullRequest']['commits']['nodes'][0]['commit']['statusCheckRollup']['contexts']['nodes']:
-                suite = node.get('checkSuite') or {}
-                if suite.get('databaseId'):
-                    scope[suite['databaseId']] = {'id':suite['databaseId'], 'head_sha':head,
-                                                'app':{'id':(suite.get('app') or {}).get('databaseId')}}
+        for node in fixture_commit_nodes(data, head):
+            suite = node.get('checkSuite') or {}
+            if suite.get('databaseId'):
+                scope[suite['databaseId']] = {'id':suite['databaseId'], 'head_sha':head,
+                                            'app':{'id':(suite.get('app') or {}).get('databaseId')}}
         rows = list(scope.values())
         count = data.get('suite_count', len(rows))
         if 'suite_count_after' in data:
@@ -77,13 +97,7 @@ def _latest_check_pages(data, endpoint):
         app = int(query['app_id'][0])
     nodes = data.get('latest_nodes')
     if nodes is None:
-        pages = data.get('rollup_pages')
-        if pages is None:
-            pages = {'': current_checks(data, {'number': str((data.get('pull_request') or data['prs'][0])['number'])})}
-        nodes = []
-        for page in pages.values():
-            if 'data' in page and not page.get('errors'):
-                nodes.extend(page['data']['repository']['pullRequest']['commits']['nodes'][0]['commit']['statusCheckRollup']['contexts']['nodes'])
+        nodes = fixture_commit_nodes(data, head)
     if parsed.path.endswith('/status'):
         if 'status_pages' in data: return data['status_pages']
         rows = [{'id': index + 1, 'node_id': n['id'], 'context': n['context'], 'state': n['state'].lower()}
