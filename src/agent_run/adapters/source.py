@@ -167,16 +167,134 @@ def _failed_check_evidence(reader: GhGitHubReader, repository: str, checks: list
         evidence.append(check)
     return evidence
 
+def _check_collection(reader: GhGitHubReader, endpoint: str, field: str, head: str) -> list[dict[str, Any]]:
+    import json
+    pages = _array(_json_response(_read(reader, ['api', endpoint, '--paginate', '--slurp'])))
+    if not pages or len(json.dumps(pages).encode()) > MATERIAL_LIMIT:
+        raise GitHubReadError('github_read_limit', 'Latest-check collection is missing or oversized')
+    count = _object(pages[0]).get('total_count')
+    if type(count) is not int or count < 0:
+        raise GitHubReadError('github_invalid_response', 'Latest-check count is missing')
+    rows: list[dict[str, Any]] = []
+    for page in pages:
+        page = _object(page)
+        if page.get('total_count') != count or field == 'statuses' and page.get('sha') != head:
+            raise GitHubReadError('github_read_failed', 'Latest-check collection changed during pagination')
+        rows.extend(_object(row) for row in _array(page.get(field)))
+    if len(rows) != count:
+        raise GitHubReadError('github_read_failed', 'Latest-check pagination is incomplete')
+    return rows
+
+
+def _latest_checks(reader: GhGitHubReader, repository: str, head: str,
+                   checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Filter rollup members using server latest views, never client ID/time order.
+
+    The ref check-runs API only covers 1000 suites. Inspect its count before and
+    after; above that bound we refuse instead of scanning unbounded history.
+    """
+    from urllib.parse import urlencode
+    import json
+    prefix = f'repos/{repository}/commits/{head}'
+    runs = [row for row in checks if row['kind'] == 'CheckRun']
+    result: list[dict[str, Any]] = []
+
+    def suite_count() -> int:
+        page = _object(_json_response(_read(reader, ['api', prefix + '/check-suites?per_page=1'])))
+        count = page.get('total_count')
+        if type(count) is not int or not 0 < count <= 1000:
+            raise GitHubReadError('github_check_currentness_unproven', 'Latest-check suite coverage cannot be proven within 1000 suites')
+        sample = _array(page.get('check_suites'))
+        if len(sample) != 1 or _object(sample[0]).get('head_sha') != head:
+            raise GitHubReadError('github_check_currentness_unproven', 'Suite coverage has no exact head witness')
+        return count
+
+    before = suite_count() if runs else None
+    for app in sorted({row['app_id'] for row in runs}):
+        group = [row for row in runs if row['app_id'] == app]
+        by_id = {}
+        for row in group:
+            original = row['original']
+            run_id, suite_id = original.get('databaseId'), original['checkSuite'].get('databaseId')
+            if type(run_id) is not int or run_id <= 0 or type(suite_id) is not int or suite_id <= 0:
+                raise GitHubReadError('github_invalid_response', 'Required check has no exact REST run/suite identity')
+            if run_id in by_id:
+                raise GitHubReadError('github_check_currentness_unproven', 'Rollup has conflicting run identities')
+            by_id[run_id] = row
+        endpoint = prefix + '/check-runs?' + urlencode({'filter': 'latest', 'app_id': app, 'per_page': 100})
+        latest = _check_collection(reader, endpoint, 'check_runs', head)
+        names: set[str] = set()
+        matched: set[str] = set()
+        for run in latest:
+            if run.get('head_sha') != head or _object(run.get('app')).get('id') != app:
+                raise GitHubReadError('github_invalid_response', 'Latest check has another App or head')
+            name = _text(run.get('name'))
+            if name not in {row['name'] for row in group}:
+                continue
+            if name in names:
+                raise GitHubReadError('github_check_currentness_unproven', 'Server latest view has ambiguous same-App contexts')
+            names.add(name)
+            run_id = run.get('id')
+            original = by_id.get(run_id) if type(run_id) is int else None
+            if (original is None or original['name'] != name
+                    or _object(run.get('check_suite')).get('id') != original['original']['checkSuite']['databaseId']):
+                raise GitHubReadError('github_check_currentness_unproven', 'Latest check is not an exactly observed required member')
+            state, bucket = _check_state(_text(run.get('status')).upper(), run.get('conclusion'))
+            result.append({**original, 'state': state, 'bucket': bucket, 'latest': run})
+            matched.add(name)
+        if len(json.dumps(result).encode()) > MATERIAL_LIMIT:
+            raise GitHubReadError('github_read_limit', 'Latest-check evidence exceeds the material limit')
+        if matched != {row['name'] for row in group}:
+            raise GitHubReadError('github_check_currentness_unproven', 'Latest view is missing an observed required context')
+    if runs and suite_count() != before:
+        raise GitHubReadError('github_check_currentness_unproven', 'Check suites changed during observation')
+    statuses = [row for row in checks if row['kind'] == 'StatusContext']
+    if statuses:
+        by_node = {row['original']['id']: row for row in statuses}
+        latest = _check_collection(reader, prefix + '/status?per_page=100', 'statuses', head)
+        seen: set[str] = set()
+        for status in latest:
+            name = _text(status.get('context'))
+            if name not in {row['name'] for row in statuses}:
+                continue
+            if name in seen:
+                raise GitHubReadError('github_check_currentness_unproven', 'Combined status has duplicate current contexts')
+            original = by_node.get(status.get('node_id'))
+            if original is None or original['name'] != name:
+                raise GitHubReadError('github_check_currentness_unproven', 'Latest status is not an observed required member')
+            state = _text(status.get('state')).upper()
+            bucket = {'SUCCESS': 'pass', 'FAILURE': 'fail', 'ERROR': 'fail', 'PENDING': 'pending'}.get(state, 'unknown')
+            result.append({**original, 'state': state, 'bucket': bucket, 'latest': status})
+            seen.add(name)
+        if seen != {row['name'] for row in statuses}:
+            raise GitHubReadError('github_check_currentness_unproven', 'Latest status collection is incomplete')
+    if len(json.dumps(result).encode()) > MATERIAL_LIMIT:
+        raise GitHubReadError('github_read_limit', 'Latest-check evidence exceeds the material limit')
+    # Preserve rollup presentation order only after server-side selection.
+    selected = {row['original']['id']: row for row in result}
+    return [selected[row['original']['id']] for row in checks if row['original']['id'] in selected]
+
+
+def _check_state(status: str, conclusion: Any) -> tuple[str, str]:
+    state = str(conclusion).upper() if status == 'COMPLETED' else status
+    bucket = {'SUCCESS': 'pass', 'NEUTRAL': 'pass', 'SKIPPED': 'pass',
+              'FAILURE': 'fail', 'TIMED_OUT': 'fail', 'CANCELLED': 'fail',
+              'ACTION_REQUIRED': 'fail', 'STARTUP_FAILURE': 'fail',
+              'QUEUED': 'pending', 'IN_PROGRESS': 'pending', 'WAITING': 'pending',
+              'REQUESTED': 'pending', 'PENDING': 'pending'}.get(state, 'unknown')
+    return state, bucket
+
+
 def _rollup_checks(reader: GhGitHubReader, number: int, head: str) -> list[dict[str, Any]]:
-    # Same PR/latest-commit rollup as gh pr checks, with identities retained.
-    # GitHub owns rerun selection. Never choose a run by numeric ID or time.
+    # Rollup supplies required applicability and identity, not rerun ordering.
+    # The server latest endpoints below determine current members.
     query = '''query CurrentRequiredChecks($owner:String!,$repo:String!,$number:Int!,$cursor:String) {
       repository(owner:$owner,name:$repo) { pullRequest(number:$number) {
         number headRefOid commits(last:1) { nodes { commit { oid statusCheckRollup {
           contexts(first:100,after:$cursor) { nodes { __typename
             ... on CheckRun { id databaseId name status conclusion detailsUrl title
               isRequired(pullRequestNumber:$number)
-              checkSuite { id commit { oid } app { databaseId }
+              checkSuite { id databaseId commit { oid } app { databaseId }
                 workflowRun { workflow { name } } } }
             ... on StatusContext { id context state targetUrl description
               isRequired(pullRequestNumber:$number) }
@@ -239,18 +357,13 @@ def _rollup_checks(reader: GhGitHubReader, number: int, head: str) -> list[dict[
                 if _object(suite.get('commit')).get('oid') != head:
                     raise GitHubReadError('change_pr_head_drift', 'Required check suite refers to another head')
                 status = _text(node.get('status'))
-                state = node.get('conclusion') if status == 'COMPLETED' else status
-                bucket = ({'SUCCESS': 'pass', 'NEUTRAL': 'pass', 'SKIPPED': 'pass',
-                           'FAILURE': 'fail', 'TIMED_OUT': 'fail', 'CANCELLED': 'fail',
-                           'ACTION_REQUIRED': 'fail', 'STARTUP_FAILURE': 'fail',
-                           'QUEUED': 'pending', 'IN_PROGRESS': 'pending', 'WAITING': 'pending',
-                           'REQUESTED': 'pending', 'PENDING': 'pending'}.get(str(state), 'unknown'))
+                state, bucket = _check_state(status, node.get('conclusion'))
                 workflow_run = suite.get('workflowRun')
                 workflow = '' if workflow_run is None else _text(_object(_object(workflow_run).get('workflow')).get('name'))
                 name, link = node.get('name'), node.get('detailsUrl')
             elif kind == 'StatusContext':
                 app, workflow = None, ''
-                name, state, link = node.get('context'), node.get('state'), node.get('targetUrl')
+                name, state, link = node.get('context'), _text(node.get('state')), node.get('targetUrl')
                 bucket = {'SUCCESS': 'pass', 'FAILURE': 'fail', 'ERROR': 'fail', 'PENDING': 'pending', 'EXPECTED': 'pending'}.get(str(state), 'unknown')
             else:
                 raise GitHubReadError('github_invalid_response', 'Unknown required-check member type')
@@ -285,7 +398,8 @@ def read_required_check_facts(reader: GhGitHubReader, pr_number: int, *, expecte
         raise GitHubReadError('change_pr_head_drift', 'Required checks refer to another PR head')
     metadata = reader.repository()
     repository = metadata.name_with_owner
-    checks = _rollup_checks(reader, pr_number, expected_head_sha)
+    checks = _latest_checks(reader, repository, expected_head_sha,
+                            _rollup_checks(reader, pr_number, expected_head_sha))
     pages = _array(_json_response(_read(reader, ['api', f'repos/{repository}/rulesets', '--paginate', '--slurp'])))
     import json
     total_bytes = len(json.dumps(before, ensure_ascii=False).encode()) + len(json.dumps(checks).encode())
@@ -371,9 +485,12 @@ def _configured_contexts(facts: Mapping[str, Any], branch: str) -> list[tuple[st
     if not facts['classic_protection_absent']:
         for item in _array(facts['classic_checks']):
             entry = _object(item)
+            if 'app_id' not in entry:
+                raise GitHubReadError('github_invalid_response', 'Classic required check is missing app_id')
             contexts.append((_text(entry.get('context')), _check_app(entry.get('app_id'), any_app=-1)))
         represented = {name for name, _app in contexts}
-        contexts.extend((_text(name), None) for name in _array(facts['classic_contexts']) if name not in represented)
+        if any(_text(name) not in represented for name in _array(facts['classic_contexts'])):
+            raise GitHubReadError('github_invalid_response', 'Classic required context has no explicit App binding')
     for item in _array(facts['rulesets']):
         entry = _object(item)
         summary, detail = _object(entry['summary']), _object(entry['detail'])
@@ -428,10 +545,6 @@ def normalize_required_checks(facts: Mapping[str, Any]) -> Checks:
     checks = [_object(value) for value in _array(facts['required_checks'])]
     details = []
     observed: set[tuple[str, int | None]] = set()
-    sources: dict[tuple[str, object], int] = {}
-    for check in checks:
-        key = (_text(check.get('name')), check.get('app_id'))
-        sources[key] = sources.get(key, 0) + 1
     states = {'pass': 'pass', 'skipping': 'pass', 'neutral': 'pass', 'fail': 'fail', 'cancel': 'fail', 'pending': 'pending'}
     for check in checks:
         name = _text(check.get('name'))
@@ -440,8 +553,6 @@ def normalize_required_checks(facts: Mapping[str, Any]) -> Checks:
             continue
         observed.update(matches)
         state = states.get(_text(check.get('bucket')).lower(), 'unknown')
-        if sources[(name, check.get('app_id'))] > 1 and state == 'pass':
-            state = 'unknown'  # Multiple current same-App runs cannot prove which replaces which.
         details.append((name, state))
     details.extend((name, 'pending') for name, app in contexts if (name, app) not in observed)
     status = {state for _, state in details}

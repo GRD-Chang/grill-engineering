@@ -18,7 +18,7 @@ from agent_run.errors import KernelError
 from agent_run.adapters.remote import RemoteEffects
 from agent_run.core.operation_contract import ReadUnavailable
 from support.effect_boundary import EffectBoundary, effect_boundary
-from support.github_checks import CHECK_ROLLUP_FAKE
+from support.github_checks import CHECK_ROLLUP_FAKE, LATEST_CHECK_FAKE
 
 
 def _fixture(tmp_path, monkeypatch, *, repository="example/project", actor="publisher"):
@@ -582,7 +582,7 @@ def test_final_observation_proves_real_current_completions_into_remote_run_befor
     assert not any("--method" in c for c in actual)
 
 
-FAKE_GH = CHECK_ROLLUP_FAKE + r'''import json, os, subprocess, sys
+FAKE_GH = CHECK_ROLLUP_FAKE + LATEST_CHECK_FAKE + r'''import json, os, subprocess, sys
 from pathlib import Path
 args=sys.argv[1:]
 state=Path(os.environ['REMOTE_TEST_STATE'])
@@ -620,6 +620,8 @@ elif endpoint=='graphql':
     v=body['variables']; assert v['issueId']=='issue-node-2' and head('refs/heads/'+v['name'])==v['oid']
     d.setdefault('links',[]).append({'ref':v['name'],'sha':v['oid']})
     result={'data':{'createLinkedBranch':{'linkedBranch':{'ref':{'name':v['name'],'target':{'oid':v['oid']}}}}}}
+elif '/commits/' in endpoint and endpoint.endswith(('/check-runs','/check-suites','/status')):
+    print(json.dumps(latest_check_response(d,args[1])));raise SystemExit(0)
 elif endpoint=='repos/example/project/commits/main': result={'sha':head('refs/heads/main')}
 elif endpoint=='repos/example/project/rulesets': result=[[]]
 elif '/protection/required_status_checks' in endpoint: result={'contexts':[],'checks':[]}
