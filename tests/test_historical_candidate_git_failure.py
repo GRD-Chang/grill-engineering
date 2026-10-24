@@ -51,6 +51,9 @@ def test_candidate_preserves_line_endings_on_commit_and_readback(git_repo, tmp_p
     assert git.parents(result.commit.sha) == (effect.before_sha,)
     assert git.run('show', result.commit.sha+':values.csv').stdout.encode('utf-8') == content
     assert local.reconcile(effect) == result
+    def no_new_authority():
+        pytest.fail('An existing committed candidate must be read back without another admission')
+    assert local.execute(effect, WriteAuthority(no_new_authority)) == result
 
 
 @pytest.mark.parametrize('content,diagnostic', [
@@ -73,6 +76,7 @@ def test_new_candidate_validation_returns_failure_without_committing(git_repo, t
 
 @pytest.mark.parametrize('content', [b'bad \n', b'<<<<<<< ours\n=======\n>>>>>>> theirs\n'])
 def test_existing_candidate_identity_cannot_bypass_content_validation(git_repo, tmp_path, content):
+    from agent_run.contracts.write_authority import WriteAuthority
     git, local, effect = _candidate(git_repo, tmp_path)
     checkout = Path(effect.payload['checkout'])
     (checkout/'invalid.txt').write_bytes(content)
@@ -84,6 +88,9 @@ def test_existing_candidate_identity_cannot_bypass_content_validation(git_repo, 
     assert result.disposition == 'failure'
     assert result.commit == committed and result.raw['returncode'] != 0
     assert effect.before_sha in result.raw['command'] and committed.sha in result.raw['command']
+    def no_new_authority():
+        pytest.fail('An existing invalid candidate cannot obtain first-dispatch authority')
+    assert local.execute(effect, WriteAuthority(no_new_authority)) == result
 
 
 def test_candidate_real_git_failure_preserves_command_and_current_head(git_repo, tmp_path):
@@ -135,12 +142,13 @@ def test_git_failure_cannot_adopt_a_foreign_head_as_repair_authority(git_repo, t
 
 
 @pytest.mark.parametrize('code', ['automatic_step_paused', 'executor_fenced'])
-def test_candidate_git_failure_handling_does_not_swallow_final_authority_refusal(git_repo, tmp_path, code):
+@pytest.mark.parametrize('name', ['new.txt', 'README.md'])
+def test_candidate_git_failure_handling_does_not_swallow_final_authority_refusal(git_repo, tmp_path, code, name):
     from agent_run.contracts.write_authority import WriteAuthority
     from agent_run.errors import KernelError
     git, local, effect = _candidate(git_repo, tmp_path)
     checkout = Path(effect.payload['checkout'])
-    (checkout/'new.txt').write_text('accepted content\n')
+    (checkout/name).write_text('invalid trailing whitespace \n')
     def denied():
         raise KernelError(code)
     with pytest.raises(KernelError, match=code):
@@ -149,11 +157,12 @@ def test_candidate_git_failure_handling_does_not_swallow_final_authority_refusal
     assert git.run('diff', '--cached', '--name-only', cwd=checkout).stdout == ''
 
 
-def test_candidate_failure_uses_existing_development_repair_and_budget(tmp_path):
+@pytest.mark.parametrize('name', ['new.txt', 'README.md'])
+def test_candidate_failure_uses_existing_development_repair_and_budget(tmp_path, name):
     from support.offline import Scenario
     from agent_run.model import DeliveryKind, Role
     scenario = Scenario(tmp_path/'scenario', DeliveryKind.TICKET, edits=(
-        {'new.txt':'invalid trailing space \n'}, {'new.txt':'repaired content\n'}))
+        {name:'invalid trailing space \n'}, {name:'repaired content\n'}))
     runner = scenario.runner()
     repaired = None
     for _ in range(80):
@@ -183,3 +192,74 @@ def test_candidate_failure_uses_existing_development_repair_and_budget(tmp_path)
     status = scenario.kernel.status(scenario.delivery.key)
     assert status['phase'] == 'complete' and status['generation'] == 1
     assert status['budgets']['requirements']['developments_used'] == 2
+
+
+def test_tracked_content_validation_admits_the_check_without_staging_or_committing(git_repo, tmp_path):
+    from agent_run.contracts.write_authority import WriteAuthority
+    git, local, effect = _candidate(git_repo, tmp_path)
+    checkout = Path(effect.payload['checkout'])
+    (checkout/'README.md').write_text('Tracked invalid whitespace \n')
+    admitted = []
+    def prepare():
+        admitted.append('prepare')
+        return lambda: admitted.append('final')
+    before = git.run('write-tree', cwd=checkout).stdout.strip()
+    for _ in range(2):
+        result = local.execute(effect, WriteAuthority(prepare))
+        assert result.disposition == 'failure' and result.raw['returncode'] != 0
+    assert admitted == ['prepare', 'final', 'prepare', 'final']
+    assert git.run('write-tree', cwd=checkout).stdout.strip() == before
+    assert git.run('rev-parse', 'HEAD', cwd=checkout).stdout.strip() == effect.before_sha
+
+
+@pytest.mark.parametrize('change', ['foreign', 'unavailable'])
+def test_tracked_candidate_failure_rechecks_identity_after_slow_preparation(git_repo, tmp_path, change):
+    from agent_run.contracts.write_authority import WriteAuthority
+    from agent_run.errors import KernelError
+    git, local, effect = _candidate(git_repo, tmp_path)
+    checkout = Path(effect.payload['checkout'])
+    (checkout/'README.md').write_text('Tracked invalid whitespace \n')
+    admitted = []
+    def prepare():
+        if change == 'foreign':
+            foreign = git.make_commit(effect.base.tree, (), 'Independent foreign root')
+            git.run('reset', '--hard', foreign.sha, cwd=checkout)
+        else:
+            checkout.rename(checkout.with_name('independently-moved'))
+        return lambda: admitted.append(True)
+    with pytest.raises(KernelError, match='local_effect_boundary_changed'):
+        local.execute(effect, WriteAuthority(prepare))
+    assert admitted == []
+
+
+def test_public_stop_during_tracked_candidate_validation_never_dispatches(tmp_path, monkeypatch):
+    from agent_run.contracts.write_authority import WriteAuthority
+    from agent_run.model import DeliveryKind
+    from support.offline import Scenario
+    scenario = Scenario(tmp_path/'scenario', DeliveryKind.TICKET, edits=({'README.md':'Invalid trailing space \n'},))
+    execute = scenario.port.execute
+    stopped = []
+    final_returned = []
+    def stop_before_final(effect, authority):
+        if effect.operation != 'candidate':
+            return execute(effect, authority)
+        def prepare():
+            final = authority.prepare()
+            scenario.kernel.control('stop', 'stop-before-candidate-validation')
+            stopped.append(effect.effect_id)
+            def admit():
+                final()
+                final_returned.append(effect.effect_id)
+            return admit
+        return execute(effect, WriteAuthority(prepare))
+    monkeypatch.setattr(scenario.port, 'execute', stop_before_final)
+    step = scenario.run()
+    assert step.kind == 'paused' and stopped and final_returned == []
+    assert scenario.kernel.status(scenario.delivery.key)['stopped']
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        effect = tx.one('SELECT status,attempts,receipt_id FROM effects WHERE id=?', (stopped[0],))
+        assert effect['attempts'] == 0 and effect['receipt_id'] is None
+        assert effect['status'] not in {'sent', 'observed', 'confirmed'}
+    checkout = Path(scenario.delivery.checkout)
+    assert scenario.port.git.run('rev-parse', 'HEAD', cwd=checkout).stdout.strip() == scenario.initial.sha
+    assert scenario.port.git.run('diff', '--cached', '--name-only', cwd=checkout).stdout == ''

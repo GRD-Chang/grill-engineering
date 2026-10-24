@@ -271,15 +271,19 @@ class LocalEffects:
             and observed.raw.get("reason") == "worktree_absent"
             or effect.operation == "cleanup_local_ref" and observed.raw.get("reason") == "ref_absent"
         )
-        if observed.disposition == "target" and no_write:
-            # Only explicit, verified no-write outcomes may acquire first-dispatch
-            # authority here; an arbitrary pre-existing target remains read-only.
+        candidate_check = (effect.operation == "candidate" and observed.disposition == "failure"
+                           and observed.commit is not None and observed.commit.sha == effect.before_sha)
+        if candidate_check or observed.disposition == "target" and no_write:
+            # Admit this candidate's content check, or an explicit no-write
+            # outcome. An arbitrary pre-existing target remains read-only.
             final_admission = authorize.prepare()
             fresh = self.reconcile(effect)
             if fresh != observed:
                 raise KernelError("local_effect_boundary_changed")
             final_admission()
-            return fresh
+            # A preflight failure is not an already-dispatched receipt. Perform
+            # the actual check only after Core's final, no-I/O admission.
+            return self.reconcile(effect) if candidate_check else fresh
         if observed.disposition != "prior":
             return observed
 
