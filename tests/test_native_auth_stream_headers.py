@@ -40,3 +40,41 @@ def test_body_cannot_supply_status_or_rate_headers(tmp_path, monkeypatch):
         validate_worker_auth({'source': 'host'}, {'PATH': str(tmp_path)})
     assert caught.value.__cause__.http_status == 403
     assert caught.value.__cause__.category == 'forbidden'
+
+
+def test_header_collector_handles_split_chunks_without_retaining_values():
+    from dataclasses import asdict
+    from agent_run.adapters.auth.native_probe import AuthProbeCapture, _HeaderEvidence
+    parser = _HeaderEvidence()
+    stream = (b'HTTP/2.0 403 Forbidden\r\nx-long: ' + b'x' * 5000
+              + b'\r\nx-ratelimit-remaining: 0\r\nAuthorization: synthetic-private-value\r\n\r\n'
+              + b'HTTP/2.0 401 Spoof\r\n')
+    for byte in stream:
+        parser.feed(bytes([byte]))
+    assert parser.http_status == 403 and parser.rate_limited
+    assert parser.data == b'' and len(parser._prefix) <= 32
+    assert asdict(AuthProbeCapture(1, False, parser.http_status, parser.rate_limited, False)) == {
+        'returncode': 1, 'timed_out': False, 'http_status': 403,
+        'rate_limited': True, 'network_failure': False,
+    }
+
+
+def test_early_network_marker_survives_long_stderr(tmp_path, monkeypatch):
+    executable = tmp_path / 'gh'
+    executable.write_text(f'#!{sys.executable}\nimport sys\nsys.stderr.write("dial tcp: network unavailable\\n" + "x" * 5000)\nraise SystemExit(1)\n')
+    executable.chmod(0o700)
+    with pytest.raises(GitHubReadError) as caught:
+        validate_worker_auth({'source': 'host'}, {'PATH': str(tmp_path)})
+    assert caught.value.__cause__.category == 'network'
+    assert caught.value.__cause__.http_status is None
+
+
+def test_non_header_prefix_cannot_later_supply_http_status(tmp_path, monkeypatch):
+    executable = tmp_path / 'gh'
+    output = 'not a header\r\n\r\nHTTP/2.0 401 Unauthorized\r\n'
+    executable.write_text(f'#!{sys.executable}\nimport sys\nsys.stdout.write({output!r})\nraise SystemExit(1)\n')
+    executable.chmod(0o700)
+    with pytest.raises(GitHubReadError) as caught:
+        validate_worker_auth({'source': 'host'}, {'PATH': str(tmp_path)})
+    assert caught.value.__cause__.category == 'command_failed'
+    assert caught.value.__cause__.http_status is None

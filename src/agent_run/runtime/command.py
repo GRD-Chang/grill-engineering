@@ -20,15 +20,18 @@ class CommandCapture:
 
 
 def capture_command(
-    process: subprocess.Popen[bytes], *, timeout: float, max_output: int
+    process: subprocess.Popen[bytes], *, timeout: float, max_output: int,
+    stdout: TailOutput | None = None, stderr: TailOutput | None = None,
 ) -> CommandCapture:
     """Drain both pipes and reap a child started with start_new_session=True.
 
     The adapter owns spawning, environment, and result interpretation. Only the
     child's process group is terminated; escaped descendants are not inferred
-    from unrelated processes owned by the caller.
+    from unrelated processes owned by the caller. Optional bounded collectors
+    are passed to the existing pump; omitted collectors keep tail capture.
     """
-    stdout, stderr = TailOutput(max_output), TailOutput(max_output)
+    stdout = TailOutput(max_output) if stdout is None else stdout
+    stderr = TailOutput(max_output) if stderr is None else stderr
     deadline = time.monotonic() + timeout
     drain_deadline: float | None = None
     timed_out = False

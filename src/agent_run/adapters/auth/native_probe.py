@@ -2,13 +2,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
 import re
-import signal
 import subprocess
-import time
 
-from agent_run.runtime.process_io import TailOutput, pump
+from agent_run.runtime.process_io import TailOutput
+from agent_run.runtime.command import capture_command
 
 
 @dataclass(frozen=True)
@@ -103,41 +101,8 @@ class _ErrorEvidence(TailOutput):
 
 
 def capture_auth_probe(process: subprocess.Popen[bytes], *, timeout: float) -> AuthProbeCapture:
-    """Use the existing pump and command timeout/group-cleanup contract."""
+    """Collect safe stream metadata under the one existing command lifecycle."""
     headers, errors = _HeaderEvidence(), _ErrorEvidence()
-    deadline = time.monotonic() + timeout
-    drain_deadline: float | None = None
-    timed_out = False
-    group_signalled = False
-
-    def terminate() -> int:
-        nonlocal group_signalled
-        if not group_signalled:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            group_signalled = True
-        return process.wait()
-
-    def check() -> bool:
-        nonlocal timed_out, drain_deadline
-        if drain_deadline is None:
-            exited = process.poll() is not None
-            if exited or time.monotonic() >= deadline:
-                timed_out = not exited
-                terminate()
-                drain_deadline = time.monotonic() + 0.1
-        return drain_deadline is None or time.monotonic() < drain_deadline
-
-    try:
-        pump(process, stdout=headers, stderr=errors, check=check, ignore_read_errors=True)
-    finally:
-        try:
-            returncode = terminate()
-        finally:
-            for stream in (process.stdout, process.stderr):
-                if stream is not None:
-                    stream.close()
-    return AuthProbeCapture(returncode, timed_out, headers.http_status,
+    result = capture_command(process, timeout=timeout, max_output=0, stdout=headers, stderr=errors)
+    return AuthProbeCapture(result.returncode, result.timed_out, headers.http_status,
                             headers.rate_limited or errors.rate_limited, errors.network_failure)
