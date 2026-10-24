@@ -126,7 +126,7 @@ def read_pull_request_facts(reader: GhGitHubReader, pr_number: int) -> dict[str,
 
 
 def _failed_check_evidence(reader: GhGitHubReader, repository: str, checks: list[Any], head_sha: str,
-                           required_contexts: set[str]) -> list[dict[str, Any]]:
+                           required_contexts: list[tuple[str, int | None]]) -> list[dict[str, Any]]:
     """Supplement real failures with exact completed jobs and available logs.
 
     No failure is preclassified as code-repairable. Missing supplementary logs
@@ -137,7 +137,7 @@ def _failed_check_evidence(reader: GhGitHubReader, repository: str, checks: list
     total_bytes = 0
     for raw in checks:
         check = dict(_object(raw))
-        if (required_contexts and check['name'] not in required_contexts
+        if (required_contexts and not _matching_requirements(check, required_contexts)
                 or str(check.get('bucket', '')).lower() not in {'fail', 'cancel'}):
             evidence.append(check)
             continue
@@ -167,6 +167,111 @@ def _failed_check_evidence(reader: GhGitHubReader, repository: str, checks: list
         evidence.append(check)
     return evidence
 
+def _rollup_checks(reader: GhGitHubReader, number: int, head: str) -> list[dict[str, Any]]:
+    # Same PR/latest-commit rollup as gh pr checks, with identities retained.
+    # GitHub owns rerun selection. Never choose a run by numeric ID or time.
+    query = '''query CurrentRequiredChecks($owner:String!,$repo:String!,$number:Int!,$cursor:String) {
+      repository(owner:$owner,name:$repo) { pullRequest(number:$number) {
+        number headRefOid commits(last:1) { nodes { commit { oid statusCheckRollup {
+          contexts(first:100,after:$cursor) { nodes { __typename
+            ... on CheckRun { id databaseId name status conclusion detailsUrl title
+              isRequired(pullRequestNumber:$number)
+              checkSuite { id commit { oid } app { databaseId }
+                workflowRun { workflow { name } } } }
+            ... on StatusContext { id context state targetUrl description
+              isRequired(pullRequestNumber:$number) }
+          } pageInfo { hasNextPage endCursor } }
+        } } } }
+      } }
+    }'''
+    owner, repo = reader.repository().name_with_owner.split('/')
+    cursor: str | None = None
+    cursors: set[str] = set()
+    identities: set[str] = set()
+    checks: list[dict[str, Any]] = []
+    total = 0
+    import json
+    while True:
+        args = ['api', 'graphql', '-f', 'query=' + query, '-f', 'owner=' + owner,
+                '-f', 'repo=' + repo, '-F', 'number=' + str(number)]
+        if cursor is not None:
+            args += ['-f', 'cursor=' + cursor]
+        loaded = _object(_json_response(_read(reader, args)))
+        total += len(json.dumps(loaded).encode())
+        if total > MATERIAL_LIMIT:
+            raise GitHubReadError('github_read_limit', 'Required-check rollup exceeds the material limit')
+        if loaded.get('errors'):
+            raise GitHubReadError('github_read_failed', 'Required-check rollup is incomplete: '
+                                      + json.dumps(loaded['errors'], ensure_ascii=False)[:4096])
+        pr = _object(_object(_object(loaded.get('data')).get('repository')).get('pullRequest'))
+        if pr.get('number') != number or pr.get('headRefOid') != head:
+            raise GitHubReadError('change_pr_head_drift', 'Required-check rollup refers to another PR head')
+        commits = _array(_object(pr.get('commits')).get('nodes'))
+        if len(commits) != 1:
+            raise GitHubReadError('github_invalid_response', 'Required-check rollup has no exact commit')
+        commit = _object(_object(commits[0]).get('commit'))
+        if commit.get('oid') != head:
+            raise GitHubReadError('change_pr_head_drift', 'Required-check rollup commit changed')
+        if 'statusCheckRollup' not in commit:
+            raise GitHubReadError('github_invalid_response', 'Required-check rollup field is missing')
+        rollup = commit['statusCheckRollup']
+        if rollup is None:
+            if cursor is not None:
+                raise GitHubReadError('github_read_failed', 'Required-check rollup disappeared during pagination')
+            return []
+        connection = _object(_object(rollup).get('contexts'))
+        for value in _array(connection.get('nodes')):
+            node = _object(value)
+            if type(node.get('isRequired')) is not bool:
+                raise GitHubReadError('github_invalid_response', 'Required-check applicability is missing')
+            if not node['isRequired']:
+                continue
+            node_id = _text(node.get('id'))
+            if not node_id or node_id in identities:
+                raise GitHubReadError('github_read_failed', 'Required-check rollup has ambiguous members')
+            identities.add(node_id)
+            kind = node.get('__typename')
+            if kind == 'CheckRun':
+                suite = _object(node.get('checkSuite'))
+                app = _object(suite.get('app')).get('databaseId')
+                if type(app) is not int or app <= 0 or not isinstance(suite.get('id'), str) or not suite['id']:
+                    raise GitHubReadError('github_invalid_response', 'Required check has no exact App/suite identity')
+                if _object(suite.get('commit')).get('oid') != head:
+                    raise GitHubReadError('change_pr_head_drift', 'Required check suite refers to another head')
+                status = _text(node.get('status'))
+                state = node.get('conclusion') if status == 'COMPLETED' else status
+                bucket = ({'SUCCESS': 'pass', 'NEUTRAL': 'pass', 'SKIPPED': 'pass',
+                           'FAILURE': 'fail', 'TIMED_OUT': 'fail', 'CANCELLED': 'fail',
+                           'ACTION_REQUIRED': 'fail', 'STARTUP_FAILURE': 'fail',
+                           'QUEUED': 'pending', 'IN_PROGRESS': 'pending', 'WAITING': 'pending',
+                           'REQUESTED': 'pending', 'PENDING': 'pending'}.get(str(state), 'unknown'))
+                workflow_run = suite.get('workflowRun')
+                workflow = '' if workflow_run is None else _text(_object(_object(workflow_run).get('workflow')).get('name'))
+                name, link = node.get('name'), node.get('detailsUrl')
+            elif kind == 'StatusContext':
+                app, workflow = None, ''
+                name, state, link = node.get('context'), node.get('state'), node.get('targetUrl')
+                bucket = {'SUCCESS': 'pass', 'FAILURE': 'fail', 'ERROR': 'fail', 'PENDING': 'pending', 'EXPECTED': 'pending'}.get(str(state), 'unknown')
+            else:
+                raise GitHubReadError('github_invalid_response', 'Unknown required-check member type')
+            name = _text(name)
+            if not name.strip():
+                raise GitHubReadError('github_invalid_response', 'Required check has an empty context')
+            checks.append({'name': name, 'bucket': bucket, 'state': state, 'link': link,
+                           'workflow': workflow, 'description': node.get('description', node.get('title', '')),
+                           'kind': kind, 'app_id': app, 'head_sha': head, 'original': node})
+        page = _object(connection.get('pageInfo'))
+        if type(page.get('hasNextPage')) is not bool:
+            raise GitHubReadError('github_invalid_response', 'Required-check pagination is missing')
+        if not page['hasNextPage']:
+            return checks
+        next_cursor = page.get('endCursor')
+        if not isinstance(next_cursor, str) or not next_cursor or next_cursor in cursors:
+            raise GitHubReadError('github_read_failed', 'Required-check pagination did not advance')
+        cursors.add(next_cursor)
+        cursor = next_cursor
+
+
 def read_required_check_facts(reader: GhGitHubReader, pr_number: int, *, expected_head_sha: str) -> dict[str, Any]:
     """Read complete required-check configuration and original check observations.
 
@@ -180,19 +285,10 @@ def read_required_check_facts(reader: GhGitHubReader, pr_number: int, *, expecte
         raise GitHubReadError('change_pr_head_drift', 'Required checks refer to another PR head')
     metadata = reader.repository()
     repository = metadata.name_with_owner
-    response = _read(reader, ['pr', 'checks', str(pr_number), '--repo', repository, '--required', '--json',
-                             'name,bucket,state,link,workflow,description'], allowed=frozenset({0, 1, 8}))
-    if response.returncode == 1 and 'no required checks reported' in response.stderr.lower():
-        checks: list[Any] = []
-    else:
-        checks = _array(_json_response(response))
-        if response.returncode == 1 and not checks:
-            raise GitHubReadError('github_read_failed', response.stderr.strip() or 'Required checks could not be read')
-    for check in checks:
-        _text(_object(check).get('name'))
+    checks = _rollup_checks(reader, pr_number, expected_head_sha)
     pages = _array(_json_response(_read(reader, ['api', f'repos/{repository}/rulesets', '--paginate', '--slurp'])))
     import json
-    total_bytes = len(json.dumps(before, ensure_ascii=False).encode()) + len(response.stdout.encode())
+    total_bytes = len(json.dumps(before, ensure_ascii=False).encode()) + len(json.dumps(checks).encode())
     rulesets = []
     for page in pages:
         for item in _array(page):
@@ -208,23 +304,25 @@ def read_required_check_facts(reader: GhGitHubReader, pr_number: int, *, expecte
                 raise GitHubReadError('github_read_limit', 'Required-check source evidence exceeds the material limit')
             rulesets.append({'summary': summary, 'detail': detail})
     branch = _text(before['base']['ref'])
-    protection = _read(reader, ['api', f'repos/{repository}/branches/{quote(branch, safe="")}/protection/required_status_checks/contexts'],
+    protection = _read(reader, ['api', f'repos/{repository}/branches/{quote(branch, safe="")}/protection/required_status_checks'],
                        allowed=frozenset({0, 1, 404}))
     absent = protection.returncode == 404 or (protection.returncode != 0 and 'http 404' in protection.stderr.lower())
     if protection.returncode and not absent:
         raise GitHubReadError('github_read_failed', protection.stderr.strip() or 'Branch protection could not be read')
-    classic = None if absent else _array(_json_response(protection))
+    classic_config = None if absent else _object(_json_response(protection))
+    classic = None if classic_config is None else _array(classic_config.get('contexts'))
+    classic_checks = [] if classic_config is None else _array(classic_config.get('checks'))
     if classic is not None:
         for context in classic:
             _text(context)
-    contexts = _configured_contexts({'classic_protection_absent': absent, 'classic_contexts': classic,
+    contexts = _configured_contexts({'classic_protection_absent': absent, 'classic_contexts': classic, 'classic_checks': classic_checks,
                                     'rulesets': rulesets, 'repository_default_branch': metadata.default_branch}, branch)
-    checks = _failed_check_evidence(reader, repository, checks, expected_head_sha, set(contexts))
+    checks = _failed_check_evidence(reader, repository, checks, expected_head_sha, contexts)
     after = read_pull_request_facts(reader, pr_number)
     if after['head']['sha'] != expected_head_sha:
         raise GitHubReadError('change_pr_head_drift', 'PR head changed during required-check observation')
     return {'pr_before': before, 'pr_after': after, 'head_sha': expected_head_sha,
-            'required_checks': checks, 'checks_exit_code': response.returncode, 'checks_stderr': response.stderr,
+            'required_checks': checks, 'classic_checks': classic_checks,
             'repository': repository, 'repository_default_branch': metadata.default_branch, 'rulesets': rulesets, 'classic_contexts': classic, 'classic_protection_absent': absent}
 
 
@@ -260,8 +358,22 @@ def _matches_ref(reference: str, pattern: Any, default_branch: str) -> bool:
     return re.fullmatch(expression, reference) is not None
 
 
-def _configured_contexts(facts: Mapping[str, Any], branch: str) -> list[str]:
-    contexts = [] if facts['classic_protection_absent'] else [_text(item) for item in _array(facts['classic_contexts'])]
+def _check_app(value: Any, *, any_app: int | None = None) -> int | None:
+    if value is None or type(value) is int and value == any_app:
+        return None
+    if type(value) is not int or value <= 0:
+        raise GitHubReadError('github_invalid_response', 'Invalid required-check App identity')
+    return value
+
+
+def _configured_contexts(facts: Mapping[str, Any], branch: str) -> list[tuple[str, int | None]]:
+    contexts: list[tuple[str, int | None]] = []
+    if not facts['classic_protection_absent']:
+        for item in _array(facts['classic_checks']):
+            entry = _object(item)
+            contexts.append((_text(entry.get('context')), _check_app(entry.get('app_id'), any_app=-1)))
+        represented = {name for name, _app in contexts}
+        contexts.extend((_text(name), None) for name in _array(facts['classic_contexts']) if name not in represented)
     for item in _array(facts['rulesets']):
         entry = _object(item)
         summary, detail = _object(entry['summary']), _object(entry['detail'])
@@ -284,12 +396,15 @@ def _configured_contexts(facts: Mapping[str, Any], branch: str) -> list[str]:
             parameters = _object(rule.get('parameters'))
             for check in _array(parameters.get('required_status_checks')):
                 check = _object(check)
-                if check.get('integration_id') is not None:
-                    raise GitHubReadError('github_unsupported_ruleset', 'Integration-bound check identity is not observable')
-                contexts.append(_text(check.get('context')))
-    if any(not context.strip() for context in contexts):
+                contexts.append((_text(check.get('context')), _check_app(check.get('integration_id'))))
+    if any(not context.strip() for context, _app in contexts):
         raise GitHubReadError('github_invalid_response', 'Required check context is empty')
     return list(dict.fromkeys(contexts))
+
+
+def _matching_requirements(check: Mapping[str, Any], contexts: list[tuple[str, int | None]]) -> list[tuple[str, int | None]]:
+    return [(name, app) for name, app in contexts if name == check.get('name')
+            and (app is None or check.get('kind') == 'CheckRun' and check.get('app_id') == app)]
 
 
 def normalize_required_checks(facts: Mapping[str, Any]) -> Checks:
@@ -312,18 +427,26 @@ def normalize_required_checks(facts: Mapping[str, Any]) -> Checks:
     contexts = _configured_contexts(facts, _text(after['base']['ref']))
     checks = [_object(value) for value in _array(facts['required_checks'])]
     details = []
-    observed = set()
+    observed: set[tuple[str, int | None]] = set()
+    sources: dict[tuple[str, object], int] = {}
+    for check in checks:
+        key = (_text(check.get('name')), check.get('app_id'))
+        sources[key] = sources.get(key, 0) + 1
     states = {'pass': 'pass', 'skipping': 'pass', 'neutral': 'pass', 'fail': 'fail', 'cancel': 'fail', 'pending': 'pending'}
     for check in checks:
         name = _text(check.get('name'))
-        if contexts and name not in contexts:
+        matches = _matching_requirements(check, contexts)
+        if contexts and not matches:
             continue
-        observed.add(name)
-        details.append((name, states.get(_text(check.get('bucket')).lower(), 'unknown')))
-    details.extend((name, 'pending') for name in contexts if name not in observed)
+        observed.update(matches)
+        state = states.get(_text(check.get('bucket')).lower(), 'unknown')
+        if sources[(name, check.get('app_id'))] > 1 and state == 'pass':
+            state = 'unknown'  # Multiple current same-App runs cannot prove which replaces which.
+        details.append((name, state))
+    details.extend((name, 'pending') for name, app in contexts if (name, app) not in observed)
     status = {state for _, state in details}
     result = ('fail' if 'fail' in status else 'pending' if 'pending' in status else 'unknown' if 'unknown' in status
-              else 'pass' if details else 'unknown' if facts['checks_exit_code'] == 8 else 'none')
+              else 'pass' if details else 'none')
     evidence = json.dumps({'source': 'original GitHub check/configuration observation',
                            'job_logs': 'per_check' if any('job' in check for check in checks) else 'not_collected',
                            'observation': dict(facts)}, ensure_ascii=False, sort_keys=True)

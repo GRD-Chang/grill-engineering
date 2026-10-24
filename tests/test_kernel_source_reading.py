@@ -11,6 +11,7 @@ from agent_run.errors import GitHubReadError
 from agent_run.model import Commit, Delivery, DeliveryKind, RunSpec
 from agent_run.core.kernel import Kernel
 from agent_run.adapters.source import read_requirements
+from support.github_checks import CHECK_ROLLUP_FAKE
 
 
 def _reader(root: Path, monkeypatch, *, invalid: bool = False) -> tuple[GhGitHubReader, Path]:
@@ -39,13 +40,17 @@ def _reader(root: Path, monkeypatch, *, invalid: bool = False) -> tuple[GhGitHub
               'labels': page([{'name': 'ready-for-agent'}, {'name': 'user-label'}]), 'blockedBy': page([])},
     }))
     script = binary / 'gh'
-    script.write_text('#!' + sys.executable + '\n' + '''import json, os, sys
+    script.write_text('#!' + sys.executable + '\n' + CHECK_ROLLUP_FAKE + '''import json, os, sys
 args=sys.argv[1:]
 with open(os.environ['SOURCE_TEST_LOG'],'a') as f: f.write(json.dumps(args)+'\\n')
 if args[:2]==['repo','view']:
     print(json.dumps({'nameWithOwner':'example/project','defaultBranchRef':{'name':'main'}}))
 elif args[:2]==['api','graphql']:
     fields=dict(value.split('=',1) for index,value in enumerate(args) if index and args[index-1] in ('-F','-f'))
+    if 'CurrentRequiredChecks' in fields['query']:
+        with open(os.environ['SOURCE_TEST_RESPONSES']) as f: data=json.load(f)
+        print(json.dumps(current_checks(data, fields)))
+        raise SystemExit(0)
     key=fields.get('cursor') or ('parent' if fields['number']=='1' else fields['number'])
     with open(os.environ['SOURCE_TEST_RESPONSES']) as f: issue=json.load(f)[key]
     print(json.dumps({'data':{'repository':{'issue':issue}}}))
@@ -74,12 +79,12 @@ elif args[:2]==['api','repos/example/project/rulesets']:
     with open(os.environ['SOURCE_TEST_RESPONSES']) as f: print(json.dumps([json.load(f)['rulesets']]))
 elif args[:1]==['api'] and args[1].startswith('repos/example/project/rulesets/'):
     with open(os.environ['SOURCE_TEST_RESPONSES']) as f: print(json.dumps(json.load(f)['ruleset_detail']))
-elif args[:2]==['api','repos/example/project/branches/main/protection/required_status_checks/contexts']:
+elif args[:2] in (['api','repos/example/project/branches/main/protection/required_status_checks/contexts'], ['api','repos/example/project/branches/main/protection/required_status_checks']):
     with open(os.environ['SOURCE_TEST_RESPONSES']) as f: data=json.load(f)
     if data.get('classic_http'):
         print('HTTP '+str(data['classic_http']),file=sys.stderr)
         raise SystemExit(1)
-    print(json.dumps(data['classic']))
+    print(json.dumps(data['classic'] if args[1].endswith('/contexts') else {'contexts':data['classic'], 'checks':data.get('classic_checks', [])}))
 else:
     raise SystemExit('Unexpected external command: '+repr(args))
 ''')
@@ -225,7 +230,9 @@ def test_checks_observation_retains_configuration_and_never_invents_none_or_pass
         uncertain = normalize_required_checks(read_required_check_facts(reader, 17, expected_head_sha='2' * 40))
         assert uncertain.result == 'unknown'
         assert dict(uncertain.details) == {'classic-ci': 'unknown', 'not-yet-reported': 'pass'}
-        assert json.loads(uncertain.logs)['observation']['required_checks'] == data['checks']
+        recorded = json.loads(uncertain.logs)['observation']['required_checks']
+        assert [item['name'] for item in recorded] == ['classic-ci', 'not-yet-reported']
+        assert [item['original']['conclusion'] for item in recorded] == ['new-server-state', 'SUCCESS']
         data['checks'].pop()
         responses.write_text(json.dumps(data))
         unfinished = normalize_required_checks(read_required_check_facts(reader, 17, expected_head_sha='2' * 40))
@@ -377,3 +384,164 @@ def test_non_actions_failure_preserves_the_original_provider_evidence_without_cl
     assert 'job' not in check and 'logs' not in check and 'repairability' not in check
     assert normalize_required_checks(facts).result == 'fail'
     assert not any('/actions/jobs/' in ' '.join(json.loads(line)) for line in log.read_text().splitlines())
+
+
+def test_app_bound_required_check_uses_original_app_identity(tmp_path: Path, monkeypatch) -> None:
+    from agent_run.adapters.source import read_required_check_facts, normalize_required_checks
+    reader, _ = _reader(tmp_path, monkeypatch)
+    path = tmp_path / 'responses.json'
+    data = json.loads(path.read_text())
+    data['checks'] = [{'name': 'quality', 'bucket': 'pass'}]
+    data['rulesets'] = [{'id': 42, 'target': 'branch', 'enforcement': 'active'}]
+    data['ruleset_detail'] = {'id': 42, 'conditions': {'ref_name': {'include': ['~DEFAULT_BRANCH']}},
+        'rules': [{'type': 'required_status_checks', 'parameters': {
+            'required_status_checks': [{'context': 'quality', 'integration_id': 1001}]}}]}
+    path.write_text(json.dumps(data))
+    facts = read_required_check_facts(reader, 17, expected_head_sha='2' * 40)
+    check = normalize_required_checks(facts)
+    assert check.result == 'pass' and check.details == (('quality', 'pass'),)
+    assert facts['required_checks'][0]['app_id'] == 1001
+    assert facts['required_checks'][0]['head_sha'] == '2' * 40
+
+
+def _current_run(*, app=1001, state='SUCCESS', head='2' * 40, identity='current-check', suite='current-suite'):
+    return {'__typename': 'CheckRun', 'id': identity, 'name': 'quality', 'isRequired': True,
+            'status': 'QUEUED' if state == 'QUEUED' else 'COMPLETED', 'conclusion': state,
+            'detailsUrl': 'https://example.invalid/check', 'title': 'Original check evidence',
+            'checkSuite': {'id': suite, 'commit': {'oid': head},
+                           'app': None if app is None else {'databaseId': app}, 'workflowRun': None}}
+
+
+def _rollup_page(nodes, *, more=False, cursor=None):
+    return {'data': {'repository': {'pullRequest': {'number': 17, 'headRefOid': '2' * 40,
+        'commits': {'nodes': [{'commit': {'oid': '2' * 40, 'statusCheckRollup': {'contexts': {
+            'nodes': nodes, 'pageInfo': {'hasNextPage': more, 'endCursor': cursor}}}}}]}}}}}
+
+
+def _bound_reader(tmp_path, monkeypatch, pages, *, classic=False):
+    reader, log = _reader(tmp_path, monkeypatch)
+    path = tmp_path / 'responses.json'
+    data = json.loads(path.read_text())
+    data['rollup_pages'] = pages
+    if classic:
+        data['classic'] = ['quality']
+        data['classic_checks'] = [{'context': 'quality', 'app_id': 1001}]
+    else:
+        data['rulesets'] = [{'id': 42, 'target': 'branch', 'enforcement': 'active'}]
+        data['ruleset_detail'] = {'id': 42, 'conditions': {'ref_name': {'include': ['~DEFAULT_BRANCH']}},
+            'rules': [{'type': 'required_status_checks', 'parameters': {
+                'required_status_checks': [{'context': 'quality', 'integration_id': 1001}]}}]}
+    path.write_text(json.dumps(data))
+    return reader, log, path
+
+
+@pytest.mark.parametrize('case,expected', [
+    ('matching', 'pass'), ('wrong-app', 'pending'), ('status-context', 'pending'),
+    ('current-pending', 'pending'), ('current-failed', 'fail'), ('not-required', 'pending'),
+    ('same-name-apps', 'pass'), ('ambiguous-suites', 'unknown'), ('old-pass-new-pending', 'pending'),
+    ('old-pass-new-fail', 'fail'), ('unknown-conclusion', 'unknown'), ('no-report', 'pending'),
+])
+def test_bound_check_requires_current_matching_check_run(tmp_path, monkeypatch, case, expected):
+    from agent_run.adapters.source import read_required_check_facts, normalize_required_checks
+    nodes = [_current_run()]
+    if case == 'wrong-app': nodes = [_current_run(app=1002)]
+    elif case == 'status-context': nodes = [{'__typename': 'StatusContext', 'id': 'status',
+        'context': 'quality', 'isRequired': True, 'state': 'SUCCESS', 'targetUrl': None}]
+    elif case == 'current-pending': nodes = [_current_run(state='QUEUED')]
+    elif case == 'current-failed': nodes = [_current_run(state='FAILURE')]
+    elif case == 'not-required': nodes[0]['isRequired'] = False
+    elif case == 'same-name-apps': nodes += [_current_run(app=1002, state='FAILURE', identity='other-app')]
+    elif case in {'ambiguous-suites', 'old-pass-new-pending', 'old-pass-new-fail'}:
+        nodes = [_current_run(identity='old-higher-999', suite='old-suite'),
+                 _current_run(identity='new-lower-1', suite='new-suite', state={
+                     'ambiguous-suites': 'SUCCESS', 'old-pass-new-pending': 'QUEUED',
+                     'old-pass-new-fail': 'FAILURE'}[case])]
+    elif case == 'unknown-conclusion': nodes = [_current_run(state='FUTURE_CONCLUSION')]
+    elif case == 'no-report': nodes = []
+    reader, log, _ = _bound_reader(tmp_path, monkeypatch, {'': _rollup_page(nodes)})
+    result = normalize_required_checks(read_required_check_facts(reader, 17, expected_head_sha='2' * 40))
+    assert result.result == expected
+    assert result.pr_number == 17 and result.head_sha == '2' * 40
+    assert not any(json.loads(line)[:2] == ['pr', 'checks'] for line in log.read_text().splitlines())
+
+
+@pytest.mark.parametrize('damage', ['missing-app', 'wrong-head', 'missing-suite', 'duplicate-member',
+                                   'missing-required', 'partial-errors', '403', 'page-errors', 'page-403', 'cursor-loop'])
+def test_incomplete_required_check_identity_or_pages_never_prove_success(tmp_path, monkeypatch, damage):
+    from agent_run.adapters.source import read_required_check_facts
+    node = _current_run()
+    pages = {'': _rollup_page([node])}
+    if damage == 'missing-app': node['checkSuite']['app'] = None
+    elif damage == 'wrong-head': node['checkSuite']['commit']['oid'] = '3' * 40
+    elif damage == 'missing-suite': node['checkSuite']['id'] = None
+    elif damage == 'duplicate-member': pages[''] = _rollup_page([node, node])
+    elif damage == 'missing-required': node.pop('isRequired')
+    elif damage == 'partial-errors': pages['']['errors'] = [{'message': 'Resource not accessible'}]
+    elif damage == '403': pages[''] = {'http': 403}
+    else:
+        pages[''] = _rollup_page([], more=True, cursor='next')
+        pages['next'] = ({'errors': [{'message': 'Partial response'}], 'data': {}} if damage == 'page-errors'
+                         else {'http': 403} if damage == 'page-403'
+                         else _rollup_page([], more=True, cursor='next'))
+    reader, _, _ = _bound_reader(tmp_path, monkeypatch, pages)
+    monkeypatch.setattr('agent_run.adapters.github_commands.time.sleep', lambda _: None)
+    with pytest.raises(GitHubReadError) as failure:
+        read_required_check_facts(reader, 17, expected_head_sha='2' * 40)
+    if damage == 'partial-errors':
+        assert 'Resource not accessible' in failure.value.message
+    elif damage == 'page-errors':
+        assert 'Partial response' in failure.value.message
+
+
+@pytest.mark.parametrize('classic', [False, True])
+def test_bound_check_pagination_keeps_app_identity_and_original_member(tmp_path, monkeypatch, classic):
+    from agent_run.adapters.source import read_required_check_facts, normalize_required_checks
+    current = _current_run(identity='new-lower-1')
+    reader, log, _ = _bound_reader(tmp_path, monkeypatch, {
+        '': _rollup_page([_current_run(app=1002, identity='wrong-app-high-999')], more=True, cursor='next'),
+        'next': _rollup_page([current])}, classic=classic)
+    facts = read_required_check_facts(reader, 17, expected_head_sha='2' * 40)
+    result = normalize_required_checks(facts)
+    assert result.result == 'pass' and result.details == (('quality', 'pass'),)
+    assert facts['required_checks'][1]['original'] == current
+    assert 'cursor=next' in log.read_text()
+
+
+def test_replaced_suite_is_not_reintroduced_from_historical_results(tmp_path, monkeypatch):
+    from agent_run.adapters.source import read_required_check_facts, normalize_required_checks
+    reader, _, path = _bound_reader(tmp_path, monkeypatch, {'': _rollup_page([_current_run(state='QUEUED')])})
+    data = json.loads(path.read_text())
+    data['checks'] = [{'name': 'quality', 'bucket': 'pass', 'completedAt': '2099-01-01'}]
+    path.write_text(json.dumps(data))
+    facts = read_required_check_facts(reader, 17, expected_head_sha='2' * 40)
+    assert normalize_required_checks(facts).result == 'pending'
+    assert [check['original']['id'] for check in facts['required_checks']] == ['current-check']
+
+
+@pytest.mark.parametrize('check_state,expected', [(None, 'pass'), ('FAILURE', 'fail'), ('QUEUED', 'pending')])
+def test_unbound_context_keeps_status_and_check_run_as_distinct_required_sources(tmp_path, monkeypatch, check_state, expected):
+    from agent_run.adapters.source import read_required_check_facts, normalize_required_checks
+    status = {'__typename': 'StatusContext', 'id': 'status-current', 'context': 'quality',
+              'isRequired': True, 'state': 'SUCCESS', 'targetUrl': None}
+    nodes = [status] + ([] if check_state is None else [_current_run(state=check_state)])
+    reader, _, path = _bound_reader(tmp_path, monkeypatch, {'': _rollup_page(nodes)}, classic=True)
+    data = json.loads(path.read_text())
+    data['classic_checks'][0]['app_id'] = -1
+    path.write_text(json.dumps(data))
+    result = normalize_required_checks(read_required_check_facts(reader, 17, expected_head_sha='2' * 40))
+    assert result.result == expected
+    assert result.details[0] == ('quality', 'pass')
+
+
+def test_same_head_and_result_do_not_erase_changed_required_app_evidence(tmp_path, monkeypatch):
+    from agent_run.adapters.source import read_required_check_facts, normalize_required_checks
+    reader, _, path = _bound_reader(tmp_path, monkeypatch, {'': _rollup_page([_current_run()])})
+    before = normalize_required_checks(read_required_check_facts(reader, 17, expected_head_sha='2' * 40))
+    data = json.loads(path.read_text())
+    data['ruleset_detail']['rules'][0]['parameters']['required_status_checks'][0]['integration_id'] = 1002
+    data['rollup_pages'][''] = _rollup_page([_current_run(app=1002)])
+    path.write_text(json.dumps(data))
+    after = normalize_required_checks(read_required_check_facts(reader, 17, expected_head_sha='2' * 40))
+    assert before.result == after.result == 'pass'
+    assert before.details == after.details and before.head_sha == after.head_sha
+    assert before.logs != after.logs and before != after

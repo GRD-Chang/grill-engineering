@@ -18,6 +18,7 @@ from agent_run.errors import KernelError
 from agent_run.adapters.remote import RemoteEffects
 from agent_run.core.operation_contract import ReadUnavailable
 from support.effect_boundary import EffectBoundary, effect_boundary
+from support.github_checks import CHECK_ROLLUP_FAKE
 
 
 def _fixture(tmp_path, monkeypatch, *, repository="example/project", actor="publisher"):
@@ -581,7 +582,7 @@ def test_final_observation_proves_real_current_completions_into_remote_run_befor
     assert not any("--method" in c for c in actual)
 
 
-FAKE_GH = r'''import json, os, subprocess, sys
+FAKE_GH = CHECK_ROLLUP_FAKE + r'''import json, os, subprocess, sys
 from pathlib import Path
 args=sys.argv[1:]
 state=Path(os.environ['REMOTE_TEST_STATE'])
@@ -607,6 +608,8 @@ if d.get('read_error') and method=='GET':
 if endpoint=='user': result={'login':d.get('actor','publisher')}
 elif endpoint=='graphql' and method=='GET':
     fields=dict(value.split('=',1) for index,value in enumerate(args) if index and args[index-1] in ('-F','-f'))
+    if 'CurrentRequiredChecks' in fields.get('query',''):
+        print(json.dumps(current_checks(d, fields)));raise SystemExit(0)
     graph=d.get('source_graph',{'parent':{'number':1,'title':'Parent','body':d.get('source_body','Whole requirement'),'sub_issues':[]},'issues':{}})
     if fields['number']=='1':
         p=graph['parent'];issue={'number':1,'title':p['title'],'body':p['body'],'subIssues':{'nodes':[{'number':n} for n in p['sub_issues']],'pageInfo':{'hasNextPage':False,'endCursor':None}}}
@@ -619,7 +622,7 @@ elif endpoint=='graphql':
     result={'data':{'createLinkedBranch':{'linkedBranch':{'ref':{'name':v['name'],'target':{'oid':v['oid']}}}}}}
 elif endpoint=='repos/example/project/commits/main': result={'sha':head('refs/heads/main')}
 elif endpoint=='repos/example/project/rulesets': result=[[]]
-elif '/protection/required_status_checks/contexts' in endpoint: result=[]
+elif '/protection/required_status_checks' in endpoint: result={'contexts':[],'checks':[]}
 elif '/git/commits/' in endpoint:
     sha=endpoint.rsplit('/',1)[1]
     result={'sha':sha,'tree':{'sha':git('show','-s','--format=%T',sha)},'parents':[{'sha':x} for x in git('show','-s','--format=%P',sha).split()]}
