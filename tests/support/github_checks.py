@@ -35,24 +35,41 @@ def current_checks(data, fields):
 '''
 
 LATEST_CHECK_FAKE = r'''
-def latest_check_response(data, endpoint):
+def _latest_check_pages(data, endpoint):
     from urllib.parse import urlsplit, parse_qs
     parsed = urlsplit(endpoint)
     if not ('/commits/' in parsed.path and parsed.path.endswith(('/check-runs', '/check-suites', '/status'))):
         return None
     head = parsed.path.split('/commits/')[1].split('/')[0]
     if parsed.path.endswith('/check-suites'):
-        count = data.get('suite_count', 1)
+        if 'suite_pages_after' in data:
+            with open(os.environ['SOURCE_TEST_LOG']) as stream:
+                if sum('/check-suites?' in line for line in stream) > 1: return data['suite_pages_after']
+        if 'suite_pages' in data: return data['suite_pages']
+        graph_pages = data.get('rollup_pages') or {'': current_checks(data, {'number':str((data.get('pull_request') or data['prs'][0])['number'])})}
+        scope = {}
+        for page in graph_pages.values():
+            if 'data' not in page or page.get('errors'): continue
+            for node in page['data']['repository']['pullRequest']['commits']['nodes'][0]['commit']['statusCheckRollup']['contexts']['nodes']:
+                suite = node.get('checkSuite') or {}
+                if suite.get('databaseId'):
+                    scope[suite['databaseId']] = {'id':suite['databaseId'], 'head_sha':head,
+                                                'app':{'id':(suite.get('app') or {}).get('databaseId')}}
+        rows = list(scope.values())
+        count = data.get('suite_count', len(rows))
         if 'suite_count_after' in data:
             with open(os.environ['SOURCE_TEST_LOG']) as stream:
                 reads = sum('/check-suites?' in line for line in stream)
-            if reads > 1: count = data['suite_count_after']
-        return {'total_count': count, 'check_suites': [{'id':101,'head_sha':head}]}
+            if reads > 1:
+                count = data['suite_count_after']
+                if count == 2 and len(rows) == 1:
+                    rows.append({'id':99999,'head_sha':head,'app':{'id':1001}})
+        if 'suite_sample' in data: rows = [data['suite_sample']]
+        return {'total_count': count, 'check_suites': rows}
     if data.get('latest_http'):
         print('HTTP ' + str(data['latest_http']), file=sys.stderr)
         raise SystemExit(1)
     if parsed.path.endswith('/check-runs'):
-        assert '--paginate' in sys.argv and '--slurp' in sys.argv
         query = parse_qs(parsed.query)
         assert query['filter'] == ['latest'] and 'status' not in query
         if 'latest_pages' in data:
@@ -68,8 +85,9 @@ def latest_check_response(data, endpoint):
             if 'data' in page and not page.get('errors'):
                 nodes.extend(page['data']['repository']['pullRequest']['commits']['nodes'][0]['commit']['statusCheckRollup']['contexts']['nodes'])
     if parsed.path.endswith('/status'):
-        rows = [{'node_id': n['id'], 'context': n['context'], 'state': n['state'].lower()}
-                for n in nodes if n.get('__typename') == 'StatusContext']
+        if 'status_pages' in data: return data['status_pages']
+        rows = [{'id': index + 1, 'node_id': n['id'], 'context': n['context'], 'state': n['state'].lower()}
+                for index, n in enumerate(nodes) if n.get('__typename') == 'StatusContext']
         return [{'sha': head, 'total_count': len(rows), 'statuses': rows}]
     rows = []
     for node in nodes:
@@ -82,4 +100,25 @@ def latest_check_response(data, endpoint):
                      'check_suite': {'id': suite.get('databaseId')}, 'status': node['status'].lower(),
                      'conclusion': str(node.get('conclusion')).lower()})
     return [{'total_count': len(rows), 'check_runs': rows}]
+
+def latest_check_response(data, endpoint):
+    from urllib.parse import urlsplit, parse_qs
+    pages = _latest_check_pages(data, endpoint)
+    if '--slurp' in sys.argv: return pages
+    if not isinstance(pages,list): pages = [pages]
+    index = int(parse_qs(urlsplit(endpoint).query).get('page',['1'])[0]) - 1
+    if index < len(pages): return pages[index]
+    field = 'check_runs' if '/check-runs?' in endpoint else 'check_suites' if '/check-suites?' in endpoint else 'statuses'
+    return {**pages[0], field:[]}
+
+def print_latest_response(data, args):
+    from urllib.parse import urlsplit, parse_qs
+    endpoint = args[1]
+    payload = latest_check_response(data, endpoint)
+    if '--include' in args:
+        pages = _latest_check_pages(data, endpoint)
+        index = int(parse_qs(urlsplit(endpoint).query).get('page',['1'])[0]) - 1
+        links = '\r\nLink: <https://api.github.com/ignored?page=next>; rel="next"' if isinstance(pages,list) and index + 1 < len(pages) else ''
+        print(data.get('latest_headers', 'HTTP/1.1 200 OK' + links + '\r\n\r\n'), end='')
+    print(json.dumps(payload))
 '''

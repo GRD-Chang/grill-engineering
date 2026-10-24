@@ -56,7 +56,7 @@ elif args[:2]==['api','graphql']:
     print(json.dumps({'data':{'repository':{'issue':issue}}}))
 elif args[:1]==['api'] and '/commits/' in args[1] and args[1].split('?')[0].endswith(('/check-runs','/check-suites','/status')):
     with open(os.environ['SOURCE_TEST_RESPONSES']) as f: data=json.load(f)
-    print(json.dumps(latest_check_response(data,args[1])))
+    print_latest_response(data,args)
 elif args[:1]==['api'] and args[1]=='repos/example/project/commits/main':
     print(json.dumps({'sha':'1111111111111111111111111111111111111111'}))
 elif args[:2]==['api','repos/example/project/pulls/17']:
@@ -411,7 +411,7 @@ def _current_run(*, app=1001, state='SUCCESS', head='2' * 40, identity='current-
     return {'__typename': 'CheckRun', 'id': identity, 'databaseId': 999 if identity == 'old-higher-999' else 2 if identity in {'other-app', 'wrong-app-high-999'} else 1, 'name': 'quality', 'isRequired': True,
             'status': 'QUEUED' if state == 'QUEUED' else 'COMPLETED', 'conclusion': state,
             'detailsUrl': 'https://example.invalid/check', 'title': 'Original check evidence',
-            'checkSuite': {'id': suite, 'databaseId': 101, 'commit': {'oid': head},
+            'checkSuite': {'id': suite, 'databaseId': 102 if app == 1002 or suite == 'new-suite' else 101, 'commit': {'oid': head},
                            'app': None if app is None else {'databaseId': app}, 'workflowRun': None}}
 
 
@@ -590,8 +590,9 @@ def test_latest_ref_scope_must_be_provably_within_service_suite_bound(tmp_path, 
     reader, _, path = _bound_reader(tmp_path, monkeypatch, {'': _rollup_page([_current_run()])})
     data = json.loads(path.read_text()); data['suite_count'] = count
     path.write_text(json.dumps(data))
-    with pytest.raises(GitHubReadError, match='1000 suites'):
+    with pytest.raises(GitHubReadError) as failure:
         read_required_check_facts(reader, 17, expected_head_sha='2' * 40)
+    assert ('1000 suites' if count == 1001 else 'count') in failure.value.message
 
 
 @pytest.mark.parametrize('damage', ['missing-page', 'wrong-app', 'wrong-head', 'wrong-suite', 'missing-app',
@@ -630,9 +631,10 @@ def test_latest_pages_are_combined_before_required_member_selection(tmp_path, mo
     facts = read_required_check_facts(reader, 17, expected_head_sha='2' * 40)
     assert normalize_required_checks(facts).result == 'pass'
     calls = [json.loads(line) for line in log.read_text().splitlines()]
-    request, = [call for call in calls if any('/check-runs?' in arg for arg in call)]
-    assert '--paginate' in request and '--slurp' in request
-    assert 'filter=latest' in request[1] and 'app_id=1001' in request[1]
+    requests = [call for call in calls if any('/check-runs?' in arg for arg in call)]
+    assert len(requests) == 2
+    assert 'page=1' in requests[0][1] and 'page=2' in requests[1][1]
+    assert all('filter=latest' in call[1] and 'app_id=1001' in call[1] for call in requests)
 
 
 @pytest.mark.parametrize('app', [None, -1])
@@ -660,3 +662,98 @@ def test_suite_coverage_change_during_latest_read_is_unproven(tmp_path, monkeypa
     path.write_text(json.dumps(data))
     with pytest.raises(GitHubReadError, match='suites changed'):
         read_required_check_facts(reader, 17, expected_head_sha='2' * 40)
+
+
+@pytest.mark.parametrize('kind', ['check-runs', 'statuses'])
+def test_duplicate_optional_page_member_cannot_hide_a_required_pending_member(tmp_path, monkeypatch, kind):
+    from agent_run.adapters.source import read_required_check_facts
+    if kind == 'check-runs':
+        pending = _current_run(identity='pending', state='QUEUED'); pending['databaseId'] = 101
+        nodes = [_current_run(), pending]
+        first = {'id':1,'name':'quality','app':{'id':1001},'head_sha':'2'*40,
+                 'check_suite':{'id':101},'status':'completed','conclusion':'success'}
+        rows = [first] + [{**first, 'id': i, 'name': f'optional-{i}'} for i in range(2, 101)]
+        field, key = 'check_runs', 'latest_pages'
+    else:
+        nodes = [{'__typename':'StatusContext','id':'current','context':'quality','state':'SUCCESS','isRequired':True},
+                 {'__typename':'StatusContext','id':'pending','context':'quality','state':'PENDING','isRequired':True}]
+        rows = [{'id':1,'node_id':'current','context':'quality','state':'success'}] + [
+            {'id':i,'node_id':f'optional-{i}','context':f'optional-{i}','state':'success'} for i in range(2,101)]
+        field, key = 'statuses', 'status_pages'
+    reader, _, path = _bound_reader(tmp_path, monkeypatch, {'': _rollup_page(nodes)}, classic=kind == 'statuses')
+    data = json.loads(path.read_text())
+    if kind == 'statuses': data['classic_checks'][0]['app_id'] = None
+    pending_row = ({**first, 'id':101,'status':'queued','conclusion':None} if kind == 'check-runs'
+                   else {'id':101,'node_id':'pending','context':'quality','state':'pending'})
+    data[key] = [{'total_count':101, 'sha':'2'*40, field:rows},
+                 {'total_count':101, 'sha':'2'*40, field:[pending_row]}]
+    path.write_text(json.dumps(data))
+    with pytest.raises(GitHubReadError):
+        read_required_check_facts(reader,17,expected_head_sha='2'*40)
+    data[key][1][field] = [rows[-1]]
+    path.write_text(json.dumps(data))
+    with pytest.raises(GitHubReadError, match='duplicate member IDs'):
+        read_required_check_facts(reader,17,expected_head_sha='2'*40)
+
+
+def test_suite_scope_without_member_identity_cannot_prove_latest_coverage(tmp_path, monkeypatch):
+    from agent_run.adapters.source import read_required_check_facts
+    reader, _, path = _bound_reader(tmp_path, monkeypatch, {'': _rollup_page([_current_run()])})
+    data = json.loads(path.read_text()); data['suite_sample'] = {'id':None,'head_sha':'2'*40,'app':{'id':1001}}
+    path.write_text(json.dumps(data))
+    with pytest.raises(GitHubReadError):
+        read_required_check_facts(reader,17,expected_head_sha='2'*40)
+
+
+@pytest.mark.parametrize('field', ['check_runs', 'check_suites', 'statuses'])
+@pytest.mark.parametrize('damage', ['duplicate', 'missing-id', 'missing-member', 'changed-count', 'foreign-head'])
+def test_all_latest_collection_members_are_validated_before_required_filter(tmp_path, monkeypatch, field, damage):
+    from agent_run.adapters.source import read_required_check_facts
+    if field == 'statuses':
+        nodes = [{'__typename':'StatusContext','id':'current','context':'quality','state':'SUCCESS','isRequired':True}]
+        rows = [{'id':1,'node_id':'current','context':'quality','state':'success'},
+                {'id':2,'node_id':'optional','context':'optional','state':'success'}]
+        key = 'status_pages'
+    else:
+        nodes = [_current_run()]
+        if field == 'check_runs':
+            row = {'id':1,'name':'quality','app':{'id':1001},'head_sha':'2'*40,
+                   'check_suite':{'id':101},'status':'completed','conclusion':'success'}
+            rows = [row, {**row,'id':2,'name':'optional'}]; key = 'latest_pages'
+        else:
+            row = {'id':101,'head_sha':'2'*40,'app':{'id':1001}}
+            rows = [row,{**row,'id':102}]; key = 'suite_pages'
+    reader, _, path = _bound_reader(tmp_path, monkeypatch, {'':_rollup_page(nodes)}, classic=field=='statuses')
+    data = json.loads(path.read_text())
+    if field == 'statuses': data['classic_checks'][0]['app_id'] = None
+    pages = [{'total_count':2,'sha':'2'*40,field:[rows[0]]}, {'total_count':2,'sha':'2'*40,field:[rows[1]]}]
+    if damage == 'duplicate': pages[1][field] = [rows[0]]
+    elif damage == 'missing-id': rows[1].pop('id')
+    elif damage == 'missing-member': pages[1][field] = []
+    elif damage == 'changed-count': pages[1]['total_count'] = 3
+    elif field == 'statuses': pages[1]['sha'] = '3'*40
+    else: rows[1]['head_sha'] = '3'*40
+    data[key] = pages; path.write_text(json.dumps(data))
+    with pytest.raises(GitHubReadError):
+        read_required_check_facts(reader,17,expected_head_sha='2'*40)
+
+
+def test_same_count_with_replaced_suite_identity_is_not_stable_coverage(tmp_path, monkeypatch):
+    from agent_run.adapters.source import read_required_check_facts
+    reader, _, path = _bound_reader(tmp_path, monkeypatch, {'':_rollup_page([_current_run()])})
+    data = json.loads(path.read_text())
+    data['suite_pages_after'] = [{'total_count':1,'check_suites':[{'id':102,'head_sha':'2'*40,'app':{'id':1001}}]}]
+    path.write_text(json.dumps(data))
+    with pytest.raises(GitHubReadError, match='suites changed'):
+        read_required_check_facts(reader,17,expected_head_sha='2'*40)
+
+
+@pytest.mark.parametrize('headers', ['', 'HTTP/1.1 200 OK\r\nLink: malformed\r\n\r\n',
+                                    'HTTP/1.1 200 OK\r\nLink: <https://example.invalid/2>; rel="next"\r\n\r\n'])
+def test_missing_or_contradictory_pagination_headers_cannot_end_collection(tmp_path, monkeypatch, headers):
+    from agent_run.adapters.source import read_required_check_facts
+    reader, _, path = _bound_reader(tmp_path, monkeypatch, {'':_rollup_page([_current_run()])})
+    data = json.loads(path.read_text()); data['latest_headers'] = headers
+    path.write_text(json.dumps(data))
+    with pytest.raises(GitHubReadError):
+        read_required_check_facts(reader,17,expected_head_sha='2'*40)

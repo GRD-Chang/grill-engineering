@@ -621,7 +621,7 @@ elif endpoint=='graphql':
     d.setdefault('links',[]).append({'ref':v['name'],'sha':v['oid']})
     result={'data':{'createLinkedBranch':{'linkedBranch':{'ref':{'name':v['name'],'target':{'oid':v['oid']}}}}}}
 elif '/commits/' in endpoint and endpoint.endswith(('/check-runs','/check-suites','/status')):
-    print(json.dumps(latest_check_response(d,args[1])));raise SystemExit(0)
+    print_latest_response(d,args);raise SystemExit(0)
 elif endpoint=='repos/example/project/commits/main': result={'sha':head('refs/heads/main')}
 elif endpoint=='repos/example/project/rulesets': result=[[]]
 elif '/protection/required_status_checks' in endpoint: result={'contexts':[],'checks':[]}

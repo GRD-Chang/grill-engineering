@@ -167,31 +167,95 @@ def _failed_check_evidence(reader: GhGitHubReader, repository: str, checks: list
         evidence.append(check)
     return evidence
 
-def _check_collection(reader: GhGitHubReader, endpoint: str, field: str, head: str) -> list[dict[str, Any]]:
-    import json
-    pages = _array(_json_response(_read(reader, ['api', endpoint, '--paginate', '--slurp'])))
-    if not pages or len(json.dumps(pages).encode()) > MATERIAL_LIMIT:
-        raise GitHubReadError('github_read_limit', 'Latest-check collection is missing or oversized')
-    count = _object(pages[0]).get('total_count')
-    if type(count) is not int or count < 0:
-        raise GitHubReadError('github_invalid_response', 'Latest-check count is missing')
+def _check_collection(reader: GhGitHubReader, endpoint: str, field: str, head: str, *,
+                      app: int | None = None, suites: Mapping[int, int] | None = None,
+                      member_ids: set[int] | None = None) -> list[dict[str, Any]]:
+    """Validate the entire bounded collection before any required-name filter."""
     rows: list[dict[str, Any]] = []
-    for page in pages:
-        page = _object(page)
-        if page.get('total_count') != count or field == 'statuses' and page.get('sha') != head:
-            raise GitHubReadError('github_read_failed', 'Latest-check collection changed during pagination')
-        rows.extend(_object(row) for row in _array(page.get(field)))
-    if len(rows) != count:
-        raise GitHubReadError('github_read_failed', 'Latest-check pagination is incomplete')
-    return rows
+    identities = set() if member_ids is None else member_ids
+    nodes: set[str] = set()
+    contexts_seen: set[str] = set()
+    count: int | None = None
+    page_number, size = 1, 0
+    while True:
+        separator = '&' if '?' in endpoint else '?'
+        response = _read(reader, ['api', endpoint + separator + 'page=' + str(page_number), '--include'])
+        headers, separator_line, body = response.stdout.replace('\r\n', '\n').partition('\n\n')
+        lines = headers.splitlines()
+        if not separator_line or not lines or not re.fullmatch(r'HTTP/[0-9.]+ 200(?: .*)?', lines[0]):
+            raise GitHubReadError('github_check_currentness_unproven', 'Latest-check pagination headers are unavailable')
+        links = []
+        for line in lines[1:]:
+            key, colon, value = line.partition(':')
+            if not colon:
+                raise GitHubReadError('github_check_currentness_unproven', 'Latest-check pagination headers are malformed')
+            if key.lower() == 'link':
+                links.extend(value.strip().split(','))
+        relations = []
+        for link in links:
+            relation = re.fullmatch(r'\s*<[^>]+>;\s*rel="([a-z]+)"\s*', link)
+            if relation is None:
+                raise GitHubReadError('github_check_currentness_unproven', 'Latest-check pagination link is malformed')
+            relations.append(relation[1])
+        if len(relations) != len(set(relations)):
+            raise GitHubReadError('github_check_currentness_unproven', 'Latest-check pagination links are ambiguous')
+        has_next = 'next' in relations
+        page = _object(_json_response(subprocess.CompletedProcess(response.args, 0, body, response.stderr)))
+        size += len(response.stdout.encode())
+        if size > MATERIAL_LIMIT:
+            raise GitHubReadError('github_read_limit', 'Latest-check collection exceeds the material limit')
+        observed = page.get('total_count')
+        if type(observed) is not int or observed < 0 or count is not None and observed != count:
+            raise GitHubReadError('github_check_currentness_unproven', 'Latest-check count is missing or changed')
+        count = observed
+        if field == 'check_suites' and not 0 < count <= 1000:
+            raise GitHubReadError('github_check_currentness_unproven', 'Latest-check coverage cannot be proven within 1000 suites')
+        if field == 'statuses' and page.get('sha') != head:
+            raise GitHubReadError('github_check_currentness_unproven', 'Latest status collection has another head')
+        chunk = _array(page.get(field))
+        for value in chunk:
+            row = _object(value)
+            identity = row.get('id')
+            if type(identity) is not int or identity <= 0 or identity in identities:
+                raise GitHubReadError('github_check_currentness_unproven', 'Latest-check collection has missing or duplicate member IDs')
+            identities.add(identity)
+            if field == 'statuses':
+                node = row.get('node_id')
+                if not isinstance(node, str) or not node.strip() or node in nodes:
+                    raise GitHubReadError('github_check_currentness_unproven', 'Latest status collection has missing or duplicate node IDs')
+                nodes.add(node)
+                name = row.get('context')
+            else:
+                provider = _object(row.get('app')).get('id')
+                if (row.get('head_sha') != head or type(provider) is not int or provider <= 0
+                        or app is not None and provider != app):
+                    raise GitHubReadError('github_check_currentness_unproven', 'Latest-check member has another head or App')
+                name = row.get('name') if field == 'check_runs' else None
+                if field == 'check_runs':
+                    suite = _object(row.get('check_suite')).get('id')
+                    if type(suite) is not int or suites is None or suites.get(suite) != provider:
+                        raise GitHubReadError('github_check_currentness_unproven', 'Latest check is outside the complete suite scope')
+            if field != 'check_suites' and (not isinstance(name, str) or not name.strip()):
+                raise GitHubReadError('github_check_currentness_unproven', 'Latest-check context is missing')
+            if field == 'statuses':
+                if name in contexts_seen:
+                    raise GitHubReadError('github_check_currentness_unproven', 'Latest status collection has duplicate current contexts')
+                contexts_seen.add(_text(name))
+            rows.append(row)
+        if (len(rows) > count or has_next and (not chunk or len(rows) >= count)
+                or not has_next and len(rows) != count):
+            raise GitHubReadError('github_check_currentness_unproven', 'Latest-check pagination is incomplete or its count changed')
+        if not has_next:
+            return rows
+        page_number += 1
 
 
 def _latest_checks(reader: GhGitHubReader, repository: str, head: str,
                    checks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Filter rollup members using server latest views, never client ID/time order.
 
-    The ref check-runs API only covers 1000 suites. Inspect its count before and
-    after; above that bound we refuse instead of scanning unbounded history.
+    The ref check-runs API only covers 1000 suites. Verify the complete bounded
+    suite identity set before and after; refuse larger/unproven collections.
     """
     from urllib.parse import urlencode
     import json
@@ -199,17 +263,12 @@ def _latest_checks(reader: GhGitHubReader, repository: str, head: str,
     runs = [row for row in checks if row['kind'] == 'CheckRun']
     result: list[dict[str, Any]] = []
 
-    def suite_count() -> int:
-        page = _object(_json_response(_read(reader, ['api', prefix + '/check-suites?per_page=1'])))
-        count = page.get('total_count')
-        if type(count) is not int or not 0 < count <= 1000:
-            raise GitHubReadError('github_check_currentness_unproven', 'Latest-check suite coverage cannot be proven within 1000 suites')
-        sample = _array(page.get('check_suites'))
-        if len(sample) != 1 or _object(sample[0]).get('head_sha') != head:
-            raise GitHubReadError('github_check_currentness_unproven', 'Suite coverage has no exact head witness')
-        return count
+    def suite_scope() -> dict[int, int]:
+        rows = _check_collection(reader, prefix + '/check-suites?per_page=100', 'check_suites', head)
+        return {row['id']: row['app']['id'] for row in rows}
 
-    before = suite_count() if runs else None
+    before = suite_scope() if runs else {}
+    latest_run_ids: set[int] = set()
     for app in sorted({row['app_id'] for row in runs}):
         group = [row for row in runs if row['app_id'] == app]
         by_id = {}
@@ -222,7 +281,7 @@ def _latest_checks(reader: GhGitHubReader, repository: str, head: str,
                 raise GitHubReadError('github_check_currentness_unproven', 'Rollup has conflicting run identities')
             by_id[run_id] = row
         endpoint = prefix + '/check-runs?' + urlencode({'filter': 'latest', 'app_id': app, 'per_page': 100})
-        latest = _check_collection(reader, endpoint, 'check_runs', head)
+        latest = _check_collection(reader, endpoint, 'check_runs', head, app=app, suites=before, member_ids=latest_run_ids)
         names: set[str] = set()
         matched: set[str] = set()
         for run in latest:
@@ -246,7 +305,7 @@ def _latest_checks(reader: GhGitHubReader, repository: str, head: str,
             raise GitHubReadError('github_read_limit', 'Latest-check evidence exceeds the material limit')
         if matched != {row['name'] for row in group}:
             raise GitHubReadError('github_check_currentness_unproven', 'Latest view is missing an observed required context')
-    if runs and suite_count() != before:
+    if runs and suite_scope() != before:
         raise GitHubReadError('github_check_currentness_unproven', 'Check suites changed during observation')
     statuses = [row for row in checks if row['kind'] == 'StatusContext']
     if statuses:
