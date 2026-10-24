@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 from collections.abc import Mapping
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from agent_run.adapters.auth.runner_transport import runner_options
 from agent_run.adapters.github_commands import run_read_command
@@ -45,12 +45,15 @@ class GhGitHubReader:
         default_branch = _string(default_ref, "name")
         commit = self._gh_json(
             "api",
-            f"repos/{name_with_owner}/commits/{default_branch}",
+            f"repos/{name_with_owner}/git/ref/heads/{quote(default_branch, safe='')}",
         )
+        if (_string(commit, "ref") != f"refs/heads/{default_branch}"
+                or _string(_mapping(commit, "object"), "type") != "commit"):
+            raise GitHubReadError("github_invalid_response", "Default branch ref has another identity or type")
         self._repository = Repository(
             name_with_owner=name_with_owner,
             default_branch=default_branch,
-            default_head_sha=_string(commit, "sha"),
+            default_head_sha=_string(_mapping(commit, "object"), "sha"),
         )
         return self._repository
 

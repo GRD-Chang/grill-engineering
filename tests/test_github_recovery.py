@@ -26,7 +26,7 @@ def test_github_reader_retries_transient_timeout(
                 return subprocess.CompletedProcess(
                     arguments, 1, "", "dial tcp: i/o timeout"
                 )
-        return _repository_response()
+        return _repository_response(arguments)
 
     monkeypatch.setattr('agent_run.adapters.github_commands._run_bounded_command', fake_run)
     monkeypatch.setattr('agent_run.adapters.github_commands.time.sleep', lambda _seconds: None)
@@ -149,7 +149,7 @@ def test_github_reader_retries_transient_http_status(
                 return subprocess.CompletedProcess(
                     arguments, 1, "", "HTTP 503: upstream unavailable"
                 )
-        return _repository_response()
+        return _repository_response(arguments)
 
     monkeypatch.setattr('agent_run.adapters.github_commands._run_bounded_command', fake_run)
     monkeypatch.setattr('agent_run.adapters.github_commands.time.sleep', lambda _seconds: None)
@@ -159,16 +159,8 @@ def test_github_reader_retries_transient_http_status(
     assert attempts == 3
 
 
-def _repository_response() -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess(
-        ["gh"],
-        0,
-        json.dumps(
-            {
-                "nameWithOwner": "example/project",
-                "defaultBranchRef": {"name": "main"},
-                "sha": "abc123",
-            }
-        ),
-        "",
-    )
+def _repository_response(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+    data = ({"nameWithOwner": "example/project", "defaultBranchRef": {"name": "main"}}
+            if arguments[1] == "repo" else
+            {"ref": "refs/heads/main", "object": {"type": "commit", "sha": "abc123"}})
+    return subprocess.CompletedProcess(arguments, 0, json.dumps(data), "")
