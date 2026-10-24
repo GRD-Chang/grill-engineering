@@ -4,6 +4,7 @@ from copy import deepcopy
 import json
 import os
 from pathlib import Path
+import shlex
 import sys
 import subprocess
 import tempfile
@@ -12,6 +13,61 @@ from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
 import ci_evidence as evidence
+
+
+class CurrentCollectionTests(unittest.TestCase):
+    """Use real product collection, independently of the receipt doubles below."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.nodes = evidence.collect_nodeids()
+
+    def test_consumed_cli_behaviors_are_in_the_actual_product_collection(self):
+        expected = {
+            "tests/test_kernel_installed_parent_only.py::test_installed_public_parent_only_reaches_approval_close_cleanup_and_normal_host_exit",
+            "tests/test_kernel_query_cli.py::test_parent_selector_works_in_a_repo_and_across_directories",
+            "tests/test_doctor_readiness.py::test_doctor_cli_separates_installation_and_execution_readiness",
+            "tests/test_kernel_query_cli.py::test_history_keeps_raw_feedback_and_pages_without_losing_events",
+        }
+        scope = evidence.contract_scope(self.nodes)
+        self.assertEqual({node.partition("[")[0] for node in scope}, expected)
+        for base in expected:
+            with self.subTest(base=base), self.assertRaisesRegex(ValueError, "Missing consumed"):
+                evidence.contract_scope([node for node in self.nodes if node.partition("[")[0] != base])
+
+    def test_default_make_entry_collects_actual_current_tests(self):
+        result = subprocess.run(
+            ["make", "test", f"PYTHON={sys.executable}", "PYTEST_ARGS=--collect-only -q"],
+            cwd=evidence.PRODUCT_ROOT, capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        nodes = [line for line in result.stdout.splitlines() if line.startswith("tests/") and "::" in line]
+        self.assertTrue(nodes)
+        self.assertEqual(len(nodes), len(set(nodes)))
+        self.assertTrue(set(nodes) <= set(self.nodes))
+
+    def test_named_make_groups_only_select_collected_current_targets(self):
+        for group in ("policy", "state", "prompts", "locator", "github", "delivery", "run", "executor"):
+            output = subprocess.check_output(
+                ["make", "-n", "test-" + group, f"PYTHON={sys.executable}"],
+                cwd=evidence.PRODUCT_ROOT, text=True, timeout=10,
+            )
+            command = next(shlex.split(line) for line in output.splitlines() if " -m pytest " in line)
+            targets = [value for value in command[command.index("pytest") + 1:] if value.startswith("tests/")]
+            self.assertTrue(targets, group)
+            for target in targets:
+                with self.subTest(group=group, target=target):
+                    self.assertTrue(any(node.partition("[")[0] == target or node.startswith(target + "::")
+                                        for node in self.nodes), target)
+
+    def test_broken_selection_fails_instead_of_running_the_complete_suite(self):
+        result = subprocess.run(
+            ["make", "test", f"PYTHON={sys.executable}", "TEST_SCOPE=false", "PYTEST_ARGS=--collect-only -q"],
+            cwd=evidence.PRODUCT_ROOT, capture_output=True, text=True, timeout=30,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(".invalid-test-selection", result.stdout + result.stderr)
+        self.assertNotIn("::", result.stdout)
 
 
 class EvidenceTests(unittest.TestCase):
@@ -34,6 +90,7 @@ class EvidenceTests(unittest.TestCase):
         self.nodes = [
             evidence.CONTRACT_TESTS[0], evidence.CONTRACT_TESTS[1],
             *[evidence.CONTRACT_TESTS[2] + f"[{value}]" for value in ("a", "b", "c", "d")],
+            *evidence.CONTRACT_TESTS[3:],
             "tests/test_sample.py::TestGroup::test_value[a::b]",
             "tests/test_sample.py::test_plain",
         ]

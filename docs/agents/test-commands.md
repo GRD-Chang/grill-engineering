@@ -14,17 +14,19 @@ pytest 不自动联网补包，缺少或损坏时明确失败并提示准备命�
 不能仅凭改动文件名判断已经覆盖所有影响。单个用例仍可直接运行
 `python -m pytest tests/文件.py::用例名 -q`。
 
-`make test` 在一次 pytest 中运行下表前四组快速回归的用例并集，重叠的 StateStore/Locator 用例只执行一次。
-Policy、State、Prompts 按完整模块选择，Locator 沿用原有关键词筛选；各组独立入口和 `make test-report` 继续可用。
+`make test` 在一次 pytest 中运行下表前四组快速回归的用例并集，重复目标只选择一次。
+当前模块及 Locator 精确用例统一列在 `.github/ci/test_scope.py`；不再靠旧模块名或关键词筛选。
+CI 工具回归将该清单和 consumed CLI 合同与真实完整 collection 对照，缺失消费者明确失败。
+各组独立入口和 `make test-report` 继续可用。
 交付、Run、Executor、安装器等重型测试需显式选择模块或运行 `make test-full`。
 快速回归通过仅代表这四组通过；修改重型模块时仍需运行相关用例，不能仅凭默认入口判定修改正确。
 
 | 入口 | 验证范围 | 需要补充的直接影响 |
 | --- | --- | --- |
-| `make test-policy` | Delivery Policy、Review Budget | 策略改变时补 Ticket / Parent-only / Run Repair 的实际调用路径 |
-| `make test-state` | StateStore、Scope Revision | 状态结构或持久化语义改变时补 Controller、恢复及相关生命周期 |
-| `make test-prompts` | 最终模型可见的 Worker Prompt 合同 | 请求结构、执行方式改变时补 Codex backend 和实际调用方 |
-| `make test-locator` | Locator、Human Run Selector 与其持久化回归 | 登记时机改变时补 Controller；修改共享选择逻辑时补相关 CLI 动作 |
+| `make test-policy` | 当前 Policy 值、稀疏覆盖与冻结更新 | 策略改变时补 Ticket / Parent-only / Final 的实际预算消费路径 |
+| `make test-state` | 当前 SQLite preflight、Task 准入、错误脱敏 | 状态结构或持久化语义改变时补 Core、恢复及相关生命周期 |
+| `make test-prompts` | 当前角色上下文与冻结 Prompt 的公开预览 | 请求结构、执行方式改变时补真实 Codex backend 和实际调用方 |
+| `make test-locator` | 当前 Repository / Parent / Run 与准确 state 目录选择 | 登记时机改变时补 Task publication；修改共享选择逻辑时补相关 CLI 动作 |
 | `make test-github` | GitHub adapter、Required Checks、外部监督 | 外部契约改变时补 Delivery / Publication 调用方 |
 | `make test-delivery` | Ticket、Parent-only、公开交付流程 | 共享 Engine 变化时补 Run Repair 和恢复路径 |
 | `make test-run` | Run 生命周期、Acceptance、Repair、Publication、任务控制 | Controller / StateStore / CLI 等直接调用方 |

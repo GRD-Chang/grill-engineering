@@ -346,6 +346,30 @@ def test_stopped_run_shows_explicit_recovery_without_claiming_executor_exit(tmp_
     assert _snapshot(tmp_path) == before
 
 
+def test_parent_selector_works_in_a_repo_and_across_directories(tmp_path: Path, git_repo: Path) -> None:
+    subprocess.run(["git", "remote", "add", "origin", "https://github.com/example/project.git"],
+                   cwd=git_repo, check=True, capture_output=True)
+    _create(tmp_path / "catalog", repository_root=git_repo)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    before = _snapshot(tmp_path / "catalog")
+    command = [sys.executable, "-m", "agent_run", "status", "--parent", "1",
+               "--data-root", str(tmp_path / "catalog"), "--json"]
+    for cwd, arguments in ((git_repo, []), (outside, ["--repo", "EXAMPLE/project"])):
+        result = subprocess.run([*command, *arguments], cwd=cwd, text=True,
+                                capture_output=True, check=False, timeout=15)
+        assert result.returncode == 0, result.stdout + result.stderr
+        document = json.loads(result.stdout)
+        assert document["run_id"] == "run-query"
+        assert document["repository"] == "example/project" and document["parent"]["number"] == 1
+        assert result.stderr == ""
+    missing = subprocess.run(command, cwd=outside, text=True, capture_output=True,
+                             check=False, timeout=15)
+    assert missing.returncode == 2
+    assert json.loads(missing.stdout)["diagnostics"][0]["code"] == "workspace_required"
+    assert _snapshot(tmp_path / "catalog") == before
+
+
 def test_parent_selector_rejects_multiple_runs_and_exact_id_remains_available(
     tmp_path: Path, capsys,
 ) -> None:
