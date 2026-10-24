@@ -3808,11 +3808,17 @@ class Kernel:
     def _merge_receipt_matches(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, row: sqlite3.Row, result: dict[str, Any]) -> bool:
         pr, commit = result["pr"], result["commit"]
         payload = json.loads(tx.get(row["payload_id"], job["id"]))
+        expected, actual = payload["commit_message"], result["raw"].get("commit_message")
+        # Git/API may add one terminating LF to an unterminated message.
+        # Body content, explicit newlines and ordinary merge policy stay exact.
+        message_matches = isinstance(actual, str) and (actual == expected
+                           or not expected.endswith("\n") and actual == expected + "\n")
         return bool(result["disposition"] == "target" and pr and commit and pr["number"] == row["pr_number"]
                     and self._pr_identity(run, row, pr)
                     and pr["state"] == "MERGED" and pr["actor"] == row["actor"] and pr["head"]["sha"] == row["after_sha"]
                     and pr["base"]["sha"] == row["before_sha"] and pr["merged"] == commit and commit["tree"] == job["publication_tree"]
-                    and result["raw"].get("parents") == payload["parents"])
+                    and result["raw"].get("parents") == payload["parents"]
+                    and (payload["method"] != "squash" or message_matches))
 
     def _final_merge_intent(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row) -> sqlite3.Row | None:
         """The frozen grant survives the bounded lifetime of an Action observer."""

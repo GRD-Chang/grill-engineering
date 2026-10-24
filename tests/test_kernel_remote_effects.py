@@ -206,6 +206,7 @@ def test_original_merge_ack_loss_settles_after_later_target_append(tmp_path, mon
     assert result.disposition == "target" and result.raw["write_returncode"] == 1
     assert result.commit.tree == push.candidate.tree
     assert result.raw["parents"] == parents and result.pr.merged == result.commit
+    assert result.raw["commit_message"] == merge.payload["commit_message"] + "\n"
     document = json.loads(state.read_text())
     for field in ("merged_by", "user"):
         original = document["prs"][0][field]
@@ -224,6 +225,7 @@ def test_original_merge_ack_loss_settles_after_later_target_append(tmp_path, mon
     assert resumed.disposition == "target" and resumed.commit == result.commit
     assert resumed.raw["target_head"] == later.sha and resumed.raw["live_pr_base"] == later.sha
     assert resumed.pr.base.sha == parents[0] == push.base.sha
+    assert resumed.raw["commit_message"] == result.raw["commit_message"]
     actual = [json.loads(line) for line in calls.read_text().splitlines()]
     assert sum(c[1].endswith("/merge") and "PUT" in c for c in actual) == 1
 
@@ -627,7 +629,8 @@ elif endpoint=='repos/example/project/rulesets': result=[[]]
 elif '/protection/required_status_checks' in endpoint: result={'contexts':[],'checks':[]}
 elif '/git/commits/' in endpoint:
     sha=endpoint.rsplit('/',1)[1]
-    result={'sha':sha,'tree':{'sha':git('show','-s','--format=%T',sha)},'parents':[{'sha':x} for x in git('show','-s','--format=%P',sha).split()]}
+    raw=subprocess.run(['git','--git-dir',os.environ['REMOTE_TEST_BARE'],'cat-file','commit',sha],capture_output=True,check=True).stdout.decode('utf-8')
+    result={'sha':sha,'tree':{'sha':git('show','-s','--format=%T',sha)},'parents':[{'sha':x} for x in git('show','-s','--format=%P',sha).split()],'message':raw.partition('\n\n')[2]}
 elif '/compare/' in endpoint:
     a,b=endpoint.rsplit('/',1)[1].split('...')
     r=subprocess.run(['git','--git-dir',os.environ['REMOTE_TEST_BARE'],'merge-base','--is-ancestor',a,b])
@@ -655,7 +658,7 @@ elif endpoint.startswith('repos/example/project/pulls'):
             parents=[pr['base']['sha']]+([] if body['merge_method']=='squash' else [pr['head']['sha']])
             command=['commit-tree',git('show','-s','--format=%T',pr['head']['sha'])]
             for parent in parents:command+=['-p',parent]
-            message=body['commit_title']+'\n'+body.get('commit_message','')
+            message=body['commit_title']+('\n\n'+body['commit_message'] if body.get('commit_message') else '')
             sha=git(*command,input=message+'\n')
             git('update-ref','refs/heads/'+pr['base']['ref'],sha,pr['base']['sha'])
             pr.update(state='closed',merged=True,merge_commit_sha=sha,merged_by={'login':'publisher'})

@@ -148,7 +148,9 @@ class OfflineGit:
         self._owned()
         sha = self._oid(sha)
         row = self._run(self.remote, "show", "--no-patch", "--format=%H %T %P", sha + "^{commit}").stdout.split()
-        return {"sha": row[0], "tree": {"sha": row[1]}, "parents": [{"sha": parent} for parent in row[2:]]}
+        raw = self._run(self.remote, "cat-file", "commit", sha).stdout
+        return {"sha": row[0], "tree": {"sha": row[1]}, "parents": [{"sha": parent} for parent in row[2:]],
+                "message": raw.partition("\n\n")[2]}
 
     def compare(self, base: str, head: str) -> dict[str, Any]:
         self._owned()
@@ -196,7 +198,7 @@ class OfflineGit:
         args = ["commit-tree", self._oid(tree)]
         for parent in parents:
             args.extend(("-p", parent))
-        message = commit_title + ("\n" + commit_message if commit_message else "")
+        message = commit_title + ("\n\n" + commit_message if commit_message else "")
         merged = self._run(self.remote, *args, input=message + "\n").stdout.strip()
         self._publish_merge(base_ref, base, head_ref, head, merged)
         return self._oid(merged)

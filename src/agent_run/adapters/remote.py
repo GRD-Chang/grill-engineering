@@ -191,7 +191,7 @@ class RemoteEffects:
             response = self._write(endpoint, method, body, authorize, check_prior)
         elif operation == "merge":
             message = _text(effect.payload["commit_message"])
-            title, _, message_body = message.partition("\n")
+            title, _, message_body = message.partition("\n\n")
             response = self._write(f"repos/{self.repository}/pulls/{effect.pr_number}/merge", "PUT",
                 {"sha": _text(effect.after_sha), "merge_method": effect.payload["method"],
                  "commit_title": title, "commit_message": message_body}, authorize, check_prior)
@@ -747,11 +747,13 @@ class RemoteEffects:
             return False
         return replace(after, pr=replace(after.pr, base=before.pr.base)) == before
 
-    def _commit(self, sha: str) -> tuple[Commit, tuple[str, ...]]:
+    def _commit(self, sha: str) -> tuple[Commit, tuple[str, ...], str | None]:
         data = self._api(f"repos/{self.repository}/git/commits/{_sha(sha)}")
         if data["sha"] != sha:
             raise ValueError("foreign commit response")
-        return Commit(sha, _sha(data["tree"]["sha"])), tuple(_sha(p["sha"]) for p in data["parents"])
+        message = data.get("message")
+        return (Commit(sha, _sha(data["tree"]["sha"])), tuple(_sha(p["sha"]) for p in data["parents"]),
+                message if isinstance(message, str) else None)
 
     def _pr(self, data: Mapping[str, Any]) -> PullRequest:
         head, base = data["head"], data["base"]
@@ -760,7 +762,7 @@ class RemoteEffects:
         merged = None
         base_commit = self._commit(_sha(base["sha"]))[0]
         if data.get("merged"):
-            merged, parents = self._commit(_sha(data["merge_commit_sha"]))
+            merged, parents, _ = self._commit(_sha(data["merge_commit_sha"]))
             if not parents:
                 raise ValueError("merged commit has no original base parent")
             # A merged receipt describes the original Git event, not a later
@@ -812,7 +814,7 @@ class RemoteEffects:
             return EffectResult("prior" if prior is not None and pr.title == prior["title"] and pr.body == prior["body"] else "third", pr=pr)
         source, target = self._remote_heads(effect.source_ref, effect.target_ref)
         if pr.state == "MERGED" and pr.merged is not None:
-            commit, parents = self._commit(pr.merged.sha)
+            commit, parents, message = self._commit(pr.merged.sha)
             merger = _login(data.get("merged_by"))
             if merger is None:
                 return EffectResult("unknown", pr=pr, raw={"diagnostic": "Merge actor is not observable"})
@@ -825,7 +827,12 @@ class RemoteEffects:
                          and compared["merge_base_commit"]["sha"] == commit.sha)
             if not contained or self._remote_head(effect.target_ref) != target:
                 return EffectResult("unknown", pr=pr)
-            return EffectResult("target", commit=commit, pr=pr, raw={"parents": list(parents), "target_head": target, "live_pr_base": data["base"]["sha"]})
+            raw = {"parents": list(parents), "target_head": target, "live_pr_base": data["base"]["sha"],
+                   "commit_message": message}
+            if effect.payload["method"] == "squash" and message is None:
+                return EffectResult("unknown", commit=commit, pr=pr,
+                    raw={**raw, "diagnostic": "Full squash commit message is not observable"})
+            return EffectResult("target", commit=commit, pr=pr, raw=raw)
         return EffectResult("prior" if self._pr_target(effect, pr, source, target) == effect.base
                             and source == effect.after_sha and target == effect.before_sha else "third", pr=pr)
 
