@@ -7,7 +7,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from typing import BinaryIO, Iterator
+from typing import Callable, Iterator
 
 from agent_run.config.paths import app_data_root
 from agent_run.contracts.task import TaskKey
@@ -22,28 +22,30 @@ def task_path(task: TaskKey) -> Path:
 
 
 @contextmanager
-def task_lock(task: TaskKey, *, wait: bool = True) -> Iterator[BinaryIO]:
-    """Own the existing Task admission lock, independently of its database."""
+def task_lock(task: TaskKey, *, wait: bool = True) -> Iterator[Callable[[], None]]:
+    """Own the Task lock; the yielded callback transfers it to process lifetime."""
     path = task_path(task)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     descriptor = os.open(path.with_suffix(".lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(descriptor, "rb") as lock:
+    process_owned = False
+    def retain_until_exit() -> None:
+        nonlocal process_owned
+        process_owned = True
+    try:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+            fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
         except BlockingIOError as error:
             raise KernelError("task_admission_busy") from error
-        yield lock
+        yield retain_until_exit
+    finally:
+        if not process_owned:
+            os.close(descriptor)
 
 
 @contextmanager
 def locked_task(task: TaskKey, *, wait: bool = True) -> Iterator[Path]:
     with task_lock(task, wait=wait):
         yield task_path(task)
-
-
-def retain_task_lock_until_exit(lock: BinaryIO) -> None:
-    """Keep this existing lock process-owned; dup is non-inheritable on Python 3."""
-    os.dup(lock.fileno())
 
 
 def read_task(path: Path) -> tuple[str, Path] | None:

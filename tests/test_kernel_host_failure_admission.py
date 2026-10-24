@@ -188,13 +188,14 @@ def test_fatal_host_drain_rejects_new_and_repeated_resume_and_preserves_settleme
         assert any("not durably" in note for note in original_error.__notes__)
 
 
-def test_unrecorded_shutdown_retains_task_admission_until_the_actual_host_exits(tmp_path):
+@pytest.mark.parametrize("dup_unavailable", [False, True])
+def test_unrecorded_shutdown_retains_task_admission_until_the_actual_host_exits(tmp_path, dup_unavailable):
     kernel, _ = task_run(tmp_path, "unrecorded-shutdown")
     request = kernel.admit_host("start", kind="run", command=("controlled-host",),
         environment_carrier=tmp_path / "carrier", preflight=lambda: None)
     assert kernel.dispatch_host(request)
     execution = kernel.host_request("start")
-    script = '''import json,sys,os
+    script = '''import errno,json,sys,os
 from contextlib import contextmanager
 from pathlib import Path
 from agent_run.core.kernel import Kernel
@@ -207,6 +208,20 @@ kernel=Kernel(Path(sys.argv[1]))
 execution=Execution(sys.argv[2],sys.argv[3],int(sys.argv[4]))
 actual=kernel.storage.transaction
 error=OSError('original Host failure')
+dup_calls=[]
+if sys.argv[5]=='True':
+    def unavailable_dup(fd):
+        dup_calls.append(fd)
+        raise OSError(errno.EMFILE,'controlled descriptor allocation failure')
+    os.dup=unavailable_dup
+lock_path=task_path(TaskKey(Path(sys.argv[1]).parent/'repository','example/project',1)).with_suffix('.lock')
+def held_descriptors():
+    held=[]
+    for fd in Path('/proc/self/fd').iterdir():
+        try:
+            if fd.readlink()==lock_path: held.append(int(fd.name))
+        except FileNotFoundError: pass
+    return held
 with kernel.executor_scope(execution) as close_admission:
     @contextmanager
     def unavailable(*,write=True):
@@ -214,18 +229,16 @@ with kernel.executor_scope(execution) as close_admission:
         with actual(write=False) as tx: yield tx
     kernel.storage.transaction=unavailable
     close_admission(error)
+    original_descriptors=held_descriptors()
 kernel.storage.transaction=actual
-lock_path=task_path(TaskKey(Path(sys.argv[1]).parent/'repository','example/project',1)).with_suffix('.lock')
-retained=[]
-for fd in Path('/proc/self/fd').iterdir():
-    try:
-        if fd.readlink()==lock_path: retained.append({'inheritable':os.get_inheritable(int(fd.name))})
-    except FileNotFoundError: pass
-print(json.dumps({'type':type(error).__name__,'message':str(error),'notes':error.__notes__,'retained':retained}),flush=True)
+retained=held_descriptors()
+print(json.dumps({'type':type(error).__name__,'message':str(error),'notes':error.__notes__,
+    'original_descriptors':original_descriptors,'retained':retained,
+    'inheritable':[os.get_inheritable(fd) for fd in retained],'dup_calls':dup_calls}),flush=True)
 assert sys.stdin.readline()=='exit\\n'
 '''
     child = subprocess.Popen([sys.executable, "-c", script, str(kernel.storage.path),
-        execution.run_id, execution.owner, str(execution.epoch)],
+        execution.run_id, execution.owner, str(execution.epoch), str(dup_unavailable)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
         assert child.stdout is not None
@@ -244,8 +257,6 @@ assert sys.stdin.readline()=='exit\\n'
         assert select.select([child.stdout], [], [], 8)[0]
         result = json.loads(child.stdout.readline())
         assert result["type"] == "OSError" and result["message"] == "original Host failure"
-        assert len(result["notes"]) == 2 and all("not durably" in note for note in result["notes"])
-        assert result["retained"] == [{"inheritable": False}]
         # Storage is available to a separate actor, but the original failed
         # Host is still alive. Neither a new nor repeated command may queue.
         assert child.poll() is None
@@ -253,6 +264,11 @@ assert sys.stdin.readline()=='exit\\n'
             kernel.control_host(request, "resume", "during-unrecorded-close", subject="parent")
         with pytest.raises(KernelError, match="task_admission_busy"):
             kernel.control_host(request, "stop", "prepare-stop", subject="parent")
+        assert len(result["notes"]) == 2 and all("not durably" in note for note in result["notes"])
+        assert len(result["original_descriptors"]) == 1
+        assert result["retained"] == result["original_descriptors"]
+        assert result["inheritable"] == [False]
+        assert result["dup_calls"] == []
         with kernel.storage.transaction(write=False) as tx:
             assert tx.one("SELECT epoch FROM runs")[0] == execution.epoch
             assert not tx.rows("SELECT id FROM actions WHERE id='during-unrecorded-close'")

@@ -16,7 +16,7 @@ import math
 from pathlib import Path
 import sqlite3
 import time
-from typing import Any, BinaryIO, Callable, Iterator, Literal, Mapping
+from typing import Any, Callable, Iterator, Literal, Mapping
 from threading import RLock
 from uuid import uuid4
 
@@ -34,7 +34,7 @@ from agent_run.storage.sqlite import CURRENT_LIMIT, Storage, Transaction
 from agent_run.core.attempt_continuation import (AttemptContinuationBasis, ContinuationFacts,
                                    bind_attempt_continuation, load_continuation)
 from agent_run.contracts.policy_values import checkpoint_policy
-from agent_run.storage.tasks import bind_task, read_task, retain_task_lock_until_exit, task_lock, task_path
+from agent_run.storage.tasks import bind_task, read_task, task_lock, task_path
 from agent_run.storage.admission import locked_admission
 from agent_run.core.operation_contract import (OperationBinding, OperationState, ReadUnavailable, ReadFence,
                                  RequirementsRead, DeliveryObservation, DeliveryRead, DeliveryFacts,
@@ -2016,19 +2016,19 @@ class Kernel:
             self._executor_owned(tx, run, execution)
             task = self._task(run)
         failure: BaseException | None = None
-        lock: BinaryIO | None = None
+        retain_lock: Callable[[], None] | None = None
         revoked = False
         with ExitStack() as held:
             def close_admission(error: BaseException) -> None:
-                nonlocal failure, lock, revoked
+                nonlocal failure, retain_lock, revoked
                 failure = error
                 try:
-                    if lock is None:
-                        lock = held.enter_context(task_lock(task))
+                    if retain_lock is None:
+                        retain_lock = held.enter_context(task_lock(task))
                     if read_task(task_path(task)) != (execution.run_id, self.storage.path.resolve()):
                         revoked = True  # The original Task binding no longer admits this Run.
                         held.close()
-                        lock = None
+                        retain_lock = None
                         return
                     self._retire_failed_executor(execution, error)
                 except Exception as unavailable:
@@ -2036,20 +2036,16 @@ class Kernel:
                 else:
                     revoked = True
                     held.close()
-                    lock = None
+                    retain_lock = None
             try:
                 yield close_admission
             finally:
                 if failure is not None and not revoked:
                     close_admission(failure)
-                    if not revoked and lock is not None:
-                        # Both commits failed. A non-inheritable duplicate keeps
-                        # this existing Task lock until this Host really exits.
-                        # There is no durable revocation/exit claim to release it.
-                        try:
-                            retain_task_lock_until_exit(lock)
-                        except OSError as unavailable:
-                            failure.add_note("Task admission lock could not be retained: " + bounded_error(str(unavailable)))
+                    if not revoked and retain_lock is not None:
+                        # Transfer the already-held descriptor without allocating
+                        # another FD. Only actual process exit releases this lock.
+                        retain_lock()
 
     def _retire_failed_executor(self, execution: Execution, error: BaseException) -> None:
         with self.storage.transaction() as tx:
