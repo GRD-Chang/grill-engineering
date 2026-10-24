@@ -76,6 +76,26 @@ def _text(value: object, label: str) -> str:
     return value.strip()
 
 
+def _commit_message(value: object) -> str:
+    """One title, an optional empty separator line, then an untouched body."""
+    if not isinstance(value, str) or not value.strip():
+        raise ArtifactContractError("commit_message must be a non-empty string")
+    parts = re.split(r"\r?\n", value, maxsplit=1)
+    title = parts[0].strip()
+    if not title or "\r" in parts[0]:
+        raise ArtifactContractError("commit_message must start with one non-empty title line")
+    if len(parts) == 1 or not parts[1]:
+        return title
+    remainder = parts[1]
+    if remainder.startswith("\r\n"):
+        body = remainder[2:]
+    elif remainder.startswith("\n"):
+        body = remainder[1:]
+    else:
+        raise ArtifactContractError("commit_message body must follow an empty separator line")
+    return title + ("\n\n" + body if body else "")
+
+
 def parse_artifact(role: str, raw: bytes) -> dict[str, Any]:
     """Validate one role's exact wire shape and normalize prose; callers retain raw bytes."""
     _role(role)
@@ -126,7 +146,8 @@ def parse_artifact(role: str, raw: bytes) -> dict[str, Any]:
         raise ArtifactContractError(f"{role} result human_blockers must be null")
     result: dict[str, Any] = {
         "result_kind": role,
-        **{name: _text(data[name], name) for name in content},
+        **{name: _commit_message(data[name]) if name == "commit_message" else _text(data[name], name)
+           for name in content},
         "human_blockers": None,
     }
     if role == "publication":
