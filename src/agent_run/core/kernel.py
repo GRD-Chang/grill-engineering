@@ -22,7 +22,7 @@ from uuid import uuid4
 
 from agent_run.contracts.agent_profiles import ProfileOverrides, resolve_profiles, validate_profile_options
 from agent_run.contracts.identity import validate_identity_snapshot
-from agent_run.contracts.pr_observation import open_pr_target
+from agent_run.contracts.pr_observation import pr_target
 from agent_run.contracts.prompt import validate_resources
 from agent_run.contracts.task import TaskKey
 
@@ -147,7 +147,7 @@ class Kernel:
                     revision = tx.one("SELECT revision FROM issue_facts WHERE issue=?", (job["issue"],))[0]
                 completion = job["completion_revision"]
             if facts.pr is not None and facts.pr.state == "OPEN" and (
-                    open_pr_target(facts.pr, repository=run["repository"], pr_number=request.query.pr_number,
+                    pr_target(facts.pr, repository=run["repository"], pr_number=request.query.pr_number,
                         source_ref=request.query.source_ref, target_ref=request.query.target_ref,
                         source=facts.source, target=facts.target, ancestry=facts.ancestry) is None
                     or facts.checks is not None and (facts.checks.pr_number != facts.pr.number or facts.checks.head_sha != facts.pr.head.sha)):
@@ -1479,18 +1479,27 @@ class Kernel:
     def _recorded_retirement(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, world: World) -> sqlite3.Row:
         rows = tx.rows("SELECT * FROM effects WHERE subject=? AND generation=? AND pr_number=? AND operation='retire_pr' AND status='confirmed' ORDER BY rowid DESC LIMIT 1",
                        (job["id"], job["generation"], job["pr_number"]))
-        if not rows or world.pr is None or world.pr.state != "CLOSED" or world.target is None:
+        if not rows or not self._retirement_current(tx, run, job, rows[0], world):
             raise KernelError("retirement_pr_changed")
-        row = rows[0]
+        return rows[0]
+
+    def _retirement_current(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row,
+                            row: sqlite3.Row, world: World) -> bool:
+        """CLOSED is usable only with this generation's exact owned retirement."""
+        if (row["operation"] != "retire_pr" or row["status"] not in {"observed", "confirmed"}
+                or row["subject"] != job["id"] or row["generation"] != job["generation"]
+                or row["pr_number"] != job["pr_number"] or row["receipt_id"] is None
+                or world.pr is None or self._pr_target(run, job, world, state="CLOSED") is None):
+            return False
         result = json.loads(tx.get(row["receipt_id"], job["id"]))
+        if result["disposition"] != "target":
+            return False
         self._validate_target(tx, run, job, row, result)
         pr = result.get("pr")
-        if (result["disposition"] != "target" or not isinstance(pr, dict) or not self._pr_identity(run, job, world.pr)
-                or world.pr.number != pr["number"] or asdict(world.pr.head) != pr["head"] or world.pr.actor != pr["actor"]
-                or world.pr.base != world.target or (world.pr.base.sha != pr["base"]["sha"]
-                    and (pr["base"]["sha"], world.pr.base.sha) not in world.ancestry)):
-            raise KernelError("retirement_pr_changed")
-        return row
+        return bool(isinstance(pr, dict) and world.pr.number == pr["number"]
+                    and asdict(world.pr.head) == pr["head"] and world.pr.actor == pr["actor"]
+                    and (asdict(world.pr.base) == pr["base"] or world.pr.base.sha != pr["base"]["sha"]
+                         and (pr["base"]["sha"], world.pr.base.sha) in world.ancestry))
 
     def _recheck_retirement(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, action: sqlite3.Row,
                             row: sqlite3.Row, result: EffectResult) -> Step:
@@ -1572,9 +1581,14 @@ class Kernel:
         return Step("paused", job["id"], reason)
 
     def _requeue_current(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, action: sqlite3.Row,
-                         world: World, *, open_pr: bool = True) -> bool:
+                         world: World, *, retirement: sqlite3.Row | None = None) -> bool:
         scope = self._requeue_scope(tx, action)
         original, pr = scope["prior_pr"], world.pr
+        if retirement is not None:
+            payload = json.loads(tx.get(retirement["payload_id"], job["id"]))
+            if (payload.get("control_kind") != "requeue" or retirement["id"] != scope.get("retired_effect")
+                    and payload.get("control_action") != action["id"]):
+                return False
         return bool(not run["stopped"] and run["blocked"] == "requeue_required" and not run["final_action"]
                     and all(gate["code"] == "requeue_required" for gate in self._gates(tx, job["id"]))
                     and self._requeue_versions_current(tx, run, job, action, world)
@@ -1583,9 +1597,10 @@ class Kernel:
                             and (scope["target"]["sha"], world.target.sha) in world.ancestry))
                     and original is not None and pr is not None and self._pr_identity(run, job, pr)
                     and pr.number == original["number"] and asdict(pr.head) == original["head"]
-                    and (self._open_pr_target(run, job, world) is not None if open_pr else pr.base == world.target)
+                    and (self._pr_target(run, job, world) is not None if retirement is None
+                         else self._retirement_current(tx, run, job, retirement, world))
                     and pr.actor == original["actor"]
-                    and pr.state == ("OPEN" if open_pr else "CLOSED"))
+                    and pr.state == ("OPEN" if retirement is None else "CLOSED"))
 
     def _advance_requeue(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, action: sqlite3.Row,
                          work: Work, world: World | None) -> Step | IORequest:
@@ -1600,6 +1615,7 @@ class Kernel:
         if run["stopped"] or any(gate["code"] != "requeue_required" for gate in self._gates(tx, subject)):
             return Step("paused", subject, self._pause_reason(tx, subject, run))
         readback = None
+        retirement = None
         if scope.get("retired_effect") is not None:
             original = tx.one("SELECT * FROM effects WHERE id=? AND subject=? AND generation=? AND status='confirmed'",
                               (scope["retired_effect"], subject, job["generation"]))
@@ -1607,9 +1623,12 @@ class Kernel:
             if not previous:
                 return self._effect_work(tx, work, original)
             readback = previous[0][0]
+            retirement = original
+        if pending is not None and pending["status"] == "observed":
+            retirement = pending
         if world is None:
             return self._observe_work(tx, work, subject)
-        if not self._requeue_current(tx, run, job, action, world, open_pr=readback is None and (pending is None or pending["status"] != "observed")):
+        if not self._requeue_current(tx, run, job, action, world, retirement=retirement):
             return self._end_requeue(tx, run, job, action, pending, "requeue_retirement_changed")
         if pending is None and readback is None:
             scope = self._requeue_scope(tx, action)
@@ -1621,10 +1640,6 @@ class Kernel:
                 raise KernelError("generation_unsettled")
             if pending["status"] == "prepared":
                 return self._effect_work(tx, work, pending)
-            result = json.loads(tx.get(pending["receipt_id"], subject))
-            self._validate_target(tx, run, job, pending, result)
-            if result["disposition"] != "target":
-                return Step("paused", subject, "retirement_unconfirmed")
             tx.execute("UPDATE effects SET status='confirmed' WHERE id=?", (pending["id"],))
             self._event(tx, subject, "effect_consumed", pending["id"], pending["receipt_id"])
             retirement_effect, retirement_receipt = pending["id"], pending["receipt_id"]
@@ -3046,8 +3061,8 @@ class Kernel:
                                json.loads(tx.get(written[0]["receipt_id"], subject)).get("pr"))
                 if (prior_pr is None or prior_pr.number != job["pr_number"] or prior_pr.state not in {"OPEN", "CLOSED"}
                         or not self._pr_identity(run, job, prior_pr) or prior_pr.head.sha != job["publication_sha"]
-                        or (self._open_pr_target(run, job, world) is None if prior_pr.state == "OPEN"
-                            else prior_pr.base != world.target) or not isinstance(original_pr, dict)
+                        or prior_pr.state == "OPEN" and self._pr_target(run, job, world) is None
+                        or not isinstance(original_pr, dict)
                         or not self._pr_identity(run, job, original_pr) or prior_pr.actor != original_pr["actor"]
                         or prior_pr.actor != written[0]["actor"]):
                     raise KernelError("retirement_pr_changed")
@@ -4836,20 +4851,21 @@ class Kernel:
         pr = world.pr
         if pr is None:
             return job["pr_number"] is None
-        return bool(pr.head.sha == job["publication_sha"] and self._open_pr_target(run, job, world) is not None)
+        return bool(pr.head.sha == job["publication_sha"] and self._pr_target(run, job, world) is not None)
 
     @staticmethod
-    def _open_pr_target(run: sqlite3.Row, resource: sqlite3.Row, world: World) -> Commit | None:
-        return None if world.pr is None else open_pr_target(world.pr,
+    def _pr_target(run: sqlite3.Row, resource: sqlite3.Row, world: World, *,
+                   state: Literal["OPEN", "CLOSED"] = "OPEN") -> Commit | None:
+        return None if world.pr is None else pr_target(world.pr,
             repository=run["repository"], pr_number=resource["pr_number"],
             source_ref=resource["source_ref"], target_ref=resource["target_ref"],
-            source=world.source, target=world.target, ancestry=world.ancestry)
+            source=world.source, target=world.target, ancestry=world.ancestry, state=state)
 
     def _published_matches(self, run: sqlite3.Row, job: sqlite3.Row, world: World) -> bool:
         pr = world.pr
         return (world.target is not None and pr is not None and pr.number == job["pr_number"]
                 and pr.head.sha == job["publication_sha"] and pr.head.tree == job["publication_tree"]
-                and world.target.sha == job["integration_target"] and self._open_pr_target(run, job, world) is not None)
+                and world.target.sha == job["integration_target"] and self._pr_target(run, job, world) is not None)
 
     def _published(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, world: World) -> bool:
         if not self._published_matches(run, job, world):

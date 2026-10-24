@@ -32,7 +32,7 @@ from agent_run.errors import ObservationSuperseded as ObservationSuperseded
 from agent_run.model import Commit, Effect, EffectResult, PullRequest, Requirements, ResourceInspection, ResourceWitness
 from agent_run.errors import KernelError
 from agent_run.adapters.local_git import LocalEffects
-from agent_run.contracts.pr_observation import open_pr_target
+from agent_run.contracts.pr_observation import pr_target
 from agent_run.adapters.source import (read_remote_heads, read_requirements, read_required_check_facts,
                              normalize_required_checks)
 
@@ -602,7 +602,7 @@ class RemoteEffects:
                          if self._ancestor(_sha(before), _sha(after)))
         checks = None
         if pr is not None and pr.state == "OPEN":
-            if source is None or open_pr_target(pr, repository=self.repository, pr_number=request.pr_number,
+            if source is None or pr_target(pr, repository=self.repository, pr_number=request.pr_number,
                     source_ref=request.source_ref, target_ref=request.target_ref,
                     source=source, target=target, ancestry=ancestry) is None:
                 raise GitHubReadError("github_observation_pending", "PR and remote ref observations have not converged")
@@ -725,11 +725,11 @@ class RemoteEffects:
         return read_remote_heads(self.root, source_ref, target_ref,
                                  runner_identity=self.identity, remote=self.remote)
 
-    def _open_pr_target(self, effect: Effect, pr: PullRequest,
+    def _pr_target(self, effect: Effect, pr: PullRequest,
                         source: str | None, target: str | None) -> Commit | None:
         live = None if target is None else self._commit(target)[0]
         ancestry = ((pr.base.sha, target),) if target is not None and self._ancestor(pr.base.sha, target) else ()
-        return open_pr_target(pr, repository=self.repository, pr_number=effect.pr_number,
+        return pr_target(pr, repository=self.repository, pr_number=effect.pr_number,
             source_ref=effect.source_ref, target_ref=effect.target_ref,
             source=pr.head if source == pr.head.sha else None, target=live, ancestry=ancestry)
 
@@ -805,7 +805,7 @@ class RemoteEffects:
             if pr.title == effect.payload["title"] and pr.body == effect.payload["body"]:
                 return EffectResult("target", pr=pr)
             source, target = self._remote_heads(effect.source_ref, effect.target_ref)
-            if (self._open_pr_target(effect, pr, source, target) != effect.base
+            if (self._pr_target(effect, pr, source, target) != effect.base
                     or source != effect.after_sha):
                 return EffectResult("third", pr=pr)
             prior = effect.payload["prior"]
@@ -826,7 +826,7 @@ class RemoteEffects:
             if not contained or self._remote_head(effect.target_ref) != target:
                 return EffectResult("unknown", pr=pr)
             return EffectResult("target", commit=commit, pr=pr, raw={"parents": list(parents), "target_head": target, "live_pr_base": data["base"]["sha"]})
-        return EffectResult("prior" if self._open_pr_target(effect, pr, source, target) == effect.base
+        return EffectResult("prior" if self._pr_target(effect, pr, source, target) == effect.base
                             and source == effect.after_sha and target == effect.before_sha else "third", pr=pr)
 
     def _current_pr_edit(self, effect: Effect, observed: EffectResult) -> EffectResult:
@@ -835,7 +835,7 @@ class RemoteEffects:
             return observed
         try:
             source, target = self._remote_heads(effect.source_ref, effect.target_ref)
-            if (self._open_pr_target(effect, observed.pr, source, target) != effect.base
+            if (self._pr_target(effect, observed.pr, source, target) != effect.base
                     or source != effect.after_sha):
                 return replace(observed, disposition="third")
         except GitHubReadError:
