@@ -266,9 +266,10 @@ def _control_history(tx: Transaction, *, identities: Sequence[str] | None = None
     actions = (_all(tx, "SELECT * FROM actions WHERE kind='resume' ORDER BY rowid DESC LIMIT 1")
                if identities is None else
                [dict(row) for identity in identities for row in tx.rows("SELECT * FROM actions WHERE id=?", (identity,))])
-    first_owner = tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
     for action in actions:
-        owner = action["subject"] or first_owner
+        # A Run-wide scope is not a material owner. The referenced intent keeps
+        # its original owner when Final or another subject appears later.
+        owner = action["subject"] or tx.one("SELECT subject FROM material WHERE id=?", (action["payload_id"],))[0]
         action["payload"] = _material(tx, action["payload_id"], owner)
         action["receipt"] = _material(tx, action["receipt_id"], owner)
     _resume_progress(tx, actions)
