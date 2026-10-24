@@ -487,7 +487,7 @@ def prepare_creation(parent: int, repository: str | None, *, source_directory: P
     head = actual_repository.default_head_sha
     if not isinstance(head, str) or not head:
         raise KernelError("missing_target_branch", "The observed default branch has no exact commit")
-    base, _ = port._commit(head)
+    base = port._commit(head)[0]
     jobs = creation_resources(run_id, requirements, base, "refs/heads/" + actual_repository.default_branch, root)
     refs = sorted({job.source_ref for job in jobs})
     for ref in refs:
