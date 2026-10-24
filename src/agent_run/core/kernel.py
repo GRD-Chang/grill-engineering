@@ -4060,7 +4060,7 @@ class Kernel:
             return Step("progress", subject)
         if phase == "publication_commit":
             attempt = tx.one("SELECT result_id FROM attempts WHERE id=?", (job["publication_attempt"],))
-            narrative = json.loads(tx.get(attempt["result_id"], subject))
+            narrative = artifact(Role.PUBLICATION, tx.get(attempt["result_id"], subject))
             parents = [job["source_sha"]]
             # Rebuilding the reviewed tree must not discard its target ancestry;
             # otherwise a resolved conflict becomes a conflicting PR again.
@@ -4090,7 +4090,7 @@ class Kernel:
                 tx.execute("UPDATE subjects SET pr_number=? WHERE id=?", (world.pr.number, subject))
                 job = self._job(tx, subject)
             attempt = tx.one("SELECT result_id FROM attempts WHERE id=?", (job["publication_attempt"],))
-            narrative = json.loads(tx.get(attempt["result_id"], subject))
+            narrative = artifact(Role.PUBLICATION, tx.get(attempt["result_id"], subject))
             old = None if world.pr is None else {"title": world.pr.title, "body": world.pr.body}
             return self._prepare_effect(tx, run, job, work, world, "pr_write", before=job["publication_sha"],
                                         after=job["publication_sha"], payload={"title": narrative["pr_title"],
@@ -4147,7 +4147,7 @@ class Kernel:
                 self._gate(tx, subject, "approval_revalidation_failed")
                 return Step("paused", subject, "merge_authority")
             publication = tx.one("SELECT result_id FROM attempts WHERE id=?", (job["publication_attempt"],))
-            narrative = json.loads(tx.get(publication[0], subject))
+            narrative = artifact(Role.PUBLICATION, tx.get(publication[0], subject))
             return self._prepare_effect(tx, run, job, work, world, "merge", before=target.sha,
                                         after=job["publication_sha"], payload={"method": "squash" if job["kind"] == DeliveryKind.TICKET else "merge",
                                         "commit_message": narrative["commit_message"] if job["kind"] == DeliveryKind.TICKET else f"merge: Delivery Run {job['source_ref'].removeprefix('refs/heads/')}",

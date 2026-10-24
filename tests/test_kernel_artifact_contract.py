@@ -8,20 +8,43 @@ import pytest
 
 from support.core_operations import CoreOperations, scripted_return
 from agent_run.model import Role
-from agent_run.contracts.artifact import role_schema
+from agent_run.contracts.artifact import parse_artifact, role_schema
+from agent_run.errors import ArtifactContractError
 from agent_run.runtime.codex import _CodexCapture
 from agent_run.model import ParentIssue, Requirements, wire_json
 from support.offline import GraphScenario, review_result
 
 
-def publication(body="Recorded validation and user impact."):
-    return dict(result_kind="publication", commit_message="feat: change", pr_title="Change",
+def publication(body="Recorded validation and user impact.", *, message="feat: change"):
+    return dict(result_kind="publication", commit_message=message, pr_title="Change",
                 pr_body_markdown=body, human_blockers=None)
 
 
 def human(blockers):
     return dict(result_kind="human_blocker", commit_message=None, pr_title=None,
                 pr_body_markdown=None, human_blockers=blockers)
+
+
+@pytest.mark.parametrize("message,expected", [
+    ("feat: title", "feat: title"),
+    (" \tfeat: title \t", "feat: title"),
+    ("feat: title\r\n", "feat: title"),
+    ("feat: title\n\n", "feat: title"),
+    ("feat: title\r\n\r\n正文\r\nNext.  \r\n", "feat: title\n\n正文\r\nNext.  \r\n"),
+    ("feat: title\n\nBody ends with spaces  ", "feat: title\n\nBody ends with spaces  "),
+    ("feat: title\n\r\nBody", "feat: title\n\nBody"),
+])
+def test_publication_message_normalizes_only_the_title_separator(message, expected):
+    raw = wire_json(publication(message=message))
+    result = parse_artifact("publication", raw)
+    assert result["commit_message"] == expected
+    assert json.loads(raw)["commit_message"] == message
+
+
+@pytest.mark.parametrize("message", ["Title\nBody", "\n\nNo title", "  \r\n\r\nBody", "Title\rBody"])
+def test_publication_message_rejects_a_missing_or_multiline_title(message):
+    with pytest.raises(ArtifactContractError, match="commit_message"):
+        parse_artifact("publication", wire_json(publication(message=message)))
 
 
 def next_call(scenario, role):
@@ -52,8 +75,9 @@ def returned(scenario, call, raw):
 
 
 @pytest.mark.parametrize("value", [publication("Fixes #2"), publication("Parent Issue: #1"),
-                                  human(["x"] * 9), human(["x" * 2001])],
-                         ids=["closing", "publisher-facts", "blocker-count", "blocker-length"])
+                                  human(["x"] * 9), human(["x" * 2001]),
+                                  publication(message="Title\nBody without a blank line")],
+                         ids=["closing", "publisher-facts", "blocker-count", "blocker-length", "multiline-title"])
 def test_native_publication_rejects_contract_drift_and_repairs_same_attempt(tmp_path: Path, value):
     scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Deliver change"), ()))
     operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)

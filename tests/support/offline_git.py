@@ -199,7 +199,7 @@ class OfflineGit:
         for parent in parents:
             args.extend(("-p", parent))
         message = commit_title + ("\n\n" + commit_message if commit_message else "")
-        merged = self._run(self.remote, *args, input=message + "\n").stdout.strip()
+        merged = self._run(self.remote, *args, input=message if message.endswith("\n") else message + "\n").stdout.strip()
         self._publish_merge(base_ref, base, head_ref, head, merged)
         return self._oid(merged)
 

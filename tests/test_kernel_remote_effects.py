@@ -200,7 +200,7 @@ def test_original_merge_ack_loss_settles_after_later_target_append(tmp_path, mon
     _effect, pr = _publish_pr(port, push)
     parents = [push.base.sha] + ([] if method == "squash" else [push.after_sha])
     merge = replace(push, effect_id="merge-1", operation="merge", pr_number=pr.number,
-        payload={"method": method, "parents": parents, "commit_message": "Reviewed merge\nOriginal body"})
+        payload={"method": method, "parents": parents, "commit_message": "Reviewed merge\n\nOriginal body"})
     _change(state, lose_operation="merge")
     result = port.execute(merge, WriteAuthority(lambda: lambda: None))
     assert result.disposition == "target" and result.raw["write_returncode"] == 1
@@ -659,7 +659,7 @@ elif endpoint.startswith('repos/example/project/pulls'):
             command=['commit-tree',git('show','-s','--format=%T',pr['head']['sha'])]
             for parent in parents:command+=['-p',parent]
             message=body['commit_title']+('\n\n'+body['commit_message'] if body.get('commit_message') else '')
-            sha=git(*command,input=message+'\n')
+            sha=git(*command,input=message if message.endswith('\n') else message+'\n')
             git('update-ref','refs/heads/'+pr['base']['ref'],sha,pr['base']['sha'])
             pr.update(state='closed',merged=True,merge_commit_sha=sha,merged_by={'login':'publisher'})
             result={'merged':True,'sha':sha}

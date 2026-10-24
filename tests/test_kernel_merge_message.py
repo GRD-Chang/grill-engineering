@@ -35,6 +35,40 @@ def _merge_record(scenario: Scenario):
             None if row["receipt_id"] is None else json.loads(tx.get(row["receipt_id"], row["subject"])))
 
 
+@pytest.mark.parametrize("message,expected,title,body", [
+    ("feat: no body\r\n", "feat: no body", "feat: no body", ""),
+    ("feat: CRLF title\r\n\r\nBody\r\nLast line  \r\n\r\n",
+     "feat: CRLF title\n\nBody\r\nLast line  \r\n\r\n",
+     "feat: CRLF title", "Body\r\nLast line  \r\n\r\n"),
+], ids=["no-body", "crlf-header"])
+def test_publication_freezes_canonical_header_and_sends_exact_title_body(
+    tmp_path, monkeypatch, message, expected, title, body,
+):
+    original = SyntheticGitHub.write
+    requests = []
+
+    def write(self, endpoint, method, fields):
+        if endpoint.endswith("/merge"):
+            requests.append(dict(fields))
+        return original(self, endpoint, method, fields)
+
+    monkeypatch.setattr(SyntheticGitHub, "write", write)
+    scenario = Scenario(tmp_path / "ticket", DeliveryKind.TICKET)
+    _message_agent(scenario, monkeypatch, message)
+    assert scenario.run().kind == "complete"
+    row, payload, receipt = _merge_record(scenario)
+    assert len(requests) == 1
+    assert requests[0]["commit_title"] == title and requests[0]["commit_message"] == body
+    assert "\n" not in requests[0]["commit_title"] and "\r" not in requests[0]["commit_title"]
+    assert payload["commit_message"] == expected and row["attempts"] == 1
+    assert receipt["raw"]["commit_message"] == (expected if expected.endswith("\n") else expected + "\n")
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        attempt = tx.one("SELECT * FROM attempts WHERE subject=? AND role='publication'", (scenario.delivery.key,))
+        output = tx.one("SELECT raw_id FROM invocation_outputs WHERE invocation=?", (attempt["current_invocation"],))
+        assert json.loads(tx.get(output[0], scenario.delivery.key))["commit_message"] == message
+        assert tx.get(attempt["result_id"], scenario.delivery.key) == tx.get(output[0], scenario.delivery.key)
+
+
 @pytest.mark.parametrize("fault", ["duplicate-body", "extra-blank-line"])
 def test_wrong_squash_message_cannot_complete_or_repeat_the_original_merge(tmp_path, monkeypatch, fault):
     original = SyntheticGitHub.write
@@ -44,7 +78,7 @@ def test_wrong_squash_message_cannot_complete_or_repeat_the_original_merge(tmp_p
         if endpoint.endswith("/merge"):
             requested.append(dict(body))
             details = body["commit_message"]
-            body = {**body, "commit_message": details + ("\n\n" + details if fault == "duplicate-body" else "\n")}
+            body = {**body, "commit_message": details + ("\n\n" + details if fault == "duplicate-body" else "\n\n")}
         return original(self, endpoint, method, body)
 
     monkeypatch.setattr(SyntheticGitHub, "write", duplicate_body)
@@ -62,6 +96,8 @@ def test_wrong_squash_message_cannot_complete_or_repeat_the_original_merge(tmp_p
     assert row["attempts"] == 1 and row["generation"] == status["generation"]
     assert receipt["raw"]["write_returncode"] == 0
     assert receipt["raw"]["commit_message"] != payload["commit_message"] + "\n"
+    if fault == "extra-blank-line":
+        assert receipt["raw"]["commit_message"] == payload["commit_message"] + "\n\n"
     assert receipt["commit"]["sha"] == scenario.port.remote_commit(scenario.delivery.target_ref).sha
     before = scenario.port.writes()
     scenario.kernel = Kernel(scenario.kernel.storage.path)
