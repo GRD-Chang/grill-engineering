@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from agent_run.adapters.auth.credential_lifecycle import ReadCredential
+from agent_run.adapters.auth.credential_lifecycle import InitialCredentialUnavailable, ReadCredential
 from agent_run.adapters.auth.worker_credentials import NativeCredentialDelivery
 
 
@@ -33,7 +33,7 @@ def test_native_delivery_initializes_private_versioned_configuration(
             assert stat.S_IMODE((directory / name).stat().st_mode) == 0o600
         assert {path.name for path in directory.iterdir()} == {"config.yml", "hosts.yml"}
     assert not (directory / "hosts.yml").exists()
-    assert json.loads((directory / "config.yml").read_text()) == {"version": "1"}
+    assert list(directory.iterdir()) == []
 
 
 def test_native_delivery_renews_hosts_without_replacing_configuration(tmp_path: Path) -> None:
@@ -72,6 +72,7 @@ def test_native_delivery_renews_hosts_without_replacing_configuration(tmp_path: 
         release_renewal.set()
         delivery.close()
     assert not (directory / "hosts.yml").exists()
+    assert list(directory.iterdir()) == []
 
 
 def test_native_delivery_does_not_mint_after_configuration_initialization_failure(tmp_path: Path) -> None:
@@ -89,3 +90,109 @@ def test_native_delivery_does_not_mint_after_configuration_initialization_failur
     assert minted == []
     assert (directory / "config.yml").is_dir()
     assert {path.name for path in directory.iterdir()} == {"config.yml"}
+
+
+def test_native_delivery_close_only_removes_files_created_by_its_scope(tmp_path: Path) -> None:
+    directory = tmp_path / "gh"
+    directory.mkdir()
+    foreign = {name: "unrelated configuration" for name in ("config.yml", "hosts.yml", "other.yml")}
+    for name, value in foreign.items():
+        (directory / name).write_text(value)
+    minted: list[bool] = []
+
+    def provider() -> ReadCredential:
+        minted.append(True)
+        return ReadCredential("synthetic-private", time.time() + 3600)
+
+    unopened = NativeCredentialDelivery(provider, directory)
+    unopened.close()
+    assert minted == []
+    assert {path.name: path.read_text() for path in directory.iterdir()} == foreign
+
+    delivery = NativeCredentialDelivery(provider, directory)
+    delivery.start()
+    delivery.close()
+    assert {path.name for path in directory.iterdir()} == {"other.yml"}
+    for name in ("config.yml", "hosts.yml"):
+        (directory / name).write_text(f"later owner's {name}")
+    delivery.close()
+    assert (directory / "other.yml").read_text() == foreign["other.yml"]
+    for name in ("config.yml", "hosts.yml"):
+        assert (directory / name).read_text() == f"later owner's {name}"
+    assert minted == [True]
+
+
+def test_native_delivery_removes_private_files_when_provider_close_fails(tmp_path: Path) -> None:
+    class Provider:
+        def __call__(self) -> ReadCredential:
+            return ReadCredential("synthetic-private", time.time() + 3600)
+
+        def cancel(self) -> None:
+            raise OSError("synthetic provider cleanup failure")
+
+    directory = tmp_path / "gh"
+    delivery = NativeCredentialDelivery(Provider(), directory)
+    delivery.start()
+    with pytest.raises(OSError, match="provider cleanup failure"):
+        delivery.close()
+    assert list(directory.iterdir()) == []
+    directory.rmdir()
+
+
+@pytest.mark.parametrize("during_renewal", [False, True])
+def test_native_delivery_close_prevents_late_provider_files_and_restart(
+    tmp_path: Path, during_renewal: bool,
+) -> None:
+    entered, release = threading.Event(), threading.Event()
+    errors: list[Exception] = []
+
+    class Provider:
+        calls = 0
+
+        def __call__(self) -> ReadCredential:
+            self.calls += 1
+            if during_renewal and self.calls == 1:
+                return ReadCredential("synthetic-initial", time.time() + 60)
+            entered.set()
+            assert release.wait(5), "Provider was not released"
+            return ReadCredential("synthetic-late", time.time() + 3600)
+
+        def cancel(self) -> None:
+            release.set()
+
+    directory = tmp_path / "gh"
+    provider = Provider()
+    delivery = NativeCredentialDelivery(provider, directory)
+
+    def start() -> None:
+        try:
+            delivery.start()
+        except Exception as error:
+            errors.append(error)
+
+    starter = threading.Thread(target=start)
+    try:
+        starter.start()
+        assert entered.wait(5), "Provider did not reach the cancellation boundary"
+        assert (directory / "config.yml").is_file()
+        delivery.close()
+        starter.join(5)
+        assert not starter.is_alive()
+        if during_renewal:
+            assert errors == []
+        else:
+            assert len(errors) == 1
+            assert isinstance(errors[0], InitialCredentialUnavailable)
+        assert list(directory.iterdir()) == []
+        directory.rmdir()
+        delivery.close()
+        calls = provider.calls
+        with pytest.raises(InitialCredentialUnavailable, match="closed"):
+            delivery.start()
+        assert provider.calls == calls
+        assert not directory.exists()
+    finally:
+        release.set()
+        delivery.close()
+        starter.join(5)
+        assert not starter.is_alive()
