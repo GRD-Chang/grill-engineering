@@ -51,10 +51,13 @@ def _reap_created(root: Path, name: str) -> int | None:
         current = _process_start_token(hook["pid"])
         if current is None or current != hook["token"]:
             return True
-        fields = Path(f"/proc/{hook['pid']}/stat").read_text().rsplit(")", 1)[1].split()
-        return fields[0] == "Z"
+        try:
+            return os.waitid(os.P_PID, hook["pid"], os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+        except ChildProcessError:
+            # A zombie may still belong to its dying parent until adoption.
+            return _process_start_token(hook["pid"]) != hook["token"]
 
-    # Verify actual terminal evidence before reaping, never kill to make this pass.
+    # Observe both exit and ownership without consuming the exact wait status.
     wait_until(exited, timeout=3)
     if _process_start_token(hook["pid"]) != hook["token"]:
         return None  # The original process is gone; never wait on a reused PID.
@@ -299,14 +302,18 @@ def test_forced_controller_exit_reaps_only_its_recorded_descendants(tmp_path, mo
 from pathlib import Path
 from agent_run.runtime.process_identity import _process_start_token
 root=Path(sys.argv[1])
-(root/'hook.json').write_text(json.dumps(dict(pid=os.getpid(),token=_process_start_token(os.getpid()))))
+record=root/'hook.tmp'
+record.write_text(json.dumps(dict(pid=os.getpid(),token=_process_start_token(os.getpid()))))
+record.replace(root/'hook.json')
 signal.pause()
 """
     git_program = """import json,os,signal,subprocess,sys
 from pathlib import Path
 from agent_run.runtime.process_identity import _process_start_token
 root=Path(sys.argv[1])
-(root/'git.json').write_text(json.dumps(dict(pid=os.getpid(),token=_process_start_token(os.getpid()))))
+record=root/'git.tmp'
+record.write_text(json.dumps(dict(pid=os.getpid(),token=_process_start_token(os.getpid()))))
+record.replace(root/'git.json')
 subprocess.Popen([sys.executable,'-c',sys.argv[2],str(root)])
 signal.pause()
 """
@@ -327,37 +334,112 @@ signal.pause()
     def ready():
         wait_until(lambda: (tmp_path / "hook.json").exists(), timeout=5)
 
-    try:
-        with monkeypatch.context() as patch:
+    previous = _subreaper_state()
+    with child_subreaper():
+        try:
+            with monkeypatch.context() as patch:
+                if first_reap_error:
+                    patch.setitem(globals(), "_reap_created", fail_first)
+                expected = BaseExceptionGroup if first_reap_error else subprocess.TimeoutExpired
+                with pytest.raises(expected):
+                    _controller_output([sys.executable, "-c", controller_program, str(tmp_path),
+                                        git_program, hook_program], tmp_path, environment,
+                                       timeout=0.05, grace=0.2, ready=ready)
+            # A failed first reaper must not prevent the second one's exact wait.
+            hook = json.loads((tmp_path / "reaped-hook.json").read_text())
+            assert hook["reaper"] == os.getpid() and hook["signal"] == signal.SIGKILL
             if first_reap_error:
-                patch.setitem(globals(), "_reap_created", fail_first)
-            expected = BaseExceptionGroup if first_reap_error else subprocess.TimeoutExpired
-            with pytest.raises(expected):
-                _controller_output([sys.executable, "-c", controller_program, str(tmp_path),
-                                    git_program, hook_program], tmp_path, environment,
-                                   timeout=0.05, grace=0.2, ready=ready)
-        # A failed first reaper must not prevent the second one's exact wait.
-        hook = json.loads((tmp_path / "reaped-hook.json").read_text())
-        assert hook["reaper"] == os.getpid() and hook["signal"] == signal.SIGKILL
-        if first_reap_error:
-            attempts = [json.loads(line) for line in (tmp_path / "cleanup-attempts.jsonl").read_text().splitlines()]
-            assert [a["name"] for a in attempts[0]["attempts"]] == ["git.json", "hook.json"]
-            assert "error" in attempts[0]["attempts"][0]
-            original(tmp_path, "git.json")
-        git = json.loads((tmp_path / "reaped-git.json").read_text())
-        assert git["reaper"] == os.getpid() and git["signal"] == signal.SIGKILL
-        controller = json.loads((tmp_path / "controller-cleanup.json").read_text())
-        assert controller["hard_kill"] and controller["returncode"] == -signal.SIGKILL
-        scope = json.loads((tmp_path / "subreaper-scope.json").read_text())
-        assert scope["during"] == 1 and scope["before"] == scope["after"]
-        assert _process_start_token(git["pid"]) != git["token"]
-        assert _process_start_token(hook["pid"]) != hook["token"]
-        with pytest.raises(ProcessLookupError):
-            os.killpg(git["pid"], 0)
-        print(json.dumps({"mechanical_only": True, "first_reap_error": first_reap_error,
-                          "controller": controller, "git": git, "hook": hook, "subreaper": scope}))
-    finally:
-        _cleanup_created(tmp_path)
+                attempts = [json.loads(line) for line in (tmp_path / "cleanup-attempts.jsonl").read_text().splitlines()]
+                assert [a["name"] for a in attempts[0]["attempts"]] == ["git.json", "hook.json"]
+                assert "error" in attempts[0]["attempts"][0]
+                original(tmp_path, "git.json")
+            git = json.loads((tmp_path / "reaped-git.json").read_text())
+            assert git["reaper"] == os.getpid() and git["signal"] == signal.SIGKILL
+            controller = json.loads((tmp_path / "controller-cleanup.json").read_text())
+            assert controller["hard_kill"] and controller["returncode"] == -signal.SIGKILL
+            scope = json.loads((tmp_path / "subreaper-scope.json").read_text())
+            assert scope["during"] == 1 and scope["before"] == scope["after"]
+            assert _process_start_token(git["pid"]) != git["token"]
+            assert _process_start_token(hook["pid"]) != hook["token"]
+            with pytest.raises(ProcessLookupError):
+                os.killpg(git["pid"], 0)
+            print(json.dumps({"mechanical_only": True, "first_reap_error": first_reap_error,
+                              "controller": controller, "git": git, "hook": hook, "subreaper": scope}))
+        finally:
+            _cleanup_created(tmp_path)
+    assert _subreaper_state() == previous
+
+
+def test_recorded_descendant_reaper_waits_for_real_adoption(tmp_path, monkeypatch):
+    """A zombie remains non-waitable until its still-live parent releases it."""
+    parent_program = """import json,os,signal,sys
+from pathlib import Path
+from agent_run.runtime.process_identity import _process_start_token
+root=Path(sys.argv[1])
+pid=os.fork()
+if pid == 0:
+    (root/'hook.json').write_text(json.dumps(dict(pid=os.getpid(),token=_process_start_token(os.getpid()))))
+    os.kill(os.getpid(),signal.SIGKILL)
+os.waitid(os.P_PID,pid,os.WEXITED | os.WNOWAIT)
+(root/'zombie-ready').touch()
+os.read(int(sys.argv[2]),1)
+os._exit(0)
+"""
+    release_read, release_write = os.pipe()
+    released = False
+    observed = []
+    actual_waitid = os.waitid
+
+    def release_after_non_child(idtype, pid, options):
+        nonlocal released
+        try:
+            return actual_waitid(idtype, pid, options)
+        except ChildProcessError:
+            if pid == hook["pid"] and not released:
+                fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+                assert fields[0] == "Z" and int(fields[1]) == parent.pid
+                assert _process_start_token(pid) == hook["token"]
+                observed.append("zombie-not-adopted")
+                os.write(release_write, b"1")
+                released = True
+            raise
+
+    with child_subreaper():
+        assert _subreaper_state() == 1
+        parent = None
+        try:
+            parent = subprocess.Popen(
+                [sys.executable, "-c", parent_program, str(tmp_path), str(release_read)],
+                pass_fds=(release_read,), start_new_session=True,
+            )
+            wait_until(lambda: (tmp_path / "zombie-ready").exists(), timeout=5)
+            hook = json.loads((tmp_path / "hook.json").read_text())
+            # Observe the real kernel ECHILD boundary; never fake a wait result.
+            with monkeypatch.context() as patch:
+                patch.setattr(os, "waitid", release_after_non_child)
+                assert _reap_created(tmp_path, "hook.json") == signal.SIGKILL
+            assert observed == ["zombie-not-adopted"]
+            reaped = json.loads((tmp_path / "reaped-hook.json").read_text())
+            assert reaped["pid"] == hook["pid"] and reaped["token"] == hook["token"]
+            assert reaped["reaper"] == os.getpid() and reaped["signal"] == signal.SIGKILL
+            assert _process_start_token(hook["pid"]) != hook["token"]
+            assert parent.wait(timeout=3) == 0
+        finally:
+            # Release the barrier even when the unfixed reaper fails before waitid.
+            try:
+                if not released:
+                    os.write(release_write, b"1")
+            finally:
+                os.close(release_write)
+                os.close(release_read)
+            if parent is not None:
+                try:
+                    parent.wait(timeout=3)
+                finally:
+                    if parent.poll() is None:
+                        os.killpg(parent.pid, signal.SIGKILL)
+                        parent.wait(timeout=3)
+                    _reap_created(tmp_path, "hook.json")
 
 
 if __name__ == "__main__":
