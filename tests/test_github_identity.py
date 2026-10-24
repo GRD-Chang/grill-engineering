@@ -67,7 +67,7 @@ def test_pat_references_refresh_and_never_fallback(tmp_path: Path) -> None:
 
 def test_auth_validation_suppresses_secret_tool_output(monkeypatch: pytest.MonkeyPatch) -> None:
     import agent_run.adapters.auth.identity as identity
-    from agent_run.runtime.command import CommandCapture
+    from agent_run.adapters.auth.native_probe import AuthProbeCapture
 
     process = object()
 
@@ -78,12 +78,12 @@ def test_auth_validation_suppresses_secret_tool_output(monkeypatch: pytest.Monke
         assert kwargs['start_new_session'] is True
         return process
 
-    def capture(owned, *, timeout, max_output):
-        assert owned is process and timeout == 15 and max_output == 4096
-        return CommandCapture(1, b'HTTP/2.0 401 Unauthorized\r\n\r\n', b'selected-secret', False)
+    def capture(owned, *, timeout):
+        assert owned is process and timeout == 15
+        return AuthProbeCapture(1, False, 401, False, False)
 
     monkeypatch.setattr(identity.subprocess, 'Popen', start)
-    monkeypatch.setattr(identity, 'capture_command', capture)
+    monkeypatch.setattr(identity, 'capture_auth_probe', capture)
     with pytest.raises(GitHubIdentityError) as error:
         validate_worker_auth({'source': 'pat', 'pat': {'env': 'PAT'}}, {'PAT': 'selected-secret'})
     assert 'selected-secret' not in str(error.value)

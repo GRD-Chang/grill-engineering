@@ -102,19 +102,19 @@ def test_native_auth_probe_process_error_is_not_invalid_credentials(tmp_path, mo
 
 def test_native_auth_probe_timeout_keeps_safe_cause(tmp_path, monkeypatch):
     environment = _gh(tmp_path, monkeypatch, "import signal\nsignal.pause()\n")
-    from agent_run.runtime.command import capture_command
+    from agent_run.adapters.auth.native_probe import capture_auth_probe
     captured = []
 
     def timeout_run(*args, **kwargs):
         raise subprocess.TimeoutExpired(args[0], 15, stderr=b"synthetic-private-value")
 
-    def bounded(process, *, timeout, max_output):
+    def bounded(process, *, timeout):
         assert timeout == 15
         captured.append(process)
-        return capture_command(process, timeout=0, max_output=max_output)
+        return capture_auth_probe(process, timeout=0)
 
     monkeypatch.setattr(identity.subprocess, "run", timeout_run)
-    monkeypatch.setattr(identity, "capture_command", bounded, raising=False)
+    monkeypatch.setattr(identity, "capture_auth_probe", bounded)
     with pytest.raises(GitHubReadError) as caught:
         identity.validate_worker_auth({"source": "host"}, environment)
     assert caught.value.__cause__.category == "timeout"

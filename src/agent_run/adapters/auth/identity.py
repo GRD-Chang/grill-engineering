@@ -17,7 +17,7 @@ from typing import Any
 
 from agent_run.config.github_app import GitHubAppProfileStore
 from agent_run.errors import GitHubIdentityError, GitHubReadError, error_message
-from agent_run.runtime.command import capture_command
+from agent_run.adapters.auth.native_probe import capture_auth_probe
 from agent_run.contracts.copy import text
 
 
@@ -158,7 +158,7 @@ def _native_auth_probe(source: str, environment: Mapping[str, str]) -> None:
             env=dict(environment), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True,
         )
-        result = capture_command(process, timeout=15, max_output=4096)
+        result = capture_auth_probe(process, timeout=15)
     except subprocess.TimeoutExpired:
         failure = _AuthProbeFailure("timeout")
     except OSError as error:
@@ -166,20 +166,16 @@ def _native_auth_probe(source: str, environment: Mapping[str, str]) -> None:
     else:
         if not result.timed_out and result.returncode == 0:
             return
-        lines = result.stdout.splitlines()
-        match = re.fullmatch(rb"HTTP/[0-9.]+ ([1-5][0-9]{2})(?: [^\r\n]*)?", lines[0]) if lines else None
-        status = int(match[1]) if match else None
+        status = result.http_status
         if result.timed_out:
             category = "timeout"
-        elif status == 403 and (
-                any(re.fullmatch(rb"(?i)x-ratelimit-remaining:\s*0\s*|retry-after:\s*[0-9]+\s*", line) for line in lines[1:])
-                or re.search(rb"secondary rate limit|rate limit exceeded", result.stderr, re.IGNORECASE)):
+        elif status == 403 and result.rate_limited:
             category = "rate_limited"
         elif status in {401, 403}:
             category = "unauthorized" if status == 401 else "forbidden"
         elif status is not None:
             category = "http_error"
-        elif re.search(rb"dial tcp|no such host|network is unreachable|connection (?:refused|reset)|i/o timeout|TLS handshake timeout", result.stderr, re.IGNORECASE):
+        elif result.network_failure:
             category = "network"
         else:
             category = "command_failed"
