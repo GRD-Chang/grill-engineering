@@ -1,6 +1,7 @@
 """Mechanical Host units with scripted runner responses, not Core admission proof."""
 import threading
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -54,6 +55,10 @@ def test_host_dispatches_call_then_polls_independent_io_and_requires_durable_exi
     class Core:
         storage = SimpleNamespace(path=tmp_path / "unused.sqlite")
         clock = staticmethod(time.monotonic)
+        @contextmanager
+        def executor_scope(self, selected):
+            assert selected == execution
+            yield lambda error: lifecycle.append("admission-closed")
     def make_runner(core, selected, make_ports):
         assert selected == execution
         port = make_ports(binding)

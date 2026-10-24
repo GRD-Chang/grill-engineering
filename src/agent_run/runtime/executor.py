@@ -90,7 +90,8 @@ def run(kernel: Kernel, execution: Execution, environment: Mapping[str, str]) ->
     notifications = NativeNotifications(kernel.storage.path, kernel.storage.path.parent)
     drain_notifications = False
     try:
-        with ThreadPoolExecutor(max_workers=state.concurrency, thread_name_prefix="agent-run") as agents, \
+        with kernel.executor_scope(execution) as close_admission, \
+                ThreadPoolExecutor(max_workers=state.concurrency, thread_name_prefix="agent-run") as agents, \
                 ThreadPoolExecutor(max_workers=1, thread_name_prefix="agent-run-io") as io:
             try:
                 while True:
@@ -144,6 +145,9 @@ def run(kernel: Kernel, execution: Execution, environment: Mapping[str, str]) ->
                         wait(pending, timeout=delay, return_when=FIRST_COMPLETED)
                     else:
                         time.sleep(delay)
+            except BaseException as error:
+                close_admission(error)
+                raise
             finally:
                 # Set before the pools wait. Native hooks retain physical exit
                 # evidence; Host never confirms exit by dropping a Future.
@@ -179,6 +183,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return run(kernel, execution, inherited.environment)
     except (OSError, ValueError, RuntimeError) as error:
         print(bounded_error(str(error)), file=sys.stderr)
+        for note in getattr(error, "__notes__", ()):
+            print(bounded_error(note), file=sys.stderr)
         return 1
 
 

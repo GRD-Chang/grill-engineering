@@ -7,6 +7,7 @@ returned request. A raw return and its business consumption commit separately.
 
 from __future__ import annotations
 
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, replace
 from datetime import datetime
 import hashlib
@@ -15,7 +16,7 @@ import math
 from pathlib import Path
 import sqlite3
 import time
-from typing import Any, Callable, Literal, Mapping
+from typing import Any, BinaryIO, Callable, Iterator, Literal, Mapping
 from threading import RLock
 from uuid import uuid4
 
@@ -28,12 +29,12 @@ from agent_run.model import (
     AgentCall, Checks, Commit, CreationInputs, DeliveryKind, Effect, EffectResult, Execution, HostLaunch, HostObservation,
     Delivery, Policy, Profile, PullRequest, Purpose, Requirements, ResourceInspection, ResourceWitness, Role, RunSpec, Step, World, ReadWait, artifact, inspection_wire, resource_wire, review_outcome, wire_json,
 )
-from agent_run.errors import KernelError, ObservationSuperseded
+from agent_run.errors import KernelError, ObservationSuperseded, bounded_error
 from agent_run.storage.sqlite import CURRENT_LIMIT, Storage, Transaction
 from agent_run.core.attempt_continuation import (AttemptContinuationBasis, ContinuationFacts,
                                    bind_attempt_continuation, load_continuation)
 from agent_run.contracts.policy_values import checkpoint_policy
-from agent_run.storage.tasks import bind_task, read_task
+from agent_run.storage.tasks import bind_task, read_task, retain_task_lock_until_exit, task_lock, task_path
 from agent_run.storage.admission import locked_admission
 from agent_run.core.operation_contract import (OperationBinding, OperationState, ReadUnavailable, ReadFence,
                                  RequirementsRead, DeliveryObservation, DeliveryRead, DeliveryFacts,
@@ -1831,7 +1832,7 @@ class Kernel:
         with self.storage.transaction(write=False) as tx:
             run = tx.one("SELECT * FROM runs")
             run_id, task = run["id"], self._task(run)
-        with locked_admission(task) as location:
+        with locked_admission(task, wait=False) as location:
             if read_task(location) != (run_id, self.storage.path.resolve()):
                 raise KernelError("task_location_identity")
             with self.storage.transaction() as tx:
@@ -2000,6 +2001,81 @@ class Kernel:
                     == (host["main_pid"], host["start_token"], host["boot_id"], host["cgroup"])
                     and isinstance(group, str) and ".." not in group.split("/")
                     and (group == host["cgroup"] or group.startswith(host["cgroup"].rstrip("/") + "/")))
+
+    @contextmanager
+    def executor_scope(self, execution: Execution) -> Iterator[Callable[[BaseException], None]]:
+        """Fence a failing Host before drain, retaining exact settlement rights.
+
+        The existing Task lock excludes lifecycle admission if storage cannot
+        record revocation. No SQL transaction spans physical cleanup. Retry the
+        revocation once after drain; never claim a failed commit closed it.
+        Unrecorded revocation retains that lock until this Host process exits.
+        """
+        with self.storage.transaction(write=False) as tx:
+            run = tx.one("SELECT * FROM runs")
+            self._executor_owned(tx, run, execution)
+            task = self._task(run)
+        failure: BaseException | None = None
+        lock: BinaryIO | None = None
+        revoked = False
+        with ExitStack() as held:
+            def close_admission(error: BaseException) -> None:
+                nonlocal failure, lock, revoked
+                failure = error
+                try:
+                    if lock is None:
+                        lock = held.enter_context(task_lock(task))
+                    if read_task(task_path(task)) != (execution.run_id, self.storage.path.resolve()):
+                        revoked = True  # The original Task binding no longer admits this Run.
+                        held.close()
+                        lock = None
+                        return
+                    self._retire_failed_executor(execution, error)
+                except Exception as unavailable:
+                    error.add_note("Executor admission not durably revoked: " + bounded_error(str(unavailable)))
+                else:
+                    revoked = True
+                    held.close()
+                    lock = None
+            try:
+                yield close_admission
+            finally:
+                if failure is not None and not revoked:
+                    close_admission(failure)
+                    if not revoked and lock is not None:
+                        # Both commits failed. A non-inheritable duplicate keeps
+                        # this existing Task lock until this Host really exits.
+                        # There is no durable revocation/exit claim to release it.
+                        try:
+                            retain_task_lock_until_exit(lock)
+                        except OSError as unavailable:
+                            failure.add_note("Task admission lock could not be retained: " + bounded_error(str(unavailable)))
+
+    def _retire_failed_executor(self, execution: Execution, error: BaseException) -> None:
+        with self.storage.transaction() as tx:
+            run = tx.one("SELECT * FROM runs")
+            if run["id"] != execution.run_id:
+                raise KernelError("executor_fenced")
+            if (run["executor"], run["epoch"]) != (execution.owner, execution.epoch):
+                return  # A prior Stop, exit or committed reply loss already fenced it.
+            tx.execute("INSERT OR IGNORE INTO retired_executors VALUES (?,?,?,'pending')",
+                       (execution.run_id, execution.owner, execution.epoch))
+            tx.execute("UPDATE runs SET epoch=epoch+1 WHERE id=?", (execution.run_id,))
+            owner = tx.one("SELECT id FROM subjects ORDER BY rowid LIMIT 1")[0]
+            material = tx.put(owner, "executor_failure", wire_json({
+                "owner": execution.owner, "epoch": execution.epoch,
+                "type": type(error).__name__, "message": bounded_error(str(error)),
+            }))
+            self._event(tx, owner, "executor_failed", execution.owner, material)
+            # Raw/exit can settle before a failed revocation is retried. The
+            # original unconsumed Attempt remains authoritative after its lease.
+            for job in tx.rows("SELECT s.id FROM subjects s JOIN attempts a ON a.id=s.current_attempt "
+                               "JOIN invocations i ON i.id=a.current_invocation WHERE a.generation=s.generation "
+                               "AND a.status IN ('running','returned','continuing') AND i.executor=? AND i.epoch=?",
+                               (execution.owner, execution.epoch)):
+                if not self._gates(tx, job["id"]):
+                    evidence = tx.put(job["id"], "executor_failure", tx.get(material, owner))
+                    self._gate(tx, job["id"], "execution_failed", evidence=evidence)
 
     def claim_executor(self, owner: str) -> Execution:
         with self.storage.transaction() as tx:

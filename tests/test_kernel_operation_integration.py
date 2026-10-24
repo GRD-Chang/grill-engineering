@@ -1,5 +1,6 @@
 """Actual Core operation runner through Host; Agent and GitHub are synthetic."""
 from agent_run.core.operation_runner import OperationRunner
+from agent_run.errors import KernelError
 import pytest
 
 import agent_run.runtime.executor as executor
@@ -240,7 +241,8 @@ def test_real_core_future_failure_and_raw_cannot_release_unknown_process(tmp_pat
         executor.run(scenario.kernel, scenario.execution, {})
     assert len(selected) == 1
     call = selected[0]
-    runner = OperationRunner(scenario.kernel, scenario.execution, lambda binding: ports)
-    assert not runner.worker_settled(call)
+    with pytest.raises(KernelError, match="executor_fenced"):
+        OperationRunner(scenario.kernel, scenario.execution, lambda binding: ports)
+    assert not scenario.kernel.worker_settled(call)
     assert scenario.kernel.status(call.subject)["pending_return"]
-    assert call.lease_id in runner.state().active
+    assert call.lease_id in scenario.kernel.operation_state().active

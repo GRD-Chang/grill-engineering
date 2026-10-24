@@ -153,7 +153,7 @@ def _check_current(task: TaskKey) -> None:
 
 
 @contextmanager
-def locked_admission(task: TaskKey) -> Iterator[Path]:
+def locked_admission(task: TaskKey, *, wait: bool = True) -> Iterator[Path]:
     """Refuse occupied/uncertain old Tasks before creating native locks or state."""
     with ExitStack() as held:
         try:
@@ -163,7 +163,7 @@ def locked_admission(task: TaskKey) -> Iterator[Path]:
             _check_current(task)
             for state in sorted({source.state for source in sources}):
                 held.enter_context(legacy_task_lock(task, state))
-            location = held.enter_context(locked_task(task))
+            location = held.enter_context(locked_task(task, wait=wait))
             if _sources(task) != sources:
                 raise _refuse(location)
             for source in sources:
@@ -171,6 +171,10 @@ def locked_admission(task: TaskKey) -> Iterator[Path]:
             _check_current(task)
         except UnsupportedState:
             raise
-        except (KernelError, OSError, ValueError, sqlite3.Error) as error:
+        except KernelError as error:
+            if error.code == "task_admission_busy":
+                raise
+            raise _refuse(task_path(task)) from error
+        except (OSError, ValueError, sqlite3.Error) as error:
             raise _refuse(task_path(task)) from error
         yield location
