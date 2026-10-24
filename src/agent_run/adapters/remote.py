@@ -32,6 +32,7 @@ from agent_run.errors import ObservationSuperseded as ObservationSuperseded
 from agent_run.model import Commit, Effect, EffectResult, PullRequest, Requirements, ResourceInspection, ResourceWitness
 from agent_run.errors import KernelError
 from agent_run.adapters.local_git import LocalEffects
+from agent_run.contracts.pr_observation import open_pr_target
 from agent_run.adapters.source import (read_remote_heads, read_requirements, read_required_check_facts,
                              normalize_required_checks)
 
@@ -147,7 +148,7 @@ class RemoteEffects:
                 raise KernelError("remote_actor_changed")
             final_admission = authorize.prepare()
             fresh = self._current_pr_edit(effect, self._reconcile(effect))
-            if fresh != observed:
+            if not self._same_pr_boundary(observed, fresh):
                 return replace(fresh, disposition="third") if fresh.disposition == "target" else fresh
             final_admission()
             return fresh
@@ -164,7 +165,7 @@ class RemoteEffects:
 
         def check_prior() -> None:
             fresh = self._reconcile(effect)
-            if fresh.disposition != "prior" or fresh != observed:
+            if fresh.disposition != "prior" or not self._same_pr_boundary(observed, fresh):
                 raise KernelError("pr_boundary_changed" if operation == "pr_write" else "operation_boundary_changed")
 
         if operation in {"push", "run_branch"}:
@@ -193,7 +194,7 @@ class RemoteEffects:
             title, _, message_body = message.partition("\n")
             response = self._write(f"repos/{self.repository}/pulls/{effect.pr_number}/merge", "PUT",
                 {"sha": _text(effect.after_sha), "merge_method": effect.payload["method"],
-                 "commit_title": title, "commit_message": message_body}, authorize)
+                 "commit_title": title, "commit_message": message_body}, authorize, check_prior)
         elif operation == "completion_comment":
             issue = self._issue(effect)
             if issue["state"] != "open":
@@ -594,16 +595,23 @@ class RemoteEffects:
         target = None if target_sha is None else self._commit(target_sha)[0]
         raw_pr = self._find_pr(request.source_ref, request.target_ref, request.pr_number) if request.read_pr else None
         pr = None if raw_pr is None else self._pr(raw_pr)
+        heads = set(request.anchors) | {head for head in (source_sha, target_sha) if head is not None}
+        if pr is not None:
+            heads.add(pr.base.sha)
+        ancestry = tuple((before, after) for before in sorted(heads) for after in sorted(heads)
+                         if self._ancestor(_sha(before), _sha(after)))
         checks = None
         if pr is not None and pr.state == "OPEN":
-            if source is None or target is None or pr.head.sha != source.sha or pr.base.sha != target.sha:
+            if source is None or open_pr_target(pr, repository=self.repository, pr_number=request.pr_number,
+                    source_ref=request.source_ref, target_ref=request.target_ref,
+                    source=source, target=target, ancestry=ancestry) is None:
                 raise GitHubReadError("github_observation_pending", "PR and remote ref observations have not converged")
             reader = GhGitHubReader(self.repository, working_directory=self.root, runner_identity=self.identity)
             checks = normalize_required_checks(read_required_check_facts(
                 reader, pr.number, expected_head_sha=request.check_head or source.sha))
-        heads = set(request.anchors) | {head for head in (source_sha, target_sha) if head is not None}
-        ancestry = tuple((before, after) for before in sorted(heads) for after in sorted(heads)
-                         if self._ancestor(_sha(before), _sha(after)))
+        if read_remote_heads(self.root, request.source_ref, request.target_ref,
+                runner_identity=self.identity, remote=self.remote) != (source_sha, target_sha):
+            raise GitHubReadError("github_observation_pending", "Remote refs changed during delivery observation")
         return DeliveryFacts(target, source, pr, checks, ancestry, self.actor(), dict(self.identity))
 
     @_operation_errors
@@ -710,6 +718,35 @@ class RemoteEffects:
             raise ValueError("foreign remote ref")
         return _sha(sha)
 
+    def _remote_heads(self, source_ref: str, target_ref: str) -> tuple[str | None, str | None]:
+        if self.git_writes is not None:
+            refs = self.git_writes.refs()
+            return refs.get(source_ref), refs.get(target_ref)
+        return read_remote_heads(self.root, source_ref, target_ref,
+                                 runner_identity=self.identity, remote=self.remote)
+
+    def _open_pr_target(self, effect: Effect, pr: PullRequest,
+                        source: str | None, target: str | None) -> Commit | None:
+        live = None if target is None else self._commit(target)[0]
+        ancestry = ((pr.base.sha, target),) if target is not None and self._ancestor(pr.base.sha, target) else ()
+        return open_pr_target(pr, repository=self.repository, pr_number=effect.pr_number,
+            source_ref=effect.source_ref, target_ref=effect.target_ref,
+            source=pr.head if source == pr.head.sha else None, target=live, ancestry=ancestry)
+
+    @staticmethod
+    def _same_pr_boundary(before: EffectResult, after: EffectResult) -> bool:
+        """Both reads already matched the same intent and exact live target.
+
+        Only their reported OPEN base snapshot may converge or lag. All other
+        fields, including content, actor and outcome, still compare exactly.
+        Neither result nor the raw base evidence is rewritten.
+        """
+        if before == after:
+            return True
+        if before.pr is None or after.pr is None or before.pr.state != "OPEN" or after.pr.state != "OPEN":
+            return False
+        return replace(after, pr=replace(after.pr, base=before.pr.base)) == before
+
     def _commit(self, sha: str) -> tuple[Commit, tuple[str, ...]]:
         data = self._api(f"repos/{self.repository}/git/commits/{_sha(sha)}")
         if data["sha"] != sha:
@@ -767,12 +804,13 @@ class RemoteEffects:
                 return EffectResult("third", pr=pr)
             if pr.title == effect.payload["title"] and pr.body == effect.payload["body"]:
                 return EffectResult("target", pr=pr)
-            source, target = self._remote_head(effect.source_ref), self._remote_head(effect.target_ref)
-            if pr.base.sha != effect.base.sha or target != effect.base.sha or source != effect.after_sha:
+            source, target = self._remote_heads(effect.source_ref, effect.target_ref)
+            if (self._open_pr_target(effect, pr, source, target) != effect.base
+                    or source != effect.after_sha):
                 return EffectResult("third", pr=pr)
             prior = effect.payload["prior"]
             return EffectResult("prior" if prior is not None and pr.title == prior["title"] and pr.body == prior["body"] else "third", pr=pr)
-        source, target = self._remote_head(effect.source_ref), self._remote_head(effect.target_ref)
+        source, target = self._remote_heads(effect.source_ref, effect.target_ref)
         if pr.state == "MERGED" and pr.merged is not None:
             commit, parents = self._commit(pr.merged.sha)
             merger = _login(data.get("merged_by"))
@@ -788,7 +826,7 @@ class RemoteEffects:
             if not contained or self._remote_head(effect.target_ref) != target:
                 return EffectResult("unknown", pr=pr)
             return EffectResult("target", commit=commit, pr=pr, raw={"parents": list(parents), "target_head": target, "live_pr_base": data["base"]["sha"]})
-        return EffectResult("prior" if pr.state == "OPEN" and pr.base.sha == effect.before_sha
+        return EffectResult("prior" if self._open_pr_target(effect, pr, source, target) == effect.base
                             and source == effect.after_sha and target == effect.before_sha else "third", pr=pr)
 
     def _current_pr_edit(self, effect: Effect, observed: EffectResult) -> EffectResult:
@@ -796,13 +834,9 @@ class RemoteEffects:
         if observed.disposition != "target" or observed.pr is None:
             return observed
         try:
-            if self.git_writes is None:
-                source, target = read_remote_heads(self.root, effect.source_ref, effect.target_ref,
-                                                  runner_identity=self.identity, remote=self.remote)
-            else:
-                heads = self.git_writes.refs()
-                source, target = heads.get(effect.source_ref), heads.get(effect.target_ref)
-            if observed.pr.base != effect.base or source != effect.after_sha or target != effect.base.sha:
+            source, target = self._remote_heads(effect.source_ref, effect.target_ref)
+            if (self._open_pr_target(effect, observed.pr, source, target) != effect.base
+                    or source != effect.after_sha):
                 return replace(observed, disposition="third")
         except GitHubReadError:
             raise

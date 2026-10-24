@@ -22,6 +22,7 @@ from uuid import uuid4
 
 from agent_run.contracts.agent_profiles import ProfileOverrides, resolve_profiles, validate_profile_options
 from agent_run.contracts.identity import validate_identity_snapshot
+from agent_run.contracts.pr_observation import open_pr_target
 from agent_run.contracts.prompt import validate_resources
 from agent_run.contracts.task import TaskKey
 
@@ -146,7 +147,9 @@ class Kernel:
                     revision = tx.one("SELECT revision FROM issue_facts WHERE issue=?", (job["issue"],))[0]
                 completion = job["completion_revision"]
             if facts.pr is not None and facts.pr.state == "OPEN" and (
-                    facts.source != facts.pr.head or facts.target != facts.pr.base
+                    open_pr_target(facts.pr, repository=run["repository"], pr_number=request.query.pr_number,
+                        source_ref=request.query.source_ref, target_ref=request.query.target_ref,
+                        source=facts.source, target=facts.target, ancestry=facts.ancestry) is None
                     or facts.checks is not None and (facts.checks.pr_number != facts.pr.number or facts.checks.head_sha != facts.pr.head.sha)):
                 raise ReadUnavailable("github_observation_pending", "PR, refs and checks have not converged")
             return World(run["observed_parent_revision"], run["observed_graph_revision"], revision, facts.target,
@@ -1580,7 +1583,8 @@ class Kernel:
                             and (scope["target"]["sha"], world.target.sha) in world.ancestry))
                     and original is not None and pr is not None and self._pr_identity(run, job, pr)
                     and pr.number == original["number"] and asdict(pr.head) == original["head"]
-                    and pr.base == world.target and pr.actor == original["actor"]
+                    and (self._open_pr_target(run, job, world) is not None if open_pr else pr.base == world.target)
+                    and pr.actor == original["actor"]
                     and pr.state == ("OPEN" if open_pr else "CLOSED"))
 
     def _advance_requeue(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, action: sqlite3.Row,
@@ -3042,7 +3046,8 @@ class Kernel:
                                json.loads(tx.get(written[0]["receipt_id"], subject)).get("pr"))
                 if (prior_pr is None or prior_pr.number != job["pr_number"] or prior_pr.state not in {"OPEN", "CLOSED"}
                         or not self._pr_identity(run, job, prior_pr) or prior_pr.head.sha != job["publication_sha"]
-                        or prior_pr.base != world.target or not isinstance(original_pr, dict)
+                        or (self._open_pr_target(run, job, world) is None if prior_pr.state == "OPEN"
+                            else prior_pr.base != world.target) or not isinstance(original_pr, dict)
                         or not self._pr_identity(run, job, original_pr) or prior_pr.actor != original_pr["actor"]
                         or prior_pr.actor != written[0]["actor"]):
                     raise KernelError("retirement_pr_changed")
@@ -4831,14 +4836,20 @@ class Kernel:
         pr = world.pr
         if pr is None:
             return job["pr_number"] is None
-        return bool(self._pr_identity(run, job, pr) and pr.state == "OPEN"
-                    and pr.head == world.source and pr.head.sha == job["publication_sha"] and pr.base == world.target)
+        return bool(pr.head.sha == job["publication_sha"] and self._open_pr_target(run, job, world) is not None)
+
+    @staticmethod
+    def _open_pr_target(run: sqlite3.Row, resource: sqlite3.Row, world: World) -> Commit | None:
+        return None if world.pr is None else open_pr_target(world.pr,
+            repository=run["repository"], pr_number=resource["pr_number"],
+            source_ref=resource["source_ref"], target_ref=resource["target_ref"],
+            source=world.source, target=world.target, ancestry=world.ancestry)
 
     def _published_matches(self, run: sqlite3.Row, job: sqlite3.Row, world: World) -> bool:
         pr = world.pr
-        return (world.target is not None and pr is not None and pr.number == job["pr_number"] and self._pr_identity(run, job, pr)
-                and world.source == pr.head and pr.head.sha == job["publication_sha"] and pr.head.tree == job["publication_tree"]
-                and pr.base.sha == job["integration_target"] and self._require_target(world).sha == pr.base.sha and pr.state == "OPEN")
+        return (world.target is not None and pr is not None and pr.number == job["pr_number"]
+                and pr.head.sha == job["publication_sha"] and pr.head.tree == job["publication_tree"]
+                and world.target.sha == job["integration_target"] and self._open_pr_target(run, job, world) is not None)
 
     def _published(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, world: World) -> bool:
         if not self._published_matches(run, job, world):
