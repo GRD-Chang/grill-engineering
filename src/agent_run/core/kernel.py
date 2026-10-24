@@ -2903,7 +2903,8 @@ class Kernel:
         payload = wire_json(command)
         prior = tx.rows("SELECT * FROM actions WHERE id=?", (action_id,))
         if prior:
-            if tx.get(prior[0]["payload_id"], material_owner) != payload:
+            original_owner = prior[0]["subject"] or tx.one("SELECT subject FROM material WHERE id=?", (prior[0]["payload_id"],))[0]
+            if tx.get(prior[0]["payload_id"], original_owner) != payload:
                 raise KernelError("action_identity_changed")
             return str(prior[0]["status"])
         if self._abandon_action(tx) is not None:
