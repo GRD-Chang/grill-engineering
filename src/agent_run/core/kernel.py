@@ -3568,6 +3568,14 @@ class Kernel:
             return Step("paused", subject, "recovery_currentness")
         return self._allocate(tx, run, job, work, world, attempt, continuation=facts, recovery_kind=kind)
 
+    def _integration_failure(self, tx: Transaction, job: sqlite3.Row) -> tuple[sqlite3.Row, dict[str, Any]] | None:
+        """The last actual integration failure, never a later Review/Git check."""
+        rows = tx.rows("SELECT e.* FROM effects e JOIN material m ON m.id=e.receipt_id "
+                       "WHERE e.subject=? AND e.generation=? AND e.operation='integrate' AND e.status='confirmed' "
+                       "AND json_extract(CAST(m.body AS TEXT),'$.disposition')='failure' ORDER BY e.rowid DESC LIMIT 1",
+                       (job["id"], job["generation"]))
+        return None if not rows else (rows[0], json.loads(tx.get(rows[0]["receipt_id"], job["id"])))
+
     def _context(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, world: World, role: Role) -> dict[str, Any]:
         context: dict[str, Any] = {
             "repository": run["repository"], "parent_issue": run["parent_issue"], "issue": job["issue"],
@@ -3605,6 +3613,13 @@ class Kernel:
                      "git_integrity": "git_integrity_evidence", "required_checks": "ci_evidence"}[job["repair_source"]]
             material = job["ci_failure"] if job["repair_source"] == "required_checks" else job["last_failure"]
             context[field] = json.loads(tx.get(material, job["id"]))
+        integration_failure = (self._integration_failure(tx, job) if job["purpose"] == Purpose.INTEGRATION
+                               and (role == Role.REVIEW or role == Role.DEVELOPMENT and job["repair_source"] == "git_integrity") else None)
+        if (role == Role.DEVELOPMENT and integration_failure is not None
+                and integration_failure[1]["raw"].get("head") == job["workspace_sha"]):
+            # A content-check repair still owns the original unfinished merge.
+            # _mechanical checks its exact HEAD and original MERGE_HEAD again.
+            context["integration_evidence"] = integration_failure[1]
         budget = self._budget(tx, job)
         if role in {Role.DEVELOPMENT, Role.REVIEW} and budget["review_limit"] is not None:
             context["review_budget_context"] = {
@@ -3658,6 +3673,19 @@ class Kernel:
                                 and (prior_candidate == full["candidate_sha"] or (prior_candidate, full["candidate_sha"]) in world.ancestry))
                     if complete:
                         focus = {"base_sha": prior_candidate, "candidate_sha": full["candidate_sha"]}
+            if integration_failure is not None:
+                failure, original = integration_failure
+                development = tx.one("SELECT id,result_id FROM attempts WHERE subject=? AND generation=? "
+                                     "AND purpose='integration' AND role='development' AND status='consumed' ORDER BY ordinal DESC LIMIT 1",
+                                     (job["id"], job["generation"]))
+                facts["integration_record"] = {
+                    "effect_id": failure["id"], "receipt_id": failure["receipt_id"], "subject": job["id"],
+                    "generation": job["generation"], "source_ref": failure["source_ref"],
+                    "target_ref": failure["target_ref"], "candidate_sha": failure["candidate_sha"],
+                    "target_sha": failure["base_sha"], "receipt": original,
+                    "development_attempt": development["id"], "development_result": development["result_id"],
+                    "development_summary": artifact(Role.DEVELOPMENT, tx.get(development["result_id"], job["id"]))["summary"],
+                }
             if job["purpose"] == Purpose.CI and job["kind"] != DeliveryKind.TICKET:
                 accepted = tx.rows("SELECT context_id,result_id FROM attempts WHERE subject=? AND generation=? AND role='review' AND outcome='pass' AND purpose!='ci' AND revision=? AND parent_revision=? AND graph_revision=? AND completion_revision=? ORDER BY ordinal DESC LIMIT 1",
                                    (job["id"], job["generation"], job["revision"], run["parent_revision"], run["graph_revision"], job["completion_revision"]))
@@ -3737,9 +3765,7 @@ class Kernel:
             if outcome == "fail":
                 tx.execute("UPDATE subjects SET last_failure=? WHERE id=?", (attempt["result_id"], subject))
                 # Review Findings drive repair input; purpose retains the active budget.
-                source = ("integration" if job["purpose"] == Purpose.INTEGRATION
-                          and job["repair_source"] == "integration" else "acceptance")
-                tx.execute("UPDATE subjects SET repair_source=? WHERE id=?", (source, subject))
+                tx.execute("UPDATE subjects SET repair_source='acceptance' WHERE id=?", (subject,))
                 phase = "development"
                 self._release_integration(tx, subject)
             else:

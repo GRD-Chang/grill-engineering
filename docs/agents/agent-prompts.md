@@ -506,6 +506,10 @@ Review Findings 退回时 `repair_source=acceptance`，仍携带原始 CI 证据
 Ticket、Parent-only、完整 Parent（含其修复候选）在 Reviewer 调用前保存 `review_context`，
 归属于现有 Semantic Attempt，完成后随其有界历史保留；status/history 的 Attempt JSON 可读取同一快照。
 快照保存需求事实、当前/前次 review identity、原始 Acceptance Artifact、CI 与集成证据。
+集成失败后的审核输入引用当前 subject/generation 的真实失败 effect 与持久 receipt，
+并绑定最近已完成集成 Development 的 result 和说明；后续 candidate 检查失败或
+Review Findings 不替换原集成现场。同次续接使用原 Attempt 冻结输入，新的独立复审
+保留原现场并更新准确修复说明；新 Generation 不继承旧现场或旧结论作为当前证据。
 `full_range` 始终描述交付基线 B 至当前候选：首次 B→C1，修复后 B→C2；有适用完整前序审核时
 `focus_range` 为 C1→C2，否则先建立完整基线。基线或需求变化不会凭相同 tree 获得前序完整审核责任。
 完整 Parent 还固定默认分支基准、预期合并 tree、Ticket Graph 与 Completion；Ticket 的 Parent 只提供背景。

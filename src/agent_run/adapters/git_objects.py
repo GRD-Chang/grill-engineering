@@ -35,8 +35,10 @@ class LocalGit:
         except GitError as error:
             raise KernelError("git_operation_failed", str(error)) from error
         if check and result.returncode:
-            raise KernelError("git_operation_failed", repr({"command": command, "returncode": result.returncode,
-                              "stdout": result.stdout, "stderr": result.stderr}))
+            evidence = {"command": command, "returncode": result.returncode,
+                        "stdout": result.stdout, "stderr": result.stderr}
+            raise KernelError("git_operation_failed", repr(evidence)) from GitError(
+                "Git command failed", evidence=evidence)
         return result
 
     def _run_in(self, directory: Path, *arguments: str, input: str | None = None,
@@ -78,6 +80,20 @@ class LocalGit:
             raise KernelError("commit_parents_changed")
         return self.commit(sha)
 
+    def check_candidate(self, checkout: Path, *revisions: str, cached: bool = False) -> None:
+        """The same content check before commit and on original-object readback.
+
+        CRLF is a line ending, not trailing whitespace. Spaces before CR and
+        actual conflict markers still fail; no repository setting is changed.
+        """
+        command = ("-c", "core.whitespace=trailing-space,space-before-tab,cr-at-eol",
+                   "diff", "--check", *(("--cached",) if cached else ()), *revisions)
+        result = self.run(*command, cwd=checkout, check=False)
+        if result.returncode:
+            raise GitError("Candidate content check failed", evidence={
+                "command": ["git", *command], "returncode": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr})
+
     def candidate(self, checkout: Path, before: str, token: str,
                   parents: tuple[str, ...]) -> tuple[Commit, bool]:
         if not parents or parents[0] != before or len(parents) not in {1, 2} or len(set(parents)) != len(parents):
@@ -92,12 +108,12 @@ class LocalGit:
             if (message != f"candidate {token}" or self.parents(actual) != parents or merge_head is not None
                     or self.run("status", "--porcelain", "--untracked-files=all", cwd=checkout).stdout):
                 raise KernelError("candidate_checkout_changed")
-            self.run("diff", "--check", before, actual, cwd=checkout)
+            self.check_candidate(checkout, before, actual)
             return self.commit(actual), False
         if merge_head != (parents[1] if len(parents) == 2 else None):
             raise KernelError("candidate_merge_changed")
         self.run("add", "--all", cwd=checkout)
-        self.run("diff", "--cached", "--check", cwd=checkout)
+        self.check_candidate(checkout, cached=True)
         tree = self.run("write-tree", cwd=checkout).stdout.strip()
         if tree == self.commit(before).tree and len(parents) == 1:
             return self.commit(before), True
