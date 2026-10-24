@@ -625,6 +625,13 @@ elif endpoint=='graphql':
 elif '/commits/' in endpoint and endpoint.endswith(('/check-runs','/check-suites','/status')):
     print_latest_response(d,args);raise SystemExit(0)
 elif endpoint=='repos/example/project/commits/main': result={'sha':head('refs/heads/main')}
+elif endpoint.startswith('repos/example/project/git/ref/heads/'):
+    from urllib.parse import unquote
+    ref='refs/heads/'+unquote(endpoint.split('/git/ref/heads/',1)[1])
+    sha=head(ref)
+    if sha is None:
+        print('HTTP 404 ref absent',file=sys.stderr);raise SystemExit(1)
+    result={'ref':ref,'object':{'type':'commit','sha':sha}}
 elif endpoint=='repos/example/project/rulesets': result=[[]]
 elif '/protection/required_status_checks' in endpoint: result={'contexts':[],'checks':[]}
 elif '/git/commits/' in endpoint:
