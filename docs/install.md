@@ -59,6 +59,9 @@ GitHub CLI 不在自动 APT 补装范围：Ubuntu 24.04 原生源中的 gh 2.45.
 上述范围是自动准备策略，模拟工具测试只验证分支与授权边界，不是完整平台支持证明。
 须在实际目标宿主验证：可联系版本 254+ 的 user systemd manager、可用的 `systemd-run`，
 以及 bubblewrap 所需 mount/device/PID namespace。工具在 PATH 上不等于具备这些执行能力。
+须使用实际运行 Runner 的登录用户会话，能够观察对应 cgroup、使用 FD store，且 Python/内核提供
+所需的 pidfd/准确退出观察。云沙箱中的 user manager 或 namespace 失败只说明该环境未就绪，
+不代表所有 Linux 不可用；也不能用容器内工具存在代替真实宿主验证。
 Runner 的 Python 须实际加载包含 WAL-reset 修复的 SQLite：3.51.3 及以上，或官方回补
 3.50.7–3.50.x / 3.44.6–3.44.x，见[状态存储](agents/state-storage.md#sqlite-运行库与资源生命周期)。
 重新安装 Runner 不会升级旧 Run 协议，也不能证明该宿主已通过完整交付验收。
@@ -67,7 +70,7 @@ Runner 的 Python 须实际加载包含 WAL-reset 修复的 SQLite：3.51.3 及�
 | --- | --- |
 | Python / Git | 准备 CPython 3.11+、venv/pip、构建后端和 Git 2.40+；以 Setup 报告核对兼容性 |
 | GitHub CLI | 按 [gh Linux 安装说明](https://github.com/cli/cli/blob/trunk/docs/install_linux.md)准备兼容版本；执行 `gh auth status` |
-| Codex | 按 [Codex 安装说明](https://github.com/openai/codex)安装并登录；核对 `codex exec --help`、`codex exec resume --help` 和 `codex login status` |
+| Codex | 按 [Codex 安装说明](https://github.com/openai/codex)安装并登录；核对 `codex exec --help`、`codex exec resume --help` 和 `codex login status`；登录及所需环境必须对实际 Executor/Worker 子进程可用，不能只在发起终端可用 |
 | user systemd / bubblewrap | 在真实用户登录会话检查 `systemctl --user show-environment`，定位 namespace 或权限问题；修复后重跑 Setup 的执行探针 |
 
 Setup 成功后的短命 systemd 探针用于检查真实执行能力。不要通过关闭全机防护、替换 init 或绕过隔离来通过检查。
@@ -87,9 +90,18 @@ Setup 成功后的短命 systemd 探针用于检查真实执行能力。不要�
 | 项目环境 | 编译、测试和运行依赖已就绪；从配置好项目 PATH/虚拟环境的终端启动，Runner 的 Python 环境不能替代它 |
 | CI | 已有 PR workflow 时，核对其 base 分支覆盖默认分支和 `agent-run/**`，并检查两类分支的必需检查规则；确认无必需检查也可运行，但不报告为 CI 通过 |
 
+完整 Parent 修复还要求所选 Runner 身份能依法更新**现存**受管 `agent-run/**/run` 分支，
+首次创建成功不证明后续更新可行。[#487](https://github.com/GRD-Chang/grill-engineer/issues/487)
+所述更新前必须已有 `quality` 的保护规则，不因取消内部 Repair PR 就自动兼容。
+当前直接写路径不自动取得该前置检查或修改规则；接入时须核实合法更新路径，缺失时保留候选和意图并报告，
+不能靠重复 `resume`、伪造检查或静默改规则补齐。
+
 ### GitHub 认证：默认无需配置 App
 
 程序端与 Worker 均可在 `settings show/configure` 独立选择 host、PAT 或 App，无配置时默认 host。两端共享凭据定义，程序端选择统一覆盖读取、克隆、发布及远端 Git，该身份须有交付所需权限。已有 App 配置的迁移见个人运行配置。
+
+Required Checks 读取也使用所选 Runner 身份，须能取得当前 head、required context 的 App 绑定、
+完整 rollup 及服务器 latest/suite/status 证据。缺字段、分页不完整或来源不明保持未知，不能按名称或旧成功记录放行。
 
 选择 host 时，由操作者执行 `gh auth login`，再用 `gh auth status` 核对宿主登录状态。程序端选择 PAT 或 App 时无需额外宿主登录；只给 Worker 选择凭据不会改变程序端来源。
 

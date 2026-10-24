@@ -57,13 +57,14 @@ Unavailable or incompatible candidates and package-manager failures must be reso
 
 This is the automatic preparation policy. Fake-tool tests verify policy and authorization branches, not platform support.
 Verify the actual target host: the user systemd manager must be reachable and version 254+, `systemd-run` must be available, and bubblewrap must be able to create the required mount/device/PID namespaces. A tool appearing on PATH does not prove these capabilities.
+Use the login session of the user who actually runs Runner. Its cgroup must be observable, FD store usable, and the Python/kernel combination must provide the required pidfd-based exit observation. A cloud sandbox's missing user manager or namespace capability means that environment is not ready; it does not establish that Linux is unsupported. Installed tools inside a container are not a substitute for checking the real host.
 The Runner's Python must load SQLite with the WAL-reset fix: 3.51.3 or later, or the official backports 3.50.7–3.50.x / 3.44.6–3.44.x. See [state storage](agents/state-storage.md#sqlite-运行库与资源生命周期). An older Run is not upgraded by reinstalling the Runner.
 
 | Missing requirement | Action and verification |
 | --- | --- |
 | Python / Git | Provide CPython 3.11+, venv/pip, the build backend, and Git 2.40+; use Setup's report to check compatibility |
 | GitHub CLI | Install a compatible version using the [gh Linux instructions](https://github.com/cli/cli/blob/trunk/docs/install_linux.md); run `gh auth status` |
-| Codex | Follow the [Codex installation instructions](https://github.com/openai/codex) and log in; check `codex exec --help`, `codex exec resume --help`, and `codex login status` |
+| Codex | Follow the [Codex installation instructions](https://github.com/openai/codex) and log in; check `codex exec --help`, `codex exec resume --help`, and `codex login status`. Login and required environment must be available to the actual Executor/Worker child processes, not only the initiating terminal |
 | User systemd / bubblewrap | Check `systemctl --user show-environment` in a real user login session; diagnose namespace or permission failures, then rerun Setup's execution probe |
 
 Setup's short-lived systemd probe checks actual execution capability. Preserve host protections and isolation when resolving failures; do not replace init or disable system-wide protections to pass the probe.
@@ -81,9 +82,13 @@ Read the target repository's `AGENTS.md` and confirm that the required content h
 | Project environment | Build, test, and runtime dependencies are ready. Start from a shell with the project's PATH/virtual environment configured; Runner's Python environment does not replace it |
 | CI | If PR workflows exist, verify that their base-branch filters cover the default branch and `agent-run/**`; check required-check rules for both. Runs may proceed with no required checks, but do not describe that as CI passing |
 
+Full Parent repair also requires a lawful path for the selected Runner identity to update an **existing** managed `agent-run/**/run` branch; successful initial creation is insufficient. The pre-update `quality` rule in [#487](https://github.com/GRD-Chang/grill-engineer/issues/487) is not automatically supported by removing internal Repair PRs. The current direct-write path neither obtains that prerequisite check automatically nor changes rules. Verify the update path at setup; otherwise preserve the candidate/intent and report the gap. Repeating `resume`, inventing checks or silently changing rules does not resolve it.
+
 ### GitHub authentication: no App required by default
 
 Runner and Worker independently select host, PAT or App through `settings show/configure`; both default to host. They share credential definitions. Runner's selection covers reading, cloning, publishing and remote Git, and needs the permissions required by the delivery workflow. See [user defaults](user-defaults.md#github-身份).
+
+Required Checks reads use the selected Runner identity too. It must obtain the current head, required-context App bindings, complete rollup and server latest/suite/status evidence. Missing fields, incomplete pagination or unproven provenance stay unknown; a matching name or earlier success cannot authorize progress.
 
 For host, the operator logs in with `gh auth login` and verifies with `gh auth status`. Runner PAT/App does not require an additional host login. Selecting credentials only for Worker does not change Runner's source.
 

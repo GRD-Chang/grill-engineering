@@ -8,7 +8,7 @@
 - 为每轮首次候选验收创建全新的 Fresh Acceptance Thread 和一次性 Validation Checkout；同一 Reviewer 因 `execution_failed` 或 Human Blocker 继续当前对象时复用原 Thread 并重新准备 checkout；
 - 以 [Acceptance Artifact Schema](acceptance-artifact-schema.md) 约束 Ticket 与 Run Reviewer 共用的三条验收 lane 输出；
 - `run` 与 `resume` 都通过同一 Task Control 和独立 Executor 连续推进；恢复失败 Invocation 或 Human Blocker 后形成的 Candidate、PR 与 Required Checks 由同一 Executor 监督到下一真实边界，发起终端退出或 Ctrl-C 只离开观察；
-- Required Checks 与 GitHub 事件等远端异步状态在单次等待预算到期后进入可恢复的监督超时暂停；GitHub 读取或对账的未知非零退出同样进入有界监督。按 `status` 指引显式 `resume` 开始新的等待窗口，不另启 watcher，不以重复 `run` 清除超时或其他人工门禁；
+- Required Checks 的 pending 等待当前默认2700秒（45分钟），到期进入可恢复的监督超时暂停；其他 GitHub 异步状态、未知读取或对账按各自有界窗口监督。远端检查在超时后成功不会自动重启或续期；按 `status` 指引显式 `resume` 开始对应的新窗口，不另启 watcher，不以重复 `run` 清除超时或其他人工门禁；
 - 通过 Required Checks 与 Published-Head Gate 后，将 Ticket PR squash merge
   到 Run Branch，并显式关闭唯一 Primary Ticket；
 - 每张 Ticket 完成后重新读取 GitHub，继续推进其他可执行分支；
@@ -278,6 +278,12 @@ evidence；任一可重建输入变化都先回到 fresh Run Acceptance 判断 R
 Run 已到人工边界、PID 消失或原命令参数相同，都不能代替准确 Host/Worker 的退出证明。
 未知启动、退出或写入结果先对账，不通过重复启动或编辑数据库猜测恢复。
 
+Host 异常时先撤销原执行代次的准入，再排空原 Worker；这期间不能用新的或重复的 `resume` 准入替代 Host。
+若撤销无法提交，原 Task 锁保留至该 Host 实际退出，原始返回/退出仍可按原归属结算，不能把提交失败写成已撤销。
+创建 guardian 的进程在事务外等待并收割原 Popen；原启动 deadline 不变，额外3秒仅限退出回收宽限。
+其他进程以准确身份/pidfd 观察原 guardian 退出，仍须同时满足 Host、cgroup 和 FD-store 证明；
+不是看到僵尸、PID变化或 Future完成就释放租约或重新启动。
+
 ### Output Repair、Resume 与 Requeue
 
 三者按失败层级分开，不可替换：
@@ -355,6 +361,12 @@ generation、payload digest 等稳定机器审计事实只在显式 `--json` 输
 如果 merge 的写入响应出现网络错误或无法解析的响应，Publisher 不盲目重放：先在 GitHub 对账。PR 已
 合并即恢复成功；PR 仍 OPEN 且 live head/base、Required Checks 与 mergeability 均保持当前时，最多重试
 同一个带精确 head 绑定的 merge intent 三次；任一状态矛盾则停止等待人工处理。
+
+PR 原 `base` 是远端观测快照，可能落后于同一 target ref 的当前提交；程序保留原快照，
+另外核对准确仓库、PR、source/head、target ref 与祖先关系，并将实时 target 绑定到审核、intent及批准。
+当前 ref 分叉、缺证或身份不符仍拒绝。CLOSED PR 还须证明本代次准确的原 `retire_pr` receipt，
+不能仅凭关闭状态或祖先 base 接管外部操作；MERGED 的结果仍按原合并证据核验。
+这些读取和写前复核不是 GitHub 服务端原子 base-CAS 承诺，不能据此跳过检查或最终批准。
 
 当所有 Ticket 完成后，`run` 自动进入 `run_acceptance_pending` 并推进 Run Acceptance。
 正常 Run Acceptance Attempt 在一次性、只读的 Validation Checkout 中派发全新的 Run Reviewer；Reviewer 不得

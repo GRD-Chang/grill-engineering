@@ -76,6 +76,14 @@ Task 位置记录位于数据主目录的 `native-task-locations/`，只绑定 R
 每次真实外部写入前仍经过 Core 的当下授权检查，未知结果沿同一 intent 读回，
 数据库提交、展示状态和 Agent 报告均不能代替真实外部结果或进程退出证据。
 
+故障 Host 在 Worker drain 前先封闭原执行代次的准入；无法持久撤销时将已持有的 Task 锁留至进程退出，
+不在业务事务中等待物理清理。guardian 创建者负责事务外 wait/reap；其他观察者只用匹配的 pidfd 证明准确退出，
+并继续核验 Host/cgroup/FD-store。原启动期限不续期，3秒仅为回收宽限，未知退出不等于可重新准入。
+
+Required Checks 按当前 head、required context/App 和完整 rollup/latest 证据核验，未知不当作通过。
+PR 原 base 快照与实时 target ref 分开保存语义；祖先关系须绑定准确身份，CLOSED 还须核验原退休 receipt。
+这不改变 Review/批准/写入授权，也不承诺远端原子 base-CAS；运行前提见[安装与仓库接入](install.md)。
+
 ## 测试支撑与配置归属
 
 合成 GitHub、脚本 Agent 和独立 Git world 位于 `tests/support`：
