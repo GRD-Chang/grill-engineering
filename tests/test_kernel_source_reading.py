@@ -27,6 +27,8 @@ def _reader(root: Path, monkeypatch, *, invalid: bool = False) -> tuple[GhGitHub
                          'head': {'ref': 'source', 'sha': '2' * 40, 'repo': {'full_name': 'outside/fork'}},
                          'base': {'ref': 'main', 'sha': '1' * 40, 'repo': {'full_name': 'example/project'}}},
         'checks': [], 'rulesets': [], 'classic': [],
+        'repository': 'example/project', 'default_branch': 'main',
+        'refs': {'refs/heads/main': '1' * 40},
         'parent': {'number': 1, 'title': 'Original Parent', 'body': 'Original Parent body\r\n保留原文',
                    'subIssues': None if invalid else page([{'number': 9}], True, 'parent-next')},
         'parent-next': {'number': 1, 'title': 'Original Parent', 'body': 'Original Parent body\r\n保留原文',
@@ -40,11 +42,15 @@ def _reader(root: Path, monkeypatch, *, invalid: bool = False) -> tuple[GhGitHub
               'labels': page([{'name': 'ready-for-agent'}, {'name': 'user-label'}]), 'blockedBy': page([])},
     }))
     script = binary / 'gh'
-    script.write_text('#!' + sys.executable + '\n' + CHECK_ROLLUP_FAKE + LATEST_CHECK_FAKE + '''import json, os, sys
+    script.write_text('#!' + sys.executable + '\n' + f'import sys\nsys.path.insert(0, {str(Path(__file__).parent)!r})\nfrom support.github_checks import repository_response\n' + CHECK_ROLLUP_FAKE + LATEST_CHECK_FAKE + '''import json, os, sys
 args=sys.argv[1:]
 with open(os.environ['SOURCE_TEST_LOG'],'a') as f: f.write(json.dumps(args)+'\\n')
-if args[:2]==['repo','view']:
-    print(json.dumps({'nameWithOwner':'example/project','defaultBranchRef':{'name':'main'}}))
+if args[:2]==['repo','view'] or (args[:1]==['api'] and '/git/ref/heads/' in args[1]):
+    with open(os.environ['SOURCE_TEST_RESPONSES']) as f: data=json.load(f)
+    result=repository_response(args, repository=data['repository'], default_branch=data['default_branch'],
+                               refs=data['refs'], errors=data.get('ref_errors'))
+    print(result.stdout,end='');print(result.stderr,end='',file=sys.stderr)
+    raise SystemExit(result.returncode)
 elif args[:2]==['api','graphql']:
     fields=dict(value.split('=',1) for index,value in enumerate(args) if index and args[index-1] in ('-F','-f'))
     if 'CurrentRequiredChecks' in fields['query']:
@@ -57,8 +63,6 @@ elif args[:2]==['api','graphql']:
 elif args[:1]==['api'] and '/commits/' in args[1] and args[1].split('?')[0].endswith(('/check-runs','/check-suites','/status')):
     with open(os.environ['SOURCE_TEST_RESPONSES']) as f: data=json.load(f)
     print_latest_response(data,args)
-elif args[:1]==['api'] and args[1]=='repos/example/project/commits/main':
-    print(json.dumps({'sha':'1111111111111111111111111111111111111111'}))
 elif args[:2]==['api','repos/example/project/pulls/17']:
     with open(os.environ['SOURCE_TEST_RESPONSES']) as f: data=json.load(f)
     pr=data['pull_request']
@@ -757,3 +761,49 @@ def test_missing_or_contradictory_pagination_headers_cannot_end_collection(tmp_p
     path.write_text(json.dumps(data))
     with pytest.raises(GitHubReadError):
         read_required_check_facts(reader,17,expected_head_sha='2'*40)
+
+
+@pytest.mark.parametrize('branch', ['trunk', 'feature/ci', 'feature/#fix%'])
+def test_repository_fixture_reads_only_the_exact_declared_default_ref(tmp_path, monkeypatch, branch):
+    from urllib.parse import quote
+    reader, log = _reader(tmp_path, monkeypatch)
+    responses = tmp_path / 'responses.json'
+    data = json.loads(responses.read_text())
+    data.update(default_branch=branch, refs={'refs/heads/' + branch: 'b' * 40})
+    responses.write_text(json.dumps(data))
+    repository = reader.repository()
+    assert (repository.name_with_owner, repository.default_branch, repository.default_head_sha) == ('example/project', branch, 'b' * 40)
+    commands = [json.loads(line) for line in log.read_text().splitlines()]
+    assert commands[-1] == ['api', 'repos/example/project/git/ref/heads/' + quote(branch, safe='')]
+    assert not any('/commits/' in str(command) for command in commands)
+
+
+@pytest.mark.parametrize('status', [404, 403, 503])
+def test_repository_fixture_preserves_absence_and_ref_read_failures(tmp_path, monkeypatch, status):
+    reader, log = _reader(tmp_path, monkeypatch)
+    responses = tmp_path / 'responses.json'
+    data = json.loads(responses.read_text())
+    if status == 404:
+        data['refs'] = {'refs/heads/another': 'c' * 40}
+    else:
+        data['ref_errors'] = {'repos/example/project/git/ref/heads/main': f'HTTP {status} ref unavailable'}
+    responses.write_text(json.dumps(data))
+    with pytest.raises(GitHubReadError) as failure:
+        read_requirements(reader, 1)
+    assert failure.value.code == 'github_read_failed'
+    assert f'HTTP {status}' in failure.value.message
+    commands = [json.loads(line) for line in log.read_text().splitlines()]
+    assert commands[1:] == [['api', 'repos/example/project/git/ref/heads/main']] * 3
+    assert not any('graphql' in command for command in commands)
+
+
+@pytest.mark.parametrize('endpoint', [
+    'repos/example/project/git/ref/heads/unknown',
+    'repos/another/project/git/ref/heads/main',
+    'repos/example/project/commits/main',
+])
+def test_repository_fixture_never_falls_back_for_another_ref_or_old_commit_route(endpoint):
+    from support.github_checks import repository_response
+    result = repository_response(['api', endpoint], repository='example/project', default_branch='main',
+                                 refs={'refs/heads/main': 'a' * 40})
+    assert result.returncode == 1 and result.stdout == '' and 'HTTP 404' in result.stderr

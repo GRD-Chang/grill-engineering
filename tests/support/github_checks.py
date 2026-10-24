@@ -1,4 +1,33 @@
-"""Raw current-rollup responses for the existing isolated gh executables."""
+"""Current repository and check responses for isolated gh executables."""
+from collections.abc import Mapping, Sequence
+import json
+import subprocess
+from urllib.parse import quote
+
+
+def repository_response(arguments: Sequence[str], *, repository: str,
+                        default_branch: str, refs: Mapping[str, str],
+                        errors: Mapping[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    """Route only repository metadata and exact refs; absence is never a tip."""
+    command = list(arguments)
+    if command[:2] == ["repo", "view"]:
+        if len(command) > 2 and command[2] not in {repository, "--json"}:
+            return subprocess.CompletedProcess(command, 1, "", "HTTP 404 repository absent")
+        data = {"nameWithOwner": repository, "defaultBranchRef": {"name": default_branch}}
+    elif len(command) == 2 and command[0] == "api":
+        endpoint = command[1]
+        if errors and endpoint in errors:
+            return subprocess.CompletedProcess(command, 1, "", errors[endpoint])
+        matches = [ref for ref in refs if ref.startswith("refs/heads/")
+                   and endpoint == f"repos/{repository}/git/ref/heads/{quote(ref.removeprefix('refs/heads/'), safe='')}"]
+        if not matches:
+            return subprocess.CompletedProcess(command, 1, "", "HTTP 404 ref absent")
+        ref = matches[0]
+        data = {"ref": ref, "object": {"type": "commit", "sha": refs[ref]}}
+    else:
+        raise AssertionError(f"Unexpected repository fixture command: {command!r}")
+    return subprocess.CompletedProcess(command, 0, json.dumps(data), "")
+
 
 CHECK_ROLLUP_FAKE = r'''
 def fixture_prs(data):

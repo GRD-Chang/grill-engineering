@@ -634,21 +634,52 @@ def test_parent_ci_target_append_changes_current_work_to_integration_and_retains
     assert len(original_ci_events) == 1
     scenario.port.external_append(scenario.delivery.target_ref, {"external.txt": "Default branch advanced\n"}, "ci-then-append")
     operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+    failed_review = None
     for _ in range(80):
         step = operations.once()
         if step.call is not None and step.call.role.value == "development" and step.call.purpose.value == "integration":
             call = step.call
             break
         if step.call is not None:
+            if step.call.role.value == "review" and step.call.purpose.value == "integration":
+                failed_review = step.call
             scripted_return(scenario.kernel, operations.runner, step.call, scenario.agent)
         assert step.kind not in {"paused", "complete", "approval", "waiting"}
     else:
         raise AssertionError("new integration Findings did not return to Development")
     assert call.context["purpose"] == "integration"
-    assert call.context["repair_source"] == "integration"
+    # Purpose selects the integration budget; the latest actual Review Findings
+    # select the repair input, not the older Git integration responsibility.
+    assert call.context["repair_source"] == "acceptance"
+    assert failed_review is not None
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        previous = tx.one("SELECT result_id,subject,generation,outcome FROM attempts WHERE id=?", (failed_review.attempt_id,))
+        findings = json.loads(tx.get(previous["result_id"], call.subject))
+        job = tx.one("SELECT last_failure FROM subjects WHERE id=?", (call.subject,))
+        assert previous["outcome"] == "fail" and job["last_failure"] == previous["result_id"]
+        assert (previous["subject"], previous["generation"]) == (call.subject, call.context["generation"])
+    assert call.context["acceptance_artifact"] == findings == review_result("fail")
     assert "ci_failure" not in call.context
     budgets = scenario.kernel.status(scenario.delivery.key)["budgets"]
     assert budgets["ci"] == original_ci
     assert budgets["integration"]["developments_used"] == 1
     assert [event for event in scenario.kernel.history(scenario.delivery.key) if event["kind"] == "ci_failed"] == original_ci_events
 
+
+    scripted_return(scenario.kernel, operations.runner, call, scenario.agent)
+    for _ in range(30):
+        step = operations.once()
+        if step.call is not None:
+            assert step.call.role.value == "review" and step.call.purpose.value == "integration"
+            rereview = step.call
+            break
+        assert step.kind not in {"paused", "complete", "approval", "waiting"}
+    else:
+        raise AssertionError("Integration Findings repair did not return to its Reviewer")
+    facts = rereview.context["review_context"]["facts"]
+    assert rereview.subject == failed_review.subject == call.subject
+    assert rereview.context["generation"] == failed_review.context["generation"] == call.context["generation"]
+    assert facts["previous_acceptance_artifact"] == findings
+    assert facts["previous_review_identity"] == failed_review.context["review_context"]["facts"]["current_review_identity"]
+    assert scenario.kernel.status(call.subject)["budgets"]["ci"] == original_ci
+    assert [event for event in scenario.kernel.history(call.subject) if event["kind"] == "ci_failed"] == original_ci_events

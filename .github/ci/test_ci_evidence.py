@@ -9,6 +9,7 @@ import sys
 import subprocess
 import tempfile
 import unittest
+from typing import ClassVar
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
@@ -17,6 +18,8 @@ import ci_evidence as evidence
 
 class CurrentCollectionTests(unittest.TestCase):
     """Use real product collection, independently of the receipt doubles below."""
+
+    nodes: ClassVar[list[str]]
 
     @classmethod
     def setUpClass(cls):

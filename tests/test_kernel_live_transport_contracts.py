@@ -21,6 +21,8 @@ import urllib.request
 
 import pytest
 
+from support.github_checks import repository_response
+
 from agent_run.adapters.github import GhGitHubReader
 from agent_run.adapters.auth.app import GitHubCredentialError, _CancellableHTTPSHandler, _SigningProcessRegistry, _create_app_jwt, mint_installation_credential
 from agent_run.config.github_app import GitHubAppProfile
@@ -40,7 +42,7 @@ def test_github_reader_retries_transient_timeout(
                 return subprocess.CompletedProcess(
                     arguments, 1, "", "dial tcp: i/o timeout"
                 )
-        return _repository_response()
+        return _repository_response(arguments)
 
     monkeypatch.setattr('agent_run.adapters.github_commands._run_bounded_command', fake_run)
     monkeypatch.setattr('agent_run.adapters.github_commands.time.sleep', lambda _seconds: None)
@@ -163,7 +165,7 @@ def test_github_reader_retries_transient_http_status(
                 return subprocess.CompletedProcess(
                     arguments, 1, "", "HTTP 503: upstream unavailable"
                 )
-        return _repository_response()
+        return _repository_response(arguments)
 
     monkeypatch.setattr('agent_run.adapters.github_commands._run_bounded_command', fake_run)
     monkeypatch.setattr('agent_run.adapters.github_commands.time.sleep', lambda _seconds: None)
@@ -173,19 +175,9 @@ def test_github_reader_retries_transient_http_status(
     assert attempts == 3
 
 
-def _repository_response() -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess(
-        ["gh"],
-        0,
-        json.dumps(
-            {
-                "nameWithOwner": "example/project",
-                "defaultBranchRef": {"name": "main"},
-                "sha": "abc123",
-            }
-        ),
-        "",
-    )
+def _repository_response(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+    return repository_response(arguments[1:], repository="example/project", default_branch="main",
+                               refs={"refs/heads/main": "a" * 40})
 
 
 def test_github_app_token_mint_extracts_only_the_http_status(

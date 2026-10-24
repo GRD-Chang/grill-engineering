@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from support.github_checks import repository_response
+
 from agent_run.adapters.github import GhGitHubReader
 from agent_run.adapters.github_commands import MAX_COMMAND_OUTPUT_BYTES, run_read_command
 
@@ -160,7 +162,5 @@ def test_github_reader_retries_transient_http_status(
 
 
 def _repository_response(arguments: list[str]) -> subprocess.CompletedProcess[str]:
-    data = ({"nameWithOwner": "example/project", "defaultBranchRef": {"name": "main"}}
-            if arguments[1] == "repo" else
-            {"ref": "refs/heads/main", "object": {"type": "commit", "sha": "abc123"}})
-    return subprocess.CompletedProcess(arguments, 0, json.dumps(data), "")
+    return repository_response(arguments[1:], repository="example/project", default_branch="main",
+                               refs={"refs/heads/main": "a" * 40})
