@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.config.github_app import GitHubAppProfileStore
-from agent_run.errors import error_message
+from agent_run.errors import GitHubIdentityError, GitHubReadError, error_message
+from agent_run.adapters.auth.native_probe import capture_auth_probe
 from agent_run.contracts.copy import text
 
 
@@ -133,12 +134,53 @@ def validate_worker_auth(
         finally:
             provider.cancel()
         return
-    selected = native_github_environment(identity, environment)
+    _native_auth_probe(identity["source"], native_github_environment(identity, environment))
+
+
+class _AuthProbeFailure(RuntimeError):
+    """Fixed safe metadata only; never retain a subprocess exception or output."""
+
+    def __init__(self, category: str, *, returncode: int | None = None,
+                 http_status: int | None = None, errno: int | None = None) -> None:
+        self.category = category
+        self.returncode = returncode
+        self.http_status = http_status
+        self.errno = errno
+        self.authorization_failed = category in {"unauthorized", "forbidden"}
+        self.retryable = category in {"timeout", "network", "rate_limited"} or http_status in {408, 429} or (http_status is not None and http_status >= 500)
+        super().__init__(f"GitHub authentication probe {category}; exit={returncode}; HTTP={http_status}; errno={errno}")
+
+
+def _native_auth_probe(source: str, environment: Mapping[str, str]) -> None:
     try:
-        result = subprocess.run(["gh", "api", "--hostname", "github.com", "user"],
-                                env=selected, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, timeout=15, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        raise _error("auth_failed", source=identity.get("source")) from None
-    if result.returncode:
-        raise _error("auth_failed", source=identity.get("source"))
+        process = subprocess.Popen(
+            ["gh", "api", "--hostname", "github.com", "user", "--include", "--silent"],
+            env=dict(environment), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        result = capture_auth_probe(process, timeout=15)
+    except subprocess.TimeoutExpired:
+        failure = _AuthProbeFailure("timeout")
+    except OSError as error:
+        failure = _AuthProbeFailure("process_error", errno=error.errno)
+    else:
+        if not result.timed_out and result.returncode == 0:
+            return
+        status = result.http_status
+        if result.timed_out:
+            category = "timeout"
+        elif status == 403 and result.rate_limited:
+            category = "rate_limited"
+        elif status in {401, 403}:
+            category = "unauthorized" if status == 401 else "forbidden"
+        elif status is not None:
+            category = "http_error"
+        elif result.network_failure:
+            category = "network"
+        else:
+            category = "command_failed"
+        failure = _AuthProbeFailure(category, returncode=result.returncode, http_status=status)
+    # Raise outside the handler so no raw subprocess exception becomes context.
+    if failure.authorization_failed:
+        raise GitHubIdentityError(f"{_error('auth_failed', source=source)} (HTTP {failure.http_status})") from failure
+    raise GitHubReadError("github_auth_unavailable", str(failure)) from failure

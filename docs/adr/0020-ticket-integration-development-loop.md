@@ -32,3 +32,10 @@ Git 失败证据包含 operation、command、returncode、准确 checkout/HEAD/M
 沿用共享 Ticket Agent 名额、公平队列和单席集成。局部暂停释放席位并保留其他 Ticket 的独立进展；CI 等待不占 Agent 名额。未知外部写入仍保留已有对账门禁。本切片不改 Parent 完整验收、不迁移旧 Run，也不授权 Agent 提交或发布。
 
 依据 [git-diff 官方说明](https://git-scm.com/docs/git-diff) 的 `--check` 非零检查和 [git-merge 官方说明](https://git-scm.com/docs/git-merge) 的冲突现场语义，采用原操作失败交接和 exact-parent 提交核验；不替 Git 决定文件格式或隐藏检查失败。真实 Git/StateStore 和既有 deliver/resume seam 覆盖 CSV BOM/CRLF 检查失败回流、成功提交、独立额度停止与继续；Agent/GitHub 使用可控替身，真实模型保持 opt-in。
+
+当前 candidate 内容检查在提交前和原提交读回时采用同一命令级 whitespace 合同：
+保留默认的行尾空白、文件末尾空行和缩进空格检查，并启用 Git 的 `cr-at-eol`，
+把 CRLF 识别为行结束符；CR 前的真实尾空格和遗留冲突标记仍拒绝。
+不修改仓库配置、不转换文件字节。实际失败命令及非零结果作为原 effect 回执保存，
+沿现有 Git 修复和预算规则继续；外来 HEAD、未知结果及失权不因此取得新的写权限。
+其语义依据 [core.whitespace](https://git-scm.com/docs/git-config#Documentation/git-config.txt-corewhitespace)。

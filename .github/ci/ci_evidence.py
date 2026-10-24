@@ -11,14 +11,10 @@ import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
+from test_scope import CONTRACT_TESTS
 
 PRODUCT_ROOT = Path(__file__).resolve().parents[2]
 DEPENDENCY_FILES = ("pyproject.toml", "tests/dev-requirements.txt", "tests/build-requirements.txt")
-CONTRACT_TESTS = (
-    "tests/test_cli_mvp.py::test_run_reaches_explicit_approval_with_status_and_history",
-    "tests/test_cli.py::test_parent_selector_works_in_a_repo_and_across_directories",
-    "tests/test_doctor_readiness.py::test_doctor_cli_separates_installation_and_execution_readiness",
-)
 IDENTITY_FIELDS = (
     "GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_WORKFLOW_REF",
 )

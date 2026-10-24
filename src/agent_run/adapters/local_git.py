@@ -184,14 +184,20 @@ class LocalEffects:
             if (message != f"candidate {effect.effect_id}" or self.git.parents(head) != parents or merge.returncode == 0
                     or self.git.run("status", "--porcelain", "--untracked-files=all", cwd=checkout).stdout):
                 return EffectResult("third")
-            self.git.run("diff", "--check", effect.before_sha, head, cwd=checkout)
+            try:
+                self.git.check_candidate(checkout, effect.before_sha, head)
+            except GitError as error:
+                return EffectResult("failure", commit=self.git.commit(head), raw=error.evidence)
             return EffectResult("target", self.git.commit(head), raw={"parents": parents, "no_change": False})
         if (merge.stdout.strip() if merge.returncode == 0 else None) != (parents[1] if len(parents) == 2 else None):
             return EffectResult("third")
-        diff = self.git.run("diff", "--check", cwd=checkout, check=False)
-        if diff.returncode:
-            return EffectResult("failure", raw={"command": ["git", "diff", "--check"], "returncode": diff.returncode,
-                                                 "stdout": diff.stdout, "stderr": diff.stderr})
+        try:
+            # Compare the complete working result to HEAD: after a failed add/
+            # check the index may still contain the prior invalid content while
+            # Development has already repaired its working-tree version.
+            self.git.check_candidate(checkout, head)
+        except GitError as error:
+            return EffectResult("failure", commit=self.git.commit(head), raw=error.evidence)
         if len(parents) == 1 and not self.git.run("status", "--porcelain", "--untracked-files=all", cwd=checkout).stdout:
             return EffectResult("target", self.git.commit(head), raw={"parents": self.git.parents(head), "no_change": True})
         return EffectResult("prior")
@@ -265,15 +271,19 @@ class LocalEffects:
             and observed.raw.get("reason") == "worktree_absent"
             or effect.operation == "cleanup_local_ref" and observed.raw.get("reason") == "ref_absent"
         )
-        if observed.disposition == "target" and no_write:
-            # Only explicit, verified no-write outcomes may acquire first-dispatch
-            # authority here; an arbitrary pre-existing target remains read-only.
+        candidate_check = (effect.operation == "candidate" and observed.disposition == "failure"
+                           and observed.commit is not None and observed.commit.sha == effect.before_sha)
+        if candidate_check or observed.disposition == "target" and no_write:
+            # Admit this candidate's content check, or an explicit no-write
+            # outcome. An arbitrary pre-existing target remains read-only.
             final_admission = authorize.prepare()
             fresh = self.reconcile(effect)
             if fresh != observed:
                 raise KernelError("local_effect_boundary_changed")
             final_admission()
-            return fresh
+            # A preflight failure is not an already-dispatched receipt. Perform
+            # the actual check only after Core's final, no-I/O admission.
+            return self.reconcile(effect) if candidate_check else fresh
         if observed.disposition != "prior":
             return observed
 
@@ -301,7 +311,17 @@ class LocalEffects:
             if head is None:
                 writer.run("worktree", "add", "--detach", str(checkout), expected)
         elif effect.operation == "candidate":
-            writer.candidate(checkout, effect.before_sha, effect.effect_id, tuple(effect.payload["parents"]))
+            try:
+                writer.candidate(checkout, effect.before_sha, effect.effect_id, tuple(effect.payload["parents"]))
+            except (GitError, KernelError) as error:
+                failure = error if isinstance(error, GitError) else error.__cause__
+                if (isinstance(error, KernelError) and error.code != "git_operation_failed"
+                        or not isinstance(failure, GitError) or not failure.evidence):
+                    raise
+                readback = self.reconcile(effect)
+                if readback.disposition in {"target", "third", "unknown"}:
+                    return replace(readback, raw={**readback.raw, "command_failure": failure.evidence})
+                return EffectResult("failure", commit=readback.commit or self.git.commit(effect.before_sha), raw=failure.evidence)
         elif effect.operation == "integrate":
             assert observed.commit is not None
             current = observed.commit

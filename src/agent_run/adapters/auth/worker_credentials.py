@@ -26,21 +26,26 @@ class NativeCredentialDelivery:
     def start(self) -> None:
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.directory.chmod(0o700)
+        # Declare the native schema before gh can try an online user migration.
+        self._replace_config("config.yml", {"version": "1"})
         self.lifecycle.start()
 
     def _write(self, credential: ReadCredential) -> None:
-        # JSON is a YAML subset. Every native gh child reads hosts.yml afresh;
-        # replacing a directory entry avoids exposing partial credentials.
-        descriptor, name = tempfile.mkstemp(prefix=".hosts-", dir=self.directory)
-        temporary = Path(name)
+        self._replace_config("hosts.yml", {"github.com": {
+            "oauth_token": credential.token, "git_protocol": "https",
+        }})
+
+    def _replace_config(self, name: str, value: dict[str, object]) -> None:
+        # JSON is a YAML subset. Every native gh child reads files afresh;
+        # replacing directory entries avoids exposing partial configuration.
+        descriptor, staging = tempfile.mkstemp(prefix=f".{name}-", dir=self.directory)
+        temporary = Path(staging)
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                json.dump({"github.com": {
-                    "oauth_token": credential.token, "git_protocol": "https",
-                }}, stream)
+                json.dump(value, stream)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, self.directory / "hosts.yml")
+            os.replace(temporary, self.directory / name)
         finally:
             temporary.unlink(missing_ok=True)
 

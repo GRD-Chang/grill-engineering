@@ -7,19 +7,9 @@ TEST_RESULTS ?= .test-results
 REPORT_MAKE = $(MAKE)
 .DEFAULT_GOAL := test
 
-# Groups are starting points; shared changes also need their callers' tests.
-TESTS_policy = tests/test_delivery_policy.py tests/test_review_budget.py
-TESTS_state = tests/test_state_store.py tests/test_scope_revision.py tests/test_error_safety.py
-TESTS_prompts = tests/test_codex_prompt_contract.py tests/test_codex_prompt_refinement.py
-TESTS_locator = tests/test_cli.py tests/test_state_store.py tests/test_run_locator*.py tests/test_test_environment.py
-LOCATOR_KEYWORDS = locator or selector or test_pytest_isolates
-FAST_CORE_TESTS = $(TESTS_policy) $(TESTS_state) $(TESTS_prompts)
-TESTS_fast = $(sort $(FAST_CORE_TESTS) $(TESTS_locator))
-FAST_KEYWORDS = $(foreach file,$(FAST_CORE_TESTS),$(basename $(notdir $(file))) or) $(LOCATOR_KEYWORDS)
-TESTS_github = tests/test_github*.py tests/test_required_checks_observation.py tests/test_external_supervision.py
-TESTS_delivery = tests/test_delivery.py tests/test_cli_delivery.py tests/test_cli_mvp.py tests/test_review_budget.py
-TESTS_run = tests/test_run_*.py tests/test_ticket_*.py
-TESTS_executor = tests/test_cli_run*.py tests/test_run_lifecycle.py tests/test_runner_lease.py tests/test_systemd_executor_host.py
+# One current inventory; shared changes also need their callers' tests.
+TEST_SCOPE = $(PYTHON) .github/ci/test_scope.py
+test_scope = $(shell $(TEST_SCOPE) $(1) || echo .invalid-test-selection)
 
 .PHONY: test test-full test-report test-bootstrap test-prepare test-policy test-state test-prompts test-locator test-github test-delivery test-run test-executor typecheck
 
@@ -36,7 +26,7 @@ test-prepare:
 # Local feedback; run the changed module's tests as well.
 test:
 	@echo "本地快速回归：Policy / State / Prompts / Locator；完整套件请运行 make test-full"
-	$(PYTHON) -m pytest $(TESTS_fast) -k '$(FAST_KEYWORDS)' $(PYTEST_ARGS)
+	$(PYTHON) -m pytest $(call test_scope,fast) $(PYTEST_ARGS)
 
 # Complete suite for CI and final validation, with a fixed process limit.
 test-full:
@@ -59,11 +49,8 @@ test-report:
 	$(PYTHON) tests/support/report_environment.py > "$(TEST_RESULTS)/environment.json"
 	@/usr/bin/time -v -o "$(TEST_RESULTS)/resources.txt" $(REPORT_MAKE) test-full PYTEST_ARGS="$(PYTEST_ARGS) --durations=50 --durations-min=0 --junitxml='$(TEST_RESULTS)/junit.xml'" 2>&1 | tee "$(TEST_RESULTS)/pytest.log"
 
-test-locator:
-	$(PYTHON) -m pytest $(TESTS_locator) -k '$(LOCATOR_KEYWORDS)' $(PYTEST_ARGS)
-
-test-policy test-state test-prompts test-github test-delivery test-run test-executor: test-%:
-	$(PYTHON) -m pytest $(TESTS_$*) $(PYTEST_ARGS)
+test-policy test-state test-prompts test-locator test-github test-delivery test-run test-executor: test-%:
+	$(PYTHON) -m pytest $(call test_scope,$*) $(PYTEST_ARGS)
 
 typecheck:
 	$(PYTHON) -m mypy src/agent_run
