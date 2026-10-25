@@ -80,7 +80,8 @@ agent-run history --parent PARENT_NUMBER --repo OWNER/REPO --json
 ```
 
 上例为后台入口。前台候选使用 `agent-run run PARENT_NUMBER --repo OWNER/REPO --foreground`，
-仅供明确授权的候选验收；正常物理 Host 与父云真实交付尚未通过，见[支持矩阵](support.md)。
+仅供明确授权的候选验收；两项物理 Host 场景已在批准的 savedcloud 上合成通过，默认权限失败仍保留。
+整体前台仍有 P1 待修复，真实 Codex 未验收、父云仍 blocked，见[支持矩阵](support.md)。
 
 命令回执只是已受理，不是已完成。Runner 在独立 clone 开发，不修改你的原 checkout；
 Development 可编辑工作文件，权威 Git metadata 只读，Review 的交付 checkout 也只读。

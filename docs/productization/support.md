@@ -16,11 +16,13 @@
 云环境兼容必须作为独立工作包验证，不能在安装脚本中跳过 systemd 检查、
 换 fake manager、禁用隔离或用进程组冒充原 cgroup 保证。
 现有 systemd 后台能力保留；前台候选已接入 `--foreground`，正常取消/退出收口仍待修复，
-两项正常物理 Host 验收尚未通过，详见[统一运行模式说明](../agent-run.md#运行模式与前台候选验收)。
+normal/stop-resume 两项已在明确批准的 savedcloud 执行上下文合成通过，原默认权限2F保留；
+整体前台仍有 P1 待修复，真实 Codex 尚未验收，详见[统一运行模式说明](../agent-run.md#运行模式与前台候选验收)。
 doctor 前台预检报告 `ready/unavailable` 和 `business_execution=not_verified`，不代表业务验收通过。
 
 父云先前因 `files.pythonhosted.org` 网络策略缺依赖的轮次仍保留 blocked 原账；
-后续固定包安装路径已到真实 Codex 兼容探针，但初始化仍失败，不能以另一环境成功替代。
+父原云 product5 正式包 `verify-release` 通过；真实安装报告 `codex_sandbox_initialization_failed`，
+未激活，仍为 blocked，不能以另一环境的合成通过替代。
 固定产品包可携带四个已锁定运行依赖，构建者仍须通过获准来源取得精确 wheel。
 
 每版矩阵补充：归档 SHA256、源码 commit、安装内容身份、工具版本、实际运行模式、

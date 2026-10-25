@@ -88,7 +88,9 @@ agent-run history --parent PARENT_NUMBER --repo OWNER/REPO --json
 
 The example above uses background mode. The foreground candidate accepts
 `agent-run run PARENT_NUMBER --repo OWNER/REPO --foreground` for explicitly authorized candidate validation.
-Two normal physical Host checks remain unpassed; real delivery in the parent assistant cloud is blocked.
+The normal and stop-resume Host checks passed synthetically in an explicitly approved savedcloud execution
+context, using fake Codex/gh and real Git; the original default-permission failures remain recorded.
+Foreground still has an unresolved P1; real Codex is unvalidated and the parent cloud remains blocked.
 See the [support matrix](support.md), not a release claim. This candidate accepts only v20 state;
 v19 and older Runs are rejected and preserved without migration or compatible resume.
 
