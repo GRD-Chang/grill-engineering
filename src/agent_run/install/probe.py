@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -18,6 +19,7 @@ if __package__ in (None, ""):
     sys.dont_write_bytecode = True
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from agent_run.runtime.process_io import TailOutput, pump
 from agent_run.runtime.process_cleanup import capture_process_scope, child_subreaper, terminate_process_group
 from agent_run.install.runtime_tree import RuntimeTreeError, find_runtime_package
 from agent_run.config.resources import read_builtin_resource
@@ -26,6 +28,26 @@ from agent_run.config.defaults import UserDefaultsStore
 
 PROBE_TIMEOUT_SECONDS = 120.0
 MAX_FINAL_OUTPUT_BYTES = 16 * 1024
+_SANDBOX_ERROR = (
+    "codex_sandbox_initialization_failed: Codex沙箱/执行环境初始化失败；"
+    "请联系环境管理员检查 Codex app-server socket 目录是否满足所属用户和 0700 权限要求；"
+    "不要绕过沙箱或平台挂载限制，当前候选未通过兼容检查"
+)
+
+
+class _ProbeStderr(TailOutput):
+    """Remember only a fixed diagnostic and enough overlap to recognize it."""
+
+    _marker = b"app-server socket directory must be a user-owned directory with mode 0700"
+
+    def __init__(self) -> None:
+        super().__init__(len(self._marker) - 1)
+        self.sandbox_initialization_failed = False
+
+    def feed(self, chunk: bytes) -> None:
+        self.sandbox_initialization_failed |= self._marker in self.data + chunk
+        super().feed(chunk)
+
 
 PROBE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -90,26 +112,41 @@ class RunnerProbeBackend:
                 prompt = read_builtin_resource("context/probe", package, language=language)
             except ValueError as error:
                 raise RunnerProbeError(str(error)) from error
-            process: subprocess.Popen[str] | None = None
+            process: subprocess.Popen[bytes] | None = None
             adopted_baseline = capture_process_scope()
             try:
                 process = subprocess.Popen(
                     command,
                     cwd=empty_directory,
                     env=os.environ.copy(),
-                    text=True,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
                     start_new_session=(
                         os.environ.get("AGENT_RUN_PROBE_INHERIT_PROCESS_GROUP") != "1"
                     ),
                 )
-                try:
-                    process.communicate(input=prompt, timeout=self.timeout_seconds)
-                except subprocess.TimeoutExpired as error:
-                    raise RunnerProbeError("Codex Compatibility Check timed out") from error
+                errors = _ProbeStderr()
+                deadline = time.monotonic() + self.timeout_seconds
+                drain_deadline: float | None = None
+
+                def check() -> bool:
+                    nonlocal drain_deadline
+                    assert process is not None
+                    now = time.monotonic()
+                    if process.poll() is not None:
+                        # A descendant holding stderr cannot delay owned cleanup.
+                        if drain_deadline is None:
+                            drain_deadline = min(deadline, now + 0.1)
+                        return now < drain_deadline
+                    if now >= deadline:
+                        raise subprocess.TimeoutExpired(command, self.timeout_seconds)
+                    return True
+
+                pump(process, stderr=errors, check=check, input_data=prompt.encode("utf-8"))
                 if process.returncode != 0:
+                    if errors.sandbox_initialization_failed:
+                        raise RunnerProbeError(_SANDBOX_ERROR)
                     raise RunnerProbeError("Codex Compatibility Check returned a non-zero exit")
                 if not output_path.is_file():
                     raise RunnerProbeError("Codex Compatibility Check produced no final output")
@@ -137,13 +174,18 @@ class RunnerProbeBackend:
                 raise RunnerProbeError("could not start Codex Compatibility Check") from error
             finally:
                 if process is not None:
-                    terminate_process_group(
-                        process,
-                        adopted_baseline=adopted_baseline,
-                        same_process_group=(
-                            os.environ.get("AGENT_RUN_PROBE_INHERIT_PROCESS_GROUP") == "1"
-                        ),
-                    )
+                    try:
+                        terminate_process_group(
+                            process,
+                            adopted_baseline=adopted_baseline,
+                            same_process_group=(
+                                os.environ.get("AGENT_RUN_PROBE_INHERIT_PROCESS_GROUP") == "1"
+                            ),
+                        )
+                    finally:
+                        for stream in (process.stdin, process.stderr):
+                            if stream is not None:
+                                stream.close()
         return {"result": "passed"}
 
 

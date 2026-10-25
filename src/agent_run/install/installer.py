@@ -56,6 +56,9 @@ _SAFE_CANDIDATE_PROBE_ERRORS = frozenset(
         "Codex Compatibility Check timed out",
         "could not start Codex Compatibility Check",
         "Codex Compatibility Check returned a non-zero exit",
+        "codex_sandbox_initialization_failed: Codex沙箱/执行环境初始化失败；"
+        "请联系环境管理员检查 Codex app-server socket 目录是否满足所属用户和 0700 权限要求；"
+        "不要绕过沙箱或平台挂载限制，当前候选未通过兼容检查",
         "Codex Compatibility Check produced no final output",
         "Codex Compatibility Check final output is too large",
         "Codex Compatibility Check returned invalid JSON",

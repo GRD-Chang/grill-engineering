@@ -50,3 +50,9 @@
 
 Runner App 长命令共享续签 scope 的生产接线缺口仍单独登记；
 这里复用既有 provider，没有新增 token manager，也没有声称已验证该长期行为。
+
+兼容性探针若报告 `codex_sandbox_initialization_failed`（Codex沙箱/执行环境初始化失败），
+表示 Codex 报告其 app-server socket 目录不满足所属用户和 `0700` 权限要求。
+请联系环境管理员检查该执行环境；受平台只读挂载或掩蔽限制时，不要自行解除限制或绕过沙箱。
+安装仍失败、候选不会因此获得兼容性通过；此分类不证明 Worker 已能运行。
+未知 stderr 继续只显示通用失败，不输出原始日志、路径或凭据；探针不会自动重试模型调用。
