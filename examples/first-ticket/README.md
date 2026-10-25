@@ -4,8 +4,10 @@
 在此目录运行 `python3 -m unittest discover -v`，基线应有两个通过的测试。
 示例 CI 尚未在真实 GitHub 上验收，见 [发行记录](../../docs/productization/release-acceptance.md)。
 
-经操作者授权，在自己的独立仓库中放入 `greeting.py` 和 `test_greeting.py`，
+经操作者授权，在自己的独立仓库中放入 `greeting.py`、`test_greeting.py` 和本目录的 `.gitignore`，
 把 `ci.yml.template` 复制为 `.github/workflows/test.yml`，提交并推送。
+复制时不要遗漏隐藏的 `.gitignore`：它排除测试生成的 `__pycache__/` 和 `*.pyc`，
+防止这些运行产物被候选的 `git add --all` 纳入交付。
 模板默认分支是 `main`；使用其他默认分支时同时修改两个 branch filter。
 将已有 `test` check 按自己的规则设置为 required，并核对准确 workflow/App 绑定。
 不要阻断 Runner 更新 `agent-run/**/run` 所需的合法路径；不自动改分支规则或授予 bypass。
