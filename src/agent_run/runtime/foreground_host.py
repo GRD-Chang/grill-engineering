@@ -32,8 +32,10 @@ _LEASE = 'AGENT_RUN_FOREGROUND_LEASE'
 
 def _observation(request: HostLaunch, record: Mapping[str, Any], disposition: Literal['running', 'exited'], *, released: bool = False) -> HostObservation:
     domain = record['domain']
+    executor = domain['executor']
     return HostObservation(disposition, None, boot_id=domain['observer']['boot_id'],
-        main_pid=domain['executor']['pid'], start_token=domain['executor']['start_token'],
+        main_pid=None if executor is None else executor['pid'],
+        start_token=None if executor is None else executor['start_token'],
         exit_status=record.get('executor_exit_code'), ended_at=record.get('ended_at'),
         evidence=_encode(record['receipt']).decode(), usage_ready=disposition == 'running',
         usage_released=released, backend='foreground', domain=domain,
@@ -104,7 +106,8 @@ class ForegroundHost:
                 raise DomainUnknown('Original namespace identity was not durably established')
             if record['phase'] != 'exited':
                 disposition = recover_init(record['domain'])
-                if disposition == 'running' and original is not None and original.usage_ready:
+                if (disposition == 'running' and original is not None and original.usage_ready
+                        and record['domain']['executor'] is not None):
                     pin = ProcessPin.open(record['domain']['executor']['pid'], record['domain']['executor'])
                     try:
                         if pin.observe() == 'running' and original.domain == record['domain']:
@@ -157,6 +160,7 @@ class ForegroundHost:
         left.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
         domain: NamespaceProcess | None = None
         executor: ProcessPin | None = None
+        settled: HostObservation | None = None
         with subreaper():
             try:
                 environment = _environment(self.environment)
@@ -170,6 +174,8 @@ class ForegroundHost:
                 record['monitor'] = domain.monitor_pin.identity.wire()
                 record['init'] = domain.init.identity.wire()
                 record['observer'] = anchor
+                record['domain'] = {'nonce': request.nonce, 'observer': anchor,
+                                    'init': domain.init.identity.wire(), 'executor': None}
                 write_record(path, record)
                 domain.release()
                 if not select.select([left], [], [], 5)[0]:raise DomainUnknown('Executor handshake expired')
@@ -201,25 +207,39 @@ class ForegroundHost:
                     select.select([domain.monitor_pin.descriptor, domain.process.stderr], [], [], 1)
                     diagnostic = domain.diagnostic()
                     if diagnostic:print(bounded_error(diagnostic), file=sys.stderr)
-                result = domain.finish(5)
+                domain.finish(5)
                 executor.wait_exit(3)
-                record.update(phase='exited', executor_exit_code=result['executor_exit_code'],
-                              namespace_exit_code=result['namespace_exit_code'], ended_at=kernel.clock(),
-                              exit_basis='retained_namespace_pidfd')
-                write_record(path, record)
-                return _settle(kernel, request, path, record)
             finally:
                 original = sys.exception()
+                errors: list[BaseException] = []
                 left.close()
                 right.close()
-                try:
-                    if domain is not None:
-                        try:domain.close()
-                        except BaseException as error:
-                            if original is None:raise
-                            original.add_note('Foreground cleanup: ' + str(error))
-                finally:
-                    if executor is not None:executor.close()
+                if domain is not None:
+                    try:domain.close()
+                    except BaseException as error:errors.append(error)
+                    # close records a retained-init proof even if another
+                    # cleanup step failed. Neither a quiet close nor Popen's
+                    # return code is accepted as namespace-exit evidence.
+                    if (domain.result is not None and domain.result.get('namespace_exited') is True
+                            and record['domain'] is not None):
+                        try:
+                            record.update(phase='exited', ended_at=kernel.clock(),
+                                executor_exit_code=(domain.result['executor_exit_code']
+                                    if record['domain']['executor'] is not None else None),
+                                namespace_exit_code=domain.result['namespace_exit_code'],
+                                exit_basis='retained_namespace_pidfd')
+                            write_record(path, record)
+                            settled = _settle(kernel, request, path, record)
+                        except BaseException as error:errors.append(error)
+                if executor is not None:
+                    try:executor.close()
+                    except BaseException as error:errors.append(error)
+                if errors:
+                    first = original if original is not None else errors.pop(0)
+                    for cleanup_error in errors:first.add_note('Foreground cleanup: ' + str(cleanup_error))
+                    if original is None:raise first
+        if settled is None:raise DomainUnknown('Foreground namespace exit remains unproven')
+        return settled
 
 
 def execute_foreground(kernel: Kernel, action: str) -> int:

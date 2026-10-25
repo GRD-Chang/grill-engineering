@@ -143,14 +143,18 @@ def foreground_exit_notice(database: Path, action_id: str, path: Path) -> dict[s
     try:
         kernel = Kernel(database)
         request, usage = kernel.host_request(action_id), kernel.host_usage(action_id)
-        if request.backend != 'foreground' or usage is None or usage.domain is None:
+        if request.backend != 'foreground' or usage is None:
             return None
         receipt = json.loads(usage.evidence)
         lock = Path(receipt['runner']['lock'])
         if path != record_root(lock) / (request.nonce + '.json'):
             return None
         record = read_record(path)
-        if (record['phase'] != 'exited' or record['domain'] != usage.domain or record['receipt'] != receipt
+        from agent_run.contracts.host import valid_foreground_domain
+        domain = record['domain']
+        if (not isinstance(domain, dict) or not valid_foreground_domain(domain, request.nonce)
+                or (domain != usage.domain if usage.domain is not None else domain['executor'] is not None)
+                or record['phase'] != 'exited' or record['receipt'] != receipt
                 or receipt['request_digest'] != _digest(request) or receipt['runner'] != _runner_witness(lock)
                 or record['binding'] != [request.run_id, request.owner, request.epoch, request.nonce]
                 or record.get('executor_exit_code') == 0):

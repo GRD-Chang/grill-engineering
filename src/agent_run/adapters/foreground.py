@@ -426,6 +426,9 @@ class NamespaceProcess:
             try:
                 if pin.observe() != 'exited':pin.kill()
                 pin.wait_exit(max(0, deadline-time.monotonic()))
+                if pin is self.init and self.result is None:
+                    self.result = {'namespace_exited': True, 'namespace_exit_code': None,
+                                   'executor_exit_code': self.status.exit_code, 'monitor_exit_code': None}
             except (OSError, DomainUnknown) as error:errors.append(str(error))
         if self.process is not None:
             try:
@@ -436,7 +439,14 @@ class NamespaceProcess:
             except (OSError, subprocess.TimeoutExpired) as error:errors.append(str(error))
         for pin in pins:
             try:
-                if pin.observe() == 'exited':pin.reap()
+                if pin.observe() == 'exited':
+                    code = pin.reap()
+                    if pin is self.init:
+                        if self.result is None:
+                            self.result = {'namespace_exited': True, 'namespace_exit_code': code,
+                                           'executor_exit_code': self.status.exit_code, 'monitor_exit_code': None}
+                        elif self.result['namespace_exit_code'] is None:
+                            self.result['namespace_exit_code'] = code
             except (OSError, DomainUnknown) as error:errors.append(str(error))
             finally:pin.close()
         if self.read_fd >= 0:

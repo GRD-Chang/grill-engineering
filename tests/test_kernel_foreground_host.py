@@ -186,3 +186,109 @@ def test_fresh_observer_does_not_require_zombie_namespace_or_signal_reused_pid(m
     finally:
         os.close(read)
         os.close(write)
+
+
+@pytest.mark.parametrize('boundary,proven', [('before-hello', True), ('before-hello', False), ('after-hello', True)])
+def test_launch_failure_settles_only_retained_init_exit(tmp_path, monkeypatch, boundary, proven):
+    """Real Core admission with a controlled physical adapter, not Linux proof."""
+    import json
+    import os
+    import socket
+    from types import SimpleNamespace
+    kernel = task_run(tmp_path, 'foreground')[0]
+    request = kernel.admit_host('launch', kind='run', command=('/usr/bin/python3',),
+        environment_carrier=tmp_path / 'carrier', preflight=lambda: None, backend='foreground')
+    facts = _domain(request.nonce)
+    manager = ForegroundHost(environment={})
+    monkeypatch.setattr(manager, 'preflight', lambda: None)
+    monkeypatch.setattr(foreground_host, 'observer_anchor', lambda: facts['observer'])
+    monkeypatch.setattr(foreground_host, 'recover_init', lambda domain: 'unknown')
+    events = []
+
+    class Pin:
+        def __init__(self, key):
+            self.identity = SimpleNamespace(wire=lambda: facts[key],
+                namespace_pids=facts[key]['namespace_pids'], pid_namespace=facts[key]['pid_namespace'])
+        def close(self):events.append('executor pin closed')
+        def observe(self):raise KeyboardInterrupt('controlled after-hello interruption')
+
+    class Domain:
+        def __init__(self, command, environment, *, pass_fds):
+            self.init = Pin('init')
+            self.monitor_pin = Pin('init')
+            self.process = SimpleNamespace(stderr=object())
+            self.channel = socket.socket(fileno=os.dup(pass_fds[0]))
+            self.result = None
+        def release(self):
+            if boundary == 'before-hello':self.channel.close()
+            else:self.channel.sendall(json.dumps({'request_digest': _digest(request), 'pid': 2,
+                                                 'namespace': facts['executor']['pid_namespace']}).encode())
+        def close(self):
+            self.channel.close()
+            events.append('physical close')
+            if not proven:raise physical.DomainUnknown('controlled unproven init exit')
+            self.result = {'namespace_exited': True, 'namespace_exit_code': -9,
+                           'executor_exit_code': None, 'monitor_exit_code': None}
+
+    monkeypatch.setattr(foreground_host, 'NamespaceProcess', Domain)
+    monkeypatch.setattr(foreground_host.ProcessPin, 'open', lambda pid: Pin('executor'))
+    authorize = kernel.authorize_host
+    def check(request):
+        authorize(request)
+        events.append('final Core authorization')
+    monkeypatch.setattr(kernel, 'authorize_host', check)
+    lock = tmp_path / 'install.lock'
+    with runner_usage_lease(lock) as lease:
+        error = KeyboardInterrupt if boundary == 'after-hello' else physical.DomainUnknown
+        with pytest.raises(error):manager.launch(kernel, request, lock=lock, lease=lease)
+    assert events.count('physical close') == 1
+    assert ('final Core authorization' in events) == (boundary == 'after-hello')
+    receipt = kernel.host_usage('launch')
+    path = physical.record_root(lock) / (request.nonce + '.json')
+    if proven:
+        assert receipt.disposition == 'exited' and receipt.usage_released
+        assert receipt.exit_status is None and receipt.namespace_exit_status == -9
+        assert (receipt.domain['executor'] is None) == (boundary == 'before-hello')
+        assert kernel.active_host_action() is None and not path.exists()
+        with runner_management_lease(lock):pass
+    else:
+        assert kernel.active_host_action() == 'launch' and path.exists()
+        assert manager.observe(kernel, request, lock).disposition == 'unknown'
+        with pytest.raises(RunnerLeaseBusy):
+            with runner_management_lease(lock):pytest.fail('Unproven init released management')
+    with kernel.storage.transaction(write=False) as tx:
+        assert tx.one('SELECT count(*) FROM attempts')[0] == 0
+        assert tx.one('SELECT count(*) FROM leases')[0] == 0
+    assert not kernel.dispatch_host(request)
+
+
+@pytest.mark.parametrize('failure', ['none', 'wait', 'reap'])
+def test_namespace_close_retains_proof_independently_of_reap_failure(failure):
+    from types import SimpleNamespace
+    domain = physical.NamespaceProcess.__new__(physical.NamespaceProcess)
+    domain.result = None
+    domain.gate = domain.read_fd = -1
+    domain.process = domain.monitor_pin = None
+    domain.status = SimpleNamespace(exit_code=None)
+    class Pin:
+        descriptor = 5
+        def kill(self):pass
+        def observe(self):
+            if failure == 'wait':raise physical.DomainUnknown('init exit unreadable')
+            return 'exited'
+        def wait_exit(self, seconds):
+            if failure == 'wait':raise physical.DomainUnknown('init exit unreadable')
+        def reap(self):
+            if failure == 'reap':raise OSError('controlled wait failure after exit proof')
+            return -9
+        def close(self):self.descriptor = -1
+    domain.init = Pin()
+    if failure == 'none':domain.close()
+    else:
+        with pytest.raises(physical.DomainUnknown):domain.close()
+    assert domain.init.descriptor == -1
+    if failure == 'wait':assert domain.result is None
+    else:
+        assert domain.result['namespace_exited'] is True
+        assert domain.result['namespace_exit_code'] == (-9 if failure == 'none' else None)
+        assert domain.result['executor_exit_code'] is None

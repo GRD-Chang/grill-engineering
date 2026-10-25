@@ -2014,11 +2014,16 @@ class Kernel:
                      and (bound[0] is None or bound == observed))
             if request.backend == "foreground":
                 domain = observation.domain
+                executor = None if domain is None else domain["executor"]
+                startup_exit = (executor is None and observation.disposition == "exited"
+                                and row["main_pid"] is None and not row["usage_ready"] and not observation.usage_ready
+                                and observation.main_pid is None and observation.start_token is None
+                                and observation.exit_status is None)
                 known = bool(domain_id is not None and domain is not None and observation.unit_name is None
                              and observation.invocation_id is None and observation.cgroup is None
                              and observation.boot_id == domain["observer"]["boot_id"]
-                             and (observation.main_pid, observation.start_token)
-                             == (domain["executor"]["pid"], domain["executor"]["start_token"]))
+                             and (startup_exit or executor is not None and (observation.main_pid, observation.start_token)
+                                  == (executor["pid"], executor["start_token"])))
             running = (known and observation.disposition == "running" and type(observation.main_pid) is int
                        and observation.main_pid > 1 and bool(observation.start_token)
                        and (row["main_pid"] is None or (row["main_pid"], row["start_token"]) == (observation.main_pid, observation.start_token)))
@@ -2069,6 +2074,8 @@ class Kernel:
                 return False
             domain = json.loads(tx.get(host["domain_id"], host["subject"]))
             executor = domain["executor"]
+            if executor is None:
+                return False
             return bool(process.get("schema") == "linux-namespace-process-v1"
                         and (process.get("host_pid"), process.get("host_start_token"), process.get("boot_id"),
                              process.get("host_namespace"), process.get("pid_namespace"))
