@@ -7,6 +7,9 @@ from __future__ import annotations
 from agent_run.contracts.write_authority import WriteAuthority
 
 import base64
+from collections.abc import Iterator
+from contextlib import contextmanager
+import os
 import json
 from pathlib import Path
 import socket
@@ -25,7 +28,10 @@ from support.github_checks import repository_response
 
 from agent_run.adapters.github import GhGitHubReader
 from agent_run.adapters.auth.app import GitHubCredentialError, _CancellableHTTPSHandler, _SigningProcessRegistry, _create_app_jwt, mint_installation_credential
-from agent_run.config.github_app import GitHubAppProfile
+from agent_run.config.github_app import (
+    GitHubAppProfile, GitHubAppProfileStore, GitHubAuthProfileError,
+    _is_inside_git_repository,
+)
 from agent_run.adapters.github_commands import MAX_COMMAND_OUTPUT_BYTES, run_read_command
 
 
@@ -180,16 +186,44 @@ def _repository_response(arguments: list[str]) -> subprocess.CompletedProcess[st
                                refs={"refs/heads/main": "a" * 40})
 
 
+@contextmanager
+def _synthetic_app_profile() -> Iterator[GitHubAppProfile]:
+    """Use the configured test temp root without falling back past a failed guard."""
+    prerequisite = "Test environment prerequisite: TMPDIR must be an existing, writable directory outside Git"
+    try:
+        configured_root = os.environ.get("TMPDIR")
+        root = Path(configured_root if configured_root is not None else tempfile.gettempdir())
+        if not root.is_absolute() or not root.is_dir():
+            raise RuntimeError(prerequisite)
+        root = root.resolve(strict=True)
+        # The original guard checks this candidate's parent and all ancestors.
+        if _is_inside_git_repository(root / "private.pem"):
+            raise RuntimeError(prerequisite)
+        temporary = tempfile.TemporaryDirectory(prefix="agent-run-http-status-", dir=root)
+    except OSError as error:
+        raise RuntimeError(prerequisite) from error
+    with temporary as directory:
+        private_key = Path(directory) / "private.pem"
+        try:
+            # Validate the real 0600 file before writing synthetic key bytes.
+            private_key.touch(mode=0o600)
+            private_key.chmod(0o600)
+            profile = GitHubAppProfileStore._validate_values("123", "456", str(private_key))
+            private_key.write_text("private-key", encoding="utf-8")
+        except (OSError, GitHubAuthProfileError) as error:
+            raise RuntimeError(prerequisite) from error
+        yield profile
+
+
 def test_github_app_token_mint_extracts_only_the_http_status(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    private_key = tmp_path / "private.pem"
-    private_key.write_text("private-key", encoding="utf-8")
-    private_key.chmod(0o600)
-    profile = GitHubAppProfile("123", "456", private_key)
     monkeypatch.setattr('agent_run.adapters.auth.app._create_app_jwt', lambda *_: "jwt")
+    response_reached = False
 
     def reject(*_args: object, **_kwargs: object) -> object:
+        nonlocal response_reached
+        response_reached = True
         raise urllib.error.HTTPError(
             "https://api.github.com/private-response",
             429,
@@ -199,11 +233,40 @@ def test_github_app_token_mint_extracts_only_the_http_status(
         )
 
     monkeypatch.setattr('agent_run.adapters.auth.app.urllib.request.urlopen', reject)
-    with pytest.raises(GitHubCredentialError) as raised:
-        mint_installation_credential(profile)
+    with _synthetic_app_profile() as profile:
+        directory = profile.private_key_path.parent
+        with pytest.raises(GitHubCredentialError) as raised:
+            mint_installation_credential(profile)
 
+    assert response_reached
     assert raised.value.http_status == 429
     assert "private-response" not in str(raised.value)
+    assert not Path(directory).exists()
+
+
+@pytest.mark.parametrize("invalid_root", ["missing", "file", "git"])
+def test_http_status_fixture_rejects_unsafe_temp_root_before_key_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid_root: str,
+) -> None:
+    root = tmp_path / "key-root"
+    if invalid_root == "file":
+        root.write_text("not a directory", encoding="utf-8")
+    elif invalid_root == "git":
+        root.mkdir()
+        (root / ".git").mkdir()
+    monkeypatch.setenv("TMPDIR", str(root))
+    before = set(root.iterdir()) if root.is_dir() else None
+
+    def unexpected_allocation(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("unsafe test temp root must be rejected before allocation")
+
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", unexpected_allocation)
+    with pytest.raises(RuntimeError, match="Test environment prerequisite: TMPDIR"):
+        with _synthetic_app_profile():
+            pytest.fail("unsafe test temp root must not yield a profile")
+
+    assert (set(root.iterdir()) if root.is_dir() else None) == before
+    assert root.exists() == (invalid_root != "missing")
 
 
 def test_app_jwt_is_rs256_and_cleans_temporary_key(
