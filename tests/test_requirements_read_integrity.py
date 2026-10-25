@@ -71,14 +71,14 @@ def test_labels_and_blockers_have_independent_complete_cursors_and_each_read_is_
     assert len(ticket_pages) == 3
     assert ticket_pages[1]['cursor'] == 'blocker-next' and ticket_pages[1]['labelsCursor'] == 'labels-next'
     assert 'cursor' not in ticket_pages[2] and ticket_pages[2]['labelsCursor'] == 'labels-last'
-    assert len(commands) == 8  # Two repository checks, two Parent pages, three Ticket9 pages, one Ticket3.
+    assert len(commands) == 7  # One metadata read, two Parent pages, three Ticket9 pages, one Ticket3.
     for key in ('9', 'blocker-next', 'labels-next', 'labels-last'):
         data[key]['body'] = 'A fresh current requirement'
     path.write_text(json.dumps(data))
     second = read_requirements(reader, 1)
     assert second.issues[0].body == 'A fresh current requirement'
     assert first.issues[0].body == 'Same original ticket body'
-    assert len(log.read_text().splitlines()) == 16
+    assert len(log.read_text().splitlines()) == 14
 
 
 def _mutate(data, case):
@@ -214,7 +214,7 @@ def test_source_403_is_not_empty_data_or_a_different_read_layout(tmp_path, monke
         read_requirements(reader, 1)
     assert caught.value.code == 'github_read_failed'
     commands = [json.loads(line) for line in log.read_text().splitlines()]
-    assert len(commands) == 5  # Original two repository reads and the existing three bounded attempts.
+    assert len(commands) == 4  # One metadata read and the existing three bounded attempts.
 
 
 @pytest.mark.parametrize('page', ['9', 'blocker-next'])
@@ -245,7 +245,7 @@ def test_global_blocker_identity_preserves_native_completion_and_external_state(
     data['3']['state'] = 'OPEN'
     path.write_text(json.dumps(data))
     source = read_requirements(reader, 1)
-    assert len(log.read_text().splitlines()) == 6  # Unchanged two repository reads, two Parent pages and two Tickets.
+    assert len(log.read_text().splitlines()) == 5  # One metadata read, two Parent pages and two Tickets.
     assert [(b.number, b.state) for b in source.issues[0].blocked_by] == [(b['number'], b['state']) for b in blockers]
     scenario = GraphScenario(tmp_path / 'normal-producer', source)
     assert scenario.kernel.source_status()['frontier'] == ['ticket:3']
@@ -288,4 +288,4 @@ def test_internal_blocker_identity_does_not_add_single_page_requests(tmp_path, m
                              'pageInfo': {'hasNextPage': False, 'endCursor': None}}
     path.write_text(json.dumps(data))
     assert [(b.number, b.state) for b in read_requirements(reader, 1).issues[0].blocked_by] == [(3, 'OPEN')]
-    assert len(log.read_text().splitlines()) == 3 + 2  # The original3+N single-page layout.
+    assert len(log.read_text().splitlines()) == 2 + 2  # One metadata read, one Parent page, N Tickets.

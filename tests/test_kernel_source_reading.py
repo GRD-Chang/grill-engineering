@@ -805,7 +805,7 @@ def test_repository_fixture_preserves_absence_and_ref_read_failures(tmp_path, mo
         data['ref_errors'] = {'repos/example/project/git/ref/heads/main': f'HTTP {status} ref unavailable'}
     responses.write_text(json.dumps(data))
     with pytest.raises(GitHubReadError) as failure:
-        read_requirements(reader, 1)
+        reader.repository()
     assert failure.value.code == 'github_read_failed'
     assert f'HTTP {status}' in failure.value.message
     commands = [json.loads(line) for line in log.read_text().splitlines()]

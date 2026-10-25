@@ -10,6 +10,7 @@ from urllib.parse import quote, urlparse
 
 from agent_run.adapters.auth.runner_transport import runner_options
 from agent_run.adapters.github_commands import run_read_command
+from agent_run.contracts.repository import same_repository
 from agent_run.runtime.git_command import git_environment
 from agent_run.model import Requirements, Repository
 from agent_run.errors import GitHubReadError
@@ -27,7 +28,6 @@ class GhGitHubReader:
         self.runner_identity = runner_identity
         self.repository_override = repository_override
         self.working_directory = working_directory
-        self._repository: Repository | None = None
 
     def repository_hint(self) -> str | None:
         identity = self.repository_override or _repository_hint_from_origin(
@@ -35,12 +35,19 @@ class GhGitHubReader:
         )
         return identity.lower() if identity else None
 
-    def repository(self) -> Repository:
+    def _repository_metadata(self, fields: str) -> dict[str, Any]:
         arguments = ["repo", "view"]
         if self.repository_override:
             arguments.append(self.repository_override)
-        arguments.extend(["--json", "nameWithOwner,defaultBranchRef"])
+        arguments.extend(["--json", fields])
         data = self._gh_json(*arguments)
+        name_with_owner = _string(data, "nameWithOwner")
+        if not same_repository(name_with_owner, self.repository_override or name_with_owner):
+            raise GitHubReadError("github_invalid_response", "Source repository does not match the selected repository")
+        return data
+
+    def repository(self) -> Repository:
+        data = self._repository_metadata("nameWithOwner,defaultBranchRef")
         name_with_owner = _string(data, "nameWithOwner")
         default_ref = _mapping(data, "defaultBranchRef")
         default_branch = _string(default_ref, "name")
@@ -51,16 +58,14 @@ class GhGitHubReader:
         if (_string(commit, "ref") != f"refs/heads/{default_branch}"
                 or _string(_mapping(commit, "object"), "type") != "commit"):
             raise GitHubReadError("github_invalid_response", "Default branch ref has another identity or type")
-        self._repository = Repository(
+        return Repository(
             name_with_owner=name_with_owner,
             default_branch=default_branch,
             default_head_sha=_string(_mapping(commit, "object"), "sha"),
         )
-        return self._repository
 
     def requirements(self, parent_number: int) -> Requirements:
-        repository = self.repository()
-        owner, name = repository.name_with_owner.split("/", 1)
+        owner, name = _string(self._repository_metadata("nameWithOwner"), "nameWithOwner").split("/", 1)
         parent = self._read_parent(owner, name, parent_number)
         issues = tuple(self._read_issue(owner, name, number, node_id, parent)
                        for number, node_id in parent.tickets)
