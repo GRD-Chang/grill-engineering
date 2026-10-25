@@ -598,8 +598,13 @@ class RemoteEffects:
         heads = set(request.anchors) | {head for head in (source_sha, target_sha) if head is not None}
         if pr is not None:
             heads.add(pr.base.sha)
-        ancestry = tuple((before, after) for before in sorted(heads) for after in sorted(heads)
-                         if self._ancestor(_sha(before), _sha(after)))
+        # Only exact objects are reused within this observation. Live refs are
+        # still bracketed below; no World or write authority is cached.
+        prepared = sorted({_sha(head) for head in heads})
+        for head in prepared:
+            self._prepare_ancestor_object(head)
+        ancestry = tuple((before, after) for before in prepared for after in prepared
+                         if before == after or self.git.is_ancestor(before, after))
         checks = None
         if pr is not None and pr.state == "OPEN":
             if source is None or pr_target(pr, repository=self.repository, pr_number=request.pr_number,
@@ -630,17 +635,22 @@ class RemoteEffects:
                      else effect.payload["owned_root"]))
         return LocalEffects(self.git, owned_root=root)
 
+    def _prepare_ancestor_object(self, sha: str) -> None:
+        # Exact objects are immutable. Fetch missing objects without updating
+        # local refs or FETCH_HEAD; a local tracking ref is never an observation.
+        if self.git.run("cat-file", "-e", sha + "^{commit}", check=False).returncode:
+            if self.git_writes is None:
+                self._read(["git", "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "--", self.remote, sha])
+            else:
+                self.git_writes.fetch(sha)
+            if self.git.run("cat-file", "-e", sha + "^{commit}", check=False).returncode:
+                raise GitHubReadError("git_ancestry_unknown", "Fetched commit object is unavailable")
+
     def _ancestor(self, before: str, after: str) -> bool:
         if before == after:
             return True
-        # Exact objects are immutable. Fetch missing objects without updating
-        # local refs or FETCH_HEAD; a local tracking ref is never an observation.
         for sha in (before, after):
-            if self.git.run("cat-file", "-e", sha + "^{commit}", check=False).returncode:
-                if self.git_writes is None:
-                    self._read(["git", "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "--", self.remote, sha])
-                else:
-                    self.git_writes.fetch(sha)
+            self._prepare_ancestor_object(sha)
         return self.git.is_ancestor(before, after)
 
     def _binding(self, effect: Effect) -> None:
