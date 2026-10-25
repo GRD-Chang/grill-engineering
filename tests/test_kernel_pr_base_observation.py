@@ -92,6 +92,28 @@ def test_delivery_reads_real_refs_and_preserves_the_reported_pr_base(tmp_path, m
     assert facts.checks is not None and facts.checks.result == 'none'
 
 
+def test_delivery_accepts_github_repository_spelling_without_rewriting_the_observation(tmp_path, monkeypatch):
+    # GitHub preserves spelling while the Runner stores a lowercase key.
+    api_repository = 'Example-Owner/Greeting-Fixture'
+    port, _git, push, state, calls = _fixture(tmp_path, monkeypatch,
+        repository='example-owner/greeting-fixture')
+    _effect, published = _publish_pr(port, push)
+    document = json.loads(state.read_text())
+    document['prs'][0]['base']['repo']['full_name'] = api_repository
+    document['prs'][0]['head']['repo']['full_name'] = api_repository
+    state.write_text(json.dumps(document))
+    writes_before = [line for line in calls.read_text().splitlines() if '--method' in line]
+
+    facts = port.delivery(DeliveryRead(push.source_ref, push.target_ref,
+                                     published.number, (), push.after_sha))
+
+    assert facts.pr is not None
+    assert facts.pr.repository == facts.pr.head_repository == api_repository
+    assert facts.source == published.head and facts.target == published.base
+    assert facts.checks is not None and facts.checks.result == 'none'
+    assert [line for line in calls.read_text().splitlines() if '--method' in line] == writes_before
+
+
 @pytest.mark.parametrize('foreign', ['repository', 'target_ref', 'head', 'actor', 'base', 'missing_target'])
 def test_an_ancestor_base_does_not_authorize_foreign_or_missing_pr_facts(tmp_path, monkeypatch, foreign):
     port, git, push, state, calls = _fixture(tmp_path, monkeypatch)

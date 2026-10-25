@@ -3,6 +3,7 @@ from collections.abc import Collection
 from typing import Literal
 
 from agent_run.model import Commit, PullRequest
+from agent_run.contracts.repository import same_repository
 
 
 def pr_target(pr: PullRequest, *, repository: str, pr_number: int | None,
@@ -16,7 +17,8 @@ def pr_target(pr: PullRequest, *, repository: str, pr_number: int | None,
     The original PR base remains evidence; MERGED never uses this rule.
     """
     if (state not in {"OPEN", "CLOSED"} or pr.state != state
-            or pr.repository != repository or pr.head_repository != repository
+            or not same_repository(pr.repository, repository)
+            or not same_repository(pr.head_repository, repository)
             or pr_number is not None and pr.number != pr_number
             or pr.source_ref != source_ref or pr.target_ref != target_ref
             or source is None or target is None or pr.head != source):

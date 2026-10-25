@@ -5,7 +5,6 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-import re
 import shutil
 import subprocess
 import tempfile
@@ -19,6 +18,7 @@ from agent_run.errors import error_message
 from agent_run.errors import GitError
 from agent_run.runtime.git_command import git_environment, run_git
 from agent_run.config.paths import app_data_root
+from agent_run.contracts.repository import normalize_repository as _normalize_repository
 from agent_run.runtime.process_cleanup import terminate_process_group
 
 _MARKER = ".agent-run-workspace.json"
@@ -30,15 +30,10 @@ class ManagedWorkspaceError(GitError):
 
 
 def normalize_repository(repository: str) -> str:
-    parts = repository.split("/")
-    if (
-        len(parts) != 2
-        or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]*", parts[0])
-        or not re.fullmatch(r"[A-Za-z0-9_.-]+", parts[1])
-        or parts[1] in {".", ".."}
-    ):
-        raise ManagedWorkspaceError(error_message("cli.error.workspace_repository_format"))
-    return repository.lower()
+    try:
+        return _normalize_repository(repository)
+    except ValueError as error:
+        raise ManagedWorkspaceError(error_message("cli.error.workspace_repository_format")) from error
 
 
 @dataclass(frozen=True)
