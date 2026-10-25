@@ -39,7 +39,9 @@
 异常或强制退出后须先确认原 Host/Worker 准确退出，再显式恢复；保留工作、Attempt 和预算。
 基底 `6a0a50f4` 的 normal（29.394秒）与 stop-resume（30.920秒）已在明确批准的 savedcloud
 执行上下文合成通过：2P/0F/0skip，非 editable 安装121文件一致；使用假 Codex/gh 与真实 Git。
-原默认权限2F（uidmap 等）独立保留；整体前台仍有 P1 待修复，真实 Codex 尚未验收。
+原默认权限2F（uidmap 等）独立保留。后继 `854f0764` 的启动失败/中断 drain 退出留证修复已独立准入：
+before/after hello 真实 namespace 合成2P、unknown 负例1P；这些不同提交的定向结果不等于最终组合全量通过。
+真实 Codex 与父助手原云交付仍未验收。
 不能把合成通过、上述合同或 doctor 的能力预检作为完整交付证明。环境实测边界统一见[支持矩阵](productization/support.md)。
 
 本候选仅接受 v20；v19 及更旧 Run 保留原数据但拒绝续接，无迁移，见[状态存储](agents/state-storage.md)。

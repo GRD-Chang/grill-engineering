@@ -15,9 +15,10 @@
 基础 namespace 成功不证明完整挂载、退出、恢复或交付成功。
 云环境兼容必须作为独立工作包验证，不能在安装脚本中跳过 systemd 检查、
 换 fake manager、禁用隔离或用进程组冒充原 cgroup 保证。
-现有 systemd 后台能力保留；前台候选已接入 `--foreground`，正常取消/退出收口仍待修复，
+现有 systemd 后台能力保留；前台候选已接入 `--foreground`，启动失败/中断 drain 的退出留证修复已独立准入，
 normal/stop-resume 两项已在明确批准的 savedcloud 执行上下文合成通过，原默认权限2F保留；
-整体前台仍有 P1 待修复，真实 Codex 尚未验收，详见[统一运行模式说明](../agent-run.md#运行模式与前台候选验收)。
+后继 `854f0764` 的真实 namespace 合成2P与unknown负例1P另账记录，不外推最终组合全通过；
+真实 Codex 与父助手原云交付尚未验收，详见[统一运行模式说明](../agent-run.md#运行模式与前台候选验收)。
 doctor 前台预检报告 `ready/unavailable` 和 `business_execution=not_verified`，不代表业务验收通过。
 
 父云先前因 `files.pythonhosted.org` 网络策略缺依赖的轮次仍保留 blocked 原账；
