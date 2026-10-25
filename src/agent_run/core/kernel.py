@@ -39,7 +39,7 @@ from agent_run.contracts.policy_values import checkpoint_policy
 from agent_run.storage.tasks import bind_task, read_task, task_lock, task_path
 from agent_run.storage.admission import locked_admission
 from agent_run.core.operation_contract import (OperationBinding, OperationState, ReadUnavailable, ReadFence,
-                                 RequirementsRead, DeliveryObservation, DeliveryRead, DeliveryFacts,
+                                 RequirementsRead, LocalCleanupRead, LocalCleanupObservation, DeliveryObservation, DeliveryRead, DeliveryFacts,
                                  _SentRead, _ApprovalRead, _ObservationPass, Work, PrepareIO, EffectIO, ObserveIO, IORequest, IOResult)
 
 
@@ -172,8 +172,54 @@ class Kernel:
             self._check_operation(tx, fence, effect.execution)
             return bool(tx.one("SELECT status FROM effects WHERE id=?", (effect.effect_id,))[0] == "prepared")
 
-    def authorize_effect_observation(self, effect: Effect, world: World, fence: ReadFence, *,
+    def _local_cleanup_effect(self, tx: Transaction, effect: Effect) -> None:
+        row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
+        job = self._job(tx, effect.subject)
+        if (effect.operation not in {"cleanup_worktree", "cleanup_local_ref"}
+                or self._abandon_action(tx) is not None or row["control_action"] is not None
+                or row["status"] not in {"prepared", "sent"}
+                or self._effect(tx, row, effect.execution) != effect or not self._cleanup_current(tx, job, row)):
+            raise KernelError("local_cleanup_observation_binding")
+
+    def begin_effect_observation(self, effect: Effect) -> RequirementsRead | LocalCleanupRead:
+        """Only ordinary local retirement is independent of Delivery facts.
+
+        Its source refresh is still mandatory at every write boundary. An
+        unrelated Delivery outage is not read or converted into permission.
+        """
+        with self.storage.transaction(write=False) as tx:
+            self._effect_owned(tx, effect, effect.execution)
+            row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
+            if self._effect(tx, row, effect.execution) != effect:
+                raise KernelError("effect_binding")
+            local = row["operation"] in {"cleanup_worktree", "cleanup_local_ref"} and row["control_action"] is None
+            if local:
+                self._local_cleanup_effect(tx, effect)
+        source = self.begin_observation(effect.subject, execution=effect.execution)
+        return LocalCleanupRead(effect, source) if local else source
+
+    def accept_local_cleanup_requirements(self, request: LocalCleanupRead, source: Requirements) -> LocalCleanupObservation:
+        if (not isinstance(request, LocalCleanupRead)
+                or not isinstance(request.source, RequirementsRead) or not isinstance(request.source.fence, ReadFence)
+                or request.source.fence.subject != request.effect.subject
+                or request.source.fence.execution != request.effect.execution or request.source.fence.cleanup):
+            raise KernelError("local_cleanup_observation_binding")
+        with self.storage.transaction(write=False) as tx:
+            self._local_cleanup_effect(tx, request.effect)
+        accepted = self.accept_requirements(request.source, source)
+        with self.storage.transaction(write=False) as tx:
+            self._check_operation(tx, accepted.fence, request.effect.execution)
+            self._local_cleanup_effect(tx, request.effect)
+        return LocalCleanupObservation(request.effect, accepted.fence)
+
+    def authorize_effect_observation(self, effect: Effect, world: World | LocalCleanupObservation, fence: ReadFence, *,
                                      prepared: bool, inspections: tuple[ResourceInspection, ...] | None) -> None:
+        if isinstance(world, LocalCleanupObservation):
+            if (not isinstance(fence, ReadFence) or (world.effect, world.fence) != (effect, fence)
+                    or fence.subject != effect.subject or fence.execution != effect.execution or fence.cleanup):
+                raise KernelError("local_cleanup_observation_binding")
+        elif not isinstance(world, World):
+            raise KernelError("effect_observation_binding")
         waiting = self._finish_operation_read(fence, effect.execution)
         if waiting is not None:
             raise ReadWait(waiting)
@@ -2892,7 +2938,7 @@ class Kernel:
                     and invocation["raw_id"] is None):
                 self._gate(tx, call.subject, "execution_failed", evidence=material)
 
-    def _guard_effect(self, effect: Effect, execution: Execution, world: World, *,
+    def _guard_effect(self, effect: Effect, execution: Execution, world: World | LocalCleanupObservation, *,
                      resource_inspections: tuple[ResourceInspection, ...] | None = None, token: str | ReadFence) -> None:
         """Read-only authority guard for each real successor mutation in an adapter."""
         with self.storage.transaction(write=False) as tx:
@@ -2907,6 +2953,8 @@ class Kernel:
                 self._abandon_write_current(tx, abandoned, row, resource_inspections)
                 return
             if effect.operation == "retire_pr":
+                if not isinstance(world, World):
+                    raise KernelError("local_cleanup_observation_binding")
                 if row["status"] != "sent" or self._effect(tx, row, execution) != effect or not self._retirement_authority(tx, run, job, row, world):
                     raise KernelError("operation_cancelled")
                 return
@@ -2915,6 +2963,8 @@ class Kernel:
                         or not self._cleanup_current(tx, job, row) or self._effect(tx, row, execution) != effect):
                     raise KernelError("operation_cancelled")
                 return
+            if not isinstance(world, World):
+                raise KernelError("local_cleanup_observation_binding")
             if effect.operation in {"completion_comment", "close"} and self._final_closing(tx, run, job):
                 if (row["status"] != "sent" or run["stopped"] or run["blocked"] or self._gates(tx, effect.subject)
                         or row["generation"] != job["generation"] or world.graph_revision != run["graph_revision"]
@@ -4405,7 +4455,12 @@ class Kernel:
             raise KernelError("publisher_identity_changed")
         return actor
 
-    def _guard_publisher(self, tx: Transaction, run: sqlite3.Row, effect: sqlite3.Row, world: World) -> None:
+    def _guard_publisher(self, tx: Transaction, run: sqlite3.Row, effect: sqlite3.Row, world: World | LocalCleanupObservation) -> None:
+        if isinstance(world, LocalCleanupObservation):
+            self._local_cleanup_effect(tx, world.effect)
+            if effect["id"] != world.effect.effect_id:
+                raise KernelError("local_cleanup_observation_binding")
+            return
         if effect["operation"] in self.REMOTE and self._publisher_actor(tx, run, world) != effect["actor"]:
             raise KernelError("publisher_identity_changed")
 
@@ -4486,7 +4541,7 @@ class Kernel:
             self._event(tx, effect.subject, "retirement_intent_prepared", effect.effect_id, material)
             return self._effect(tx, tx.one("SELECT * FROM effects WHERE id=?", (effect.effect_id,)), execution)
 
-    def _dispatch(self, effect: Effect, execution: Execution, world: World, *,
+    def _dispatch(self, effect: Effect, execution: Execution, world: World | LocalCleanupObservation, *,
                  resource_inspections: tuple[ResourceInspection, ...] | None = None, token: str | ReadFence) -> bool:
         """Recheck authority immediately before the single external operation."""
         with self.storage.transaction() as tx:
@@ -4510,6 +4565,8 @@ class Kernel:
                 self._event(tx, effect.subject, "effect_dispatched", effect.effect_id, generation=row["generation"])
                 return True
             if effect.operation == "retire_pr":
+                if not isinstance(world, World):
+                    raise KernelError("local_cleanup_observation_binding")
                 if not effect.payload.get("retirement_intent"):
                     raise KernelError("retirement_intent_required")
                 if not self._retirement_authority(tx, run, job, row, world):
@@ -4525,6 +4582,8 @@ class Kernel:
                 tx.execute("UPDATE effects SET status='sent',attempts=attempts+1 WHERE id=?", (effect.effect_id,))
                 self._event(tx, effect.subject, "effect_dispatched", effect.effect_id)
                 return True
+            if not isinstance(world, World):
+                raise KernelError("local_cleanup_observation_binding")
             if not self._current(tx, job, run, world):
                 return False
             if world.target is None and not (effect.operation == "run_branch" and job["kind"] == DeliveryKind.TICKET):

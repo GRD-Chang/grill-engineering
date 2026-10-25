@@ -88,6 +88,18 @@ class RequirementsRead:
 
 
 @dataclass(frozen=True)
+class LocalCleanupRead:
+    effect: Effect
+    source: RequirementsRead
+
+
+@dataclass(frozen=True)
+class LocalCleanupObservation:
+    effect: Effect
+    fence: ReadFence
+
+
+@dataclass(frozen=True)
 class DeliveryObservation:
     fence: ReadFence
     query: DeliveryRead

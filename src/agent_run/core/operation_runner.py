@@ -22,6 +22,8 @@ from agent_run.model import AgentCall, Effect, EffectResult, Execution, ReadWait
 from agent_run.errors import KernelError
 from agent_run.core.operation_contract import (OperationBinding, OperationPorts, OperationState, ReadUnavailable,
                                  ReadFence, RequirementsRead, DeliveryRead, DeliveryFacts,
+                                 LocalCleanupRead,
+                                 LocalCleanupObservation,
                                  _ObservationPass, PrepareIO, EffectIO, ObserveIO, IOResult)
 
 if TYPE_CHECKING:
@@ -132,7 +134,13 @@ class OperationRunner:
     def _prepare_authority(self, request: EffectIO) -> FinalAdmission:
         effect = request.effect
         try:
-            world, fence = self._observe(effect.subject)
+            world: World | LocalCleanupObservation
+            demand = self.kernel.begin_effect_observation(effect)
+            if isinstance(demand, LocalCleanupRead):
+                world = self.kernel.accept_local_cleanup_requirements(demand, self.ports.source(demand.source.parent_number))
+                fence = world.fence
+            else:
+                world, fence = _read_observation(self.kernel, self.ports, demand)
             prepared = self.kernel.effect_observation_prepared(effect, fence)
             resources = self.kernel.effect_resources(effect)
             inspections = None if resources is None else self.ports.inspect(resources)
