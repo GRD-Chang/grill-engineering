@@ -91,7 +91,11 @@ def read_state(path: Path) -> Iterator[sqlite3.Connection]:
             db.execute("BEGIN")
             # BEGIN is deferred: read the database before checking the identity
             # of the snapshot we are about to expose to the caller.
-            db.execute("SELECT name FROM sqlite_schema LIMIT 1").fetchone()
+            try:
+                db.execute("SELECT name FROM sqlite_schema LIMIT 1").fetchone()
+            except sqlite3.Error as error:
+                # This schema read formerly happened in support classification.
+                raise UnsupportedState(path, "uncertain_state") from error
             current = path.lstat()
             parent = path.parent.stat()
             if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
