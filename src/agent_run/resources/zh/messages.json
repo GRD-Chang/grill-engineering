@@ -1099,5 +1099,6 @@
   "cli.usage_prefix": "用法: ",
   "cli.help_option": "显示帮助并退出",
   "cli.invalid_choice": "参数 {argument} 的无效选项：{value}（可选：{choices}）",
-  "cli.error.run_locator_missing": "找不到匹配的 Run。请先用 agent-run runs --repo OWNER/NAME 核对已有 Run；若尚未创建此 Parent 的 Runner 工作区，请用 agent-run run PARENT --repo OWNER/NAME 启动。"
+  "cli.error.run_locator_missing": "找不到匹配的 Run。请先用 agent-run runs --repo OWNER/NAME 核对已有 Run；若尚未创建此 Parent 的 Runner 工作区，请用 agent-run run PARENT --repo OWNER/NAME 启动。",
+  "presentation.status.recorded_review": "已记录验收结论"
 }

@@ -1099,5 +1099,6 @@
   "cli.usage_prefix": "usage: ",
   "cli.help_option": "show this help message and exit",
   "cli.invalid_choice": "argument {argument}: invalid choice: {value} (choose from {choices})",
-  "cli.error.run_locator_missing": "No matching Run was found. First inspect existing Runs with agent-run runs --repo OWNER/NAME; if this Parent has no Runner workspace yet, start it with agent-run run PARENT --repo OWNER/NAME."
+  "cli.error.run_locator_missing": "No matching Run was found. First inspect existing Runs with agent-run runs --repo OWNER/NAME; if this Parent has no Runner workspace yet, start it with agent-run run PARENT --repo OWNER/NAME.",
+  "presentation.status.recorded_review": "Recorded review"
 }

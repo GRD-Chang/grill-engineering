@@ -170,6 +170,15 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
     if data["parent"]["title"]:
         yield data["parent"]["title"]
     yield f"{copy['status']}: {terms.get(data['status'], copy.get(data['status'], data['status']))} | {copy['phase']}: {terms.get(data['phase'], data['phase'])}"
+    tickets = [job for job in data["subjects"] if job["kind"] == "ticket"]
+    if tickets:
+        progress = text("presentation.status.completed_v1_v3_tickets", language=document.language,
+                        v1=sum(job["phase"] == "complete" for job in tickets), v3=len(tickets))
+    else:
+        progress = text("presentation.status.no_tickets_working_directly_on_the_requirement" if any(
+            job["kind"] == "parent_only" for job in data["subjects"]) else
+            "presentation.status.progress_cannot_be_confirmed", language=document.language)
+    yield f"{text('presentation.status.overall_progress', language=document.language)}: {progress}"
     yield f"{copy['duration']}: {data['elapsed_seconds'] if data['elapsed_seconds'] is not None else copy['incomplete']}"
     yield copy["unknown_live"]
     yield from _notification_lines(document)
@@ -218,7 +227,7 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
                 if invocation["outputs"][-1]["started_at"] is not None:
                     yield f"  {copy['started']}"
                 yield f"  {copy['duration']}: {invocation['elapsed_seconds'] if invocation['elapsed_seconds'] is not None else copy['incomplete']}"
-        for budget in job["budgets"]:
+        for budget in job["budgets"] if job["phase"] not in {"complete", "abandoned"} else []:
             review_limit = budget["review_limit"] if budget["review_limit"] is not None else copy["unknown"]
             yield (f"  {copy['budget']}: {terms.get(budget['purpose'], budget['purpose'])} W{budget['window']} "
                    f"D {budget['developments_used']}/{budget['development_limit']} R {budget['reviews_used']}/{review_limit}")
@@ -226,9 +235,15 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
             cleanup = job["delivery_cleanup"]
             yield f"  {copy['cleanup']}: {copy['complete'] if cleanup['state'] == 'complete' else copy['pending']}"
         review = job["review"]
-        if review and review["outcome"] != "pass":
-            for finding in review_findings(review["artifact"]):
-                yield f"{copy['findings']}: {finding}"
+        if review:
+            yield f"{text('presentation.status.recorded_review', language=document.language)}: {text('card.result.' + review['outcome'], language=document.language)}"
+            if review["outcome"] == "pass":
+                for name, lane in review["artifact"]["checks"].items():
+                    yield f"  {text('card.check.' + name, language=document.language)}: {text('card.result.' + lane['status'], language=document.language)}"
+                    yield f"  {copy['evidence']}: {lane['evidence']}"
+            else:
+                for finding in review_findings(review["artifact"]):
+                    yield f"{copy['findings']}: {finding}"
     if document.kind == "history":
         yield copy["history"]
         history = data["history"]
