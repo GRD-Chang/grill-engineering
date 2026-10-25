@@ -408,11 +408,11 @@ def _control_environment(git_repo: Path, directory: Path, monkeypatch, *, codex:
         str(number): {"number": number, "title": f"Managed Ticket {number}",
                      "body": f"Original requirement for Ticket {number}.", "state": "OPEN", "labels": ["ready-for-agent"]}
         for number in tickets}}}))
-    clone = r'''import json, os, sys
-from pathlib import Path
+    clone = ('import sys\nsys.path.insert(0, ' + repr(str(Path(__file__).parent)) + ')\n'
+             'from support.fixture_text import read_text\n') + r'''import json, os, sys
 if sys.argv[1:3] == ['issue', 'view']:
     number = sys.argv[3]
-    source = json.loads(Path(os.environ['REMOTE_TEST_STATE']).read_text())
+    source = json.loads(read_text(os.environ['REMOTE_TEST_STATE']))
     print(json.dumps(source['source_graph']['parent'] if number == '1' else source['source_graph']['issues'][number]))
     raise SystemExit(0)
 if sys.argv[1:3] == ['repo', 'clone']:

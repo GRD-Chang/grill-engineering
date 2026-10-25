@@ -585,11 +585,11 @@ def test_final_observation_proves_real_current_completions_into_remote_run_befor
 
 
 FAKE_GH = ('import sys\nsys.path.insert(0, ' + repr(str(Path(__file__).parent)) + ')\n'
+           'from support.fixture_text import read_text, write_text\n'
            + CHECK_ROLLUP_FAKE + LATEST_CHECK_FAKE) + r'''import json, os, sys
-from pathlib import Path
 args=sys.argv[1:]
-state=Path(os.environ['REMOTE_TEST_STATE'])
-d=json.loads(state.read_text())
+state=os.environ['REMOTE_TEST_STATE']
+d=json.loads(read_text(state))
 os.environ.update(GIT_AUTHOR_NAME='Publisher',GIT_AUTHOR_EMAIL='publisher@example.invalid',GIT_COMMITTER_NAME='Publisher',GIT_COMMITTER_EMAIL='publisher@example.invalid',GIT_AUTHOR_DATE='2000-01-01T00:00:00Z',GIT_COMMITTER_DATE='2000-01-01T00:00:00Z')
 with open(os.environ['REMOTE_TEST_CALLS'],'a') as f: f.write(json.dumps(args)+'\n')
 def git(*args, input=None):
@@ -607,7 +607,7 @@ if args[:2]==['pr','checks']:
 if args[0]!='api': raise SystemExit('unexpected '+repr(args))
 endpoint=args[1].split('?',1)[0]
 method=args[args.index('--method')+1] if '--method' in args else 'GET'
-body=json.loads(Path(args[args.index('--input')+1]).read_text()) if '--input' in args else {}
+body=json.loads(read_text(args[args.index('--input')+1])) if '--input' in args else {}
 if d.get('read_error') and method=='GET':
     print('HTTP 403 forbidden',file=sys.stderr);raise SystemExit(1)
 if endpoint=='user': result={'login':d.get('actor','publisher')}
@@ -698,7 +698,7 @@ elif endpoint.startswith('repos/example/project/issues/'):
     else:result={'number':2,'node_id':'issue-node-2','state':d['issue_state']}
 else:raise SystemExit('unexpected endpoint '+endpoint)
 if method!='GET' and d.get('read_error_after_write'):d['read_error']=True
-state.write_text(json.dumps(d))
+write_text(state,json.dumps(d))
 print(json.dumps(result))
 if method!='GET' and d.get('lose_operation')==('issue_link' if endpoint=='graphql' else 'merge' if endpoint.endswith('/merge') else 'comment' if endpoint.endswith('/comments') else 'close' if '/issues/' in endpoint else 'pr'):
     print('response lost after actual mutation',file=sys.stderr);raise SystemExit(1)

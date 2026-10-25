@@ -24,7 +24,7 @@ def install_currentness(directory: Path, state: Path) -> None:
         assert program.count(original) == 1, original
         program = program.replace(original, changed)
 
-    replace("d=json.loads(state.read_text())", """d=json.loads(state.read_text())
+    replace("d=json.loads(read_text(state))", """d=json.loads(read_text(state))
 from datetime import datetime, timedelta, timezone
 def tick():
     d['operation_clock'] += 1
@@ -45,7 +45,7 @@ def tick():
             assert body and set(body) <= {'title','body'}
             resource.update(body)
             resource['updated_at']=tick()
-            state.write_text(json.dumps(d))
+            write_text(state,json.dumps(d))
             print(json.dumps(resource))
             raise SystemExit(0)
         resource['state']=body['state'].upper()""")
