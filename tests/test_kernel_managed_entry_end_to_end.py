@@ -430,6 +430,9 @@ if os.environ.get('ENTRY_APPROVAL_CONTROL') and sys.argv[1:3] == ['api', 'graphq
         assert channel.recv(1) == b'1'
 '''
     gh = FAKE_GH
+    gh = gh.replace("v['issueId']=='issue-node-2'",
+        "v['issueId'] in {f\"issue-node-{issue['number']}\" for issue in "
+        "(d['source_graph']['parent'], *d['source_graph']['issues'].values())}")
     gh = gh.replace("'number':17,'state':'open'", "'number':17+len(d['prs']),'state':'open'")
     gh = gh.replace("else: result=[d['prs']] if '--slurp' in args else d['prs']", """else:
             from urllib.parse import parse_qs, urlsplit
