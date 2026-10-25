@@ -90,6 +90,14 @@ def runner_management_lease(lock_path: Path) -> Iterator[RunnerLease]:
         fcntl.LOCK_EX,
         "存在活动 Executor 或另一个 Runner 管理操作",
     ) as lease:
+        # A killed foreground supervisor can release flock before namespace
+        # teardown is proven. Only successful exact exit settlement removes this
+        # physical protection; acquiring EX is not sufficient evidence.
+        root = lock_path.parent / "foreground-hosts"
+        if root.exists() or root.is_symlink():
+            from agent_run.adapters.foreground import record_root
+            if next(record_root(lock_path).iterdir(), None) is not None:
+                raise RunnerLeaseBusy("Foreground Host exit or exit handoff remains unproven")
         yield lease
 
 

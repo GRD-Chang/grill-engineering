@@ -72,11 +72,18 @@ def _cgroup(pid: int) -> str:
     return groups[0]
 
 
-def _identity(pid: int) -> dict[str, int | str]:
+def _identity(pid: int, *, foreground: bool = False) -> dict[str, int | str]:
     host = os.getpid()
     start, host_start = _start_token(pid), _start_token(host)
     if start is None or host_start is None or os.getpgid(pid) != pid:
         raise ProcessExitUnknown("Worker process identity is unavailable")
+    if foreground:
+        namespace, host_namespace = os.readlink(f"/proc/{pid}/ns/pid"), os.readlink("/proc/self/ns/pid")
+        if namespace != host_namespace or _start_token(pid) != start or _start_token(host) != host_start:
+            raise ProcessExitUnknown("Worker namespace identity is unavailable")
+        return {"schema": "linux-namespace-process-v1", "pid": pid, "start_token": start, "pgid": pid,
+                "host_pid": host, "host_start_token": host_start, "pid_namespace": namespace,
+                "host_namespace": host_namespace, "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
     group, host_group = _cgroup(pid), _cgroup(host)
     if _start_token(pid) != start or _start_token(host) != host_start:
         raise ProcessExitUnknown("Process identity changed while reading cgroup")
@@ -326,7 +333,7 @@ def _run_dispatched(
     failure: BaseException | None = None
     try:
         pidfd = os.pidfd_open(process.pid)
-        identity = _identity(process.pid)
+        identity = _identity(process.pid, foreground=kernel.host_backend(call.execution) == "foreground")
         kernel.agent_started(call, identity)
         bound = True
         _authorize_source(kernel, call, authorize_source, deadline, capture)

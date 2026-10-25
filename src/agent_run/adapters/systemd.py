@@ -66,6 +66,8 @@ class SystemdHost:
     def launch(self, request: HostLaunch, *, dispatch: Callable[[], bool],
                exit_properties: tuple[str, ...] = ()) -> HostObservation | None:
         """Consume exactly one Kernel launch grant; never retry an unknown start."""
+        if request.backend != "systemd" or request.unit_name is None:
+            raise HostUnavailable("A systemd Host request is required")
         if not dispatch():
             return None
         try:
@@ -117,6 +119,8 @@ class SystemdHost:
         ControlPID/cgroup settlement is deliberately irrelevant here: this
         proves neither whole-Host exit nor release of its retained lease.
         """
+        if request.backend != "systemd" or request.unit_name is None:
+            return False
         if not re.fullmatch(r"[0-9a-f]{32}", invocation_id) or int(invocation_id, 16) == 0:
             return False
         try:
@@ -138,6 +142,8 @@ class SystemdHost:
 
     def observe(self, request: HostLaunch) -> HostObservation:
         """Read twice around physical evidence; this never mutates the Kernel."""
+        if request.backend != "systemd" or request.unit_name is None:
+            raise HostUnavailable("A systemd Host request is required")
         try:
             fields = self._fields(request.unit_name)
             if (fields["Id"] != request.unit_name or fields["Description"] != request.description
@@ -182,7 +188,7 @@ class SystemdHost:
 
     def stored_descriptors(self, request: HostLaunch, observation: HostObservation) -> int | None:
         """Read the store count only while the exact observed unit stays fixed."""
-        if observation.disposition not in {"running", "exited"}:
+        if request.backend != "systemd" or request.unit_name is None or observation.disposition not in {"running", "exited"}:
             return None
         try:
             fields = self._fields(request.unit_name)

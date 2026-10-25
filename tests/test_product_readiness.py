@@ -86,15 +86,19 @@ def test_non_host_configuration_is_not_rejected_by_host_login(
     assert "gh auth" not in calls.read_text()
 
 
-def test_foreground_is_not_advertised_before_host_support(
+def test_foreground_is_not_advertised_when_host_preflight_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
     _tools(tmp_path, monkeypatch)
+    from agent_run.runtime.foreground_host import ForegroundHost
+    def unavailable(self):raise RuntimeError('Controlled unavailable namespace observation')
+    monkeypatch.setattr(ForegroundHost, 'preflight', unavailable)
     assert main(["doctor", "--local", "--mode", "foreground", "--json"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["execution_readiness"]["status"] == "unavailable"
     assert report["execution_readiness"]["mode"] == "foreground"
-    assert report["modes"]["foreground"]["status"] == "not_integrated"
+    assert report["modes"]["foreground"]["status"] == "unavailable"
+    assert report["modes"]["foreground"]["business_execution"] == "not_verified"
 
 
 @pytest.mark.parametrize("version,supported", [

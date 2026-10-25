@@ -1,6 +1,8 @@
 """Public native query and personal-settings entry point."""
 from __future__ import annotations
 
+from agent_run.adapters.foreground import DomainUnknown
+
 import argparse
 from collections.abc import Iterable
 from functools import partial
@@ -176,7 +178,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 and sys.stdout.isatty()) else "plain"
         render(document, style=style, details=getattr(parsed, "details", False), stream=sys.stdout)
         return 0
-    except (ValueError, OSError, GitError, GitHubReadError, RunnerLeaseError, KernelError, HostUnavailable, HandoffError) as error:
+    except (DomainUnknown, ValueError, OSError, GitError, GitHubReadError, RunnerLeaseError, KernelError, HostUnavailable, HandoffError) as error:
         language = getattr(parsed, "_run_language", language)
         diagnostic_code = "execution_readiness" if isinstance(error, HostUnavailable) else str(getattr(error, "code", "command_failed"))
         error_candidates = error.candidates if isinstance(error, QueryError) else []

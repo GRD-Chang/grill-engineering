@@ -103,9 +103,8 @@ def _collect(*, local: bool, online: bool, mode: str, repository: str | None,
         "checks": list(installation_keys),
     }
     background = _execution_readiness()
-    foreground = {"status": "not_integrated", "reason": "前台 Host 尚未集成；不能据基础 namespace 探针报告可用"}
-    execution = dict(background) if mode == "background" else {
-        "status": "unavailable", "host": "foreground", "reason": foreground["reason"]}
+    foreground = _foreground_readiness()
+    execution = dict(background if mode == "background" else foreground)
     execution["mode"] = mode
     execution_keys: tuple[str, ...] = (
         "sqlite", "git", "codex", "openssl", "bubblewrap", "github", "worker_read_provider", "runner_identity",
@@ -141,6 +140,17 @@ def _collect(*, local: bool, online: bool, mode: str, repository: str | None,
         "skills": skills_check(),
         "next_steps": next_steps(),
     }
+
+
+def _foreground_readiness() -> dict[str, object]:
+    from agent_run.runtime.foreground_host import ForegroundHost
+    try:
+        ForegroundHost(environment=os.environ).preflight()
+        return {"status": "ready", "host": "foreground", "business_execution": "not_verified"}
+    except (OSError, ValueError, RuntimeError):
+        return {"status": "unavailable", "host": "foreground",
+                "reason": "前台 Host 的进程域观察能力不可用；不会降级或绕过隔离",
+                "business_execution": "not_verified"}
 
 
 def _sqlite_check() -> dict[str, object]:

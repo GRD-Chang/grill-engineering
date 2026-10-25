@@ -40,6 +40,9 @@ def _abnormal(result: object, code: object, status: object) -> bool:
 
 def host_exit_current(database: Path, notice: Mapping[str, Any]) -> bool:
     """Recheck the original Task, Host and Runner without recording any state."""
+    if notice.get('backend') == 'foreground':
+        current = foreground_exit_notice(database, str(notice.get('action_id')), Path(str(notice.get('physical_record'))))
+        return current is not None and current == notice
     try:
         if (database.is_symlink() or not _abnormal(notice.get("service_result"), notice.get("exit_code"),
                                                   notice.get("exit_status"))):
@@ -128,3 +131,51 @@ def host_exit_notice(database: Path, action_id: str, receipt: Mapping[str, Any],
                   "service_result": service_result, "exit_code": exit_code, "exit_status": exit_status,
                   "observed_at": datetime.now(UTC).isoformat()}
     return notice if host_exit_current(database, notice) else None
+
+
+def foreground_exit_notice(database: Path, action_id: str, path: Path) -> dict[str, Any] | None:
+    """Read the exact persisted physical exit before Core retires this Host.
+
+    No cgroup/unit facts are invented. Missing executor status remains unknown;
+    it is not silently turned into a successful command or a guessed signal.
+    """
+    from agent_run.adapters.foreground import DomainUnknown, read_record, record_root
+    try:
+        kernel = Kernel(database)
+        request, usage = kernel.host_request(action_id), kernel.host_usage(action_id)
+        if request.backend != 'foreground' or usage is None or usage.domain is None:
+            return None
+        receipt = json.loads(usage.evidence)
+        lock = Path(receipt['runner']['lock'])
+        if path != record_root(lock) / (request.nonce + '.json'):
+            return None
+        record = read_record(path)
+        if (record['phase'] != 'exited' or record['domain'] != usage.domain or record['receipt'] != receipt
+                or receipt['request_digest'] != _digest(request) or receipt['runner'] != _runner_witness(lock)
+                or record['binding'] != [request.run_id, request.owner, request.epoch, request.nonce]
+                or record.get('executor_exit_code') == 0):
+            return None
+        with kernel.storage.transaction(write=False) as tx:
+            run = tx.one('SELECT * FROM runs')
+            host = tx.one('SELECT * FROM hosts WHERE action_id=?', (action_id,))
+            task = TaskKey(Path(run['repository_root']), run['repository'], run['parent_issue'])
+            if (read_task(task_path(task)) != (run['id'], database.resolve()) or run['stopped']
+                    or (run['id'], run['executor'], run['epoch']) != (request.run_id, request.owner, request.epoch)
+                    or host['status'] == 'exited' or tx.rows("SELECT id FROM actions WHERE kind='abandon' LIMIT 1")):
+                return None
+            originals = tx.rows('SELECT subject,material_id FROM run_inputs WHERE run_id=?', (run['id'],))
+            if not originals:return None
+            inputs = originals[0]
+            config = json.loads(tx.get(inputs['material_id'], inputs['subject'])).get('notifications')
+            if not isinstance(config, dict) or config.get('enabled') is not True:
+                return None
+        state = kernel.operation_state()
+        if not state.active and state.disposition in {'complete', 'quiescent'}:
+            return None
+        return {'backend': 'foreground', 'physical_record': str(path), 'action_id': action_id,
+                'run_id': request.run_id, 'owner': request.owner, 'epoch': request.epoch, 'nonce': request.nonce,
+                'runner': receipt['runner'], 'request_digest': receipt['request_digest'],
+                'executor_exit_code': record.get('executor_exit_code'), 'ended_at': record['ended_at'],
+                'domain': record['domain']}
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, KernelError, DomainUnknown) as error:
+        raise HostExitUnavailable('Foreground exit currentness is unavailable') from error

@@ -282,9 +282,10 @@ class HostLaunch:
     epoch: int
     owner: str
     nonce: str
-    unit_name: str
+    unit_name: str | None
     command: tuple[str, ...]
     environment_carrier: Path
+    backend: Literal["systemd", "foreground"] = "systemd"
 
     @property
     def description(self) -> str:
@@ -296,7 +297,7 @@ class HostLaunch:
 @dataclass(frozen=True)
 class HostObservation:
     disposition: Literal["running", "exited", "unknown"]
-    unit_name: str
+    unit_name: str | None
     invocation_id: str | None = None
     cgroup: str | None = None
     boot_id: str | None = None
@@ -308,6 +309,10 @@ class HostObservation:
     usage_ready: bool = False
     usage_released: bool = False
     usage_pending: bool = False
+    backend: Literal["systemd", "foreground"] = "systemd"
+    domain: dict[str, Any] | None = None
+    namespace_exit_status: int | None = None
+    exit_evidence: str = ""
 
 
 @dataclass(frozen=True)

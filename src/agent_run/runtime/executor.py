@@ -164,6 +164,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
     parser.add_argument("--runner-lock", type=Path, required=True)
     parsed = parser.parse_args(arguments)
     try:
+        kernel = Kernel(parsed.database)
+        if kernel.host_request(parsed.action).backend == "foreground":
+            from agent_run.runtime.foreground_host import execute_foreground
+            return execute_foreground(kernel, parsed.action)
         credential_directory, notify_socket = os.environ.get("CREDENTIALS_DIRECTORY"), os.environ.get("NOTIFY_SOCKET")
         if not credential_directory or not notify_socket:
             raise KernelError("managed_host_required")

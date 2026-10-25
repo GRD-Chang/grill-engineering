@@ -1726,14 +1726,14 @@ class Kernel:
                    message: str | None = None, new_thread: bool = False,
                    policy_overrides: Mapping[str, Any] | None = None, replacement: Delivery | None = None,
                    resource_inspections: tuple[ResourceInspection, ...] | None = None, discard_worktree: bool = False,
-                   continuation_of: str | None = None) -> HostLaunch:
+                   continuation_of: str | None = None, backend: Literal["systemd", "foreground"] = "systemd") -> HostLaunch:
         """Bind one Task and apply its explicit control with the same Host intent."""
-        if (kind not in {"run", "resume", "approve", "revise", "requeue", "abandon"} or not action_id or not command
+        if (backend not in {"systemd", "foreground"} or kind not in {"run", "resume", "approve", "revise", "requeue", "abandon"} or not action_id or not command
                 or any(not part or "\0" in part for part in command) or not environment_carrier.is_absolute()):
             raise KernelError("host_request_invalid")
         preflight()  # External I/O precedes both Task binding and durable Action.
         intent: dict[str, Any] = {"kind": kind, "subject": subject, "message": message, "new_thread": new_thread,
-                  "command": list(command), "environment_carrier": str(environment_carrier),
+                  "command": list(command), "environment_carrier": str(environment_carrier), "backend": backend,
                   "policy_overrides": dict(policy_overrides or {})}
         if replacement is not None:
             intent["replacement"] = asdict(replacement)
@@ -1835,10 +1835,11 @@ class Kernel:
                                   resource_inspections=resource_inspections, discard_worktree=discard_worktree)
                 epoch = tx.one("SELECT epoch FROM runs")[0] + 1
                 owner, nonce = identity(), identity()
-                request = HostLaunch(run_id, epoch, owner, nonce, "agent-run-kernel-" + nonce + ".service", command, environment_carrier)
+                request = HostLaunch(run_id, epoch, owner, nonce, "agent-run-kernel-" + nonce + ".service" if backend == "systemd" else None,
+                                     command, environment_carrier, backend)
                 material = tx.put(material_owner, "host_request", wire_json({**asdict(request), "environment_carrier": str(environment_carrier), "intent": intent}))
-                tx.execute("INSERT INTO hosts(run_id,epoch,owner,nonce,action_id,subject,request_id,unit_name,allocated_at,status) VALUES (?,?,?,?,?,?,?,?,?,'allocated')",
-                           (run_id, epoch, owner, nonce, action_id, material_owner, material, request.unit_name, self.clock()))
+                tx.execute("INSERT INTO hosts(run_id,epoch,owner,nonce,action_id,subject,request_id,unit_name,backend,allocated_at,status) VALUES (?,?,?,?,?,?,?,?,?,?,'allocated')",
+                           (run_id, epoch, owner, nonce, action_id, material_owner, material, request.unit_name, backend, self.clock()))
                 tx.execute("UPDATE runs SET executor=?,epoch=?", (owner, epoch))
                 self._event(tx, material_owner, "host_allocated", nonce, material)
                 return request
@@ -1900,7 +1901,7 @@ class Kernel:
     def _host_launch(tx: Transaction, row: sqlite3.Row) -> HostLaunch:
         value = json.loads(tx.get(row["request_id"], row["subject"]))
         return HostLaunch(value["run_id"], value["epoch"], value["owner"], value["nonce"], value["unit_name"],
-                          tuple(value["command"]), Path(value["environment_carrier"]))
+                          tuple(value["command"]), Path(value["environment_carrier"]), value["backend"])
 
     def host_request(self, action_id: str) -> HostLaunch:
         """Read the original request; reading never allocates or relaunches it."""
@@ -1938,12 +1939,40 @@ class Kernel:
             self._event(tx, row["subject"], "host_dispatched", request.nonce)
             return True
 
+    def host_backend(self, execution: Execution) -> str:
+        with self.storage.transaction(write=False) as tx:
+            rows = tx.rows("SELECT backend FROM hosts WHERE run_id=? AND owner=? AND epoch=?",
+                           (execution.run_id, execution.owner, execution.epoch))
+            return "systemd" if not rows else str(rows[0][0])
+
+    def host_action(self, request: HostLaunch) -> str:
+        with self.storage.transaction(write=False) as tx:
+            return str(self._host(tx, request)["action_id"])
+
+    def authorize_host(self, request: HostLaunch) -> None:
+        """Final bootstrap check against the original admitted Host and lease."""
+        with self.storage.transaction(write=False) as tx:
+            row = self._host(tx, request)
+            run = tx.one("SELECT * FROM runs")
+            execution = Execution(request.run_id, request.owner, request.epoch)
+            abandoned = self._abandon_action(tx)
+            if abandoned is not None:
+                self._abandon_owned(tx, abandoned, execution)
+            else:
+                self._executor_owned(tx, run, execution)
+                if run["stopped"]:
+                    raise KernelError("operator_stopped")
+            if row["status"] != "running" or not row["usage_ready"] or row["usage_released"]:
+                raise KernelError("host_not_ready")
+
     def observe_host(self, request: HostLaunch, observation: HostObservation) -> str:
         """Settle exact manager evidence without rearming an unknown launch."""
         with self.storage.transaction() as tx:
             row = self._host(tx, request)
             if row["dispatched_at"] is None:
                 raise KernelError("host_not_dispatched")
+            if observation.backend != request.backend or row["backend"] != request.backend:
+                raise KernelError("host_backend_changed")
             if observation.usage_pending:
                 if (observation.disposition != "unknown" or observation.unit_name != request.unit_name
                         or not observation.evidence or observation.usage_ready or observation.usage_released):
@@ -1958,7 +1987,17 @@ class Kernel:
                 if row["invocation_id"] is not None or row["status"] == "exited":
                     raise KernelError("host_handoff_late")
                 self._event(tx, row["subject"], "host_usage_pending", request.nonce, material)
+            domain_id = None
+            if request.backend == "foreground" and observation.domain is not None:
+                from agent_run.contracts.host import valid_foreground_domain
+                if not valid_foreground_domain(observation.domain, request.nonce):
+                    raise KernelError("host_domain_invalid")
+                domain_id = tx.put(row["subject"], "foreground_domain", wire_json(observation.domain))
+                if row["domain_id"] is not None and domain_id != row["domain_id"]:
+                    raise KernelError("host_domain_changed")
             if row["status"] == "exited":
+                if request.backend == "foreground" and domain_id != row["domain_id"]:
+                    return "unknown"
                 if (observation.unit_name, observation.invocation_id, observation.cgroup, observation.boot_id) != (
                         request.unit_name, row["invocation_id"], row["cgroup"], row["boot_id"]):
                     return "unknown"
@@ -1973,14 +2012,25 @@ class Kernel:
             observed = (observation.invocation_id, observation.cgroup, observation.boot_id)
             known = (observation.unit_name == request.unit_name and all(isinstance(value, str) and value for value in observed)
                      and (bound[0] is None or bound == observed))
+            if request.backend == "foreground":
+                domain = observation.domain
+                known = bool(domain_id is not None and domain is not None and observation.unit_name is None
+                             and observation.invocation_id is None and observation.cgroup is None
+                             and observation.boot_id == domain["observer"]["boot_id"]
+                             and (observation.main_pid, observation.start_token)
+                             == (domain["executor"]["pid"], domain["executor"]["start_token"]))
             running = (known and observation.disposition == "running" and type(observation.main_pid) is int
                        and observation.main_pid > 1 and bool(observation.start_token)
                        and (row["main_pid"] is None or (row["main_pid"], row["start_token"]) == (observation.main_pid, observation.start_token)))
-            exited = (known and observation.disposition == "exited" and type(observation.exit_status) is int
+            exited = (known and observation.disposition == "exited" and (type(observation.exit_status) is int or request.backend == "foreground" and observation.exit_status is None)
+                      and (request.backend == "systemd" or observation.exit_evidence in {"retained_namespace_pidfd", "same_observer_init_exit"})
                       and isinstance(observation.ended_at, (float, int)) and not isinstance(observation.ended_at, bool)
                       and math.isfinite(observation.ended_at) and observation.ended_at > 0)
             disposition = "running" if running else "exited" if exited else "unknown"
             if known and (running or exited):
+                if domain_id is not None:
+                    tx.execute("UPDATE hosts SET domain_id=coalesce(domain_id,?) WHERE run_id=? AND epoch=?",
+                               (domain_id, request.run_id, request.epoch))
                 tx.execute("UPDATE hosts SET invocation_id=?,cgroup=?,boot_id=?,main_pid=coalesce(main_pid,?),start_token=coalesce(start_token,?) WHERE run_id=? AND epoch=?",
                            (*observed, observation.main_pid, observation.start_token, request.run_id, request.epoch))
                 tx.execute("UPDATE hosts SET usage_ready=max(usage_ready,?),usage_released=max(usage_released,?) WHERE run_id=? AND epoch=?",
@@ -1995,7 +2045,7 @@ class Kernel:
                 for output in tx.all("SELECT o.*,l.subject FROM leases l JOIN invocation_outputs o ON o.lease=l.id WHERE l.executor=? AND l.epoch=?", (request.owner, request.epoch)):
                     process = None if output["process_identity"] is None else json.loads(tx.get(output["process_identity"], output["subject"]))
                     unstarted = output["dispatch_state"] == "allocated"
-                    if not unstarted and (process is None or not self._host_contains_process(row, process)):
+                    if not unstarted and (process is None or not self._host_contains_process(tx, row, process)):
                         continue
                     proof = tx.put(output["subject"], "worker_host_exit", wire_json({"host_nonce": request.nonce, "observation": asdict(observation)}))
                     tx.execute("UPDATE invocation_outputs SET dispatch_state=?,exited_at=?,failure_kind='fatal',start_evidence=? WHERE invocation=? AND ordinal=? AND exit_code IS NULL",
@@ -2013,7 +2063,17 @@ class Kernel:
             return disposition
 
     @staticmethod
-    def _host_contains_process(host: sqlite3.Row, process: Mapping[str, Any]) -> bool:
+    def _host_contains_process(tx: Transaction, host: sqlite3.Row, process: Mapping[str, Any]) -> bool:
+        if host["backend"] == "foreground":
+            if host["domain_id"] is None:
+                return False
+            domain = json.loads(tx.get(host["domain_id"], host["subject"]))
+            executor = domain["executor"]
+            return bool(process.get("schema") == "linux-namespace-process-v1"
+                        and (process.get("host_pid"), process.get("host_start_token"), process.get("boot_id"),
+                             process.get("host_namespace"), process.get("pid_namespace"))
+                        == (executor["namespace_pids"][-1], executor["start_token"], executor["boot_id"],
+                            executor["pid_namespace"], executor["pid_namespace"]))
         group = process.get("cgroup")
         return bool(host["main_pid"] is not None
                     and (process.get("host_pid"), process.get("host_start_token"), process.get("boot_id"), process.get("host_cgroup"))
@@ -2711,7 +2771,7 @@ class Kernel:
         with self.storage.transaction() as tx:
             invocation = self._invocation(tx, call)
             hosts = tx.rows("SELECT * FROM hosts WHERE run_id=? AND owner=? AND epoch=?", (call.execution.run_id, call.execution.owner, call.execution.epoch))
-            if hosts and not self._host_contains_process(hosts[0], process_identity):
+            if hosts and not self._host_contains_process(tx, hosts[0], process_identity):
                 raise KernelError("worker_host_binding")
             witness = tx.put(call.subject, "worker_process_identity", wire_json(process_identity))
             if invocation["process_identity"] is not None:

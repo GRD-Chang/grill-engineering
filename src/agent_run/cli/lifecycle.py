@@ -15,11 +15,12 @@ from pathlib import Path
 import re
 from typing import Any, TYPE_CHECKING
 
-from agent_run.errors import error_message
+from agent_run.errors import error_message, KernelError
 from agent_run.contracts.copy import text
 
 from agent_run.cli import settings as personal_settings
 from agent_run.core.operation_runner import observe_control
+from agent_run.runtime.foreground_host import ForegroundHost
 from agent_run.model import Commit, Delivery, DeliveryKind, HostObservation, Requirements, ResourceInspection, RunSpec, World
 
 if TYPE_CHECKING:
@@ -74,6 +75,9 @@ def add_parsers(commands: Any, language: str) -> None:
         child.add_argument("--repo", help=text("cli.repo_help", language=language))
         child.add_argument("--state-dir", type=Path, help=text("cli.state_dir_help", language=language))
         child.add_argument("--json", action="store_true", dest="as_json")
+        if command != "stop":
+            child.add_argument("--foreground", action="store_true", default=None,
+                               help="Run the admitted Host in this terminal; never fall back from systemd")
         if command in {"resume", "stop"}:
             child.add_argument("--ticket", type=partial(personal_settings._positive, language=language),
                                help=text(f"cli.{command}_ticket_help", language=language))
@@ -111,7 +115,7 @@ def _runtime_directory(action_id: str, environment: Mapping[str, str]) -> Path:
 
 
 def submit(kernel: Kernel, kind: str, *, action_id: str, command: tuple[str, ...],
-           manager: SystemdHost, environment: Mapping[str, str], runner_lock: Path,
+           manager: SystemdHost | ForegroundHost, environment: Mapping[str, str], runner_lock: Path,
            subject: str | None = None, world: World | None = None,
            message: str | None = None, new_thread: bool = False,
            policy_overrides: Mapping[str, Any] | None = None,
@@ -122,7 +126,7 @@ def submit(kernel: Kernel, kind: str, *, action_id: str, command: tuple[str, ...
 
     The caller supplies the exact command constructed by the selected native
     Executor, including the original loader environment needed before imports.
-    Unknown launch remains unknown; no foreground executor or retry is started.
+    Unknown launch remains unknown; no replacement executor or retry is started.
     """
     from agent_run.runtime.package_lease import runner_usage_lease
     from agent_run.runtime.handoff import handoff_scope, launch_handoff
@@ -135,21 +139,26 @@ def submit(kernel: Kernel, kind: str, *, action_id: str, command: tuple[str, ...
                                     message=message, new_thread=new_thread, policy_overrides=policy_overrides,
                                     replacement=replacement,
                                     resource_inspections=resource_inspections, discard_worktree=discard_worktree,
-                                    continuation_of=continuation_of)
-        from agent_run.cli.host_exit import exit_properties
-        properties = exit_properties(kernel.storage.path, action_id, request, runner_lock, environment)
-        with handoff_scope(request, environment, runner_lock=runner_lock, terminal_lease=terminal) as handoff:
-            observed = launch_handoff(kernel, action_id, manager, handoff, exit_properties=properties)
+                                    continuation_of=continuation_of,
+                                    backend="foreground" if isinstance(manager, ForegroundHost) else "systemd")
+        observed: HostObservation | None
+        if isinstance(manager, ForegroundHost):
+            observed = manager.launch(kernel, request, lock=runner_lock, lease=terminal)
+        else:
+            from agent_run.cli.host_exit import exit_properties
+            properties = exit_properties(kernel.storage.path, action_id, request, runner_lock, environment)
+            with handoff_scope(request, environment, runner_lock=runner_lock, terminal_lease=terminal) as handoff:
+                observed = launch_handoff(kernel, action_id, manager, handoff, exit_properties=properties)
         with kernel.storage.transaction(write=False) as tx:
             action_status = tx.one("SELECT status FROM actions WHERE id=?", (action_id,))[0]
         return {"result": "accepted", "status": "action_" + action_status, "run_id": request.run_id,
                 "action_id": action_id, "action": kind,
                 "host": "unknown" if observed is None else observed.disposition,
-                "host_unit": request.unit_name}
+                "host_unit": request.unit_name, "host_backend": request.backend}
 
 
 
-def attach(kernel: Kernel, *, requested_action: str, manager: SystemdHost,
+def attach(kernel: Kernel, *, requested_action: str, manager: SystemdHost | ForegroundHost,
            environment: Mapping[str, str], runner_lock: Path) -> dict[str, Any] | None:
     """Observe an original Host, or continue only its still-unsent launch grant.
 
@@ -159,13 +168,20 @@ def attach(kernel: Kernel, *, requested_action: str, manager: SystemdHost,
     from agent_run.runtime.package_lease import runner_usage_lease
     from agent_run.runtime.handoff import handoff_scope, launch_handoff, reconcile_handoff
     with runner_usage_lease(runner_lock) as terminal:
+        if isinstance(manager, ForegroundHost):
+            manager.reconcile_closed(kernel, runner_lock)
         action_id = kernel.active_host_action()
         if action_id is None:
             return None
         manager.preflight()
         request = kernel.host_request(action_id)
         observed: HostObservation | None
-        if kernel.host_dispatched(action_id):
+        if (request.backend == "foreground") != isinstance(manager, ForegroundHost):
+            raise KernelError("host_backend_changed")
+        if isinstance(manager, ForegroundHost):
+            observed = (manager.observe(kernel, request, runner_lock) if kernel.host_dispatched(action_id)
+                        else manager.launch(kernel, request, lock=runner_lock, lease=terminal))
+        elif kernel.host_dispatched(action_id):
             observed = reconcile_handoff(kernel, action_id, manager)
         else:
             from agent_run.cli.host_exit import exit_properties
@@ -178,7 +194,26 @@ def attach(kernel: Kernel, *, requested_action: str, manager: SystemdHost,
                 "action_id": action_id, "action": action["kind"],
                 "requested_action": requested_action, "requested_action_applied": False,
                 "host": "unknown" if observed is None else observed.disposition,
-                "host_unit": request.unit_name}
+                "host_unit": request.unit_name, "host_backend": request.backend}
+
+def _manager_for(kernel: Kernel | None, parsed: argparse.Namespace,
+                 environment: Mapping[str, str]) -> SystemdHost | ForegroundHost:
+    import shutil
+    from agent_run.adapters.systemd import SystemdHost
+    requested = getattr(parsed, "foreground", None)
+    backend = "foreground" if requested else "systemd"
+    if kernel is not None:
+        action = kernel.active_host_action()
+        if action is not None:
+            original = kernel.host_request(action).backend
+            if requested and original != "foreground":
+                raise KernelError("host_backend_changed")
+            backend = original
+    if backend == "foreground":
+        return ForegroundHost(environment=environment)
+    return SystemdHost(systemctl=shutil.which("systemctl") or "systemctl",
+                       systemd_run=shutil.which("systemd-run") or "systemd-run", environment=environment)
+
 
 def _active_runner() -> bool:
     from agent_run.config.paths import app_data_root
@@ -186,7 +221,7 @@ def _active_runner() -> bool:
     return Path(__file__).resolve().is_relative_to(active)
 
 
-def _run(parsed: argparse.Namespace, *, manager: SystemdHost,
+def _run(parsed: argparse.Namespace, *, manager: SystemdHost | ForegroundHost,
          environment: Mapping[str, str], runner_lock: Path) -> dict[str, Any]:
     """Freeze creation inputs outside the sole Core Task creation transaction."""
     from uuid import uuid4
@@ -208,6 +243,7 @@ def _run(parsed: argparse.Namespace, *, manager: SystemdHost,
         raise KernelError("managed_state_identity", "run requires the repository's managed state directory")
     kernel = Kernel.open_task(TaskKey(workspace.repository_root, workspace.repository, parsed.parent))
     if kernel is None:
+        manager.preflight()
         overrides: dict[str, str | bool | None] = {
             f"{role}_{field}": getattr(parsed, f"{role}_{field}")
             for role in ("development", "review", "publication") for field in ("model", "effort")
@@ -227,6 +263,8 @@ def _run(parsed: argparse.Namespace, *, manager: SystemdHost,
         if run["language"] not in {"en", "zh"} or run["repository_root"] != str(workspace.repository_root):
             raise KernelError("creation_metadata_missing")
         parsed._run_language = run["language"]
+    manager = _manager_for(kernel, parsed, environment)
+    manager.preflight()
     workspace.open_path()
     original = attach(kernel, requested_action="run", manager=manager, environment=environment, runner_lock=runner_lock)
     if original is not None:
@@ -264,9 +302,7 @@ def execute(parsed: argparse.Namespace, *, language: str) -> dict[str, Any]:
         if parsed.command == "run":
             if not _active_runner():
                 raise HostUnavailable("Lifecycle commands require the installed Active Runner")
-            manager = SystemdHost(systemctl=shutil.which("systemctl") or "systemctl",
-                systemd_run=shutil.which("systemd-run") or "systemd-run", environment=environment)
-            manager.preflight()
+            manager = _manager_for(None, parsed, environment)
             return _run(parsed, manager=manager, environment=environment, runner_lock=runner_lock)
         selection = argparse.Namespace(**vars(parsed))
         selection.parent = None
@@ -332,12 +368,14 @@ def execute(parsed: argparse.Namespace, *, language: str) -> dict[str, Any]:
                 return abandon_receipt()
         if not _active_runner():
             raise HostUnavailable("Lifecycle commands require the installed Active Runner")
-        manager = SystemdHost(systemctl=shutil.which("systemctl") or "systemctl",
-                              systemd_run=shutil.which("systemd-run") or "systemd-run", environment=environment)
+        manager = _manager_for(kernel, parsed, environment)
         manager.preflight()
         workspace.open_path()
         original = attach(kernel, requested_action=parsed.command, manager=manager,
                           environment=environment, runner_lock=runner_lock)
+        if (original is not None and original["host"] == "exited" and kernel.active_host_action() is None
+                and isinstance(manager, ForegroundHost)):
+            original = None
         if parsed.command == "abandon":
             if original is not None and original["host"] != "running":
                 if original["host"] == "exited" and kernel.active_host_action() is None and abandonment is not None:
@@ -421,7 +459,7 @@ def execute(parsed: argparse.Namespace, *, language: str) -> dict[str, Any]:
             with kernel.storage.transaction(write=False) as tx:
                 action_status = tx.one("SELECT status FROM actions WHERE id=?", (action_id,))[0]
             result = {"result": "accepted", "status": "action_" + action_status, "run_id": run["id"],
-                "action_id": action_id, "action": parsed.command, "host": "running", "host_unit": request.unit_name}
+                "action_id": action_id, "action": parsed.command, "host": "running", "host_unit": request.unit_name, "host_backend": request.backend}
         else:
             result = submit(kernel, parsed.command, action_id=action_id,
                             command=command(database, action_id, runner_lock, environment), manager=manager,
