@@ -585,7 +585,7 @@ def test_final_observation_proves_real_current_completions_into_remote_run_befor
 
 
 FAKE_GH = ('import sys\nsys.path.insert(0, ' + repr(str(Path(__file__).parent)) + ')\n'
-           + CHECK_ROLLUP_FAKE + LATEST_CHECK_FAKE) + r'''import json, os, subprocess, sys
+           + CHECK_ROLLUP_FAKE + LATEST_CHECK_FAKE) + r'''import json, os, sys
 from pathlib import Path
 args=sys.argv[1:]
 state=Path(os.environ['REMOTE_TEST_STATE'])
@@ -593,9 +593,11 @@ d=json.loads(state.read_text())
 os.environ.update(GIT_AUTHOR_NAME='Publisher',GIT_AUTHOR_EMAIL='publisher@example.invalid',GIT_COMMITTER_NAME='Publisher',GIT_COMMITTER_EMAIL='publisher@example.invalid',GIT_AUTHOR_DATE='2000-01-01T00:00:00Z',GIT_COMMITTER_DATE='2000-01-01T00:00:00Z')
 with open(os.environ['REMOTE_TEST_CALLS'],'a') as f: f.write(json.dumps(args)+'\n')
 def git(*args, input=None):
+    import subprocess
     result=subprocess.run(['git','--git-dir',os.environ['REMOTE_TEST_BARE'],*args],text=True,input=input,capture_output=True,check=True)
     return result.stdout.strip()
 def head(ref):
+    import subprocess
     r=subprocess.run(['git','--git-dir',os.environ['REMOTE_TEST_BARE'],'rev-parse','--verify',ref],text=True,capture_output=True)
     return r.stdout.strip() if r.returncode==0 else None
 if args[:2]==['repo','view']:
@@ -637,10 +639,12 @@ elif endpoint.startswith('repos/example/project/git/ref/heads/'):
 elif endpoint=='repos/example/project/rulesets': result=[[]]
 elif '/protection/required_status_checks' in endpoint: result={'contexts':[],'checks':[]}
 elif '/git/commits/' in endpoint:
+    import subprocess
     sha=endpoint.rsplit('/',1)[1]
     raw=subprocess.run(['git','--git-dir',os.environ['REMOTE_TEST_BARE'],'cat-file','commit',sha],capture_output=True,check=True).stdout.decode('utf-8')
     result={'sha':sha,'tree':{'sha':git('show','-s','--format=%T',sha)},'parents':[{'sha':x} for x in git('show','-s','--format=%P',sha).split()],'message':raw.partition('\n\n')[2]}
 elif '/compare/' in endpoint:
+    import subprocess
     a,b=endpoint.rsplit('/',1)[1].split('...')
     r=subprocess.run(['git','--git-dir',os.environ['REMOTE_TEST_BARE'],'merge-base','--is-ancestor',a,b])
     result={'status':'identical' if a==b else 'ahead' if r.returncode==0 else 'diverged','base_commit':{'sha':a},'merge_base_commit':{'sha':git('merge-base',a,b)}}

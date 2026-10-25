@@ -243,8 +243,9 @@ def test_public_run_reaches_ticket_close_through_managed_host_after_lost_merge_r
               "state": "OPEN", "labels": []}}}}))
     # Extend only the external executable's clone/auth boundary; all delivery
     # effects continue through the existing real-Git/stateful-gh fixture.
-    gh = r'''import os, subprocess, sys
+    gh = r'''import os, sys
 if sys.argv[1:3] == ['repo', 'clone']:
+    import subprocess
     raise SystemExit(subprocess.run(['git', 'clone', '--no-local', '--quiet', '--', os.environ['REMOTE_TEST_BARE'], sys.argv[4]]).returncode)
 if '--hostname' in sys.argv:
     position = sys.argv.index('--hostname'); assert sys.argv[position + 1] == 'github.com'
@@ -407,7 +408,7 @@ def _control_environment(git_repo: Path, directory: Path, monkeypatch, *, codex:
         str(number): {"number": number, "title": f"Managed Ticket {number}",
                      "body": f"Original requirement for Ticket {number}.", "state": "OPEN", "labels": ["ready-for-agent"]}
         for number in tickets}}}))
-    clone = r'''import json, os, subprocess, sys
+    clone = r'''import json, os, sys
 from pathlib import Path
 if sys.argv[1:3] == ['issue', 'view']:
     number = sys.argv[3]
@@ -415,6 +416,7 @@ if sys.argv[1:3] == ['issue', 'view']:
     print(json.dumps(source['source_graph']['parent'] if number == '1' else source['source_graph']['issues'][number]))
     raise SystemExit(0)
 if sys.argv[1:3] == ['repo', 'clone']:
+    import subprocess
     raise SystemExit(subprocess.run(['git', 'clone', '--no-local', '--quiet', '--', os.environ['REMOTE_TEST_BARE'], sys.argv[4]]).returncode)
 if '--hostname' in sys.argv:
     position = sys.argv.index('--hostname'); assert sys.argv[position + 1] == 'github.com'
