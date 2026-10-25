@@ -31,7 +31,8 @@ if command -v timeout >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 &&
     probe_python=yes
 fi
 if [ -e "$SOURCE_DIR/release-manifest.json" ] || [ -L "$SOURCE_DIR/release-manifest.json" ] ||
-   [ -e "$SOURCE_DIR/requirements.lock" ] || [ -e "$SOURCE_DIR/wheels" ]; then
+   [ -e "$SOURCE_DIR/requirements.lock" ] || [ -L "$SOURCE_DIR/requirements.lock" ] ||
+   [ -e "$SOURCE_DIR/wheels" ] || [ -L "$SOURCE_DIR/wheels" ]; then
     if [ "$probe_python" != yes ]; then
         echo '固定发行包须先有 CPython >= 3.11 和 timeout 才能校验；尚未执行任何系统准备。'
         exit 1

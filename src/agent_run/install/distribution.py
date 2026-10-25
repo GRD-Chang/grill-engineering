@@ -18,6 +18,15 @@ class ReleaseError(ValueError):
     pass
 
 
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ReleaseError("Duplicate release manifest key")
+        result[key] = value
+    return result
+
+
 def file_digest(path: Path) -> str:
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
@@ -71,7 +80,7 @@ def verify_release(root: Path) -> dict[str, Any] | None:
     try:
         if manifest_path.is_symlink() or manifest_path.stat().st_size > 1024 * 1024:
             raise ReleaseError("Invalid release manifest")
-        manifest = json.loads(manifest_path.read_bytes())
+        manifest = json.loads(manifest_path.read_bytes(), object_pairs_hook=_unique_object)
         if (not isinstance(manifest, dict) or manifest.get("format") != FORMAT
                 or not isinstance(manifest.get("release"), str)
                 or manifest.get("includes_python") is not False
