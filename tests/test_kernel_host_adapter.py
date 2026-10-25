@@ -1,5 +1,6 @@
 """Real local CLI boundaries; controlled manager replies are not a live unit."""
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -164,15 +165,28 @@ def test_running_host_requires_real_main_process_start_and_cgroup(tmp_path: Path
     assert host.observe(request).disposition == "unknown"  # PID absence is not Host exit.
 
 
-def test_real_systemctl_cannot_use_an_unavailable_user_bus(tmp_path: Path) -> None:
+def _unavailable_manager(tmp_path: Path, *, missing_tools: bool = False) -> tuple[SystemdHost, str]:
     systemctl, systemd_run = shutil.which("systemctl"), shutil.which("systemd-run")
-    assert systemctl is not None and systemd_run is not None
-    host = SystemdHost(systemctl=systemctl, systemd_run=systemd_run, environment={
+    if missing_tools or systemctl is None or systemd_run is None:
+        # A real exec failure, never a substitute systemctl implementation.
+        absent = tmp_path / "absent-tools"
+        absent.mkdir()
+        systemctl, systemd_run = str(absent / "systemctl"), str(absent / "systemd-run")
+        capability = "missing-tools"
+    else:
+        capability = "missing-bus"
+    return SystemdHost(systemctl=systemctl, systemd_run=systemd_run, environment={
         "PATH": os.defpath, "HOME": str(tmp_path), "XDG_RUNTIME_DIR": str(tmp_path / "absent-runtime"),
         "DBUS_SESSION_BUS_ADDRESS": "unix:path=" + str(tmp_path / "absent-user-bus"),
-    })
+    }), capability
+
+
+def test_real_unavailable_manager_refuses_host_readiness(tmp_path: Path, record_property) -> None:
+    host, capability = _unavailable_manager(tmp_path)
+    record_property("unavailable_manager_capability", capability)
     with pytest.raises(HostUnavailable, match="user systemd"):
         host.preflight()
+    _assert_unavailable_manager_precedes_admission(tmp_path, host, capability)
 
 
 def host_kernel(tmp_path: Path) -> Kernel:
@@ -184,20 +198,39 @@ def host_kernel(tmp_path: Path) -> Kernel:
     ))
 
 
-def test_real_unavailable_bus_rejects_kernel_admission_before_action(tmp_path: Path) -> None:
+def _assert_unavailable_manager_precedes_admission(tmp_path: Path, host: SystemdHost, capability: str) -> None:
+    from agent_run.contracts.task import TaskKey
+    from agent_run.storage.tasks import read_task, task_path
     kernel = host_kernel(tmp_path)
-    systemctl, systemd_run = shutil.which("systemctl"), shutil.which("systemd-run")
-    assert systemctl is not None and systemd_run is not None
-    host = SystemdHost(systemctl=systemctl, systemd_run=systemd_run, environment={
-        "PATH": os.defpath, "HOME": str(tmp_path), "XDG_RUNTIME_DIR": str(tmp_path / "absent-runtime"),
-        "DBUS_SESSION_BUS_ADDRESS": "unix:path=" + str(tmp_path / "absent-user-bus"),
-    })
-    with pytest.raises(HostUnavailable, match="user systemd"):
+    carrier = tmp_path / "carrier"
+    task = TaskKey(tmp_path / "repository", "example/repository", 1)
+    assert read_task(task_path(task)) is None and not carrier.exists()
+    with pytest.raises(HostUnavailable, match="user systemd") as rejected:
         kernel.admit_host("start", kind="run", command=(sys.executable, "-c", "pass"),
-                          environment_carrier=tmp_path / "carrier", preflight=host.preflight)
+                          environment_carrier=carrier, preflight=host.preflight)
+    if capability == "missing-tools":
+        cause = rejected.value.__cause__
+        assert isinstance(cause, FileNotFoundError) and cause.errno == errno.ENOENT
+        assert cause.filename == host.systemctl
+    else:
+        assert rejected.value.__cause__ is None  # A real CLI reply, not an exec/permission failure.
     with kernel.storage.transaction(write=False) as tx:
         assert tx.one("SELECT count(*) FROM actions")[0] == 0
+        assert tx.one("SELECT count(*) FROM hosts")[0] == 0
         assert tx.one("SELECT executor FROM runs")[0] is None
+    assert read_task(task_path(task)) is None and not carrier.exists()
+
+
+def test_real_unavailable_manager_rejects_kernel_admission_before_action(tmp_path: Path, record_property) -> None:
+    host, capability = _unavailable_manager(tmp_path)
+    record_property("unavailable_manager_capability", capability)
+    _assert_unavailable_manager_precedes_admission(tmp_path, host, capability)
+
+
+def test_real_missing_manager_tools_reject_kernel_admission_before_action(tmp_path: Path, record_property) -> None:
+    host, capability = _unavailable_manager(tmp_path, missing_tools=True)
+    record_property("unavailable_manager_capability", capability)
+    _assert_unavailable_manager_precedes_admission(tmp_path, host, capability)
 
 
 def test_real_manager_boundary_reports_unknown_and_reconciles_original_kernel_grant(tmp_path: Path) -> None:
