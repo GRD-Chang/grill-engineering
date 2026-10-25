@@ -56,20 +56,22 @@ def test_last_sqlite_close_during_sidecar_observation_preserves_committed_state(
     sidecars = [Path(str(native.path) + ending) for ending in ('-wal', '-shm')]
     assert all(path.is_file() for path in sidecars)
     target = Path(str(native.path) + suffix)
-    original_exists = Path.exists
+    original_stat = Path.stat
+    closed = False
 
-    def observed_exists(path: Path):
-        existed = original_exists(path)
-        if path == target and existed:
-            # A true existence observation does not pin a sidecar. Let the
-            # real last connection close before that observation returns.
+    def observed_stat(path: Path, *args, **kwargs):
+        nonlocal closed
+        if path == target and not closed:
+            closed = True
             writer.close()
-            assert all(not original_exists(item) for item in sidecars)
-        return existed
+            with pytest.raises(FileNotFoundError):
+                original_stat(target, follow_symlinks=False)
+        return original_stat(path, *args, **kwargs)
 
     try:
-        monkeypatch.setattr(Path, 'exists', observed_exists)
+        monkeypatch.setattr(Path, 'stat', observed_stat)
         assert require_supported_state(native.path) == PROTOCOL
+        assert closed
         writer.close()
         with closing(sqlite3.connect(native.path.as_uri() + '?mode=ro', uri=True)) as reader:
             assert reader.execute('PRAGMA user_version').fetchone()[0] == 7

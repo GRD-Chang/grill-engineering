@@ -8,6 +8,7 @@ from __future__ import annotations
 
 
 from contextlib import contextmanager
+import errno
 from pathlib import Path
 import sqlite3
 import stat
@@ -55,6 +56,9 @@ def read_state(path: Path) -> Iterator[sqlite3.Connection]:
         info = path.lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise UnsupportedState(path, "uncertain_state")
+        directory = path.parent.stat()
+        if not stat.S_ISDIR(directory.st_mode):
+            raise UnsupportedState(path, "uncertain_state")
         for suffix in ("-wal", "-shm", "-journal"):
             sidecar = Path(str(path) + suffix)
             try:
@@ -63,6 +67,17 @@ def read_state(path: Path) -> Iterator[sqlite3.Connection]:
                 # SQLite's last connection can remove its WAL/SHM normally.
                 # Only an absent sidecar is optional; the database is not.
                 continue
+            if (suffix in {"-wal", "-shm"} and stat.S_ISREG(metadata.st_mode)
+                    and metadata.st_nlink == 0):
+                # Lookup can retain an inode while SQLite's last close unlinks
+                # it. Only proven absence, not a replacement, resolves this read.
+                try:
+                    sidecar.stat(follow_symlinks=False)
+                except OSError as error:
+                    if error.errno == errno.ENOENT:
+                        continue
+                    raise
+                raise UnsupportedState(path, "uncertain_state")
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or suffix == "-journal" and metadata.st_size:
                 raise UnsupportedState(path, "uncertain_state")
         db = sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True,
@@ -74,7 +89,17 @@ def read_state(path: Path) -> Iterator[sqlite3.Connection]:
             db.execute("PRAGMA query_only=ON")
             db.execute("PRAGMA trusted_schema=OFF")
             db.execute("BEGIN")
-        except sqlite3.Error as error:
+            # BEGIN is deferred: read the database before checking the identity
+            # of the snapshot we are about to expose to the caller.
+            db.execute("SELECT name FROM sqlite_schema LIMIT 1").fetchone()
+            current = path.lstat()
+            parent = path.parent.stat()
+            if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+                    or (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino)
+                    or not stat.S_ISDIR(parent.st_mode)
+                    or (parent.st_dev, parent.st_ino) != (directory.st_dev, directory.st_ino)):
+                raise UnsupportedState(path, "uncertain_state")
+        except (OSError, sqlite3.Error) as error:
             raise UnsupportedState(path, "unreadable_state") from error
         yield db
     finally:
