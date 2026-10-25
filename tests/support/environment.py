@@ -37,6 +37,10 @@ def _user_environment(root: Path) -> dict[str, str]:
         ),
         "GIT_CONFIG_NOSYSTEM": "1",
     }
+    # CI verifies the prepared SQLite before exporting its loader path. Keep
+    # that runtime selection in CLI children without inheriting host secrets.
+    if library_path := os.environ.get("LD_LIBRARY_PATH"):
+        environment["LD_LIBRARY_PATH"] = library_path
     for variable, directory in (
         ("HOME", "home"),
         ("XDG_STATE_HOME", "state"),

@@ -246,3 +246,24 @@ print(json.dumps({"run_id": run_id}))
     ]
     assert not automatic_maintenance, automatic_maintenance
     assert {path.relative_to(host): path.read_bytes() for path in host.rglob("*") if path.is_file()} == before
+
+
+@pytest.mark.parametrize('prepared_loader', [False, True])
+def test_isolated_cli_children_keep_prepared_sqlite_loader(tmp_path, monkeypatch, prepared_loader):
+    from support.environment import _user_environment
+
+    monkeypatch.delenv('LD_LIBRARY_PATH', raising=False)
+    if prepared_loader:
+        library_path = os.pathsep.join((str(tmp_path / 'verified-sqlite'), str(tmp_path / 'prior-libraries')))
+        monkeypatch.setenv('LD_LIBRARY_PATH', library_path)
+    monkeypatch.setenv('GH_TOKEN', 'synthetic-host-secret-must-not-be-inherited')
+    monkeypatch.setenv('LD_PRELOAD', '/synthetic-unrelated-loader-must-not-be-inherited')
+    environment = _user_environment(tmp_path / 'isolated')
+    assert environment.get('LD_LIBRARY_PATH') == (library_path if prepared_loader else None)
+    assert 'GH_TOKEN' not in environment and 'LD_PRELOAD' not in environment
+    assert environment['HOME'] == str(tmp_path / 'isolated/home')
+    observed = json.loads(subprocess.check_output(
+        [sys.executable, '-c', 'import json, os; print(json.dumps(os.environ.get("LD_LIBRARY_PATH")))'],
+        env=environment, text=True, timeout=10,
+    ))
+    assert observed == (library_path if prepared_loader else None)
