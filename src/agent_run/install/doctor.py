@@ -7,14 +7,18 @@ import os
 import platform
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any, Mapping
 
 from agent_run.runtime.process_io import CompleteOutput, pump
 from agent_run.config.defaults import UserDefaultsStore
 from agent_run.config.github_app import GitHubAppProfileStore
+from agent_run.install.readiness import identity_checks, next_steps, skills_check
+from agent_run.storage.sqlite_runtime import require_wal_runtime
 from agent_run.install.installer import InstallPaths, InstallerError, _read_active
 from agent_run.adapters.systemd import HostUnavailable, SystemdHost
 from agent_run.runtime.process_cleanup import capture_process_scope, child_subreaper, terminate_process_group as _terminate_process_group
@@ -23,10 +27,12 @@ _COMMAND_TIMEOUT_SECONDS = 3
 _MAX_SIGNATURE_OUTPUT_BYTES = 4096
 
 
-def run(*, as_json: bool = False) -> int:
+def run(*, as_json: bool = False, local: bool = False, online: bool = False,
+        mode: str = "background", repository: str | None = None,
+        frozen: Mapping[str, Any] | None = None) -> int:
     """Print a diagnostic report without changing any local state."""
 
-    report = collect()
+    report = collect(local=local, online=online, mode=mode, repository=repository, frozen=frozen)
     if as_json:
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
     else:
@@ -34,26 +40,60 @@ def run(*, as_json: bool = False) -> int:
     return 0
 
 
-def collect() -> dict[str, object]:
+def collect(*, local: bool = False, online: bool = False, mode: str = "background",
+            repository: str | None = None, frozen: Mapping[str, Any] | None = None) -> dict[str, object]:
     """Collect the public, non-secret doctor report."""
 
     with child_subreaper():
-        return _collect()
+        return _collect(local=local, online=online, mode=mode, repository=repository, frozen=frozen)
 
 
-def _collect() -> dict[str, object]:
+def _collect(*, local: bool, online: bool, mode: str, repository: str | None,
+             frozen: Mapping[str, Any] | None) -> dict[str, object]:
+    if local and online or mode not in {"foreground", "background"}:
+        raise ValueError("Choose --local or --online and a supported mode name")
+    if repository is not None:
+        from agent_run.adapters.workspace import normalize_repository
+        repository = normalize_repository(repository)
+    try:
+        document = dict(frozen) if frozen is not None else UserDefaultsStore().describe()
+        github = document["github"]
+        if not isinstance(github, Mapping):
+            raise ValueError("Selected GitHub identity facts are unavailable")
+        identities = identity_checks(github, online=False, repository=repository)
+    except (ValueError, OSError, RuntimeError, KeyError, TypeError):
+        document = {}
+        identities = {role: {"source": "unknown", "status": "invalid", "authentication": "not_verified"}
+                      for role in ("runner", "worker")}
+    host_selected = any(check["source"] == "host" for check in identities.values())
     checks = {
         "python": _python_check(),
+        "sqlite": _sqlite_check(),
         "git": _git_check(),
-        "codex": _codex_check(),
+        "codex": _codex_check(authenticate=not local),
         "openssl": _tool_check("openssl", version_arguments=("version",)),
         "bubblewrap": _bubblewrap_check(),
-        "github": _github_check(),
+        "github": _github_check(authenticate=host_selected and not local and not online),
         "active_runner": _active_runner_check(),
         "path": _path_check(),
-        "worker_read_provider": _provider_check(),
+        "worker_read_provider": {"provider": identities["worker"]["source"], "status": identities["worker"]["status"]},
+        "runner_identity": {"provider": identities["runner"]["source"], "status": identities["runner"]["status"]},
     }
-    installation_keys = ("python", "active_runner", "path")
+    repository_read: dict[str, object] = {"status": "not_verified"}
+    if online and _check_is_ok(checks["github"]) and document:
+        identities = identity_checks(document["github"], online=True, repository=repository)
+        for role, key in (("worker", "worker_read_provider"), ("runner", "runner_identity")):
+            checks[key] = {"provider": identities[role]["source"], "status": identities[role]["status"]}
+        if repository is not None and identities["runner"]["authentication"] == "verified":
+            from agent_run.adapters.github import GhGitHubReader
+            try:
+                observed = GhGitHubReader(repository, runner_identity=document["github"]["runner"]).repository()
+                if observed.name_with_owner.casefold() != repository.casefold():
+                    raise ValueError("Repository identity changed")
+                repository_read = {"status": "verified", "repository": observed.name_with_owner}
+            except (ValueError, OSError, RuntimeError):
+                repository_read = {"status": "unavailable", "reason": "无法用所选 Runner 读取仓库及默认分支；检查授权与网络"}
+    installation_keys = ("python", "sqlite", "active_runner", "path")
     installation = {
         "status": (
             "ready"
@@ -62,10 +102,17 @@ def _collect() -> dict[str, object]:
         ),
         "checks": list(installation_keys),
     }
-    execution = _execution_readiness()
-    execution_keys = (
-        "git", "codex", "openssl", "bubblewrap", "github", "worker_read_provider",
+    background = _execution_readiness()
+    foreground = {"status": "not_integrated", "reason": "前台 Host 尚未集成；不能据基础 namespace 探针报告可用"}
+    execution = dict(background) if mode == "background" else {
+        "status": "unavailable", "host": "foreground", "reason": foreground["reason"]}
+    execution["mode"] = mode
+    execution_keys: tuple[str, ...] = (
+        "sqlite", "git", "codex", "openssl", "bubblewrap", "github", "worker_read_provider", "runner_identity",
     )
+    if online and repository is not None:
+        checks["repository_read"] = {"status": "ok" if repository_read["status"] == "verified" else "unavailable"}
+        execution_keys += ("repository_read",)
     execution["checks"] = list(execution_keys)
     missing = [key for key in execution_keys if not _check_is_ok(checks[key])]
     if _check_is_ok(execution) and missing:
@@ -82,7 +129,27 @@ def _collect() -> dict[str, object]:
         "checks": checks,
         "installation_readiness": installation,
         "execution_readiness": execution,
+        "identities": identities,
+        "configuration": {"scope": "run" if frozen is not None else "future-runs",
+                          "run_id": document.get("run_id"), "source": document.get("source")},
+        "verification": {"scope": "online" if online else "local" if local else "legacy-host-check",
+                         "authentication": "verified" if all(value["authentication"] == "verified" for value in identities.values())
+                         else "unavailable" if any(value["status"] != "ok" for value in identities.values()) else "not_verified",
+                         "model_call": False, "repository_permissions": "not_verified",
+                         "worker_environment": "not_verified", "repository_read": repository_read},
+        "modes": {"background": background, "foreground": foreground},
+        "skills": skills_check(),
+        "next_steps": next_steps(),
     }
+
+
+def _sqlite_check() -> dict[str, object]:
+    try:
+        require_wal_runtime()
+    except ValueError:
+        return {"status": "unsupported", "version": sqlite3.sqlite_version,
+                "reason": "Runner 解释器实际加载的 SQLite 缺少支持的 WAL-reset 修复；见状态存储文档"}
+    return {"status": "ok", "version": sqlite3.sqlite_version}
 
 
 def _execution_readiness() -> dict[str, object]:
@@ -144,7 +211,7 @@ def _git_check() -> dict[str, object]:
     return tool
 
 
-def _codex_check() -> dict[str, object]:
+def _codex_check(*, authenticate: bool = True) -> dict[str, object]:
     tool = _tool_check("codex")
     executable = tool.get("path")
     if tool["status"] != "ok" or not isinstance(executable, str):
@@ -159,6 +226,8 @@ def _codex_check() -> dict[str, object]:
         if code != 0 or any(flag not in output for flag in flags):
             return {**tool, "status": "timeout" if timed_out else "unsupported",
                     "reason": "Codex exec/resume 缺少生产调用选项；请更新 Codex"}
+    if not authenticate:
+        return {**tool, "logged_in": None, "authentication": "not_checked"}
     code, timed_out = _run_bounded_probe([executable, "login", "status"])
     return {**tool, "status": "ok" if code == 0 else (
         "timeout" if timed_out else "not_logged_in"), "logged_in": code == 0,
@@ -191,7 +260,7 @@ def _run_bounded_probe(
     return code, timed_out
 
 
-def _github_check() -> dict[str, object]:
+def _github_check(*, authenticate: bool = True) -> dict[str, object]:
     tool = _tool_check("gh")
     if tool.get("status") != "ok":
         return {**tool, "logged_in": False}
@@ -204,6 +273,8 @@ def _github_check() -> dict[str, object]:
     if code != 0 or any(flag not in output for flag in (b"--paginate", b"--slurp", b"--method", b"--header")):
         return {**tool, "status": "timeout" if timed_out else "unsupported",
                 "logged_in": False, "reason": "gh api 缺少生产调用选项；请更新 GitHub CLI"}
+    if not authenticate:
+        return {**tool, "logged_in": None, "authentication": "not_checked"}
     returncode, timed_out = _run_bounded_probe([executable, "auth", "status"])
     if returncode is None:
         return {
@@ -388,14 +459,16 @@ def _print_human(report: dict[str, object]) -> None:
         raise ValueError("doctor checks must be an object")
     labels = (
         ("python", "Python"),
+        ("sqlite", "SQLite"),
         ("git", "Git"),
         ("codex", "Codex"),
         ("openssl", "OpenSSL"),
         ("bubblewrap", "bubblewrap"),
-        ("github", "宿主 gh 登录"),
+        ("github", "GitHub CLI / 宿主登录（仅所选 host）"),
         ("active_runner", "Active Runner"),
         ("path", "PATH"),
         ("worker_read_provider", "Worker GitHub identity"),
+        ("runner_identity", "Runner GitHub identity"),
     )
     print("agent-run doctor（只读诊断）")
     for key, label in labels:
@@ -405,8 +478,8 @@ def _print_human(report: dict[str, object]) -> None:
             continue
         detail: object = None
         if key == "github":
-            detail = "已登录" if check.get("logged_in") else "未登录"
-        elif key == "worker_read_provider":
+            detail = "未验证登录" if check.get("logged_in") is None else "已登录" if check.get("logged_in") else "未登录"
+        elif key in {"worker_read_provider", "runner_identity"}:
             detail = check.get("provider")
         elif key == "path":
             detail = {
@@ -431,3 +504,12 @@ def _print_human(report: dict[str, object]) -> None:
         if execution.get("reason"):
             print(f"  {execution['reason']}")
     print(f"总体: {report.get('status')}")
+    verification = report.get("verification")
+    if isinstance(verification, dict):
+        print(f"验证范围: {verification['scope']}；所选身份认证: {verification['authentication']}")
+    skills = report.get("skills")
+    if isinstance(skills, dict):
+        print(f"用户 Skills 入口: {skills['status']}；引用依赖与 Worker 发现尚未验证")
+    print("此结果不是仓库写权限、Worker 内部认证或真实交付证明；未调用模型。")
+    for step in next_steps():
+        print(f"  {step}")

@@ -89,6 +89,13 @@ def _parser(language: str) -> argparse.ArgumentParser:
     doctor = commands.add_parser("doctor", language=language,
         help="只读运行环境诊断" if language == "zh" else "Read-only runtime diagnostics")
     doctor.add_argument("--json", action="store_true", dest="as_json")
+    verification = doctor.add_mutually_exclusive_group()
+    verification.add_argument("--local", action="store_true", help="仅本地检查，不读取 token 或调用认证服务")
+    verification.add_argument("--online", action="store_true", help="显式验证所选 GitHub 身份，不调用模型")
+    doctor.add_argument("--mode", choices=("background", "foreground"), default="background")
+    doctor.add_argument("--repo")
+    doctor.add_argument("--run", dest="run_id", help="检查此 Run 的冻结身份，而非新任务默认")
+    doctor.add_argument("--state-dir", type=Path)
     personal_settings.add_parsers(commands, language)
     from agent_run.cli import profiles as run_profile_cli
     run_profile_cli.add_parser(commands, language)
@@ -129,7 +136,17 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return 0
         if parsed.command == "doctor":
             from agent_run.install.doctor import run as diagnose
-            return diagnose(as_json=parsed.as_json)
+            if parsed.state_dir is not None and parsed.run_id is None:
+                raise ValueError("doctor --state-dir requires --run RUN_ID")
+            frozen = None
+            if parsed.run_id is not None:
+                parsed.parent = None
+                candidate = cli_selection._select(parsed, cli_selection._candidates(parsed))[0]
+                frozen = read(Path(candidate["database"]), "settings", expected_run=candidate["run_id"],
+                              expected_repository=candidate["repository"].lower()).data
+                parsed.repo = candidate["repository"]
+            return diagnose(as_json=parsed.as_json, local=parsed.local, online=parsed.online,
+                            mode=parsed.mode, repository=parsed.repo, frozen=frozen)
         if parsed.command == "settings":
             if parsed.settings_command == "show" and (parsed.run_id is not None or parsed.parent is not None):
                 candidate = cli_selection._select(parsed, cli_selection._candidates(parsed))[0]
