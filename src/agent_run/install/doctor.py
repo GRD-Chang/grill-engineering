@@ -114,7 +114,7 @@ def _collect(*, local: bool, online: bool, mode: str, repository: str | None,
         execution_keys += ("repository_read",)
     execution["checks"] = list(execution_keys)
     missing = [key for key in execution_keys if not _check_is_ok(checks[key])]
-    if _check_is_ok(execution) and missing:
+    if execution.get("status") in {"ok", "ready"} and missing:
         execution["status"] = "unavailable"
         execution["reason"] = "执行依赖不可用：" + ", ".join(missing)
     return {
@@ -122,7 +122,7 @@ def _collect(*, local: bool, online: bool, mode: str, repository: str | None,
         "status": (
             "ready"
             if all(_check_is_ok(check) for check in checks.values())
-            and _check_is_ok(execution)
+            and execution.get("status") in {"ok", "ready"}
             else "issues"
         ),
         "checks": checks,
