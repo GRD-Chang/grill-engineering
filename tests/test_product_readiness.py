@@ -48,6 +48,24 @@ def test_local_readiness_does_not_authenticate_or_read_pat(
     assert "openssl dgst" not in calls.read_text()
 
 
+@pytest.mark.parametrize("mode", ["--local", "--online", None])
+def test_codex_login_is_only_checked_outside_local_mode(tmp_path, monkeypatch, capsys, mode) -> None:
+    calls = _tools(tmp_path, monkeypatch)
+    arguments = ["doctor", "--json"] + ([mode] if mode else [])
+    assert main(arguments) == 0
+    report = json.loads(capsys.readouterr().out)
+    commands = calls.read_text().splitlines()
+    assert "codex --version" in commands
+    assert "codex exec --help" in commands
+    assert "codex exec resume --help" in commands
+    assert ("codex login status" in commands) is (mode != "--local")
+    if mode == "--local":
+        assert report["checks"]["codex"]["authentication"] == "not_checked"
+        assert report["checks"]["codex"]["logged_in"] is None
+    else:
+        assert report["checks"]["codex"]["logged_in"] is True
+
+
 def test_non_host_configuration_is_not_rejected_by_host_login(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:

@@ -70,7 +70,7 @@ def _collect(*, local: bool, online: bool, mode: str, repository: str | None,
         "python": _python_check(),
         "sqlite": _sqlite_check(),
         "git": _git_check(),
-        "codex": _codex_check(),
+        "codex": _codex_check(authenticate=not local),
         "openssl": _tool_check("openssl", version_arguments=("version",)),
         "bubblewrap": _bubblewrap_check(),
         "github": _github_check(authenticate=host_selected and not local and not online),
@@ -211,7 +211,7 @@ def _git_check() -> dict[str, object]:
     return tool
 
 
-def _codex_check() -> dict[str, object]:
+def _codex_check(*, authenticate: bool = True) -> dict[str, object]:
     tool = _tool_check("codex")
     executable = tool.get("path")
     if tool["status"] != "ok" or not isinstance(executable, str):
@@ -226,6 +226,8 @@ def _codex_check() -> dict[str, object]:
         if code != 0 or any(flag not in output for flag in flags):
             return {**tool, "status": "timeout" if timed_out else "unsupported",
                     "reason": "Codex exec/resume 缺少生产调用选项；请更新 Codex"}
+    if not authenticate:
+        return {**tool, "logged_in": None, "authentication": "not_checked"}
     code, timed_out = _run_bounded_probe([executable, "login", "status"])
     return {**tool, "status": "ok" if code == 0 else (
         "timeout" if timed_out else "not_logged_in"), "logged_in": code == 0,
