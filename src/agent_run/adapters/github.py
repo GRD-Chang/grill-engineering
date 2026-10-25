@@ -126,6 +126,7 @@ class GhGitHubReader:
         labels, blockers = _SourceConnection("labels"), _SourceConnection("blockedBy")
         label_names: set[str] = set()
         blocked_by: list[Blocker] = []
+        ticket_ids = dict(parent.tickets)
         snapshot = None
         while not labels.done or not blockers.done:
             data = self._graphql(query, owner, name, number, None if blockers.done else blockers.cursor,
@@ -154,6 +155,8 @@ class GhGitHubReader:
                     blocker_number = _integer(blocker, "number")
                     if blocker_number < 1 or any(value.number == blocker_number for value in blocked_by):
                         raise GitHubReadError("github_invalid_response", "Duplicate or invalid blocker number")
+                    if blocker_number in ticket_ids and _nonempty(blocker, "id") != ticket_ids[blocker_number]:
+                        raise GitHubReadError("github_invalid_response", "Blocker number belongs to a different global Issue")
                     blocked_by.append(Blocker(blocker_number, _issue_state(blocker)))
         assert snapshot is not None
         return Issue(number, snapshot[0], snapshot[1], snapshot[2], frozenset(label_names), tuple(blocked_by))

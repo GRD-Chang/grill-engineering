@@ -215,3 +215,77 @@ def test_source_403_is_not_empty_data_or_a_different_read_layout(tmp_path, monke
     assert caught.value.code == 'github_read_failed'
     commands = [json.loads(line) for line in log.read_text().splitlines()]
     assert len(commands) == 5  # Original two repository reads and the existing three bounded attempts.
+
+
+@pytest.mark.parametrize('page', ['9', 'blocker-next'])
+def test_blocker_matching_a_local_ticket_number_must_match_its_global_id(tmp_path, monkeypatch, page):
+    reader, _ = _reader(tmp_path, monkeypatch)
+    path = tmp_path / 'responses.json'
+    data = json.loads(path.read_text())
+    data[page]['blockedBy']['nodes'][0].update(number=3, id='outside-repository-issue-3', state='OPEN')
+    if page == '9':
+        data['blocker-next']['blockedBy']['nodes'][0].update(number=99, id='external-issue-99', state='OPEN')
+    path.write_text(json.dumps(data))
+    with pytest.raises(GitHubReadError, match='different global Issue'):
+        read_requirements(reader, 1)
+
+
+@pytest.mark.parametrize('external_state', [None, 'OPEN', 'CLOSED'], ids=['internal-only', 'external-open', 'external-closed'])
+def test_global_blocker_identity_preserves_native_completion_and_external_state(tmp_path, monkeypatch, external_state):
+    from support.offline import GraphScenario
+
+    reader, log = _reader(tmp_path, monkeypatch)
+    path = tmp_path / 'responses.json'
+    data = json.loads(path.read_text())
+    blockers = [{'id': 'issue-node-3', 'number': 3, 'state': 'OPEN'}]
+    if external_state is not None:
+        blockers.append({'id': 'outside-repository-issue-99', 'number': 99, 'state': external_state})
+    data['9']['blockedBy'] = {'totalCount': len(blockers), 'nodes': blockers,
+                             'pageInfo': {'hasNextPage': False, 'endCursor': None}}
+    data['3']['state'] = 'OPEN'
+    path.write_text(json.dumps(data))
+    source = read_requirements(reader, 1)
+    assert len(log.read_text().splitlines()) == 6  # Unchanged two repository reads, two Parent pages and two Tickets.
+    assert [(b.number, b.state) for b in source.issues[0].blocked_by] == [(b['number'], b['state']) for b in blockers]
+    scenario = GraphScenario(tmp_path / 'normal-producer', source)
+    assert scenario.kernel.source_status()['frontier'] == ['ticket:3']
+    boundary = scenario.run()
+    current = scenario.kernel.source_status()
+    assert any(c['subject'] == 'ticket:3' for c in current['completions'])
+    if external_state == 'OPEN':
+        assert boundary.kind == 'waiting'
+        assert current['remaining']['ticket:9'] == 'blocked_by_open_issues'
+        assert scenario.kernel.status('ticket:9')['phase'] == 'workspace'
+        assert scenario.kernel.status('ticket:9')['pending_attempt'] is None
+        with scenario.kernel.storage.transaction(write=False) as tx:
+            assert not tx.rows("SELECT id FROM attempts WHERE subject='ticket:9'")
+    else:
+        assert boundary.kind == 'complete'
+        assert scenario.kernel.status('ticket:9')['phase'] == 'complete'
+        assert {c['subject'] for c in current['completions']} == {'ticket:3', 'ticket:9'}
+
+
+def test_external_blocker_identity_drift_during_label_pagination_is_rejected(tmp_path, monkeypatch):
+    reader, _ = _reader(tmp_path, monkeypatch)
+    path = tmp_path / 'responses.json'
+    data = json.loads(path.read_text())
+    _long_labels(data)
+    data['labels-last']['blockedBy']['nodes'][0]['id'] = 'different-global-issue-id'
+    path.write_text(json.dumps(data))
+    with pytest.raises(GitHubReadError) as caught:
+        read_requirements(reader, 1)
+    assert caught.value.code == 'github_observation_pending'
+
+
+def test_internal_blocker_identity_does_not_add_single_page_requests(tmp_path, monkeypatch):
+    reader, log = _reader(tmp_path, monkeypatch)
+    path = tmp_path / 'responses.json'
+    data = json.loads(path.read_text())
+    children = data['parent']['subIssues']
+    children['nodes'] += data['parent-next']['subIssues']['nodes']
+    children['pageInfo'] = {'hasNextPage': False, 'endCursor': None}
+    data['9']['blockedBy'] = {'totalCount': 1, 'nodes': [{'id': 'issue-node-3', 'number': 3, 'state': 'OPEN'}],
+                             'pageInfo': {'hasNextPage': False, 'endCursor': None}}
+    path.write_text(json.dumps(data))
+    assert [(b.number, b.state) for b in read_requirements(reader, 1).issues[0].blocked_by] == [(3, 'OPEN')]
+    assert len(log.read_text().splitlines()) == 3 + 2  # The original3+N single-page layout.
