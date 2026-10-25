@@ -105,7 +105,10 @@ def read_pull_request_facts(reader: GhGitHubReader, pr_number: int) -> dict[str,
     """
     if type(pr_number) is not int or pr_number < 1:
         raise ValueError('PR number must be a positive integer')
-    repository = reader.repository().name_with_owner
+    return _pull_request_facts(reader, reader.repository().name_with_owner, pr_number)
+
+
+def _pull_request_facts(reader: GhGitHubReader, repository: str, pr_number: int) -> dict[str, Any]:
     data = _object(_json_response(_read(reader, ['api', f'repos/{repository}/pulls/{pr_number}'])))
     if type(data.get('number')) is not int or data['number'] != pr_number:
         raise GitHubReadError('github_invalid_response', 'PR observation has another identity')
@@ -344,7 +347,7 @@ def _check_state(status: str, conclusion: Any) -> tuple[str, str]:
     return state, bucket
 
 
-def _rollup_checks(reader: GhGitHubReader, number: int, head: str) -> list[dict[str, Any]]:
+def _rollup_checks(reader: GhGitHubReader, repository: str, number: int, head: str) -> list[dict[str, Any]]:
     # Rollup supplies required applicability and identity, not rerun ordering.
     # The server latest endpoints below determine current members.
     query = '''query CurrentRequiredChecks($owner:String!,$repo:String!,$number:Int!,$cursor:String) {
@@ -361,7 +364,7 @@ def _rollup_checks(reader: GhGitHubReader, number: int, head: str) -> list[dict[
         } } } }
       } }
     }'''
-    owner, repo = reader.repository().name_with_owner.split('/')
+    owner, repo = repository.split('/')
     cursor: str | None = None
     cursors: set[str] = set()
     identities: set[str] = set()
@@ -452,13 +455,17 @@ def read_required_check_facts(reader: GhGitHubReader, pr_number: int, *, expecte
     The exact PR head brackets these independent observations.
     """
     from urllib.parse import quote
-    before = read_pull_request_facts(reader, pr_number)
-    if before['head']['sha'] != expected_head_sha:
-        raise GitHubReadError('change_pr_head_drift', 'Required checks refer to another PR head')
+    if type(pr_number) is not int or pr_number < 1:
+        raise ValueError('PR number must be a positive integer')
+    # Resolve once for this observation, never across calls. PR head reads
+    # still bracket the complete checks/configuration observation below.
     metadata = reader.repository()
     repository = metadata.name_with_owner
+    before = _pull_request_facts(reader, repository, pr_number)
+    if before['head']['sha'] != expected_head_sha:
+        raise GitHubReadError('change_pr_head_drift', 'Required checks refer to another PR head')
     checks = _latest_checks(reader, repository, expected_head_sha,
-                            _rollup_checks(reader, pr_number, expected_head_sha))
+                            _rollup_checks(reader, repository, pr_number, expected_head_sha))
     pages = _array(_json_response(_read(reader, ['api', f'repos/{repository}/rulesets', '--paginate', '--slurp'])))
     import json
     total_bytes = len(json.dumps(before, ensure_ascii=False).encode()) + len(json.dumps(checks).encode())
@@ -491,7 +498,7 @@ def read_required_check_facts(reader: GhGitHubReader, pr_number: int, *, expecte
     contexts = _configured_contexts({'classic_protection_absent': absent, 'classic_contexts': classic, 'classic_checks': classic_checks,
                                     'rulesets': rulesets, 'repository_default_branch': metadata.default_branch}, branch)
     checks = _failed_check_evidence(reader, repository, checks, expected_head_sha, contexts)
-    after = read_pull_request_facts(reader, pr_number)
+    after = _pull_request_facts(reader, repository, pr_number)
     if after['head']['sha'] != expected_head_sha:
         raise GitHubReadError('change_pr_head_drift', 'PR head changed during required-check observation')
     return {'pr_before': before, 'pr_after': after, 'head_sha': expected_head_sha,
