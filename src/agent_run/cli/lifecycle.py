@@ -341,6 +341,9 @@ def execute(parsed: argparse.Namespace, *, language: str) -> dict[str, Any]:
                     subject = str(targets[0]["id"])
             action_id = uuid4().hex
             action_status = kernel.stop_task(action_id, subject=subject)
+            if action_status == "complete":
+                return {"result": "completed", "status": "completed", "run_id": run["id"],
+                        "action_id": None, "action": "stop", "host": "exited", "language": run["language"]}
             return {"result": "accepted", "status": "action_" + action_status, "run_id": run["id"],
                     "action_id": action_id, "action": "stop", "host": "unknown", "language": run["language"]}
         inspections = None

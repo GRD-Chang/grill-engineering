@@ -1928,6 +1928,14 @@ class Kernel:
         with locked_admission(task) as location:
             if read_task(location) != (run_id, self.storage.path.resolve()):
                 raise KernelError("task_location_identity")
+            with self.storage.transaction(write=False) as tx:
+                terminal = (tx.one("SELECT final_action FROM runs")[0] is None
+                            and self._abandon_action(tx) is None
+                            and not tx.rows("SELECT id FROM actions WHERE id=?", (action_id,)))
+            # Reuse Task retirement's complete delivery/resource/exit proof.
+            # An unfinished or unknown Host still needs the durable Stop fence.
+            if terminal and self._replaceable(task, run_id):
+                return "complete"
             with self.storage.transaction() as tx:
                 return self._control(tx, "stop", action_id, subject=subject)
 
