@@ -21,12 +21,21 @@ Runner's Python environment does not replace the project environment.
 
 ## 2. Install one exact version
 
-Download the source archive from the maintainer's release entry, verify its published SHA256,
-and use documentation from that same version. From the extracted source root:
+Obtain a fixed product archive through an authorized maintainer channel, independently verify
+its SHA256, and use documentation from that same version. From the extracted package root:
 
 ```sh
+./install.sh --verify-release
 ./setup.sh
 ```
+
+The first command checks the manifest, complete file inventory, wheels and hashed dependency
+lock without creating installation state or calling a model. The package contains the product
+wheel and four dependency wheels for offline candidate installation; Python, system tools and
+Skills are not included. Verification requires CPython 3.11+; setup also requires timeout.
+A checksum alongside the package does not establish publisher identity. Full documentation
+and examples come from the maintainer's matching-version documentation entry; the package
+currently includes only a short installation note. A private build is not a public release.
 
 Read and confirm the plan. Missing administrator access and account login require the
 appropriate person; Setup does not grant either. Installation includes a real Codex
@@ -34,12 +43,12 @@ compatibility call that consumes account quota. In a new login shell:
 
 ```sh
 command -v agent-run
-agent-run doctor --json
+agent-run doctor --local --json
 agent-run settings show --json
 ```
 
-Read the report statuses: doctor can exit 0 while reporting issues. Its current gh check
-covers host login, not the separately selected PAT/App repository access. Do not paste raw
+Read the report statuses: doctor can exit 0 while reporting issues. Local checks inspect tools
+and identity references without checking account authentication. Do not paste raw
 configuration output into a public Issue. Use the existing [update/rollback/uninstall
 commands](../install.en.md#update-rollback-and-uninstall).
 
@@ -56,6 +65,13 @@ Runner and Worker independently support host/PAT/App; both default to host.
 The two sides may use different sources. Credentials determine Worker GitHub capabilities;
 there is no local command allowlist. Write capability does not grant publication or approval
 responsibility. A Run freezes its source/reference; resume does not silently switch identity.
+
+Explicitly run `agent-run doctor --online --repo OWNER/REPO --json` when ready to check access.
+It uses the selected host/PAT/App identities for Runner/Worker authentication and Runner
+repository reads; App mode may issue a short-lived token. It calls no model and does not prove
+write permissions or authentication inside the actual Worker sandbox. See the
+[staged preparation contract](../preparation.md). `doctor --local --mode foreground` reports
+`not_integrated`; it does not start a foreground Host.
 
 ## 4. Start a small task
 

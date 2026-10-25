@@ -19,11 +19,19 @@ Runner 自己的 Python 环境不代替项目环境。示例只用 Python 标准
 
 ## 2. 安装同一版本
 
-从维护者发布入口下载所选版本的源码归档，核对该版本公布的 SHA256，解压后在根目录运行：
+从已授权的维护者入口取得所选版本的固定产品包，独立核对归档 SHA256，
+解压后先在包根目录只读校验，再启动安装：
 
 ```sh
+./install.sh --verify-release
 ./setup.sh
 ```
+
+`--verify-release` 核验 manifest、完整文件清单、wheel 和哈希依赖锁，不创建安装状态或调用模型。
+产品包含产品及四个依赖 wheel，候选 Python 环境离线安装；不含 Python、系统工具或 Skills。
+校验前须有 CPython 3.11+，setup 还需 timeout；同包 checksum 不能代替可信来源。
+同版完整文档和示例从维护者的同版文档入口取得，当前产品包只附简短安装说明。
+私有候选构建成功不代表已获公开发布授权或已建立公开下载入口。
 
 阅读计划后确认；缺管理员权限由管理员补齐，登录由你完成。Setup 不授予权限或创建账号。
 安装包含一次真实 Codex 兼容调用，会消耗账号额度。
@@ -31,12 +39,12 @@ Runner 自己的 Python 环境不代替项目环境。示例只用 Python 标准
 
 ```sh
 command -v agent-run
-agent-run doctor --json
+agent-run doctor --local --json
 agent-run settings show --json
 ```
 
-doctor 的退出码 0 不代表全部就绪，要看报告状态；当前版本的 gh 检查只覆盖 host，
-不证明另选的 PAT/App 可访问目标仓库。不要直接把原始配置输出贴到公开 Issue。
+doctor 的退出码 0 不代表全部就绪，要看报告状态；`--local` 不检查账号认证，
+只检查工具和身份引用。不要直接把原始配置输出贴到公开 Issue。
 更新、回滚和卸载继续用 [现有安装生命周期](../install.md#更新回滚与卸载)。
 
 ## 3. 选择已有身份方式
@@ -51,6 +59,11 @@ Runner 和 Worker 各自支持 host/PAT/App，默认都是 host；无需为了�
 
 可以混合选择两端身份。Worker 的 GitHub 能力由凭据决定，不由本地命令白名单限制；
 拥有写权限不授予自我发布或批准职责。新任务固定来源和引用，恢复不静默切换身份。
+
+需要验证时明确执行 `agent-run doctor --online --repo OWNER/REPO --json`。
+这会按所选 host/PAT/App 检查 Runner/Worker 认证和 Runner 仓库读取，App 可能签发短期 token；
+不调用模型，不证明写权限或实际 sandbox 内的 Worker 认证。详细边界见[分阶段准备](../preparation.md)。
+`doctor --local --mode foreground` 只诊断并报告 `not_integrated`，不是前台启动命令。
 
 ## 4. 启动一个小任务
 

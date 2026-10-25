@@ -2,7 +2,9 @@
 
 使用 [JSON 模板](diagnostic-report.template.json) 手动填写公开摘要，保留字段白名单。
 这不是新的 doctor 或自动采集器，不读取环境变量、账号文件或 Run 数据，也不自动上传。
-先在本地查看现有 `agent-run doctor --json` 及安装回执；任务问题再在本地看 status/history。
+先在本地查看 `agent-run doctor --local --json` 及安装回执；任务问题再在本地看 status/history。
+明确需要认证/仓库读取时才运行 `doctor --online --repo OWNER/REPO --json`；
+此检查使用所选身份，App 可能签发短期 token，不调用模型。报告中仍有未验证的能力。
 **不要原样附上这些输出**：其中可能有路径、仓库身份、引用或任务正文。
 
 只填写：准确 Runner commit/安装内容 SHA256、OS/架构、纯工具版本号、运行模式、
