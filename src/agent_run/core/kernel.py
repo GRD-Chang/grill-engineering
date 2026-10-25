@@ -23,6 +23,7 @@ from uuid import uuid4
 from agent_run.contracts.agent_profiles import ProfileOverrides, resolve_profiles, validate_profile_options
 from agent_run.contracts.identity import validate_identity_snapshot
 from agent_run.contracts.pr_observation import pr_target
+from agent_run.contracts.repository import same_repository
 from agent_run.contracts.prompt import validate_resources
 from agent_run.contracts.task import TaskKey
 
@@ -4943,7 +4944,8 @@ class Kernel:
     @staticmethod
     def _pr_identity(run: sqlite3.Row, resource: sqlite3.Row, pr: PullRequest | Mapping[str, Any]) -> bool:
         value = asdict(pr) if isinstance(pr, PullRequest) else pr
-        return bool(value["repository"] == value.get("head_repository") == run["repository"]
+        return bool(same_repository(value["repository"], run["repository"])
+                    and same_repository(value.get("head_repository"), run["repository"])
                     and value["source_ref"] == resource["source_ref"] and value["target_ref"] == resource["target_ref"]
                     and (resource["pr_number"] is None or value["number"] == resource["pr_number"]))
 

@@ -8,6 +8,7 @@ from typing import Any
 
 from agent_run.notifications.envelope import event_copy, event_envelope
 from agent_run.contracts.copy import selected_language, text
+from agent_run.contracts.repository import same_repository
 
 from agent_run.queries.execution import execution_facts
 from agent_run.storage.sqlite import Transaction
@@ -270,7 +271,7 @@ def _project(tx: Transaction, row: Mapping[str, Any], state: dict[str, Any], mod
             receipt = json.loads(tx.get(row["material_id"], row["subject"]))
             pr = receipt.get("pr")
             if (receipt.get("disposition") != "target" or not isinstance(pr, dict)
-                    or pr.get("repository") != state["repository"]
+                    or not same_repository(pr.get("repository"), state["repository"])
                     or type(pr.get("number")) is not int or pr["number"] <= 0):
                 return []
             number = pr["number"]
