@@ -32,6 +32,7 @@ from agent_run.config.paths import app_data_root
 from agent_run.runtime.process_cleanup import capture_process_scope, child_subreaper, terminate_process_group as _terminate_process_group
 from agent_run.install.runtime_tree import RuntimeTreeError, find_runtime_package
 from agent_run.runtime.package_lease import RunnerLeaseBusy, RunnerLeaseError, runner_management_lease
+from agent_run.install.distribution import ReleaseError, runtime_digest, verify_release
 
 
 PATH_BLOCK_START = "# >>> agent-run managed PATH >>>"
@@ -117,6 +118,13 @@ def _main(arguments: Sequence[str] | None = None) -> int:
         return code if isinstance(code, int) else int(code) if isinstance(code, str) else 1
     try:
         source = Path(parsed.source).resolve()
+        release = verify_release(source) if not (parsed.rollback or parsed.uninstall) else None
+        if parsed.verify_release:
+            if release is None:
+                raise InstallerError("Not a product release directory")
+            print(json.dumps({"result": "release_verified", "release": release["release"],
+                              "runtime_sha256": release["runtime_sha256"]}, sort_keys=True))
+            return 0
         paths = InstallPaths.from_environment()
         _reject_managed_paths_inside_source(paths, source)
         with _handle_sigterm():
@@ -130,7 +138,7 @@ def _main(arguments: Sequence[str] | None = None) -> int:
     except (InstallerInterrupted, KeyboardInterrupt):
         print("agent-run install: interrupted", file=sys.stderr)
         return 1
-    except InstallerError as error:
+    except (InstallerError, ReleaseError) as error:
         print(f"agent-run install: {error}", file=sys.stderr)
         return 1
     except (OSError, ValueError) as error:
@@ -151,6 +159,7 @@ def _build_parser() -> argparse.ArgumentParser:
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--rollback", action="store_true", help="回退到紧邻上一个 Snapshot")
     modes.add_argument("--uninstall", action="store_true", help="卸载受管 Runner")
+    modes.add_argument("--verify-release", action="store_true", help="只读校验发行包；不安装或调用模型")
     parser.add_argument("--source", required=True, help=argparse.SUPPRESS)
     return parser
 
@@ -190,6 +199,7 @@ def _install(paths: InstallPaths, source: Path) -> dict[str, object]:
 
 def _install_transaction(paths: InstallPaths, source: Path) -> dict[str, object]:
     _check_source(source)
+    verify_release(source)
     source_provenance = _source_provenance(source)
     _check_managed_entry(paths, for_uninstall=False)
     old_current, old_previous, old_generation = _read_active(paths)
@@ -378,6 +388,9 @@ def _check_prerequisites(source: Path) -> None:
         import venv
     except ImportError as error:
         raise InstallerError("当前 Python 缺少 venv") from error
+    if verify_release(source) is not None:
+        # ensurepip in the new venv supplies pip; no system pip/build backend is used.
+        return
     try:
         pip = subprocess.run(
             [sys.executable, "-m", "pip", "--version"],
@@ -436,6 +449,7 @@ def _build_candidate(candidate: Path, source: Path) -> tuple[str, str]:
             raise InstallerError(
                 "准备构建源码阶段失败；请检查源码读取权限、安装目录写入权限和磁盘空间后重试"
             ) from error
+        release = verify_release(build_source)
         return_code = _run_pip_install(python, build_source)
     finally:
         try:
@@ -445,25 +459,28 @@ def _build_candidate(candidate: Path, source: Path) -> tuple[str, str]:
     if return_code != 0:
         raise InstallerError(_build_failure_message(b"", return_code))
     package = _runtime_package(candidate)
+    if release is not None and runtime_digest(package) != release["runtime_sha256"]:
+        raise InstallerError("Installed release runtime differs from its verified source")
     identity = _runtime_identity(package)
     return identity, f"{sys.version_info.major}.{sys.version_info.minor}"
 
 
 def _run_pip_install(python: Path, source: Path) -> int:
+    release = verify_release(source)
+    arguments = [str(python), "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--no-cache-dir", str(source)]
+    environment = None
+    if release is not None:
+        arguments = [str(python), "-I", "-m", "pip", "install", "--disable-pip-version-check", "--no-input",
+                     "--no-cache-dir", "--no-index", "--find-links", str(source / "wheels"),
+                     "--only-binary=:all:", "--require-hashes", "-r", str(source / "requirements.lock")]
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("PIP_")}
+        environment["PIP_CONFIG_FILE"] = os.devnull
     adopted_baseline = capture_process_scope()
     try:
         process = subprocess.Popen(
-            [
-                str(python),
-                "-m",
-                "pip",
-                "install",
-                "--disable-pip-version-check",
-                "--no-input",
-                "--no-cache-dir",
-                str(source),
-            ],
+            arguments,
             cwd=source,
+            env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -670,6 +687,10 @@ def _runtime_identity(package: Path) -> str:
 
 
 def _source_provenance(source: Path) -> dict[str, object]:
+    release = verify_release(source)
+    if release is not None:
+        return {"kind": "product-release", "release": release["release"],
+                "source_commit": release.get("source_commit"), "runtime_sha256": release["runtime_sha256"]}
     commit = _git_field(source, "rev-parse", "--verify", "HEAD")
     ref = _git_field(source, "symbolic-ref", "--short", "-q", "HEAD")
     if commit is None and ref is None:

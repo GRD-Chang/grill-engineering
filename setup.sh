@@ -30,6 +30,15 @@ if command -v timeout >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 &&
     timeout -k 1 5 python3 -c 'import platform, sys; sys.exit(not (platform.python_implementation() == "CPython" and sys.version_info >= (3, 11)))' >/dev/null 2>&1; then
     probe_python=yes
 fi
+if [ -e "$SOURCE_DIR/release-manifest.json" ] || [ -L "$SOURCE_DIR/release-manifest.json" ] ||
+   [ -e "$SOURCE_DIR/requirements.lock" ] || [ -e "$SOURCE_DIR/wheels" ]; then
+    if [ "$probe_python" != yes ]; then
+        echo '固定发行包须先有 CPython >= 3.11 和 timeout 才能校验；尚未执行任何系统准备。'
+        exit 1
+    fi
+    python3 "$SOURCE_DIR/src/agent_run/install/installer.py" --verify-release --source "$SOURCE_DIR" || exit 1
+    echo '发行包完整性已核验；候选从内置 wheel 安装。安装仍调用真实 Codex 兼容性探针，会使用账号额度。'
+fi
 probe() {
     if [ "$probe_python" = yes ]; then
         python3 "$SOURCE_DIR/src/agent_run/install/setup.py" "$@"
