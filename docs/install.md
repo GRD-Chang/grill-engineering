@@ -2,6 +2,9 @@
 
 [English](install.en.md) | 简体中文
 
+首次使用可先读[一页快速开始](productization/quickstart.md)；
+完整前提与排障仍以本页为准，[支持矩阵](productization/support.md)区分适配代码与真实发行验证。
+
 按本页完成安装和目标仓库检查；运行任务见 [Agent 操作指南](agent-guide.md#运行任务)。
 工具源码目录用于安装；交付使用 Runner 从目标远端建立的独立克隆，用户仓库保持不变。
 

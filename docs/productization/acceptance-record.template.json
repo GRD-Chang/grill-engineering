@@ -1,0 +1,17 @@
+{
+  "format": "agent-run-release-checklist-v1",
+  "source_commit": null,
+  "archive_sha256": null,
+  "documentation_commit": null,
+  "checks": {
+    "archive_install": {"status": "unrun", "evidence": []},
+    "identity_access": {"status": "unrun", "evidence": []},
+    "real_worker": {"status": "unrun", "evidence": []},
+    "ticket_delivery": {"status": "unrun", "evidence": []},
+    "ci_repair": {"status": "unrun", "evidence": []},
+    "approval_boundary": {"status": "unrun", "evidence": []},
+    "stop_resume": {"status": "unrun", "evidence": []},
+    "background_delivery": {"status": "unrun", "evidence": []},
+    "parent_cloud_delivery": {"status": "blocked", "evidence": []}
+  }
+}
