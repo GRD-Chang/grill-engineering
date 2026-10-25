@@ -164,15 +164,22 @@ def main(arguments: Sequence[str] | None = None) -> int:
     parser.add_argument("--runner-lock", type=Path, required=True)
     parsed = parser.parse_args(arguments)
     try:
-        kernel = Kernel(parsed.database)
-        if kernel.host_request(parsed.action).backend == "foreground":
-            from agent_run.runtime.foreground_host import execute_foreground
-            return execute_foreground(kernel, parsed.action)
         credential_directory, notify_socket = os.environ.get("CREDENTIALS_DIRECTORY"), os.environ.get("NOTIFY_SOCKET")
-        if not credential_directory or not notify_socket:
+        foreground_channel = all(os.environ.get(name) for name in
+                                 ("AGENT_RUN_FOREGROUND_CHANNEL", "AGENT_RUN_FOREGROUND_LEASE"))
+        # Transport materials permit bootstrap inspection, never execution.
+        # Both backends still prove their original handshake and physical lease.
+        if not (credential_directory and notify_socket) and not foreground_channel:
             raise KernelError("managed_host_required")
         kernel = Kernel(parsed.database)
         request = kernel.host_request(parsed.action)
+        if request.backend == "foreground":
+            if not foreground_channel:
+                raise KernelError("managed_host_required")
+            from agent_run.runtime.foreground_host import execute_foreground
+            return execute_foreground(kernel, parsed.action)
+        if not credential_directory or not notify_socket:
+            raise KernelError("managed_host_required")
         manager = SystemdHost(systemctl="systemctl", systemd_run="systemd-run", environment=os.environ)
         with managed_host_environment(
             kernel, parsed.action, manager, runner_lock=parsed.runner_lock,
