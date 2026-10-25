@@ -11,7 +11,7 @@ Run 的身份读取由 [`cli.selection`](../../src/agent_run/cli/selection.py) �
 | 查询参数及输出、Parent 或准确 Run ID 的生命周期分流 | [`cli.main`](../../src/agent_run/cli/main.py)、[`cli.lifecycle`](../../src/agent_run/cli/lifecycle.py) |
 | Action 准入、Receipt、执行代次与恢复 | [`core.kernel`](../../src/agent_run/core/kernel.py)；生命周期层负责准确 Host 附着和交接 |
 
-`status`、`history` 从当前 v19 数据库读取；准确 Run ID、Repository、Parent、数据库位置及
+`status`、`history` 从当前 v20 数据库读取；准确 Run ID、Repository、Parent、数据库位置及
 Task 发布记录须一致。旧 JSON/v6、native v17/v18 不提供兼容查询或恢复。
 读取和修改不能因共享定位而共享权限。
 

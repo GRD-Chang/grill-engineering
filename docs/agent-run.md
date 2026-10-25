@@ -7,7 +7,7 @@
 - 让持久 Development Thread 实现和修复，并由独立、只读 Publication Codex 生成发布语义；
 - 为每轮首次候选验收创建全新的 Fresh Acceptance Thread 和一次性 Validation Checkout；同一 Reviewer 因 `execution_failed` 或 Human Blocker 继续当前对象时复用原 Thread 并重新准备 checkout；
 - 以 [Acceptance Artifact Schema](acceptance-artifact-schema.md) 约束 Ticket 与 Run Reviewer 共用的三条验收 lane 输出；
-- `run` 与 `resume` 都通过同一 Task Control 和独立 Executor 连续推进；恢复失败 Invocation 或 Human Blocker 后形成的 Candidate、PR 与 Required Checks 由同一 Executor 监督到下一真实边界，发起终端退出或 Ctrl-C 只离开观察；
+- `run` 与 `resume` 都通过同一 Task Control 和独立 Executor 连续推进；恢复失败 Invocation 或 Human Blocker 后形成的 Candidate、PR 与 Required Checks 由同一 Executor 监督到下一真实边界，后台模式下发起终端退出或 Ctrl-C 只离开观察；前台候选的区别见下节；
 - Required Checks 的 pending 等待当前默认2700秒（45分钟），到期进入可恢复的监督超时暂停；其他 GitHub 异步状态、未知读取或对账按各自有界窗口监督。远端检查在超时后成功不会自动重启或续期；按 `status` 指引显式 `resume` 开始对应的新窗口，不另启 watcher，不以重复 `run` 清除超时或其他人工门禁；
 - 通过 Required Checks 与 Published-Head Gate 后，将 Ticket PR squash merge
   到 Run Branch，并显式关闭唯一 Primary Ticket；
@@ -21,9 +21,30 @@
 各智能角色的目标 Prompt 与证据合同见
 [`docs/agents/agent-prompts.md`](agents/agent-prompts.md)。
 
+## 运行模式与前台候选验收
+
+默认后台模式仍由 systemd user manager 托管；关闭终端或 Ctrl-C 只离开命令观察，
+停止工作使用 `stop`。跨注销持续能力仍取决于宿主配置，不承诺跨重启自动恢复。
+
+本候选已接入显式 `--foreground`，例如 `agent-run run PARENT --repo OWNER/REPO --foreground`；
+后续需新建前台执行时显式使用 `resume RUN_ID --repo OWNER/REPO --foreground`。
+`approve`、`requeue`、`revise`、`abandon` 也接受该选项；`stop` 不接受它。
+活动 Host 按已记录 backend 核验，不静默从后台回退前台，也不以新选项替换活动 Host。
+前台共用原 Core、Executor、Git 只读、身份和批准链路，不需要 systemd user manager，
+但仍须满足 bwrap、准确进程身份/退出观察及原有工具和认证前置。
+
+**前台仍待验收，不是已发布可用能力。** 正常取消的验收合同是请求停止并等待收尾，
+而非仅退出观察；不保证关闭终端、注销或会话结束后继续运行。
+最终批准操作及恢复该操作的执行仍不可取消；未知外部写入必须沿原 intent 读回，不能重放。
+异常或强制退出后须先确认原 Host/Worker 准确退出，再显式恢复；保留工作、Attempt 和预算。
+基底 `6a0a50f4` 的正常取消/退出收口仍待修复和复验，两项正常物理 Host 验收尚未通过；
+不能把上述合同或 doctor 的能力预检作为完成证明。环境实测边界统一见[支持矩阵](productization/support.md)。
+
+本候选仅接受 v20；v19 及更旧 Run 保留原数据但拒绝续接，无迁移，见[状态存储](agents/state-storage.md)。
+
 ## 一条命令推进 Ticket 交付
 
-先按[安装与接入](install.md)准备已激活的 Runner、可用的 user systemd 254+、
+先按[安装与接入](install.md)准备已激活的 Runner、后台所需的 user systemd 254+、
 bubblewrap namespace、修复版 SQLite、Codex、所选 GitHub 身份及目标项目的构建/测试环境。
 安装完成或 `doctor` 返回 ready 不能证明目标 Ticket 已通过真实交付验收。
 
@@ -272,7 +293,7 @@ evidence；任一可重建输入变化都先回到 fresh Run Acceptance 判断 R
 | `stop --ticket` | 未终止 Run 中尚未完成的指定 Ticket，最终批准期间除外 | 持久记录停止意图，立即中断准确归属该票的 Agent，取消未启动的工作排队；确认进程退出后释放名额，其他 Ticket 与 CI 监督继续 | 保留工作区、Attempt、适用 Thread 与独立预算门禁；在途写入先对账，状态展示等待收口原因；用 `resume --ticket` 显式继续 |
 | `abandon` | 未完成 Run（包括人工边界） | 先检查所有 Managed Development Checkout；干净时写入 durable abandonment，再执行受限的 PR 关闭、Ticket reopen 与本地清理恢复 | 不回滚默认分支；dirty checkout 默认不删且不执行 GitHub mutation，只有显式 `--discard-worktree` 才强制丢弃 |
 
-控制 Action、Host、Executor 与业务事实同在 v19 数据库中，不能依靠删除一个控制文件恢复准入。
+控制 Action、Host、Executor 与业务事实同在 v20 数据库中，不能依靠删除一个控制文件恢复准入。
 生命周期命令先核验准确 Task 绑定、原 Host 和 Runner 使用租约，再决定附着或交接。
 附着回执不表示本次新请求已应用；须核对 requested action 与实际应用结果。
 Run 已到人工边界、PID 消失或原命令参数相同，都不能代替准确 Host/Worker 的退出证明。
@@ -344,7 +365,7 @@ Ticket 和两种 Parent 共用开发循环，由 Development 定向调查失败�
 耗尽后显式 resume 仅续期该额度并保留历史，修复后的当前成果须重新通过准确 CI 和人工批准。
 
 新 Run 在 `native-task-locations/` 发布 Task → Run ID / 数据库路径的准确绑定，
-业务身份从 v19 数据库核验。`runs` 可以按当前仓库或显式 `--repo` 发现候选；
+业务身份从 v20 数据库核验。`runs` 可以按当前仓库或显式 `--repo` 发现候选；
 `status`、`history` 可以按当前仓库唯一未终止 Run、`--parent`，或任意目录的
 `--repo + --parent` 选择。同一用户的不同启动目录和用户 clone 共用同一 Repository/Parent 的未完成任务。
 候选不唯一或身份冲突时停止，不按最近时间猜测，不全盘搜索，不补写状态。
@@ -589,7 +610,7 @@ Worker host/PAT/App 来源通过 `settings show/configure` 管理，详情见[�
 | 位置（相对于数据主目录） | 内容 |
 | --- | --- |
 | `repositories/<owner>/<repo>/repository/` | 从远端独立克隆的 Git 仓库；owner/repo 统一小写 |
-| `repositories/<owner>/<repo>/state/<run_id>/kernel.sqlite3` | v19 Run、控制、Host、Profile、预算与历史关系 |
+| `repositories/<owner>/<repo>/state/<run_id>/kernel.sqlite3` | v20 Run、控制、Host、Profile、预算与历史关系 |
 | `repositories/<owner>/<repo>/worktrees/<run_id>/` | 准确属于该 Run 的开发、集成与发布工作区 |
 | `native-task-locations/<task-fingerprint>.json` | Task → Run ID 与数据库位置，不复制业务状态 |
 | `repositories/<owner>/<repo>/state/<run_id>/notifications/` | 独立通知投递记录，与业务数据库和只读查询分工 |
@@ -597,7 +618,7 @@ Worker host/PAT/App 来源通过 `settings show/configure` 管理，详情见[�
 
 配置继续位于 `$XDG_CONFIG_HOME/agent-run/`（默认 `~/.config/agent-run/`），临时环境交接文件使用运行时目录。卸载仅清理安装内容，保留任务数据。用户仓库的文件、索引、引用和 Git 元数据均由用户自行管理。
 
-当前唯一状态协议是 **`independent-delivery-kernel-v19`**，详见[状态存储](agents/state-storage.md)。
+当前唯一状态协议是 **`independent-delivery-kernel-v20`**，详见[状态存储](agents/state-storage.md)。
 旧 JSON/v6、native v17/v18、来源封印及导入状态不升级、不转换，不提供兼容查询或恢复；
 原数据、Candidate 和工作区保留，拒绝继续不授予清理权限。
 稳定 Development Checkout 在 Required Checks pending 或 Worker/Publisher 普通失败、超时、

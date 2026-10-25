@@ -74,7 +74,7 @@ execution and recovery details.
 
 </details>
 
-The run keeps going after the terminal closes. Use `stop` to pause it and preserve the work,
+Default background runs keep going after the terminal closes. The foreground candidate has different cancellation semantics and remains [unvalidated](docs/productization/quickstart.en.md#5-stop-resume-and-approve-explicitly). Use `stop` to pause it and preserve the work,
 and `resume` to continue later.
 
 ## Feishu notifications

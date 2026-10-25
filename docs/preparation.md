@@ -44,8 +44,9 @@
 使用冻结身份，不从新默认补齐或改写 Run。更换引用内容后仍按原身份恢复，不能自动换源。
 
 模式默认 `--mode background`，使用现有 systemd manager 预检。
-`--mode foreground` 目前明确报告 `not_integrated` / 执行不可用，
-不能因为基础 namespace 探针成功就报告支持无 systemd 的前台执行。
+`--mode foreground` 已调用前台 Host 预检，报告 `ready` 或 `unavailable`，
+并明确 `business_execution=not_verified`；它不启动业务，也不证明完整 namespace 启动、收尾或恢复可用。
+前台命令及待验收限制见[运行模式](agent-run.md#运行模式与前台候选验收)。
 缺 Host 能力时保留安装和配置、报告宿主缺项，不修改 OS 安全设置。
 
 Runner App 长命令共享续签 scope 的生产接线缺口仍单独登记；

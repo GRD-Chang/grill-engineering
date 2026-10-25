@@ -181,7 +181,7 @@ Run 创建时从个人默认与显式覆盖解析并固定：`reuse`（默认）
 _Avoid_: 每次进程启动新会话、每张 Ticket 新会话、单次人工替换 Thread、Reviewer Thread 策略
 
 **Change Job Record（变更任务记录）**:
-Controller 私有保存的交付对象身份、Development Thread 身份、Revision Snapshot、Git 基线、Attempt、PR、预算和幂等事实。Ticket、Parent-only 与 Final 由 `subjects` 及准确关联表保存各自生命周期；完整 Parent 的修复沿同一 Parent 对象持有额度，不另建可变 Repair 预算副本。对象按稳定身份和 Generation 保留，持久 FIFO、租约及集成单席选择当前工作，不使用 `active_ticket_job` 指针；切换工作不得删除仍属于 Parent Ticket Set 的 blocked 或 completed 对象。`gates` 及 Run 级控制记录保存恢复所需的门禁，查询从已提交事实派生诊断，不另存可变 blocked 投影。Controller 在任何外部 mutation 前验证准确身份、当前适用性与授权；唯一支持的状态协议为 `independent-delivery-kernel-v19`。旧 JSON/v6、native v17/v18、来源封印及导入状态明确拒绝，不兼容读取、不转换、不迁移、不推断剩余额度，不清除 Task 或删除既有 Candidate、工作区与成果。当前 Review、CI 与 Ticket Fallback 的事实使用 v19 的对象、用途、窗口及原证据关系；旧 `branch_authority_protocol` / `review_budget_protocol` 字段不构成当前准入条件。拒绝或缺损不授权重新创建、清理或猜测原 Run 的事实；该记录用于恢复与校验，不作为需要 Codex 理解或复述的任务输入。
+Controller 私有保存的交付对象身份、Development Thread 身份、Revision Snapshot、Git 基线、Attempt、PR、预算和幂等事实。Ticket、Parent-only 与 Final 由 `subjects` 及准确关联表保存各自生命周期；完整 Parent 的修复沿同一 Parent 对象持有额度，不另建可变 Repair 预算副本。对象按稳定身份和 Generation 保留，持久 FIFO、租约及集成单席选择当前工作，不使用 `active_ticket_job` 指针；切换工作不得删除仍属于 Parent Ticket Set 的 blocked 或 completed 对象。`gates` 及 Run 级控制记录保存恢复所需的门禁，查询从已提交事实派生诊断，不另存可变 blocked 投影。Controller 在任何外部 mutation 前验证准确身份、当前适用性与授权；唯一支持的状态协议为 `independent-delivery-kernel-v20`。旧 JSON/v6、native v17/v18/v19、来源封印及导入状态明确拒绝，不兼容读取、不转换、不迁移、不推断剩余额度，不清除 Task 或删除既有 Candidate、工作区与成果。当前 Review、CI 与 Ticket Fallback 的事实使用 v20 的对象、用途、窗口及原证据关系；旧 `branch_authority_protocol` / `review_budget_protocol` 字段不构成当前准入条件。拒绝或缺损不授权重新创建、清理或猜测原 Run 的事实；该记录用于恢复与校验，不作为需要 Codex 理解或复述的任务输入。
 _Avoid_: Development Brief、Agent Artifact、PR 正文
 
 **Job Generation（任务世代）**:
@@ -288,7 +288,7 @@ Run Executor Session 在可自动判定的远端异步边界（例如 Required C
 _Avoid_: 维护者轮询 CI、等待其他 Ticket 结束才观测、常驻的第二套控制器、自动越过 Final Human Acceptance
 
 **Run Executor Session（运行执行会话）**:
-一个 Delivery Run 中连续推进已获授权自动工作的活动执行区间。它由已接受的 Lifecycle Action 启动，覆盖 Development、Acceptance、Publication 与 Run 内部监督，期间可接受局部 Ticket Resume；单 Ticket 的人工门禁、失败或监督超时不结束仍有独立工作的会话。整个 Run 已无自动工作、出现全局门禁或到达终态时，会话结束。同一 Delivery Task 同时最多有一个 Run Executor Session，不同 Delivery Task 可以并行。会话不属于发起命令的终端，也不等同于整个 Delivery Run：终端离开不结束它，所有剩余工作均等待人工时不要求它继续存在。运行中定向恢复及局部退出边界的需求修订见 [ADR 0019](docs/adr/0019-ticket-work-concurrency-and-supervision.md)。
+一个 Delivery Run 中连续推进已获授权自动工作的活动执行区间。它由已接受的 Lifecycle Action 启动，覆盖 Development、Acceptance、Publication 与 Run 内部监督，期间可接受局部 Ticket Resume；单 Ticket 的人工门禁、失败或监督超时不结束仍有独立工作的会话。整个 Run 已无自动工作、出现全局门禁或到达终态时，会话结束。同一 Delivery Task 同时最多有一个 Run Executor Session，不同 Delivery Task 可以并行。会话不等同于整个 Delivery Run；后台模式下不属于发起命令的终端，终端离开不结束它，所有剩余工作均等待人工时不要求它继续存在。运行中定向恢复及局部退出边界的需求修订见 [ADR 0019](docs/adr/0019-ticket-work-concurrency-and-supervision.md)。
 _Avoid_: 终端拥有执行权、整个 Run 常驻进程、workspace 全局 daemon、把一次意图重复应用于自动循环、全局串行、同一本地任务多执行者、仓库级 Git 并发协调
 
 **Executor Host（执行会话宿主）**:
@@ -296,7 +296,7 @@ _Avoid_: 终端拥有执行权、整个 Run 常驻进程、workspace 全局 daem
 _Avoid_: 业务状态权威、常驻 workspace daemon、裸 PID 身份、自动 restart、主机级并发上限、跨任务资源调度
 
 **Linux Executor Host Availability（Linux 执行宿主可用性）**:
-Linux MVP 启动 Run Executor Session 的运行前置，表示当前用户的 systemd manager 可访问且能够创建用户级 transient service。它通常随正常登录会话提供，不要求安装、启用或常驻一个 agent-run service，也不要求开启 Logout Persistence。该能力不可用时，公开生命周期动作明确失败并说明环境缺口，不回退为绑定当前终端的第二套执行模式；`status` 与 `history` 等只读查询仍可使用。
+后台模式启动 Run Executor Session 的运行前置，表示当前用户的 systemd manager 可访问且能够创建用户级 transient service。它通常随正常登录会话提供，不要求安装、启用或常驻一个 agent-run service，也不要求开启 Logout Persistence。该能力不可用时，公开生命周期动作明确失败并说明环境缺口，不静默回退前台；显式前台候选共用原 Core/Executor，取消、退出与恢复仍待验收，见[运行模式](docs/agent-run.md#运行模式与前台候选验收)；`status` 与 `history` 等只读查询仍可使用。
 
 启用通知的 Session 由宿主在退出后执行一次有界观察，核对准确 Run、Action、Generation、Runner 与异常主进程退出事实，再复用通知 outbox 自动尝试告警。观察不拥有业务写入或恢复权限；正常退出、Stop、等待批准、离开观察窗口和已替换代次不误报。无每 Run 常驻轮询，通知关闭不注册观察。环境私有副本、时间边界与外部不可用限制见[通知合同](docs/notifications.md#executor-意外退出)。
 _Avoid_: linger 前置条件、常驻 agent-run daemon、手工 enable 固定 service、静默前台回退、阻止只读查询
@@ -310,8 +310,8 @@ Executor Host 在维护者最后一个登录会话结束后仍允许当前 Run E
 _Avoid_: 运行前置条件、Terminal Independence、重启恢复、自动 restart、Delivery Run 持久性
 
 **Action Completion Observation（动作完成观察）**:
-`stop`、`abandon`、`approve` 及恢复原最终批准操作的 `resume` 在 Lifecycle Action 安全接受后，由当前命令对该 Action 直至准确完成或无法继续边界的有界只读观察。观察只呈现少量结构化进展，可以随时离开；关闭终端或中断观察不会撤销 Action、停止 Executor、改变 Run 状态或转化为 Execution Failure。`status` 只返回一次当前 Delivery Progress View，其他公开生命周期命令也不进入持续观察。
-_Avoid_: 通用 watch 命令、终端所有权、Worker PTY 代理、以 Ctrl-C 隐式停止 Run、第二份运行状态、无界日志
+`stop`、`abandon`、`approve` 及恢复原最终批准操作的 `resume` 在 Lifecycle Action 安全接受后，由当前命令对该 Action 直至准确完成或无法继续边界的有界只读观察。后台观察只呈现少量结构化进展，可以随时离开；关闭终端或中断后台观察不会撤销 Action、停止 Executor、改变 Run 状态或转化为 Execution Failure。前台候选的正常取消合同是请求停止并收尾，最终批准操作仍不可取消；实现验收限制见[运行模式](docs/agent-run.md#运行模式与前台候选验收)。`status` 只返回一次当前 Delivery Progress View，其他公开生命周期命令也不进入持续观察。
+_Avoid_: 通用 watch 命令、终端所有权、Worker PTY 代理、以后台观察的 Ctrl-C 隐式停止 Run、第二份运行状态、无界日志
 
 **Lifecycle Action（生命周期动作）**:
 维护者通过公开生命周期命令向准确 Delivery Run 提交的一次性、可验证意图。Action 在当前 Run 状态允许时被接受，并由唯一 Run Executor Session 至多消费一次；`run`、`resume`、`approve`、`revise`、`requeue`、`stop` 与 `abandon` 共用这一入口和后续 Driver，不各自形成独立控制流程。活动 Executor 且没有未完成 Action 时再次收到普通 `run`，只返回现有执行状态而不创建新 Action；`resume`、`approve`、`revise` 与 `requeue` 只在准确对应边界接受，否则立即拒绝；`stop` 与 `abandon` 可在没有未完成 Action 的活动执行中请求收口；最终批准操作执行期间不可取消，恢复该操作时同样适用。不被当前状态允许的 Action 不等待未来状态、不进入通用队列。完全匹配当前 unresolved Action 的 task、kind 与用户显式输入的重复原命令可以在新 Action 准入前附着并对账原 Action；它继续确认第一次接受时已解析并保存的语义 payload，即使其后用户级默认配置发生变化，也不重新解释第一次操作。原 Action 未收口时不产生第二个 Action 或历史，只有确认原 Action 已失败并持久收口后，同一次用户命令才可顺序提交 successor Action。恢复原最终批准操作的 `resume` 是有限例外：可在新动作准入前对账原最终批准操作的未完成 Action（approve 或恢复该操作的 resume），但仍须确认旧执行已结束并形成原 Action 的确定结果，才能继续未完成部分。其他相同或不同命令仍立即拒绝。
@@ -524,7 +524,7 @@ Run Acceptance 与 Run PR Required Checks 全部通过后，Controller 首次向
 _Avoid_: Ticket 级确认、自动 merge 默认分支、Agent 语义范围判断
 
 **Final Approval Command（最终批准命令）**:
-维护者通过本地显式命令 `agent-run approve <parent-issue>`，对已通过全部自动门禁的 Delivery Run 发起的不可取消的最终交付操作，涵盖最终条件复核、合并与收尾；接受后不允许操作者用 stop 撤销正在执行的操作，但可以因错误结束，并由显式 `resume` 在确认原执行已结束及实际结果后继续未完成部分。该授权只对重新验证的 Run PR head、base 和有效 Revision 生效，事实未变时恢复原操作无需重复批准，新 head 或 base 则令授权失效并重新请求验收；失败不使已合并代码自动回滚，结果未知时必须先确认是否已生效。命令等待完整操作完成或明确无法继续后返回；关闭终端只离开观察，不取消操作。准入、回执与恢复边界见 [ADR 0012](docs/adr/0012-noncancellable-final-approval.md)。
+维护者通过本地显式命令 `agent-run approve <parent-issue>`，对已通过全部自动门禁的 Delivery Run 发起的不可取消的最终交付操作，涵盖最终条件复核、合并与收尾；接受后不允许操作者用 stop 撤销正在执行的操作，但可以因错误结束，并由显式 `resume` 在确认原执行已结束及实际结果后继续未完成部分。该授权只对重新验证的 Run PR head、base 和有效 Revision 生效，事实未变时恢复原操作无需重复批准，新 head 或 base 则令授权失效并重新请求验收；失败不使已合并代码自动回滚，结果未知时必须先确认是否已生效。命令等待完整操作完成或明确无法继续后返回；后台模式关闭终端只离开观察，不取消操作；前台不保证会话结束后持续，但不撤销批准，未知结果仍须按原意图读回。准入、回执与恢复边界见 [ADR 0012](docs/adr/0012-noncancellable-final-approval.md)。
 _Avoid_: GitHub Approve、标签触发、永久授权、可取消操作、失败时全部回滚、恢复时重复合并、以未知结果当作未执行
 
 **Final Revision Command（最终修改命令）**:
@@ -807,7 +807,7 @@ _Avoid_: Invocation Resume、智能重试、独立持久 journal
 
 **Invocation Resume（调用恢复）**:
 调用层的续接动作，其业务含义必须区分 Business Resume 与 Execution Recovery；复用同一 Thread 或生成 successor Invocation 本身不表示授权了新的预算窗口。公开 `resume` 保持单一入口，本次恢复意图绑定准入时的准确暂停原因、对象与授权，不能因后续状态变化被重解释；自动执行续接不具有解除业务阻塞或开启预算窗口的权限。以下保留公开 `resume` 的承载关系，不能据此把两种语义合并。
-维护者以 `agent-run resume <parent-issue>` 继续当前 `execution_failed` 或 Human Blocker 工作，需要 Agent 时创建 successor Invocation。若失败 Invocation 属于一次已分配且尚未收口的 Development、Reviewer 或 Publication Attempt，Resume 只继续该语义 Attempt，不再次占用角色预算或增加 Attempt 计数，也不得接受 Delivery Policy 覆盖；这一原则与是否复用原 Thread 无关。每次 Resume 都是新的显式人工授权，系统保留其次数与失败原因供 `status`/`history` 审计，但不为同一 Semantic Agent Attempt 另设 Resume Budget 或硬上限。Ctrl-C 或关闭发起终端只离开观察，后台 Host/Executor 继续推进；停止须使用公开 `stop`，不表示放弃 Attempt 或授权清理 Managed Development Checkout。
+维护者以 `agent-run resume <parent-issue>` 继续当前 `execution_failed` 或 Human Blocker 工作，需要 Agent 时创建 successor Invocation。若失败 Invocation 属于一次已分配且尚未收口的 Development、Reviewer 或 Publication Attempt，Resume 只继续该语义 Attempt，不再次占用角色预算或增加 Attempt 计数，也不得接受 Delivery Policy 覆盖；这一原则与是否复用原 Thread 无关。每次 Resume 都是新的显式人工授权，系统保留其次数与失败原因供 `status`/`history` 审计，但不为同一 Semantic Agent Attempt 另设 Resume Budget 或硬上限。后台模式的 Ctrl-C 或关闭发起终端只离开观察，后台 Host/Executor 继续推进；停止须使用公开 `stop`，不表示放弃 Attempt 或授权清理 Managed Development Checkout。
 预算耗尽检查点的显式 Resume 按准确 subject、purpose 和 gate 续期对应窗口，保留旧窗口用量与策略，不续期其他对象或用途。需求用途按该对象的开发/审核配额建立后继窗口；完整 Parent 集成用途只续期已耗尽的 Development 或 Reviewer 配额，另一项未耗尽用量保留；Ticket 与 Parent-only 集成用途保留累计用量并追加额度。CI 续期只开启对应 CI 开发窗口，Reviewer 次数保持累计，Ticket CI 审核策略与两种 Parent 必须 Review 的规则不变；新提交、失败版本或 PR 更新不自行重置累计额度。resync 额度独立处理。只有明确的开发、审核或 CI 预算耗尽门禁允许 Resume 在该对象已存策略上接受本次 Delivery Policy 覆盖，不重新读取个人默认；普通执行续接不接受覆盖或开启预算窗口。它仍是同一 Job Generation，按创建时固定的 Development Thread Policy 选择开发 Thread，保留 branch、PR 和原工作，不把新 Attempt 伪装成旧窗口的额外轮次。
 若检查点保留了尚需修改代码的准确失败证据，后继开发必须先把该证据交给按 Development Thread Policy 选择的开发会话，产生新 Candidate 后才启动新窗口的 Reviewer；真实 CI 失败通过独立 CI 开发用途处理，不先审查未修改且已知 CI 失败的 Candidate。复用仍有效 Thread 时由 Controller 根据 Development、Repair、Reviewer 或 Publication 角色选择短 Prompt，只重发完成本轮所需的当前动态证据；模型不接收 Resume、`execution_failed`、预算窗口或状态流转说明，Reviewer 与定向 Repair 只保留当前职责所需的简短审查次数。策略为新开发轮选择新 Thread 或显式 `--new-thread` 时，以相应角色和任务模式的完整标准 Prompt 新开 Thread；同轮故障缺少可恢复 Thread 时保留明确失败，不能自动替换。Resume 成功与否不改变 Job Generation；原需求或 currentness 已 stale 时不启动 Codex，按该对象的 Requeue 或重新验收边界处理，不以恢复消息接受正式需求或任务图变更。JSON 格式修复步骤因执行异常中断后，默认同 Thread Resume 只续接该次只读修复并继承已用次数，不重新开放开发任务。人工 Resume 不重置同一 Semantic Agent Attempt 已用的普通异常自动恢复额度；本次进程异常恢复不改变格式修复额度耗尽后的既有授权规则。未知外部写入仍先沿原 intent/receipt 对账；Resume 或 message 不替代绑定准确 PR/head/base、适用验收和 Required Checks 的最终人工批准。
 _Avoid_: Output Repair、Publisher/check 幂等恢复、隐式 Requeue
