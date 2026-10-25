@@ -25,7 +25,7 @@ from support.github_checks import repository_response
 
 from agent_run.adapters.github import GhGitHubReader
 from agent_run.adapters.auth.app import GitHubCredentialError, _CancellableHTTPSHandler, _SigningProcessRegistry, _create_app_jwt, mint_installation_credential
-from agent_run.config.github_app import GitHubAppProfile
+from agent_run.config.github_app import GitHubAppProfileStore
 from agent_run.adapters.github_commands import MAX_COMMAND_OUTPUT_BYTES, run_read_command
 
 
@@ -181,15 +181,14 @@ def _repository_response(arguments: list[str]) -> subprocess.CompletedProcess[st
 
 
 def test_github_app_token_mint_extracts_only_the_http_status(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    private_key = tmp_path / "private.pem"
-    private_key.write_text("private-key", encoding="utf-8")
-    private_key.chmod(0o600)
-    profile = GitHubAppProfile("123", "456", private_key)
     monkeypatch.setattr('agent_run.adapters.auth.app._create_app_jwt', lambda *_: "jwt")
+    response_reached = False
 
     def reject(*_args: object, **_kwargs: object) -> object:
+        nonlocal response_reached
+        response_reached = True
         raise urllib.error.HTTPError(
             "https://api.github.com/private-response",
             429,
@@ -199,11 +198,20 @@ def test_github_app_token_mint_extracts_only_the_http_status(
         )
 
     monkeypatch.setattr('agent_run.adapters.auth.app.urllib.request.urlopen', reject)
-    with pytest.raises(GitHubCredentialError) as raised:
-        mint_installation_credential(profile)
+    # tmp_path may be inside a checkout. Keep the synthetic key outside Git,
+    # with the real key-path guard enabled and cleanup on every exit path.
+    with tempfile.TemporaryDirectory(prefix="agent-run-http-status-", dir="/dev/shm") as directory:
+        private_key = Path(directory) / "private.pem"
+        private_key.write_text("private-key", encoding="utf-8")
+        private_key.chmod(0o600)
+        profile = GitHubAppProfileStore._validate_values("123", "456", str(private_key))
+        with pytest.raises(GitHubCredentialError) as raised:
+            mint_installation_credential(profile)
 
+    assert response_reached
     assert raised.value.http_status == 429
     assert "private-response" not in str(raised.value)
+    assert not Path(directory).exists()
 
 
 def test_app_jwt_is_rs256_and_cleans_temporary_key(
