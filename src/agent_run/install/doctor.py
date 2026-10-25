@@ -16,7 +16,6 @@ from typing import Any, Mapping
 
 from agent_run.runtime.process_io import CompleteOutput, pump
 from agent_run.config.defaults import UserDefaultsStore
-from agent_run.config.github_app import GitHubAppProfileStore
 from agent_run.install.readiness import identity_checks, next_steps, skills_check
 from agent_run.storage.sqlite_runtime import require_wal_runtime
 from agent_run.install.installer import InstallPaths, InstallerError, _read_active
@@ -363,35 +362,6 @@ def _is_managed_entry(paths: InstallPaths) -> bool:
         and expected.is_file()
         and os.access(expected, os.X_OK)
     )
-
-
-def _provider_check() -> dict[str, object]:
-    provider = "unknown"
-    try:
-        github = UserDefaultsStore().describe()["github"]
-        identity = github["worker"]
-        provider = identity["source"]
-        if github["migration"] == "required":
-            return {"provider": provider, "status": "migration_required",
-                    "reason": github["notice"]}
-        if provider == "app":
-            profile = GitHubAppProfileStore._validate_values(**identity["app_profile"])
-            if not _private_key_is_usable(profile.private_key_path):
-                return {"provider": provider, "status": "invalid"}
-    except (ValueError, OSError, RuntimeError):
-        return {"provider": provider, "status": "invalid"}
-    return {"provider": provider, "status": "ok"}
-
-
-def _private_key_is_usable(path: Path) -> bool:
-    executable = shutil.which("openssl")
-    if executable is None:
-        return False
-    returncode, timed_out, signature = _run_bounded_output_probe(
-        [executable, "dgst", "-sha256", "-sign", str(path)],
-        input_data=b"agent-run GitHub App profile doctor check\n",
-    )
-    return returncode == 0 and not timed_out and bool(signature)
 
 
 def _run_bounded_output_probe(

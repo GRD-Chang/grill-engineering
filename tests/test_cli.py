@@ -11,6 +11,7 @@ import pytest
 
 
 import agent_run.install.doctor as doctor
+from support.readiness import fake_readiness_tools
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
@@ -63,7 +64,14 @@ def test_doctor_uses_unified_identity_and_ignores_old_app_metadata(
     original = settings.read_bytes()
     monkeypatch.setenv("XDG_CONFIG_HOME", str(config.parent))
     monkeypatch.delenv("TEST_MISSING_PAT", raising=False)
-    assert doctor._provider_check() == {"provider": source, "status": "ok"}
+    calls = fake_readiness_tools(tmp_path, monkeypatch)
+    report = doctor.collect(local=True)
+    assert report["checks"]["worker_read_provider"] == {
+        "provider": source, "status": "ok" if source == "host" else "unavailable",
+    }
+    assert report["identities"]["worker"]["authentication"] == "not_verified"
+    assert "gh auth" not in calls.read_text()
+    assert "openssl dgst" not in calls.read_text()
     assert settings.read_bytes() == original
     assert legacy.read_text() == "invalid legacy configuration"
 
