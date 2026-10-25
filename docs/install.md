@@ -109,6 +109,30 @@ Setup 成功后的短命 systemd 探针用于检查真实执行能力。不要�
 Required Checks 读取也使用所选 Runner 身份，须能取得当前 head、required context 的 App 绑定、
 完整 rollup 及服务器 latest/suite/status 证据。缺字段、分页不完整或来源不明保持未知，不能按名称或旧成功记录放行。
 
+### GitHub 读取权限与 403 排查
+
+host、PAT、App 都受支持；身份来源不等于权限完备，PR 创建成功也不证明 Required Checks 可完整读取。
+在已有交付写权限之外，接入时还须核对所选 **Runner** 身份对目标仓库的这些读取能力。
+下表是 GitHub 官方 fine-grained PAT / App 权限名称；host 复用的认证可能采用不同授权模型，
+应核实其实际账号、仓库访问和端点能力，不要仅凭错误文字推断当前身份类型或自动切换来源。
+
+| 用途 | 所需仓库权限 | 官方依据 |
+| --- | --- | --- |
+| 产品读取分支 Required Status Checks 保护配置：`GET /repos/{owner}/{repo}/branches/{branch}/protection/required_status_checks` | `Administration: read`；读取现有规则，不要求管理写权限 | [Get status checks protection](https://docs.github.com/en/rest/branches/branch-protection#get-status-checks-protection) |
+| 读取 Actions workflow 配置（GET），以及接入 CI 时核实读取能力 | `Actions: read` | [Get a workflow](https://docs.github.com/en/rest/actions/workflows#get-a-workflow) |
+
+维护者若另行选择**手动 dispatch** workflow，才需相应的 `Actions: write` 及 workflow 的
+`workflow_dispatch` 配置，见 [Create a workflow dispatch event](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event)。
+这不是普通读取检查的要求，也不要求为运行产品授予 `Administration: write`、修改保护规则或绕过批准。
+
+保护规则 GET 返回 `403 Resource not accessible by integration` 时，当前代码会拒绝放行；
+不能将 403 当成 404 或“没有保护／没有必需检查”。由维护者核对实际 Runner 来源、目标仓库范围、
+该端点所需读取权限及组织／安装授权，保留进度，修复原引用后再显式恢复。
+workflow GET 的 `Forbidden` 也须按实际端点、来源和响应调查；目前观测到的失败原因未确定，
+不能只凭 Forbidden 断言缺少某项权限。不要上传 token、私钥或原始认证日志来排查。
+`agent-run doctor --online --repo OWNER/REPO` 成功仅证明该次认证和仓库读取，
+不证明保护规则、Required Checks 全读取权限、写权限或 Worker 环境均已验证。
+
 选择 host 时，由操作者执行 `gh auth login`，再用 `gh auth status` 核对宿主登录状态。程序端选择 PAT 或 App 时无需额外宿主登录；只给 Worker 选择凭据不会改变程序端来源。
 
 host/PAT/App Worker 使用原生 `gh`，不经过本地命令白名单，GitHub 能力由凭据决定。角色仍不得自行正式发布或自我批准，Controller 批准和 Publisher 职责保持不变。PAT 只引用一个环境变量名或文件路径，秘密值不进入 Run 快照。Run 固定来源与引用，修改默认值不影响已有 Run；凭据故障后修复同一引用，再显式 resume，不回退 host。

@@ -98,6 +98,33 @@ Runner and Worker independently select host, PAT or App through `settings show/c
 
 Required Checks reads use the selected Runner identity too. It must obtain the current head, required-context App bindings, complete rollup and server latest/suite/status evidence. Missing fields, incomplete pagination or unproven provenance stay unknown; a matching name or earlier success cannot authorize progress.
 
+### GitHub read permissions and 403 troubleshooting
+
+host, PAT and App remain supported. Selecting an identity or creating a PR does not establish complete
+Required Checks access. Besides existing delivery write permissions, verify the selected **Runner**
+identity's read access to the target repository. The names below apply to fine-grained PATs and Apps;
+host authentication may use a different authorization model. Check the actual account, repository scope
+and endpoint access rather than inferring the identity type from an error or switching sources automatically.
+
+| Purpose | Repository permission | Official reference |
+| --- | --- | --- |
+| Product read of branch Required Status Checks protection: `GET /repos/{owner}/{repo}/branches/{branch}/protection/required_status_checks` | `Administration: read`; reads existing rules without administrative writes | [Get status checks protection](https://docs.github.com/en/rest/branches/branch-protection#get-status-checks-protection) |
+| Read Actions workflow configuration (GET) and verify CI access during onboarding | `Actions: read` | [Get a workflow](https://docs.github.com/en/rest/actions/workflows#get-a-workflow) |
+
+Only a separately chosen **manual workflow dispatch** needs `Actions: write` and a workflow configured
+for `workflow_dispatch`: see [Create a workflow dispatch event](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event).
+Ordinary read checks do not require dispatch, `Administration: write`, changing branch protection or bypassing approval.
+
+A protection GET returning `403 Resource not accessible by integration` remains a closed gate;
+403 must not be interpreted as 404, an unprotected branch or an empty required-check set.
+Have the maintainer verify the actual Runner source, repository scope, endpoint read permission and
+organization/installation authorization. Preserve progress and explicitly resume after repairing the original reference.
+A workflow GET `Forbidden` also needs investigation using the actual endpoint, identity and response;
+the observed workflow failure's cause is still undetermined, so Forbidden alone does not establish a specific missing permission.
+Do not upload tokens, private keys or raw authentication logs for diagnosis.
+A successful `agent-run doctor --online --repo OWNER/REPO` verifies only that authentication/repository read,
+not all protection/Required Checks reads, write permissions or the Worker environment.
+
 For host, the operator logs in with `gh auth login` and verifies with `gh auth status`. Runner PAT/App does not require an additional host login. Selecting credentials only for Worker does not change Runner's source.
 
 Host/PAT/App Workers use native `gh` without a local command allowlist. Credentials determine GitHub capabilities; role instructions still prohibit self-publication or self-approval, and Controller approval and Publisher responsibilities remain unchanged. PAT values are read from exactly one environment-variable or file reference, never stored in Run snapshots. A Run freezes its source and reference; updating defaults does not change an existing Run. Repair the same reference and explicitly resume after a credential failure; there is no fallback to host.
