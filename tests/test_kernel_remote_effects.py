@@ -584,7 +584,8 @@ def test_final_observation_proves_real_current_completions_into_remote_run_befor
     assert not any("--method" in c for c in actual)
 
 
-FAKE_GH = CHECK_ROLLUP_FAKE + LATEST_CHECK_FAKE + r'''import json, os, subprocess, sys
+FAKE_GH = ('import sys\nsys.path.insert(0, ' + repr(str(Path(__file__).parent)) + ')\n'
+           + CHECK_ROLLUP_FAKE + LATEST_CHECK_FAKE) + r'''import json, os, subprocess, sys
 from pathlib import Path
 args=sys.argv[1:]
 state=Path(os.environ['REMOTE_TEST_STATE'])
@@ -616,8 +617,9 @@ elif endpoint=='graphql' and method=='GET':
     if fields['number']=='1':
         p=graph['parent'];issue={'number':1,'title':p['title'],'body':p['body'],'subIssues':{'nodes':[{'number':n} for n in p['sub_issues']],'pageInfo':{'hasNextPage':False,'endCursor':None}}}
     else:
-        p=graph['issues'][fields['number']];issue={**p,'labels':{'nodes':[{'name':name} for name in p['labels']]},'blockedBy':{'nodes':[],'pageInfo':{'hasNextPage':False,'endCursor':None}}}
-    result={'data':{'repository':{'issue':issue}}}
+        p=graph['issues'][fields['number']];issue={**p,'labels':{'nodes':[{'name':name} for name in p['labels']],'pageInfo':{'hasNextPage':False,'endCursor':None}},'blockedBy':{'nodes':[],'pageInfo':{'hasNextPage':False,'endCursor':None}}}
+    from support.github_requirements import source_issue, source_response
+    result=source_response(source_issue(issue))
 elif endpoint=='graphql':
     v=body['variables']; assert v['issueId']=='issue-node-2' and head('refs/heads/'+v['name'])==v['oid']
     d.setdefault('links',[]).append({'ref':v['name'],'sha':v['oid']})
