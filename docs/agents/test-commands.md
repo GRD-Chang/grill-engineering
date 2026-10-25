@@ -44,6 +44,13 @@ CI 使用两个独立的产品测试分片，每台 runner 仍固定两个 worke
 本地默认等价命令为 `python -m pytest -q -n 6 --dist worksteal`；直接运行 `pytest` 仍收集完整套件，没有隐含的慢测试过滤。
 `make test-full` 未收到显式 `TMPDIR` 时，在标准且可写的 `/run/user/<uid>` tmpfs 中放置测试临时文件；其他环境沿用 `/tmp`。
 该路径对受控 Worker 子进程可见，避免 `/dev/shm` 在 bubblewrap 的 `/dev` 挂载下不可见；需要对照磁盘临时目录时可显式设置 `TMPDIR=/tmp`。
+GitHub App HTTP 状态回归中的合成私钥也复用 `TMPDIR`；未设置时使用 Python 正常系统临时目录。
+该目录必须已存在、可写且通过产品原有的 Git 仓库外检查；显式配置无效时明确报测试环境前置错误，
+不跳过、不回退或搜索其他位置，也不删除工具提供的 `.git` 标记。普通 CI 可使用已提供且经检查的
+`TMPDIR="$RUNNER_TEMP" python -m pytest tests/test_kernel_live_transport_contracts.py::test_github_app_token_mint_extracts_only_the_http_status`。
+仅在该受控目录满足原保护时运行；没有安全临时根的环境记为 blocked，不调整产品安全设置。
+每次仅创建、验证并清理测试合成文件，不使用真实私钥或发起网络请求。
+
 调试顺序问题用 `make test-full TEST_WORKERS=0`；临时追加过滤或诊断参数，例如
 `make test-policy PYTEST_ARGS='-q --durations=10'`。不要把带 `-k`、`--lf` 等过滤的结果记为全量通过。
 
