@@ -2,6 +2,10 @@
 
 English | [简体中文](install.md)
 
+Start with the [one-page quickstart](productization/quickstart.en.md) for a first task.
+This page retains the full prerequisites; the [support matrix](productization/support.md)
+distinguishes preparation policy from actual release validation.
+
 Complete installation and the target repository checks on this page. To run a task, follow the [agent guide](agent-guide.en.md#run-a-task).
 The tool's source directory is used for installation. Delivery uses Runner's independent clone of the target remote; the user checkout stays unchanged.
 
