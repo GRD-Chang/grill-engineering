@@ -7,10 +7,10 @@
 
 ## 1. 确认电脑和账号
 
-当前基线使用 Linux、可达的 systemd user manager 254+ 和可工作的 bwrap；
+后台模式使用 Linux、可达的 systemd user manager 254+ 和可工作的 bwrap；
 仅装好可执行文件不够。Python、SQLite、Git、gh、Codex 的准确要求及补齐方式见
-[安装指南](../install.md#环境缺项)。无 systemd 的云环境当前尚未就绪，
-不要通过关闭隔离或伪造 manager 继续。
+[安装指南](../install.md#环境缺项)。显式前台候选已接入但仍待验收，见[运行模式](../agent-run.md#运行模式与前台候选验收)。
+无 systemd 不自动表示支持前台；不要通过关闭隔离或伪造 manager 继续。
 
 需要你完成 Codex 登录及选定 GitHub 身份的授权。普通 host 模式可复用已有 gh 登录；
 Runner PAT/App 不要求额外登录 host gh。目标项目的测试/构建工具仍需准备，
@@ -63,7 +63,8 @@ Runner 和 Worker 各自支持 host/PAT/App，默认都是 host；无需为了�
 需要验证时明确执行 `agent-run doctor --online --repo OWNER/REPO --json`。
 这会按所选 host/PAT/App 检查 Runner/Worker 认证和 Runner 仓库读取，App 可能签发短期 token；
 不调用模型，不证明写权限或实际 sandbox 内的 Worker 认证。详细边界见[分阶段准备](../preparation.md)。
-`doctor --local --mode foreground` 只诊断并报告 `not_integrated`，不是前台启动命令。
+`doctor --local --mode foreground` 预检报告 `ready` 或 `unavailable`，并保留
+`business_execution=not_verified`；不是前台启动或真实交付验证。
 
 ## 4. 启动一个小任务
 
@@ -77,6 +78,10 @@ agent-run run PARENT_NUMBER --repo OWNER/REPO
 agent-run status --parent PARENT_NUMBER --repo OWNER/REPO --json
 agent-run history --parent PARENT_NUMBER --repo OWNER/REPO --json
 ```
+
+上例为后台入口。前台候选使用 `agent-run run PARENT_NUMBER --repo OWNER/REPO --foreground`，
+仅供明确授权的候选验收；两项物理 Host 场景已在批准的 savedcloud 上合成通过，默认权限失败仍保留。
+整体前台仍有 P1 待修复，真实 Codex 未验收、父云仍 blocked，见[支持矩阵](support.md)。
 
 命令回执只是已受理，不是已完成。Runner 在独立 clone 开发，不修改你的原 checkout；
 Development 可编辑工作文件，权威 Git metadata 只读，Review 的交付 checkout 也只读。
@@ -92,6 +97,8 @@ agent-run stop RUN_ID --repo OWNER/REPO
 agent-run resume RUN_ID --repo OWNER/REPO
 ```
 
+前台候选新启动用 `agent-run resume RUN_ID --repo OWNER/REPO --foreground`；正常取消须请求停止并收尾，
+不承诺终端关闭或注销后持续。最终批准及恢复批准的执行仍不可取消，详见[运行模式](../agent-run.md#运行模式与前台候选验收)。
 核对 status 中的实际停止/继续结果，不只看命令回执。恢复保留原工作和身份；
 普通恢复不重置 Attempt 或预算，额度耗尽按 [操作指南](../agent-guide.md) 的当前门禁处理。
 未知外部写先按原意图读回，不能直接重放。

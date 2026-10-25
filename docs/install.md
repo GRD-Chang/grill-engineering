@@ -46,6 +46,9 @@
 完成条件：所选版本已激活，执行环境检查满足；否则报告具体缺项和修复动作。
 生产运行使用安装后的 `agent-run`，不使用源码或 editable 环境代替。
 
+前台候选已有显式入口，但物理 Host 与真实交付仍待验收；见[运行模式](agent-run.md#运行模式与前台候选验收)。
+本节原 systemd 检查针对后台路径，安装成功不代表前台已验证。
+
 ### 环境缺项
 
 Setup 仅在 Linux 运行，自动 APT 准备范围为 **Ubuntu 24.04、Debian 13 的 x86_64 / aarch64**，且 `apt-get` 可用。
@@ -60,7 +63,7 @@ GitHub CLI 不在自动 APT 补装范围：Ubuntu 24.04 原生源中的 gh 2.45.
 软件源候选不可用、版本仍不兼容或包安装失败时按实际错误处理，不能视为执行就绪。
 
 上述范围是自动准备策略，模拟工具测试只验证分支与授权边界，不是完整平台支持证明。
-须在实际目标宿主验证：可联系版本 254+ 的 user systemd manager、可用的 `systemd-run`，
+后台路径须在实际目标宿主验证：可联系版本 254+ 的 user systemd manager、可用的 `systemd-run`，
 以及 bubblewrap 所需 mount/device/PID namespace。工具在 PATH 上不等于具备这些执行能力。
 须使用实际运行 Runner 的登录用户会话，能够观察对应 cgroup、使用 FD store，且 Python/内核提供
 所需的 pidfd/准确退出观察。云沙箱中的 user manager 或 namespace 失败只说明该环境未就绪，

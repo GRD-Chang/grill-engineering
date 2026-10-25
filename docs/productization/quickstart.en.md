@@ -8,11 +8,11 @@ this guide promises no fixed completion time.
 
 ## 1. Check your computer and accounts
 
-The current baseline needs Linux, a reachable systemd user manager 254+ and working bwrap.
+Background mode needs Linux, a reachable systemd user manager 254+ and working bwrap.
 Executable files on PATH alone do not establish readiness. Follow the exact Python, SQLite,
 Git, gh and Codex requirements in [installation](../install.en.md#missing-prerequisites).
-A cloud environment without systemd is not ready on this baseline. Foreground compatibility
-is a separate pending work package; there is no foreground flag in this guide.
+An explicit foreground candidate is wired but still awaits physical Host and real delivery validation.
+Lack of systemd alone does not establish foreground support; do not disable isolation or use a fake manager.
 
 You authorize Codex and the selected GitHub identity. Host mode reuses native gh login;
 Runner PAT/App does not require an additional host login. Prepare the target project's own
@@ -70,8 +70,8 @@ Explicitly run `agent-run doctor --online --repo OWNER/REPO --json` when ready t
 It uses the selected host/PAT/App identities for Runner/Worker authentication and Runner
 repository reads; App mode may issue a short-lived token. It calls no model and does not prove
 write permissions or authentication inside the actual Worker sandbox. See the
-[staged preparation contract](../preparation.md). `doctor --local --mode foreground` reports
-`not_integrated`; it does not start a foreground Host.
+[staged preparation contract](../preparation.md). `doctor --local --mode foreground` now reports
+`ready` or `unavailable`, with `business_execution=not_verified`; this preflight is not a business run.
 
 ## 4. Start a small task
 
@@ -85,6 +85,14 @@ agent-run run PARENT_NUMBER --repo OWNER/REPO
 agent-run status --parent PARENT_NUMBER --repo OWNER/REPO --json
 agent-run history --parent PARENT_NUMBER --repo OWNER/REPO --json
 ```
+
+The example above uses background mode. The foreground candidate accepts
+`agent-run run PARENT_NUMBER --repo OWNER/REPO --foreground` for explicitly authorized candidate validation.
+The normal and stop-resume Host checks passed synthetically in an explicitly approved savedcloud execution
+context, using fake Codex/gh and real Git; the original default-permission failures remain recorded.
+Foreground still has an unresolved P1; real Codex is unvalidated and the parent cloud remains blocked.
+See the [support matrix](support.md), not a release claim. This candidate accepts only v20 state;
+v19 and older Runs are rejected and preserved without migration or compatible resume.
 
 A receipt is acceptance of a request, not completed delivery. Runner uses an independent
 clone and leaves your checkout unchanged. Development can edit working files; authoritative
@@ -101,6 +109,13 @@ Use the exact `RUN_ID` returned by the query:
 agent-run stop RUN_ID --repo OWNER/REPO
 agent-run resume RUN_ID --repo OWNER/REPO
 ```
+
+For a new foreground execution use `agent-run resume RUN_ID --repo OWNER/REPO --foreground`.
+Its normal-cancellation contract requests stop and waits for cleanup; that closure still needs repair and validation.
+It does not promise continued execution after terminal closure, logout or session termination.
+Final approval and its recovery remain non-cancellable. An active Host retains its recorded backend;
+there is no silent fallback from systemd or replacement of an active Host. See the
+[shared mode contract](../agent-run.md#运行模式与前台候选验收).
 
 Confirm the actual result in status. Resume retains work and identity; ordinary resume does
 not reset Attempts or budgets. Follow the current gate and [operation guide](../agent-guide.en.md)

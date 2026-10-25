@@ -8,12 +8,12 @@
 数据主目录默认为 `~/.local/share/agent-run/`，或 `$XDG_DATA_HOME/agent-run/`。
 每个新 Run 的控制、Host 与业务关系保存在
 `repositories/<owner>/<repo>/state/<run_id>/kernel.sqlite3`；
-数据库的 `meta.protocol` 必须为 **`independent-delivery-kernel-v19`**。
+数据库的 `meta.protocol` 必须为 **`independent-delivery-kernel-v20`**。
 `native-task-locations/<task-fingerprint>.json` 只保存该 Task 的 Run ID 和数据库路径，
 不复制生命周期状态；替换与占用判断仍由 Core 决定。
 
 [`storage.preflight`](../../src/agent_run/storage/preflight.py) 以只读连接检查现有数据库。
-旧 JSON/v6、早期 native v17/v18、来源封印及导入状态明确拒绝，
+旧 JSON/v6、早期 native v17/v18/v19、来源封印及导入状态明确拒绝，
 保留原文件、Candidate、工作区和成果，不升级、不转换、不双写，也不直接续接。
 [`storage.admission`](../../src/agent_run/storage/admission.py) 只检查旧 Task 占用及拒绝条件，
 不解释或转移旧工作。拒绝不授权清除旧 Task、封印或历史数据。

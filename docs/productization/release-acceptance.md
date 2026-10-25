@@ -17,7 +17,8 @@
    正确最终 PR 等待明确人工批准，批准后核对实际合并、Issue 关闭和 Runner 完成。
 3. 终端离开后后台继续，公开 stop 确认停止，再公开 resume 保留原工作推进；
    另在父助手实际云完成安装到交付，并验证前台适配声明的退出/恢复语义。
-   当前 doctor 的前台状态为 `not_integrated`，此项保持 blocked，不套用后台语义。
+   前台入口已接入但物理 Host 收尾及真实交付仍待验收，此项保持 blocked；
+   doctor 的 `ready` / `business_execution=not_verified` 不代替这些证据，见[运行模式](../agent-run.md#运行模式与前台候选验收)。
 
 同一任务的正常停止/恢复与故障恢复分别记录；普通 resume 不重置预算。
 记录下载、准备依赖、人工授权、Worker 启动、模型/CI 等待和清理各自耗时；

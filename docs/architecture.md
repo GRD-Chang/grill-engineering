@@ -15,7 +15,7 @@
 flowchart TD
     CLI[cli.main] --> Lifecycle[cli.lifecycle]
     Lifecycle --> Core[Kernel: Task / Action / Host 准入]
-    Lifecycle --> Host[runtime.handoff / SystemdHost]
+    Lifecycle --> Host[SystemdHost / ForegroundHost 候选]
     Host --> Executor[runtime.executor: 进程与并发调用]
     Executor --> Runner[OperationRunner: 单次物理操作]
     Runner --> Core
@@ -35,6 +35,8 @@ Ticket、Parent-only 和完整 Parent 的 Final 交付共用一个 Core。
 从准备 Parent 到一条命令推进、人工批准和收尾的操作路径见
 [运行说明](agent-run.md#一条命令推进-ticket-交付)。
 
+前后台合同及前台尚未完成的验收见[运行模式](agent-run.md#运行模式与前台候选验收)。
+
 ## 模块责任
 
 | 模块 | 负责什么 | 不承担什么 |
@@ -44,6 +46,7 @@ Ticket、Parent-only 和完整 Parent 的 Final 交付共用一个 Core。
 | [`OperationRunner`](../src/agent_run/core/operation_runner.py) | 获取冻结配置，协调一次观察、Core 请求、实际操作和结果对账 | 不自行制定业务后继、预算或写权限 |
 | [`executor`](../src/agent_run/runtime/executor.py) | Agent 与 I/O 的物理并发、取消、等待和返回/退出收口 | 不用 Future 完成代替持久租约释放或退出证明 |
 | [`runtime.handoff`](../src/agent_run/runtime/handoff.py)、[`SystemdHost`](../src/agent_run/adapters/systemd.py) | 环境交接、Runner 使用租约、systemd 启动与原 Host 身份观察 | 不把未知启动或未知退出当成重新启动许可 |
+| [`ForegroundHost`](../src/agent_run/runtime/foreground_host.py)、[`adapters.foreground`](../src/agent_run/adapters/foreground.py) | 显式前台候选的 namespace 启动、握手、原进程身份和退出观察；正常收尾仍待验收 | 不替代 Core 或后台 Host，不把跨 observer 的未知退出当作恢复许可 |
 | [`adapters.source`](../src/agent_run/adapters/source.py)、[`RemoteEffects`](../src/agent_run/adapters/remote.py)、[`LocalEffects`](../src/agent_run/adapters/local_git.py)、[`LocalGit`](../src/agent_run/adapters/git_objects.py) | 真实需求、refs、PR/checks 读取，Git/GitHub 操作、资源检查和准确读回 | 不用读取失败推断不存在，不自行重试未知写入 |
 | [`runtime.codex`](../src/agent_run/runtime/codex.py)、[`core.prompts.role`](../src/agent_run/core/prompts/role.py) | 已分配调用的 Prompt、隔离进程、Thread、原始返回及活动事实 | 不从 Agent 自报完成推导业务通过或合并许可 |
 | [`queries.run`](../src/agent_run/queries/run.py)、[`cli.render`](../src/agent_run/cli/render.py)、[`queries.execution`](../src/agent_run/queries/execution.py) | 同源只读状态、分页历史、冻结设置和显示 | 不恢复执行、不写业务状态、不发送通知 |
@@ -61,12 +64,12 @@ OperationRunner 以冻结的 `OperationBinding` 组合真实端口，将观察�
 
 ## 状态与证据
 
-当前唯一支持的状态协议是 **`independent-delivery-kernel-v19`**。
+当前唯一支持的状态协议是 **`independent-delivery-kernel-v20`**。
 新 Run 使用受管目录 `repositories/<owner>/<repo>/state/<run_id>/kernel.sqlite3`；
 Task 位置记录位于数据主目录的 `native-task-locations/`，只绑定 Run ID 与数据库路径。
 具体事务和读取范围见[状态存储](agents/state-storage.md)，显示归属见[展示事实](agents/display-facts.md)。
 
-旧 JSON/v6、早期 native v17/v18、来源封印和导入状态不升级、不转换、不兼容推进。
+旧 JSON/v6、早期 native v17/v18/v19、来源封印和导入状态不升级、不转换、不兼容推进。
 [`storage.preflight`](../src/agent_run/storage/preflight.py) 在读取、写前和写锁内检查支持边界；
 [`storage.admission`](../src/agent_run/storage/admission.py) 只核对旧 Task 占用与拒绝条件。
 这些拒绝检查不提供迁移入口，也不授权删除旧数据库、Candidate 或工作区。
@@ -78,7 +81,7 @@ Task 位置记录位于数据主目录的 `native-task-locations/`，只绑定 R
 
 故障 Host 在 Worker drain 前先封闭原执行代次的准入；无法持久撤销时将已持有的 Task 锁留至进程退出，
 不在业务事务中等待物理清理。guardian 创建者负责事务外 wait/reap；其他观察者只用匹配的 pidfd 证明准确退出，
-并继续核验 Host/cgroup/FD-store。原启动期限不续期，3秒仅为回收宽限，未知退出不等于可重新准入。
+后台继续核验 Host/cgroup/FD-store；前台候选核验原 observer、namespace 和准确进程退出。原启动期限不续期，3秒仅为回收宽限，未知退出不等于可重新准入。
 
 Required Checks 按当前 head、required context/App 和完整 rollup/latest 证据核验，未知不当作通过。
 PR 原 base 快照与实时 target ref 分开保存语义；祖先关系须绑定准确身份，CLOSED 还须核验原退休 receipt。

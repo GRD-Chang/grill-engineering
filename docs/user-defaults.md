@@ -45,7 +45,7 @@ agent-run run 330 --worker-github-source pat --github-pat-env DELIVERY_GITHUB_PA
 
 `run` 覆盖只作用于新 Run，不改个人默认。使用环境引用时，启动及恢复命令的环境须包含该变量，后台执行器继承所需环境。Run 固定非秘密来源和引用，秘密值不进入快照或普通输出；修改个人默认不改变已有 Run。文件引用适合在相同路径更换 token；环境引用则在恢复前重新导出同名变量。已有 Run 因凭据不可用暂停时，保留进度与诊断，修复原引用后公开 `resume`，不切换来源、不重置正式批准边界。
 
-`settings show` 的 `github.worker` 与 `github.runner` 分别展示两端有效来源及引用，`capabilities` 说明能力边界；查询不签发凭据、不输出秘密值。`settings show --run` 查看受支持 v19 Run 的固定配置，不从当前默认推测缺失事实；旧协议不提供兼容查询或恢复，见[状态存储](agents/state-storage.md)。GitHub 写能力不授权 Worker 自行提交、正式发布、自我批准或完成交付，角色合同和 Controller/Publisher 职责继续有效。
+`settings show` 的 `github.worker` 与 `github.runner` 分别展示两端有效来源及引用，`capabilities` 说明能力边界；查询不签发凭据、不输出秘密值。`settings show --run` 查看受支持 v20 Run 的固定配置，不从当前默认推测缺失事实；旧协议不提供兼容查询或恢复，见[状态存储](agents/state-storage.md)。GitHub 写能力不授权 Worker 自行提交、正式发布、自我批准或完成交付，角色合同和 Controller/Publisher 职责继续有效。
 
 ### App 配置与迁移
 

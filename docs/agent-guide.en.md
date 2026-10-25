@@ -24,8 +24,8 @@ Read only the relevant branch and its required references. Detailed operation re
 The Runner's actual Python interpreter must load SQLite with the WAL-reset fix:
 3.51.3 or later, or the official backports 3.50.7–3.50.x / 3.44.6–3.44.x.
 Check that interpreter with `python -c 'import sqlite3; print(sqlite3.sqlite_version)'`.
-Only `independent-delivery-kernel-v19` is supported; older data and work are retained, without conversion or compatible resume.
-See [state storage](agents/state-storage.md). A working user systemd manager version 254+ and the required bubblewrap namespaces are execution prerequisites; installation alone does not establish end-to-end readiness.
+Only `independent-delivery-kernel-v20` is supported; v19 and older data and work are retained but rejected, without conversion, migration or compatible resume.
+See [state storage](agents/state-storage.md). Background execution requires a working user systemd manager version 254+ and the required bubblewrap namespaces; the explicit foreground candidate remains [unvalidated](productization/quickstart.en.md#4-start-a-small-task); installation alone does not establish end-to-end readiness.
 
 ## Run a task
 
@@ -67,7 +67,7 @@ Run mutation commands from any directory with the actual Parent and `--repo OWNE
 | `requeue_required` | Check the changed requirements, then `requeue` |
 | Final PR awaits approval | Show the PR, acceptance, and check results; execute `approve` only with explicit approval for that final delivery |
 | Feedback on the whole multi-ticket Parent | Pass the original feedback through `revise --message` at its final approval phase when current gates allow it; this command does not apply to Parent-only |
-| Pause | Use `stop`, or `stop --ticket N` for one Ticket and `resume --ticket N` to continue it; Ctrl-C or closing the terminal only ends observation, while the background task continues |
+| Pause | Use `stop`, or `stop --ticket N` for one Ticket and `resume --ticket N` to continue it; in background mode Ctrl-C or closing the terminal only ends observation; the foreground cancellation contract requests stop and waits for cleanup, still awaiting validation (see [mode limits](productization/quickstart.en.md#5-stop-resume-and-approve-explicitly)) |
 | Abandon | Follow `abandon` boundaries; preserve uncommitted work by default and require explicit authorization for forced discard |
 
 For exhausted limits, changed scope, or incompatible state, report the decision needed. Recover through the public CLI; never edit persistent run state to bypass gates. See [local state and cleanup](agent-run.md#本地状态与清理) for directory ownership and retention.

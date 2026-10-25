@@ -46,6 +46,10 @@ The tool's source directory is used for installation. Delivery uses Runner's ind
 Completion: the selected version is active and execution prerequisites are satisfied. Otherwise, report the specific missing requirements and recovery steps.
 Use the installed `agent-run` for delivery, rather than a source or editable environment.
 
+An explicit foreground candidate is wired but still awaits physical Host and real delivery validation;
+see the [candidate quickstart](productization/quickstart.en.md#4-start-a-small-task).
+The systemd checks below apply to background mode; installation is not foreground acceptance.
+
 ### Missing prerequisites
 
 Setup runs on Linux only. Automatic APT preparation is limited to **Ubuntu 24.04 and Debian 13 on x86_64 / aarch64**, with `apt-get` available.
@@ -60,7 +64,7 @@ Missing privileges require administrator action; authentication requires user lo
 Unavailable or incompatible candidates and package-manager failures must be resolved; they do not establish execution readiness.
 
 This is the automatic preparation policy. Fake-tool tests verify policy and authorization branches, not platform support.
-Verify the actual target host: the user systemd manager must be reachable and version 254+, `systemd-run` must be available, and bubblewrap must be able to create the required mount/device/PID namespaces. A tool appearing on PATH does not prove these capabilities.
+For background mode, verify the actual target host: the user systemd manager must be reachable and version 254+, `systemd-run` must be available, and bubblewrap must be able to create the required mount/device/PID namespaces. A tool appearing on PATH does not prove these capabilities.
 Use the login session of the user who actually runs Runner. Its cgroup must be observable, FD store usable, and the Python/kernel combination must provide the required pidfd-based exit observation. A cloud sandbox's missing user manager or namespace capability means that environment is not ready; it does not establish that Linux is unsupported. Installed tools inside a container are not a substitute for checking the real host.
 The Runner's Python must load SQLite with the WAL-reset fix: 3.51.3 or later, or the official backports 3.50.7–3.50.x / 3.44.6–3.44.x. See [state storage](agents/state-storage.md#sqlite-运行库与资源生命周期). An older Run is not upgraded by reinstalling the Runner.
 
