@@ -142,7 +142,9 @@ def test_history_renders_one_round_with_original_configurations_and_true_timing(
     assert _snapshot(tmp_path) == before
 
 
-def test_history_keeps_unconsumed_malformed_review_as_raw_evidence_without_a_verdict(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("raw,marker", [(wire_json({"unvalidated-review": "原始材料"}), "unvalidated-review"),
+    (b"unvalidated-review / non-JSON text", "unvalidated-review"), (b"null", "\nnull\n")], ids=["json", "text", "null"])
+def test_history_keeps_unconsumed_malformed_review_as_raw_evidence_without_a_verdict(tmp_path: Path, monkeypatch, raw: bytes, marker: str) -> None:
     from agent_run.cli.render import render
 
     scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Original scope"), ()))
@@ -153,7 +155,7 @@ def test_history_keeps_unconsumed_malformed_review_as_raw_evidence_without_a_ver
             # Format repair requires the backend thread actually reported by
             # this normal synthetic Agent, not merely a logical Thread row.
             scenario.kernel.bind_thread(call, call.reported_thread or "history-review-backend")
-        return wire_json({"unvalidated-review": "原始材料"}) if call.role == "review" else original(call)
+        return raw if call.role == "review" else original(call)
 
     _recorded_agents(scenario, monkeypatch, agent)
     for _ in range(30):
@@ -171,7 +173,7 @@ def test_history_keeps_unconsumed_malformed_review_as_raw_evidence_without_a_ver
         render(replace(document, language="en"), style="plain", details=details, stream=output)
         assert "awaiting Controller consumption" in output.getvalue()
         assert "Acceptance passed" not in output.getvalue()
-        assert ("unvalidated-review" in output.getvalue()) is details
+        assert (marker in output.getvalue()) is details
     assert _snapshot(tmp_path) == before
     repair = scenario.step()
     assert repair.call is not None and repair.call.output_ordinal == 1

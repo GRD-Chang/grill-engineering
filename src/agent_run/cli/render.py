@@ -216,10 +216,10 @@ def _history_round(attempt: Mapping[str, Any], issue: int, language: str, detail
                     yield text("presentation.history.activity_start" if event["active"] else
                                "presentation.history.activity_end", language=language, stamp=stamp, zone=zone)
     result = attempt["result"]
-    if not isinstance(result, Mapping):
+    if attempt["result_id"] is None:
         yield text("presentation.history.result_not_recorded", language=language)
         return
-    if attempt["status"] == "returned" or attempt["outcome"] is None:
+    if attempt["status"] == "returned" or attempt["outcome"] is None or not isinstance(result, Mapping):
         yield text("presentation.history.return_awaits_consumption" if attempt["status"] == "returned" else
                    "presentation.history.result_not_recorded", language=language)
         if details:
