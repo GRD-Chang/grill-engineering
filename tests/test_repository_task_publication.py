@@ -17,6 +17,7 @@ from agent_run.core import kernel as core
 from agent_run.contracts.task import TaskKey
 from agent_run.errors import KernelError
 from agent_run.model import Commit, Delivery, DeliveryKind, Execution, HostObservation, ParentIssue, Requirements, RunSpec
+from agent_run.queries.read_facts import QueryError
 from agent_run.storage import routing, sqlite as storage_module, tasks
 from agent_run.storage.routing import RepositoryRoute
 from agent_run.storage.sqlite import Storage
@@ -254,7 +255,7 @@ def test_invalid_selector_never_selects_or_changes_task_binding(repository, fiel
     request = parsed(**{field: value})
     before = dump(repository)
     for invoke in (lambda: repository_candidates(request, (repository,)), lambda: select_repository(request, ())):
-        with pytest.raises(KernelError, match='run_locator_invalid'):
+        with pytest.raises(QueryError, match='Choose a positive Parent or one exact Run ID'):
             invoke()
     assert dump(repository) == before
 
@@ -265,12 +266,12 @@ def test_ambiguous_same_id_across_repository_roots_is_refused_and_exact_repo_iso
     assert create(foreign, 'A', 1).created
     request = parsed(run_id='A', repo=None)
     candidates = repository_candidates(request, (repository, foreign))
-    with pytest.raises(KernelError, match='run_locator_conflict'):
+    with pytest.raises(QueryError, match='Multiple repository Runs match'):
         select_repository(request, candidates)
     request.repo = 'EXAMPLE/PROJECT'
     selected = select_repository(request, repository_candidates(request, (repository, foreign)))
     assert len(selected) == 1 and selected[0].database == repository.database
-    with pytest.raises(KernelError, match='run_locator_conflict'):
+    with pytest.raises(QueryError, match='Duplicate repository database route'):
         repository_candidates(request, (repository, repository))
 
 
