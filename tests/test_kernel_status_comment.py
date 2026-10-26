@@ -10,6 +10,7 @@ from agent_run.notifications.status_comment import StatusComments
 from agent_run.queries.status_comment import project_status
 from agent_run.storage import notification_outbox as outbox
 from support.offline import Scenario
+from support.status_comments import CommentsAPI
 
 
 def published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, notifications=None, kind=DeliveryKind.PARENT_ONLY, runner_identity=None) -> Scenario:
@@ -81,49 +82,6 @@ def test_status_rejects_damaged_journal_and_task_without_mutating_core(tmp_path,
     assert database.read_bytes() == before
 
 
-class CommentsAPI:
-    """Independent remote objects; successful writes may lose their response."""
-    def __init__(self, target):
-        self.target = target
-        self.comments = []
-        self.commands = []
-        self.reads = 0
-        self.lose = False
-        self.hidden = False
-        self.before_write = lambda: None
-
-    def object(self, endpoint):
-        self.reads += 1
-        if endpoint == "user":
-            return {"login": "offline-publisher"}
-        assert endpoint == f"repos/{self.target.repository}/pulls/{self.target.pr_number}"
-        return {"number": self.target.pr_number, "user": {"login": "offline-publisher"},
-                "head": {"ref": self.target.source_ref.removeprefix("refs/heads/"),
-                         "repo": {"full_name": self.target.repository}},
-                "base": {"ref": self.target.target_ref.removeprefix("refs/heads/"),
-                         "repo": {"full_name": self.target.repository}}}
-
-    def list(self, endpoint):
-        self.reads += 1
-        assert endpoint == f"repos/{self.target.repository}/issues/{self.target.pr_number}/comments?per_page=100"
-        return [] if self.hidden else [dict(row) for row in self.comments]
-
-    def write(self, endpoint, method, body):
-        import subprocess
-        self.before_write()
-        self.commands.append((endpoint, method, dict(body)))
-        if method == "POST":
-            assert endpoint == f"repos/{self.target.repository}/issues/{self.target.pr_number}/comments"
-            self.comments.append({"id": 100 + len(self.comments), "user": {"login": "offline-publisher"},
-                                  "body": body["body"],
-                                  "issue_url": f"https://api.github.com/repos/{self.target.repository}/issues/{self.target.pr_number}"})
-        else:
-            assert method == "PATCH"
-            row, = [row for row in self.comments if endpoint == f"repos/{self.target.repository}/issues/comments/{row['id']}"]
-            row["body"] = body["body"]
-        if self.lose:
-            raise OSError("lost reply; private diagnostic must not enter journal")
-        return subprocess.CompletedProcess([], 0, "", "")
 
 
 def test_status_lost_create_and_patch_reconcile_original_without_reposting(tmp_path, monkeypatch):
@@ -330,7 +288,7 @@ def test_status_real_sender_exit_retains_sent_intent_through_journal_compaction(
     script = '''
 import json,os,sys
 from pathlib import Path
-from test_kernel_status_comment import CommentsAPI
+from support.status_comments import CommentsAPI
 from agent_run.queries.status_comment import project_status
 from agent_run.notifications.status_comment import StatusComments
 p,subject,output=Path(sys.argv[1]),sys.argv[2],Path(sys.argv[3])
@@ -348,7 +306,8 @@ StatusComments(p).deliver(subject,api=a)
 raise AssertionError('physical dispatch was not reached')
 '''
     before = database.read_bytes()
-    result = subprocess.run([sys.executable, "-c", script, str(database), subject, str(evidence), str(dispatched)],
+    script = "import sys;sys.path.insert(0,sys.argv.pop(1))\n" + script
+    result = subprocess.run([sys.executable, "-c", script, str(Path(__file__).parent), str(database), subject, str(evidence), str(dispatched)],
                             env=dict(os.environ), capture_output=True, text=True, timeout=20)
     assert result.returncode == (17 if dispatched else 18), result.stderr
     assert database.read_bytes() == before
@@ -654,7 +613,7 @@ def test_normal_exit_hook_uses_original_handoff_without_claiming_domain_release(
     from agent_run.runtime.package_lease import runner_usage_lease
     from agent_run.runtime.process_identity import _process_start_token
     from agent_run.runtime.execution import _cgroup
-    from test_kernel_host_adapter import controlled_manager
+    from support.systemd_manager import controlled_manager
     scenario = published(tmp_path, monkeypatch)
     kernel, subject = scenario.kernel, scenario.delivery.key
     kernel.control("stop", "offline-executor-exit")

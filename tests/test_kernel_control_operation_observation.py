@@ -17,7 +17,7 @@ from support.offline import Scenario
 from agent_run.core.operation_contract import ReadUnavailable
 from agent_run.cli.main import _parser
 from agent_run.adapters.remote import RemoteEffects
-from test_kernel_host_adapter import controlled_manager
+from support.systemd_manager import controlled_manager
 from test_kernel_operation_runner import setup
 from test_kernel_remote_effects import _fixture
 

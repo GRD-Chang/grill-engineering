@@ -21,7 +21,8 @@ from agent_run.errors import KernelError
 from agent_run.model import Execution, HostObservation
 from support.core_operations import CoreOperations, native_agent_fixture
 from agent_run.runtime.handoff import HandoffError, host_environment, launch_handoff, prepare_handoff
-from test_kernel_host_adapter import controlled_manager, host_kernel
+from support.systemd_manager import controlled_manager
+from test_kernel_host_adapter import host_kernel
 
 
 def test_terminal_guardian_host_and_fdstore_keep_one_continuous_usage_lease(tmp_path: Path) -> None:

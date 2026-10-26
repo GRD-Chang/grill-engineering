@@ -24,6 +24,7 @@
 | Run 受阻审核通知 | `notification_scenarios` | 从已完成 Ticket 起点执行真实 Reviewer、Profile、通知查询及 observer；关闭本次 sender，后续恢复仍走 CLI |
 | 控制与恢复 | `control`、`receipt_host`、`lifecycle`、`executor`、`resume`、`resume_intent`、`cli_actions` | 按控制边界选择 fake，不把不同 receipt/退出语义合并为通用 fake |
 | 受控后台交付 | `background_delivery` | 共享真实 Executor 取消上下文；失败时关闭准入、释放阶段屏障并有界回收交付线程，再结束所有权占位进程和通知；业务完成由用例独立确认 |
+| systemd 外部观察与 Status 评论端口 | `systemd_manager`、`status_comments` | 只合成外部 manager/sysfs 或 GitHub 评论对象；保留真实子进程及原生产身份校验。测试子进程显式引用本轮测试支撑目录，不从其他测试模块加载共享工具 |
 | 并发测试的线程生命周期 | `ticket_execution` | 原窗口内先断言正常退出；失败时独立取消并释放 gate，等待本次线程池退出后才能关闭 sender 或撤销 fixture；取消不能制造成功 |
 | 共享存储故障的真实 Worker | `shared_storage`、`shared_storage_processes` | 历史准备先于 ready 计时；测试资源登记独立于受测故障存储，按 PID/start token 回收全部启动者，使用 subreaper 回收孤儿并保护无关进程 |
 | 合并冲突与监督 | `merge_resolution`、`merge_faults`、`cli_supervision`、`parent_approval_update`、`run_approval_update` | 保留真实 Git 冲突、子进程、信号及归属清理 |

@@ -195,7 +195,7 @@ def test_existing_run_error_uses_frozen_language_after_personal_language_changes
     defaults.configure(language="zh")
     # This is a language/selection test, not a real user-bus release claim.
     # Keep readiness explicit through the existing executable manager fixture.
-    from tests.test_kernel_host_adapter import controlled_manager
+    from support.systemd_manager import controlled_manager
     import agent_run.cli.lifecycle as lifecycle_cli
     import agent_run.adapters.systemd as host_adapter
     manager, _request, _response, _calls = controlled_manager(tmp_path)
@@ -215,7 +215,8 @@ def test_existing_run_error_uses_frozen_language_after_personal_language_changes
 def test_dispatched_unknown_host_is_attached_without_applying_a_new_action(tmp_path: Path, monkeypatch) -> None:
     import json
     import os
-    from tests.test_kernel_host_adapter import controlled_manager, host_kernel
+    from support.systemd_manager import controlled_manager
+    from tests.test_kernel_host_adapter import host_kernel
     from agent_run.cli.lifecycle import attach
     kernel = host_kernel(tmp_path)
     manager, fixture, response, calls = controlled_manager(tmp_path)
@@ -244,7 +245,8 @@ def test_dispatched_unknown_host_is_attached_without_applying_a_new_action(tmp_p
 def test_allocated_original_host_continues_its_one_dispatch_and_then_only_attaches(tmp_path: Path, monkeypatch) -> None:
     import json
     import os
-    from tests.test_kernel_host_adapter import controlled_manager, host_kernel
+    from support.systemd_manager import controlled_manager
+    from tests.test_kernel_host_adapter import host_kernel
     import agent_run.runtime.handoff as native_host
     from agent_run.cli.lifecycle import attach
     kernel = host_kernel(tmp_path)
@@ -361,7 +363,7 @@ def _ready_public_host(kernel, tmp_path: Path, monkeypatch, *, admit: bool = Tru
     import agent_run.adapters.systemd as host_adapter
     import agent_run.cli.lifecycle as lifecycle_cli
     from agent_run.model import Execution
-    from tests.test_kernel_host_adapter import controlled_manager
+    from support.systemd_manager import controlled_manager
 
     active = app_data_root() / "active" / "current"
     active.parent.mkdir(parents=True)

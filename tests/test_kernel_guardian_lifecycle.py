@@ -16,7 +16,8 @@ import pytest
 from agent_run.cli.lifecycle import _runtime_directory, attach, submit
 from agent_run.runtime import handoff as native
 from agent_run.runtime.package_lease import runner_management_lease, runner_usage_lease
-from test_kernel_host_adapter import controlled_manager, host_kernel
+from support.systemd_manager import controlled_manager
+from test_kernel_host_adapter import host_kernel
 
 
 @pytest.mark.parametrize("now,remaining", [(100.25, 2.5), (105.25, 0)])
