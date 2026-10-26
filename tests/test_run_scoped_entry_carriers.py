@@ -214,7 +214,7 @@ def test_exit_hook_builder_carries_exact_selection_without_claiming_a_real_host(
         host_exit.exit_properties(repository.database, 'action', foreign, tmp_path / 'runner.lock', {}, storage=selected)
 
 
-def test_notification_pages_and_progress_rechecks_keep_same_id_siblings_outside_the_selected_snapshot(repository):
+def test_notification_pages_and_progress_rechecks_keep_same_id_siblings_outside_the_selected_snapshot(repository, monkeypatch):
     a, b = repository.kernel('A'), repository.kernel('B')
     a.control('stop', 'same-action', subject=SUBJECT)
     b.control('stop', 'same-action', subject=SUBJECT)
@@ -242,8 +242,16 @@ def test_notification_pages_and_progress_rechecks_keep_same_id_siblings_outside_
     observer.database, observer.storage = repository.database, a.storage
     with a.storage.transaction(write=False) as tx:
         observer.run_id, observer.binding, observer.config, observer.state = observer._run(tx)
+    from agent_run.notifications import sender
+    projected_rows = []
+    def project(tx, row, state, mode):
+        assert row['run_id'] == tx.run_id == state['run_id'] == 'A'
+        projected_rows.append(dict(row))
+        return project_event(tx, row, state, mode)
+    monkeypatch.setattr(sender, 'project_event', project)
     events, more, cursor = observer._page(0)
     assert events == [] and not more and cursor == rows_a[-1]['position']
+    assert projected_rows and all(row['run_id'] == 'A' for row in projected_rows)
     context = StatusComments(repository.database, storage=a.storage)
     assert context._kernel().storage is a.storage
     assert status_subjects(repository.database, storage=a.storage) == []

@@ -206,8 +206,8 @@ def attach(kernel: Kernel, *, requested_action: str, manager: SystemdHost | Fore
                          'SELECT kind,status FROM actions WHERE run_id=? AND id=?', (action_id,)))
         if observed is not None and observed.disposition == "exited" and observed.usage_released:
             from agent_run.notifications.sender import notify_committed
-            notify_committed(kernel.storage.path,
-                **({"storage": kernel.storage} if getattr(kernel.storage, "run_id", None) is not None else {}))
+            notification_options: dict[str, Any] = {"storage": kernel.storage} if getattr(kernel.storage, "run_id", None) is not None else {}
+            notify_committed(kernel.storage.path, **notification_options)
         return {"result": "attached", "status": "action_" + action["status"], "run_id": request.run_id,
                 "action_id": action_id, "action": action["kind"],
                 "requested_action": requested_action, "requested_action_applied": False,

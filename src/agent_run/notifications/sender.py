@@ -132,8 +132,8 @@ class NativeNotifications:
             run_id, binding, config, state = self._run(tx)
             if not self._same_binding(run_id, binding, config, state):
                 raise ValueError("notification Run or recipient binding changed")
-            history = tx.rows(*selected_statement(tx, 'SELECT position,subject,kind,identity,generation,created_at,material_id,phase,purpose FROM history WHERE position>? ORDER BY position LIMIT 16',
-                          'SELECT position,subject,kind,identity,generation,created_at,material_id,phase,purpose FROM history WHERE run_id=? AND position>? ORDER BY position LIMIT 16', (after,)), limit=16)
+            history = tx.rows(*selected_statement(tx, 'SELECT run_id,position,subject,kind,identity,generation,created_at,material_id,phase,purpose FROM history WHERE position>? ORDER BY position LIMIT 16',
+                          'SELECT run_id,position,subject,kind,identity,generation,created_at,material_id,phase,purpose FROM history WHERE run_id=? AND position>? ORDER BY position LIMIT 16', (after,)), limit=16)
             events: list[dict[str, Any]] = []
             for row in history:
                 events.extend(projected.content for projected in project_event(

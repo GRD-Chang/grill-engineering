@@ -52,7 +52,7 @@ def run_is_current(owner: "Transaction", database: Path) -> bool:
     if (row is None or len(links) != 1
             or tuple(links[0]) != (task.fingerprint, task.repository, str(task.workspace), task.parent_number)):
         raise KernelError("task_location_identity")
-    return row["current_run"] == selected.run_id
+    return bool(row["current_run"] == selected.run_id)
 
 
 def task_path(task: TaskKey) -> Path:

@@ -41,7 +41,7 @@ def command(database: Path, action: str, runner_lock: Path,
             or not action or len(action) > 256 or "\0" in action
             or not Path(sys.executable).is_absolute()):
         raise ValueError("An exact native Host command is required")
-    arguments = (sys.executable, "-m", "agent_run.runtime.executor", "--database", str(database),
+    arguments: tuple[str, ...] = (sys.executable, "-m", "agent_run.runtime.executor", "--database", str(database),
                  "--action", action, "--runner-lock", str(runner_lock))
     if run_id is not None:
         if type(run_id) is not str or not run_id or "\0" in run_id:
