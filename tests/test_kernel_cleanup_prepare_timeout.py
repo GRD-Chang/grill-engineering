@@ -21,7 +21,7 @@ from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 import agent_run.adapters.cleanup as cleanup
 from support.worker_process_timing import wait_until
-from test_kernel_cleanup_lifecycle import _native_scenario, _local_head
+from support.cleanup_scenarios import _native_scenario, _local_head
 
 
 def _kill_owned_group(root: Path) -> None:

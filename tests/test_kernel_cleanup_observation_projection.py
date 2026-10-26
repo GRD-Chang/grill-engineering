@@ -9,7 +9,7 @@ from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.errors import KernelError
 from agent_run.model import ReadWait
 from agent_run.model import DeliveryKind
-from test_kernel_cleanup_lifecycle import _native_scenario
+from support.cleanup_scenarios import _native_scenario
 
 
 def test_local_cleanup_does_not_read_delivery_inside_write_authority(tmp_path, monkeypatch):

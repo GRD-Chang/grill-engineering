@@ -20,32 +20,12 @@ import pytest
 
 from agent_run.model import DeliveryKind, Effect, EffectResult
 from agent_run.core.kernel import Kernel
-from support.offline import GraphScenario, OfflinePort, Scenario
-from support.requirements_scenarios import independent_source
-from support.core_operations import CoreOperations, final_scenario
+from support.offline import OfflinePort, Scenario
+from support.core_operations import CoreOperations
+from support.cleanup_scenarios import _native_scenario, _local_head
 
 
 CLEANUP_OPERATIONS = ("cleanup_worktree", "cleanup_local_ref", "cleanup_remote_ref")
-
-
-def _native_scenario(root: Path, kind: DeliveryKind) -> GraphScenario:
-    if kind == DeliveryKind.FINAL_RUN:
-        return final_scenario(root)
-    source = independent_source()
-    if kind == DeliveryKind.PARENT_ONLY:
-        source = replace(source, parent=replace(source.parent, sub_issue_numbers=()), issues=())
-    else:
-        # Isolate one delivery's cleanup. A global runner may otherwise start
-        # the independent sibling when the completed subject's cleanup blocks.
-        first = source.issues[0]
-        source = replace(source, parent=replace(source.parent, sub_issue_numbers=(first.number,)), issues=(first,))
-    return GraphScenario(root, source)
-
-
-def _local_head(scenario: Scenario, ref: str) -> str | None:
-    output = scenario.port.git.run("for-each-ref", "--format=%(refname)%09%(objectname)", ref).stdout
-    return next((line.partition("\t")[2] for line in output.splitlines()
-                 if line.partition("\t")[0] == ref), None)
 
 
 def _local_marker(scenario: Scenario) -> str:

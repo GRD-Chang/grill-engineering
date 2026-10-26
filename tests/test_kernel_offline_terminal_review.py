@@ -1,23 +1,20 @@
 """Independent business terminal/resource obligation distinction; no SQL writes."""
-import test_kernel_cleanup_local_witness as witness
+from support.cleanup_scenarios import prepared_generation_two_cleanup
 
 
 def test_foreign_local_ref_keeps_unallocated_remote_cleanup_after_business_complete(tmp_path, monkeypatch):
-    scenarios = []
-    factory = witness.GraphScenario
-
-    def capture(*args, **kwargs):
-        scenario = factory(*args, **kwargs)
-        scenarios.append(scenario)
-        return scenario
-
-    monkeypatch.setattr(witness, "GraphScenario", capture)
-    # Run every original foreign-protection assertion unchanged, including
-    # retained local+remote refs and only worktree/local cleanup operations.
-    witness.test_generation_two_cleanup_uses_the_original_local_marker_and_published_remote_head(
-        tmp_path, monkeypatch, True)
-    scenario, = scenarios
+    scenario, original, replacement, original_marker, cleanups = prepared_generation_two_cleanup(tmp_path, monkeypatch, True)
     kernel, subject = scenario.kernel, scenario.delivery.key
+    assert scenario.run().kind == "complete"
+    cleanup = kernel.status(subject)["resource_cleanup"]
+    pr = scenario.port.pull_request_by_ref(replacement.source_ref, replacement.target_ref)
+    assert pr is not None and pr.merged is not None
+    assert cleanup["source_sha"] == pr.head.sha
+    assert scenario.port.git.commit(original.source_ref).sha == original_marker
+    assert cleanup["stage"] == 1 and cleanup["outcome"] == "third"
+    assert scenario.port.git.commit(replacement.source_ref).sha == pr.head.sha
+    assert scenario.port.remote_refs()[replacement.source_ref] == pr.head.sha
+    assert [effect.operation for effect in cleanups] == ["cleanup_worktree", "cleanup_local_ref"]
     before = kernel.status(subject)
     assert before["phase"] == "complete"
     assert (before["resource_cleanup"]["stage"], before["resource_cleanup"]["outcome"]) == (1, "third")
