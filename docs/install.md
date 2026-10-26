@@ -72,6 +72,12 @@ Runner 的 Python 须实际加载包含 WAL-reset 修复的 SQLite：3.51.3 及�
 3.50.7–3.50.x / 3.44.6–3.44.x，见[状态存储](agents/state-storage.md#sqlite-运行库与资源生命周期)。
 重新安装 Runner 不会升级旧 Run 协议，也不能证明该宿主已通过完整交付验收。
 
+Windows/macOS 用户应先进入自己已准备的 WSL2 / Linux VM Guest，在 Guest 内完成
+本节全部检查；不在 PowerShell 或 macOS 原生 Python 中运行 Worker。
+项目、临时 Unix socket、Runner 数据与所选凭据引用的[Guest 布局及诊断](productization/support.md#linux-guest-路径与只读诊断)
+须先确认。Guest 路径尚未完成受控 Worker/Stop/Resume 平台验收，不能标为已支持；
+不自动安装 VM、开启 systemd 或修改安全设置。
+
 | 缺项 | 处理与复查 |
 | --- | --- |
 | Python / Git | 准备 CPython 3.11+、venv/pip、构建后端和 Git 2.40+；以 Setup 报告核对兼容性 |
@@ -82,8 +88,9 @@ Runner 的 Python 须实际加载包含 WAL-reset 修复的 SQLite：3.51.3 及�
 Setup 成功后的短命 systemd 探针用于检查真实执行能力。不要通过关闭全机防护、替换 init 或绕过隔离来通过检查。
 `doctor` 只读检查，不安装或修复；也不证明 Skills 可用、项目测试通过或全部仓库权限满足。
 检查 JSON 的 `status`、`installation_readiness` 和 `execution_readiness`，不能仅凭退出码 0 判断就绪。
-当前 GitHub 检查仍探测宿主 `gh auth status`，不能代替独立所选 Runner PAT/App 来源的验证；
-将这项诊断局限与实际所选来源的证据分别记录。
+先执行 `doctor --local`；它不验证登录或读取凭据内容。用户允许认证读取时再执行
+`doctor --online --repo OWNER/REPO`，分别验证所选 Runner/Worker host/PAT/App 来源及仓库读取；
+仍不证明全部交付写权限、模型执行或业务完成，不会回退到宿主身份。
 
 ## 目标仓库接入
 

@@ -10,6 +10,21 @@ from agent_run.cli.main import main
 from support.readiness import fake_readiness_tools as _tools
 
 
+def test_local_readiness_gives_guest_commands_without_claiming_guest_validation(
+    tmp_path, monkeypatch, capsys,
+) -> None:
+    calls = _tools(tmp_path, monkeypatch)
+    assert main(["doctor", "--local", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    steps = "\n".join(report["next_steps"])
+    assert "WSL2 / Linux VM Guest" in steps and "uname -s" in steps
+    assert "不证明 Guest 已通过运行验收" in steps
+    assert "agent-run doctor --local --mode foreground --json" in steps
+    assert "agent-run doctor --local --mode background --json" in steps
+    assert report["verification"]["model_call"] is False
+    assert "codex login status" not in calls.read_text() and "gh auth" not in calls.read_text()
+
+
 def test_local_readiness_does_not_authenticate_or_read_pat(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:

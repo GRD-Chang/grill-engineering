@@ -71,6 +71,8 @@ def skills_check() -> dict[str, Any]:
 
 def next_steps() -> list[str]:
     return [
+        "Windows/macOS 原生进程不支持 Worker；进入已准备的 WSL2 / Linux VM Guest 后执行 uname -s（应为 Linux）；Linux 输出本身不证明 Guest 已通过运行验收",
+        "项目、Run 数据、Unix socket 与所选凭据引用留在同一 Linux Guest 用户环境；先执行 agent-run doctor --local --mode foreground --json；后台另查 agent-run doctor --local --mode background --json，布局见 docs/productization/support.md",
         "核对安装版本与本地环境：agent-run doctor --local",
         "保留已有身份、模型和预算：agent-run settings show；需要时才 settings configure",
         "核对 implement/code-review 及其依赖、项目工具链和 AGENTS.md；默认无需 prompts init",
