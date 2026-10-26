@@ -70,7 +70,7 @@ def test_same_thread_new_repair_and_human_continuation_keep_distinct_responsibil
 
 
 @pytest.mark.parametrize("kind", [DeliveryKind.PARENT_ONLY, DeliveryKind.FINAL_RUN])
-def test_parent_publication_gets_the_actual_accepted_artifact(tmp_path: Path, kind: DeliveryKind) -> None:
+def test_parent_publication_gets_the_actual_accepted_artifact(tmp_path: Path, kind: DeliveryKind, capsys) -> None:
     scenario = (final_scenario(tmp_path / kind.value) if kind == DeliveryKind.FINAL_RUN
                 else Scenario(tmp_path / kind.value, kind))
     operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
@@ -78,6 +78,16 @@ def test_parent_publication_gets_the_actual_accepted_artifact(tmp_path: Path, ki
     assert publication.context.get("acceptance_artifact") == review_result("pass")
     assert "fallback_publication_context" not in publication.context
     assert "ci_repair_publication_context" not in publication.context
+    from agent_run.cli.main import main
+    from agent_run.contracts.artifact import role_schema
+    request = tmp_path / 'actual-publication-request.json'
+    request.write_text(json.dumps({**publication.context, 'thread_id': publication.reported_thread,
+                                   '_invocation_mode': 'new-thread' if publication.mode == 'fresh' else 'new-attempt'}))
+    role = 'final-publication' if kind == DeliveryKind.FINAL_RUN else 'publication'
+    assert main(['prompts', 'preview', '--role', role, '--request', str(request), '--json']) == 0
+    preview = json.loads(capsys.readouterr().out)
+    assert preview['prompt'] == render_role_prompt(publication)
+    assert preview['schema'] == role_schema('publication')
 
 
 def test_ticket_fallback_publication_discloses_the_unreviewed_candidate(tmp_path: Path) -> None:
@@ -94,7 +104,7 @@ def test_ticket_fallback_publication_discloses_the_unreviewed_candidate(tmp_path
 
 
 @pytest.mark.parametrize("kind", [DeliveryKind.TICKET, DeliveryKind.PARENT_ONLY])
-def test_findings_review_uses_previous_actual_result_and_current_development(tmp_path: Path, kind):
+def test_findings_review_uses_previous_actual_result_and_current_development(tmp_path: Path, kind, capsys):
     scenario = Scenario(tmp_path / kind.value, kind, reviews=("fail", "pass"))
     runner = scenario.runner()
     development = next_call(scenario, Role.DEVELOPMENT)
@@ -114,9 +124,24 @@ def test_findings_review_uses_previous_actual_result_and_current_development(tmp
     assert 'Spec、Standards、E2E 三个独立子 Agent' in actual_prompt
     assert '最终结构化响应' in actual_prompt and '不得继续调用工具' in actual_prompt
     assert all(command in actual_prompt for command in ('kill', 'pkill', 'killall'))
+    from agent_run.cli.main import main
+    from agent_run.contracts.artifact import role_schema
+    request_file = tmp_path / 'actual-review-request.json'
+    request_file.write_text(json.dumps({**review.context, 'thread_id': review.reported_thread,
+                                        '_invocation_mode': 'new-thread'}))
+    assert main(['prompts', 'preview', '--role', 'review', '--request', str(request_file), '--json']) == 0
+    preview = json.loads(capsys.readouterr().out)
+    assert preview['prompt'] == actual_prompt
+    assert preview['schema'] == role_schema('review')
+    assert 'delivery_identity_background' in actual_prompt
+    for key in ('candidate_sha', 'candidate_tree', 'expected_tree'):
+        assert json.dumps(key) + ': ' + json.dumps(review.context[key]) in actual_prompt
     wrong_range = {**frozen, "review_range": {**frozen["review_range"], "candidate_sha": scenario.initial.sha}}
     with pytest.raises(KernelError, match="review_context_identity_unavailable"):
         render_role_prompt(replace(review, context={**review.context, "review_context": wrong_range}))
+    with pytest.raises(KernelError, match="review_context_unavailable"):
+        render_role_prompt(replace(review, context={key: value for key, value in review.context.items()
+                                                   if key != 'review_context'}))
     old_resources = dict(review.context["_prompt_resources"])
     old_resources["review/context-ranges"] = old_resources.pop("review/fixed-range")
     with pytest.raises(ValueError):

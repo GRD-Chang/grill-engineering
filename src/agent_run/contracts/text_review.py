@@ -81,11 +81,11 @@ Do not use kill, pkill or killall, clean up by PID, or signal yourself, parent p
 Do not commit, push, merge or modify GitHub.""",
     },
     'review/integration-evidence': {
-        'zh': """已有子任务的原始审查、后续修改与集成证据：
+        'zh': """本次集成的原始现场和实际处理说明：
 {}
 
 这些记录帮助定位风险，不替代当前整体结果的独立验收。""",
-        'en': """Original review, subsequent change and integration evidence for existing subtasks:
+        'en': """Original integration failure and actual repair explanation:
 {}
 
 These records help locate risks; they do not replace independent acceptance review of the current integrated result.""",
@@ -140,12 +140,6 @@ Correct only the result format. Do not restart development, review or validation
 Keep the independent Spec, Standards and E2E duties and this review's fixed range. Clean only known task-specific temporary paths; do not use kill, pkill or killall, clean up by PID, or signal yourself, parent processes or your process group.
 Return the current review result JSON as the final structured response, retaining status, evidence and findings for e2e, standards and spec in checks. End immediately; do not call tools afterwards. JSON in commentary cannot replace the final response.""",
     },
-    'review/candidate-object': {
-        'zh': """本次验收对象：
-当前工作区是待验收修复与默认分支合并后的未提交预览；HEAD 留在默认分支基准是正常情况。按下面的实际默认分支基准和待合并提交检查工作树中的整体结果，不能只证明局部修复通过。""",
-        'en': """Current acceptance review object:
-The current workspace is an uncommitted preview of the repair under review merged with the default branch. HEAD remaining at the default-branch base is normal. Use the actual default-branch base and commit to merge below to inspect the complete result in the working tree; proving only the local repair passes is insufficient.""",
-    },
     'review/commit-object': {
         'zh': """本次验收对象：
 当前工作区的 HEAD 对应固定待验收提交。只按 review_range 核验本轮比较；交付身份基准用于背景，不是另一个审核起点。""",
@@ -158,28 +152,6 @@ The checkout HEAD is the fixed commit under review. Inspect only the comparison 
         'en': """Current acceptance review object:
 The checkout is the fixed committed result combining the default branch with the entire delivery. HEAD must match reviewed_candidate_sha. Verify the actual result using only review_range; complete requirements and completion facts provide context without changing this round's comparison.""",
     },
-    'review/run-repair-object': {
-        'zh': """本次验收对象：
-当前工作区是本次修复与默认分支合并后的未提交预览；HEAD 留在默认分支基准是正常情况，检查修复进入整体后的结果。整体开发基准与实际合并基准可能不同，不把二者混为一谈。实际合并基准从当前工作区的只读 Git 取得。""",
-        'en': """Current acceptance review object:
-The current workspace is an uncommitted preview of this repair merged with the default branch. HEAD remaining at the default-branch base is normal; inspect the repair as part of the integrated result. The overall development base and actual merge base may differ; do not conflate them. Obtain the actual merge base using read-only Git in the current workspace.""",
-    },
-    'review/identity-candidate': {
-        'zh': """待合并提交""",
-        'en': """Commit to merge""",
-    },
-    'review/identity-default-base': {
-        'zh': """默认分支合并基准""",
-        'en': """Default-branch merge base""",
-    },
-    'review/identity-expected-tree': {
-        'zh': """预期合并文件树""",
-        'en': """Expected merged file tree""",
-    },
-    'review/identity-repair-candidate': {
-        'zh': """待合并的修复提交""",
-        'en': """Repair commit to merge""",
-    },
     'review/identity-reviewed-base': {
         'zh': """交付身份基准（背景，不是本轮比较起点）""",
         'en': """Delivery identity base (background, not this review's comparison start)""",
@@ -191,14 +163,6 @@ The current workspace is an uncommitted preview of this repair merged with the d
     'review/identity-reviewed-tree': {
         'zh': """待验收文件树""",
         'en': """File tree under acceptance review""",
-    },
-    'review/identity-run-base': {
-        'zh': """整体开发基准""",
-        'en': """Overall development base""",
-    },
-    'review/identity-run-head': {
-        'zh': """本次全部交付的提交""",
-        'en': """Commit containing the complete delivery""",
     },
     'review/previous-result': {
         'zh': """上一次验收对象：

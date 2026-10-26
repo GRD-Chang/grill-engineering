@@ -12,10 +12,7 @@ from agent_run.contracts.prompt import METHOD_NAMES, validate_resources
 from agent_run.config import resources as prompt_resources
 from agent_run.contracts.copy import text, validate_language
 from agent_run.config.defaults import UserDefaultsStore
-from agent_run.core.prompts.development import development_prompt
-from agent_run.core.prompts.context import structured_output_repair_prompt
-from agent_run.core.prompts.publication import publication_continuation_prompt, publication_prompt
-from agent_run.core.prompts.review import review_continuation_prompt, review_prompt
+from agent_run.core.prompts.role import prompt_schema, render_prompt
 
 
 LEGACY_METHODS = {
@@ -78,11 +75,12 @@ def execute(parsed: argparse.Namespace) -> int:
             request["_prompt_resources"] = prompt_resources.resolve_resources(language)
         validate_resources(request["_prompt_resources"])
         prompt = _preview(request, parsed.role, parsed.continuation)
-        result: dict[str, Any] = {"result": "prompt_preview", "role": parsed.role, "prompt": prompt}
+        schema = prompt_schema(parsed.role, request)
+        result: dict[str, Any] = {"result": "prompt_preview", "role": parsed.role, "prompt": prompt, "schema": schema}
         result.update(details)
         if frozen:
             result["sources"] = {f"{name}.md": "request_snapshot" for name in METHOD_NAMES}
-        plain = prompt
+        plain = prompt + "\n\n```json\n" + json.dumps(schema, ensure_ascii=False, indent=2) + "\n```"
         notice = _legacy_notice(details, language)
         if notice:
             result["notice"] = notice
@@ -137,17 +135,4 @@ def execute(parsed: argparse.Namespace) -> int:
 
 
 def _preview(request: dict[str, Any], role: str, continuation: bool) -> str:
-    if role == "output-repair":
-        output_name = request.get("output_name")
-        contract_error = request.get("contract_error")
-        if not isinstance(output_name, str) or not isinstance(contract_error, str):
-            raise ValueError(text("prompts.repair_fields", language=prompt_resources.selected_language(request.get("language"))))
-        if continuation:
-            raise ValueError(text("prompts.repair_continuation", language=prompt_resources.selected_language(request.get("language"))))
-        return structured_output_repair_prompt(output_name, contract_error, request=request)
-    if role == "development":
-        return development_prompt(request, force_continuation=continuation)
-    if role == "review":
-        return review_continuation_prompt(request) if continuation else review_prompt(request)
-    build = publication_continuation_prompt if continuation else publication_prompt
-    return build(request, final_run=role == "final-publication")
+    return render_prompt(request, role, continuation=continuation)
