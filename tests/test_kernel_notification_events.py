@@ -325,7 +325,7 @@ def test_completed_ticket_effort_spans_budget_renewal_without_recounting_resume(
                                                 evidence={"type": "turn.completed"})
         now[0] += seconds + 2
 
-    _recorded_agents(scenario, monkeypatch, started=started)
+    _recorded_agents(scenario, monkeypatch, started=started, activity=False)
     assert scenario.run().kind == "paused"
     before = scenario.kernel.status("ticket:2")["budgets"]
     assert (before["ci"]["window"], before["ci"]["developments_used"], before["ci"]["reviews_used"]) == (1, 1, 1)
