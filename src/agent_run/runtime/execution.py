@@ -197,6 +197,18 @@ def execute(
     )
 
 
+def _unavailable(
+    kernel: Kernel, call: AgentCall, code: str, evidence: dict[str, object] | str,
+    capture: _CodexCapture | None,
+) -> None:
+    if capture is None:
+        kernel.agent_unavailable(call, code, evidence)
+    else:
+        # Native preparation still owns files/provider resources. Settle only
+        # after its context has closed successfully.
+        capture.unstarted_failure = (code, evidence)
+
+
 def _execute(
     kernel: Kernel, call: AgentCall, *, arguments: Sequence[str], cwd: Path,
     prompt: str, environment: Mapping[str, str], timeout: float | None,
@@ -204,7 +216,15 @@ def _execute(
     credential_file: Path | None = None, capture: _CodexCapture | None = None,
 ) -> ProcessExit | None:
     started = time.monotonic()
-    if not kernel.dispatch_agent(call):
+    try:
+        claimed = kernel.dispatch_agent(call)
+    except BaseException as error:
+        if capture is None:
+            _unavailable(kernel, call, "worker_preparation_failed", {"error_type": type(error).__name__}, None)
+        raise
+    if not claimed:
+        if capture is not None:
+            capture.unstarted_failure = None  # Another launch claim is not ours to settle.
         return None
     configured = call.deadline_at - kernel.clock()
     supplied = call.deadline_seconds if timeout is None else timeout
@@ -215,7 +235,7 @@ def _execute(
         if time.monotonic() >= deadline:
             raise TimeoutError("Worker deadline expired before preparation")
     except BaseException as error:
-        kernel.agent_unavailable(call, "worker_preparation_failed", {"error_type": type(error).__name__})
+        _unavailable(kernel, call, "worker_preparation_failed", {"error_type": type(error).__name__}, capture)
         raise
     return _run_dispatched(
         kernel, call, arguments=arguments, cwd=cwd, prompt=prompt,
@@ -272,7 +292,7 @@ def _run_dispatched(
             with credential_file.open("rb"):
                 pass
         except OSError:
-            kernel.agent_unavailable(call, "worker_credentials_unavailable", "Selected Worker credentials are unavailable")
+            _unavailable(kernel, call, "worker_credentials_unavailable", "Selected Worker credentials are unavailable", capture)
             return None
     try:
         if not arguments:
@@ -286,11 +306,13 @@ def _run_dispatched(
         if time.monotonic() >= deadline:
             raise TimeoutError("Worker deadline expired during preparation")
     except BaseException as error:
-        kernel.agent_unavailable(call, "github_read_wait" if isinstance(error, ReadWait) else "worker_preparation_failed",
-                                 {"error_type": type(error).__name__})
+        _unavailable(kernel, call, "github_read_wait" if isinstance(error, ReadWait) else "worker_preparation_failed",
+                     {"error_type": type(error).__name__}, capture)
         raise
     gate_read, gate_write = os.pipe()
     try:
+        if capture is not None:
+            capture.unstarted_failure = None  # Popen may create a child before raising.
         process = subprocess.Popen(
             [sys.executable, "-I", "-c", _BOOTSTRAP, str(gate_read), *arguments],
             cwd=cwd, env=dict(environment), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -298,7 +320,7 @@ def _run_dispatched(
         )
     except OSError as error:
         os.close(gate_write)
-        kernel.agent_unavailable(call, "worker_start_failed", {"errno": error.errno})
+        _unavailable(kernel, call, "worker_start_failed", {"errno": error.errno}, capture)
         return None
     except BaseException:
         os.close(gate_write)
@@ -309,6 +331,7 @@ def _run_dispatched(
     identity: dict[str, int | str] | None = None
     pidfd: int | None = None
     bound = False
+    released = False
     raw, stderr = b"", ""
     failure: BaseException | None = None
     try:
@@ -324,6 +347,7 @@ def _run_dispatched(
             raise TimeoutError("Worker deadline expired before process release")
         kernel.agent_source_ready(call)
         os.write(gate_write, b"1")
+        released = True
         os.close(gate_write)
         gate_write = -1
         raw, stderr = _drain(process, prompt, deadline, kernel, call, identity, capture)
@@ -360,9 +384,9 @@ def _run_dispatched(
             "observed_exit": process.returncode,
         })
         raise failure or ProcessExitUnknown("Worker binding commit is unknown")
-    framed = failure is None and process.returncode == 0
+    framed = released and failure is None and process.returncode == 0
     capture_failed = False
-    if capture is not None:
+    if capture is not None and released:
         try:
             raw = capture.finish()
             framed = True

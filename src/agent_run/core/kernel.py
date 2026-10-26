@@ -2910,10 +2910,10 @@ class Kernel:
                 self._gate(tx, call.subject, "worker_start_unknown", evidence=material)
 
     def agent_unavailable(self, call: AgentCall, code: str, evidence: dict[str, Any] | str) -> None:
-        """A proven pre-launch failure pauses the allocated semantic Attempt."""
+        """Caller proves no spawn and completed cleanup; missing PID is no proof."""
         with self.storage.transaction() as tx:
             invocation = self._invocation(tx, call)
-            if invocation["process_identity"] is not None or invocation["dispatch_state"] not in {"sent", "unavailable"}:
+            if invocation["process_identity"] is not None or invocation["dispatch_state"] not in {"allocated", "sent", "unavailable"}:
                 raise KernelError("worker_exit_unproven")
             material = tx.put(call.subject, "worker_unavailable", wire_json({"code": code, "evidence": evidence}))
             tx.execute("UPDATE invocation_outputs SET dispatch_state='unavailable',start_evidence=? WHERE invocation=? AND ordinal=?",
