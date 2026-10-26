@@ -11,6 +11,9 @@ import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from agent_run.contracts.agent_profiles import resolve_profiles
+from agent_run.contracts.policy import positive_seconds
+from agent_run.errors import AgentProfileError
 from agent_run.model import AgentPreparation, Execution, Purpose, Role
 from agent_run.queries.execution import recorded_profile
 from agent_run.storage.sqlite import Transaction
@@ -94,17 +97,16 @@ def _preparation_scope(tx: Transaction, run: Mapping[str, Any], row: Mapping[str
     try:
         execution = Execution(**scope["execution"])
         role, purpose = Role(scope["role"]), Purpose(scope["purpose"])
+        positive_seconds(scope["deadline_seconds"], "recorded Agent deadline")
     except (TypeError, ValueError):
         raise invalid from None
     if (execution.run_id != run["id"] or not isinstance(execution.owner, str) or not execution.owner
-            or type(execution.epoch) is not int or execution.epoch < 1
+            or type(execution.epoch) is not int or not 1 <= execution.epoch <= 2**63 - 1
             or any(not isinstance(scope[key], str) or not scope[key]
                    for key in ("reservation_id", "attempt_id", "thread_id", "context_id"))
             or type(scope["new_thread"]) is not bool or type(scope["owned_period"]) is not bool
             or type(scope["profile_revision"]) is not int or scope["profile_revision"] < 1
             or type(scope["output_ordinal"]) is not int or scope["output_ordinal"] < 0
-            or type(scope["deadline_seconds"]) not in {int, float}
-            or not math.isfinite(scope["deadline_seconds"]) or scope["deadline_seconds"] <= 0
             or scope["mode"] not in {"fresh", "resume", "output-repair", "execution-recovery"}
             or scope["reported_thread"] is not None and (
                 not isinstance(scope["reported_thread"], str) or not scope["reported_thread"])):
@@ -126,8 +128,15 @@ def _preparation_scope(tx: Transaction, run: Mapping[str, Any], row: Mapping[str
             or not (role == bound["thread_role"] or role == Role.PUBLICATION
                     and bound["thread_role"] == Role.DEVELOPMENT and bound["kind"] != "final_run")):
         raise invalid
-    profile = recorded_profile(tx, bound["profile_revision"])["profiles"][bound["thread_role"]]
-    if scope["profile_reference"] != profile["reference"]:
+    profiles = recorded_profile(tx, bound["profile_revision"])
+    try:
+        checked = resolve_profiles(current=profiles)
+    except AgentProfileError as error:
+        raise invalid from error
+    profile = profiles["profiles"][bound["thread_role"]]
+    if (any(profile[field] != checked["profiles"][bound["thread_role"]][field]
+            for field in ("model", "reasoning_effort", "reference"))
+            or scope["profile_reference"] != profile["reference"]):
         raise invalid
     # Stop/failure may already have fenced the original epoch. Its recorded
     # identity remains readable while cleanup still owns the preparation seat.

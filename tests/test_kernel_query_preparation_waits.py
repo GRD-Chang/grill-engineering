@@ -247,3 +247,52 @@ def test_status_preserves_pending_continuation_bindings(tmp_path, repair):
     assert runner.state().preparing == (pending.reservation_id,)
     assert kernel.status(pending.subject)["budgets"]["requirements"]["developments_used"] == 1
     assert _durable(kernel) == before
+
+
+@pytest.mark.parametrize("fault", [
+    "duration-huge", "duration-nan", "duration-inf", "duration-bool", "duration-text",
+    "duration-zero", "duration-negative", "epoch-huge", "profile-model-list", "profile-model-null",
+    "profile-effort-null", "profile-effort-list", "profile-effort-unknown", "profile-role-list",
+])
+def test_public_status_rejects_malformed_preparation_values_read_only(tmp_path, monkeypatch, capsys, fault):
+    kernel, _, _, step, _ = agent_preparation_fixture(tmp_path)
+    request = step.preparation
+    assert request is not None
+    read(kernel.storage.path, "status")
+    before = _durable(kernel)
+    original_material, original_profile = read_facts.material, read_facts.recorded_profile
+    durations = {"huge": 10**400, "nan": float("nan"), "inf": float("inf"),
+                 "bool": True, "text": "120", "zero": 0, "negative": -1}
+
+    def material(tx, identity, subject):
+        value = original_material(tx, identity, subject)
+        if fault.startswith("duration-") and isinstance(value, dict) and value.get("reservation_id") == request.reservation_id:
+            return {**value, "deadline_seconds": durations[fault.removeprefix("duration-")]}
+        if fault == "epoch-huge" and isinstance(value, dict) and value.get("reservation_id") == request.reservation_id:
+            return {**value, "execution": {**value["execution"], "epoch": 10**400}}
+        return value
+
+    def profile(tx, revision):
+        value = original_profile(tx, revision)
+        if fault.startswith("profile-") and revision == request.profile_revision:
+            role = value["profiles"][request.role]
+            if fault == "profile-role-list":
+                role = []
+            else:
+                field = "model" if "model" in fault else "reasoning_effort"
+                bad = [] if fault.endswith("list") else "unknown-effort" if fault.endswith("unknown") else None
+                role = {**role, field: bad}
+            return {**value, "profiles": {**value["profiles"], request.role: role}}
+        return value
+
+    monkeypatch.setattr(read_facts, "material", material)
+    monkeypatch.setattr(read_facts, "recorded_profile", profile)
+    arguments = ["status", "preparation", "--repo", "example/repository", "--state-dir", str(kernel.storage.path)]
+    assert main([*arguments, "--json"]) == 2
+    assert json.loads(capsys.readouterr().out)["diagnostics"][0]["code"] == "incompatible_run_state"
+    assert main([*arguments, "--plain"]) == 2
+    assert "incompatible_run_state" in capsys.readouterr().out
+    with pytest.raises(QueryError) as rejected:
+        read(kernel.storage.path, "status")
+    assert rejected.value.code == "incompatible_run_state"
+    assert _durable(kernel) == before
