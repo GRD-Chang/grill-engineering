@@ -383,7 +383,10 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
             cleanup = job["delivery_cleanup"]
             yield f"  {copy['cleanup']}: {copy['complete'] if cleanup['state'] == 'complete' else copy['pending']}"
         review = job["review"]
-        if review:
+        review_state = job["review_state"] if document.kind == "status" else None
+        if review_state in {"stale", "pending", "unknown", "not_recorded"}:
+            yield text("presentation.status.review_state_" + review_state, language=document.language)
+        elif review:
             yield f"{text('presentation.status.recorded_review', language=document.language)}: {text('card.result.' + review['outcome'], language=document.language)}"
             if review["outcome"] == "pass":
                 for name, lane in review["artifact"]["checks"].items():

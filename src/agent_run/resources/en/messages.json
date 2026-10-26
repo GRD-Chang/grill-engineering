@@ -1149,5 +1149,9 @@
   "presentation.history.historical_result": "    Historical result; not authorization for the current delivery",
   "presentation.history.acceptance_installed": "Accepted result installed at the delivery boundary",
   "presentation.history.allowance_records": "Recorded allowance windows (not round-start budget snapshots)",
-  "presentation.history.page_round_unavailable": "Round details unavailable on this page; expand the history range"
+  "presentation.history.page_round_unavailable": "Round details unavailable on this page; expand the history range",
+  "presentation.status.review_state_stale": "Current version awaits review; the previous conclusion applies to an earlier scope.",
+  "presentation.status.review_state_pending": "Current Review awaits a consumed conclusion.",
+  "presentation.status.review_state_unknown": "The recorded Review cannot establish a conclusion for the current version.",
+  "presentation.status.review_state_not_recorded": "No Review conclusion recorded yet."
 }

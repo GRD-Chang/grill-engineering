@@ -1149,5 +1149,9 @@
   "presentation.history.historical_result": "    历史结论，不表示对当前成果的授权",
   "presentation.history.acceptance_installed": "验收成果已安装到交付边界",
   "presentation.history.allowance_records": "已记录额度窗口（不是每轮启动时的预算快照）",
-  "presentation.history.page_round_unavailable": "此页未包含可关联的完整轮次材料；请扩大历史查询范围"
+  "presentation.history.page_round_unavailable": "此页未包含可关联的完整轮次材料；请扩大历史查询范围",
+  "presentation.status.review_state_stale": "当前版本待复验；上次验收结论仅适用于旧范围。",
+  "presentation.status.review_state_pending": "当前验收尚无已消费的结论。",
+  "presentation.status.review_state_unknown": "已记录验收不足以确认当前版本的结论。",
+  "presentation.status.review_state_not_recorded": "尚未记录验收结论。"
 }

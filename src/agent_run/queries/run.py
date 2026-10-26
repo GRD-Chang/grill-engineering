@@ -21,7 +21,7 @@ from agent_run.storage.sqlite import QUERY_LIMIT, Storage, Transaction
 from agent_run.storage.preflight import UnsupportedState, require_supported_state
 from agent_run.storage.tasks import read_task, task_path
 from agent_run.queries.read_facts import QueryError as QueryError, all_rows as _all, material as _material, timestamp as _timestamp, read_header as _header, public_phase as _public_phase, read_boundaries
-from agent_run.queries.read_facts import action_guidance
+from agent_run.queries.read_facts import action_guidance, recorded_review
 
 
 @dataclass(frozen=True)
@@ -214,7 +214,7 @@ def _resync(tx: Transaction, subject: str) -> dict[str, Any]:
             "source_sha": snapshot["source_sha"] if snapshot else None, "target_sha": snapshot["target_sha"] if snapshot else None}
 
 
-def _subject(tx: Transaction, job: dict[str, Any], boundary: Mapping[str, Any]) -> dict[str, Any]:
+def _subject(tx: Transaction, run: Mapping[str, Any], job: dict[str, Any], boundary: Mapping[str, Any]) -> dict[str, Any]:
     subject = job["id"]
     budgets = _all(tx, "SELECT * FROM budgets WHERE subject=? ORDER BY purpose,window", (subject,))
     pending = None
@@ -238,7 +238,7 @@ def _subject(tx: Transaction, job: dict[str, Any], boundary: Mapping[str, Any]) 
             "candidate_sha": job["candidate_sha"], "publication_sha": job["publication_sha"],
             "integrated_sha": job["integrated_sha"], "pr_number": job["pr_number"],
             "ci_evidence": _material(tx, job["ci_failure"], subject),
-            "gates": boundary["gates"], "budgets": budgets, "pending_attempt": pending, "review": review, "required_checks": checks,
+            "gates": boundary["gates"], "budgets": budgets, "pending_attempt": pending, "review": review, "review_state": recorded_review(tx, run, job), "required_checks": checks,
             "integration_resync": _resync(tx, subject), "effect_failures": _effect_failures(tx, subject),
             "pending_writes": effects, "delivery_cleanup": boundary["delivery_cleanup"],
             "blocked_by": [row[0] for row in tx.all("SELECT s.issue FROM dependencies d JOIN subjects s ON s.id=d.predecessor "
@@ -440,7 +440,7 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
             now = time.time()
             boundaries = read_boundaries(tx, now)
             by_subject = {job["subject"]: job for job in boundaries["subjects"]}
-            subjects = [_subject(tx, job, by_subject[job["id"]]) for job in _all(tx, "SELECT * FROM subjects ORDER BY id")]
+            subjects = [_subject(tx, run, job, by_subject[job["id"]]) for job in _all(tx, "SELECT * FROM subjects ORDER BY id")]
             windows = boundaries["supervision_windows"]
             for subject in subjects:
                 subject_windows = [window for window in windows if window["subject"] == subject["subject"]]

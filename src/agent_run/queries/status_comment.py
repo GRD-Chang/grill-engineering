@@ -8,8 +8,7 @@ import time
 from agent_run.contracts.status_comment import StatusProjection, StatusTarget
 from agent_run.contracts.repository import same_repository
 from agent_run.contracts.task import TaskKey
-from agent_run.model import Role, artifact, review_outcome
-from agent_run.queries.read_facts import material, read_boundaries
+from agent_run.queries.read_facts import material, read_boundaries, recorded_review
 from agent_run.storage.sqlite import Storage, Transaction
 from agent_run.storage.tasks import read_task, task_path
 
@@ -29,37 +28,6 @@ def status_subjects(database: Path) -> list[str]:
     with Storage(database).transaction(write=False) as tx:
         _run(tx, database.absolute())
         return [str(row[0]) for row in tx.all("SELECT id FROM subjects WHERE pr_number IS NOT NULL ORDER BY id")]
-
-
-def _recorded_review(tx: Transaction, run: sqlite3.Row, job: sqlite3.Row) -> str:
-    """Describe recorded applicability, never claim a fresh remote observation."""
-    current = (tx.one("SELECT * FROM attempts WHERE id=? AND subject=?", (job["current_attempt"], job["id"]))
-               if job["current_attempt"] else None)
-    active = current is not None and current["role"] == "review"
-    review = current if active else (tx.one("SELECT * FROM attempts WHERE id=? AND subject=?",
-        (job["review_attempt"], job["id"])) if job["review_attempt"] else None)
-    if review is None:
-        return "not_recorded"
-    snapshots = tx.rows("SELECT target_sha FROM integration_snapshots WHERE subject=? ORDER BY window DESC LIMIT 1", (job["id"],))
-    base = snapshots[0][0] if snapshots else job["integration_target"] or job["base_sha"]
-    revision = (tx.one("SELECT revision FROM issue_facts WHERE issue=?", (job["issue"],))[0]
-                if job["kind"] == "ticket" else run["observed_parent_revision"])
-    if (review["role"] != "review" or review["generation"] != job["generation"]
-            or review["revision"] != job["revision"] or review["revision"] != revision
-            or review["parent_revision"] != run["parent_revision"] or review["parent_revision"] != run["observed_parent_revision"]
-            or review["graph_revision"] != run["graph_revision"] or review["graph_revision"] != run["observed_graph_revision"]
-            or review["base_sha"] != base or any(review[key] != job[key] for key in (
-                "candidate_sha", "candidate_tree", "expected_tree", "completion_revision"))
-            or review["candidate_sha"] is None or review["candidate_tree"] is None):
-        return "stale"
-    if active and review["status"] in {"allocated", "running", "returned", "continuing"}:
-        return "pending"
-    if review["status"] != "consumed" or review["result_id"] is None or review["outcome"] not in {"pass", "fail"}:
-        return "unknown"
-    result = artifact(Role.REVIEW, tx.get(review["result_id"], job["id"]))
-    if review_outcome(result) != review["outcome"]:
-        return "unknown"
-    return "pass" if review["outcome"] == "pass" else "request_changes"
 
 
 def project_status(database: Path, subject: str) -> StatusProjection:
@@ -117,7 +85,7 @@ def project_status(database: Path, subject: str) -> StatusProjection:
                  f"Delivery: {job['phase']}; Run: {boundaries['status']}; gates: {gates}",
                  f"Candidate: `{job['candidate_sha'] or 'not_recorded'}`",
                  f"Recorded PR head: `{pr['head']['sha']}`; base: `{pr['base']['sha']}`",
-                 f"Recorded Review: {_recorded_review(tx, run, job)} (recorded candidate/base/scope; not a live remote check)",
+                 f"Recorded Review: {recorded_review(tx, dict(run), dict(job))} (recorded candidate/base/scope; not a live remote check)",
                  f"Integration gate: {job['gate_mode'] or 'not_recorded'}; Required Checks: {checks}",
                  f"Cleanup: {cleanup['state'] if cleanup else 'not_recorded'}; Host exit: {host}"]
         actions = [item["next_action"] for item in boundaries["actions"] if item["subject"] in {None, subject}]

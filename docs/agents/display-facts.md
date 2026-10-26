@@ -30,6 +30,10 @@ Host，不能由持久 `running` 记录推断进程仍存活。`scheduling` 保�
 ## 原始工作与历史
 
 `subjects` 保存当前对象的 gate、预算、候选、PR、依赖、适用 Review、检查与写入事实。
+`subjects[].review` 保留准确已记录的 Review 产物；`review_state` 使用本地与远程 Status
+共用的候选、base、generation 和需求范围判定，说明该结论是否仍适用。
+`stale`、`pending`、`unknown` 或 `not_recorded` 不证明当前版本已通过；旧产物仍可审计，
+不能因此将旧 Findings 或通过证据显示为新候选的结论。这是持久事实投影，不是新的实时授权。
 `focus_subject` 仅引用其中一个对象，不复制当前 Worker 或预算。`pending_attempt` 使用真实当前
 Attempt；其 `current_invocation` 指针在 `invocations` 中定位当前调用，不能以最后一条记录替代。
 当前与历史 Attempt 共用 `result` 和 `invocations[].outputs[]` 结构。
