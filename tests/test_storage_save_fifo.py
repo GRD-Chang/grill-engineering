@@ -1,6 +1,6 @@
 """Submission order at the real SQLite boundary, independent of work scheduling."""
 import inspect
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import sqlite3
 import os
 import sys
@@ -435,3 +435,65 @@ def test_cancel_while_sqlite_waits_never_enters_business_body(tmp_path, monkeypa
         external.close()
         if waiter.ident is not None:
             waiter.join(2)
+
+
+@pytest.mark.parametrize('ordered', [True, False], ids=['business-save', 'control-write'])
+def test_writer_lock_acquired_after_original_deadline_cannot_enter_body(tmp_path, ordered):
+    kernel, _, _, step, _ = agent_preparation_fixture(tmp_path)
+    code = Storage.transaction.__wrapped__.__code__
+    lines, start = inspect.getsourcelines(Storage.transaction.__wrapped__)
+    before_begin = start + next(i for i, line in enumerate(lines) if 'connection.execute("BEGIN IMMEDIATE")' in line)
+    prepared, release, executing = (threading.Event() for _ in range(3))
+    deadlines, acquired, failures, ran = [], [], [], []
+
+    def save():
+        def trace(frame, event, arg):
+            if frame.f_code is code and event == 'line':
+                if frame.f_lineno == before_begin:
+                    # Preserve the real timeout already installed in SQLite,
+                    # then model scheduling delay before its actual BEGIN.
+                    deadlines.append(frame.f_locals['deadline'])
+                    prepared.set()
+                    assert release.wait(2), 'writer-boundary barrier was not released'
+                    executing.set()
+                elif frame.f_lineno == before_begin + 1 and not acquired:
+                    acquired.append(time.monotonic())
+            return trace
+        sys.settrace(trace)
+        try:
+            with kernel.storage.transaction(ordered=ordered) as tx:
+                ran.append(True)
+                tx.put(step.preparation.subject, 'expired-save', b'must not commit')
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            sys.settrace(None)
+
+    waiter = threading.Thread(target=save)
+    with closing(sqlite3.connect(kernel.storage.path, isolation_level=None)) as external:
+        try:
+            external.execute('BEGIN IMMEDIATE')
+            waiter.start()
+            assert prepared.wait(2)
+            # The original real busy timeout is now longer than the remaining
+            # total budget. Neither the clock nor SQLite's result is replaced.
+            threading.Event().wait(0.4)
+            release.set()
+            assert executing.wait(2)
+            threading.Event().wait(max(0, deadlines[0] + 0.05 - time.monotonic()))
+            assert not acquired, 'writer lock was acquired while the other writer held it'
+            external.rollback()
+            waiter.join(2)
+        finally:
+            external.rollback()
+            release.set()
+            if waiter.ident is not None:
+                waiter.join(3)
+    assert not waiter.is_alive()
+    assert len(acquired) == 1 and acquired[0] >= deadlines[0]
+    assert not ran and len(failures) == 1
+    assert isinstance(failures[0], KernelError) and failures[0].code == 'storage_busy'
+    assert not save_order._gates
+    with Storage(kernel.storage.path).transaction() as tx:
+        assert tx.one("SELECT count(*) FROM material WHERE purpose='expired-save'")[0] == 0
+        tx.put(step.preparation.subject, 'after-expired-save', b'next save remains usable')

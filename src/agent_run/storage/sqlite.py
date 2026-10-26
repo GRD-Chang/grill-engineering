@@ -405,6 +405,7 @@ class Storage:
                 self._capacity(connection)
                 if write:
                     check_cancelled(cancelled)
+                    remaining(deadline)
                 yield transaction
                 if transaction.failed:
                     raise KernelError("transaction_aborted", "a caught SQL failure poisoned this transaction")
