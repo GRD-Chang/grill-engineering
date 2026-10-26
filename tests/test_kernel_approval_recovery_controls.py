@@ -13,6 +13,7 @@ from agent_run.core.operation_runner import OperationRunner
 from agent_run.errors import KernelError
 from agent_run.model import Checks, DeliveryKind, Execution
 from support.offline import Scenario
+from support.core_operations import prepare_scripted_agent
 from test_kernel_control_operation_observation import managed_approval
 from test_kernel_host_observation import managed_parent
 from test_kernel_remote_effects import _change
@@ -107,7 +108,7 @@ def test_idle_public_approve_starts_existing_recovery_without_a_merge_grant(tmp_
     agents.kernel, agents.port.git = kernel, physical.git
     ci_calls = []
     for _ in range(180):
-        step = runner.run_once()
+        step = prepare_scripted_agent(kernel, runner.run_once())
         assert step.kind not in {"paused", "waiting", "complete"}, step
         if step.call is not None:
             assert step.call.subject == subject

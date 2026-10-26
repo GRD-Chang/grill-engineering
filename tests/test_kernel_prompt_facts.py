@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from support.core_operations import CoreOperations, scripted_return, final_scenario
+from support.core_operations import CoreOperations, scripted_return, final_scenario, prepare_scripted_agent
 from agent_run.model import AgentCall, DeliveryKind, Policy, Role, Step
 from agent_run.model import wire_json
 from agent_run.core.kernel import Kernel
@@ -192,7 +192,7 @@ def test_ci_review_uses_failed_head_then_the_actual_findings_review(tmp_path: Pa
     previous_review = None
     development = None
     for _ in range(220):
-        step = runner.run_once()
+        step = prepare_scripted_agent(scenario.kernel, runner.run_once())
         call = step.call
         if call is None:
             assert step.kind not in {"paused", "waiting", "complete", "approval"}, step
