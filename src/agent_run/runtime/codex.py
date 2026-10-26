@@ -156,8 +156,15 @@ class _CodexCapture:
                 raise ValueError("Worker output schema exceeds its file limit")
             _write_member(self.directory, "schema.json", schema)
             _write_member(self.directory, "last-message.txt", b"")
+            # Reference names may also be gh's final consumption variable.
+            # Preserve only the validated selected Worker PAT, never a Runner
+            # or inherited host token, while removing the original references.
+            worker_pat = (self.environment["GH_TOKEN"]
+                          if self.identity is not None and self.identity["source"] == "pat" else None)
             for variable in self.hidden_environment:
                 self.environment.pop(variable, None)
+            if worker_pat is not None:
+                self.environment["GH_TOKEN"] = worker_pat
             self.environment["GH_PROMPT_DISABLED"] = "1"
             self.environment["GIT_TERMINAL_PROMPT"] = "0"
             readonly = self.preparation.context["readonly"]
