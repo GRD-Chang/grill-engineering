@@ -156,6 +156,51 @@ def test_malformed_semantic_raw_capacity_wait_expires_at_the_original_deadline(t
         assert not tx.rows("SELECT id FROM effects")
 
 
+@pytest.mark.parametrize("raw", [None, b'{"summary":'], ids=["without-raw", "malformed-raw"])
+def test_explicit_resume_waits_for_real_capacity_after_the_semantic_deadline(tmp_path, raw):
+    kernel, _, operations, attempt, original = _native_boundary(tmp_path, return_body=INCOMPLETE)
+    before = kernel.status(original.subject)["budgets"]
+    kernel.clock = lambda: 103.0
+    resumed = operations.once().call
+    assert resumed is not None
+    kernel.clock = lambda: 104.0
+    finish(kernel, resumed, raw, failure_kind="capacity", returncode=1)
+    for now in (104.0, 106.0):
+        kernel.clock = lambda: now
+        assert operations.once().call is None
+        state = operations.runner.state()
+        assert state.disposition == "waiting" and state.wake_at == 107.0
+    kernel.clock = lambda: 107.0
+    expired = operations.once()
+    assert (expired.kind, expired.reason) == ("paused", "invocation_deadline_exceeded")
+    kernel.clock = lambda: 108.0
+    kernel.control("resume", "explicit-after-semantic-expiry", subject=original.subject)
+    for now in (108.0, 109.0, 133.0):
+        kernel.clock = lambda: now
+        assert operations.once().call is None
+        state = operations.runner.state()
+        assert state.disposition == "waiting" and state.wake_at == 134.0
+        with kernel.storage.transaction(write=False) as tx:
+            facts = load_continuation(tx, attempt)
+            assert facts.prior.recovery_ready_at == 134.0 and facts.semantic_deadline == 107.0
+            assert tx.one("SELECT count(*) FROM invocations")[0] == 2
+            assert not tx.rows("SELECT scope_id FROM waits WHERE kind='agent_preparation'")
+    kernel.clock = lambda: 134.0
+    explicit = operations.once().call
+    assert explicit is not None and explicit.attempt_id == attempt
+    assert explicit.thread_id == original.thread_id and explicit.deadline_at == 141.0
+    assert explicit.mode == "resume" and explicit.output_ordinal == 0
+    assert kernel.status(original.subject)["budgets"] == before
+    with kernel.storage.transaction(write=False) as tx:
+        facts = load_continuation(tx, attempt)
+        assert facts.semantic_used == 1 and facts.semantic_deadline is None
+        assert facts.ordinary_used == facts.capacity_count == facts.output_ordinal == 0
+        assert tx.one("SELECT recovery_kind FROM invocations WHERE id=?", (explicit.invocation_id,))[0] == "explicit"
+        assert tx.one("SELECT deadline_at FROM invocations WHERE id=?", (original.invocation_id,))[0] == 107.0
+        assert tx.one("SELECT count(*) FROM invocations")[0] == 3
+        assert not tx.rows("SELECT id FROM effects")
+
+
 def test_stop_revokes_semantic_preparation_and_late_raw_is_only_history(tmp_path):
     kernel, _, operations, _, original = _native_boundary(tmp_path, return_body=INCOMPLETE)
     request = operations.runner.run_once().preparation

@@ -332,7 +332,8 @@ class Kernel:
                 if prior.status == "running" and not (prior.dispatch_state == "allocated" and self.clock() >= prior.deadline_at):
                     return Step("waiting", subject, "agent_running")
                 if prior.failure_kind == "capacity" and prior.recovery_ready_at is not None and self.clock() < prior.recovery_ready_at:
-                    deadline = None if facts is None else facts.semantic_deadline
+                    # Explicit Resume starts its new period only after capacity returns.
+                    deadline = facts.semantic_deadline if facts is not None and attempt["resume_action"] is None else None
                     if deadline is None or self.clock() < deadline:
                         retry_at = prior.recovery_ready_at if deadline is None else min(deadline, prior.recovery_ready_at)
                         return Step("waiting", subject, "capacity_recovery_wait", retry_at=retry_at)
