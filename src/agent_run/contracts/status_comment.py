@@ -8,6 +8,7 @@ import json
 class StatusTarget:
     repository: str
     run_id: str
+    parent_issue: int
     subject: str
     generation: int
     issue: int

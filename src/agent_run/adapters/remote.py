@@ -15,9 +15,10 @@ import re
 import subprocess
 from tempfile import NamedTemporaryFile
 from typing import Any, NoReturn, ParamSpec, Protocol, TYPE_CHECKING, TypeVar
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from agent_run.contracts.write_authority import WriteAuthority, admit_write
+from agent_run.contracts.status_comment import StatusTarget
 from agent_run.adapters.github import GhGitHubReader
 from agent_run.errors import GitHubReadError
 from agent_run.errors import bounded_error
@@ -108,7 +109,7 @@ class RemoteEffects:
         self.api = api
         self.git_writes = git_writes
 
-    def actor(self) -> str:
+    def actor(self, before_attempt: Callable[[], None] | None = None) -> str:
         """Resolve the selected Runner's actual login, not a fixture identity."""
         if self.identity["source"] == "app":
             from agent_run.adapters.auth.app import resolve_app_login
@@ -116,7 +117,62 @@ class RemoteEffects:
             profile = self.identity["app_profile"]
             return resolve_app_login(GitHubAppProfile(profile["app_id"], profile["installation_id"],
                                                      Path(profile["private_key_path"])))
-        return _text(self._api("user")["login"])
+        return _text((self._api("user") if before_attempt is None else self._api("user", before_attempt))["login"])
+
+    def read_status_comment(self, target: StatusTarget, marker: str, intent: Mapping[str, Any],
+                            cancelled: Callable[[], bool]) -> dict[str, Any]:
+        """Observe one exact display intent. Foreign/absent is never write authority."""
+        def check_cancel() -> None:
+            if cancelled():
+                raise ValueError("Status delivery cancelled")
+        check_cancel()
+        if target.repository != self.repository or self.actor(check_cancel) != target.actor:
+            return {"disposition": "third"}
+        check_cancel()
+        pr = self._api(f"repos/{self.repository}/pulls/{target.pr_number}", check_cancel)
+        head, base = pr.get("head", {}), pr.get("base", {})
+        if (not isinstance(head, dict) or not isinstance(base, dict)
+                or not isinstance(head.get("repo"), dict) or not isinstance(base.get("repo"), dict)
+                or pr.get("number") != target.pr_number or _login(pr.get("user")) != target.actor
+                or head.get("repo", {}).get("full_name") != self.repository
+                or base.get("repo", {}).get("full_name") != self.repository
+                or "refs/heads/" + str(head.get("ref")) != target.source_ref
+                or "refs/heads/" + str(base.get("ref")) != target.target_ref):
+            return {"disposition": "third"}
+        check_cancel()
+        rows = self._pages(f"repos/{self.repository}/issues/{target.pr_number}/comments?per_page=100", check_cancel)
+        prefix = f"<!-- agent-run-status:{target.key}:"
+        found = [row for row in rows if row.get("id") == intent["comment_id"]
+                 or isinstance(row.get("body"), str) and prefix in row["body"]]
+        if not found:
+            return {"disposition": "prior" if intent["comment_id"] is None else "third"}
+        if len(found) != 1:
+            return {"disposition": "third"}
+        row = found[0]
+        if (type(row.get("id")) is not int or row["id"] <= 0
+                or intent["comment_id"] is not None and row["id"] != intent["comment_id"]
+                or _login(row.get("user")) != target.actor
+                or urlsplit(str(row.get("issue_url", ""))).path != f"/repos/{self.repository}/issues/{target.pr_number}"
+                or not isinstance(row.get("body"), str) or not row["body"].startswith(marker + "\n")):
+            return {"disposition": "third"}
+        disposition = ("target" if row["body"] == intent["body"] else "prior"
+                       if intent["comment_id"] is not None and row["body"] == intent["before"] else "third")
+        return {"disposition": disposition, "comment_id": row["id"]}
+
+    def write_status_comment(self, target: StatusTarget, marker: str, intent: Mapping[str, Any],
+                             authorize: WriteAuthority, cancelled: Callable[[], bool]) -> dict[str, Any]:
+        """Only POST/PATCH this comment. No retry, deletion, merge or Issue mutation."""
+        def boundary() -> None:
+            if self.read_status_comment(target, marker, intent, cancelled)["disposition"] != "prior":
+                raise ValueError("Status comment changed before write")
+        identifier = intent["comment_id"]
+        endpoint, method = (f"issues/{target.pr_number}/comments", "POST") if identifier is None else (f"issues/comments/{identifier}", "PATCH")
+        response = self._write(f"repos/{self.repository}/{endpoint}", method, {"body": intent["body"]}, authorize, boundary)
+        try:
+            result = self.read_status_comment(target, marker, intent, cancelled)
+        except (GitHubReadError, OSError, ValueError) as error:
+            raise EffectReadError(GitHubReadError("status_readback_unavailable", "Status readback unavailable"), response) from error
+        return {**result, "write_returncode": response.returncode}
 
     @_operation_errors
     def execute(self, effect: Effect, authorize: WriteAuthority) -> EffectResult:
@@ -967,25 +1023,32 @@ class RemoteEffects:
             return EffectResult("third", raw={"event": event})
         return EffectResult("target" if issue["state"] == "closed" else "unknown", raw={"event": event})
 
-    def _read(self, command: list[str]) -> subprocess.CompletedProcess[str]:
-        response = run_read_command(command, cwd=self.root, runner_identity=self.identity)
+    def _read(self, command: list[str], before_attempt: Callable[[], None] | None = None) -> subprocess.CompletedProcess[str]:
+        response = (run_read_command(command, cwd=self.root, runner_identity=self.identity) if before_attempt is None else
+                    run_read_command(command, cwd=self.root, runner_identity=self.identity, before_attempt=before_attempt))
         if response.returncode:
             raise GitHubReadError("remote_read_failed", response.stderr[:4096] or "Remote read failed")
         return response
 
-    def _api(self, endpoint: str) -> dict[str, Any]:
-        data = self.api.object(endpoint) if self.api is not None else json.loads(self._read(["gh", "api", endpoint]).stdout)
+    def _api(self, endpoint: str, before_attempt: Callable[[], None] | None = None) -> dict[str, Any]:
+        if before_attempt is not None:
+            before_attempt()
+        data = self.api.object(endpoint) if self.api is not None else json.loads((
+            self._read(["gh", "api", endpoint]) if before_attempt is None else self._read(["gh", "api", endpoint], before_attempt)).stdout)
         if not isinstance(data, dict):
             raise ValueError("expected remote object")
         return data
 
-    def _pages(self, endpoint: str) -> list[dict[str, Any]]:
+    def _pages(self, endpoint: str, before_attempt: Callable[[], None] | None = None) -> list[dict[str, Any]]:
+        if before_attempt is not None:
+            before_attempt()
         if self.api is not None:
             rows = self.api.list(endpoint)
             if not all(isinstance(row, dict) for row in rows) or len(json.dumps(rows).encode()) > MATERIAL_LIMIT:
                 raise ValueError("invalid or oversized remote collection")
             return rows
-        pages = json.loads(self._read(["gh", "api", endpoint, "--paginate", "--slurp"]).stdout)
+        command = ["gh", "api", endpoint, "--paginate", "--slurp"]
+        pages = json.loads((self._read(command) if before_attempt is None else self._read(command, before_attempt)).stdout)
         if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
             raise ValueError("expected paginated remote list")
         rows = [row for page in pages for row in page]

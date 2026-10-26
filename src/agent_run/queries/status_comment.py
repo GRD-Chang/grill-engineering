@@ -13,10 +13,14 @@ def project_status(database: Path, subject: str) -> StatusProjection:
     database = database.absolute()
     with Storage(database).transaction(write=False) as tx:
         run = tx.one("SELECT * FROM runs")
+        if not isinstance(run["repository_root"], str) or not Path(run["repository_root"]).is_absolute():
+            raise ValueError("Status Task workspace is invalid")
         task = TaskKey(Path(run["repository_root"]), run["repository"], run["parent_issue"])
         if read_task(task_path(task)) != (run["id"], database):
             raise ValueError("Status Task binding changed")
         job = tx.one("SELECT * FROM subjects WHERE id=? AND run_id=?", (subject, run["id"]))
+        if any(type(job[key]) is not int or job[key] <= 0 for key in ("pr_number", "issue", "generation")):
+            raise ValueError("Status publication number is invalid")
         publications = tx.all("SELECT * FROM effects WHERE subject=? AND generation=? "
                               "AND operation='pr_write' AND status='confirmed' ORDER BY rowid",
                               (subject, job["generation"]))
@@ -27,6 +31,8 @@ def project_status(database: Path, subject: str) -> StatusProjection:
             if isinstance(pr, dict) and pr.get("number") == job["pr_number"]:
                 if (pr.get("repository") != run["repository"] or pr.get("head_repository") != run["repository"]
                         or pr.get("actor") != effect["actor"] or not effect["actor"]
+                        or not isinstance(pr.get("head"), dict) or pr["head"].get("sha") != effect["after_sha"]
+                        or not isinstance(pr.get("base"), dict) or not isinstance(pr["base"].get("sha"), str)
                         or pr.get("source_ref") != job["source_ref"] or pr.get("target_ref") != job["target_ref"]):
                     raise ValueError("Status publication identity changed")
                 proofs.append((effect, pr))
@@ -35,7 +41,7 @@ def project_status(database: Path, subject: str) -> StatusProjection:
         original, first = proofs[0]
         if any(pr["actor"] != first["actor"] for _, pr in proofs):
             raise ValueError("Status publication actor changed")
-        target = StatusTarget(run["repository"], run["id"], subject, job["generation"], job["issue"],
+        target = StatusTarget(run["repository"], run["id"], run["parent_issue"], subject, job["generation"], job["issue"],
                               job["pr_number"], original["actor"], original["id"], original["receipt_id"],
                               job["source_ref"], job["target_ref"])
         _, pr = proofs[-1]
