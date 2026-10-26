@@ -299,6 +299,40 @@ def test_close_uses_original_comment_watermark_and_rejects_reopened_or_foreign_i
     assert sum("POST" in c for c in actual) == 1 and sum("PATCH" in c for c in actual) == 1
 
 
+def test_comment_collections_keep_distinct_issue_pr_and_foreign_identity(tmp_path, monkeypatch):
+    import subprocess
+    port, _git, push, state, _calls = _fixture(tmp_path, monkeypatch)
+    _effect, pr = _publish_pr(port, push)
+    assert pr.number == 17 and push.subject == "ticket:2"
+    completion = replace(push, effect_id="completion-routing", operation="completion_comment", after_sha=None,
+        pr_number=pr.number, payload={"issue": 2, "merge_sha": push.after_sha, "gate_mode": "reviewed", "kind": "ticket"})
+    result = port.execute(completion, WriteAuthority(lambda: lambda: None))
+    assert result.disposition == "target"
+    document = json.loads(state.read_text())
+    completion_id = document["comments"][0]["id"]
+    foreign = {"id": 90, "body": "<!-- agent-run-status:foreign -->", "user": {"login": "foreign"},
+               "issue_url": "https://api.github.com/repos/example/project/issues/17"}
+    document["comments"].append(foreign)
+    state.write_text(json.dumps(document))
+    def read(repository, number):
+        return subprocess.run(["gh", "api", f"repos/{repository}/issues/{number}/comments?per_page=100",
+                               "--paginate", "--slurp"], text=True, capture_output=True, timeout=5, check=False)
+    issue = read("example/project", 2)
+    pull_request = read("example/project", 17)
+    assert issue.returncode == pull_request.returncode == 0
+    assert [[row["id"] for row in page] for page in json.loads(issue.stdout)] == [[completion_id]]
+    assert json.loads(pull_request.stdout) == [[foreign]]  # Server never sanitizes foreign facts into an empty page.
+    for repository, number in (("example/project", 999), ("foreign/project", 2)):
+        response = read(repository, number)
+        assert response.returncode != 0 and response.stdout == ""
+    payload = tmp_path / "invalid-status.json"
+    payload.write_text(json.dumps({"body": "<!-- agent-run-status:not-a-pr -->"}))
+    rejected = subprocess.run(["gh", "api", "repos/example/project/issues/2/comments", "--method", "POST",
+                               "--input", str(payload)], text=True, capture_output=True, timeout=5, check=False)
+    assert rejected.returncode != 0
+    assert json.loads(state.read_text())["comments"] == document["comments"]
+
+
 def test_unknown_reads_and_unbound_close_never_authorize_a_write(tmp_path, monkeypatch):
     port, _git, effect, state, calls = _fixture(tmp_path, monkeypatch)
     close = replace(effect, operation="close", payload={"issue": 2, "merge_sha": effect.after_sha})
@@ -613,6 +647,9 @@ FAKE_GH = ('import sys\nsys.path.insert(0, ' + repr(str(Path(__file__).parent)) 
            + CHECK_ROLLUP_FAKE + LATEST_CHECK_FAKE) + r'''import json, os, sys
 args=sys.argv[1:]
 state=os.environ['REMOTE_TEST_STATE']
+import fcntl
+server_lock=open(state+'.lock','a+')
+fcntl.flock(server_lock.fileno(),fcntl.LOCK_EX)
 d=json.loads(read_text(state))
 os.environ.update(GIT_AUTHOR_NAME='Publisher',GIT_AUTHOR_EMAIL='publisher@example.invalid',GIT_COMMITTER_NAME='Publisher',GIT_COMMITTER_EMAIL='publisher@example.invalid',GIT_AUTHOR_DATE='2000-01-01T00:00:00Z',GIT_COMMITTER_DATE='2000-01-01T00:00:00Z')
 with open(os.environ['REMOTE_TEST_CALLS'],'a') as f: f.write(json.dumps(args)+'\n')
@@ -632,6 +669,7 @@ if args[0]!='api': raise SystemExit('unexpected '+repr(args))
 endpoint=args[1].split('?',1)[0]
 method=args[args.index('--method')+1] if '--method' in args else 'GET'
 body=json.loads(read_text(args[args.index('--input')+1])) if '--input' in args else {}
+status_operation=False
 if d.get('read_error') and method=='GET':
     print('HTTP 403 forbidden',file=sys.stderr);raise SystemExit(1)
 if endpoint=='user': result={'login':d.get('actor','publisher')}
@@ -705,15 +743,40 @@ elif endpoint.startswith('repos/example/project/pulls'):
             if body.get('state')=='closed':
                 d['events'].append({'id':len(d['events'])+1,'event':'closed','actor':{'login':'publisher'},'created_at':'2026-10-21T10:01:00Z'})
         else:result=pr
+elif endpoint.startswith('repos/example/project/issues/comments/'):
+    status_operation=True
+    identifier=int(endpoint.rsplit('/',1)[1])
+    matches=[row for row in d['comments'] if row['id']==identifier and row['body'].startswith('<!-- agent-run-status:')]
+    if len(matches)!=1 or method!='PATCH' or set(body)!={'body'}:
+        raise SystemExit('unexpected Status comment object')
+    result=matches[0];result['body']=body['body']
+    d.setdefault('status_writes',[]).append({'method':'PATCH','id':identifier,'body':body['body']})
+elif endpoint.startswith('repos/example/project/issues/') and endpoint.endswith('/comments'):
+    if d.get('issue_read_error') and method=='GET':
+        print('HTTP 403 Issue unavailable',file=sys.stderr);raise SystemExit(1)
+    number=int(endpoint.split('/issues/',1)[1].split('/',1)[0])
+    graph=d.get('source_graph',{})
+    known_issue=number==2 or number==graph.get('parent',{}).get('number') or str(number) in graph.get('issues',{})
+    known_pr=any(pr['number']==number for pr in d['prs'])
+    if not (known_issue or known_pr):raise SystemExit('unknown comment target')
+    url='https://api.github.com/repos/example/project/issues/'+str(number)
+    status_operation=method=='POST' and body.get('body','').startswith('<!-- agent-run-status:')
+    if method=='POST':
+        if status_operation and not known_pr:raise SystemExit('unknown Status target PR')
+        result={'id':max((row['id'] for row in d['comments']),default=0)+1,'body':body['body'],
+                'user':{'login':d.get('actor','publisher')},'issue_url':url,'created_at':'2026-10-21T10:00:00Z'}
+        d['comments'].append(result)
+        if status_operation:d.setdefault('status_writes',[]).append({'method':'POST','id':result['id'],'body':body['body']})
+    elif method=='GET':
+        # Legacy fixture rows without issue_url are the declared Ticket #2's
+        # completion comments. Never expose those rows on the distinct PR.
+        rows=[row for row in d['comments'] if row.get('issue_url','https://api.github.com/repos/example/project/issues/2')==url]
+        result=[rows] if '--slurp' in args else rows
+    else:raise SystemExit('unexpected comment method')
 elif endpoint.startswith('repos/example/project/issues/'):
     if d.get('issue_read_error') and method=='GET':
         print('HTTP 403 Issue unavailable',file=sys.stderr);raise SystemExit(1)
-    if endpoint.endswith('/comments'):
-        if method=='POST':
-            c={'id':len(d['comments'])+1,'body':body['body'],'user':{'login':'publisher'},'created_at':'2026-10-21T10:00:00Z'}
-            d['comments'].append(c);result=c
-        else:result=[d['comments']] if '--slurp' in args else d['comments']
-    elif endpoint.endswith('/events'):result=[d['events']] if '--slurp' in args else d['events']
+    if endpoint.endswith('/events'):result=[d['events']] if '--slurp' in args else d['events']
     elif method=='PATCH':
         d['issue_state']=body['state'];
         event='closed' if body['state']=='closed' else 'reopened'
@@ -721,9 +784,9 @@ elif endpoint.startswith('repos/example/project/issues/'):
         d['events'].append({'id':len(d['events'])+1,'event':event,'actor':{'login':'publisher'},'created_at':at});result={'state':d['issue_state']}
     else:result={'number':2,'node_id':'issue-node-2','state':d['issue_state']}
 else:raise SystemExit('unexpected endpoint '+endpoint)
-if method!='GET' and d.get('read_error_after_write'):d['read_error']=True
+if method!='GET' and not status_operation and d.get('read_error_after_write'):d['read_error']=True
 write_text(state,json.dumps(d))
 print(json.dumps(result))
-if method!='GET' and d.get('lose_operation')==('issue_link' if endpoint=='graphql' else 'merge' if endpoint.endswith('/merge') else 'comment' if endpoint.endswith('/comments') else 'close' if '/issues/' in endpoint else 'pr'):
+if method!='GET' and not status_operation and d.get('lose_operation')==('issue_link' if endpoint=='graphql' else 'merge' if endpoint.endswith('/merge') else 'comment' if endpoint.endswith('/comments') else 'close' if '/issues/' in endpoint else 'pr'):
     print('response lost after actual mutation',file=sys.stderr);raise SystemExit(1)
 '''

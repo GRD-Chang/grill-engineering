@@ -231,10 +231,14 @@ def test_fatal_close_wins_over_a_late_healthy_recovery_read(tmp_path: Path, monk
         observer.observe_committed()
         assert entered.wait(3)
         observer.close(drain=False)
-        assert observer.closed and observer.cancel.is_set()
+        # close requests cancellation; a deliberately held callback still owns
+        # its thread until released. Do not call that physical cleanup proved.
+        assert not observer.closed and observer.cancel.is_set()
         release.set()
         assert observer.thread is not None
         observer.thread.join(timeout=3)
+        observer.close(drain=False)
+        assert observer.closed and observer.cancel.is_set()
         assert not observer.thread.is_alive() and calls == []
         assert observer.cancel.is_set() and observer.failure_reason is not None
         document = outbox.read_notifications(tmp_path, "run-native")

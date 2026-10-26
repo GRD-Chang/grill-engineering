@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import shutil
 import sys
 
 from agent_run.runtime.package_lease import runner_usage_lease
@@ -31,10 +32,17 @@ def exit_properties(database: Path, action_id: str, request: HostLaunch, runner_
         run = tx.one("SELECT id FROM runs")
         originals = tx.rows("SELECT subject,material_id FROM run_inputs WHERE run_id=?", (run["id"],))
         if not originals:
-            return ()  # No frozen opt-in; do not arm a notification hook.
+            return ()  # No frozen Run inputs; neither channel can be bound.
         original = originals[0]
         config = json.loads(tx.get(original["material_id"], original["subject"])).get("notifications")
-    if not isinstance(config, dict) or config.get("enabled") is not True:
+    from agent_run.queries.status_comment import status_subjects
+    try:
+        status_subjects(database)
+        status_enabled = True
+    except (OSError, ValueError, RuntimeError, sqlite3.Error):
+        status_enabled = False
+    feishu_enabled = isinstance(config, dict) and config.get("enabled") is True
+    if not feishu_enabled and not status_enabled:
         return ()
     if not database.is_absolute() or not runner_lock.is_absolute() or not Path(sys.executable).is_absolute():
         raise ValueError("An exact Host exit command is required")
@@ -48,7 +56,8 @@ def exit_properties(database: Path, action_id: str, request: HostLaunch, runner_
     if library:
         arguments = ["/usr/bin/env", "LD_LIBRARY_PATH=" + library, *arguments]
     rendered = " ".join(json.dumps(value.replace("%", "%%"), ensure_ascii=False) for value in arguments)
-    return ("ExecStopPost=-:" + rendered, "TimeoutStopSec=70s", "TimeoutStopFailureMode=kill", "OOMPolicy=continue")
+    return ("ExecStopPost=-:" + rendered, "TimeoutStopSec=70s" if feishu_enabled else "TimeoutStopSec=5s",
+            "TimeoutStopFailureMode=kill", "OOMPolicy=continue")
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
@@ -60,7 +69,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
     args = parser.parse_args(arguments)
     result, code, status, invocation = (os.environ.get(key, "") for key in
                                        ("SERVICE_RESULT", "EXIT_CODE", "EXIT_STATUS", "INVOCATION_ID"))
-    if not _abnormal(result, code, status):
+    abnormal = _abnormal(result, code, status)
+    if not abnormal and (result, code, status) != ("success", "exited", "0"):
         return 0
     try:
         credential_directory = os.environ.get("CREDENTIALS_DIRECTORY")
@@ -74,12 +84,28 @@ def main(arguments: Sequence[str] | None = None) -> int:
                                                credential=Path(credential_directory) / "agent-run-environment")
             os.environ.clear()
             os.environ.update(inherited.environment)
-            notice = host_exit_notice(args.database, args.action, inherited.receipt,
-                                      service_result=result, exit_code=code, exit_status=status,
-                                      invocation_id=invocation)
-            if notice is not None:
-                from agent_run.notifications.sender import deliver_host_exit_notice
-                deliver_host_exit_notice(args.database, args.database.parent, notice)
+            notice = None
+            if abnormal:
+                notice = host_exit_notice(args.database, args.action, inherited.receipt,
+                                          service_result=result, exit_code=code, exit_status=status,
+                                          invocation_id=invocation)
+                if notice is not None:
+                    from agent_run.notifications.sender import deliver_host_exit_notice
+                    deliver_host_exit_notice(args.database, args.database.parent, notice)
+            if notice is None:
+                from agent_run.queries.status_comment import status_subjects
+                try:
+                    status_subjects(args.database)
+                except (OSError, ValueError, RuntimeError, sqlite3.Error):
+                    return 0
+                from agent_run.adapters.systemd import SystemdHost
+                manager = SystemdHost(systemctl=shutil.which("systemctl") or "systemctl",
+                                      systemd_run="systemd-run", environment=os.environ)
+                if manager.exit_identity(request, invocation):
+                    # Stop-post still belongs to the unit. Refresh committed
+                    # facts, never infer empty cgroup or released Runner usage.
+                    from agent_run.notifications.sender import notify_committed
+                    notify_committed(args.database)
         return 0
     except (OSError, ValueError, RuntimeError, sqlite3.Error):
         # Credentials, arbitrary CLI output and native metadata stay private.

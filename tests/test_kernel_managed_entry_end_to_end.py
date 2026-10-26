@@ -326,10 +326,29 @@ if '--hostname' in sys.argv:
         calls_seen = [json.loads(line) for line in calls.read_text().splitlines()]
         writes = [row for row in calls_seen if "--method" in row]
         merges = [index for index, row in enumerate(writes) if row[1].endswith("/merge")]
-        comments = [index for index, row in enumerate(writes) if row[1].endswith("/comments")]
+        comments = [index for index, row in enumerate(writes) if row[1] == "repos/example/project/issues/2/comments"]
         closes = [index for index, row in enumerate(writes) if row[1] == "repos/example/project/issues/2"]
         assert len(merges) == len(comments) == len(closes) == 1
         assert merges[0] < comments[0] < closes[0]
+        # Publication display is a separate purpose on the PR, never the
+        # Ticket's authoritative completion comment or another merge/close.
+        status_rows = [row for row in document["comments"] if row["body"].startswith("<!-- agent-run-status:")]
+        assert len(status_rows) == 1
+        status_writes = document["status_writes"]
+        assert [row["method"] for row in status_writes].count("POST") == 1
+        assert all(row["id"] == status_rows[0]["id"] for row in status_writes)
+        assert all(a["body"] != b["body"] for a, b in zip(status_writes, status_writes[1:]))
+        assert "Delivery: complete" in status_rows[0]["body"]
+        assert "Host exit: exit_unproven" in status_rows[0]["body"]  # Shared test cgroup is still populated.
+        stopped = subprocess.run([sys.executable, "-m", "agent_run", "stop", "1", "--repo", "example/project", "--json"],
+                                 cwd=git_repo, env=environment, text=True, capture_output=True, timeout=20)
+        assert stopped.returncode == 0, (stopped.stdout, stopped.stderr)
+        assert json.loads(stopped.stdout)["action"] == "stop"
+        stopped_document = json.loads(state.read_text())
+        updated, = [row for row in stopped_document["comments"] if row["body"].startswith("<!-- agent-run-status:")]
+        assert updated["id"] == status_rows[0]["id"] and "operator_stopped" in updated["body"]
+        assert [row["method"] for row in stopped_document["status_writes"]].count("POST") == 1
+        assert kernel.status("ticket:2")["phase"] == "complete"
         with runner_management_lease(default_runner_lock_path(environment)):
             pass
         assert _git(git_repo, "status", "--porcelain=v1") == ""

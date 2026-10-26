@@ -190,6 +190,9 @@ def attach(kernel: Kernel, *, requested_action: str, manager: SystemdHost | Fore
                 observed = launch_handoff(kernel, action_id, manager, handoff, exit_properties=properties)
         with kernel.storage.transaction(write=False) as tx:
             action = tx.one("SELECT kind,status FROM actions WHERE id=?", (action_id,))
+        if observed is not None and observed.disposition == "exited" and observed.usage_released:
+            from agent_run.notifications.sender import notify_committed
+            notify_committed(kernel.storage.path)
         return {"result": "attached", "status": "action_" + action["status"], "run_id": request.run_id,
                 "action_id": action_id, "action": action["kind"],
                 "requested_action": requested_action, "requested_action_applied": False,
@@ -344,6 +347,9 @@ def execute(parsed: argparse.Namespace, *, language: str) -> dict[str, Any]:
             if action_status == "complete":
                 return {"result": "completed", "status": "completed", "run_id": run["id"],
                         "action_id": None, "action": "stop", "host": "exited", "language": run["language"]}
+            if action_status != "complete":
+                from agent_run.notifications.sender import notify_committed
+                notify_committed(database)
             return {"result": "accepted", "status": "action_" + action_status, "run_id": run["id"],
                     "action_id": action_id, "action": "stop", "host": "unknown", "language": run["language"]}
         inspections = None

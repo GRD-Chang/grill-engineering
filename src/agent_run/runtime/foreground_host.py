@@ -67,6 +67,8 @@ def _settle(kernel: Kernel, request: HostLaunch, path: Path, record: dict[str, A
         write_record(path, record)
     if kernel.observe_host(request, observation) != 'exited':
         raise DomainUnknown('Core did not accept the original foreground exit')
+    from agent_run.notifications.sender import notify_committed
+    notify_committed(kernel.storage.path)
     _remove_record(path)
     return observation
 
