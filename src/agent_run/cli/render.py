@@ -11,6 +11,7 @@ import unicodedata
 from agent_run.contracts.copy import text
 
 from agent_run.queries.run import QueryDocument, review_findings
+from agent_run.queries.execution import invocation_timing
 from agent_run.queries.read_facts import QueryError
 from agent_run.storage.sqlite import QUERY_LIMIT
 
@@ -154,6 +155,141 @@ def _notification_lines(document: QueryDocument) -> Iterator[str]:
         yield copy["notification_binding_unknown"]
 
 
+def _budget_lines(job: Mapping[str, Any], language: str) -> Iterator[str]:
+    copy, terms = _COPY[language], _TERMS[language]
+    for budget in job["budgets"]:
+        review_limit = budget["review_limit"] if budget["review_limit"] is not None else copy["unknown"]
+        yield (f"  {copy['budget']}: {terms.get(budget['purpose'], budget['purpose'])} W{budget['window']} "
+               f"D {budget['developments_used']}/{budget['development_limit']} R {budget['reviews_used']}/{review_limit}")
+
+
+def _history_timing(invocations: list[dict[str, Any]], language: str) -> Iterator[str]:
+    facts = invocation_timing(invocations)
+
+    def duration(value: int) -> str:
+        minutes, seconds = divmod(value, 60)
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours:02}:{minutes:02}:{seconds:02}"
+
+    if facts["execution_timing_complete"]:
+        yield text("presentation.history.round_execution_time", language=language, v1=duration(facts["execution_seconds"]))
+    elif "recorded_execution_seconds" in facts:
+        yield text("presentation.history.timing_incomplete", language=language)
+        yield text("presentation.history.recorded_execution_time", language=language,
+                   v1=duration(facts["recorded_execution_seconds"]))
+    else:
+        yield text("presentation.history.timing_unknown", language=language)
+
+
+def _history_round(attempt: Mapping[str, Any], issue: int, language: str, details: bool) -> Iterator[str]:
+    copy, terms = _COPY[language], _TERMS[language]
+    yield text("presentation.history.round_identity", language=language, issue=issue,
+               role=copy[attempt["role"]], ordinal=attempt["ordinal"], generation=attempt["generation"],
+               window=attempt["window"], purpose=terms.get(attempt["purpose"], attempt["purpose"]))
+    outputs = [output for invocation in attempt["invocations"] for output in invocation["outputs"]]
+    repairs = sum(output["mode"] == "output-repair" for output in outputs)
+    if repairs:
+        yield text("presentation.history.output_continuations_included_in_this_round", language=language, v1=repairs)
+    start = min(output["started_at"] for output in outputs) if outputs and all(
+        output["started_at"] is not None for output in outputs) else None
+    end = max(output["exited_at"] for output in outputs) if outputs and all(
+        output["exited_at"] is not None for output in outputs) else None
+    first, zone = _time(start)
+    last, end_zone = _time(end)
+    zone = zone if start is not None else end_zone
+    yield text("presentation.history.time_range", language=language,
+               v1=f"{first or copy['unknown']} → {last or copy['unknown']} ({zone})")
+    yield from _history_timing(attempt["invocations"], language)
+    previous = None
+    for index, invocation in enumerate(attempt["invocations"], 1):
+        configuration = (invocation["model"], invocation["effort"], invocation["profile_reference"])
+        if details:
+            yield text("presentation.history.invocation", language=language, ordinal=index)
+        if details or configuration != previous:
+            yield f"  {copy['model']}: {configuration[0]} | {copy['effort']}: {configuration[1]}"
+        previous = configuration
+        if details:
+            yield from _history_timing([invocation], language)
+            for output in invocation["outputs"]:
+                for event in output["activity"]:
+                    stamp, zone = _time(event["observed_at"])
+                    yield text("presentation.history.activity_start" if event["active"] else
+                               "presentation.history.activity_end", language=language, stamp=stamp, zone=zone)
+    result = attempt["result"]
+    if not isinstance(result, Mapping):
+        yield text("presentation.history.result_not_recorded", language=language)
+        return
+    if attempt["status"] == "returned" or attempt["outcome"] is None:
+        yield text("presentation.history.return_awaits_consumption" if attempt["status"] == "returned" else
+                   "presentation.history.result_not_recorded", language=language)
+        if details:
+            yield _body(result)
+        return
+    if attempt["role"] == "review":
+        if attempt["outcome"] in {"pass", "fail", "blocked"}:
+            outcome = {"pass": "passed", "fail": "failed", "blocked": "blocked"}[attempt["outcome"]]
+            yield text("presentation.history.acceptance_" + outcome, language=language)
+        if attempt["status"] == "stale":
+            yield text("presentation.history.historical_result", language=language)
+        for name, lane in result["checks"].items():
+            yield f"  {text('card.check.' + name, language=language)}: {text('card.result.' + lane['status'], language=language)}"
+            if details or lane["status"] == "blocked":
+                yield f"  {copy['evidence']}: {lane['evidence']}"
+            for finding in lane["findings"]:
+                yield text("presentation.history.finding_166", language=language, v1=finding)
+    elif result.get("summary"):
+        yield text("presentation.history.development_summary", language=language) + ": " + result["summary"]
+    elif result.get("pr_title"):
+        yield f"  {text('presentation.history.pr_title', language=language)}: {result['pr_title']}"
+        if details:
+            for field in ("commit_message", "pr_body_markdown"):
+                label = "commit_message" if field == "commit_message" else "pr_body"
+                yield f"  {text('presentation.history.' + label, language=language)}: {result[field]}"
+    for blocker in result.get("human_blockers") or []:
+        yield text("presentation.history.finding_166", language=language, v1=blocker)
+
+
+def _history_lines(document: QueryDocument, details: bool) -> Iterator[str]:
+    copy, terms = _COPY[document.language], _TERMS[document.language]
+    history = document.data["history"]
+    yield copy["history"]
+    owners = {row["subject"]: row["issue"] for row in document.data["subjects"]}
+    attempts = {row["id"]: row for row in history["attempts"]}
+    identities = {identity: attempt for attempt in attempts.values() for invocation in attempt["invocations"]
+                  for identity in (invocation["id"], *(f"{invocation['id']}:{output['ordinal']}" for output in invocation["outputs"]))}
+    shown: set[str] = set()
+    milestones = {"final_activated", "paused", "human_response", "control_applied", "checks_observed", "ci_failed",
+                  "effect_consumed", "generation_requeued", "budget_renewed", "resource_retired", "cleanup_pending",
+                  "boundary_update", "acceptance_promoted"}
+    round_events = {"agent_allocated", "agent_dispatched", "worker_started", "worker_exited", "raw_returned",
+                    "role_consumed", "output_repair_allocated"}
+    for event in history["events"]:
+        attempt = attempts.get(event["identity"]) or identities.get(event["identity"])
+        if attempt is not None and attempt["id"] not in shown:
+            shown.add(attempt["id"])
+            yield from _history_round(attempt, owners[attempt["subject"]], document.language, details)
+        if event["kind"] not in milestones:
+            if attempt is not None or event["kind"] not in round_events:
+                continue
+            kind = text("presentation.history.page_round_unavailable", language=document.language)
+        else:
+            kind = (text("presentation.history.acceptance_installed", language=document.language)
+                    if event["kind"] == "acceptance_promoted" else terms.get(event["kind"], event["kind"]))
+        stamp, zone = _time(event["created_at"])
+        subject = f"#{owners[event['subject']]}" if event["subject"] in owners else copy["global"]
+        yield f"{stamp or copy['unknown']} [{zone}] {subject} {kind}"
+        if event["kind"] in milestones and event["evidence"] is not None and (details or event["kind"] == "human_response"):
+            yield _body(event["evidence"])
+    if history["has_more"]:
+        yield f"{copy['more']}: --after {history['next_after']}"
+    if details:
+        yield text("presentation.history.allowance_records", language=document.language)
+        for job in document.data["subjects"]:
+            if job["budgets"]:
+                yield f"{copy['subject']}: #{job['issue']}"
+                yield from _budget_lines(job, document.language)
+
+
 def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
     copy = _COPY[document.language]
     terms = _TERMS[document.language]
@@ -181,6 +317,9 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
     yield f"{text('presentation.status.overall_progress', language=document.language)}: {progress}"
     yield f"{copy['duration']}: {data['elapsed_seconds'] if data['elapsed_seconds'] is not None else copy['incomplete']}"
     yield copy["unknown_live"]
+    if document.kind == "history":
+        yield from _history_lines(document, details)
+        return
     yield from _notification_lines(document)
     for window in data.get("supervision_windows", []):
         target = window["subject"] or copy["global"]
@@ -227,10 +366,8 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
                 if invocation["outputs"][-1]["started_at"] is not None:
                     yield f"  {copy['started']}"
                 yield f"  {copy['duration']}: {invocation['elapsed_seconds'] if invocation['elapsed_seconds'] is not None else copy['incomplete']}"
-        for budget in job["budgets"] if document.kind != "status" or job["phase"] not in {"complete", "abandoned"} else []:
-            review_limit = budget["review_limit"] if budget["review_limit"] is not None else copy["unknown"]
-            yield (f"  {copy['budget']}: {terms.get(budget['purpose'], budget['purpose'])} W{budget['window']} "
-                   f"D {budget['developments_used']}/{budget['development_limit']} R {budget['reviews_used']}/{review_limit}")
+        if document.kind != "status" or job["phase"] not in {"complete", "abandoned"}:
+            yield from _budget_lines(job, document.language)
         if job["delivery_cleanup"]:
             cleanup = job["delivery_cleanup"]
             yield f"  {copy['cleanup']}: {copy['complete'] if cleanup['state'] == 'complete' else copy['pending']}"
@@ -244,43 +381,6 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
             else:
                 for finding in review_findings(review["artifact"]):
                     yield f"{copy['findings']}: {finding}"
-    if document.kind == "history":
-        yield copy["history"]
-        history = data["history"]
-        attempts = {row["id"]: row for row in history["attempts"]}
-        invocations = {row["id"]: row for attempt in history["attempts"] for row in attempt["invocations"]}
-        shown: set[str] = set()
-        milestones = {"source_refreshed", "final_activated", "role_consumed", "paused", "human_response", "control_applied",
-                      "checks_observed", "ci_failed", "effect_consumed", "generation_requeued", "budget_renewed", "resource_retired", "cleanup_pending"}
-        for event in history["events"]:
-            if not details and event["kind"] not in milestones:
-                continue
-            invocation = invocations.get(event["identity"])
-            attempt = attempts.get(event["identity"]) or (attempts.get(invocation["attempt"]) if invocation else None)
-            if attempt and attempt["id"] not in shown:
-                shown.add(attempt["id"])
-                yield f"{attempt['subject']} {copy.get(attempt['role'], attempt['role'])} #{attempt['ordinal']} ({terms.get(attempt['purpose'], attempt['purpose'])})"
-            stamp, zone = _time(event["created_at"])
-            yield f"{stamp or copy['unknown']} [{zone}] {event['subject']} {terms.get(event['kind'], event['kind'])}"
-            evidence = event["evidence"]
-            if event["kind"] in {"human_response", "paused"} and evidence is not None:
-                content = _body(evidence)
-                yield content if details or len(content) <= 1000 else content[:1000] + " [truncated; --details]"
-            elif details and evidence is not None:
-                yield f"  {copy['evidence']}: {_body(evidence)}"
-            if event["kind"] == "role_consumed":
-                for finding in review_findings(evidence):
-                    yield f"{copy['findings']}: {finding if details or len(finding) <= 1000 else finding[:1000] + ' [truncated; --details]'}"
-        if details:
-            for attempt in history["attempts"]:
-                yield f"{attempt['subject']} {copy.get(attempt['role'], attempt['role'])} #{attempt['ordinal']}: {attempt['status']}"
-                if attempt["result"] is not None:
-                    yield _body(attempt["result"])
-                for invocation in attempt["invocations"]:
-                    yield f"{invocation['attempt']} — {copy['model']}: {invocation['model']} | {copy['effort']}: {invocation['effort']}"
-                    yield f"  {copy['duration']}: {copy['incomplete']}"
-        if history["has_more"]:
-            yield f"{copy['more']}: --after {history['next_after']}"
 
 
 def render(document: QueryDocument, *, style: Literal["json", "plain", "rich"], details: bool, stream: TextIO) -> None:

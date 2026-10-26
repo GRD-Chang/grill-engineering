@@ -1121,5 +1121,16 @@
   "cli.receipt.target": "目标: {target}",
   "cli.receipt.boundary": "此回执不表示 Agent 已启动或交付已完成。",
   "cli.receipt.next": "核对原工作: {command}",
-  "cli.receipt.failed": "请求处理失败"
+  "cli.receipt.failed": "请求处理失败",
+  "presentation.history.round_identity": "#{issue} {role} #{ordinal} · 代次 {generation} · 窗口 {window} ({purpose})",
+  "presentation.history.invocation": "  本轮调用 {ordinal}",
+  "presentation.history.activity_start": "    活动开始: {stamp} ({zone})",
+  "presentation.history.activity_end": "    活动结束: {stamp} ({zone})",
+  "presentation.history.timing_unknown": "    执行耗时未记录",
+  "presentation.history.result_not_recorded": "    本轮结果未记录",
+  "presentation.history.return_awaits_consumption": "    本轮结果已返回，等待程序处理",
+  "presentation.history.historical_result": "    历史结论，不表示对当前成果的授权",
+  "presentation.history.acceptance_installed": "验收成果已安装到交付边界",
+  "presentation.history.allowance_records": "已记录额度窗口（不是每轮启动时的预算快照）",
+  "presentation.history.page_round_unavailable": "此页未包含可关联的完整轮次材料；请扩大历史查询范围"
 }

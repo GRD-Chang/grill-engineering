@@ -1121,5 +1121,16 @@
   "cli.receipt.target": "Target: {target}",
   "cli.receipt.boundary": "This receipt does not prove that an Agent has started or delivery has completed.",
   "cli.receipt.next": "Inspect the existing work: {command}",
-  "cli.receipt.failed": "Request processing failed"
+  "cli.receipt.failed": "Request processing failed",
+  "presentation.history.round_identity": "#{issue} {role} #{ordinal} · Generation {generation} · Window {window} ({purpose})",
+  "presentation.history.invocation": "  Invocation {ordinal} in this round",
+  "presentation.history.activity_start": "    Activity started: {stamp} ({zone})",
+  "presentation.history.activity_end": "    Activity ended: {stamp} ({zone})",
+  "presentation.history.timing_unknown": "    Execution timing not recorded",
+  "presentation.history.result_not_recorded": "    Round result not recorded",
+  "presentation.history.return_awaits_consumption": "    Round result returned; awaiting Controller consumption",
+  "presentation.history.historical_result": "    Historical result; not authorization for the current delivery",
+  "presentation.history.acceptance_installed": "Accepted result installed at the delivery boundary",
+  "presentation.history.allowance_records": "Recorded allowance windows (not round-start budget snapshots)",
+  "presentation.history.page_round_unavailable": "Round details unavailable on this page; expand the history range"
 }
