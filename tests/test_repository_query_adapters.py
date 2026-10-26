@@ -178,7 +178,7 @@ def test_public_repository_adapters_remain_closed_before_any_query_profile_or_pr
     monkeypatch.setattr(selection, 'repository_target', no_repository)
     monkeypatch.setattr(selection, 'repository_candidates', no_repository)
     monkeypatch.setattr(RepositoryRoute, 'metadata', no_repository)
-    assert cli_main.main(arguments, repository_routes=(repository,)) == 1
+    assert cli_main.main(arguments, repository_routes=(repository,)) == 2
     assert json.loads(capsys.readouterr().out)['diagnostics'][0]['code'] == 'repository_activation_incomplete'
     assert dump(repository.database) == before
 
@@ -258,6 +258,11 @@ def test_real_current_database_uncheckpointed_wal_materials_and_budget_survive_n
     raw = database.parent / 'raw.bin'
     raw.write_bytes(b'Exact old raw bytes\0\xff')
     with closing(sqlite3.connect(database, isolation_level=None)) as keeper:
+        # BEGIN is deferred: an actual read pins the pre-Stop snapshot so the
+        # writer's committed WAL cannot disappear on its final close.
+        keeper.execute('BEGIN')
+        assert keeper.execute('SELECT id FROM runs').fetchall() == [(spec.run_id,)]
+        assert keeper.in_transaction
         old.stop_task('old-stop')
         wal = database.with_name(database.name + '-wal')
         assert wal.is_file() and wal.stat().st_size > 0
