@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from contextlib import closing, contextmanager
 import hashlib
+import mmap
 from pathlib import Path
 import sqlite3
 from typing import Any, Iterator, Sequence
@@ -392,7 +393,7 @@ class Storage:
                     raise KernelError("transaction_aborted", "a caught SQL failure poisoned this transaction")
                 if write:
                     require_supported_connection(connection, self.path)
-                self._capacity(connection)
+                self._capacity(connection, committing=write)
                 connection.commit()
             except BaseException as error:
                 connection.rollback()
@@ -409,10 +410,28 @@ class Storage:
                         raise KernelError(diagnostic, f"{error.sqlite_errorname}: {error}") from error
                 raise
 
-    def _capacity(self, connection: sqlite3.Connection) -> None:
+    def _capacity(self, connection: sqlite3.Connection, *, committing: bool = False) -> None:
         page_count = connection.execute("PRAGMA page_count").fetchone()[0]
         page_size = connection.execute("PRAGMA page_size").fetchone()[0]
-        physical = sum(path.stat().st_size for path in (self.path, Path(str(self.path) + "-wal"),
-                                                      Path(str(self.path) + "-shm")) if path.exists())
-        if page_count * page_size > DATABASE_LIMIT or physical > PHYSICAL_LIMIT:
+        database_size = page_count * page_size
+        sizes = [path.stat().st_size if path.exists() else 0 for path in
+                 (self.path, Path(str(self.path) + "-wal"), Path(str(self.path) + "-shm"))]
+        physical = sum(sizes)
+        if committing:
+            # Under BEGIN IMMEDIATE no other writer can append. Commit writes
+            # at most one remaining frame per database page, plus a WAL header
+            # and FULL-sync sector padding (SQLite clamps sectors to 64 KiB).
+            # Already-spilled frames are included in the measured WAL size.
+            frame_size = page_size + 24
+            wal_size = sizes[1] + 32 + page_count * frame_size + 65536 + frame_size
+            # WAL-index regions are 32 KiB: 4062 frames in the first, then 4096.
+            frames = (wal_size - 32 + frame_size - 1) // frame_size
+            shm_size = (1 + (frames + 33) // 4096) * 32768
+            shm_unit = max(32768, mmap.PAGESIZE)
+            shm_size = ((shm_size + shm_unit - 1) // shm_unit) * shm_unit
+            # The writer lock does not exclude an older checkpoint. Reserve
+            # its possible database growth within the existing database cap.
+            physical += (wal_size - sizes[1] + max(0, shm_size - sizes[2])
+                         + max(0, DATABASE_LIMIT - sizes[0]))
+        if database_size > DATABASE_LIMIT or physical > PHYSICAL_LIMIT:
             raise KernelError("storage_limit")

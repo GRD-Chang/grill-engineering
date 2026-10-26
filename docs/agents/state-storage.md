@@ -108,11 +108,22 @@ OperationRunner 将读回证据交给 Core 核验和消费，数据库提交不�
 | `Transaction.rows` | 每次至多 128 行；同一事务累计至多 65,536 行、32 MiB 读取 |
 | 公开响应 | `queries.run` 按实际编码结果检查 32 MiB 上限 |
 | 主库 `DATABASE_LIMIT` | 256 MiB；事务边界检查页面数乘页面大小 |
-| 库及 sidecar `PHYSICAL_LIMIT` | DB/WAL/SHM 合计 1 GiB；事务边界检查实际大小 |
+| 库及 sidecar `PHYSICAL_LIMIT` | DB/WAL/SHM 合计 1 GiB；检查实际大小，写事务另在 COMMIT 前预留提交增长 |
 
 这些检查不宣称存在旧的每批 8 MiB 门禁、`max_page_count` 设置或跨事务查询缓存。
 超限明确失败，不截断证据，不通过删历史或扩大业务预算回退；
 容量界限也不能替代身份、版本、外键、材料摘要、批准适用性与未知结果对账。
+
+写事务持有原 `BEGIN IMMEDIATE` writer lock，在提交前将当前实占用与保守增长预留合并检查：
+剩余 WAL 页面帧、标头与 FULL 同步填充，SHM 索引区域及 OS 页对齐，
+以及并发 checkpoint 在既有 `DATABASE_LIMIT` 内可能造成的主库增长。
+预留不足返回 `storage_limit`，原事务回滚；不在已提交后抛错冒充回滚。
+因此写入可能在实际文件尚未达到 1 GiB 时拒绝，不保证可使用到上限的最后一个字节；
+配额数值及数据库上限不变，读取只检查实际占用。
+
+这是受管 SQLite 事务的提交准入界限，不是文件系统硬配额：事务体的 cache spill 可能临时增加 WAL，
+回滚也不承诺立即缩短 WAL 尾部。正常 checkpoint 可回收 sidecar 空间，
+程序不删除原始证据、扩大配置或改变 SQLite 同步、缓存、checkpoint 策略来规避拒绝。
 
 ## 控制、原子性与收口权限
 
