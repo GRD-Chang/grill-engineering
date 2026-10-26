@@ -163,7 +163,8 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
             yield copy["no_runs"]
         for run in data["runs"]:
             stamp, zone = _time(run["created_at"])
-            yield f"{run['repository']} Parent #{run['parent']} {run['run_id']}"
+            identity = json.dumps(run["run_id"], ensure_ascii=True)
+            yield f"{run['repository']} Parent #{run['parent']} {identity}"
             yield f"  {run['repository_root'] or copy['unknown']} | {stamp or copy['unknown']} ({zone}) | {', '.join(run['phases'])}"
         return
     yield f"{copy['run']}: {data['repository']} Parent #{data['parent']['number']}"

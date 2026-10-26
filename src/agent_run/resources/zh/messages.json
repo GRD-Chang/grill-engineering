@@ -55,6 +55,8 @@
   "card.guidance_unavailable": "指引含不安全控制符，无法在卡片提供可复制命令；请在本地按完整 Run ID 查询。",
   "card.guidance_too_long": "指引过长，无法在卡片完整显示；请在本地按完整 Run ID 查询。",
   "card.payload_too_large": "完整卡片超过消息大小限制，未发送；请在本地查询完整状态。",
+  "guidance.exact_action_unavailable": "exact_run_command_unavailable：当前 CLI 无法表达针对原 Run ID {identity} 的精确动作。不提供可执行动作命令，请勿改用 Parent 编号。",
+  "guidance.unsafe_identity": "unsafe_command_identity：{identity} 含控制字符，显示会改变查询目标，因此不提供可执行命令。请从 JSON 核验原始身份。",
   "card.boundary.local": "子任务待办",
   "card.boundary.global": "整体交付待办",
   "card.next_step": "下一步",

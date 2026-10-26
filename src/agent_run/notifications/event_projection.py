@@ -14,7 +14,7 @@ from agent_run.contracts.repository import same_repository
 from agent_run.queries.execution import execution_facts
 from agent_run.queries.read_facts import read_boundaries
 from agent_run.storage.sqlite import Transaction
-from agent_run.queries.read_facts import action_command
+from agent_run.queries.read_facts import action_guidance
 from agent_run.queries.resume_facts import resume_facts
 
 
@@ -48,7 +48,7 @@ def completion_context(view: Mapping[str, Any], state: dict[str, Any]) -> dict[s
     """
     tickets = [job for job in view["subjects"] if job["kind"] == "ticket"]
     completed = sum(job["phase"] == "complete" for job in tickets)
-    status_query = action_command("status", run_id=state["run_id"], repository=state["repository"])
+    status_query = action_guidance("status", run_id=state["run_id"], repository=state["repository"], language=state["language"])
     actions = [{"issue": item.get("issue"), "scope": item["scope"],
                 "reasons": item["reasons"], "next_action": item["next_action"]}
                for item in view["actions"]]

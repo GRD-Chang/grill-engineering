@@ -1,5 +1,6 @@
 """Displayed actions select the original Task through the real CLI grammar."""
 from dataclasses import replace
+from hashlib import sha256
 import json
 import subprocess
 import sys
@@ -9,18 +10,22 @@ from markdown_it import MarkdownIt
 
 from agent_run.adapters.systemd import SystemdHost
 from agent_run.adapters.git_objects import LocalGit
+from agent_run.adapters.local_git import LocalEffects
 from agent_run.adapters.workspace import ManagedWorkspace
 from agent_run.cli import lifecycle
 from agent_run.cli.main import main
 from agent_run.cli.main import _parser
 from agent_run.core.kernel import Kernel
+from agent_run.core.operation_runner import OperationRunner
+from agent_run.core.operation_contract import DeliveryFacts
 from agent_run.model import Delivery, DeliveryKind, Issue, ParentIssue, Requirements, RunSpec
 from agent_run.notifications.cards import card
 from agent_run.notifications.envelope import event_envelope
 from agent_run.notifications.event_projection import completion_context, event_state
-from agent_run.queries.read_facts import action_command, read_boundaries
+from agent_run.queries.read_facts import action_guidance, read_boundaries
 from agent_run.queries.run import read
 from support.offline import GraphScenario, fixture_inputs
+from support.core_operations import ReadOnlyPorts
 
 
 @pytest.fixture
@@ -112,7 +117,8 @@ def _published_task(remote, repository, identity, parent, *, language="en", tick
         "refs/heads/run", "refs/heads/main"),)
     spec = RunSpec(identity, workspace.repository, parent, "parent", "graph", jobs,
                    repository_root=str(workspace.repository_root), language=language, inputs=fixture_inputs())
-    return Kernel.create_task(workspace.state_root / str(parent) / "kernel.sqlite3", spec, requirements=source)
+    directory = sha256(identity.encode()).hexdigest()[:16]
+    return Kernel.create_task(workspace.state_root / str(parent) / directory / "kernel.sqlite3", spec, requirements=source)
 
 
 @pytest.mark.parametrize("language", ["zh", "en"])
@@ -125,12 +131,16 @@ def test_displayed_stop_resume_and_queries_select_only_the_original_published_ta
     other = _published_task(git_repo, "example/project", "1", 7)
     foreign = _published_task(git_repo, "other/project", identity, 1)
     other_before, foreign_before = other.source_status(), foreign.source_status()
-    stop = action_command("stop", run_id=identity, repository="example/project", parent_issue=1,
-                          ticket=2 if local else None)
-    argv = shell_argv(stop)
-    assert main([argv[0], "--json", *argv[1:]]) == 0
-    applied = json.loads(capsys.readouterr().out)
-    assert applied["run_id"] == identity and applied["status"] == "action_applied"
+    stop = action_guidance("stop", run_id=identity, repository="example/project",
+                          ticket=2 if local else None, language=language)
+    if identity.isdecimal():
+        assert "exact_run_command_unavailable" in stop and not stop.startswith("agent-run ")
+        assert wanted.stop_task("explicit-api-stop", subject="ticket:2" if local else None) == "applied"
+    else:
+        argv = shell_argv(stop)
+        assert main([argv[0], "--json", *argv[1:]]) == 0
+        applied = json.loads(capsys.readouterr().out)
+        assert applied["run_id"] == identity and applied["status"] == "action_applied"
     if local:
         assert wanted.status("ticket:2")["gates"] == ["operator_stopped"]
         assert wanted.status("ticket:3")["gates"] == []
@@ -144,11 +154,11 @@ def test_displayed_stop_resume_and_queries_select_only_the_original_published_ta
     event = event_envelope(state, "boundary", "original-stop", "Stopped",
         summary="Original summary. " * 20, **completion_context(view, state))
     commands = _displayed_commands(event)
-    assert len(commands) == 3
+    assert len(commands) == (2 if identity.isdecimal() else 3)
     for command in commands:
         argv = shell_argv(command)
         if argv[0] == "resume":
-            assert argv[-1] == ("1" if identity.isdecimal() else identity)
+            assert not identity.isdecimal() and argv[-1] == identity
             assert main([argv[0], "--json", *argv[1:]]) == 2
             failure = json.loads(capsys.readouterr().out)
             assert failure["diagnostics"][0]["code"] == "execution_readiness"
@@ -158,6 +168,102 @@ def test_displayed_stop_resume_and_queries_select_only_the_original_published_ta
             document = json.loads(capsys.readouterr().out)
             assert document["run_id"] == identity and document["parent"]["number"] == 1
             assert document["repository"] == "example/project"
-    assert unavailable_manager == [(identity, wanted.storage.path)]
+    assert unavailable_manager == ([] if identity.isdecimal() else [(identity, wanted.storage.path)])
     assert other.source_status() == other_before and foreign.source_status() == foreign_before
     assert wanted.active_host_action() is None
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+@pytest.mark.parametrize("operation", ["resume", "stop"])
+def test_stale_numeric_run_card_cannot_control_its_normal_successor(
+    tmp_path, git_repo, capsys, shell_argv, unavailable_manager, language, operation,
+):
+    original = _published_task(git_repo, "example/project", "7", 1, language=language)
+    execution = original.claim_executor("original-driver")
+    assert original.stop_task("original-pause") == "applied"
+    with original.storage.transaction(write=False) as tx:
+        state = event_state(tx)
+    old_card = event_envelope(state, "boundary", "old-stop", "Stopped",
+        next_step=action_guidance(operation, run_id="7", repository="example/project", language=language))
+    # Finish only the normally claimed in-process fixture driver; no physical
+    # Host or Worker was started or assigned an invented exit observation.
+    original.confirm_executor_exit(execution)
+    assert original.control("resume", "prepare-abandon") == "applied"
+    driver = original.claim_executor("abandon-driver")
+    assert original.abandon_task("original-abandon", resource_inspections=()) == "pending"
+    base = LocalGit(ManagedWorkspace.for_repository("example/project").repository_root).commit("HEAD")
+    local = LocalEffects(LocalGit(ManagedWorkspace.for_repository("example/project").repository_root))
+
+    class Ports(ReadOnlyPorts):
+        def inspect(self, resources):
+            return local.inspect_resources(resources)
+
+        def execute(self, effect, authority):
+            if effect.operation == "inspect_resources":
+                return local.execute(effect, authority)
+            return super().execute(effect, authority)
+
+    ports = Ports(Requirements(ParentIssue(1, "Parent", "Scope"), ()),
+                         "refs/heads/run", "refs/heads/main", DeliveryFacts(base, base))
+    runner = OperationRunner(original, driver, lambda _: ports)
+    for _ in range(8):
+        if runner.run_once().kind == "complete":
+            break
+    else:
+        pytest.fail("the normal resource-free Abandon did not complete")
+    original.confirm_executor_exit(driver)
+    assert original.source_status()["abandonment"]["status"] == "complete"
+    successor = _published_task(git_repo, "example/project", "successor", 1, language=language)
+    assert successor.storage.path != original.storage.path
+    assert read(successor.storage.path, "status").data["run_id"] == "successor"
+    before = successor.source_status()
+    executable = _displayed_commands(old_card)
+    for command in executable:
+        argv = shell_argv(command)
+        main([argv[0], "--json", *argv[1:]])
+        capsys.readouterr()
+    assert successor.source_status() == before
+    assert unavailable_manager == []
+    assert executable == []
+    rendered = json.dumps(card(old_card), ensure_ascii=False)
+    assert "exact_run_command_unavailable" in rendered
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+@pytest.mark.parametrize("terminal", [False, True], ids=["plain", "rich"])
+@pytest.mark.parametrize("identity,encoded", [("a\u202eb", r'"a\u202eb"'),
+    ("a\x1b[31mb", r'"a\u001b[31mb"'), ("a\nb", r'"a\nb"')])
+def test_terminal_guidance_never_deletes_a_control_character_to_target_another_run(
+    tmp_path, git_repo, capsys, shell_argv, monkeypatch, language, terminal, identity, encoded,
+):
+    wanted = _published_task(git_repo, "example/project", identity, 1, language=language)
+    other = _published_task(git_repo, "example/project", "ab", 7)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: terminal)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLUMNS", "200")
+    assert main(["status", "--repo", "example/project", "--", identity]) == 0
+    output = capsys.readouterr().out
+    commands = [line[line.index("agent-run "):] for line in output.splitlines() if "agent-run " in line]
+    for command in commands:
+        argv = shell_argv(command)
+        assert main([argv[0], "--json", *argv[1:]]) == 0
+        observed = json.loads(capsys.readouterr().out)
+        assert observed["run_id"] == identity and observed["parent"]["number"] == 1
+    assert commands == []
+    assert encoded in output and identity not in output
+    assert "unsafe_command_identity" in output
+    assert main(["runs", "--repo", "example/project"]) == 0
+    inventory = capsys.readouterr().out
+    assert encoded in inventory and identity not in inventory
+    assert read(wanted.storage.path, "status").data["run_id"] == identity
+    assert read(other.storage.path, "status").data["run_id"] == "ab"
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+@pytest.mark.parametrize("operation,identity", [("run", "normal-run"), ("resume", "7"),
+    ("stop", "7"), ("approve", "7"), ("requeue", "7"), ("abandon", "7")])
+def test_task_only_cli_grammar_never_becomes_an_exact_run_action(operation, identity, language):
+    guidance = action_guidance(operation, run_id=identity, repository="example/project", language=language)
+    assert "exact_run_command_unavailable" in guidance
+    assert not guidance.startswith("agent-run ")
+    assert json.dumps(identity) in guidance

@@ -55,6 +55,8 @@
   "card.guidance_unavailable": "Guidance contains unsafe control characters; no copyable command is shown. Query locally using the complete Run ID.",
   "card.guidance_too_long": "Guidance is too long to display in full in this card. Query locally using the complete Run ID.",
   "card.payload_too_large": "The complete card exceeds the message size limit; it was not sent. Query the full status locally.",
+  "guidance.exact_action_unavailable": "exact_run_command_unavailable: the current CLI cannot express an exact action for Run ID {identity}. No executable action command is provided; do not substitute a Parent number.",
+  "guidance.unsafe_identity": "unsafe_command_identity: {identity} contains control characters. No executable command is provided because display would change its target. Inspect the original identity in JSON.",
   "card.boundary.local": "Ticket boundary",
   "card.boundary.global": "Run boundary",
   "card.next_step": "Next step",
