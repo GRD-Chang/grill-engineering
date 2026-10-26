@@ -23,14 +23,15 @@ def _snapshot(root: Path) -> dict[str, bytes]:
             and not (path.name.endswith("-wal") and path.stat().st_size == 0)}
 
 
-def _run(root: Path, *, enabled: bool = True, run_id: str = "notification-query", frozen: bool = True) -> Kernel:
+def _run(root: Path, *, enabled: bool = True, run_id: str = "notification-query", frozen: bool = True,
+         language: str = "en") -> Kernel:
     defaults = UserDefaultsStore()
-    defaults.configure(language="en", notifications={"enabled": enabled, "open_id": "ou_frozen",
+    defaults.configure(language=language, notifications={"enabled": enabled, "open_id": "ou_frozen",
         "profile": "frozen-profile", "app_id": "cli_frozen"})
     delivery = Delivery("parent:1", DeliveryKind.PARENT_ONLY, 1, "requirement", Commit("base", "tree"),
                         "refs/heads/parent", "refs/heads/main")
     spec = RunSpec(run_id, "example/project", 1, "parent", "graph", (delivery,),
-                   language="en", repository_root=str(root / "checkout"))
+                   language=language, repository_root=str(root / "checkout"))
     if frozen:
         spec = freeze_creation(spec, defaults)
     return Kernel.create(root / spec.run_id / "kernel.sqlite3", spec)
@@ -282,4 +283,45 @@ def test_public_notification_warning_and_json_preserve_current_delivery_facts(
                 reason = "Feishu notifications unavailable: Original sender failure evidence"
                 assert reason in output.getvalue()
                 assert "binding not recorded" in output.getvalue()
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("language", ["en", "zh"])
+@pytest.mark.parametrize("style", ["plain", "rich"])
+def test_history_notification_diagnostics_remain_readonly_in_each_language(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, language: str, style: str,
+) -> None:
+    from contextlib import redirect_stdout
+
+    kernel = _run(tmp_path, language=language)
+    _journal(kernel)
+    with outbox.transaction(kernel.storage.path.parent, "notification-query") as document:
+        document["unavailable_reason"] = "Original sender failure evidence"
+    before = _snapshot(tmp_path)
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Rendering history must not start a sender or an external command")
+
+    monkeypatch.setattr("subprocess.run", forbidden)
+    monkeypatch.setattr("agent_run.notifications.sender.NativeNotifications", forbidden)
+    machine = io.StringIO()
+    with redirect_stdout(machine):
+        assert main(["history", "notification-query", "--state-dir", str(kernel.storage.path), "--json"]) == 0
+    assert json.loads(machine.getvalue())["notifications"]["unconfirmed_count"] == 4
+    output = io.StringIO()
+    if style == "rich":
+        output.isatty = lambda: True
+        monkeypatch.setenv("TERM", "xterm")
+        monkeypatch.delenv("NO_COLOR", raising=False)
+    with redirect_stdout(output):
+        assert main(["history", "notification-query", "--state-dir", str(kernel.storage.path)]) == 0
+    rendered = output.getvalue()
+    if language == "en":
+        assert "Feishu notifications not confirmed delivered: 4;" in rendered
+        assert "Feishu notifications unavailable: Original sender failure evidence" in rendered
+        assert "binding not recorded" in rendered
+    else:
+        assert "飞书通知未确认送达: 4 条" in rendered
+        assert "飞书通知不可用: Original sender failure evidence" in rendered
+        assert "通知日志未记录收件人及配置的绑定回执" in rendered
     assert _snapshot(tmp_path) == before
