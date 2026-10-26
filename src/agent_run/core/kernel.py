@@ -2237,7 +2237,8 @@ class Kernel:
             for waiting in tx.rows("SELECT * FROM waits WHERE kind='agent_preparation'"):
                 preparation, _ = self._preparation(tx, waiting)
                 if preparation.execution == execution and not self._gates(tx, preparation.subject):
-                    self._gate(tx, preparation.subject, "worker_unavailable", evidence=material)
+                    evidence = tx.put(preparation.subject, "executor_failure", tx.get(material, owner))
+                    self._gate(tx, preparation.subject, "worker_unavailable", evidence=evidence)
             # Raw/exit can settle before a failed revocation is retried. The
             # original unconsumed Attempt remains authoritative after its lease.
             for job in tx.rows("SELECT s.id FROM subjects s JOIN attempts a ON a.id=s.current_attempt "

@@ -302,3 +302,34 @@ def test_host_exit_does_not_block_continuation_of_an_already_approved_final_acti
         assert tx.one('SELECT count(*) FROM grants')[0]==1
         assert tx.one('SELECT action FROM grants WHERE id=?',(grant,))[0]=='original-final-grant'
         assert tx.one('SELECT status FROM actions WHERE id=\'original-final-grant\'')[0]=='complete'
+
+
+def test_failed_executor_preserves_each_preparation_owner_for_one_run_resume(tmp_path):
+    scenario,kernel,_,host,_,exited,requests,calls=interrupted_run(tmp_path,admitted=False)
+    assert not calls and {request.subject for request in requests}=={'ticket:2','ticket:3'}
+    before={request.subject:kernel.status(request.subject)['budgets'] for request in requests}
+    with kernel.executor_scope(scenario.execution) as close_admission:
+        close_admission(OSError('controlled Host preparation failure'))
+    with kernel.storage.transaction(write=False) as tx:
+        original=[dict(row) for row in tx.all('SELECT g.subject,g.evidence,m.subject AS evidence_owner,m.body '
+            'FROM gates g JOIN material m ON m.id=g.evidence WHERE g.code=\'worker_unavailable\' ORDER BY g.subject')]
+        assert len(original)==2
+    assert kernel.observe_host(host,exited)=='exited'
+    assert all(kernel.worker_settled(request) for request in requests)
+    assert kernel.resume_subject() is None
+    assert kernel.control('resume','resume-all-original-preparations')=='applied'
+    for request in requests:
+        assert kernel.status(request.subject)['gates']==[]
+        assert kernel.status(request.subject)['budgets']==before[request.subject]
+        with kernel.storage.transaction(write=False) as tx:
+            row=tx.one('SELECT resume_action,thread_id FROM attempts WHERE id=?',(request.attempt_id,))
+            assert row['resume_action']=='resume-all-original-preparations'
+            assert row['thread_id']==request.thread_id
+    assert all(row['subject']==row['evidence_owner'] for row in original)
+    assert len({row['evidence'] for row in original})==2
+    assert original[0]['body']==original[1]['body']
+    with kernel.storage.transaction(write=False) as tx:
+        assert not tx.rows('SELECT id FROM invocations')
+        assert not tx.rows('SELECT id FROM leases')
+        assert not tx.rows('SELECT scope_id FROM waits WHERE kind=\'agent_preparation\'')
+        assert tx.one('SELECT executor FROM runs')[0] is None
