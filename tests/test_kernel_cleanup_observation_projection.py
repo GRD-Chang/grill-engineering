@@ -76,7 +76,7 @@ def pending_cleanup(tmp_path, monkeypatch, operation="cleanup_worktree", *, sibl
     """Stop at a real committed intent; never seed or edit persisted state."""
     if sibling:
         from support.offline import GraphScenario
-        from test_kernel_requirements import independent_source
+        from support.requirements_scenarios import independent_source
         s = GraphScenario(tmp_path / "scenario", independent_source())
     else:
         s = _native_scenario(tmp_path / "scenario", DeliveryKind.TICKET)

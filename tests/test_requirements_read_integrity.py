@@ -22,7 +22,7 @@ def test_graphql_partial_data_and_errors_is_not_a_requirement_snapshot(tmp_path,
 
 
 def test_partial_source_cannot_be_committed_by_the_normal_kernel_refresh(tmp_path, monkeypatch):
-    from test_kernel_requirements import source_run
+    from support.requirements_scenarios import source_run
 
     reader, _ = _reader(tmp_path, monkeypatch)
     source = read_requirements(reader, 1)

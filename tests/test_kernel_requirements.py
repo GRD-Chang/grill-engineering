@@ -7,27 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.model import Commit, Delivery, DeliveryKind, Policy, Requirements, RunSpec, World
+from agent_run.model import Commit, Policy, Requirements, World
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from support.offline import GraphScenario
 from agent_run.model import Effect, Execution, HostObservation
 from support.core_operations import CoreOperations, scripted_return
 from support.api_observation import api_writes, lose_api_reply, pr_author_read
-
-
-def native_input() -> dict:
-    return json.loads((Path(__file__).parent / "data/kernel/graph-refresh-v1.json").read_text())
-
-
-def source_run(path: Path, requirements: Requirements | None = None) -> tuple[Kernel, Requirements]:
-    source = requirements or Requirements.from_wire(native_input()["initial_requirements"])
-    base = Commit("base", "base-tree")
-    deliveries = tuple(Delivery(f"ticket:{number}", DeliveryKind.TICKET, number, "reader-untrusted-revision", base,
-                                f"refs/heads/ticket-{number}", "refs/heads/run") for number in source.parent.sub_issue_numbers)
-    final = Delivery("final:1", DeliveryKind.FINAL_RUN, 1, "reader-untrusted-revision", base, "refs/heads/run", "refs/heads/main")
-    spec = RunSpec("native-run", "example/project", 1, "untrusted-parent", "untrusted-graph", (*deliveries, final), Policy(concurrency=2))
-    return Kernel.create(path, spec, requirements=source), source
+from support.requirements_scenarios import independent_source, native_input
 
 
 def test_closed_local_dependency_without_completion_never_unblocks_or_creates_final(tmp_path: Path) -> None:
@@ -101,11 +88,6 @@ def test_real_ticket_close_receipts_create_completion_before_dependency_and_fina
     assert scenario.port.remote_commit("refs/heads/main") != scenario.port.remote_commit("refs/heads/run")
     scenario.kernel.control("approve", "approve-whole-parent", subject=final, world=scenario.world())
     assert scenario.run().kind == "complete"
-
-
-def independent_source() -> Requirements:
-    source = Requirements.from_wire(native_input()["initial_requirements"])
-    return replace(source, issues=tuple(replace(issue, blocked_by=()) for issue in source.issues))
 
 
 def demand_world(kernel: Kernel, subject: str) -> World:

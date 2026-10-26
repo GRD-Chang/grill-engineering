@@ -152,7 +152,7 @@ def test_prompt_preparation_failure_durably_releases_only_its_original_allocatio
     import threading
     from support.offline import GraphScenario
     from support.core_operations import CoreOperations
-    from test_kernel_requirements import independent_source
+    from support.requirements_scenarios import independent_source
     scenario = GraphScenario(tmp_path / "preparation", independent_source())
     kernel = scenario.kernel
     operations = CoreOperations(kernel, scenario.execution, scenario.make_ports, prepare_agents=False)
@@ -185,7 +185,7 @@ def test_stop_between_dispatch_and_write_does_not_invent_a_command_failure(
 ) -> None:
     from support.offline import GraphScenario
     from support.core_operations import CoreOperations, scripted_return
-    from test_kernel_requirements import independent_source
+    from support.requirements_scenarios import independent_source
     scenario = GraphScenario(tmp_path / "stop", independent_source())
     kernel = scenario.kernel
     operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)

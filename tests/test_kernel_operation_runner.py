@@ -14,7 +14,7 @@ from agent_run.errors import KernelError
 from support.offline import GraphScenario
 from agent_run.core.operation_contract import ReadUnavailable
 from agent_run.queries.run import read
-from test_kernel_requirements import independent_source, native_input
+from support.requirements_scenarios import independent_source, native_input
 
 
 class Ports:

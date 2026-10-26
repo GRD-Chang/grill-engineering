@@ -303,7 +303,7 @@ def test_explicit_final_publication_reuse_requires_lazy_current_authority(tmp_pa
 @pytest.mark.parametrize("operation", ["validation_cleanup", "cleanup_worktree", "cleanup_local_ref"])
 def test_original_absent_local_cleanup_requires_lazy_authority(tmp_path: Path, monkeypatch, operation: str) -> None:
     from support.offline import GraphScenario
-    from test_kernel_requirements import independent_source
+    from support.requirements_scenarios import independent_source
 
     scenario = GraphScenario(tmp_path / "scenario", independent_source())
     held = advance_to_effect(scenario, monkeypatch, operation)

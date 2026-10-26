@@ -19,7 +19,7 @@ from agent_run.runtime.process_identity import _process_start_token
 from support.offline import GraphScenario
 from test_kernel_operation_integration import _admit_host
 from test_kernel_operation_runner import Ports
-from test_kernel_requirements import independent_source
+from support.requirements_scenarios import independent_source
 from test_kernel_host_admission import task_run
 
 

@@ -11,7 +11,7 @@ from agent_run.model import DeliveryKind, Policy
 import agent_run.runtime.executor as executor
 from support.offline import GraphScenario, Scenario
 from agent_run.core.operation_contract import ReadUnavailable
-from test_kernel_requirements import independent_source
+from support.requirements_scenarios import independent_source
 from test_kernel_operation_review_host import _NoNotifications
 
 

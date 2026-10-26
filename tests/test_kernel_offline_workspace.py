@@ -3,7 +3,7 @@ from pathlib import Path
 
 from agent_run.model import DeliveryKind
 from support.offline import GraphScenario
-from test_kernel_requirements import independent_source
+from support.requirements_scenarios import independent_source
 
 
 def test_graph_scenario_leaves_ticket_resources_for_the_first_workspace_effect(tmp_path: Path) -> None:

@@ -15,7 +15,7 @@ from agent_run.core.kernel import Kernel
 from agent_run.config.creation import freeze_creation
 from agent_run.notifications.sender import NativeNotifications
 from support.offline import GraphScenario, Scenario
-from test_kernel_requirements import independent_source
+from support.requirements_scenarios import independent_source
 
 
 def _enabled_scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: DeliveryKind,

@@ -8,7 +8,7 @@ import agent_run.runtime.executor as executor
 from support.offline import GraphScenario
 from test_kernel_host_observation import admit_scenario
 from test_kernel_operation_runner import Ports
-from test_kernel_requirements import independent_source
+from support.requirements_scenarios import independent_source
 
 
 class Notifications:
