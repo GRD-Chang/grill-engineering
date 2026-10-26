@@ -176,17 +176,19 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
     scenario.requirements = independent_source()
     assert next(issue for issue in ports.source(1).issues if issue.number == 4).state == "OPEN"
     now[0] = 105.25
-    entered, polled = threading.Event(), threading.Event()
+    entered, polled, completed, returned = (threading.Event() for _ in range(4))
     delivery = ports.delivery
     def read(request):
         facts = delivery(request)
-        if request.check_head is not None and facts.pr is not None and facts.pr.source_ref == "refs/heads/ticket-3":
-            if entered.is_set():
+        if facts.pr is not None and facts.pr.state == "OPEN" and facts.pr.source_ref == "refs/heads/ticket-3":
+            if request.check_head is not None and entered.is_set() and not polled.is_set():
                 with scenario.kernel.storage.transaction(write=False) as tx:
                     assert len(tx.rows("SELECT id FROM leases")) == 1
                     assert tx.one("SELECT integration_holder FROM runs")[0] == "ticket:3"
                 polled.set()
-            return replace(facts, checks=Checks(facts.pr.number, facts.pr.head.sha, "none" if polled.is_set() else "pending"))
+            conclusion = "pass" if polled.is_set() else "pending"
+            return replace(facts, checks=Checks(facts.pr.number, facts.pr.head.sha, conclusion,
+                                               (("quality", conclusion),)))
         return facts
     monkeypatch.setattr(ports, "delivery", read)
     monkeypatch.setattr(executor, "_make_ports", lambda binding: ports)
@@ -204,13 +206,34 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
                 now[0] = 111.25
                 entered.set()
                 assert polled.wait(8), "CI poll stalled behind the only Agent worker"
+                assert completed.wait(8), "Ticket merge/close stalled behind the only Agent worker"
+                assert not returned.is_set()
+                returned.set()
             scenario.select(call.subject)
             kernel.receive(call, scenario.agent(call))
         finally:
             kernel.agent_exited(call, process, 0)
     monkeypatch.setattr('agent_run.runtime.codex.execute_selected_codex', execute)
-    monkeypatch.setattr('agent_run.notifications.sender.NativeNotifications', Notifications)
-    # The 8-second handshake above verifies CI progress alongside the Agent.
+    class CompletionObserver(Notifications):
+        def observe_committed(self):
+            # Observe only; the real runner must produce merge, close and
+            # Completion while B is still blocked in its first Agent call.
+            if not entered.is_set() or completed.is_set():
+                return
+            if scenario.kernel.status("ticket:3")["phase"] != "complete":
+                return
+            assert polled.is_set() and not returned.is_set()
+            pr = scenario.port.pull_request_by_ref("refs/heads/ticket-3", "refs/heads/run")
+            assert pr is not None and pr.merged is not None
+            assert scenario.port.remote_commit("refs/heads/run") == pr.merged
+            assert scenario.port.objects.issue(3)["state"] == "closed"
+            assert any(item["subject"] == "ticket:3" for item in scenario.kernel.source_status()["completions"])
+            writes = [item["operation"] for item in scenario.port.writes() if item["subject"] == "ticket:3"]
+            assert writes.count("merge") == writes.count("close") == 1
+            completed.set()
+
+    monkeypatch.setattr('agent_run.notifications.sender.NativeNotifications', CompletionObserver)
+    # The bounded handshakes verify actual Ticket closeout alongside the Agent.
     # This 90-second bound only prevents the full Git/Host-to-Final fixture hanging.
     def expired(_signum, _frame):
         raise TimeoutError("CI/Agent full-flow fixture exceeded its 90-second watchdog")
@@ -224,6 +247,7 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous_handler)
     assert entered.is_set() and polled.is_set()
+    assert completed.is_set() and returned.is_set()
     assert scenario.kernel.status(scenario.kernel.source_status()["final_subject"])["phase"] == "approval"
 
 

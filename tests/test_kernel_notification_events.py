@@ -319,6 +319,59 @@ def _project(kernel: Kernel, mode: str) -> list[dict[str, Any]]:
         return result
 
 
+def test_completed_ticket_effort_spans_budget_renewal_without_recounting_resume(tmp_path, monkeypatch):
+    import json
+    from agent_run.model import Policy
+    from agent_run.notifications.cards import card
+    from agent_run.queries.run import read
+
+    scenario = GraphScenario(tmp_path, Requirements(ParentIssue(1, "Parent", "Scope", (2,)),
+        (Issue(2, "Ticket", "Original task", "OPEN", labels=("ready-for-agent",)),)),
+        policy=Policy(ticket_ci_developments=1, ticket_ci_review=True))
+    scenario.checks = ["fail", "fail", "none"]
+    now, calls = [100.0], []
+    scenario.kernel.clock = lambda: now[0]
+
+    def started(call):
+        calls.append(call)
+        seconds = {Role.DEVELOPMENT: 2, Role.REVIEW: 3, Role.PUBLICATION: 5}[call.role]
+        scenario.kernel.observe_worker_activity(call, "start", active=True, observed_at=now[0] + 1,
+                                                evidence={"type": "turn.started"})
+        scenario.kernel.observe_worker_activity(call, "end", active=False, observed_at=now[0] + 1 + seconds,
+                                                evidence={"type": "turn.completed"})
+        now[0] += seconds + 2
+
+    _recorded_agents(scenario, monkeypatch, started=started)
+    assert scenario.run().kind == "paused"
+    before = scenario.kernel.status("ticket:2")["budgets"]
+    assert (before["ci"]["window"], before["ci"]["developments_used"], before["ci"]["reviews_used"]) == (1, 1, 1)
+    prior_attempts = {call.attempt_id for call in calls}
+    now[0] += 100  # Human waiting is not Agent execution.
+    assert scenario.kernel.control("resume", "renew-ci-once", subject="ticket:2") == "applied"
+    assert scenario.kernel.control("resume", "renew-ci-once", subject="ticket:2") == "applied"
+    renewed = scenario.kernel.status("ticket:2")["budgets"]
+    assert (renewed["ci"]["window"], renewed["ci"]["developments_used"], renewed["ci"]["reviews_used"]) == (2, 0, 1)
+    assert renewed["requirements"] == before["requirements"]
+    assert scenario.run().kind == "complete"
+    assert scenario.kernel.status("ticket:2")["resource_cleanup"]["state"] == "complete"
+    assert scenario.port.objects.issue(2)["state"] == "closed"
+    projected = _project(scenario.kernel, "concise")
+    event, = [item for item in projected if item["kind"] == "ticket_completed"]
+    attempts = read(scenario.kernel.storage.path, "history").data["history"]["attempts"]
+    assert prior_attempts <= {attempt["id"] for attempt in attempts}
+    for role, seconds in ((Role.DEVELOPMENT, 6), (Role.REVIEW, 9)):
+        actual = {call.attempt_id for call in calls if call.role == role}
+        assert len(actual) == event["effort"][role.value]["rounds"] == 3
+        assert actual == {attempt["id"] for attempt in attempts if attempt["role"] == role.value}
+        assert event["effort"][role.value]["execution_seconds"] == seconds
+    assert sum(call.role == Role.PUBLICATION for call in calls) == 3
+    assert event["total_seconds"] == 30 and event["execution_timing_complete"] is True
+    for language, count in (("zh", "3 轮"), ("en", "3 rounds")):
+        rendered = json.dumps(card({**event, "language": language}), ensure_ascii=False)
+        assert rendered.count(count) == 2
+    assert _project(scenario.kernel, "concise") == projected
+
+
 @pytest.mark.parametrize("mode", ["detailed", "concise"])
 def test_role_events_require_real_start_and_consumption_and_do_not_duplicate_first_start(
     tmp_path: Path, mode: str, monkeypatch: pytest.MonkeyPatch,

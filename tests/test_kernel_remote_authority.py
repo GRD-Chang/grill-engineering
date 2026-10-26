@@ -1,6 +1,7 @@
 """Remote heads and original-intent readback, independent of local Git refs."""
 
 from pathlib import Path
+import json
 
 import pytest
 
@@ -106,3 +107,39 @@ def test_original_merge_readback_distinguishes_server_commit_from_partial_local_
             with pytest.raises(EffectBoundary) as pending:
                 scenario.runner().run_once()
         assert pending.value.phase == "reconcile" and pending.value.effect == effect
+
+
+@pytest.mark.parametrize("operation", ["merge", "close"], ids=["merge-ack-lost", "close-ack-lost"])
+def test_parent_closeout_recovers_after_merged_source_ref_is_deleted(tmp_path, monkeypatch, operation):
+    scenario = Scenario(tmp_path / "parent", DeliveryKind.PARENT_ONLY)
+    with effect_boundary(scenario, monkeypatch, operation, sent=True):
+        with pytest.raises(EffectBoundary) as held:
+            scenario.run(approve=True)
+    effect, authority = held.value.effect, held.value.authorize
+    assert authority is not None
+    scenario.port.lose_response.add(operation)
+    with pytest.raises(ReadUnavailable):
+        scenario.port.execute(effect, authority)
+    pr = scenario.port.pull_request_by_ref(effect.source_ref, effect.target_ref)
+    assert pr is not None and pr.merged is not None
+    assert scenario.port.remote_commit(effect.target_ref) == pr.merged
+    assert scenario.port.physical.delete(effect.source_ref, pr.head.sha).returncode == 0
+    assert effect.source_ref not in scenario.port.remote_refs()
+    roles, budgets = list(scenario.role_calls), scenario.kernel.status(effect.subject)["budgets"]
+    assert scenario.kernel.status(effect.subject)["pending_write"]["status"] == "sent"
+    scenario.kernel = Kernel(scenario.kernel.storage.path)
+    assert scenario.run(approve=True).kind == "complete"
+    status = scenario.kernel.status(effect.subject)
+    assert status["phase"] == "complete" and status["budgets"] == budgets
+    assert scenario.role_calls == roles
+    assert scenario.port.objects.issue(scenario.delivery.issue)["state"] == "closed"
+    assert scenario.port.remote_commit(effect.target_ref) == pr.merged
+    assert effect.source_ref not in scenario.port.remote_refs()
+    assert all(sum(write["operation"] == op for write in scenario.port.writes()) == 1
+               for op in ("merge", "completion_comment", "close"))
+    assert scenario.kernel.status(effect.subject)["resource_cleanup"]["state"] == "complete"
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        cleanup = tx.one("SELECT * FROM effects WHERE subject=? AND operation='cleanup_remote_ref'", (effect.subject,))
+        assert (cleanup["status"], cleanup["attempts"]) == ("confirmed", 0)
+        receipt = json.loads(tx.get(cleanup["receipt_id"], effect.subject))
+        assert receipt["disposition"] == "target" and receipt["raw"]["reason"] == "remote_ref_absent"

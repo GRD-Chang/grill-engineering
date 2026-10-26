@@ -4991,6 +4991,16 @@ class Kernel:
                         raise KernelError("effect_binding")
                     return self._recheck_retirement(tx, run, job, requeue, row, result)
                 return Step("progress", effect.subject)
+            # An already absent owned cleanup resource needs no deletion.
+            # Record observation only: never invent a dispatch or successful delete.
+            if row["status"] == "prepared" and effect.operation in self.CLEANUP and result.disposition == "target":
+                _, job = self._owned(tx, effect.subject, execution)
+                if self._effect(tx, row, execution) != effect or not self._cleanup_current(tx, job, row):
+                    raise KernelError("effect_binding")
+                receipt = tx.put(effect.subject, "effect_receipt", wire_json(asdict(result)))
+                tx.execute("UPDATE effects SET status='observed',receipt_id=? WHERE id=?", (receipt, effect.effect_id))
+                self._event(tx, effect.subject, "effect_observed", effect.effect_id, receipt)
+                return Step("progress", effect.subject)
             # A foreign cleanup resource is a known observation, not a write.
             # Persist the refusal without inventing first-dispatch authority.
             if row["status"] == "prepared" and effect.operation in self.CLEANUP and result.disposition == "third":
