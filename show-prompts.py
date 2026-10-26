@@ -77,6 +77,24 @@ def scenarios(parent_url: str, task_url: str, language: str = "zh") -> dict[str,
                 "review_context": {"facts": facts,
                                    "review_range": {"base_sha": base, "candidate_sha": candidate}}}
 
+    def publication_request(scope: dict[str, Any], *, updated: bool = False) -> dict[str, Any]:
+        head, target = "<示例当前固定成果SHA>", "<示例PR目标快照SHA>"
+        prior = "<示例上次已发布SHA>" if updated else "<示例发布分支起点SHA>"
+        return {**scope, "reviewed_commit": head,
+            "_invocation_mode": "new-attempt" if updated else "new-thread",
+            "thread_id": "example-publication-thread" if updated else None, "publication_context": {
+            "commit_range": None if scope["acceptance_scope"] == "run" else {"base_sha": prior, "head_sha": head},
+            "pr_range": {"base_sha": target, "head_sha": head},
+            "existing_pr": None if not updated else {
+                "number": 3, "url": "https://github.com/example/project/pull/3",
+                "repository": "example/project", "head_repository": "example/project",
+                "source_ref": "refs/heads/example-source", "target_ref": "refs/heads/example-target",
+                "head": {"sha": prior, "tree": "<示例已发布tree>"},
+                "base": {"sha": target, "tree": "<示例目标tree>"},
+                "title": "【示例】完整任务交付", "body": "【示例原文】已有成果及上次验证；本次修复后需据事实更新。",
+                "state": "OPEN", "actor": "example-publisher", "merged": None,
+            }}}
+
     ci = {"pr_number": 3, "head_sha": "<示例CI失败head>", "result": "fail",
           "details": [["example-regression", "fail"]],
           "logs": "【示例原始日志】AssertionError: expected greeting\r\n"}
@@ -158,21 +176,23 @@ def scenarios(parent_url: str, task_url: str, language: str = "zh") -> dict[str,
                 previous_acceptance_artifact=failed)
             add(prefix + "integration-review-followup", f"最近集成失败后的复审：{label}", "review", integrated_followup)
 
-        publication = {**scope, "acceptance_artifact": passed}
+        publication = {**publication_request(scope), "acceptance_artifact": passed}
         publication_role = "final-publication" if prefix == "run-" else "publication"
         publication_name = "final-publication" if prefix == "run-" else prefix + "publication"
         add(publication_name, f"已审核成果的交付文案：{label}", publication_role, publication)
+        add(publication_name + "-update", f"已有 PR 更新与本次提交范围：{label}", publication_role,
+            {**publication_request(scope, updated=True), "acceptance_artifact": passed})
         continuations.extend(((prefix + "repair", f"{label} 修复", "development", repair),
                               (prefix + "review", f"{label} 审核", "review", followup),
                               (publication_name, f"{label} 文案", publication_role, publication)))
 
-    fallback = {**task, "fallback_publication_context": {
+    fallback = {**publication_request(task), "fallback_publication_context": {
         "last_review_identity": identity("<示例开发起点SHA>", "<示例上轮实际审核提交>"),
         "last_review_artifact": failed,
         "current_candidate_identity": {"candidate_sha": "<示例当前候选SHA>"},
         "current_candidate_has_additional_review": False,
         "development_summary": "【示例】审核额度耗尽后完成的最后一轮修改，未获新审核。"}}
-    ci_waiver = {**task, "ci_repair_publication_context": {
+    ci_waiver = {**publication_request(task, updated=True), "ci_repair_publication_context": {
         "failed_required_checks": ci, "previous_published_head": "<示例CI失败head>",
         "current_candidate_identity": {"candidate_sha": "<示例CI免审候选SHA>"},
         "current_candidate_has_additional_review": False,

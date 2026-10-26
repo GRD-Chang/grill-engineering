@@ -9,6 +9,7 @@ from agent_run.config.resources import bind_resources, resource
 from agent_run.core.prompts.context import (
     human_continuation,
     pretty,
+    prompt_context,
     task_brief,
     uses_short_role_prompt,
 )
@@ -78,6 +79,22 @@ def _publication_evidence(request: dict[str, Any]) -> str:
         raise ValueError(
             "Publication requires acceptance_artifact, fallback_publication_context, or ci_repair_publication_context"
         )
+    scope = request.get("publication_context")
+    if scope is not None:
+        if not isinstance(scope, dict) or (scope.get("commit_range") is None) != (request.get("acceptance_scope") == "run"):
+            raise ValueError("Publication scope must distinguish an actual commit from Final Run PR copy")
+        boundaries = [scope.get("pr_range")]
+        if scope.get("commit_range") is not None:
+            boundaries.append(scope["commit_range"])
+        for boundary in boundaries:
+            if (not isinstance(boundary, dict)
+                    or any(not isinstance(boundary.get(key), str) or not boundary[key] for key in ("base_sha", "head_sha"))
+                    or boundary["head_sha"] != request.get("reviewed_commit")):
+                raise ValueError("Publication scope must bind the fixed delivery result")
+        evidence += "\n\n" + pretty({"publication_context": scope})
+    facts = prompt_context(request, "acceptance_identity", "ticket_completions", "ci_evidence")
+    if facts:
+        evidence += "\n\n" + pretty(facts)
     feedback = request.get("human_feedback")
     if feedback is not None:
         if not isinstance(feedback, str) or not feedback.strip():

@@ -3883,6 +3883,13 @@ class Kernel:
             context["review_context"] = {"facts": facts, "review_range": {
                 "base_sha": review_base, "candidate_sha": context["reviewed_commit"]}}
         elif role == Role.PUBLICATION:
+            context["publication_context"] = {
+                "commit_range": None if job["kind"] == DeliveryKind.FINAL_RUN else {
+                    "base_sha": job["source_sha"], "head_sha": context["reviewed_commit"]},
+                "pr_range": {"base_sha": self._require_target(world).sha, "head_sha": context["reviewed_commit"]},
+                "existing_pr": None if world.pr is None else {
+                    **asdict(world.pr), "url": f"https://github.com/{world.pr.repository}/pull/{world.pr.number}"},
+            }
             if job["gate_mode"] == "review" and previous_context is not None and previous_artifact is not None:
                 if review_outcome(previous_artifact) != "pass":
                     raise KernelError("publication_authority_missing")
