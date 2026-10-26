@@ -274,16 +274,21 @@ def _history_lines(document: QueryDocument, details: bool) -> Iterator[str]:
             shown.add(attempt["id"])
             yield from _history_round(attempt, owners[attempt["subject"]], document.language, details)
         if event["kind"] not in milestones:
-            if attempt is not None or event["kind"] not in round_events:
+            if event["kind"] in round_events:
+                if attempt is not None:
+                    continue
+                kind = text("presentation.history.page_round_unavailable", language=document.language)
+            elif details:
+                kind = terms.get(event["kind"], event["kind"])
+            else:
                 continue
-            kind = text("presentation.history.page_round_unavailable", language=document.language)
         else:
             kind = (text("presentation.history.acceptance_installed", language=document.language)
                     if event["kind"] == "acceptance_promoted" else terms.get(event["kind"], event["kind"]))
         stamp, zone = _time(event["created_at"])
         subject = f"#{owners[event['subject']]}" if event["subject"] in owners else copy["global"]
         yield f"{stamp or copy['unknown']} [{zone}] {subject} {kind}"
-        if event["kind"] in milestones and event["evidence"] is not None and (details or event["kind"] == "human_response"):
+        if event["evidence"] is not None and (details or event["kind"] == "human_response"):
             yield _body(event["evidence"])
     if history["has_more"]:
         yield f"{copy['more']}: --after {history['next_after']}"

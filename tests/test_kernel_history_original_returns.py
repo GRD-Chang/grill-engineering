@@ -10,9 +10,8 @@ from agent_run.cli.render import render
 from agent_run.model import ParentIssue, Requirements, wire_json
 from agent_run.queries.run import read
 from support.offline import GraphScenario
-from test_kernel_notification_events import _recorded_agents
-from test_kernel_query_cli import _snapshot
-from test_kernel_history_presentation import continued_round
+from support.notification import recorded_agents as _recorded_agents, continued_round
+from support.environment import durable_snapshot as _snapshot
 
 
 @pytest.mark.parametrize("returns,marker,count", [
