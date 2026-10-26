@@ -19,6 +19,7 @@ from urllib.parse import urlencode, urlsplit
 
 from agent_run.contracts.write_authority import WriteAuthority, admit_write
 from agent_run.contracts.status_comment import StatusTarget
+from agent_run.contracts.repository import same_repository
 from agent_run.adapters.github import GhGitHubReader
 from agent_run.errors import GitHubReadError
 from agent_run.errors import bounded_error
@@ -127,7 +128,7 @@ class RemoteEffects:
             if cancelled():
                 raise ValueError("Status delivery cancelled")
         check_cancel()
-        if target.repository != self.repository or self.actor(check_cancel) != target.actor:
+        if not same_repository(target.repository, self.repository) or self.actor(check_cancel) != target.actor:
             return {"disposition": "third"}
         check_cancel()
         pr = self._api(f"repos/{self.repository}/pulls/{target.pr_number}", check_cancel)
@@ -135,8 +136,10 @@ class RemoteEffects:
         if (not isinstance(head, dict) or not isinstance(base, dict)
                 or not isinstance(head.get("repo"), dict) or not isinstance(base.get("repo"), dict)
                 or pr.get("number") != target.pr_number or _login(pr.get("user")) != target.actor
-                or head.get("repo", {}).get("full_name") != self.repository
-                or base.get("repo", {}).get("full_name") != self.repository
+                or not isinstance(head["repo"].get("full_name"), str)
+                or not same_repository(head["repo"]["full_name"], self.repository)
+                or not isinstance(base["repo"].get("full_name"), str)
+                or not same_repository(base["repo"]["full_name"], self.repository)
                 or "refs/heads/" + str(head.get("ref")) != target.source_ref
                 or "refs/heads/" + str(base.get("ref")) != target.target_ref):
             return {"disposition": "third"}
@@ -150,10 +153,13 @@ class RemoteEffects:
         if len(found) != 1:
             return {"disposition": "third"}
         row = found[0]
+        issue_path = urlsplit(str(row.get("issue_url", ""))).path.split("/")
         if (type(row.get("id")) is not int or row["id"] <= 0
                 or intent["comment_id"] is not None and row["id"] != intent["comment_id"]
                 or _login(row.get("user")) != target.actor
-                or urlsplit(str(row.get("issue_url", ""))).path != f"/repos/{self.repository}/issues/{target.pr_number}"
+                or len(issue_path) != 6 or issue_path[:2] != ["", "repos"]
+                or issue_path[4:] != ["issues", str(target.pr_number)]
+                or not same_repository("/".join(issue_path[2:4]), self.repository)
                 or not isinstance(row.get("body"), str) or not row["body"].startswith(marker + "\n")):
             return {"disposition": "third"}
         disposition = ("target" if row["body"] == intent["body"] else "prior"

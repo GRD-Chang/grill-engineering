@@ -4,6 +4,7 @@ import sqlite3
 import time
 
 from agent_run.contracts.status_comment import StatusProjection, StatusTarget
+from agent_run.contracts.repository import same_repository
 from agent_run.contracts.task import TaskKey
 from agent_run.queries.read_facts import material, read_boundaries
 from agent_run.storage.sqlite import Storage, Transaction
@@ -42,7 +43,9 @@ def project_status(database: Path, subject: str) -> StatusProjection:
             receipt = material(tx, effect["receipt_id"], subject)
             pr = receipt.get("pr") if isinstance(receipt, dict) else None
             if isinstance(pr, dict) and pr.get("number") == job["pr_number"]:
-                if (pr.get("repository") != run["repository"] or pr.get("head_repository") != run["repository"]
+                if (not isinstance(pr.get("repository"), str) or not isinstance(pr.get("head_repository"), str)
+                        or not same_repository(pr["repository"], run["repository"])
+                        or not same_repository(pr["head_repository"], run["repository"])
                         or pr.get("actor") != effect["actor"] or not effect["actor"]
                         or not isinstance(pr.get("head"), dict) or pr["head"].get("sha") != effect["after_sha"]
                         or not isinstance(pr.get("base"), dict) or not isinstance(pr["base"].get("sha"), str)

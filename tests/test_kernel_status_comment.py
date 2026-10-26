@@ -729,3 +729,53 @@ raise SystemExit(main(sys.argv[3:]))
             child.stdout.close()
         if handoff is not None and handoff.process.poll() is None:
             handoff.process.terminate(); handoff.process.wait(timeout=3)
+
+
+def test_status_repository_case_uses_one_identity_and_still_rejects_foreign_objects(tmp_path, monkeypatch):
+    from copy import deepcopy
+    from agent_run.adapters.remote import RemoteEffects
+    from support.offline_api import SyntheticGitHub
+    def spelling(value):
+        if isinstance(value, dict):
+            return {key: item.upper() if key == "full_name" and isinstance(item, str) else spelling(item)
+                    for key, item in value.items()}
+        return [spelling(item) for item in value] if isinstance(value, list) else value
+    original_object, original_list = SyntheticGitHub.object, SyntheticGitHub.list
+    monkeypatch.setattr(SyntheticGitHub, "object", lambda self, endpoint: spelling(original_object(self, endpoint)))
+    monkeypatch.setattr(SyntheticGitHub, "list", lambda self, endpoint: spelling(original_list(self, endpoint)))
+    scenario = published(tmp_path, monkeypatch)
+    database, subject = scenario.kernel.storage.path, scenario.delivery.key
+    projection = project_status(database, subject)  # Actual normal publication receipt has uppercase full_name.
+    api = CommentsAPI(projection.target)
+    remote_object, remote_list = api.object, api.list
+    api.object = lambda endpoint: spelling(remote_object(endpoint))
+    def comments(endpoint):
+        rows = deepcopy(remote_list(endpoint))
+        for row in rows:
+            row["issue_url"] = row["issue_url"].replace(projection.target.repository,
+                                                        projection.target.repository.upper())
+        return rows
+    api.list = comments
+    before = database.read_bytes()
+    sender = StatusComments(database)
+    assert sender.deliver(subject, api=api) == "confirmed"
+    assert database.read_bytes() == before
+    scenario.kernel.control("stop", "case-insensitive-status-stop", subject=subject)
+    intent = sender.stage(subject)
+    binding = scenario.kernel.operation_binding()
+    remote = RemoteEffects(binding.repository_root, binding.repository,
+                           runner_identity=binding.inputs.runner_identity, api=api)
+    marker = intent["body"].split("\n", 1)[0]
+    assert remote.read_status_comment(projection.target, marker, intent, lambda: False)["disposition"] == "prior"
+    for invalid in ("foreign/repository", "example/other", None, 17):
+        def foreign(endpoint, invalid=invalid):
+            row = spelling(remote_object(endpoint))
+            if endpoint != "user":
+                row["base"]["repo"]["full_name"] = invalid
+            return row
+        with monkeypatch.context() as patch:
+            patch.setattr(api, "object", foreign)
+            assert remote.read_status_comment(projection.target, marker, intent, lambda: False)["disposition"] == "third"
+    assert [command[1] for command in api.commands] == ["POST"]
+    assert sender.deliver(subject, api=api) == "confirmed"
+    assert [command[1] for command in api.commands] == ["POST", "PATCH"]
