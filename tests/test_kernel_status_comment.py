@@ -1104,3 +1104,68 @@ def test_actual_sender_keeps_ticket_completion_receipt_summary_and_parent_progre
         assert not observer.thread.is_alive() and database.read_bytes() == before
     finally:
         observer.close(drain=False)
+
+
+def test_status_dirty_journal_fault_keeps_worker_alive_until_explicit_recovery(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from threading import Event, current_thread
+    import agent_run.notifications.sender as notifications
+
+    scenario = published(tmp_path, monkeypatch, notifications={"enabled": True, "mode": "concise",
+        "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
+    database, subject = scenario.kernel.storage.path, scenario.delivery.key
+    scenario.kernel.control("stop", "important-before-one-journal-fault", subject=subject)
+    started, release, failed, paused, ended, delivered = (Event() for _ in range(6))
+    original_work, original_pause = notifications.NativeNotifications._work, notifications.NativeNotifications._pause
+    original_transaction = outbox.transaction
+    def held_work(self):
+        started.set()
+        assert release.wait(5)
+        try:
+            original_work(self)
+        finally:
+            ended.set()
+    def observed_pause(self, error):
+        original_pause(self, error)
+        paused.set()
+    @contextmanager
+    def one_failure(*args, **kwargs):
+        if current_thread().name == "kernel-notifications" and not failed.is_set():
+            failed.set()
+            raise OSError("one controlled journal failure before claim")
+        with original_transaction(*args, **kwargs) as document:
+            yield document
+    sent = []
+    def transport(*_args, **_kwargs):
+        sent.append(1)
+        delivered.set()
+        return {"outcome": "success", "reason": None}
+    monkeypatch.setattr(notifications.NativeNotifications, "_work", held_work)
+    monkeypatch.setattr(notifications.NativeNotifications, "_pause", observed_pause)
+    observer = notifications.NativeNotifications(database, database.parent,
+        transport=transport, status_api=CommentsAPI(project_status(database, subject).target))
+    try:
+        assert started.wait(5)
+        before = outbox.read_notifications(database.parent, scenario.spec.run_id)
+        important = [item for item in before["pending"] if item.get("important")]
+        assert important and observer._status_preempt.is_set() and observer._status_dirty
+        deadlines = {item["event"]["id"]: item["deadline_at"] for item in important}
+        monkeypatch.setattr(outbox, "transaction", one_failure)
+        release.set()
+        assert paused.wait(5) and failed.is_set()
+        assert not ended.wait(.5), "Unclosed sender died with dirty Status after a single journal fault"
+        assert observer.thread.is_alive() and not observer.closing and sent == []
+        faulted = outbox.read_notifications(database.parent, scenario.spec.run_id)
+        assert all(item["attempts"] == 0 for item in faulted["pending"])
+        observer.observe_committed()
+        assert delivered.wait(5)
+        observer.close()
+        assert not observer.thread.is_alive() and observer.failure_reason is None
+        final = outbox.read_notifications(database.parent, scenario.spec.run_id)
+        for item in final["records"]:
+            if item["id"] in deadlines:
+                assert item["outcome"] == "success" and item["attempts"] == 1
+                assert item["deadline_at"] == deadlines[item["id"]]
+    finally:
+        release.set()
+        observer.close(drain=False)

@@ -555,7 +555,7 @@ class NativeNotifications:
                     continue
                 with self.condition:
                     while (self.failure_reason is not None and not self._recovery_requested
-                           and not self.closing and not self._shutdown and not self._status_dirty):
+                           and not self.closing and not self._shutdown):
                         self.condition.wait()
                     if self._shutdown:
                         return
