@@ -51,7 +51,7 @@ def test_ticket_completion_keeps_original_summary_and_current_parent_progress(tm
             assert scenario.kernel.control("stop", "stop-sibling", subject="ticket:3") == "applied"
             paused, = _completions(scenario)
             assert paused["id"] == original["id"]
-            assert paused["next_step"] == "agent-run status 1 --repo example/project"
+            assert paused["next_step"] == "agent-run status --repo example/project -- offline-run"
             assert paused["completion_actions"] == [{"issue": 3, "scope": "local",
                 "reasons": ["operator_stopped"],
                 "next_action": "agent-run resume 1 --repo example/project --ticket 3"}]
@@ -78,7 +78,7 @@ def test_parent_only_completion_context_uses_actual_cleanup_and_approval_boundar
 
     approval = context()
     assert approval["parent_only"] is True and approval["ticket_progress"] is None
-    assert approval["next_step"] == "agent-run status 1 --repo example/project"
+    assert approval["next_step"] == "agent-run status --repo example/project -- offline-run"
     assert len(approval["completion_actions"]) == 1
     assert approval["completion_actions"][0]["next_action"] == "agent-run approve 1 --repo example/project"
     assert scenario.kernel.control("approve", "original-approval", subject="parent:1", world=scenario.world()) == "pending"
@@ -121,7 +121,7 @@ def test_completion_cards_keep_all_current_actions_and_explicit_parent_only(lang
     # promising that independent work can run past the global boundary.
     assert ("independent work can continue" if language == "en" else "其他独立工作可继续") not in rendered
     assert ("Ticket boundary" if language == "en" else "子任务待办") in rendered
-    assert event["next_step"] == "agent-run status 1 --repo example/project"
+    assert event["next_step"] == "agent-run status --repo example/project -- example-run"
     view.update(subjects=[{"kind": "parent_only", "phase": "complete"}], actions=[], status="completed")
     event.update(completion_context(view, state))
     rendered = json.dumps(card(event), ensure_ascii=False)

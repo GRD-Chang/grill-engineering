@@ -3,6 +3,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
+import shlex
 from pathlib import Path
 import time
 from typing import Any
@@ -47,7 +48,7 @@ def completion_context(view: Mapping[str, Any], state: dict[str, Any]) -> dict[s
     """
     tickets = [job for job in view["subjects"] if job["kind"] == "ticket"]
     completed = sum(job["phase"] == "complete" for job in tickets)
-    status_query = f"agent-run status {state['parent']['number']} --repo {state['repository']}"
+    status_query = shlex.join(["agent-run", "status", "--repo", state["repository"], "--", state["run_id"]])
     actions = [{"issue": item.get("issue"), "scope": item["scope"],
                 "reasons": item["reasons"], "next_action": item["next_action"]}
                for item in view["actions"]]
