@@ -138,7 +138,7 @@ class StatusComments:
                 marker = entry["marker"]
             binding = Kernel(self.database).operation_binding()
             remote = RemoteEffects(binding.repository_root, binding.repository,
-                                   runner_identity=binding.inputs.runner_identity, api=api)
+                                   runner_identity=binding.inputs.runner_identity, api=api, cancelled=stopped)
             def admit() -> None:
                 # Slow transport/credential preparation and remote reads are
                 # already finished. No remote I/O follows this final check.

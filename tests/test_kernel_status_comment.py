@@ -431,12 +431,13 @@ def test_status_and_existing_enabled_sender_share_one_original_run_binding(tmp_p
     def transport(*args, **kwargs):
         sent.append(args[2])
         return {"outcome": "success", "reason": None}
-    observer = NativeNotifications(database, database.parent, transport=transport)
+    api = CommentsAPI(project_status(database, subject).target)
+    assert sender.deliver(subject, api=api) == "confirmed"
+    observer = NativeNotifications(database, database.parent, transport=transport, status_api=api)
     observer.close()
     assert observer.failure_reason is None
     assert sent
-    api = CommentsAPI(project_status(database, subject).target)
-    assert sender.deliver(subject, api=api) == "confirmed"
+    assert [command[1] for command in api.commands] == ["POST"]
     document = outbox.read_notifications(database.parent, scenario.spec.run_id)
     assert document["native_run_start"] is True
     assert document["pending"] == []
@@ -541,3 +542,190 @@ def test_app_identity_403_is_scoped_display_failure_without_dispatch(tmp_path, m
     entry, = document["remote_status"]["bindings"].values()
     assert "claim" not in entry and entry["intent"]["sent"] is False
     assert database.read_bytes() == before
+
+
+def test_existing_sender_automatically_updates_status_with_feishu_disabled(tmp_path, monkeypatch):
+    from agent_run.notifications.sender import NativeNotifications
+    from support.worker_process_timing import wait_until
+    scenario = published(tmp_path, monkeypatch)
+    database, subject = scenario.kernel.storage.path, scenario.delivery.key
+    api = CommentsAPI(project_status(database, subject).target)
+    def forbidden(*args, **kwargs):
+        pytest.fail("Feishu was disabled in the frozen Run")
+    observer = NativeNotifications(database, database.parent, transport=forbidden, status_api=api)
+    try:
+        wait_until(lambda: len(api.commands) == 1, timeout=5)
+        assert [command[1] for command in api.commands] == ["POST"]
+        for _ in range(3):
+            observer.observe_committed()
+        scenario.kernel.control("stop", "automatic-status-stop", subject=subject)
+        observer.observe_committed()
+        wait_until(lambda: len(api.commands) == 2, timeout=5)
+        assert [command[1] for command in api.commands] == ["POST", "PATCH"]
+        assert "operator_stopped" in api.comments[0]["body"]
+    finally:
+        observer.close()
+    assert not observer.thread.is_alive()
+    assert [command[1] for command in api.commands] == ["POST", "PATCH"]
+    assert len(api.comments) == 1
+    document = outbox.read_notifications(database.parent, scenario.spec.run_id)
+    assert document["pending"] == [] and document["records"] == []
+
+
+def test_automatic_unknown_status_is_not_polled_by_clock_or_passive_queries(tmp_path, monkeypatch):
+    from agent_run.notifications.sender import NativeNotifications
+    from agent_run.queries.run import read
+    from support.worker_process_timing import wait_until
+    scenario = published(tmp_path, monkeypatch)
+    database, subject = scenario.kernel.storage.path, scenario.delivery.key
+    api = CommentsAPI(project_status(database, subject).target)
+    api.lose = True
+    observer = NativeNotifications(database, database.parent, status_api=api)
+    def unresolved():
+        doc = outbox.read_notifications(database.parent, scenario.spec.run_id)
+        values = list(doc.get("remote_status", {}).get("bindings", {}).values())
+        return bool(values and values[0].get("intent", {}).get("sent") and not values[0].get("claim"))
+    try:
+        wait_until(unresolved, timeout=5)
+        reads = api.reads
+        for _ in range(3):
+            read(database, "status")
+            observer.observe_committed()
+    finally:
+        observer.close()
+    assert api.reads == reads
+    assert [command[1] for command in api.commands] == ["POST"]
+    assert not observer.thread.is_alive()
+    api.lose = False
+    reopened = NativeNotifications(database, database.parent, status_api=api)
+    reopened.close()
+    assert not reopened.thread.is_alive()
+    doc = outbox.read_notifications(database.parent, scenario.spec.run_id)
+    entry, = doc["remote_status"]["bindings"].values()
+    assert entry["intent"] is None and entry["comment_id"] == 100
+    assert [command[1] for command in api.commands] == ["POST"]
+
+
+@pytest.mark.parametrize("mode", ["read", "write"])
+def test_status_transport_cancel_reaps_its_actual_child_without_retry(tmp_path, mode):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    import os
+    import signal
+    import sys
+    from agent_run.adapters.github_commands import run_read_command, run_write_command
+    from support.worker_process_timing import wait_until
+    log = tmp_path / "command-pid"
+    script = "from pathlib import Path;import os,signal;p=Path(" + repr(str(log)) + ");t=p.with_suffix('.new');t.write_text(str(os.getpid()));t.replace(p);signal.pause()"
+    cancel = Event()
+    authorized = []
+    def command():
+        args = [sys.executable, "-c", script]
+        if mode == "read":
+            return run_read_command(args, cancelled=cancel.is_set)
+        return run_write_command(args, authorize=lambda: authorized.append("original"), cancelled=cancel.is_set)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(command)
+        try:
+            wait_until(log.exists, timeout=5)
+            pid = int(log.read_text())
+        finally:
+            cancel.set()
+        if mode == "read":
+            with pytest.raises(InterruptedError, match="cancelled"):
+                future.result(timeout=5)
+        else:
+            result = future.result(timeout=5)
+            assert result.returncode == -signal.SIGKILL  # Observed exit, not an invented network response.
+    assert authorized == ([] if mode == "read" else ["original"])
+    with pytest.raises(ChildProcessError):
+        os.waitpid(pid, os.WNOHANG)
+
+
+def test_normal_exit_hook_uses_original_handoff_without_claiming_domain_release(tmp_path, monkeypatch):
+    import json
+    import os
+    import select
+    import shutil
+    import subprocess
+    import sys
+    from agent_run.model import HostObservation
+    from agent_run.runtime.handoff import prepare_handoff
+    from agent_run.runtime.package_lease import runner_usage_lease
+    from agent_run.runtime.process_identity import _process_start_token
+    from agent_run.runtime.execution import _cgroup
+    from test_kernel_host_adapter import controlled_manager
+    scenario = published(tmp_path, monkeypatch)
+    kernel, subject = scenario.kernel, scenario.delivery.key
+    kernel.control("stop", "offline-executor-exit")
+    kernel.confirm_executor_exit(scenario.execution)
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    credentials = private / "credentials"
+    credentials.mkdir(mode=0o700)
+    manager_root = tmp_path / "manager"
+    manager_root.mkdir()
+    manager, _, response, _ = controlled_manager(manager_root)
+    lock, release = tmp_path / "runner.lock", tmp_path / "release-child"
+    program = "from pathlib import Path;import time;print('ready',flush=True)\nwhile not Path(" + repr(str(release)) + ").exists():time.sleep(.01)"
+    command = (sys.executable, "-I", "-c", program)
+    request = kernel.admit_host("status-normal-exit", kind="resume", command=command,
+                               environment_carrier=private / "environment.json", preflight=lambda: None)
+    child = subprocess.Popen(command, stdout=subprocess.PIPE, start_new_session=True)
+    handoff = None
+    try:
+        assert child.stdout and select.select([child.stdout], [], [], 3)[0]
+        assert child.stdout.readline() == b"ready\n"
+        token = _process_start_token(child.pid)
+        assert token
+        environment = {**os.environ, "PATH": str(Path(manager.systemctl).parent) + os.pathsep + os.environ["PATH"]}
+        output = tmp_path / "normal-status-hook.jsonl"
+        with runner_usage_lease(lock) as terminal:
+            handoff = prepare_handoff(request, environment, runner_lock=lock, terminal_lease=terminal, ttl_seconds=.5)
+            shutil.copyfile(request.environment_carrier, credentials / "agent-run-environment")
+            (credentials / "agent-run-environment").chmod(0o600)
+            assert kernel.dispatch_host(request)
+            evidence = json.dumps(handoff.receipt, sort_keys=True, separators=(",", ":"))
+            kernel.observe_host(request, HostObservation("unknown", request.unit_name, evidence=evidence, usage_pending=True))
+            kernel.observe_host(request, HostObservation("running", request.unit_name, invocation_id="1" * 32,
+                cgroup=_cgroup(child.pid), boot_id=Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                main_pid=child.pid, start_token=token, evidence=evidence, usage_ready=True))
+            state = json.loads(response.read_text())
+            state["fields"].update(Id=request.unit_name, Description=request.description, InvocationID="1" * 32, LoadState="loaded")
+            response.write_text(json.dumps(state))
+            release.write_text("exit")
+            assert child.wait(timeout=3) == 0
+            assert handoff.process.wait(timeout=3) == 1
+            before = kernel.storage.path.read_bytes()
+            script = '''
+import json,sys
+from pathlib import Path
+import agent_run.notifications.sender as sender
+from agent_run.queries.status_comment import project_status
+def status(database,**kwargs):
+ body=project_status(database,sys.argv[1]).body
+ with Path(sys.argv[2]).open('a') as log:log.write(json.dumps(body)+'\\n')
+sender.notify_committed=status
+from agent_run.cli.host_exit import main
+raise SystemExit(main(sys.argv[3:]))
+'''
+            args = [sys.executable, "-c", script, subject, str(output), "--database", str(kernel.storage.path),
+                    "--action", "status-normal-exit", "--runner-lock", str(lock)]
+            hook_environment = {**environment, "CREDENTIALS_DIRECTORY": str(credentials),
+                                "SERVICE_RESULT": "success", "EXIT_CODE": "exited", "EXIT_STATUS": "0", "INVOCATION_ID": "1" * 32}
+            hook = subprocess.run(args, env=hook_environment, capture_output=True, text=True, timeout=10)
+            assert hook.returncode == 0, hook.stderr
+            body, = [json.loads(line) for line in output.read_text().splitlines()]
+            assert "Host exit: exit_unproven" in body  # Main return is not whole-domain release.
+            wrong = subprocess.run(args, env={**hook_environment, "INVOCATION_ID": "2" * 32},
+                                   capture_output=True, text=True, timeout=10)
+            assert wrong.returncode == 0, wrong.stderr
+            assert len(output.read_text().splitlines()) == 1
+            assert kernel.storage.path.read_bytes() == before
+    finally:
+        if child.poll() is None:
+            child.kill(); child.wait(timeout=3)
+        if child.stdout:
+            child.stdout.close()
+        if handoff is not None and handoff.process.poll() is None:
+            handoff.process.terminate(); handoff.process.wait(timeout=3)

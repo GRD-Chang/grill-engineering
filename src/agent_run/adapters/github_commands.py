@@ -23,8 +23,10 @@ def run_read_command(
     cwd: Path | None = None,
     before_attempt: Callable[[], None] | None = None,
     runner_identity: Mapping[str, Any] | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     last: subprocess.CompletedProcess[str] | None = None
+    cancellation: dict[str, Any] = {"cancelled": cancelled} if cancelled is not None else {}
     for attempt in range(MAX_READ_ATTEMPTS):
         if before_attempt is not None:
             before_attempt()
@@ -34,6 +36,7 @@ def run_read_command(
                 cwd=cwd,
                 timeout=READ_TIMEOUT_SECONDS,
                 **runner_options(runner_identity),
+                **cancellation,
             )
         except subprocess.TimeoutExpired as error:
             result = subprocess.CompletedProcess(
@@ -42,6 +45,8 @@ def run_read_command(
                 _text(error.stdout),
                 _text(error.stderr) or "GitHub command timed out",
             )
+        if cancelled is not None and cancelled():
+            raise InterruptedError("GitHub read cancelled")
         if result.returncode == 0 or attempt == MAX_READ_ATTEMPTS - 1:
             return result
         last = result
@@ -53,8 +58,10 @@ def run_read_command(
 def run_write_command(
     arguments: list[str], *, authorize: Callable[[], None], cwd: Path | None = None,
     runner_identity: Mapping[str, Any] | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Prepare credentials, then authorize once at the command-start boundary."""
+    cancellation: dict[str, Any] = {"cancelled": cancelled} if cancelled is not None else {}
     try:
         return _run_bounded_command(
             arguments,
@@ -62,6 +69,7 @@ def run_write_command(
             timeout=READ_TIMEOUT_SECONDS,
             before_start=authorize,
             **runner_options(runner_identity),
+            **cancellation,
         )
     except subprocess.TimeoutExpired as error:
         return subprocess.CompletedProcess(
@@ -82,6 +90,7 @@ def _run_bounded_command(
     arguments: list[str], *, cwd: Path | None, timeout: int,
     runner_identity: Mapping[str, Any] | None = None,
     before_start: Callable[[], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     from agent_run.adapters.auth.runner_transport import (
         runner_environment, runner_git_environment,
@@ -100,8 +109,10 @@ def _run_bounded_command(
         start_new_session=True,
         env=environment,
     )
+    cancellation: dict[str, Any] = {"cancelled": cancelled} if cancelled is not None else {}
     result = capture_command(
-        process, timeout=timeout, max_output=MAX_COMMAND_OUTPUT_BYTES
+        process, timeout=timeout, max_output=MAX_COMMAND_OUTPUT_BYTES,
+        **cancellation,
     )
     stdout = redact_transport_output(result.stdout.decode("utf-8", errors="replace"), environment)
     stderr = redact_transport_output(result.stderr.decode("utf-8", errors="replace"), environment)

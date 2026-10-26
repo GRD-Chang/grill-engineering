@@ -290,7 +290,9 @@ def test_enabled_host_arms_only_the_exact_bounded_exit_command_without_private_e
     other = Kernel.create(disabled / "kernel.sqlite3", spec)
     off = other.admit_host("disabled", kind="run", command=fixture.command,
                            environment_carrier=disabled / "environment.json", preflight=lambda: None)
-    assert exit_properties(other.storage.path, "disabled", off, lock, environment) == ()
+    status_properties = exit_properties(other.storage.path, "disabled", off, lock, environment)
+    assert len([item for item in status_properties if item.startswith("ExecStopPost=")]) == 1
+    assert "TimeoutStopSec=5s" in status_properties and "TimeoutStopSec=70s" not in status_properties
     assert not (disabled / "notifications").exists()
 
 

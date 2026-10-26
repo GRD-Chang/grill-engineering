@@ -7,6 +7,7 @@ import signal
 import subprocess
 import time
 from dataclasses import dataclass
+from collections.abc import Callable
 
 from agent_run.runtime.process_io import TailOutput, pump
 
@@ -22,6 +23,7 @@ class CommandCapture:
 def capture_command(
     process: subprocess.Popen[bytes], *, timeout: float, max_output: int,
     stdout: TailOutput | None = None, stderr: TailOutput | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> CommandCapture:
     """Drain both pipes and reap a child started with start_new_session=True.
 
@@ -52,8 +54,8 @@ def capture_command(
         nonlocal timed_out, drain_deadline
         if drain_deadline is None:
             exited = process.poll() is not None
-            if exited or time.monotonic() >= deadline:
-                timed_out = not exited
+            if exited or time.monotonic() >= deadline or cancelled is not None and cancelled():
+                timed_out = not exited and time.monotonic() >= deadline
                 terminate()
                 # Escaped pipe holders cannot prolong this owned-group cleanup.
                 drain_deadline = time.monotonic() + 0.1

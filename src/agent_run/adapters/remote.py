@@ -98,7 +98,7 @@ class RemoteEffects:
     """
     def __init__(self, root: Path, repository: str, *, runner_identity: Mapping[str, Any],
                  remote: str = "origin", api: PhysicalAPI | None = None,
-                 git_writes: PhysicalGit | None = None) -> None:
+                 git_writes: PhysicalGit | None = None, cancelled: Callable[[], bool] | None = None) -> None:
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
             raise ValueError("Expected an exact GitHub owner/repository")
         if not remote or remote.startswith("-") or "\0" in remote:
@@ -108,6 +108,7 @@ class RemoteEffects:
         self.git = LocalGit(root)
         self.api = api
         self.git_writes = git_writes
+        self.cancelled = cancelled
 
     def actor(self, before_attempt: Callable[[], None] | None = None) -> str:
         """Resolve the selected Runner's actual login, not a fixture identity."""
@@ -1024,8 +1025,9 @@ class RemoteEffects:
         return EffectResult("target" if issue["state"] == "closed" else "unknown", raw={"event": event})
 
     def _read(self, command: list[str], before_attempt: Callable[[], None] | None = None) -> subprocess.CompletedProcess[str]:
-        response = (run_read_command(command, cwd=self.root, runner_identity=self.identity) if before_attempt is None else
-                    run_read_command(command, cwd=self.root, runner_identity=self.identity, before_attempt=before_attempt))
+        response = (run_read_command(command, cwd=self.root, runner_identity=self.identity) if before_attempt is None and self.cancelled is None else
+                    run_read_command(command, cwd=self.root, runner_identity=self.identity, before_attempt=before_attempt,
+                                     **({"cancelled": self.cancelled} if self.cancelled is not None else {})))
         if response.returncode:
             raise GitHubReadError("remote_read_failed", response.stderr[:4096] or "Remote read failed")
         return response
@@ -1068,7 +1070,8 @@ class RemoteEffects:
             stream.write(data)
             stream.flush()
             return run_write_command(["gh", "api", endpoint, "--method", method, "--input", stream.name],
-                                     authorize=lambda: admit_write(authorize, boundary), cwd=self.root, runner_identity=self.identity)
+                                     authorize=lambda: admit_write(authorize, boundary), cwd=self.root, runner_identity=self.identity,
+                                     **({"cancelled": self.cancelled} if self.cancelled is not None else {}))
 
 
 def _login(value: Any) -> str | None:

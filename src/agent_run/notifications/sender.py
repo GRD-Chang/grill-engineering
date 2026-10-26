@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import sys
+import sqlite3
 import threading
 import time
 import uuid
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_run.storage import notification_outbox as outbox
-from agent_run.errors import bounded_error
+from agent_run.errors import bounded_error, KernelError
 from agent_run.notifications.cards import card
 from agent_run.notifications.envelope import event_copy, event_envelope
 from agent_run.adapters.notification_transport import send
@@ -28,6 +29,10 @@ from agent_run.queries.execution import execution_facts
 from agent_run.notifications.event_projection import event_state, project_event
 from agent_run.queries.resume_facts import resume_facts
 from agent_run.notifications.progress import obsolete_progress
+from agent_run.notifications.status_comment import StatusComments
+from agent_run.queries.status_comment import project_status, status_subjects
+from agent_run.adapters.remote import PhysicalAPI
+from agent_run.adapters.auth.credential_lifecycle import WORKER_CREDENTIAL_PROVIDER_OPERATION_TIMEOUT_SECONDS
 from agent_run.queries.read_facts import material, read_boundaries
 from agent_run.storage.sqlite import Storage, Transaction
 
@@ -40,7 +45,7 @@ class NativeNotifications:
     """Deliver only committed native events for one exact Run and owned directory."""
 
     def __init__(self, database: Path, state_root: Path, *, transport: Send = send,
-                 exit_notice: Mapping[str, Any] | None = None) -> None:
+                 exit_notice: Mapping[str, Any] | None = None, status_api: PhysicalAPI | None = None) -> None:
         if (database.is_symlink() or state_root.is_symlink()
                 or not database.is_file() or not state_root.is_dir()
                 or database.parent.resolve() != state_root.resolve()):
@@ -53,7 +58,19 @@ class NativeNotifications:
         self.storage = Storage(database)
         with self.storage.transaction(write=False) as tx:
             self.run_id, self.binding, self.config, self.state = self._run(tx)
-        self.enabled = self.config.get("enabled") is True
+        self.feishu_enabled = self.config.get("enabled") is True
+        self.status = StatusComments(database)
+        self.status_api = status_api
+        self.status_failure_reason: str | None = None
+        self._status_seen: dict[str, tuple[str, str]] = {}
+        try:
+            status_subjects(database)
+            self.status_enabled = True
+        except (OSError, ValueError, KernelError, sqlite3.Error):
+            self.status_enabled = False
+        self.enabled = self.feishu_enabled or self.status_enabled
+        self._status_dirty = self.status_enabled
+        self._status_cancel = threading.Event()
         self.condition = threading.Condition()
         self.cancel = threading.Event()
         self.owner = {"pid": os.getpid(), "token": _process_start_token(os.getpid()),
@@ -307,11 +324,33 @@ class NativeNotifications:
         if not self.enabled or self.closed or self._shutdown:
             return
         with self.condition:
+            if self.status_enabled:
+                self._status_dirty = True
+                self.condition.notify_all()
             if self.failure_reason is not None:
                 self._recovery_requested = True
                 self.condition.notify_all()
                 return
-        self._observe_committed()
+        if self.feishu_enabled:
+            self._observe_committed()
+
+    def _send_status(self) -> None:
+        """Coalesce display only; never infer business progress or schedule work."""
+        for subject in status_subjects(self.database):
+            if self._shutdown or self._status_cancel.is_set():
+                return
+            projection = project_status(self.database, subject)
+            fingerprint = (projection.target.key, hashlib.sha256(projection.body.encode()).hexdigest())
+            if self._status_seen.get(subject) == fingerprint:
+                continue
+            self._status_seen[subject] = fingerprint
+            # A successful readback may settle an older sent intent. One more
+            # opportunity can then apply current copy, without replaying it.
+            for _ in range(2):
+                result = self.status.deliver(subject, api=self.status_api, cancelled=self._status_cancel.is_set)
+                if result != "confirmed":
+                    break
+        self.status_failure_reason = None
 
     def _pause(self, error: Exception) -> None:
         reason = bounded_error(str(error))
@@ -419,6 +458,8 @@ class NativeNotifications:
         """Read only committed facts; claim no transport while a kernel lock is held."""
         if not self.enabled or self.closed or self._shutdown:
             return False
+        if not self.feishu_enabled:
+            return True
         try:
             if self.exit_notice is not None:
                 return self._observe_exit_notice()
@@ -470,11 +511,34 @@ class NativeNotifications:
         while not self._shutdown:
             try:
                 with self.condition:
+                    status_dirty = self._status_dirty
+                    self._status_dirty = False
+                if status_dirty:
+                    try:
+                        self._send_status()
+                    except Exception:
+                        # This is the asynchronous channel boundary, not a
+                        # success classification in the public Status port.
+                        self.status_failure_reason = "status_sender_failed"
+                        print("Agent Run Status unavailable; business continues", file=sys.stderr)
+                if not self.feishu_enabled:
+                    with self.condition:
+                        if self._shutdown:
+                            return
+                        if self._status_dirty:
+                            continue
+                        if self.closing:
+                            return
+                        self.condition.wait()
+                    continue
+                with self.condition:
                     while (self.failure_reason is not None and not self._recovery_requested
-                           and not self.closing and not self._shutdown):
+                           and not self.closing and not self._shutdown and not self._status_dirty):
                         self.condition.wait()
                     if self._shutdown:
                         return
+                    if self._status_dirty:
+                        continue
                     recovering = self.failure_reason is not None
                     if recovering and not self._recovery_requested:
                         return  # A normal close already made its one recovery attempt.
@@ -534,6 +598,8 @@ class NativeNotifications:
                     self.failure_reason = None
                     self.cancel.clear()
                     if event is None:
+                        if self._status_dirty:
+                            continue
                         if self.closing and not pending and not self._more:
                             return
                         self.condition.wait(timeout=(max(0.01, min(wait, 0.1))
@@ -598,25 +664,31 @@ class NativeNotifications:
                 claim["attempt_history"][-1]["not_sent"] = True
                 outbox.settle(document, time.time())
 
-    def close(self, *, drain: bool = True) -> None:
+    def close(self, *, drain: bool = True, timeout_seconds: float = CLOSE_TIMEOUT_SECONDS) -> None:
         if not self.enabled or self.closed:
             return
         with self.condition:
             self.closing = True
             if drain:
                 self._recovery_requested = True
+                self._status_dirty = self.status_enabled
             else:
                 self._shutdown = True
                 self.cancel.set()
+                self._status_cancel.set()
             self.condition.notify_all()
         if self.thread is not None and drain:
-            self.thread.join(timeout=CLOSE_TIMEOUT_SECONDS)
+            self.thread.join(timeout=max(0.0, min(timeout_seconds, CLOSE_TIMEOUT_SECONDS)))
         with self.condition:
             self._shutdown = True
             self.cancel.set()
+            self._status_cancel.set()
             self.condition.notify_all()
         if self.thread is not None:
-            self.thread.join(timeout=2)
+            # Existing provider preparation has at most signing + HTTP work;
+            # allow its own bounded cleanup after cancelling physical commands.
+            grace = 2 * WORKER_CREDENTIAL_PROVIDER_OPERATION_TIMEOUT_SECONDS + 5 if self.status_enabled else 2
+            self.thread.join(timeout=grace)
         if drain and self.failure_reason is not None:
             try:
                 with outbox.transaction(self.state_root, self.run_id) as document:
@@ -629,7 +701,23 @@ class NativeNotifications:
                         document["delivery_error"] = {"reason": self.failure_reason, "observed_at": time.time()}
             except Exception:
                 pass
-        self.closed = True
+        self.closed = self.thread is None or not self.thread.is_alive()
+        if not self.closed:
+            self.status_failure_reason = "status_sender_cleanup_unproven"
+            print("Notification sender cleanup unproven", file=sys.stderr)
+
+
+def notify_committed(database: Path, *, timeout_seconds: float = 1.0) -> None:
+    """One finite post-commit opportunity through the existing sender."""
+    observer: NativeNotifications | None = None
+    try:
+        observer = NativeNotifications(database, database.parent)
+        observer.close(timeout_seconds=timeout_seconds)
+    except Exception:
+        print("Notification observation unavailable; business continues", file=sys.stderr)
+    finally:
+        if observer is not None and not observer.closed:
+            observer.close(drain=False)
 
 
 def deliver_host_exit_notice(database: Path, state_root: Path, notice: Mapping[str, Any]) -> None:

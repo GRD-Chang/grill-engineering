@@ -1,23 +1,36 @@
 """Concise Status from current committed facts and original publication proof."""
 from pathlib import Path
+import sqlite3
 import time
 
 from agent_run.contracts.status_comment import StatusProjection, StatusTarget
 from agent_run.contracts.task import TaskKey
 from agent_run.queries.read_facts import material, read_boundaries
-from agent_run.storage.sqlite import Storage
+from agent_run.storage.sqlite import Storage, Transaction
 from agent_run.storage.tasks import read_task, task_path
+
+
+def _run(tx: Transaction, database: Path) -> sqlite3.Row:
+    run = tx.one("SELECT * FROM runs")
+    if not isinstance(run["repository_root"], str) or not Path(run["repository_root"]).is_absolute():
+        raise ValueError("Status Task workspace is invalid")
+    task = TaskKey(Path(run["repository_root"]), run["repository"], run["parent_issue"])
+    if read_task(task_path(task)) != (run["id"], database):
+        raise ValueError("Status Task binding changed")
+    return run
+
+
+def status_subjects(database: Path) -> list[str]:
+    """Only the published Task can activate this channel, even before its first PR."""
+    with Storage(database).transaction(write=False) as tx:
+        _run(tx, database.absolute())
+        return [str(row[0]) for row in tx.all("SELECT id FROM subjects WHERE pr_number IS NOT NULL ORDER BY id")]
 
 
 def project_status(database: Path, subject: str) -> StatusProjection:
     database = database.absolute()
     with Storage(database).transaction(write=False) as tx:
-        run = tx.one("SELECT * FROM runs")
-        if not isinstance(run["repository_root"], str) or not Path(run["repository_root"]).is_absolute():
-            raise ValueError("Status Task workspace is invalid")
-        task = TaskKey(Path(run["repository_root"]), run["repository"], run["parent_issue"])
-        if read_task(task_path(task)) != (run["id"], database):
-            raise ValueError("Status Task binding changed")
+        run = _run(tx, database)
         job = tx.one("SELECT * FROM subjects WHERE id=? AND run_id=?", (subject, run["id"]))
         if any(type(job[key]) is not int or job[key] <= 0 for key in ("pr_number", "issue", "generation")):
             raise ValueError("Status publication number is invalid")
