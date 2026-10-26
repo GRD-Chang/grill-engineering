@@ -394,8 +394,14 @@ class Storage:
                     require_supported_connection(connection, self.path)
                 self._capacity(connection)
                 connection.commit()
-            except BaseException:
+            except BaseException as error:
                 connection.rollback()
+                if (isinstance(error, sqlite3.OperationalError)
+                        and getattr(error, "sqlite_errorcode", None) in (
+                            sqlite3.SQLITE_BUSY, sqlite3.SQLITE_BUSY_RECOVERY,
+                            sqlite3.SQLITE_BUSY_SNAPSHOT, sqlite3.SQLITE_BUSY_TIMEOUT,
+                        )):
+                    raise KernelError("storage_busy", "SQLite transaction is locked; retry the command") from error
                 raise
 
     def _capacity(self, connection: sqlite3.Connection) -> None:

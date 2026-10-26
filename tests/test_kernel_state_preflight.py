@@ -8,6 +8,57 @@ import pytest
 
 from agent_run.storage.preflight import PROTOCOL, UnsupportedState, require_supported_state
 from agent_run.storage.sqlite import Storage
+from agent_run.errors import KernelError
+
+
+@pytest.mark.parametrize('exception,code', [
+    (sqlite3.OperationalError, code) for code in (
+        sqlite3.SQLITE_BUSY, sqlite3.SQLITE_BUSY_RECOVERY,
+        sqlite3.SQLITE_BUSY_SNAPSHOT, sqlite3.SQLITE_BUSY_TIMEOUT,
+        sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_IOERR,
+        sqlite3.SQLITE_READONLY, sqlite3.SQLITE_PERM, sqlite3.SQLITE_ERROR, None, 1029,
+    )
+] + [(sqlite3.ProgrammingError, sqlite3.SQLITE_BUSY)])
+def test_transaction_classifies_only_supported_native_busy_codes(tmp_path, monkeypatch, exception, code):
+    native = Storage.create(tmp_path / 'state.sqlite3')
+    error = exception('database is locked' if code not in {5, 261, 517, 773} else 'opaque native detail')
+    if code is not None:
+        error.sqlite_errorcode = code
+    events = []
+    connect = sqlite3.connect
+
+    class Connection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if sql == 'BEGIN IMMEDIATE':
+                events.append('begin')
+                raise error
+            return super().execute(sql, parameters)
+
+        def rollback(self):
+            events.append('rollback')
+            return super().rollback()
+
+        def close(self):
+            events.append('close')
+            return super().close()
+
+    def open_connection(*args, **kwargs):
+        if '?mode=rw' in str(args[0]):
+            assert kwargs['timeout'] == 1.0
+            return connect(*args, **kwargs, factory=Connection)
+        return connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, 'connect', open_connection)
+    busy = exception is sqlite3.OperationalError and code in {5, 261, 517, 773}
+    with pytest.raises(KernelError if busy else exception) as failed:
+        with native.transaction():
+            pytest.fail('A rejected BEGIN must not execute its business body')
+    if busy:
+        assert failed.value.code == 'storage_busy' and failed.value.__cause__ is error
+        assert 'opaque native detail' not in str(failed.value)
+    else:
+        assert failed.value is error
+    assert events == ['begin', 'rollback', 'close']
 
 
 def _durable_bytes(path: Path) -> dict[str, bytes]:
