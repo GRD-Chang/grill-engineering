@@ -1163,5 +1163,6 @@
   "presentation.history.role_subject_parent": "Parent-only",
   "presentation.history.role_subject_run": "Whole-Run",
   "notification.event.unavailable_development_continues": "Feishu notifications unavailable; development continues: {reason}",
-  "presentation.status.recorded_worker_exit": "  Recorded Worker exit: {stamp} ({zone})"
+  "presentation.status.recorded_worker_exit": "  Recorded Worker exit: {stamp} ({zone})",
+  "presentation.status.recorded_worker_exit_time_unknown": "  Recorded Worker exit; exact end time unknown"
 }

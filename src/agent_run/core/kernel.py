@@ -2130,8 +2130,11 @@ class Kernel:
                     if not unstarted and (process is None or not self._host_contains_process(tx, row, process)):
                         continue
                     proof = tx.put(output["subject"], "worker_host_exit", wire_json({"host_nonce": request.nonce, "observation": asdict(observation)}))
-                    tx.execute("UPDATE invocation_outputs SET dispatch_state=?,exited_at=?,failure_kind='fatal',start_evidence=? WHERE invocation=? AND ordinal=? AND exit_code IS NULL",
-                               ("unavailable" if unstarted else "exited", observation.ended_at, proof, output["invocation"], output["ordinal"]))
+                    # Domain exit proves no member survives, not when each
+                    # Worker ended. Keep the Host observation time in its proof;
+                    # only the exact Worker receipt supplies exited_at.
+                    tx.execute("UPDATE invocation_outputs SET dispatch_state=?,failure_kind='fatal',start_evidence=? WHERE invocation=? AND ordinal=? AND exit_code IS NULL",
+                               ("unavailable" if unstarted else "exited", proof, output["invocation"], output["ordinal"]))
                     if output["raw_id"] is None:
                         tx.execute("UPDATE invocations SET status='interrupted' WHERE id=?", (output["invocation"],))
                     tx.execute("DELETE FROM leases WHERE id=?", (output["lease"],))

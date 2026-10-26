@@ -27,6 +27,9 @@ Host，不能由持久 `running` 记录推断进程仍存活。普通 Status 可
 已记录的准确 Worker 退出及其时间；只消费原输出的启动、退出字段，不将旧 Invocation
 的退出改写成当前 Host 或新 epoch 的活性证明。`scheduling` 保存实际席位、并发上限、
 集成持有者及两条 FIFO；不再另造 scheduler 或 Ticket 活性镜像。
+Host 或 namespace 域退出可以证明原成员已退出，却不能替代每个 Worker 的准确结束时间。
+缺少独立 Worker 退出时间时，保留域退出证据，显示已记录退出、准确结束时间未知；
+不得把首次发现域退出的时刻填入 Worker 的 `exited_at` 或实际执行时长。
 通知观察者与 Host 的真实活动证据分别核验，不由显示布局倒推执行许可。
 
 ## 原始工作与历史

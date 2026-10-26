@@ -8,13 +8,14 @@ import pytest
 from agent_run.adapters import foreground as physical
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
-from agent_run.model import HostObservation
+from agent_run.model import Execution, HostObservation
 from agent_run.runtime.package_lease import runner_management_lease, runner_usage_lease, RunnerLeaseBusy
 from agent_run.runtime.foreground_host import ForegroundHost
 import agent_run.runtime.foreground_host as foreground_host
 from agent_run.cli.lifecycle import attach
 from agent_run.runtime.handoff import _digest, _encode, _runner_witness
-from support.core_operations import task_run
+from support.core_operations import CoreOperations, task_run
+from support.environment import durable_snapshot
 
 
 def _domain(nonce):
@@ -56,6 +57,103 @@ def test_foreground_admission_is_frozen_stop_fences_and_null_exit_does_not_becom
         assert tx.one('SELECT count(*) FROM attempts')[0] == 0
         assert tx.one('SELECT count(*) FROM leases')[0] == 0
         assert tx.one("SELECT count(*) FROM actions WHERE id='stop'")[0] == 1
+
+
+@pytest.mark.parametrize('known_worker_exit', [False, True], ids=['discovered-domain-exit', 'exact-worker-exit'])
+def test_discovered_domain_exit_is_not_an_exact_worker_end_time(tmp_path, monkeypatch, known_worker_exit):
+    """Controlled physical-read seam; no Host/process is actually launched."""
+    from io import StringIO
+    import json
+    from agent_run.cli.render import render
+    from agent_run.queries.run import read
+
+    kernel, ports = task_run(tmp_path, 'discovered-exit')
+    clock = [1000.]
+    kernel.clock = lambda: clock[0]
+    request = kernel.admit_host('launch', kind='run', command=('controlled-executor',),
+        environment_carrier=tmp_path / 'carrier', preflight=lambda: None, backend='foreground')
+    assert kernel.dispatch_host(request)
+    domain = _domain(request.nonce)
+    lock = tmp_path / 'install.lock'
+    with runner_usage_lease(lock):
+        receipt = {'request_digest': _digest(request), 'nonce': request.nonce, 'runner': _runner_witness(lock),
+                   'boot_id': 'test-boot', 'pid_namespace': 'pid:[10]'}
+        running = HostObservation('running', None, boot_id='test-boot', main_pid=202, start_token='203',
+            backend='foreground', domain=domain, usage_ready=True, evidence=_encode(receipt).decode())
+        assert kernel.observe_host(request, running) == 'running'
+        operations = CoreOperations(kernel, Execution(request.run_id, request.owner, request.epoch), lambda _: ports)
+        call = operations.until(lambda step: step.call is not None).call
+        assert call is not None and kernel.dispatch_agent(call)
+        kernel.bind_thread(call, 'original-backend-thread')
+        process = {'schema': 'linux-namespace-process-v1', 'pid': 3, 'pgid': 3, 'start_token': 'worker',
+            'host_pid': 2, 'host_start_token': '203', 'boot_id': 'test-boot',
+            'host_namespace': 'pid:[20]', 'pid_namespace': 'pid:[20]'}
+        clock[0] = 1001.
+        kernel.agent_started(call, process)
+        kernel.agent_source_ready(call)
+        kernel.observe_worker_activity(call, 'active', active=True, observed_at=1001., evidence={'turn': 'started'})
+        clock[0] = 1002.
+        kernel.observe_worker_activity(call, 'inactive', active=False, observed_at=1002., evidence={'turn': 'completed'})
+        raw = b'{"result_kind":"development","summary":"original result","human_blockers":null}'
+        kernel.receive(call, raw)
+        if known_worker_exit:
+            clock[0] = 1003.
+            kernel.agent_exited(call, process, 0)
+        path = physical.record_root(lock, create=True) / (request.nonce + '.json')
+        physical.write_record(path, {'binding': [request.run_id, request.owner, request.epoch, request.nonce],
+            'receipt': receipt, 'phase': 'running', 'domain': domain,
+            'database': str(kernel.storage.path.resolve()), 'action': 'launch'}, create=True)
+        monkeypatch.setattr(foreground_host, 'recover_init', lambda _: 'unknown')
+        before_unknown = durable_snapshot(tmp_path)
+        assert ForegroundHost(environment={}).observe(kernel, request, lock).disposition == 'unknown'
+        assert kernel.active_host_action() == 'launch' and path.exists()
+        with kernel.storage.transaction(write=False) as tx:
+            assert tx.one('SELECT count(*) FROM leases')[0] == int(not known_worker_exit)
+        assert durable_snapshot(tmp_path) == before_unknown
+        monkeypatch.setattr(foreground_host, 'recover_init', lambda value: 'exited' if value == domain else 'unknown')
+        clock[0] = 2000.  # Only now does a fresh observer discover the old domain exit.
+        observed = ForegroundHost(environment={}).observe(kernel, request, lock)
+        assert observed.disposition == 'exited' and observed.usage_released
+        assert observed.ended_at == 2000. and observed.exit_status is None
+        assert observed.exit_evidence == 'same_observer_init_exit'
+        assert kernel.active_host_action() is None and not path.exists()
+
+    before = durable_snapshot(tmp_path)
+    from types import SimpleNamespace
+    import agent_run.queries.run as query_run
+    monkeypatch.setattr(query_run, 'time', SimpleNamespace(time=lambda: clock[0]))
+    for kind in ('status', 'history'):
+        clock[0] += 1000.
+        document = read(kernel.storage.path, kind)
+        job, = document.data['subjects']
+        invocation, = job['pending_attempt']['invocations']
+        output, = invocation['outputs']
+        assert output['dispatch_state'] == 'exited'
+        assert output['raw_return'] == json.loads(raw)
+        assert output['exit_code'] == (0 if known_worker_exit else None)
+        assert output['exited_at'] == (1003. if known_worker_exit else None)
+        assert output['process_span_seconds'] == (2. if known_worker_exit else None)
+        assert output['recorded_execution_seconds'] == 1.
+        assert invocation['live_status'] == document.data['executor_control']['live_status'] == 'unknown'
+        for language, label in [('en', 'Recorded Worker exit; exact end time unknown'),
+                                ('zh', '已记录 Worker 退出；准确结束时间未知')]:
+            for style in ('plain', 'rich'):
+                target = StringIO()
+                render(replace(document, language=language), style=style, details=False, stream=target)
+                value = target.getvalue()
+                if kind == 'status':
+                    assert (label in value) is not known_worker_exit
+                else:
+                    assert ('Time range:' if language == 'en' else '时间区间：') in value
+                    assert (('→ Not recorded' if language == 'en' else '→ 未记录') in value) is not known_worker_exit
+    assert durable_snapshot(tmp_path) == before
+    with kernel.storage.transaction(write=False) as tx:
+        assert tx.one('SELECT count(*) FROM leases')[0] == 0
+        assert tx.one('SELECT developments_used FROM budgets WHERE subject=? AND purpose=? AND current=1',
+                      (call.subject, call.purpose))[0] == 1
+        assert tx.one('SELECT backend_id FROM threads WHERE id=?', (call.thread_id,))[0] == 'original-backend-thread'
+        raw_id = tx.one('SELECT raw_id FROM invocation_outputs WHERE invocation=?', (call.invocation_id,))[0]
+        assert tx.get(raw_id, call.subject) == raw
 
 
 def test_foreground_cannot_use_systemd_or_a_changed_domain_as_exit_evidence(tmp_path):

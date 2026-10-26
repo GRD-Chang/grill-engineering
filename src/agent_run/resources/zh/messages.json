@@ -1163,5 +1163,6 @@
   "presentation.history.role_subject_parent": "Parent-only",
   "presentation.history.role_subject_run": "整体交付",
   "notification.event.unavailable_development_continues": "飞书通知不可用（开发继续）：{reason}",
-  "presentation.status.recorded_worker_exit": "  已记录 Worker 退出：{stamp}（{zone}）"
+  "presentation.status.recorded_worker_exit": "  已记录 Worker 退出：{stamp}（{zone}）",
+  "presentation.status.recorded_worker_exit_time_unknown": "  已记录 Worker 退出；准确结束时间未知"
 }

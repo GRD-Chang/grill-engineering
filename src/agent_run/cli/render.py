@@ -412,10 +412,12 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
             for invocation in pending["invocations"]:
                 yield f"  {copy['model']}: {invocation['model']} | {copy['effort']}: {invocation['effort']}"
                 output = invocation["outputs"][-1]
-                if (output["dispatch_state"] == "exited" and output["started_at"] is not None
-                        and output["exited_at"] is not None and output["exited_at"] >= output["started_at"]):
-                    stamp, zone = _time(output["exited_at"])
-                    yield text("presentation.status.recorded_worker_exit", language=document.language, stamp=stamp, zone=zone)
+                if output["dispatch_state"] == "exited" and output["started_at"] is not None:
+                    if output["exited_at"] is not None and output["exited_at"] >= output["started_at"]:
+                        stamp, zone = _time(output["exited_at"])
+                        yield text("presentation.status.recorded_worker_exit", language=document.language, stamp=stamp, zone=zone)
+                    else:
+                        yield text("presentation.status.recorded_worker_exit_time_unknown", language=document.language)
                 elif output["started_at"] is not None:
                     yield f"  {copy['started']}"
                 yield f"  {copy['duration']}: {invocation['elapsed_seconds'] if invocation['elapsed_seconds'] is not None else copy['incomplete']}"
