@@ -48,7 +48,7 @@ def test_before_final_timeout_uses_one_original_global_notification_and_resume(t
     assert {path: body for path, body in _snapshot(tmp_path).items() if "kernel.sqlite3" in path} == before
     boundary, = [(event, rendered) for event, rendered in sent if event["kind"] == "boundary"]
     event, rendered = boundary
-    command = "agent-run resume 1 --repo example/project"
+    command = "agent-run resume --repo example/project -- offline-run"
     assert event["work_subject"] is None and event["scope"] == "global"
     assert event["title"] == event_copy({"language": "en"}, "timeout")
     assert event["next_step"] == command

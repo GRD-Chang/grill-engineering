@@ -54,7 +54,7 @@ def test_ticket_completion_keeps_original_summary_and_current_parent_progress(tm
             assert paused["next_step"] == "agent-run status --repo example/project -- offline-run"
             assert paused["completion_actions"] == [{"issue": 3, "scope": "local",
                 "reasons": ["operator_stopped"],
-                "next_action": "agent-run resume 1 --repo example/project --ticket 3"}]
+                "next_action": "agent-run resume --repo example/project --ticket 3 -- offline-run"}]
             rendered = json.dumps(card(paused), ensure_ascii=False)
             assert "operator\\_stopped" in rendered.replace("\\\\", "\\")
             assert "--ticket 3" in rendered
@@ -80,7 +80,7 @@ def test_parent_only_completion_context_uses_actual_cleanup_and_approval_boundar
     assert approval["parent_only"] is True and approval["ticket_progress"] is None
     assert approval["next_step"] == "agent-run status --repo example/project -- offline-run"
     assert len(approval["completion_actions"]) == 1
-    assert approval["completion_actions"][0]["next_action"] == "agent-run approve 1 --repo example/project"
+    assert approval["completion_actions"][0]["next_action"] == "agent-run approve --repo example/project -- offline-run"
     assert scenario.kernel.control("approve", "original-approval", subject="parent:1", world=scenario.world()) == "pending"
     for _ in range(100):
         if scenario.kernel.status("parent:1")["phase"] == "complete":
@@ -91,7 +91,7 @@ def test_parent_only_completion_context_uses_actual_cleanup_and_approval_boundar
         raise AssertionError("The original close did not complete")
     pending = context()
     assert pending["parent_only"] is True
-    assert pending["next_step"] == "agent-run resume offline-run"
+    assert pending["next_step"] == "agent-run resume --repo example/project -- offline-run"
     assert pending["completion_actions"] == []
     assert scenario.run().kind == "complete"
     closed = context()
@@ -106,9 +106,9 @@ def test_completion_cards_keep_all_current_actions_and_explicit_parent_only(lang
     state = {"run_id": "example-run", "repository": "example/project", "language": language,
              "parent": {"number": 1, "title": "Original requirement"}}
     actions = [{"issue": 3, "scope": "local", "reasons": ["Original blocker / 原始原因"],
-                "next_action": "agent-run resume 1 --repo example/project --ticket 3"},
+                "next_action": "agent-run resume --repo example/project --ticket 3 -- example-run"},
                {"issue": None, "scope": "global", "reasons": ["execution_failed"],
-                "next_action": "agent-run status 1 --repo example/project"}]
+                "next_action": "agent-run status --repo example/project -- example-run"}]
     view = {"subjects": [{"kind": "ticket", "phase": "complete"}, {"kind": "ticket", "phase": "development"}],
             "actions": actions, "status": "execution_failed", "abandonment": None, "delivery_cleanup": None}
     event = event_envelope(state, "ticket_completed", "original-completion", "Completed Ticket",

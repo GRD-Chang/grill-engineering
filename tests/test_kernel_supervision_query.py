@@ -60,7 +60,7 @@ def test_wait_deadline_does_not_invent_a_timeout_and_keeps_all_scopes(tmp_path, 
     expired_clock = read_only(kernel, tmp_path).data
     assert all(window["remaining_seconds"] == 0 and not window["timed_out"] for window in expired_clock["supervision_windows"])
     assert expired_clock["operator_actions"] == []
-    assert expired_clock["next_action"] == "agent-run status 1 --repo example/repository"
+    assert expired_clock["next_action"] == "agent-run status --repo example/repository -- run"
 
 
 @pytest.mark.parametrize("language", ["zh", "en"])
@@ -84,7 +84,7 @@ def test_run_timeout_renders_original_evidence_and_resumes_only_after_core_appli
     document = read_only(kernel, tmp_path)
     data = document.data
     window = data["supervision_windows"][0]
-    command = "agent-run resume 1 --repo example/project"
+    command = "agent-run resume --repo example/project -- offline-run"
     assert data["status"] == "supervision_timeout" and data["next_action"] == command
     assert window["timed_out"] and window["remaining_seconds"] == 0
     assert window["timeout"]["scope_id"] == window["scope_id"]
@@ -137,7 +137,7 @@ def test_ticket_timeout_keeps_sibling_waits_and_exact_target_resume(tmp_path, mo
     assert windows["ticket:2"]["timed_out"] and not windows["ticket:3"]["timed_out"]
     assert "supervision" not in data  # No guessed current window across independent Tickets.
     assert data["status"] == "active"
-    assert data["next_action"] == "agent-run resume 1 --repo example/repository --ticket 2"
+    assert data["next_action"] == "agent-run resume --repo example/repository --ticket 2 -- run"
     assert data["operator_actions"][0]["evidence"]["failure_evidence"]["supervision_windows"] == [windows["ticket:2"]]
     assert kernel.control("resume", "only-original-ticket", subject="ticket:2") == "applied"
     remaining = read_only(kernel, tmp_path).data["supervision_windows"]
@@ -154,4 +154,4 @@ def test_required_checks_projection_keeps_the_original_45_minute_window(tmp_path
     assert window["kind"] == "required_checks"
     assert window["deadline"] == 2800 and window["remaining_seconds"] == 2459
     assert not window["timed_out"]
-    assert window["timeout_resume_action"] == "agent-run resume 1 --repo example/repository --ticket 2"
+    assert window["timeout_resume_action"] == "agent-run resume --repo example/repository --ticket 2 -- offline-run"
