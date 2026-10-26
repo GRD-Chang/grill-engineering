@@ -16,6 +16,7 @@ from pathlib import Path
 import stat
 import tempfile
 import threading
+import time
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Self
 
@@ -23,8 +24,8 @@ from agent_run.errors import bounded_error
 from agent_run.runtime.sandbox import _BoundedJsonlStream, WorkerSandboxError, bubblewrap_command, native_worker_environment
 
 from agent_run.contracts.artifact import role_schema
-from agent_run.runtime.execution import ProcessExit, _execute
-from agent_run.model import AgentCall
+from agent_run.runtime.execution import ProcessExit, ProcessExitUnknown, _execute
+from agent_run.model import AgentCall, AgentPreparation
 
 if TYPE_CHECKING:
     from agent_run.core.kernel import Kernel
@@ -91,24 +92,26 @@ class _CodexCapture:
     """A concrete owned-file/JSONL capture, not a backend or recovery policy."""
 
     def __init__(
-        self, kernel: Kernel, call: AgentCall, *, executable: str,
+        self, kernel: Kernel, preparation: AgentPreparation, *, executable: str,
         environment: Mapping[str, str], credential_file: Path | None,
         hidden_paths: Sequence[Path], hidden_environment: Sequence[str],
         identity: Mapping[str, Any] | None = None, cancelled: threading.Event | None = None,
     ) -> None:
-        self.kernel, self.call, self.executable = kernel, call, executable
+        self.kernel, self.preparation, self.executable = kernel, preparation, executable
+        self.call: AgentCall | None = None
+        self.cleanup_complete = False
         self.source_environment = dict(environment)
         self.credential_file = credential_file
         self.identity, self.cancelled = identity, cancelled
         self.credential_exhausted = threading.Event()
         self.inherit_host_auth = False
         self.hidden_paths, self.hidden_environment = tuple(hidden_paths), tuple(hidden_environment)
-        self.cwd = Path(call.context["checkout"])
+        self.cwd = Path(preparation.context["checkout"])
         self.arguments: list[str] = []
         self.environment: dict[str, str] = {}
         self.resources = ExitStack()
         self.directory: int | None = None
-        self.thread = call.reported_thread
+        self.thread = preparation.reported_thread
         self.observed_thread: str | None = None
         self.invalid = False
         self.stdout_bytes = 0
@@ -117,6 +120,21 @@ class _CodexCapture:
         self.sequence = 0
         self.failure_kind = "ordinary"
         self.diagnostic: dict[str, Any] | None = None
+        self.preparation_deadline = time.monotonic() + max(0.0, preparation.preparation_deadline - kernel.clock())
+
+    def bind_call(self, call: AgentCall) -> None:
+        if (self.call is not None or call.lease_id != self.preparation.reservation_id
+                or call.attempt_id != self.preparation.attempt_id or call.execution != self.preparation.execution):
+            raise ValueError("Preparation admission binding changed")
+        self.call = call
+
+    def _preparation_guard(self) -> None:
+        self.guard()
+        self.kernel.guard_preparation(self.preparation)
+
+    def _close(self) -> None:
+        self.resources.close()
+        self.cleanup_complete = True
 
     def __enter__(self) -> Self:
         try:
@@ -124,11 +142,11 @@ class _CodexCapture:
             temporary.chmod(0o700)
             self.directory = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             self.resources.callback(os.close, self.directory)
-            self.guard()
+            self._preparation_guard()
             gh = temporary / "gh"
             self.environment = self._credential_environment(gh)
-            self.guard()
-            schema = json.dumps(role_schema(self.call.role.value), separators=(",", ":")).encode()
+            self._preparation_guard()
+            schema = json.dumps(role_schema(self.preparation.role.value), separators=(",", ":")).encode()
             if len(schema) > 64 * 1024:
                 raise ValueError("Worker output schema exceeds its file limit")
             _write_member(self.directory, "schema.json", schema)
@@ -137,10 +155,10 @@ class _CodexCapture:
                 self.environment.pop(variable, None)
             self.environment["GH_PROMPT_DISABLED"] = "1"
             self.environment["GIT_TERMINAL_PROMPT"] = "0"
-            readonly = self.call.context["readonly"]
+            readonly = self.preparation.context["readonly"]
             if type(readonly) is not bool:
                 raise ValueError("Allocated checkout access must be explicit")
-            if self.call.output_ordinal > 0 and not readonly:
+            if self.preparation.output_ordinal > 0 and not readonly:
                 raise ValueError("Output repair requires an allocated read-only checkout")
             command = self._command(temporary)
             self.arguments = bubblewrap_command(
@@ -148,8 +166,16 @@ class _CodexCapture:
                 environment=self.environment, hidden_paths=self._protected_paths(), inherit_host_auth=self.inherit_host_auth,
             )
             return self
-        except BaseException:
-            self.resources.close()
+        except BaseException as error:
+            from agent_run.adapters.auth.credential_lifecycle import safe_http_status
+
+            failure = error if hasattr(error, "retryable") else error.__cause__
+            self.diagnostic = {"source": "worker-preparation", "error_type": type(error).__name__,
+                               "http_status": safe_http_status(getattr(failure, "http_status", None))}
+            try:
+                self._close()
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
             raise
 
     def _credential_environment(self, gh: Path) -> dict[str, str]:
@@ -173,7 +199,7 @@ class _CodexCapture:
             from agent_run.contracts.identity import validate_identity_snapshot
 
             self.identity = identity = validate_identity_snapshot(self.identity)
-            repository = self.call.context["repository"]
+            repository = self.preparation.context["repository"]
             if not isinstance(repository, str) or not repository:
                 raise ValueError("Allocated repository identity is unavailable")
             if identity["source"] == "app":
@@ -194,7 +220,7 @@ class _CodexCapture:
                 delivery = self.resources.enter_context(NativeCredentialDelivery(
                     provider, gh, on_exhausted=lambda _message: self.credential_exhausted.set(),
                 ))
-                delivery.start()
+                delivery.start(guard=self._preparation_guard, deadline=self.preparation_deadline)
                 environment = native_worker_environment(git_environment(self.source_environment), gh, host=False)
                 environment.pop("GH_HOST", None)
                 environment.update({
@@ -204,7 +230,10 @@ class _CodexCapture:
                     "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper", "GIT_CONFIG_VALUE_0": "",
                 })
             else:
-                validate_worker_auth(identity, self.source_environment)
+                from agent_run.adapters.auth.credential_lifecycle import prepare_initial_credential
+
+                prepare_initial_credential(lambda: validate_worker_auth(identity, self.source_environment),
+                    guard=self._preparation_guard, deadline=self.preparation_deadline)
                 self.inherit_host_auth = identity["source"] == "host"
                 environment = native_worker_environment(
                     native_github_environment(identity, self.source_environment), gh, host=self.inherit_host_auth,
@@ -232,23 +261,23 @@ class _CodexCapture:
         self, exception_type: type[BaseException] | None, exception: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        self.resources.close()
+        self._close()
 
     def _command(self, temporary: Path) -> list[str]:
-        if self.call.mode == "fresh":
-            if self.call.reported_thread is not None:
+        if self.preparation.mode == "fresh":
+            if self.preparation.reported_thread is not None:
                 raise ValueError("Fresh invocation already has a backend Thread")
             command = [self.executable, "exec", "--json", "--color", "never",
                        "--dangerously-bypass-approvals-and-sandbox", "--cd", str(self.cwd)]
-        elif self.call.mode in {"resume", "output-repair", "execution-recovery"}:
-            if not self.call.reported_thread:
+        elif self.preparation.mode in {"resume", "output-repair", "execution-recovery"}:
+            if not self.preparation.reported_thread:
                 raise ValueError("Continuation requires its original backend Thread")
             command = [self.executable, "exec", "resume", "--json",
-                       "--dangerously-bypass-approvals-and-sandbox", self.call.reported_thread]
+                       "--dangerously-bypass-approvals-and-sandbox", self.preparation.reported_thread]
         else:
             raise ValueError("Unknown allocated Codex invocation mode")
-        command.extend(["--model", self.call.profile.model, "--config",
-                        f'model_reasoning_effort="{self.call.profile.effort}"',
+        command.extend(["--model", self.preparation.profile.model, "--config",
+                        f'model_reasoning_effort="{self.preparation.profile.effort}"',
                         "--output-schema", str(temporary / "schema.json"),
                         "--output-last-message", str(temporary / "last-message.txt"), "-"])
         return command
@@ -290,6 +319,7 @@ class _CodexCapture:
         return tuple(paths)
 
     def _line(self, line: str) -> None:
+        assert self.call is not None
         try:
             event: Any = json.loads(line)
         except ValueError:
@@ -366,33 +396,57 @@ class _CodexCapture:
         return value
 
 
+def _execute_prepared(
+    capture: _CodexCapture, *, prompt: str, timeout: float | None,
+    authorize_source: Callable[[AgentCall], None],
+) -> ProcessExit | None:
+    call: AgentCall | None = None
+    try:
+        with capture:
+            step = capture.kernel.admit_agent(capture.preparation)
+            call = step.call
+            assert call is not None
+            capture.bind_call(call)
+            return _execute(capture.kernel, call, arguments=capture.arguments, cwd=capture.cwd,
+                prompt=prompt, environment=capture.environment, timeout=timeout,
+                authorize_source=lambda: authorize_source(call), capture=capture)
+    except BaseException as error:
+        # No Future or exception is an exit proof. Only successful resource
+        # cleanup releases a preparation seat; admitted work uses output proof.
+        if call is None and capture.cleanup_complete:
+            expired = capture.kernel.clock() >= capture.preparation.preparation_deadline
+            capture.kernel.preparation_failed(capture.preparation,
+                ("invocation_deadline_exceeded" if capture.preparation.mode == "output-repair" else
+                 "preparation_deadline_exceeded") if expired else "worker_preparation_failed",
+                capture.diagnostic or {"source": "worker-preparation", "error_type": type(error).__name__})
+        if call is not None and not capture.cleanup_complete and isinstance(error, Exception):
+            raise ProcessExitUnknown("Worker credential resource cleanup remains unproven") from error
+        if call is None and isinstance(error, OSError) and capture.cleanup_complete:
+            return None
+        raise
+
+
 def execute_codex(
-    kernel: Kernel, call: AgentCall, *, executable: str, prompt: str,
+    kernel: Kernel, preparation: AgentPreparation, *, executable: str, prompt: str,
     environment: Mapping[str, str], credential_file: Path, hidden_paths: Sequence[Path],
-    authorize_source: Callable[[], None], timeout: float | None = None,
+    authorize_source: Callable[[AgentCall], None], timeout: float | None = None,
     hidden_environment: Sequence[str] = (),
 ) -> ProcessExit | None:
-    """Execute exactly this allocated call; no service or identity discovery."""
-    capture = _CodexCapture(kernel, call, executable=executable, environment=environment,
+    """Prepare credentials, atomically admit this seat, then execute once."""
+    capture = _CodexCapture(kernel, preparation, executable=executable, environment=environment,
                             credential_file=credential_file, hidden_paths=hidden_paths,
                             hidden_environment=hidden_environment)
-    return _execute(
-        kernel, call, arguments=(), cwd=capture.cwd, prompt=prompt,
-        environment=environment, timeout=timeout, authorize_source=authorize_source, capture=capture,
-    )
+    return _execute_prepared(capture, prompt=prompt, timeout=timeout, authorize_source=authorize_source)
 
 
 def execute_selected_codex(
-    kernel: Kernel, call: AgentCall, *, identity: Mapping[str, Any],
+    kernel: Kernel, preparation: AgentPreparation, *, identity: Mapping[str, Any],
     environment: Mapping[str, str], prompt: str, hidden_paths: Sequence[Path],
-    authorize_source: Callable[[], None], executable: str = "codex", timeout: float | None = None,
+    authorize_source: Callable[[AgentCall], None], executable: str = "codex", timeout: float | None = None,
     hidden_environment: Sequence[str] = (), cancelled: threading.Event | None = None,
 ) -> ProcessExit | None:
-    """Consume the frozen native identity within this single owned invocation."""
-    capture = _CodexCapture(kernel, call, executable=executable, environment=environment,
+    """Own credential preparation and the admitted native invocation together."""
+    capture = _CodexCapture(kernel, preparation, executable=executable, environment=environment,
                             credential_file=None, identity=identity, cancelled=cancelled,
                             hidden_paths=hidden_paths, hidden_environment=hidden_environment)
-    return _execute(
-        kernel, call, arguments=(), cwd=capture.cwd, prompt=prompt,
-        environment=environment, timeout=timeout, authorize_source=authorize_source, capture=capture,
-    )
+    return _execute_prepared(capture, prompt=prompt, timeout=timeout, authorize_source=authorize_source)

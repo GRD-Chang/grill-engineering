@@ -5,7 +5,9 @@ import math
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, TypeVar
+
+from agent_run.contracts.policy import AGENT_PREPARATION_SECONDS
 
 WORKER_CREDENTIAL_LIFETIME_SECONDS = 3600
 WORKER_RENEWAL_MARGIN_SECONDS = 300
@@ -42,6 +44,44 @@ class ReadCredential:
 
 # Providers own bounded I/O and implement cancel() for interruptible operations.
 CredentialProvider = Callable[[], ReadCredential | str]
+_T = TypeVar("_T")
+
+
+def prepare_initial_credential(
+    prepare: Callable[[], _T], *, guard: Callable[[], None], deadline: float,
+) -> _T:
+    """Retry only proved transient pre-launch reads within the original call.
+
+    The same reservation owns this bounded wait; this never retries a Worker.
+    Provider I/O remains independently bounded and no credential is a grant.
+    """
+    if not math.isfinite(deadline):
+        raise ValueError("Initial credential wait requires a finite deadline")
+    until = min(deadline, time.monotonic() + AGENT_PREPARATION_SECONDS)
+    delay = 1.0
+    last_status: int | None = None
+    while True:
+        guard()
+        if time.monotonic() >= until:
+            raise InitialCredentialUnavailable("Initial Worker credential wait expired", retryable=True, http_status=last_status)
+        try:
+            result = prepare()
+        except Exception as error:
+            # Native gh retains only classified safe metadata in its cause.
+            failure = error if hasattr(error, "retryable") else error.__cause__
+            if getattr(failure, "retryable", False) is not True:
+                raise
+            last_status = safe_http_status(getattr(failure, "http_status", None))
+            retry_at = min(until, time.monotonic() + delay)
+            while time.monotonic() < retry_at:
+                guard()
+                time.sleep(min(0.1, max(0.0, retry_at - time.monotonic())))
+            delay = min(30.0, delay * 2)
+        else:
+            guard()
+            if time.monotonic() >= until:
+                raise InitialCredentialUnavailable("Initial Worker credential wait expired", retryable=True)
+            return result
 
 
 class RenewableCredential:
@@ -69,11 +109,35 @@ class RenewableCredential:
         self.failure_authorization_failed = False
         self._attempts = 0
 
-    def start(self) -> None:
+    def start(self, *, guard: Callable[[], None] | None = None, deadline: float | None = None) -> None:
+        control_failure: BaseException | None = None
+
+        def check() -> None:
+            nonlocal control_failure
+            assert guard is not None
+            try:
+                with self._condition:
+                    if self._closed:
+                        raise InitialCredentialUnavailable("Credential lifecycle is closed")
+                guard()
+            except BaseException as error:
+                control_failure = error
+                raise
+
         try:
-            self._update()
-        except Exception as error:
-            self.close()
+            if guard is None:
+                self._update()
+            else:
+                if deadline is None:
+                    raise ValueError("Initial credential wait requires the original deadline")
+                prepare_initial_credential(self._update, guard=check, deadline=deadline)
+        except BaseException as error:
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
+            if error is control_failure or isinstance(error, InitialCredentialUnavailable) or not isinstance(error, Exception):
+                raise
             raise WorkerCredentialError(
                 "Could not create initial Worker credential: " + (
                     "invalid credential" if getattr(error, "retryable", None) is False
@@ -111,6 +175,8 @@ class RenewableCredential:
                 if (thread is not None and thread.ident is not None
                         and thread is not threading.current_thread()):
                     thread.join(timeout=WORKER_CREDENTIAL_PROVIDER_TIMEOUT_SECONDS + 1)
+                    if thread.is_alive():
+                        raise WorkerCredentialError("Credential provider cleanup is unproven")
 
     def _cancel_provider(self) -> None:
         cancel = getattr(self._provider, "cancel", None)

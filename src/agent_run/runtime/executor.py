@@ -20,7 +20,7 @@ from agent_run.errors import bounded_error
 from agent_run.adapters.systemd import SystemdHost
 from agent_run.runtime.execution import ProcessExitUnknown
 from agent_run.core.kernel import Kernel
-from agent_run.model import AgentCall, Execution, Step
+from agent_run.model import AgentPreparation, Execution, Step
 from agent_run.errors import KernelError
 from agent_run.core.operation_contract import OperationBinding
 from agent_run.core.operation_runner import OperationRunner
@@ -55,12 +55,11 @@ class _Executor:
         self.kernel, self.runner = kernel, runner
         self.environment = dict(environment)
 
-    def agent(self, call: AgentCall, cancelled: threading.Event) -> None:
+    def agent(self, call: AgentPreparation, cancelled: threading.Event) -> None:
         try:
             prompt = render_role_prompt(call)
         except Exception as error:
-            if self.kernel.dispatch_agent(call):
-                self.kernel.agent_unavailable(call, "worker_preparation_failed", {"error_type": type(error).__name__})
+            self.kernel.preparation_failed(call, "worker_preparation_failed", {"source": "prompt", "error_type": type(error).__name__})
             return
         from agent_run.runtime.codex import execute_selected_codex
         binding = self.runner.binding
@@ -69,7 +68,7 @@ class _Executor:
         execute_selected_codex(
             self.kernel, call, identity=binding.inputs.worker_identity, environment=self.environment,
             prompt=prompt, hidden_paths=binding.hidden_paths, hidden_environment=binding.hidden_environment,
-            authorize_source=lambda: self.runner.authorize_agent(call), cancelled=cancelled,
+            authorize_source=self.runner.authorize_agent, cancelled=cancelled,
         )
 
 
@@ -85,7 +84,7 @@ def run(kernel: Kernel, execution: Execution, environment: Mapping[str, str]) ->
     runner.activate_observation()
     driver = _Executor(kernel, runner, environment)
     state = runner.state()
-    workers: dict[str, tuple[AgentCall, Future[None], threading.Event]] = {}
+    workers: dict[str, tuple[AgentPreparation, Future[None], threading.Event]] = {}
     operation: Future[Step] | None = None
     notifications = NativeNotifications(kernel.storage.path, kernel.storage.path.parent)
     drain_notifications = False
@@ -98,14 +97,14 @@ def run(kernel: Kernel, execution: Execution, environment: Mapping[str, str]) ->
                     if operation is not None and operation.done():
                         step = operation.result()
                         operation = None
-                        if step.call is not None:
-                            # Hand off an allocated call before state, observer,
+                        if step.preparation is not None:
+                            # Hand off the preparation seat before state, observer,
                             # or another potentially slow operation is touched.
-                            call = step.call
-                            if call.lease_id in workers:
+                            call = step.preparation
+                            if call.reservation_id in workers:
                                 raise KernelError("duplicate_host_call")
                             cancelled = threading.Event()
-                            workers[call.lease_id] = (call, agents.submit(driver.agent, call, cancelled), cancelled)
+                            workers[call.reservation_id] = (call, agents.submit(driver.agent, call, cancelled), cancelled)
                     for lease, (call, future, _) in list(workers.items()):
                         if not future.done():
                             continue

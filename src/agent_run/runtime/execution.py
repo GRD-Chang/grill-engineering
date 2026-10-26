@@ -9,7 +9,6 @@ This is a local process adapter, not a systemd/cgroup or live Codex adapter.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import ExitStack
 from dataclasses import dataclass
 import math
 import os
@@ -218,30 +217,11 @@ def _execute(
     except BaseException as error:
         kernel.agent_unavailable(call, "worker_preparation_failed", {"error_type": type(error).__name__})
         raise
-    resources = ExitStack()
-    if capture is not None:
-        try:
-            resources.enter_context(capture)
-        except BaseException as error:
-            kernel.agent_unavailable(call, "worker_preparation_failed", {"error_type": type(error).__name__})
-            if isinstance(error, OSError):
-                return None
-            raise
-        arguments, cwd, environment = capture.arguments, capture.cwd, capture.environment
-    try:
-        result = _run_dispatched(
-            kernel, call, arguments=arguments, cwd=cwd, prompt=prompt,
-            environment=environment, deadline=deadline, authorize_source=authorize_source,
-            credential_file=credential_file, capture=capture,
-        )
-    except BaseException as error:
-        try:
-            resources.close()
-        except BaseException as cleanup_error:
-            raise error from cleanup_error
-        raise
-    resources.close()
-    return result
+    return _run_dispatched(
+        kernel, call, arguments=arguments, cwd=cwd, prompt=prompt,
+        environment=environment, deadline=deadline, authorize_source=authorize_source,
+        credential_file=credential_file, capture=capture,
+    )
 
 
 def _authorize_source(

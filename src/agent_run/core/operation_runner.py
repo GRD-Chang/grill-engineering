@@ -1,7 +1,7 @@
 """Core operation interface, bound to one in-process physical adapter.
 
 run_once performs one committed transition, one Effect, or one poll and returns;
-an AgentCall is returned immediately for Host supervision. It never runs an
+an AgentPreparation is returned immediately for Host supervision. It never runs an
 Agent or waits for a workflow/CI to finish. observe is an explicit operational
 read: it accepts fresh Requirements/audit facts but allocates no work, advances
 no phase and grants no write. User status/history queries do not call observe.
@@ -18,7 +18,7 @@ import json
 
 
 
-from agent_run.model import AgentCall, Effect, EffectResult, Execution, ReadWait, Step, World
+from agent_run.model import AgentCall, AgentPreparation, Effect, EffectResult, Execution, ReadWait, Step, World
 from agent_run.errors import KernelError
 from agent_run.core.operation_contract import (OperationBinding, OperationPorts, OperationState, ReadUnavailable,
                                  ReadFence, RequirementsRead, DeliveryRead, DeliveryFacts,
@@ -103,7 +103,7 @@ class OperationRunner:
             raise ReadWait(self.kernel._wait_for_read(request.fence, self.execution, error.code, error.message)) from error
         self.kernel.authorize_agent_observation(call, world, fence)
 
-    def worker_settled(self, call: AgentCall) -> bool:
+    def worker_settled(self, call: AgentCall | AgentPreparation) -> bool:
         return self.kernel.worker_settled(call)
 
     def run_once(self, *, agent_capacity: int = 1) -> Step:
