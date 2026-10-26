@@ -17,7 +17,7 @@ from typing import Iterator
 from agent_run.errors import KernelError
 
 
-PROTOCOL = "independent-delivery-kernel-v20"
+PROTOCOL = "independent-delivery-kernel-v21"
 LEGACY_PROTOCOL = "sqlite-work-records-v6"
 SOURCE_FENCE_PREFIX = "original-source-to-native/1:"
 

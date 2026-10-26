@@ -24,6 +24,8 @@ POLICY_VALUE_FIELDS = {
     "parent_ci_development_limit": "parent_ci_developments",
 }
 
+AGENT_PREPARATION_SECONDS = 600
+
 
 def positive_integer(value: Any, name: str) -> int:
     if type(value) is not int or value <= 0:

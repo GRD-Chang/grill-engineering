@@ -54,6 +54,7 @@ class OperationState:
     cancel: tuple[str, ...]  # The same lease identity space as active.
     wake_at: float | None  # Absolute time in Kernel.clock's domain.
     disposition: Literal["ready", "waiting", "quiescent", "complete"]
+    preparing: tuple[str, ...] = ()  # Preparation IDs become the real lease IDs atomically.
 
 class OperationPorts(Protocol):
     """Physical reads/writes only; no Core SQL, refresh or World construction."""

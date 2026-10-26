@@ -316,6 +316,27 @@ class HostObservation:
 
 
 @dataclass(frozen=True)
+class AgentPreparation:
+    """An Attempt's bounded preparation seat; no Invocation or execution clock."""
+    reservation_id: str
+    attempt_id: str
+    subject: str
+    role: Role
+    purpose: Purpose
+    thread_id: str
+    execution: Execution
+    context: Mapping[str, Any]
+    profile: Profile
+    deadline_seconds: float
+    preparation_deadline: float
+    mode: str = "fresh"
+    reported_thread: str | None = None
+    output_ordinal: int = 0
+    profile_revision: int = 1
+    profile_reference: str | None = None
+
+
+@dataclass(frozen=True)
 class AgentCall:
     attempt_id: str
     invocation_id: str
@@ -401,6 +422,7 @@ class Step:
     reason: str = ""
     call: AgentCall | None = None
     retry_at: float | None = None
+    preparation: AgentPreparation | None = None
 
 
 class ReadWait(KernelError):
