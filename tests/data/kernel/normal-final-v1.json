@@ -89,9 +89,9 @@
   "cut": "completed after Final whole-Run Review, Final Publication, explicit approval, normal merge, Parent close and cleanup; completed Ticket is historical input",
   "delivery_kind": "full_parent",
   "completed_ticket_precondition": {
-    "source": "unchanged support.run_scenarios._completed_run historical fixture",
+    "source": "native Ticket producer with full published PR squash narrative",
     "ticket_number": 3,
-    "commit_message": "feat(ticket): integrated accepted ticket",
+    "commit_message": "feat(ticket): accepted historical fixture\n\nParent Issue: #1\nPrimary Ticket: #3\nDelivery Type: Ticket\n\nAccepted historical Ticket with recorded review, checks and exact Git evidence.",
     "commit_parents": [
       "initial"
     ],

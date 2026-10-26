@@ -4349,7 +4349,8 @@ class Kernel:
             narrative = artifact(Role.PUBLICATION, tx.get(publication[0], subject))
             return self._prepare_effect(tx, run, job, work, world, "merge", before=target.sha,
                                         after=job["publication_sha"], payload={"method": "squash" if job["kind"] == DeliveryKind.TICKET else "merge",
-                                        "commit_message": narrative["commit_message"] if job["kind"] == DeliveryKind.TICKET else f"merge: Delivery Run {job['source_ref'].removeprefix('refs/heads/')}",
+                                        "commit_message": (narrative["pr_title"] + "\n\n" + self._narrative_body(tx, run, job, narrative["pr_body_markdown"]))
+                                        if job["kind"] == DeliveryKind.TICKET else f"merge: Delivery Run {job['source_ref'].removeprefix('refs/heads/')}",
                                         "parents": [target.sha] + ([] if job["kind"] == DeliveryKind.TICKET else [job["publication_sha"]])})
         if phase == "completion_comment":
             return self._prepare_effect(tx, run, job, work, world, "completion_comment", before=job["merge_sha"],

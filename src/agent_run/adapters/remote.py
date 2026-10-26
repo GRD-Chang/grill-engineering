@@ -843,6 +843,9 @@ class RemoteEffects:
                 return EffectResult("unknown", commit=commit, pr=pr,
                     raw={**raw, "diagnostic": "Full squash commit message is not observable"})
             return EffectResult("target", commit=commit, pr=pr, raw=raw)
+        if (effect.payload["method"] == "squash"
+                and pr.title + "\n\n" + pr.body != effect.payload["commit_message"]):
+            return EffectResult("third", pr=pr)
         return EffectResult("prior" if self._pr_target(effect, pr, source, target) == effect.base
                             and source == effect.after_sha and target == effect.before_sha else "third", pr=pr)
 
