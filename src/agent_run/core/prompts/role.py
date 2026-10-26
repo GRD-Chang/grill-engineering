@@ -121,5 +121,7 @@ def render_role_prompt(call: AgentCall | AgentPreparation) -> str:
     )
     if call.role == Role.REVIEW and not isinstance(context.get("review_context"), dict):
         raise KernelError("review_context_unavailable")
+    if call.role == Role.PUBLICATION and not isinstance(context.get("publication_context"), dict):
+        raise KernelError("publication_scope_unavailable")
     role = "final-publication" if call.role == Role.PUBLICATION and scope == DeliveryKind.FINAL_RUN else call.role.value
     return render_prompt(request, role)

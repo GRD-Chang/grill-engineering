@@ -1,6 +1,17 @@
 """发布文案的双语证据边界、续接与输出语义。"""
 
 
+_SCOPE_ZH = """publication_context 给出本次固定成果的准确范围和观察到的已有 PR 原文。
+commit_range 是本次提交的内容范围：从 base_sha 到 head_sha 对应的固定成果；最终发布提交的 SHA 尚未创建，不要把它与该内容提交混淆。若 commit_range 为 null，本次只编写最终 Parent PR，commit_message 不用于创建提交，简短概括整体交付即可。
+pr_range 是整个 PR 相对目标快照的范围。pr_title 和 pr_body_markdown 必须描述这个范围内仍有效的完整任务成果，结合 existing_pr 更新并删除过时内容，不缩成最后一次 CI 或集成修复日志。existing_pr 是观察事实，不授予覆盖、合并或批准权限。
+如实披露新 head 尚未发布、远端 CI 尚未执行或最终批准尚未取得；这些后续程序步骤不是编写文案的前置条件。"""
+
+_SCOPE_EN = """publication_context contains the exact ranges of the fixed result and the observed existing PR copy.
+commit_range is the content range of this commit: base_sha to the fixed result at head_sha. The new publication commit SHA does not exist yet; do not confuse it with that content commit. When commit_range is null, this task drafts only the final Parent PR: commit_message is not used to create a commit and may briefly summarize the overall delivery.
+pr_range covers the entire PR relative to its target snapshot. pr_title and pr_body_markdown must describe all still-valid task accomplishments in that range, updating existing_pr and removing obsolete text rather than shrinking to the latest CI or integration repair log. existing_pr is an observation, not permission to overwrite, merge or approve.
+Disclose an unpublished new head, unexecuted remote CI or missing final approval accurately; those later program steps are not prerequisites for drafting this copy."""
+
+
 TEXTS: dict[str, dict[str, str]] = {
     'publication/ci-repair-evidence': {
         'zh': """本次可使用的验证事实：
@@ -41,7 +52,9 @@ Complete independent review result for this task (original acceptance_artifact J
         'en': """You are the engineer responsible for checking the commit-description output format. Do not read or modify the repository or call tools. Return only result_kind set to human_blocker, commit_message, pr_title and pr_body_markdown set to null, and human_blockers set to an array containing exactly one nonempty English string.""",
     },
     'publication/output': {
-        'zh': """只读当前工作区与证据，不修改文件、重新验收或执行 Git/GitHub 写入。
+        'zh': _SCOPE_ZH + """
+
+只读当前工作区与证据，不修改文件、重新验收或执行 Git/GitHub 写入。
 若在工作区外创建本轮临时文件，定位并清理，不进行宽泛删除。
 
 任务关联、关闭与完成信息由程序填写；不写 closing keywords，也不预先宣称 CI、合并或尚未发生的验收已通过。
@@ -49,7 +62,9 @@ Complete independent review result for this task (original acceptance_artifact J
 最后只输出符合指定输出 schema 的 JSON。正常完成时 result_kind 为 publication，提供 commit_message、pr_title 和 pr_body_markdown，human_blockers 为 null。
 
 只有确实需要人提供决定、权限、凭据或不可替代操作时，result_kind 为 human_blocker，三个文案字段为 null；human_blockers 说明发生了什么、已尝试什么、人必须做什么。""",
-        'en': """Read only the current workspace and evidence. Do not modify files, repeat acceptance review or perform Git/GitHub writes.
+        'en': _SCOPE_EN + """
+
+Read only the current workspace and evidence. Do not modify files, repeat acceptance review or perform Git/GitHub writes.
 If you create temporary files outside the workspace for this task, locate and clean them up; do not perform broad deletion.
 
 The program supplies task associations, closure and completion information. Do not write closing keywords or prematurely claim that CI, merging or acceptance review that has not happened has passed.
@@ -71,8 +86,12 @@ Correct only the result format. Do not restart development, review or validation
     'publication/resume': {
         'zh': """你是负责本次交付说明的工程师。继续完成你负责的交付说明。根据当前改动和允许使用的证据，完成准确的提交说明与 PR 文案。
 
+""" + _SCOPE_ZH + """
+
 最后只返回文案结果 JSON，保留 result_kind、commit_message、pr_title、pr_body_markdown 和 human_blockers 字段。""",
         'en': """You are the engineer responsible for describing this delivery. Continue your assigned writing task. Complete an accurate commit message and PR copy using current changes and the evidence you are allowed to use.
+
+""" + _SCOPE_EN + """
 
 Return only the publication result JSON, retaining result_kind, commit_message, pr_title, pr_body_markdown and human_blockers.""",
     },

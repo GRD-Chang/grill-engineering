@@ -175,3 +175,35 @@ def test_source_preview_cli_lists_and_writes_selected_schema_without_changing_cw
     invalid = invoke("candidate-run-review")
     assert invalid.returncode == 2
     assert "未知阶段" in invalid.stderr
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_publication_examples_show_commit_and_entire_pr_ranges_through_real_renderer(catalog, monkeypatch, language):
+    requests = {}
+    original = catalog.render_prompt
+
+    def capture(request, role, *, continuation=False):
+        if role in {"publication", "final-publication"}:
+            prompt = original(request, role, continuation=continuation)
+            requests[prompt] = request
+            return prompt
+        return original(request, role, continuation=continuation)
+
+    monkeypatch.setattr(catalog, "render_prompt", capture)
+    previews = catalog.scenarios(PARENT, TICKET, language)
+    for name in ("publication", "parent-publication", "final-publication", "publication-update",
+                 "parent-publication-update", "final-publication-update", "fallback-publication",
+                 "ci-waiver-publication", "continue-publication", "fresh-publication"):
+        _, prompt, schema = previews[name]
+        request = requests[prompt]
+        scope = request["publication_context"]
+        assert json.dumps({"publication_context": scope}, ensure_ascii=False, indent=2, sort_keys=True) in prompt
+        assert scope["pr_range"]["head_sha"] == request["reviewed_commit"]
+        assert (scope["commit_range"] is None) == (request["acceptance_scope"] == "run")
+        assert schema == role_schema("publication")
+        if name.endswith("-update") or name == "ci-waiver-publication":
+            assert scope["existing_pr"]["url"].endswith("/pull/3")
+            assert scope["existing_pr"]["body"] in prompt
+            if scope["commit_range"] is not None:
+                assert scope["commit_range"]["base_sha"] == scope["existing_pr"]["head"]["sha"]
+                assert scope["commit_range"] != scope["pr_range"]

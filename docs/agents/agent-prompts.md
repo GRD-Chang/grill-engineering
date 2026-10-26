@@ -45,7 +45,8 @@ Skill 例外、明确需求链接及修复风险审查例外。领域定义见 [
 输出 schema 另列，来自后端实际使用的 `role_schema`，不复制进角色正文。`--json` 预览结果分别包含 `prompt` 和 `schema`。
 安装器兼容性检查和文案握手只读展示各自的真实文案与 schema，不执行探针。
 目录只保留当前合法组合：CI 免审仅适用于 Ticket；不展示内部 Repair PR、Ticket 集成 Review 或完整 Parent 的初次整体 Development。
-完整 PR 与本次增量提交范围的发布示例待 #446 的生产输入合同交付后补齐，不提前编造未消费的字段。
+发布示例包括 `publication-update`、`parent-publication-update`、`final-publication-update`：
+展示实际组装器消费的完整 PR 范围、本次发布提交内容范围及已有 PR 原文，全部明确标为示例。
 实际安装探针读取候选安装包自己的文案；展示脚本使用当前源码。必需资源缺失时明确报错，避免复制正文后漂移。它不启动 Codex、不访问 GitHub、不读取真实运行状态，
 也不包含 Codex 自身系统指令、自动加载的 `AGENTS.md` 或 Skill 内容。默认只输出到终端，
 只有指定 `--output` 时才写入展示文件。
@@ -529,3 +530,21 @@ Reviewer 在固定范围内自主决定核验深度，程序不解析 Findings �
 ## 集成 Development 的人工续接
 
 Ticket、Parent-only 与完整 Parent 集成求助后的实际 Development 输入保留原集成证据、原始求助与当前 Generation 的人工回复。`--new-thread` 创建该开发角色的新会话，不因完整 Parent 的保存容器名选择 Reviewer；会话变化不改变任务目标、范围或原 Attempt。已有程序收口结果不再次调用 Agent，message 不成为正式需求或批准。覆盖入口为 `test_run_integration_work.py` 的公开 resume、StateStore 重载及实际调用输入，`test_unified_resume.py` 的无活动 Invocation 组合，及既有集成恢复和 Prompt 回归。
+
+
+### 发布提交与 PR 文案的不同范围
+
+Core 在 Publication Attempt 的原 `context_id` 中固定 `publication_context`，不新增基准账本：
+`commit_range` 从当前发布分支的准确 `source_sha` 到已核验的固定成果；`pr_range`
+从本次观察的目标快照到同一固定成果；`existing_pr` 原样保留所观察 PR 的身份、标题、正文和链接。
+两个范围属于不同文案产物，不改变 Reviewer 唯一增量主范围，也不把 CI 标签或最后一次修复当范围依据。
+
+`commit_message` 描述本次程序实际创建的发布提交的全部内容变化；范围终点是已存在的内容提交，
+不预猜尚未创建的新发布提交 SHA。PR 标题与正文描述整个 PR 相对目标的完整交付，
+追加修复后保留仍有效的任务成果，并据实际证据更新旧文案。最终多 Ticket Parent 复用成果提交，
+`commit_range` 为 null，统一输出中的 `commit_message` 不用于创建提交；Ticket 最终 squash
+继续使用完整已发布 PR 的标题和正文，Parent-only/Parent 普通合并方式不变。
+
+运行与公开预览共用这些冻结事实；原线程续接也展示同一范围，不从当前配置或修复标签重算。
+缺少绑定范围的 Worker 明确拒绝，纯方法检查预览不等同于已分配的真实调用。
+已有 PR 仅是观察事实，不增加写入、覆盖、合并或批准权；unknown、CI 和人工批准仍由原门禁处理。

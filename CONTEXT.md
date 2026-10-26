@@ -15,6 +15,10 @@ Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付�
 
 本轮架构合同见 [ADR 0024](docs/adr/0024-orchestration-responsibility-separation.md) 与 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md)。共同 Agent 执行、图调度与交付阶段分界、固定预算归属、Review Context、同类证据适用规则及准确发布对账共同支持三种交付对象。完整 Parent 的修复直接纳入自身开发、集成和审核，程序准确更新 Run Branch，仅最终 Run PR 承担 Publish 文案、Hosted CI 与人工批准。Ticket 与 Parent-only 在自身 Job 保存预算，完整 Parent 在 Run Acceptance 保存预算，Repair Job 仅引用所属 Parent 的额度。Review Context 在既有 Semantic Attempt 中固定调用事实并绑定返回结论。修复保留身份、受管工作区、必要本地分支、候选与历史；不兼容读取或迁移旧 Run。审核范围、额度策略、准确成果核验及人工批准合同继续有效。
 
+Publication 在原 Attempt 输入中固定实际发布提交的内容范围、整个 PR 相对目标快照的范围及已有 PR 原文。
+提交说明描述前者，PR 文案描述完整任务成果；最终多 Ticket Parent 不据文案创建新提交。
+这些文案事实不改变 Reviewer 的唯一增量范围或现有发布、CI、批准权限。
+
 ## 静态 Prompt 资源与个人方法
 
 新 Delivery Run 在首次持久化前一次读取并固定语言、四份角色正文及代码定义的对应语言内部静态文案。
