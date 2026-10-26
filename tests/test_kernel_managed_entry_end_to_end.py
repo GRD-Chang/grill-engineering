@@ -918,9 +918,15 @@ issue = int(re.search(r'https://github.com/example/project/issues/(\\d+)', promp
             assert final_remote['source_graph']['issues']['2']['state'] == final_remote['source_graph']['issues']['4']['state'] == 'CLOSED'
             assert final_remote['source_graph']['issues']['3']['state'] == final_remote['source_graph']['issues']['5']['state'] == 'OPEN'
             assert len(final_remote['prs']) == 2 and all(row['merged'] for row in final_remote['prs'])
-            assert _git(tmp_path / 'origin.git', 'show', 'refs/heads/main:delivery-2.txt') == 'Original delivery for Ticket 2.'
-            assert _git(tmp_path / 'origin.git', 'show', 'refs/heads/main:delivery-4.txt') == 'Original delivery for Ticket 4.'
-            _git(tmp_path / 'origin.git', 'merge-base', '--is-ancestor', pr_a['merge_commit_sha'], 'refs/heads/main')
+            target = kernel.delivery('ticket:2').target_ref
+            assert target == kernel.delivery('ticket:4').target_ref
+            assert all('refs/heads/' + row['base']['ref'] == target for row in final_remote['prs'])
+            default = _git(tmp_path / 'origin.git', 'symbolic-ref', 'HEAD')
+            assert default != target
+            assert _git(tmp_path / 'origin.git', 'rev-parse', default) == pr_a['base']['sha']
+            assert _git(tmp_path / 'origin.git', 'show', target + ':delivery-2.txt') == 'Original delivery for Ticket 2.'
+            assert _git(tmp_path / 'origin.git', 'show', target + ':delivery-4.txt') == 'Original delivery for Ticket 4.'
+            _git(tmp_path / 'origin.git', 'merge-base', '--is-ancestor', pr_a['merge_commit_sha'], target)
             assert all(pin.observe() == 'exited' for pin in pins)
             assert not list(record_root(lock).glob('*.json'))
             with runner_management_lease(lock):
