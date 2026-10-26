@@ -158,3 +158,25 @@ def test_malformed_reference_is_rejected_without_echoing_arbitrary_text(database
         RunTransaction(database, "A").get(identity, "parent:1")
     assert error.value.code == "material_corrupt"
     assert "secret-fixture" not in str(error.value)
+
+
+def test_reopened_readonly_file_keeps_both_run_scopes_and_original_bytes(tmp_path):
+    path = tmp_path / "staged-scope.sqlite3"
+    with closing(connection(path)) as database:
+        assert database.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        database.execute("BEGIN")
+        seed(database, "A")
+        seed(database, "B")
+        database.commit()
+        identities = {run: RunTransaction(database, run).put("parent:1", "raw", run.encode()) for run in ("A", "B")}
+    before = path.read_bytes()
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, isolation_level=None)) as reopened:
+        reopened.row_factory = sqlite3.Row
+        reopened.execute("PRAGMA query_only=ON")
+        reopened.execute("PRAGMA trusted_schema=OFF")
+        for run in ("A", "B"):
+            tx = RunTransaction(reopened, run)
+            assert tx.get(identities[run], "parent:1") == run.encode()
+            with pytest.raises(KernelError, match="material_corrupt"):
+                tx.get(identities["B" if run == "A" else "A"], "parent:1")
+    assert path.read_bytes() == before

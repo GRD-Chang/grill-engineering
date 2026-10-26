@@ -4,13 +4,14 @@ The profile bytes are intentionally opaque to these SQL-constraint tests. Do
 not use this producer as an authorization, Invocation or lifecycle fixture.
 """
 from hashlib import sha256
+from pathlib import Path
 import sqlite3
 
 from agent_run.storage.repository_schema import REPOSITORY_RUN_SCHEMA
 
 
-def connection() -> sqlite3.Connection:
-    database = sqlite3.connect(":memory:", isolation_level=None)
+def connection(path: Path | str = ":memory:") -> sqlite3.Connection:
+    database = sqlite3.connect(path, isolation_level=None)
     try:
         database.row_factory = sqlite3.Row
         database.execute("PRAGMA foreign_keys=ON")
