@@ -1,5 +1,6 @@
 """Real fake-gh transport into native Requirements; Kernel owns all decisions."""
 import json
+import os
 from pathlib import Path
 
 import pytest
