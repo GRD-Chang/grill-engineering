@@ -68,6 +68,3 @@ def _native_boundary(tmp_path: Path, *, ordinary_used: bool = False, malformed: 
             call = source_operations.once().call
             assert call is not None
     return source, owner, source_operations, call.attempt_id, call
-
-
-
