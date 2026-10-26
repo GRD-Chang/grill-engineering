@@ -25,8 +25,8 @@ def empty_save_registry():
 
 @contextmanager
 def paused_head(storage, subject):
-    code = Storage.transaction.__wrapped__.__code__
-    lines, start = inspect.getsourcelines(Storage.transaction.__wrapped__)
+    code = Storage._transaction.__wrapped__.__code__
+    lines, start = inspect.getsourcelines(Storage._transaction.__wrapped__)
     line = start + next(i for i, text in enumerate(lines) if 'connection.execute("BEGIN IMMEDIATE")' in text)
     ready, release = threading.Event(), threading.Event()
     errors = []
@@ -78,19 +78,18 @@ def test_earlier_save_cannot_be_overtaken_after_preflight(tmp_path, client):
         alias = tmp_path / 'state-alias'
         alias.symlink_to(kernel.storage.path.parent, target_is_directory=True)
         other = Storage(alias / kernel.storage.path.name)
-    code = Storage.transaction.__wrapped__.__code__
-    lines, start = inspect.getsourcelines(Storage.transaction.__wrapped__)
+    code = Storage._transaction.__wrapped__.__code__
+    lines, start = inspect.getsourcelines(Storage._transaction.__wrapped__)
     before_begin = start + next(i for i, line in enumerate(lines) if 'connection.execute("BEGIN IMMEDIATE")' in line)
     first_ready, release, second_entered, second_saved = (threading.Event() for _ in range(4))
     failures = []
     def save(storage, label):
         def trace(frame, event, arg):
-            if frame.f_code is code:
-                if label == 'B' and event == 'call':
-                    second_entered.set()
-                if label == 'A' and event == 'line' and frame.f_lineno == before_begin:
-                    first_ready.set()
-                    assert release.wait(2), 'first save barrier was not released'
+            if frame.f_code is Storage.transaction.__wrapped__.__code__ and label == 'B' and event == 'call':
+                second_entered.set()
+            if frame.f_code is code and label == 'A' and event == 'line' and frame.f_lineno == before_begin:
+                first_ready.set()
+                assert release.wait(2), 'first save barrier was not released'
             return trace
         sys.settrace(trace)
         try:
@@ -349,8 +348,8 @@ def test_same_database_replacement_while_waiting_is_not_adopted(tmp_path, monkey
 def test_control_revokes_a_waiting_admission_without_creating_an_invocation(tmp_path):
     kernel, runner, _, step, _ = agent_preparation_fixture(tmp_path)
     request = step.preparation
-    code = Storage.transaction.__wrapped__.__code__
-    lines, start = inspect.getsourcelines(Storage.transaction.__wrapped__)
+    code = Storage._transaction.__wrapped__.__code__
+    lines, start = inspect.getsourcelines(Storage._transaction.__wrapped__)
     line = start + next(i for i, text in enumerate(lines) if 'connection.execute("BEGIN IMMEDIATE")' in text)
     ready, release = threading.Event(), threading.Event()
     failures = []
@@ -440,8 +439,8 @@ def test_cancel_while_sqlite_waits_never_enters_business_body(tmp_path, monkeypa
 @pytest.mark.parametrize('ordered', [True, False], ids=['business-save', 'control-write'])
 def test_writer_lock_acquired_after_original_deadline_cannot_enter_body(tmp_path, ordered):
     kernel, _, _, step, _ = agent_preparation_fixture(tmp_path)
-    code = Storage.transaction.__wrapped__.__code__
-    lines, start = inspect.getsourcelines(Storage.transaction.__wrapped__)
+    code = Storage._transaction.__wrapped__.__code__
+    lines, start = inspect.getsourcelines(Storage._transaction.__wrapped__)
     before_begin = start + next(i for i, line in enumerate(lines) if 'connection.execute("BEGIN IMMEDIATE")' in line)
     prepared, release, executing = (threading.Event() for _ in range(3))
     deadlines, acquired, failures, ran = [], [], [], []

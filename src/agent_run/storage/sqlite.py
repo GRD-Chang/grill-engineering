@@ -13,15 +13,17 @@ import math
 import mmap
 from pathlib import Path
 import sqlite3
+import sys
 from threading import Event
-from time import monotonic
+from time import monotonic, sleep
 from typing import Any, Iterator, Sequence
 
 from agent_run.storage.sqlite_runtime import require_wal_runtime
 
 from agent_run.errors import KernelError
 from agent_run.storage.preflight import PROTOCOL, UnsupportedState, read_state, require_supported_connection, require_supported_state
-from agent_run.storage.save_order import WRITE_CONTENTION_SECONDS, check_cancelled, database_identity, remaining, save_turn
+from agent_run.storage.save_order import (WRITE_CONTENTION_SECONDS, MAX_PENDING_WRITES, RepositorySave, SaveClock, SaveCommit,
+    SaveNotHead, check_cancelled, database_identity, remaining, save_turn)
 
 MATERIAL_LIMIT = 4 * 1024 * 1024
 CURRENT_LIMIT = 256 * 1024
@@ -265,6 +267,17 @@ CREATE INDEX history_action_facts ON history(kind,identity);
 """
 
 
+class _SaveAdmissionBusy(RuntimeError):
+    """BEGIN contention with confirmed rollback, before any callback."""
+
+
+def _save_warning() -> None:
+    try:
+        print('Storage save cleanup unavailable; preserve original state', file=sys.stderr)
+    except OSError:
+        pass  # Diagnostic-channel failure cannot undo a confirmed COMMIT.
+
+
 class Transaction:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
@@ -424,20 +437,149 @@ class Storage:
         require_wal_runtime()
         if deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline)):
             raise ValueError("A finite absolute transaction deadline is required")
-        # A caller coordinating commit readback may shorten, never renew, the
-        # original contention allowance. Default callers keep their old budget.
         deadline = min(monotonic() + WRITE_CONTENTION_SECONDS, deadline) if deadline is not None else monotonic() + WRITE_CONTENTION_SECONDS
         with ExitStack() as scopes:
             identity = None
             if write:
-                identity = scopes.enter_context(save_turn(self.path, ordered=ordered,
+                # Staged repository writes use only the durable queue below.
+                # The old deque remains solely for the still-active v21 layout;
+                # ordered=False retains its shared nested-owner/afterfork guard.
+                identity = scopes.enter_context(save_turn(self.path, ordered=ordered and not self._repository_mode,
                     deadline=deadline, cancelled=cancelled))
-                if self._repository_mode:
-                    require_supported_state(self.path, timeout=remaining(deadline), _repository=True)
-                else:
-                    require_supported_state(self.path, timeout=remaining(deadline))
+                require_supported_state(self.path, timeout=remaining(deadline), **({'_repository': True} if self._repository_mode else {}))
                 if database_identity(self.path) != identity:
                     raise UnsupportedState(self.path, "uncertain_state")
+            if write and ordered and self._repository_mode:
+                assert identity is not None
+                with self._repository_save(identity, deadline, cancelled) as tx:
+                    yield tx
+            else:
+                with self._transaction(write=write, identity=identity, deadline=deadline, cancelled=cancelled) as tx:
+                    yield tx
+
+    def _verify_save_database(self, identity: tuple[int, int], deadline: float) -> None:
+        if database_identity(self.path) != identity:
+            raise UnsupportedState(self.path, "uncertain_state")
+        with read_state(self.path, timeout=remaining(deadline)) as connection:
+            connection.row_factory = sqlite3.Row
+            require_supported_connection(connection, self.path, _repository=True)
+            self._require_namespace(Transaction(connection))
+        if database_identity(self.path) != identity:
+            raise UnsupportedState(self.path, "uncertain_state")
+
+    @staticmethod
+    def _save_pause(deadline: float, cancelled: Event | None) -> None:
+        check_cancelled(cancelled)
+        delay = min(remaining(deadline), 0.05)
+        if cancelled is None:
+            sleep(delay)
+        else:
+            cancelled.wait(delay)
+        check_cancelled(cancelled)
+        remaining(deadline)
+
+    def _save_metadata(self, request: RepositorySave, identity: tuple[int, int],
+                       cancelled: Event | None, operation: str, commit: SaveCommit | None = None) -> None:
+        # Never call public transaction recursively or expose this metadata
+        # owner to business code. Every retry has ended BEFORE any callback.
+        while True:
+            request.require()
+            try:
+                with self._transaction(write=True, identity=identity, deadline=request.deadline,
+                        cancelled=cancelled, select_run=False, commit=commit, retry_admission=True) as tx:
+                    if operation == 'register':
+                        request.register(tx)
+                    elif operation == 'reconcile':
+                        request.reconcile(tx)
+                    elif operation == 'discard':
+                        request.discard(tx)
+                    else:
+                        raise ValueError('Unknown save metadata operation')
+                return
+            except _SaveAdmissionBusy:
+                self._save_pause(request.deadline, cancelled)
+
+    @contextmanager
+    def _repository_save(self, identity: tuple[int, int], deadline: float,
+                         cancelled: Event | None) -> Iterator[Transaction]:
+        from agent_run.adapters.foreground import DomainUnknown
+        try:
+            clock = SaveClock()
+        except (OSError, ValueError, DomainUnknown) as error:
+            raise KernelError('storage_clock_domain', 'Comparable save clock is unavailable') from error
+        request = RepositorySave(clock, self._run_id, deadline)
+        original: BaseException | None = None
+        may_be_registered = False
+        try:
+            registration = SaveCommit()
+            try:
+                self._save_metadata(request, identity, cancelled, 'register', registration)
+                may_be_registered = True
+            except (OSError, sqlite3.Error, KernelError) as error:
+                may_be_registered = registration.attempted
+                code = getattr(error, 'sqlite_errorcode', None)
+                uncertain_io = (isinstance(error, OSError) and not isinstance(error, InterruptedError)
+                    or isinstance(error, sqlite3.OperationalError) and type(code) is int
+                    and (code & 255) == sqlite3.SQLITE_IOERR)
+                if not registration.attempted or registration.confirmed or not uncertain_io:
+                    raise  # FULL/INTERRUPT/cancel/protocol/capacity retain their original category.
+                # COMMIT began: absence is never rollback. Reconcile only this
+                # original UUID/position/binding; never INSERT it again.
+                try:
+                    self._save_metadata(request, identity, cancelled, 'reconcile')
+                except (OSError, sqlite3.Error, KernelError) as unavailable:
+                    failure = KernelError('storage_registration_unknown', 'Original save registration is unproven')
+                    failure.add_note('Registration readback unavailable: ' + type(unavailable).__name__)
+                    raise failure from error
+            while True:
+                try:
+                    with self._transaction(write=True, identity=identity, deadline=deadline,
+                            cancelled=cancelled, request=request, commit=request.commit, retry_admission=True) as tx:
+                        request.body_entered = True
+                        yield tx
+                    return
+                except (_SaveAdmissionBusy, SaveNotHead):
+                    if request.body_entered:
+                        raise  # An application callback is never replayed.
+                    self._save_pause(deadline, cancelled)
+                except (OSError, sqlite3.Error):
+                    if not request.commit.confirmed:
+                        raise
+                    _save_warning()  # Only connection-close I/O remains after acknowledged COMMIT.
+                    return
+        except BaseException as error:
+            original = error
+            raise
+        finally:
+            try:
+                if may_be_registered and not request.commit.confirmed:
+                    try:
+                        # A set cancellation flag must not forbid exact cleanup;
+                        # the original absolute budget still bounds acquisition.
+                        self._save_metadata(request, identity, None, 'discard')
+                    except (OSError, sqlite3.Error, KernelError) as cleanup:
+                        if original is None:
+                            raise
+                        original.add_note('Save registration cleanup unavailable: ' + type(cleanup).__name__)
+            finally:
+                try:
+                    clock.close()
+                except OSError as cleanup:
+                    if original is not None:
+                        original.add_note('Save clock cleanup unavailable: ' + type(cleanup).__name__)
+                    elif request.commit.confirmed:
+                        _save_warning()
+                    else:
+                        raise
+
+    @contextmanager
+    def _transaction(self, *, write: bool, identity: tuple[int, int] | None, deadline: float,
+                     cancelled: Event | None, select_run: bool = True, request: RepositorySave | None = None,
+                     commit: SaveCommit | None = None, retry_admission: bool = False) -> Iterator[Transaction]:
+        if write and self._repository_mode:
+            assert identity is not None
+            self._verify_save_database(identity, deadline)
+        with ExitStack() as scopes:
             scope = (closing(sqlite3.connect(self.path.absolute().as_uri() + "?mode=rw", uri=True,
                                             isolation_level=None, timeout=remaining(deadline))) if write else read_state(self.path))
             connection = scopes.enter_context(scope)
@@ -447,11 +589,15 @@ class Storage:
             if write:
                 connection.execute("PRAGMA synchronous=FULL")
             transaction = Transaction(connection)
+            beginning = False
             try:
                 if write:
                     check_cancelled(cancelled)
-                    connection.execute(f"PRAGMA busy_timeout={int(remaining(deadline) * 1000)}")
+                    allowance = min(remaining(deadline), 0.05) if retry_admission else remaining(deadline)
+                    connection.execute(f"PRAGMA busy_timeout={int(allowance * 1000)}")
+                    beginning = True
                     connection.execute("BEGIN IMMEDIATE")
+                    beginning = False
                     if database_identity(self.path) != identity:
                         raise UnsupportedState(self.path, "uncertain_state")
                 if self._repository_mode:
@@ -460,11 +606,13 @@ class Storage:
                     require_supported_connection(connection, self.path)
                 self._capacity(connection)
                 self._require_namespace(transaction)
+                if request is not None:
+                    request.admit(transaction)
                 exposed = transaction
-                if self._repository_mode and self._run_id is not None:
+                if self._repository_mode and self._run_id is not None and select_run:
                     from agent_run.storage.run_scope import RunTransaction
                     exposed = RunTransaction(transaction, self._run_id)
-                elif self._run_id is not None:
+                elif not self._repository_mode and self._run_id is not None:
                     if transaction.one("SELECT id FROM runs")[0] != self._run_id:
                         raise KernelError("run_scope_changed")
                 if write:
@@ -481,15 +629,27 @@ class Storage:
                     else:
                         require_supported_connection(connection, self.path)
                     self._require_namespace(transaction)
+                    if request is not None:
+                        request.finish(transaction)
                 self._capacity(connection, committing=write)
+                if commit is not None:
+                    commit.attempted = True
                 connection.commit()
+                if commit is not None:
+                    commit.confirmed = True
             except BaseException as error:
-                connection.rollback()
-                if (isinstance(error, sqlite3.OperationalError)
-                        and getattr(error, "sqlite_errorcode", None) in (
-                            sqlite3.SQLITE_BUSY, sqlite3.SQLITE_BUSY_RECOVERY,
-                            sqlite3.SQLITE_BUSY_SNAPSHOT, sqlite3.SQLITE_BUSY_TIMEOUT,
-                        )):
+                rollback_complete = False
+                try:
+                    connection.rollback()
+                    rollback_complete = not connection.in_transaction
+                except (OSError, sqlite3.Error) as cleanup:
+                    error.add_note('SQLite rollback unavailable: ' + type(cleanup).__name__)
+                busy = isinstance(error, sqlite3.OperationalError) and getattr(error, 'sqlite_errorcode', None) in (
+                    sqlite3.SQLITE_BUSY, sqlite3.SQLITE_BUSY_RECOVERY,
+                    sqlite3.SQLITE_BUSY_SNAPSHOT, sqlite3.SQLITE_BUSY_TIMEOUT)
+                if beginning and busy and retry_admission and rollback_complete:
+                    raise _SaveAdmissionBusy('Save BEGIN contention ended before callback') from error
+                if busy:
                     raise KernelError("storage_busy", "SQLite transaction is locked; retry the command") from error
                 if isinstance(error, sqlite3.OperationalError):
                     code = getattr(error, "sqlite_errorcode", None)
@@ -521,5 +681,9 @@ class Storage:
             # its possible database growth within the existing database cap.
             physical += (wal_size - sizes[1] + max(0, shm_size - sizes[2])
                          + max(0, DATABASE_LIMIT - sizes[0]))
+        if self._repository_mode:
+            tickets = connection.execute("SELECT count(*) FROM save_admissions").fetchone()[0]
+            if tickets > MAX_PENDING_WRITES:
+                raise KernelError("storage_limit")
         if database_size > DATABASE_LIMIT or physical > PHYSICAL_LIMIT:
             raise KernelError("storage_limit")

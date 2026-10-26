@@ -688,6 +688,18 @@ CREATE TABLE task_runs (
 
 
 REPOSITORY_ROUTING_SCHEMA = """
+CREATE TABLE save_admissions (
+ position INTEGER PRIMARY KEY AUTOINCREMENT,
+ request TEXT NOT NULL UNIQUE CHECK(length(request)=32 AND request NOT GLOB '*[^0-9a-f]*'),
+ run_id TEXT REFERENCES runs(id),
+ clock_domain TEXT NOT NULL CHECK(length(clock_domain) BETWEEN 1 AND 512),
+ deadline REAL NOT NULL CHECK(deadline>0 AND deadline<1.0e100)
+);
+CREATE TRIGGER save_admission_capacity BEFORE INSERT ON save_admissions
+WHEN (SELECT count(*) FROM save_admissions)>=128
+BEGIN SELECT RAISE(ABORT,'save admission capacity'); END;
+CREATE TRIGGER save_admission_immutable BEFORE UPDATE ON save_admissions
+BEGIN SELECT RAISE(ABORT,'save registration is immutable'); END;
 CREATE TABLE repository_binding (
  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
  repository TEXT NOT NULL,
