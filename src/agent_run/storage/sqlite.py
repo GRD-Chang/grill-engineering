@@ -7,7 +7,7 @@ rolls back as a whole, including when a nested failure was caught by a caller.
 from __future__ import annotations
 
 
-from contextlib import ExitStack, closing, contextmanager
+from contextlib import ExitStack, contextmanager
 import hashlib
 import math
 import mmap
@@ -274,8 +274,27 @@ class _SaveAdmissionBusy(RuntimeError):
 def _save_warning() -> None:
     try:
         print('Storage save cleanup unavailable; preserve original state', file=sys.stderr)
-    except OSError:
-        pass  # Diagnostic-channel failure cannot undo a confirmed COMMIT.
+    except (OSError, ValueError):
+        pass  # Closed diagnostic channels cannot undo a confirmed COMMIT.
+
+
+@contextmanager
+def _owned_connection(connection: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """Close this handle without replacing an exception from its own scope."""
+    original: BaseException | None = None
+    try:
+        yield connection
+    except BaseException as error:
+        original = error
+        raise
+    finally:
+        try:
+            connection.close()
+        except (OSError, sqlite3.Error) as cleanup:
+            if original is None or isinstance(original, (_SaveAdmissionBusy, SaveNotHead)):
+                # Failed handle cleanup must not disappear into an internal wait/retry.
+                raise
+            original.add_note('SQLite connection cleanup unavailable: ' + type(cleanup).__name__)
 
 
 class Transaction:
@@ -581,7 +600,7 @@ class Storage:
             assert identity is not None
             self._verify_save_database(identity, deadline)
         with ExitStack() as scopes:
-            scope = (closing(sqlite3.connect(self.path.absolute().as_uri() + "?mode=rw", uri=True,
+            scope = (_owned_connection(sqlite3.connect(self.path.absolute().as_uri() + "?mode=rw", uri=True,
                                             isolation_level=None, timeout=remaining(deadline))) if write else read_state(self.path))
             connection = scopes.enter_context(scope)
             connection.row_factory = sqlite3.Row

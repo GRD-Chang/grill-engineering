@@ -4,6 +4,7 @@ Clock substitutes exercise decisions, not actual kernel clock comparability.
 True separate-process/clock/crash/WAL-cost acceptance remains explicitly pending.
 """
 from contextlib import closing
+import io
 import sqlite3
 from threading import Event
 from types import SimpleNamespace
@@ -500,3 +501,101 @@ def test_nonhead_wait_is_not_retried_when_its_rollback_is_unproven(repository, m
     assert failed.value.code == 'transaction_aborted' and rollbacks == [True]
     assert scalar(repository, 'SELECT count(*) FROM save_admissions') == 1
     assert scalar(repository, 'SELECT request FROM save_admissions') == earlier.request
+
+
+def test_confirmed_commit_clock_close_with_closed_stderr_remains_success(repository, monkeypatch):
+    closed = io.StringIO()
+    closed.close()
+    clocks, entered = [], []
+    class CloseError(DecisionClock):
+        def __init__(self):
+            super().__init__()
+            clocks.append(self)
+        def close(self):
+            super().close()
+            raise OSError('controlled acknowledged-commit clock cleanup failure')
+    with monkeypatch.context() as patch:
+        patch.setattr(storage_module, 'SaveClock', CloseError)
+        patch.setattr(storage_module.sys, 'stderr', closed)
+        with repository.at_run('A').transaction() as tx:
+            entered.append(tx.run_id)
+            tx.execute('UPDATE runs SET stopped=1 WHERE id=?', ('A',))
+    assert entered == ['A'] and len(clocks) == 1 and clocks[0].closed
+    assert scalar(repository, 'SELECT stopped FROM runs WHERE id=?', ('A',)) == 1
+    assert scalar(repository, 'SELECT count(*) FROM save_admissions') == 0
+
+
+def test_cancelled_before_body_keeps_original_exception_when_connection_close_fails(repository, monkeypatch):
+    cancelled = Event()
+    original_connect, original_admit = sqlite3.connect, RepositorySave.admit
+    closed, rollbacks, entered = [], [], []
+    primary = InterruptedError('controlled original cancellation')
+    class CloseError(sqlite3.Connection):
+        def rollback(self):
+            before = self.in_transaction
+            super().rollback()
+            if before:
+                rollbacks.append(self.in_transaction)
+        def close(self):
+            fail = (cancelled.is_set() and not closed
+                and self.execute('PRAGMA query_only').fetchone()[0] == 0)
+            super().close()
+            if fail:
+                closed.append(True)
+                raise OSError('controlled already-closed connection cleanup failure')
+    def cancel_before_yield(ticket, tx):
+        original_admit(ticket, tx)
+        cancelled.set()
+    def precise_cancel(event):
+        if event is not None and event.is_set():
+            raise primary
+    with monkeypatch.context() as patch:
+        patch.setattr(storage_module.sqlite3, 'connect', lambda *a, **kw:
+            original_connect(*a, **kw, factory=CloseError))
+        patch.setattr(RepositorySave, 'admit', cancel_before_yield)
+        patch.setattr(storage_module, 'check_cancelled', precise_cancel)
+        with pytest.raises(InterruptedError) as caught:
+            with repository.at_run('A').transaction(cancelled=cancelled):
+                entered.append('unexpected body')
+    assert caught.value is primary and entered == [] and rollbacks == [False]
+    assert closed == [True]
+    assert 'SQLite connection cleanup unavailable: OSError' in primary.__notes__
+    assert all('controlled already-closed' not in note for note in primary.__notes__)
+    assert scalar(repository, 'SELECT stopped FROM runs WHERE id=?', ('A',)) == 0
+    assert scalar(repository, 'SELECT count(*) FROM save_admissions') == 0
+
+
+@pytest.mark.parametrize('cleanup_type', [OSError, sqlite3.OperationalError])
+def test_normal_connection_scope_does_not_swallow_close_failure_from_ambient_exception(cleanup_type):
+    cleanup = cleanup_type('controlled own cleanup')
+    class Connection:
+        def close(self):
+            raise cleanup
+    try:
+        raise ValueError('Already handled outside connection scope')
+    except ValueError as prior:
+        with pytest.raises(cleanup_type) as caught:
+            with storage_module._owned_connection(Connection()):
+                pass
+        assert caught.value is cleanup and not getattr(prior, '__notes__', ())
+
+
+def test_unexpected_connection_cleanup_runtime_error_is_still_visible():
+    class Connection:
+        def close(self):
+            raise RuntimeError('controlled programming failure')
+    with pytest.raises(RuntimeError, match='controlled programming failure'):
+        with storage_module._owned_connection(Connection()):
+            pass
+
+
+@pytest.mark.parametrize('waiting_type', [storage_module._SaveAdmissionBusy, SaveNotHead])
+def test_connection_close_failure_cannot_be_hidden_in_internal_wait_retry(waiting_type):
+    failure = OSError('controlled wait-scope connection cleanup')
+    class Connection:
+        def close(self):
+            raise failure
+    with pytest.raises(OSError) as caught:
+        with storage_module._owned_connection(Connection()):
+            raise waiting_type('controlled pre-body wait')
+    assert caught.value is failure and isinstance(caught.value.__context__, waiting_type)
