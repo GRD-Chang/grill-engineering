@@ -202,9 +202,76 @@ def test_history_binds_each_review_findings_and_evidence_to_its_original_candida
         second_heading = f"#1 Review Agent #{second['ordinal']}"
         assert value.count(first_heading) == value.count(second_heading) == 1
         old, new = value.split(first_heading, 1)[1].split(second_heading, 1)
-        assert finding in old and finding not in new
+        assert (finding in old) is details
+        assert "ORIGINAL-REVIEW-FINDING" in old and "ORIGINAL-REVIEW-FINDING" not in new
+        assert ("original evidence" in old) is details
+        assert ("original fix" in old) is details
+        assert ("original retest" in old) is details
+        if not details:
+            assert "Findings (1)" in old
+        assert "Budget at round start: not recorded" in old
+        assert value.rstrip().endswith(f"Task elapsed seconds: {document.data['elapsed_seconds']}")
+        assert "Role rounds in this history page" in value
+        assert "Parent-only · Review Agent: 2" in value
         assert "Acceptance failed" in old and "Acceptance passed" in new
         for name in ("e2e", "standards", "spec"):
             assert (f"REVIEW-1-{name}-EVIDENCE" in old) is details
             assert (f"REVIEW-2-{name}-EVIDENCE" in new) is details
     assert _snapshot(tmp_path) == before
+
+
+def test_default_history_bounds_human_text_without_changing_details_or_audit(tmp_path, monkeypatch):
+    from agent_run.cli.render import render
+
+    scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Scope"), ()))
+    original = scenario.agent
+    blocker = "ORIGINAL-BLOCKER " + "长文 x " * 300 + " BLOCKER-END"
+    reply = "ORIGINAL-REPLY\r\n" + "回复 y " * 300 + " REPLY-END"
+    calls = []
+
+    def agent(call):
+        calls.append(call)
+        if len(calls) == 1:
+            return wire_json({"result_kind": "human_blocker", "summary": None, "human_blockers": [blocker]})
+        return original(call)
+
+    _recorded_agents(scenario, monkeypatch, agent)
+    assert scenario.run().kind == "paused"
+    assert scenario.kernel.control("resume", "long-original-answer", subject=scenario.delivery.key,
+                                   message=reply) == "applied"
+    assert scenario.step().call is not None
+    before = _snapshot(tmp_path)
+    document = read(scenario.kernel.storage.path, "history")
+    audit = json.dumps(document.data, ensure_ascii=False, sort_keys=True)
+    for language, marker in (("en", "truncated; --details retains the original"),
+                             ("zh", "已截断；--details 保留原文")):
+        for details in (False, True):
+            output = StringIO()
+            render(replace(document, language=language), style="plain", details=details, stream=output)
+            value = output.getvalue()
+            assert ("BLOCKER-END" in value) is details
+            assert ("REPLY-END" in value) is details
+            assert (marker in value) is not details
+            assert "ORIGINAL-BLOCKER" in value and "ORIGINAL-REPLY" in value
+        assert json.dumps(document.data, ensure_ascii=False, sort_keys=True) == audit
+    assert blocker in audit and "REPLY-END" in audit
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("finding,problem", [
+    ("问题：精确问题\n证据：证据原文\n必须修复：修复原文\n复验：复验原文", "精确问题"),
+    ("Problem: exact problem\r\nEvidence: original evidence\r\nRequired fix: original fix\r\nRetest: original retest", "exact problem"),
+    ("unstructured original", None),
+    ("Problem: original\nEvidence: only two parts", None),
+    ("Problem: original\nEvidence: one\nEvidence: repeated\nRequired fix: fix\nRetest: test", None),
+    ("preface\nProblem: original\nEvidence: one\nRequired fix: fix\nRetest: test", None),
+    ("Problem: original\nEvidence:\nRequired fix: fix\nRetest: test", None),
+])
+def test_history_problem_extraction_is_conservative_and_does_not_translate_originals(finding, problem):
+    from agent_run.cli.render import _history_problem
+    from agent_run.contracts.copy import text
+
+    for language in ("zh", "en"):
+        expected = problem if problem is not None else text(
+            "presentation.history.unsplit_finding", language=language, finding=finding)
+        assert _history_problem(finding, language) == expected
