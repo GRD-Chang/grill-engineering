@@ -9,6 +9,7 @@ import pytest
 from agent_run.model import Issue, ParentIssue, Requirements, wire_json
 from agent_run.queries.run import read
 from support.offline import GraphScenario
+from support.core_operations import prepare_scripted_agent
 from support.notification import recorded_agents as _recorded_agents, continued_round
 from support.environment import durable_snapshot as _snapshot
 
@@ -46,7 +47,7 @@ def test_closed_activity_without_worker_exit_does_not_prove_complete_execution(t
     kernel.clock = lambda: 100.0
     runner = scenario.runner()
     for _ in range(30):
-        call = runner.run_once().call
+        call = prepare_scripted_agent(kernel, runner.run_once()).call
         if call is not None:
             break
     else:
