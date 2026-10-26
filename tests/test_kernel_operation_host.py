@@ -8,7 +8,7 @@ import pytest
 
 import agent_run.runtime.executor as executor
 from agent_run.runtime.execution import ProcessExitUnknown
-from agent_run.model import AgentCall, Execution, Profile, Purpose, Role, Step
+from agent_run.model import AgentCall, AgentPreparation, Execution, Profile, Purpose, Role, Step
 from support.offline import fixture_inputs
 from agent_run.core.operation_contract import OperationBinding, OperationState
 
@@ -18,6 +18,8 @@ def test_host_dispatches_call_then_polls_independent_io_and_requires_durable_exi
     execution = Execution("host-unit", "owner", 1)
     call = AgentCall("attempt", "invocation", "ticket:2", Role.DEVELOPMENT, Purpose.REQUIREMENTS,
                      "thread", "original-lease", execution, {}, Profile(), 30.0, time.monotonic()+30)
+    preparation = AgentPreparation(call.lease_id, call.attempt_id, call.subject, call.role, call.purpose,
+        call.thread_id, execution, call.context, call.profile, call.deadline_seconds, time.monotonic()+600)
     binding = OperationBinding(tmp_path, "example/project", 1, fixture_inputs(),
                                (tmp_path / "hidden",), ("FROZEN_SECRET",))
     entered, read_done, exited = threading.Event(), threading.Event(), threading.Event()
@@ -34,7 +36,7 @@ def test_host_dispatches_call_then_polls_independent_io_and_requires_durable_exi
             assert lifecycle[:2] == ["activate", "state"]
             capacities.append(agent_capacity)
             if len(capacities) == 1:
-                return Step("agent", call.subject, call=call)
+                return Step("preparing", call.subject, preparation=preparation)
             assert len(capacities) == 2, "Host must respect waiting/quiescent disposition"
             assert entered.wait(5), "allocated AgentCall was retained before a later slow poll"
             read_done.set()
@@ -42,14 +44,16 @@ def test_host_dispatches_call_then_polls_independent_io_and_requires_durable_exi
         def state(self):
             assert lifecycle and lifecycle[0] == "activate"
             lifecycle.append("state")
-            return OperationState(1, () if exited.is_set() and settled else (call.lease_id,),
+            finished = exited.is_set() and settled
+            return OperationState(1, (call.lease_id,) if entered.is_set() and not finished else (),
                                   (call.lease_id,) if read_done.is_set() else (), None,
-                                  "quiescent" if read_done.is_set() else "ready")
+                                  "quiescent" if read_done.is_set() else "ready",
+                                  (preparation.reservation_id,) if not entered.is_set() and not finished else ())
         def authorize_agent(self, selected):
             assert selected == call
             assert threading.current_thread().name.startswith("agent-run_")
         def worker_settled(self, selected):
-            assert selected == call and exited.is_set()
+            assert selected == preparation and exited.is_set()
             return settled
 
     class Core:
@@ -67,12 +71,12 @@ def test_host_dispatches_call_then_polls_independent_io_and_requires_durable_exi
         return Runner()
 
     def execute(_kernel, selected, **kwargs):
-        assert selected == call
+        assert selected == preparation
         assert kwargs["identity"] == binding.inputs.worker_identity
         assert kwargs["environment"] == {"FROZEN_ENV": "captured"}
         assert kwargs["hidden_paths"] == binding.hidden_paths
         assert kwargs["hidden_environment"] == binding.hidden_environment
-        kwargs["authorize_source"]()  # Inline; it cannot queue behind its own Future.
+        kwargs["authorize_source"](call)  # Inline; it cannot queue behind its own Future.
         entered.set()
         try:
             assert read_done.wait(5), "I/O was queued behind the only Agent worker"

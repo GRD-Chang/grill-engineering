@@ -38,7 +38,7 @@ def test_frozen_call_deadline_cannot_be_extended_or_used_after_expiry(tmp_path: 
     now[0] = 107.25
     with pytest.raises(KernelError, match="invocation_deadline_exceeded"):
         kernel.guard_agent(call)
-    assert kernel.status(delivery.key)["budgets"]["requirements"]["developments_used"] == 1
+    assert kernel.status(delivery.key)["budgets"]["requirements"]["developments_used"] == 0
 
 
 def test_created_language_is_consumed_by_the_actual_agent_call(tmp_path: Path) -> None:
@@ -143,6 +143,7 @@ def test_format_repair_keeps_deadline_and_retains_each_physical_output(tmp_path:
     kernel.bind_thread(first, "backend-thread")
     process = {"pid": 23, "start_token": "first-start", "pgid": 23, "host_pid": 11, "host_start_token": "host-start"}
     kernel.agent_started(first, process)
+    kernel.agent_source_ready(first)
     kernel.receive(first, invalid_output)
     kernel.agent_exited(first, process, 0)
     now[0] = 102.5
@@ -181,6 +182,7 @@ def test_ordinary_recovery_keeps_attempt_thread_and_uses_one_new_deadline(tmp_pa
     kernel.bind_thread(first, "backend-thread")
     process = {"pid": 23, "start_token": "first-start", "pgid": 23, "host_pid": 11, "host_start_token": "host-start"}
     kernel.agent_started(first, process)
+    kernel.agent_source_ready(first)
     now[0] = 102.5
     kernel.agent_exited(first, process, 1)
     step = operations.once()
@@ -192,6 +194,7 @@ def test_ordinary_recovery_keeps_attempt_thread_and_uses_one_new_deadline(tmp_pa
     assert kernel.dispatch_agent(second)
     next_process = {**process, "pid": 24, "pgid": 24, "start_token": "second-start"}
     kernel.agent_started(second, next_process)
+    kernel.agent_source_ready(second)
     kernel.agent_exited(second, next_process, 1)
     assert operations.once().kind == "paused"
     kernel.control("resume", "manual-thread-replacement", subject=delivery.key, new_thread=True)
@@ -201,6 +204,7 @@ def test_ordinary_recovery_keeps_attempt_thread_and_uses_one_new_deadline(tmp_pa
     kernel.bind_thread(third, "replacement-backend-thread")
     third_process = {**process, "pid": 25, "pgid": 25, "start_token": "third-start"}
     kernel.agent_started(third, third_process)
+    kernel.agent_source_ready(third)
     kernel.agent_exited(third, third_process, 1)
     assert operations.once().kind == "paused"
     assert kernel.status(delivery.key)["budgets"]["requirements"]["developments_used"] == 1
@@ -220,6 +224,7 @@ def test_manual_resume_after_format_deadline_only_continues_the_readonly_output_
     kernel.bind_thread(first, "original-backend-thread")
     process = {"pid": 23, "start_token": "first-start", "pgid": 23, "host_pid": 11, "host_start_token": "host-start"}
     kernel.agent_started(first, process)
+    kernel.agent_source_ready(first)
     kernel.receive(first, b"invalid structured output")
     kernel.agent_exited(first, process, 0)
     now[0] = 108.0
@@ -264,7 +269,7 @@ def test_allocated_call_deadline_releases_only_its_undispatched_lease(tmp_path: 
     assert operations.once().kind == "paused"
     assert operations.runner.state().active == ()
     assert kernel.dispatch_agent(call) is False
-    assert kernel.status(delivery.key)["budgets"]["requirements"]["developments_used"] == 1
+    assert kernel.status(delivery.key)["budgets"]["requirements"]["developments_used"] == 0
 
 
 def test_capacity_recovery_waits_thirty_seconds_and_checks_current_authority(tmp_path: Path) -> None:
@@ -281,6 +286,7 @@ def test_capacity_recovery_waits_thirty_seconds_and_checks_current_authority(tmp
     kernel.bind_thread(call, "backend-thread")
     process = {"pid": 23, "start_token": "first-start", "pgid": 23, "host_pid": 11, "host_start_token": "host-start"}
     kernel.agent_started(call, process)
+    kernel.agent_source_ready(call)
     now[0] = 101.5
     kernel.agent_exited(call, process, 1, failure="machine:server_overloaded", failure_kind="capacity")
     now[0] = 131.499
@@ -293,6 +299,7 @@ def test_capacity_recovery_waits_thirty_seconds_and_checks_current_authority(tmp
     assert kernel.dispatch_agent(recovered)
     second_process = {**process, "pid": 24, "pgid": 24, "start_token": "second-start"}
     kernel.agent_started(recovered, second_process)
+    kernel.agent_source_ready(recovered)
     kernel.agent_exited(recovered, second_process, 1, failure="machine:server_overloaded", failure_kind="capacity")
     now[0] = 161.5
     ports.requirements = replace(ports.requirements, issues=tuple(

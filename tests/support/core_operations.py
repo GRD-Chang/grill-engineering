@@ -9,7 +9,7 @@ from pathlib import Path
 
 from typing import TYPE_CHECKING, Any, Mapping
 
-from agent_run.model import AgentCall, CreationInputs, Delivery, DeliveryKind, Effect, EffectResult, Execution, Issue, Policy, ParentIssue, Requirements, ResourceInspection, ResourceWitness, RunSpec, Step
+from agent_run.model import AgentCall, AgentPreparation, CreationInputs, Delivery, DeliveryKind, Effect, EffectResult, Execution, Issue, Policy, ParentIssue, Requirements, wire_json, ResourceInspection, ResourceWitness, RunSpec, Step
 from agent_run.core.kernel import Kernel
 from agent_run.core.operation_contract import DeliveryFacts, DeliveryRead, OperationBinding, OperationPorts
 from agent_run.core.operation_runner import OperationRunner
@@ -124,12 +124,17 @@ def final_scenario(root: Path, *, policy: Policy | None = None,
 
 class CoreOperations:
     def __init__(self, kernel: Kernel, execution: Execution,
-                 make_ports: Callable[[OperationBinding], OperationPorts]) -> None:
+                 make_ports: Callable[[OperationBinding], OperationPorts], *, credentials_ready: bool = True) -> None:
+        self.credentials_ready = credentials_ready
         self.runner = OperationRunner(kernel, execution, make_ports)
         self.steps: list[Step] = []
 
     def once(self, *, agent_capacity: int = 1) -> Step:
         step = self.runner.run_once(agent_capacity=agent_capacity)
+        if self.credentials_ready and step.preparation is not None:
+            # This driver owns explicitly synthetic credential readiness;
+            # native credential tests use the Runner directly until admission.
+            step = self.runner.kernel.admit_agent(step.preparation)
         self.steps.append(step)
         return step
 
@@ -139,6 +144,22 @@ class CoreOperations:
             step = self.once(agent_capacity=agent_capacity)
             if predicate(step):
                 return step
-            if step.call is not None:
-                raise AssertionError(f"Test must handle the allocated AgentCall: {step}")
+            if step.call is not None or step.preparation is not None:
+                raise AssertionError(f"Test must handle the reserved Agent work: {step}")
         raise AssertionError(f"Core did not reach the expected boundary in {limit} operations: {self.steps}")
+
+
+def observed_call(kernel: Kernel, request: AgentPreparation) -> AgentCall:
+    """Read the real admitted identity after native transport ran, never admit.
+
+    Tests use the actual Invocation/output bound to this original seat. No
+    execution, credential readiness, raw result or exit evidence is fabricated.
+    """
+    with kernel.storage.transaction(write=False) as tx:
+        row = tx.one("SELECT i.id,i.deadline_seconds,i.deadline_at,o.ordinal,o.context_id FROM invocations i "
+                     "JOIN invocation_outputs o ON o.invocation=i.id WHERE o.lease=?", (request.reservation_id,))
+        assert tx.get(row['context_id'], request.subject) == wire_json(request.context)
+        return AgentCall(request.attempt_id, row['id'], request.subject, request.role, request.purpose,
+            request.thread_id, request.reservation_id, request.execution, request.context, request.profile,
+            row['deadline_seconds'], row['deadline_at'], request.mode, request.reported_thread,
+            row['ordinal'], request.profile_revision, request.profile_reference)

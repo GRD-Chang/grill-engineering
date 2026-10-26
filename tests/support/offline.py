@@ -559,6 +559,8 @@ class Scenario:
     def step(self) -> Step:
         runner = self.runner()
         step = runner.run_once()
+        if step.preparation is not None:
+            step = self.kernel.admit_agent(step.preparation)
         if step.call is not None:
             runner.authorize_agent(step.call)
             self.kernel.receive(step.call, self.agent(step.call))

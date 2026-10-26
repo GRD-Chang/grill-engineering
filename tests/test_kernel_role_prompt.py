@@ -11,17 +11,17 @@ from dataclasses import replace
 
 from agent_run.config.resources import builtin_resources, personal_method_directory
 from agent_run.config.defaults import UserDefaultsStore
-from agent_run.model import AgentCall, Commit, Delivery, DeliveryKind, Role, RunSpec
+from agent_run.model import AgentPreparation, Commit, Delivery, DeliveryKind, Role, RunSpec
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.runtime.codex import execute_codex
 from agent_run.config.creation import freeze_creation
 from support.offline import Scenario, review_result
 from agent_run.core.prompts.role import render_role_prompt
-from support.core_operations import CoreOperations, native_agent_fixture, scripted_return, final_scenario
+from support.core_operations import CoreOperations, native_agent_fixture, observed_call, scripted_return, final_scenario
 
 
-def frozen_call(tmp_path: Path) -> tuple[Kernel, AgentCall, CoreOperations, UserDefaultsStore]:
+def frozen_call(tmp_path: Path) -> tuple[Kernel, AgentPreparation, CoreOperations, UserDefaultsStore]:
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     base = Commit("base", "tree")
@@ -37,8 +37,8 @@ def frozen_call(tmp_path: Path) -> tuple[Kernel, AgentCall, CoreOperations, User
     spec = freeze_creation(RunSpec("prompt-run", "example/repository", 1, "parent-v1", "graph-v1", (delivery,)),
                            defaults, prompt_resources=resources)
     kernel, ports = native_agent_fixture(tmp_path / "state" / "kernel.sqlite3", spec)
-    operations = CoreOperations(kernel, kernel.claim_executor("prompt-owner"), lambda binding: ports)
-    call = operations.once().call
+    operations = CoreOperations(kernel, kernel.claim_executor("prompt-owner"), lambda binding: ports, credentials_ready=False)
+    call = operations.once().preparation
     assert call is not None
     return kernel, call, operations, defaults
 
@@ -70,15 +70,19 @@ print(json.dumps({{'type': 'thread.started', 'thread_id': 'prompt-thread'}}), fl
     credential.chmod(0o600)
     result = execute_codex(kernel, call, executable=str(executable), prompt=prompt,
                            environment={"PATH": os.defpath, "HOME": str(tmp_path)}, credential_file=credential,
-                           hidden_paths=(), authorize_source=lambda: None, timeout=5)
+                           hidden_paths=(), authorize_source=lambda admitted: None, timeout=5)
     assert result is not None and result.raw == b"" and result.returncode == 0
-    repair = operations.once().call
+    repair = operations.once().preparation
     assert repair is not None and repair.mode == "output-repair"
     repaired_prompt = render_role_prompt(repair)
     assert repair.context["contract_error"] in repaired_prompt
     assert "Frozen development method" not in repaired_prompt
     assert "Unrelated acceptance method must not leak" not in repaired_prompt
-    assert repair.invocation_id == call.invocation_id and repair.deadline_at == call.deadline_at
+    assert credential.read_bytes()  # The renderer test explicitly owns this synthetic readiness.
+    actual_repair = kernel.admit_agent(repair).call
+    assert actual_repair is not None
+    assert actual_repair.invocation_id == observed_call(kernel, call).invocation_id
+    assert actual_repair.deadline_at == observed_call(kernel, call).deadline_at
     assert call.context["_prompt_resources"] == repair.context["_prompt_resources"]
 
 
@@ -86,7 +90,7 @@ def test_call_without_frozen_resources_is_rejected_before_dispatch(tmp_path: Pat
     base = Commit("base", "tree")
     delivery = Delivery("ticket", DeliveryKind.TICKET, 2, "ticket", base, "source", "target")
     kernel, ports = native_agent_fixture(tmp_path / "kernel.sqlite3", RunSpec("run", "example/repository", 1, "parent", "graph", (delivery,)))
-    call = CoreOperations(kernel, kernel.claim_executor("owner"), lambda binding: ports).once().call
+    call = CoreOperations(kernel, kernel.claim_executor("owner"), lambda binding: ports, credentials_ready=False).once().preparation
     # Missing resources is a renderer input contract, not authorization to run
     # an unconfigured Core. Exercise it on the immutable call before dispatch.
     assert call is not None
@@ -95,11 +99,11 @@ def test_call_without_frozen_resources_is_rejected_before_dispatch(tmp_path: Pat
     with pytest.raises(KernelError, match="prompt_resources_unavailable"):
         render_role_prompt(call)
     with kernel.storage.transaction(write=False) as tx:
-        output = tx.one("SELECT dispatch_state,process_identity FROM invocation_outputs WHERE invocation=?", (call.invocation_id,))
-        assert tuple(output) == ("allocated", None)
+        assert not tx.rows("SELECT invocation FROM invocation_outputs")
+        assert tx.one("SELECT count(*) FROM waits WHERE kind='agent_preparation'")[0] == 1
 
 
-def run_prompt_call(kernel: Kernel, call: AgentCall, tmp_path: Path, raw: bytes, *, edit: bool = False) -> str:
+def run_prompt_call(kernel: Kernel, call: AgentPreparation, tmp_path: Path, raw: bytes, *, edit: bool = False) -> str:
     prompt = render_role_prompt(call)
     executable = tmp_path / "prompt-codex"
     executable.write_text(f"#!{sys.executable}\n" + f"""\
@@ -120,7 +124,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_bytes({raw!r})
     credential.chmod(0o600)
     result = execute_codex(kernel, call, executable=str(executable), prompt=prompt,
                            environment={"PATH": os.defpath, "HOME": str(tmp_path)}, credential_file=credential,
-                           hidden_paths=(), authorize_source=lambda: None, timeout=5)
+                           hidden_paths=(), authorize_source=lambda admitted: None, timeout=5)
     assert result is not None and result.returncode == 0 and result.raw == raw
     return prompt
 
@@ -135,15 +139,15 @@ def test_same_thread_new_development_attempt_keeps_complete_repair_method(tmp_pa
     spec = freeze_creation(scenario.spec, defaults, prompt_resources=resources)
     scenario.kernel = Kernel.create(tmp_path / "state" / "kernel.sqlite3", spec, requirements=scenario.requirements)
     scenario.execution = scenario.kernel.claim_executor("prompt-owner")
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports, credentials_ready=False)
     first = None
     reviewed = False
     for _ in range(30):
         step = operations.once()
-        if step.call is None:
+        if step.preparation is None:
             assert step.kind in {"effect", "progress"}, step
             continue
-        call = step.call
+        call = step.preparation
         if call.role == Role.REVIEW:
             assert first is not None and not reviewed
             prompt = run_prompt_call(scenario.kernel, call, tmp_path, json.dumps(review_result("fail")).encode())
@@ -176,7 +180,7 @@ def test_human_continuation_renders_only_the_latest_original_response(tmp_path: 
     assert operations.once().reason == "human_blocker"
     first_response = "Previous human decision.\r\n"
     kernel.control("resume", "human-one", subject=first.subject, message=first_response)
-    second = operations.once().call
+    second = operations.once().preparation
     assert second is not None and second.context["semantic_continuation"] is True
     second_prompt = run_prompt_call(kernel, second, tmp_path, blocker)
     assert json.dumps(first_response, ensure_ascii=False)[1:-1] in second_prompt
@@ -184,7 +188,7 @@ def test_human_continuation_renders_only_the_latest_original_response(tmp_path: 
     assert operations.once().reason == "human_blocker"
     latest = "Latest human decision: retain exact formatting.\r\n"
     kernel.control("resume", "human-two", subject=first.subject, message=latest)
-    third = operations.once().call
+    third = operations.once().preparation
     assert third is not None and third.attempt_id == first.attempt_id and third.thread_id == first.thread_id
     assert third.context["human_responses"] == [first_response, latest]
     prompt = run_prompt_call(kernel, third, tmp_path,
@@ -216,13 +220,13 @@ def test_publication_prompt_consumes_only_the_actual_authorized_evidence(
         scenario.kernel = Kernel.create(tmp_path / "state" / "kernel.sqlite3", spec, requirements=scenario.requirements)
     if kind != DeliveryKind.FINAL_RUN:
         scenario.execution = scenario.kernel.claim_executor("prompt-owner")
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports, credentials_ready=False)
     for _ in range(80):
         step = operations.once()
-        if step.call is None:
+        if step.preparation is None:
             assert step.kind in {"effect", "progress"}, step
             continue
-        call = step.call
+        call = step.preparation
         if call.role == Role.DEVELOPMENT:
             run_prompt_call(scenario.kernel, call, tmp_path,
                             b'{"result_kind":"development","summary":"Implemented the allocated work.","human_blockers":null}', edit=True)

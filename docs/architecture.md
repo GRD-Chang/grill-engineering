@@ -59,17 +59,17 @@ Ticket、Parent-only 和完整 Parent 的 Final 交付共用一个 Core。
 
 Core 通过 [`operation_contract`](../src/agent_run/core/operation_contract.py) 给出完整读取和操作请求；
 OperationRunner 以冻结的 `OperationBinding` 组合真实端口，将观察和结果交回 Core，自己不读取 SQL。
-`run_once` 返回 AgentCall 后由 Executor 派发 Agent，不在 I/O 驱动中等待模型或 CI 完成。
+`run_once` 返回 AgentPreparation 后由 Executor 准备凭据；Core 原子准入返回 AgentCall 后才派发 Agent，不在 I/O 驱动中等待模型或 CI 完成。
 公开 status/history 只读数据库，不调用这条会接受新观察的运行链路。
 
 ## 状态与证据
 
-当前唯一支持的状态协议是 **`independent-delivery-kernel-v20`**。
+当前唯一支持的状态协议是 **`independent-delivery-kernel-v21`**。
 新 Run 使用受管目录 `repositories/<owner>/<repo>/state/<run_id>/kernel.sqlite3`；
 Task 位置记录位于数据主目录的 `native-task-locations/`，只绑定 Run ID 与数据库路径。
 具体事务和读取范围见[状态存储](agents/state-storage.md)，显示归属见[展示事实](agents/display-facts.md)。
 
-旧 JSON/v6、早期 native v17/v18/v19、来源封印和导入状态不升级、不转换、不兼容推进。
+旧 JSON/v6、早期 native v17/v18/v19/v20、来源封印和导入状态不升级、不转换、不兼容推进。
 [`storage.preflight`](../src/agent_run/storage/preflight.py) 在读取、写前和写锁内检查支持边界；
 [`storage.admission`](../src/agent_run/storage/admission.py) 只核对旧 Task 占用与拒绝条件。
 这些拒绝检查不提供迁移入口，也不授权删除旧数据库、Candidate 或工作区。

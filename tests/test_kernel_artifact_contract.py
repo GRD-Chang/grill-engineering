@@ -47,10 +47,14 @@ def test_publication_message_rejects_a_missing_or_multiline_title(message):
         parse_artifact("publication", wire_json(publication(message=message)))
 
 
-def next_call(scenario, role):
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+def next_call(scenario, role, *, preparation=False):
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports, credentials_ready=not preparation)
     for _ in range(40):
         step = operations.once()
+        if step.preparation is not None:
+            if step.preparation.role == role:
+                return step.preparation
+            step = scenario.kernel.admit_agent(step.preparation)
         if step.call is not None and step.call.role == role:
             return step.call
         assert step.kind in {"agent", "effect", "progress"}, step
@@ -125,19 +129,21 @@ _FAIL_AND_BLOCKED["checks"]["e2e"].update(status="blocked")
 def test_native_valid_outputs_keep_wire_raw_and_route_all_roles(tmp_path, role, value, outcome):
     scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Deliver change"), ()))
     operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
-    call = next_call(scenario, role)
+    request = next_call(scenario, role, preparation=True)
     # Inspect the transport's actual owned schema file without launching a
     # process: UID namespaces are unavailable in some execution environments.
     credential = tmp_path / "fixture-hosts.yml"
     credential.write_text("github.com:\n  oauth_token: synthetic-not-a-credential\n")
     credential.chmod(0o600)
-    with _CodexCapture(scenario.kernel, call, executable="unused-local-codex",
+    with _CodexCapture(scenario.kernel, request, executable="unused-local-codex",
                        environment={"PATH": os.defpath, "HOME": str(tmp_path)},
                        credential_file=credential, hidden_paths=(), hidden_environment=()) as capture:
         assert capture.directory is not None
         descriptor = os.open("schema.json", os.O_RDONLY, dir_fd=capture.directory)
         with os.fdopen(descriptor, "rb") as schema:
             assert json.load(schema) == role_schema(role.value)
+    call = scenario.kernel.admit_agent(request).call
+    assert call is not None
     raw = b"\n " + wire_json(value) + b" \n"
     returned(scenario, call, raw)
     step = operations.once(agent_capacity=0)

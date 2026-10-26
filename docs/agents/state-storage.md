@@ -8,12 +8,12 @@
 数据主目录默认为 `~/.local/share/agent-run/`，或 `$XDG_DATA_HOME/agent-run/`。
 每个新 Run 的控制、Host 与业务关系保存在
 `repositories/<owner>/<repo>/state/<run_id>/kernel.sqlite3`；
-数据库的 `meta.protocol` 必须为 **`independent-delivery-kernel-v20`**。
+数据库的 `meta.protocol` 必须为 **`independent-delivery-kernel-v21`**。
 `native-task-locations/<task-fingerprint>.json` 只保存该 Task 的 Run ID 和数据库路径，
 不复制生命周期状态；替换与占用判断仍由 Core 决定。
 
 [`storage.preflight`](../../src/agent_run/storage/preflight.py) 以只读连接检查现有数据库。
-旧 JSON/v6、早期 native v17/v18/v19、来源封印及导入状态明确拒绝，
+旧 JSON/v6、早期 native v17/v18/v19/v20、来源封印及导入状态明确拒绝，
 保留原文件、Candidate、工作区和成果，不升级、不转换、不双写，也不直接续接。
 [`storage.admission`](../../src/agent_run/storage/admission.py) 只检查旧 Task 占用及拒绝条件，
 不解释或转移旧工作。拒绝不授权清除旧 Task、封印或历史数据。
@@ -46,6 +46,18 @@ Attempt、Invocation 和 Thread 各有独立 `id`，通过明确外键关联。
 物理输出以 `(invocation, ordinal)` 标识；原始返回、进程身份与活动事实属于准确输出，
 不从后来的当前对象重建早先调用或审核依据。Attempt 的 `thread_id` 和 `opening_id`
 由 continuation 入口绑定，分别引用 Thread 和不可变 Opening 材料。
+
+凭据准备只在现有 `waits(kind=agent_preparation)` 预留准确 Attempt 的工作席位，
+固定绝对截止最多 600 秒；读取、重试和兄弟进度不续期。准备席位与真实 lease
+共同占用并发容量。凭据就绪后，同一事务以原 reservation ID 创建 Invocation/output/lease
+并删除准备 Wait；执行期限从该准入点开始，Output Repair 仍继承原 Invocation 截止。
+准备失败不创建 Invocation、不消耗 Development 用量；同一 Attempt 在最终 Worker
+放行准入或实际返回工作证据处仅记账一次。准备取消只有准确资源清理完成或原 Host
+退出证明才能释放席位；Future 完成及未知 Host 均不是清理证明。
+
+v20 的分配时扣费且 `accounted=0` 不能解释为 v21 延迟扣费。当前 Runner 在写前、
+锁内与读取时明确拒绝 v20；不迁移、不补偿退款、不改写其用量。保留原数据及匹配
+Runner Snapshot，以原版本恢复；安装新 Runner 不意味着能够继续旧 Run。
 
 需求/图版本、候选、预期合并树与 Ticket 完成事实保留准确关联，
 后来的当前对象不得改写早先审核或批准依据。

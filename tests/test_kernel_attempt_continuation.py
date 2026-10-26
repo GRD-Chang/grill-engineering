@@ -53,7 +53,7 @@ def test_human_resume_uses_attempt_input_and_binding_without_charging_again(tmp_
     assert second is not None and second.attempt_id == first.attempt_id
     assert bound == [first.attempt_id]
     with kernel.storage.transaction(write=False) as tx:
-        assert tx.one("SELECT protocol FROM meta")[0] == PROTOCOL == "independent-delivery-kernel-v20"
+        assert tx.one("SELECT protocol FROM meta")[0] == PROTOCOL == "independent-delivery-kernel-v21"
         references = {row["from"]: (row["table"], row["to"])
                       for row in tx.execute("PRAGMA foreign_key_list(attempts)")}
         assert references["thread_id"] == ("threads", "id")
@@ -108,6 +108,7 @@ def _native_boundary(tmp_path: Path, *, ordinary_used: bool = False, malformed: 
         process = {"pid": 23 + index, "start_token": "start-" + str(index), "pgid": 23 + index,
                    "host_pid": 11, "host_start_token": "host-start"}
         source.agent_started(call, process)
+        source.agent_source_ready(call)
         body = b'{"summary":"incomplete return"}' if malformed else return_body
         if body is not None:
             source.receive(call, body)

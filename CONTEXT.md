@@ -763,7 +763,7 @@ checkout 只读，使用按角色区分的短格式 Prompt，且不增加领域 
 _Avoid_: Development Attempt、自动替代 Thread、领域 retry
 
 **Semantic Agent Attempt（语义 Agent 尝试）**:
-Development、Reviewer 或 Publication 角色针对一个准确 Work Subject、Job Generation、Currentness Boundary 与角色序号完成的一轮语义工作。它在首个 Codex 进程前分配，可跨越初始 Invocation、successor Invocation、Thread 替换与 Output Repair；执行失败、Human Blocker 或前台中断都不创建新 Attempt。Development 在分配时占用一次 Development Budget，Reviewer 在形成合法 Acceptance Artifact 时占用一次 Review Budget，Publication 在分配时计入一次 Publication Attempt；三者的 Resume 均不重复计数。已持久且尚未收口的 pending Attempt 优先于新 Attempt 的预算门禁：即使窗口计数已达上限，Controller 也必须先继续该 pending Attempt，不得将它拒绝为预算耗尽。只有当前 Attempt 已形成完整角色结果，或其 Currentness Boundary 失效并按规则收口后，才能分配后继 Attempt。
+Development、Reviewer 或 Publication 角色针对一个准确 Work Subject、Job Generation、Currentness Boundary 与角色序号完成的一轮语义工作。它在首个 Codex 进程前分配，可跨越初始 Invocation、successor Invocation、Thread 替换与 Output Repair；执行失败、Human Blocker 或前台中断都不创建新 Attempt。Development 在凭据就绪、实际 Worker 最终放行准入时占用一次 Development Budget，或由准确实际返回工作证据补齐尚未记账的一次用量；凭据准备失败不计费，Reviewer 在形成合法 Acceptance Artifact 时占用一次 Review Budget，Publication 在分配时计入一次 Publication Attempt；三者的 Resume 均不重复计数。已持久且尚未收口的 pending Attempt 优先于新 Attempt 的预算门禁：即使窗口计数已达上限，Controller 也必须先继续该 pending Attempt，不得将它拒绝为预算耗尽。只有当前 Attempt 已形成完整角色结果，或其 Currentness Boundary 失效并按规则收口后，才能分配后继 Attempt。
 _Avoid_: Agent Invocation、Output Attempt、Codex 进程启动次数、Thread 序号
 
 **Reviewer Invocation（审查调用）**:

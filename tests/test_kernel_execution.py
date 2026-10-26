@@ -174,7 +174,7 @@ def test_raw_persistence_failure_still_records_exact_process_exit(tmp_path: Path
     assert reopened.status(call.subject)["budgets"]["requirements"]["developments_used"] == 1
 
 
-def test_selected_credentials_pause_without_refunding_or_reallocating_attempt(tmp_path: Path) -> None:
+def test_selected_credentials_pause_without_charging_or_reallocating_attempt(tmp_path: Path) -> None:
     path, kernel, call, ports = allocated(tmp_path)
     credential = tmp_path / "selected-worker-credential"
     canary = tmp_path / "agent-executed"
@@ -189,7 +189,7 @@ def test_selected_credentials_pause_without_refunding_or_reallocating_attempt(tm
     reopened = Kernel(path)
     paused = reopened.status(call.subject)
     assert paused["pending_attempt"] == call.attempt_id and paused["gates"] == ["worker_unavailable"]
-    assert paused["budgets"]["requirements"]["developments_used"] == 1
+    assert paused["budgets"]["requirements"]["developments_used"] == 0
     assert not canary.exists() and reopened.operation_state().active == ()
     credential.write_text("Controlled reference availability; no online secret.")
     reopened.control("resume", "resume-selected-identity", subject=call.subject)
@@ -282,7 +282,7 @@ def test_executor_loss_before_durable_binding_never_releases_or_restarts_worker(
             # Actual exit is proved to this observer, but no forged Kernel
             # confirmation or second dispatch may clear the original lease.
             assert len(Kernel(path).operation_state().active) == 1
-            assert Kernel(path).status(call.subject)["budgets"]["requirements"]["developments_used"] == 1
+            assert Kernel(path).status(call.subject)["budgets"]["requirements"]["developments_used"] == 0
         finally:
             os.close(read_fd)
             if executor is not None:
@@ -341,5 +341,5 @@ def test_real_source_refresh_revokes_blocked_worker_before_argv(tmp_path: Path) 
     paused = Kernel(tmp_path / "kernel.sqlite3").status(call.subject)
     assert paused["gates"] == ["requeue_required"]
     assert paused["phase"] == "development" and paused["pending_return"] is False
-    assert paused["budgets"]["requirements"]["developments_used"] == 1
+    assert paused["budgets"]["requirements"]["developments_used"] == 0
     assert kernel.operation_state().active == ()
