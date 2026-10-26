@@ -155,6 +155,82 @@ def test_late_stopped_activity_does_not_take_the_first_start_or_resume_milestone
     assert kernel.worker_settled(first) and kernel.worker_settled(resumed)
 
 
+@pytest.mark.parametrize("resumed", [False, True], ids=["first", "resumed"])
+@pytest.mark.parametrize("offset", [-1, 0, 1], ids=["before", "at", "after"])
+@pytest.mark.parametrize("old_observer", [False, True], ids=["current", "v21-no-trigger"])
+def test_activity_start_respects_the_original_invocation_deadline(
+    tmp_path, monkeypatch, capsys, resumed, offset, old_observer,
+):
+    import json
+    from agent_run.cli.main import main
+    from support.core_operations import CoreOperations
+
+    scenario = Scenario(tmp_path, DeliveryKind.PARENT_ONLY)
+    kernel = scenario.kernel
+    now = [100.0]
+    kernel.clock = lambda: now[0]
+    if old_observer:
+        record = kernel._event
+
+        def without_observer_trigger(tx, subject, kind, identity, material=None, **kwargs):
+            if kind != "worker_active":
+                record(tx, subject, kind, identity, material, **kwargs)
+
+        monkeypatch.setattr(kernel, "_event", without_observer_trigger)
+    operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
+    first = operations.until(lambda step: step.call is not None).call
+    assert first is not None and kernel.dispatch_agent(first)
+    operations.runner.authorize_agent(first)
+    kernel.bind_thread(first, "deadline-backend")
+    process = {"pid": 21, "pgid": 21, "start_token": "first-bootstrap",
+               "host_pid": 10, "host_start_token": "synthetic-host"}
+    kernel.agent_started(first, process)
+    kernel.agent_source_ready(first)
+    call = first
+    if resumed:
+        now[0] = 101.0
+        assert kernel.control("stop", "stop-before-deadline-activity", subject=first.subject) == "applied"
+        kernel.agent_exited(first, process, 1, failure="Controlled stopped fixture", failure_kind="fatal")
+        now[0] = 103.0
+        assert kernel.control("resume", "resume-deadline", subject=first.subject,
+                              world=scenario.world()) == "applied"
+        call = operations.until(lambda step: step.call is not None).call
+        assert call is not None and call.attempt_id == first.attempt_id
+        assert call.invocation_id != first.invocation_id and call.thread_id == first.thread_id
+        assert kernel.dispatch_agent(call)
+        operations.runner.authorize_agent(call)
+        process = dict(process, start_token="resumed-bootstrap")
+        kernel.agent_started(call, process)
+        kernel.agent_source_ready(call)
+    deadline = call.deadline_at
+    charged = kernel.status(call.subject)["budgets"]["requirements"]["developments_used"]
+    assert charged == 1
+    now[0] = deadline + offset
+    kernel.observe_worker_activity(call, "deadline-activity", active=True, observed_at=now[0],
+                                   evidence={"type": "turn.started"})
+    try:
+        events = [event for event in _project(kernel, "concise") if event["kind"] == "parent_started"]
+        # Reading later must preserve a real in-deadline start, without granting
+        # an expired observation a fresh interval or another Development charge.
+        now[0] = deadline + 2
+        assert main(["status", scenario.spec.run_id, "--state-dir", str(kernel.storage.path), "--json"]) == 0
+        data = json.loads(capsys.readouterr().out)
+        if resumed:
+            facts = data["latest_resume"]["resume"]
+            assert (facts["progress"] is not None) is (offset < 0)
+            assert (facts["started_at"] is not None) is (offset < 0)
+            if offset < 0:
+                assert facts["progress"]["resume_outcome"] == "started"
+                assert facts["progress"]["invocation_id"] == call.invocation_id
+        assert len(events) == (1 if offset < 0 else 0)
+        assert kernel.status(call.subject)["budgets"]["requirements"]["developments_used"] == charged
+        with kernel.storage.transaction(write=False) as tx:
+            assert tx.one("SELECT deadline_at FROM invocations WHERE id=?", (call.invocation_id,))[0] == deadline
+    finally:
+        kernel.agent_exited(call, process, 1, failure="Controlled deadline fixture finished", failure_kind="fatal")
+    assert kernel.worker_settled(call)
+
+
 def test_stopped_repair_activity_is_not_presented_as_still_active(tmp_path, monkeypatch):
     scenario = Scenario(tmp_path, DeliveryKind.FINAL_RUN, reviews=("fail", "pass"))
     stopped = []

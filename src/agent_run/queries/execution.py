@@ -16,6 +16,7 @@ def worker_activity_start(tx: Transaction, subject: str | None, *, position: int
     Earlier v21 writers have only the binding history anchor. Its actual
     activity must be within that original control interval; ambiguous old
     facts remain unknown. The optional observer trigger is never authority.
+    Activity at or after its original Invocation deadline is not a start.
     """
     sql = (
         "SELECT a.*,i.id AS invocation_id,i.action_id,o.ordinal AS output_ordinal,o.dispatch_state,o.exit_code,"
@@ -25,6 +26,7 @@ def worker_activity_start(tx: Transaction, subject: str | None, *, position: int
         "JOIN worker_activity w ON w.invocation=o.invocation AND w.ordinal=o.ordinal "
         "JOIN history h ON h.subject=a.subject AND h.generation=a.generation "
         "WHERE o.process_identity IS NOT NULL AND o.started_at IS NOT NULL AND w.active=1 "
+        "AND w.observed_at<i.deadline_at "
         "AND w.rowid=(SELECT min(rowid) FROM worker_activity WHERE invocation=o.invocation AND ordinal=o.ordinal AND active=1) "
         "AND ((h.kind='worker_active' AND h.identity=o.invocation || ':' || o.ordinal AND h.material_id=w.evidence) "
         "OR (h.kind='worker_started' AND h.identity=i.id AND h.material_id=o.process_identity "
