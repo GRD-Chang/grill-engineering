@@ -73,6 +73,25 @@ def _observation(request: HostLaunch, record: Mapping[str, Any], disposition: Li
         namespace_exit_status=record.get('namespace_exit_code'), exit_evidence=record.get('exit_basis', ''))
 
 
+def _validate_record(request: HostLaunch, record: Mapping[str, Any]) -> None:
+    """One protection-record contract for Host and local Worker observations."""
+    phase, domain = record.get('phase'), record.get('domain')
+    if (not isinstance(phase, str) or phase not in {'pending', 'running', 'exited'}
+            or not isinstance(domain, dict) or not valid_foreground_domain(domain, request.nonce)):
+        raise DomainUnknown('Foreground protection state is invalid')
+    if phase == 'exited':
+        ended = record.get('ended_at')
+        try:
+            valid = (record.get('exit_basis') in {'retained_namespace_pidfd', 'same_observer_init_exit'}
+                and isinstance(ended, (int, float)) and not isinstance(ended, bool)
+                and math.isfinite(ended) and ended > 0
+                and all(value is None or type(value) is int for value in
+                        (record.get('executor_exit_code'), record.get('namespace_exit_code'))))
+        except OverflowError:
+            valid = False
+        if not valid:raise DomainUnknown('Foreground exit evidence is invalid')
+
+
 def _bound_record(request: HostLaunch, lock: Path, database: Path) -> tuple[Path, dict[str, Any]]:
     path = record_root(lock) / (request.nonce + '.json')
     record = read_record(path)
@@ -82,6 +101,7 @@ def _bound_record(request: HostLaunch, lock: Path, database: Path) -> tuple[Path
             or record['binding'] != [request.run_id, request.owner, request.epoch, request.nonce]
             or record.get('database') != str(database.resolve())):
         raise DomainUnknown('Foreground record belongs to another launch or Runner')
+    _validate_record(request, record)
     return path, record
 
 
@@ -125,20 +145,11 @@ class ForegroundHost:
 
     def _inspect(self, request: HostLaunch, original: HostObservation | None,
                  record: Mapping[str, Any]) -> HostInspection:
-        """The caller has authenticated this private record's frozen binding."""
-        domain = record.get('domain')
-        if (record.get('phase') not in {'pending', 'running', 'exited'}
-                or not isinstance(domain, dict) or not valid_foreground_domain(domain, request.nonce)
-                or original is not None and original.domain is not None and original.domain != domain):
+        """The caller has authenticated and validated this private record."""
+        domain = record['domain']
+        if original is not None and original.domain is not None and original.domain != domain:
             return _unavailable(request)
         if record['phase'] == 'exited':
-            ended = record.get('ended_at')
-            if (record.get('exit_basis') not in {'retained_namespace_pidfd', 'same_observer_init_exit'}
-                    or not isinstance(ended, (int, float)) or isinstance(ended, bool)
-                    or not math.isfinite(ended) or ended <= 0
-                    or any(value is not None and type(value) is not int for value in
-                           (record.get('executor_exit_code'), record.get('namespace_exit_code')))):
-                return _unavailable(request)
             return HostInspection(request, _observation(request, record, 'exited'), 'recorded_exit')
         disposition = recover_init(domain)
         if disposition == 'exited':

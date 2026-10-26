@@ -249,6 +249,36 @@ def test_copied_database_cannot_borrow_the_original_local_process_observation(in
     assert durable_snapshot(tmp_path) == before
 
 
+@pytest.mark.parametrize('damage', [None, 'invalid-phase', 'invalid-exit'])
+def test_worker_inspection_cannot_bypass_invalid_protection_record(inspection_worker, tmp_path, monkeypatch, damage):
+    from types import SimpleNamespace
+    kernel, request, call, _, domain, lock, path = inspection_worker
+    record = physical.read_record(path)
+    if damage == 'invalid-phase':record['phase'] = 'invalid'
+    elif damage == 'invalid-exit':record.update(phase='exited', exit_basis='unproven')
+    physical.write_record(path, record)
+    # The Host's original outer observer cannot be used here. A valid record
+    # still permits independent exact Worker observation inside its namespace.
+    monkeypatch.setattr(foreground_host, 'recover_init', lambda _: 'unknown')
+    monkeypatch.setattr(foreground_host, 'observer_anchor', lambda: {
+        'boot_id': 'test-boot', 'pid_namespace': 'pid:[20]', 'pid1_start': domain['init']['start_token']})
+    opened, closed = [], []
+    def pin(pid):
+        opened.append(pid)
+        return SimpleNamespace(identity=SimpleNamespace(start_token='203' if pid == 2 else 'worker',
+            boot_id='test-boot', pid_namespace='pid:[20]'), observe=lambda: 'running', close=lambda: closed.append(pid))
+    monkeypatch.setattr(foreground_host.ProcessPin, 'open', pin)
+    before = durable_snapshot(tmp_path)
+    manager = ForegroundHost(environment={})
+    host = manager.inspect(kernel, request, lock)
+    assert host.observation.disposition == 'unknown' and host.source == 'unavailable'
+    worker = manager.inspect_worker(kernel, request, call, lock)
+    assert worker.disposition == ('unknown' if damage else 'running')
+    assert worker.source == ('unavailable' if damage else 'local')
+    assert opened == closed[::-1] == ([] if damage else [2, 3])
+    assert durable_snapshot(tmp_path) == before
+
+
 def test_foreground_admission_is_frozen_stop_fences_and_null_exit_does_not_become_zero(tmp_path):
     kernel = task_run(tmp_path, 'foreground')[0]
     args = dict(kind='run', command=('/usr/bin/python3',), environment_carrier=tmp_path / 'carrier',
