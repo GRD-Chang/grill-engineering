@@ -162,8 +162,8 @@ def test_query_rejects_invalid_typed_wait_reads_without_mutating_records(tmp_pat
     original_rows, original_material = read_facts.all_rows, read_facts.material
     observed = []
 
-    def rows(tx, sql, values=()):
-        result = original_rows(tx, sql, values)
+    def rows(tx, sql, values=(), *, scoped_sql=None):
+        result = original_rows(tx, sql, values, scoped_sql=scoped_sql)
         if sql.startswith("SELECT w.*,m.subject"):
             row, = result
             observed.append(row["scope_id"])

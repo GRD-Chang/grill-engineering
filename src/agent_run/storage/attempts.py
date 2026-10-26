@@ -9,8 +9,7 @@ The current-layout statements are removed at the one-way protocol activation.
 import sqlite3
 from typing import Any, Sequence, cast
 
-from agent_run.errors import KernelError
-from agent_run.storage.run_scope import RunTransaction
+from agent_run.storage.run_scope import RunTransaction, selected_statement, transaction_scope
 from agent_run.storage.sqlite import Transaction
 
 
@@ -19,21 +18,10 @@ class AttemptRecords:
 
     def __init__(self, transaction: Transaction) -> None:
         self.transaction = transaction
-        if type(transaction) is Transaction:
-            # A missing scope must never select the current statements on a
-            # repository schema, even when it happens to contain only one Run.
-            columns = transaction.execute("PRAGMA table_info(material)").fetchmany(32)
-            primary = [row["name"] for row in sorted(columns, key=lambda row: row["pk"]) if row["pk"]]
-            if primary != ["id"]:
-                raise KernelError("run_scope_required")
-        elif not isinstance(transaction, RunTransaction):
-            raise KernelError("run_scope_required")
+        transaction_scope(transaction)
 
     def _selection(self, current: str, scoped: str, values: Sequence[Any]) -> tuple[str, Sequence[Any]]:
-        if isinstance(self.transaction, RunTransaction):
-            scope = self.transaction.require_scope()
-            return scoped, (scope.run_id, *values)
-        return current, values
+        return selected_statement(self.transaction, current, scoped, values)
 
     def _one(self, current: str, scoped: str, values: Sequence[Any]) -> sqlite3.Row:
         sql, parameters = self._selection(current, scoped, values)

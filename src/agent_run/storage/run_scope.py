@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 import sqlite3
+from typing import Any, Sequence
 
 from agent_run.contracts.repository import normalize_repository
 from agent_run.errors import KernelError
@@ -109,3 +110,36 @@ class RunTransaction(Transaction):
         if hashlib.sha256(body).hexdigest() != header["digest"]:
             raise KernelError("material_corrupt", identity)
         return bytes(body)
+
+
+def transaction_scope(transaction: Transaction) -> RunScope | None:
+    """Select an explicit layout, never infer a Run from arbitrary record data.
+
+    The None branch belongs only to the still-active current producer. It is
+    removed at one-way protocol activation, not an old-protocol reader.
+    """
+    if isinstance(transaction, RunTransaction):
+        return transaction.require_scope()
+    if type(transaction) is not Transaction:
+        raise KernelError("run_scope_required")
+    columns = transaction.execute("PRAGMA table_info(material)").fetchmany(32)
+    primary = [row["name"] for row in sorted(columns, key=lambda row: row["pk"]) if row["pk"]]
+    if primary != ["id"]:
+        raise KernelError("run_scope_required")
+    return None
+
+
+def selected_statement(transaction: Transaction, current: str, scoped: str | None,
+                       values: Sequence[Any] = ()) -> tuple[str, Sequence[Any]]:
+    """Choose complete caller-owned SQL; do not generate or rewrite predicates.
+
+    Run-bound statements explicitly put the selected Run parameter first. A
+    consumer not yet migrated must refuse the staged layout rather than issue
+    its current-layout statement there. Query budgets still belong to Transaction.
+    """
+    scope = transaction_scope(transaction)
+    if scope is None:
+        return current, values
+    if scoped is None:
+        raise KernelError("run_scope_required")
+    return scoped, (scope.run_id, *values)
