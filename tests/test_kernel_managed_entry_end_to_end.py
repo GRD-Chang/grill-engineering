@@ -821,6 +821,8 @@ issue = int(re.search(r'https://github.com/example/project/issues/(\\d+)', promp
             pr_a, = state_a['prs']
             assert pr_a['merged'] and state_a['source_graph']['issues']['2']['state'] == 'CLOSED'
             history = public('history')['history']
+            completed_history_a = [row for row in history['events'] if row['subject'] == 'ticket:2'
+                and row['kind'] in {'role_consumed', 'effect_consumed', 'worker_exited'}]
             attempt_b, = [row for row in history['attempts'] if row['subject'] == 'ticket:3']
             attempt_c, = [row for row in history['attempts'] if row['subject'] == 'ticket:4' and row['role'] == 'publication']
             invocation_b, = attempt_b['invocations']
@@ -845,6 +847,7 @@ issue = int(re.search(r'https://github.com/example/project/issues/(\\d+)', promp
             assert failed_jobs['ticket:3']['budgets'] == jobs['ticket:3']['budgets']
             gate, = failed_jobs['ticket:3']['gates']
             assert gate['subject'] == 'ticket:3' and gate['detail']['returncode'] == 23
+            assert gate['detail']['kind'] == 'ordinary'
             assert failed_jobs['ticket:5']['blocked_by'] == [3]
             assert not any(row['pending_attempt'] for name, row in failed_jobs.items() if name == 'ticket:5')
             observations['after_b_failure'] = failed
@@ -867,15 +870,42 @@ issue = int(re.search(r'https://github.com/example/project/issues/(\\d+)', promp
             assert not any(row['subject'] == 'ticket:5' for row in fresh_history['attempts'])
             current_b, = [row for row in fresh_history['attempts'] if row['id'] == attempt_b['id']]
             current_c, = [row for row in fresh_history['attempts'] if row['id'] == attempt_c['id']]
-            assert current_b['subject'] == 'ticket:3' and current_b['result'] is None
-            failed_invocation, = current_b['invocations']
-            assert failed_invocation['id'] == invocation_b['id'] and failed_invocation['backend_id'] == invocation_b['backend_id']
-            output, = failed_invocation['outputs']
-            assert output['dispatch_state'] == 'exited' and output['exit_code'] == 23 and output['raw_return'] is None
-            assert output['failure_evidence']['returncode'] == 23 and output['failure_kind'] == 'fatal'
-            assert current_c['result'] is not None and current_c['invocations'][0]['id'] == invocation_c['id']
-            assert any(row['subject'] == 'ticket:3' and row['kind'] == 'worker_exited'
-                       and row['identity'] == invocation_b['id'] for row in fresh_history['events'])
+            # Native preparation creates an empty last-message file. Exit23
+            # therefore saves empty raw and permits one ordinary recovery;
+            # neither invocation is a successful Development result.
+            assert current_b['subject'] == 'ticket:3' and current_b['result'] == '' and current_b['outcome'] is None
+            assert current_b['status'] == 'returned'
+            first_b, recovery_b = current_b['invocations']
+            assert first_b['id'] == invocation_b['id'] and first_b['recovery_kind'] is None
+            assert first_b['predecessor'] is None
+            assert recovery_b['recovery_kind'] == 'ordinary' and recovery_b['predecessor'] == first_b['id']
+            assert current_b['current_invocation'] == recovery_b['id']
+            assert recovery_b['allocated_at'] >= first_b['outputs'][0]['exited_at']
+            assert first_b['deadline_at'] == invocation_b['deadline_at']
+            assert recovery_b['deadline_seconds'] == first_b['deadline_seconds'] == invocation_b['deadline_seconds']
+            for invocation in (first_b, recovery_b):
+                assert invocation['subject'] == 'ticket:3' and invocation['attempt'] == attempt_b['id']
+                assert all(invocation[key] == invocation_b[key] for key in (
+                    'thread', 'backend_id', 'profile_revision', 'model', 'effort', 'executor', 'epoch'))
+                output, = invocation['outputs']
+                assert output['dispatch_state'] == 'exited' and output['exit_code'] == 23
+                assert output['raw_return'] == '' and output['raw_id'] is not None
+                assert output['failure_evidence']['returncode'] == 23 and output['failure_kind'] == 'ordinary'
+            exited_b = [row for row in fresh_history['events'] if row['kind'] == 'worker_exited'
+                        and row['identity'] in {first_b['id'], recovery_b['id']}]
+            assert len(exited_b) == 2 and all(row['subject'] == 'ticket:3' for row in exited_b)
+            assert {row['identity'] for row in exited_b} == {first_b['id'], recovery_b['id']}
+            assert gate['detail'] == recovery_b['outputs'][0]['failure_evidence']
+            assert current_c['status'] == 'consumed' and current_c['result'] is not None
+            completed_c, = current_c['invocations']
+            assert all(completed_c[key] == invocation_c[key] for key in (
+                'id', 'attempt', 'thread', 'backend_id', 'profile_revision', 'model', 'effort',
+                'executor', 'epoch', 'deadline_at'))
+            output_c, = completed_c['outputs']
+            assert output_c['dispatch_state'] == 'exited' and output_c['exit_code'] == 0
+            assert output_c['failure_kind'] is None and output_c['raw_return']['result_kind'] == 'publication'
+            assert [row for row in fresh_history['events'] if row['subject'] == 'ticket:2'
+                    and row['kind'] in {'role_consumed', 'effect_consumed', 'worker_exited'}] == completed_history_a
             assert not any(row['kind'] == 'role_consumed' and row['identity'] == attempt_b['id']
                            for row in fresh_history['events'])
             reopened = Kernel(Path(record['database']))
