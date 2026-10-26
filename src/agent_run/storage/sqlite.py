@@ -645,6 +645,8 @@ class Storage:
                     rollback_complete = not connection.in_transaction
                 except (OSError, sqlite3.Error) as cleanup:
                     error.add_note('SQLite rollback unavailable: ' + type(cleanup).__name__)
+                if isinstance(error, SaveNotHead) and not rollback_complete:
+                    raise KernelError('transaction_aborted', 'Save admission rollback is unproven') from error
                 busy = isinstance(error, sqlite3.OperationalError) and getattr(error, 'sqlite_errorcode', None) in (
                     sqlite3.SQLITE_BUSY, sqlite3.SQLITE_BUSY_RECOVERY,
                     sqlite3.SQLITE_BUSY_SNAPSHOT, sqlite3.SQLITE_BUSY_TIMEOUT)

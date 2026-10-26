@@ -478,3 +478,25 @@ def test_clock_ownership_is_closed_when_request_construction_fails(repository, m
             pytest.fail('Business entered without a request')
     assert len(clocks) == 1 and clocks[0].closed
     assert scalar(repository, 'SELECT count(*) FROM save_admissions') == 0
+
+
+def test_nonhead_wait_is_not_retried_when_its_rollback_is_unproven(repository, monkeypatch):
+    earlier = request()
+    with repository.metadata().transaction(ordered=False) as tx:
+        earlier.register(tx)
+    original = sqlite3.connect
+    rollbacks = []
+    class UnprovedRollback(sqlite3.Connection):
+        def rollback(self):
+            if self.in_transaction and self.execute('PRAGMA query_only').fetchone()[0] == 0:
+                rollbacks.append(True)
+                raise OSError('controlled admission rollback failure')
+            return super().rollback()
+    with monkeypatch.context() as patch:
+        patch.setattr(storage_module.sqlite3, 'connect', lambda *a, **kw: original(*a, **kw, factory=UnprovedRollback))
+        with pytest.raises(KernelError) as failed:
+            with repository.at_run('A').transaction():
+                pytest.fail('Nonhead body entered after unproved rollback')
+    assert failed.value.code == 'transaction_aborted' and rollbacks == [True]
+    assert scalar(repository, 'SELECT count(*) FROM save_admissions') == 1
+    assert scalar(repository, 'SELECT request FROM save_admissions') == earlier.request
