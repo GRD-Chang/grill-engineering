@@ -100,6 +100,11 @@ class _CodexCapture:
         self.kernel, self.preparation, self.executable = kernel, preparation, executable
         self.call: AgentCall | None = None
         self.cleanup_complete = False
+        self.dispatch_claimed = False
+        # Local launch knowledge only. Cleared before Popen can create anything;
+        # absence of a stored PID or a completed Future is never this proof.
+        self.unstarted_failure: tuple[str, dict[str, Any] | str] | None = (
+            "worker_preparation_failed", {"boundary": "before_worker_spawn"})
         self.source_environment = dict(environment)
         self.credential_file = credential_file
         self.identity, self.cancelled = identity, cancelled
@@ -407,7 +412,7 @@ def _execute_prepared(
             call = step.call
             assert call is not None
             capture.bind_call(call)
-            return _execute(capture.kernel, call, arguments=capture.arguments, cwd=capture.cwd,
+            result = _execute(capture.kernel, call, arguments=capture.arguments, cwd=capture.cwd,
                 prompt=prompt, environment=capture.environment, timeout=timeout,
                 authorize_source=lambda: authorize_source(call), capture=capture)
     except BaseException as error:
@@ -418,11 +423,22 @@ def _execute_prepared(
             capture.kernel.preparation_failed(capture.preparation,
                 "preparation_deadline_exceeded" if expired else "worker_preparation_failed",
                 capture.diagnostic or {"source": "worker-preparation", "error_type": type(error).__name__})
+        if call is not None and capture.cleanup_complete and capture.unstarted_failure is not None:
+            try:
+                capture.kernel.agent_unavailable(call, *capture.unstarted_failure,
+                    before_dispatch=not capture.dispatch_claimed)
+            except BaseException as settlement_error:
+                raise error from settlement_error
         if call is not None and not capture.cleanup_complete and isinstance(error, Exception):
             raise ProcessExitUnknown("Worker credential resource cleanup remains unproven") from error
         if call is None and isinstance(error, OSError) and capture.cleanup_complete:
             return None
         raise
+    if capture.cleanup_complete and capture.unstarted_failure is not None:
+        assert call is not None
+        capture.kernel.agent_unavailable(call, *capture.unstarted_failure,
+            before_dispatch=not capture.dispatch_claimed)
+    return result
 
 
 def execute_codex(

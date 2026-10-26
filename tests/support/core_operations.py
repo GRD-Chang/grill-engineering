@@ -9,7 +9,7 @@ from pathlib import Path
 
 from typing import TYPE_CHECKING, Any, Mapping
 
-from agent_run.model import AgentCall, AgentPreparation, CreationInputs, Delivery, DeliveryKind, Effect, EffectResult, Execution, Issue, Policy, ParentIssue, Requirements, wire_json, ResourceInspection, ResourceWitness, RunSpec, Step
+from agent_run.model import Commit, AgentCall, AgentPreparation, CreationInputs, Delivery, DeliveryKind, Effect, EffectResult, Execution, Issue, Policy, ParentIssue, Requirements, wire_json, ResourceInspection, ResourceWitness, RunSpec, Step
 from agent_run.core.kernel import Kernel
 from agent_run.core.operation_contract import DeliveryFacts, DeliveryRead, OperationBinding, OperationPorts
 from agent_run.core.operation_runner import OperationRunner
@@ -189,3 +189,22 @@ def observed_call(kernel: Kernel, request: AgentPreparation) -> AgentCall:
             request.thread_id, request.reservation_id, request.execution, request.context, request.profile,
             row['deadline_seconds'], row['deadline_at'], request.mode, request.reported_thread,
             row['ordinal'], request.profile_revision, request.profile_reference)
+
+
+def agent_preparation_fixture(tmp_path: Path, *, concurrency: int = 1):
+    base = Commit('base', 'tree')
+    spec = RunSpec('preparation', 'example/repository', 1, 'parent', 'graph', (
+        Delivery('ticket:2', DeliveryKind.TICKET, 2, 'original', base,
+                 'refs/heads/ticket', 'refs/heads/run', checkout=str(tmp_path)),
+    ), Policy(ticket_rounds=1, development_deadline_seconds=120, concurrency=concurrency))
+    (tmp_path / 'state').mkdir()
+    kernel, ports = native_agent_fixture(tmp_path / 'state' / 'kernel.sqlite3', spec)
+    clock = [1000.0]
+    kernel.clock = lambda: clock[0]
+    owner = kernel.claim_executor('preparation-owner')
+    runner = OperationRunner(kernel, owner, lambda _: ports)
+    for _ in range(6):
+        step = runner.run_once()
+        if step.call is not None or getattr(step, 'preparation', None) is not None:
+            return kernel, runner, ports, step, clock
+    raise AssertionError('Core did not reserve Agent work')

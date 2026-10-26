@@ -11,7 +11,8 @@ from agent_run.core.kernel import Kernel
 from agent_run.model import DeliveryKind, Policy
 from support.offline import Scenario
 from support.core_operations import prepare_scripted_agent
-from support.agent_continuation import _native_boundary, _read_operations, preparation
+from support.agent_continuation import _native_boundary, _read_operations
+from support.core_operations import agent_preparation_fixture as preparation
 
 
 INCOMPLETE = wire_json({"result_kind": "incomplete", "summary": "Implementation is unfinished; continue the current task.", "human_blockers": None})

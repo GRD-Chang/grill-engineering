@@ -56,6 +56,11 @@ def test_busy_host_applies_resume_message_once_and_preserves_the_ticket_queue(tm
     assert continued.thread_id != failed.thread_id and continued.invocation_id != failed.invocation_id
     assert continued.execution == execution and continued.context["human_responses"] == [message]
     assert continued.context["semantic_continuation"] is True
+    assert kernel.status("ticket:2")["budgets"]["requirements"]["developments_used"] == 0
+    # An admitted Call alone is uncharged in v21. Preserve the original charged
+    # result assertion after this unit driver actually supplies its role return.
+    operations.runner.authorize_agent(continued)
+    kernel.receive(continued, b'{"result_kind":"development","summary":"Original resumed work","human_blockers":null}')
     assert kernel.status("ticket:2")["budgets"]["requirements"]["developments_used"] == 1
     applied = [event for event in kernel.history("ticket:2") if event["kind"] == "control_applied" and event["identity"] == "resume-ticket-2"]
     assert len(applied) == 1

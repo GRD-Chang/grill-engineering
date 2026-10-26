@@ -11,10 +11,7 @@ from agent_run.core.operation_runner import OperationRunner
 from agent_run.errors import KernelError
 from agent_run.model import Commit, Delivery, DeliveryKind, Policy, RunSpec
 from agent_run.runtime.execution import execute
-from support.core_operations import native_agent_fixture
-from support.agent_continuation import preparation
-
-
+from support.core_operations import native_agent_fixture, agent_preparation_fixture as preparation
 
 
 def counts(kernel):
