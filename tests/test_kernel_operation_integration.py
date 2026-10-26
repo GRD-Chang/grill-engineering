@@ -1,4 +1,5 @@
 """Actual Core operation runner through Host; Agent and GitHub are synthetic."""
+from support.control_scenarios import _admit_host
 from support.core_operations import prepare_scripted_agent
 from agent_run.core.operation_runner import OperationRunner
 from agent_run.errors import KernelError
@@ -6,7 +7,6 @@ import pytest
 
 import agent_run.runtime.executor as executor
 from support.offline import GraphScenario
-from test_kernel_host_observation import admit_scenario
 from support.core_operations import Ports
 from support.requirements_scenarios import independent_source
 
@@ -18,17 +18,6 @@ class Notifications:
         pass
     def close(self, **_kwargs):
         pass
-
-
-def _admit_host(scenario, tmp_path):
-    """Use the admitted manager witness for this synthetic process adapter."""
-    admit_scenario(scenario, tmp_path)
-    action = scenario.kernel.active_host_action()
-    assert action is not None
-    usage = scenario.kernel.host_usage(action)
-    assert usage is not None and usage.usage_ready and not usage.usage_released
-    return {"host_pid": usage.main_pid, "host_start_token": usage.start_token,
-            "boot_id": usage.boot_id, "host_cgroup": usage.cgroup, "cgroup": usage.cgroup}
 
 
 def test_github_reader_can_be_imported_cold_in_an_independent_process():

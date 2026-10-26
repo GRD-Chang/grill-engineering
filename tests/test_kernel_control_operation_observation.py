@@ -1,5 +1,5 @@
 """Manual managed controls share Core observation without an Executor claim."""
-from support.core_operations import prepare_scripted_agent
+from support.control_scenarios import managed_approval
 from agent_run.core.operation_runner import OperationRunner, observe_control
 from dataclasses import replace
 import json
@@ -8,20 +8,15 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.config.defaults import UserDefaultsStore
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 import agent_run.cli.lifecycle as lifecycle_cli
-from agent_run.model import DeliveryKind, Execution
+from agent_run.model import Execution
 from agent_run.errors import ObservationSuperseded
-from support.offline import Scenario
 from agent_run.core.operation_contract import ReadUnavailable
 from agent_run.cli.main import _parser
-from agent_run.adapters.remote import RemoteEffects
-from support.systemd_manager import controlled_manager
 from support.ticket_process import isolated_ticket_test
 from support.core_operations import setup
-from support.remote_effects import _fixture
 
 
 def test_control_observation_never_claims_executor_or_allocates_work(tmp_path, monkeypatch):
@@ -81,82 +76,6 @@ def test_control_read_failure_is_a_cli_error_without_a_work_wait_or_claim(tmp_pa
         assert not tx.rows("SELECT id FROM attempts")
         assert not tx.rows("SELECT id FROM leases")
         assert not tx.rows("SELECT subject FROM waits")
-
-
-def managed_approval(tmp_path, monkeypatch, *, tickets, language="en", interrupt_development=False, save_development=False):
-    transport = tmp_path / "transport"
-    transport.mkdir()
-    port, git, push, state, calls = _fixture(transport, monkeypatch)
-    fake = transport / "bin" / "gh"
-    fake.write_text(fake.read_text().replace("'number':17,", "'number':17+len(d['prs']),"))
-    graph = {"parent": {"number": 1, "title": "Parent", "body": "Original requirement", "sub_issues": list(tickets)},
-             "issues": {str(n): {"number": n, "title": "Ticket", "body": "Ticket requirement", "state": "OPEN",
-                                    "labels": ["ready-for-agent"]} for n in tickets}}
-    state.write_text(json.dumps({"prs": [], "comments": [], "events": [], "issue_state": "open", "source_graph": graph}))
-    defaults = UserDefaultsStore()
-    defaults.configure(language=language, profile={"preset": "economy"})
-    database, spec, source = lifecycle_cli.prepare_creation(1, "example/project", source_directory=git.root,
-        defaults=defaults, remote_url=str(transport / "origin.git"))
-    kernel = Kernel.create_task(database, spec, requirements=source)
-    manager_root = tmp_path / "manager"
-    manager_root.mkdir()
-    manager, _, response, manager_calls = controlled_manager(manager_root)
-    request = kernel.admit_host("original-host", kind="run", command=("fixture-native-host",),
-        environment_carrier=manager_root / "original-carrier", preflight=manager.preflight)
-    assert kernel.dispatch_host(request)
-    sealed = ""
-    if interrupt_development:
-        from agent_run.runtime.handoff import prepare_handoff
-        from agent_run.runtime.package_lease import default_runner_lock_path, runner_usage_lease
-        from agent_run.model import HostObservation
-        manager_root.chmod(0o700)
-        lock = default_runner_lock_path(dict(os.environ))
-        with runner_usage_lease(lock) as terminal:
-            handoff = prepare_handoff(request, {}, runner_lock=lock, terminal_lease=terminal, ttl_seconds=.5)
-            try:
-                sealed = json.dumps(handoff.receipt, sort_keys=True, separators=(",", ":"))
-                assert kernel.observe_host(request, HostObservation("unknown", request.unit_name,
-                    usage_pending=True, evidence=sealed)) == "unknown"
-            finally:
-                handoff.process.wait(timeout=3)
-        assert not Path(f"/proc/{handoff.process.pid}").exists()
-    document = json.loads(response.read_text())
-    group = next(line[3:] for line in Path(f"/proc/{os.getpid()}/cgroup").read_text().splitlines() if line.startswith("0::"))
-    document["fields"].update(Id=request.unit_name, Description=request.description,
-        ActiveState="active", SubState="running", MainPID=str(os.getpid()), ControlGroup=group)
-    response.write_text(json.dumps(document))
-    observed = manager.observe(request)
-    assert observed.disposition == "running"
-    assert kernel.observe_host(request, replace(observed, usage_ready=True, evidence=sealed)) == "running"
-    execution = Execution(request.run_id, request.owner, request.epoch)
-    physical = RemoteEffects(Path(spec.repository_root), spec.repository, runner_identity=spec.inputs.runner_identity)
-    runner = OperationRunner(kernel, execution, lambda binding: physical)
-    # This existing fake Agent only makes files/raw bytes. All source, Git, PR,
-    # Completion and operation decisions above/below remain production paths.
-    agents = Scenario(tmp_path / "agents", DeliveryKind.PARENT_ONLY)
-    agents.kernel, agents.port.git = kernel, physical.git
-    subject = "final:1" if tickets else "parent:1"
-    for _ in range(180):
-        step = prepare_scripted_agent(kernel, runner.run_once())
-        if step.call is not None:
-            if interrupt_development:
-                if save_development:
-                    runner.authorize_agent(step.call)
-                    kernel.receive(step.call, agents.agent(step.call))
-                break
-            runner.authorize_agent(step.call)
-            kernel.receive(step.call, agents.agent(step.call))
-        if kernel.source_status()["final_subject"] == subject or not tickets:
-            status = kernel.status(subject)
-            assert not status["gates"], (step, status["gates"])
-            if status["phase"] == "approval":
-                break
-    else:
-        raise AssertionError("The managed Run never reached its real approval")
-    monkeypatch.setattr(lifecycle_cli, "_active_runner", lambda: True)
-    import agent_run.adapters.systemd as adapter
-    monkeypatch.setattr(adapter, "SystemdHost", lambda **kwargs: manager)
-    return kernel, runner, physical, state, calls, request, subject, source
 
 
 @pytest.mark.parametrize("command", ["approve", "revise", "requeue"])

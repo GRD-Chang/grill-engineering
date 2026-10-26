@@ -10,7 +10,7 @@ import pytest
 from agent_run.runtime.package_lease import runner_usage_lease
 from agent_run.model import HostObservation
 from agent_run.runtime.handoff import prepare_handoff
-from test_kernel_host_adapter import host_kernel
+from support.core_operations import host_kernel
 
 
 def test_original_private_credential_keeps_runner_binding_after_startup_expiry(tmp_path: Path) -> None:

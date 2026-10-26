@@ -8,10 +8,10 @@
 | 责任 | 当前支撑模块 | 使用边界 |
 | --- | --- | --- |
 | 用户与 Git 环境隔离 | `environment`、`workspace` | 每例独立 HOME/XDG、目录和环境；不可变 Git 模板按 worker 创建，每例复制后独立修改 |
-| 准备、准入与脚本化 Agent 返回 | `core_operations`、`agent_continuation` | `Ports` / `setup` 保留真实 Core 选择和有限依赖场景；驱动准备→准入→Invocation，不跳过凭据准备。`settle_agent` 仅为原单元场景的显式合成进程观察，不是 OS/Host 退出证明 |
+| 准备、准入与脚本化 Agent 返回 | `core_operations`、`agent_continuation` | `Ports` / `setup` 保留真实 Core 选择和有限依赖场景；驱动准备→准入→Invocation，不跳过凭据准备。`host_kernel` / `task_run` 仅创建有限 Run；`settle_agent` 仅为原单元场景的显式合成进程观察，不是 OS/Host 退出证明 |
 | 合成交付世界 | `offline`、`offline_api`、`offline_git` | `Scenario` / `GraphScenario` 使用真实 Kernel、SQLite、私有 Git；Agent 输出和 GitHub 原始对象是合成输入，不是预期结果权威 |
 | 有限需求场景 | `requirements_scenarios` | `native_input` 每次读取新数据；`independent_source` 仅移除声明的依赖，`source_run` 通过真实 Core 创建库，不补造完成状态 |
-| 已发布 Ticket 的控制前置 | `control_scenarios` | `prepared_control` 只准备准确 PR、合成 HostObservation 及控制观察；调用方自行执行 Requeue/Abandon 并保留逐步和读回断言，不调用其他测试函数 |
+| 有限托管控制与观察前置 | `control_scenarios` | `prepared_control` / `managed_approval` 准备准确 PR、合成 manager/HostObservation 及控制观察；`admit_scenario` / `sent_workspaces` 保留原准入和 unknown-intent。调用方拥有控制、读回与退出断言，不把合成事实当 OS 证明 |
 | 资源清理前置与本地 ref 读取 | `cleanup_scenarios` | `_native_scenario`、`_local_head` 保留原种类和准确 ref 语义；`prepared_generation_two_cleanup` 只准备正常 Requeue 与原观察回调，执行和 foreign/退出断言仍由各用例拥有 |
 | 真实 gh 子进程与远端 effect 前置 | `remote_effects` | 唯一 `FAKE_GH` 脚本及 `_fixture`、`_change`、`_pr_effect`、`_publish_pr`、`_source_kernel`；调用方拥有独立仓库、状态、日志及 monkeypatch |
 | GitHub 读取与文本 fixture | `github_requirements`、`github_checks`、`fixture_text` | 保留编号/仓库/父子关系、分页、检查身份及文本路径语义；错误响应仍由真实 reader 拒绝 |

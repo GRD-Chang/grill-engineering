@@ -270,3 +270,18 @@ def dependent_ticket(tmp_path: Path):
     assert not Path(scenario.delivery.checkout).exists()
     assert not scenario.port.git.run("for-each-ref", "--format=%(refname)", scenario.delivery.source_ref).stdout
     return scenario, head
+
+
+def host_kernel(tmp_path: Path) -> Kernel:
+    base = Commit("base", "tree")
+    delivery = Delivery("parent", DeliveryKind.PARENT_ONLY, 1, "requirements", base, "source", "target")
+    return Kernel.create(tmp_path / "state" / "kernel.sqlite3", RunSpec(
+        "host-run", "example/repository", 1, "requirements", "graph", (delivery,),
+        language="en", repository_root=str(tmp_path / "repository"),
+    ))
+
+def task_run(root: Path, run_id: str, *, parent: int = 1) -> tuple[Kernel, ReadOnlyPorts]:
+    base = Commit("base", "tree")
+    delivery = Delivery("parent", DeliveryKind.PARENT_ONLY, parent, "v1", base, "refs/heads/task", "refs/heads/main")
+    return native_agent_fixture(root / (run_id + ".sqlite3"), RunSpec(run_id, "example/project", parent, "v1", "graph", (delivery,),
+                         language="en", repository_root=str(root / "repository")))

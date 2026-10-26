@@ -2,7 +2,7 @@
 import json
 
 from agent_run.core.operation_contract import ReadUnavailable
-from test_kernel_host_observation import sent_workspaces
+from support.control_scenarios import sent_workspaces
 
 
 def test_late_sent_target_is_audited_without_settling_or_renewing(tmp_path):

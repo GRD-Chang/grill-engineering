@@ -224,7 +224,7 @@ def test_dispatched_unknown_host_is_attached_without_applying_a_new_action(tmp_p
     import json
     import os
     from support.systemd_manager import controlled_manager
-    from test_kernel_host_adapter import host_kernel
+    from support.core_operations import host_kernel
     from agent_run.cli.lifecycle import attach
     kernel = host_kernel(tmp_path)
     manager, fixture, response, calls = controlled_manager(tmp_path)
@@ -254,7 +254,7 @@ def test_allocated_original_host_continues_its_one_dispatch_and_then_only_attach
     import json
     import os
     from support.systemd_manager import controlled_manager
-    from test_kernel_host_adapter import host_kernel
+    from support.core_operations import host_kernel
     import agent_run.runtime.handoff as native_host
     from agent_run.cli.lifecycle import attach
     kernel = host_kernel(tmp_path)

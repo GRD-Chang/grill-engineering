@@ -1,4 +1,5 @@
 """Real local CLI boundaries; controlled manager replies are not a live unit."""
+from support.core_operations import host_kernel
 
 import errno
 import json
@@ -12,10 +13,8 @@ import time
 import pytest
 
 from agent_run.adapters.systemd import HostUnavailable, SystemdHost
-from agent_run.model import Commit, Delivery, DeliveryKind
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
-from agent_run.model import RunSpec
 from agent_run.model import HostLaunch
 from support.systemd_manager import controlled_manager
 
@@ -142,15 +141,6 @@ def test_real_unavailable_manager_refuses_host_readiness(tmp_path: Path, record_
     with pytest.raises(HostUnavailable, match="user systemd"):
         host.preflight()
     _assert_unavailable_manager_precedes_admission(tmp_path, host, capability)
-
-
-def host_kernel(tmp_path: Path) -> Kernel:
-    base = Commit("base", "tree")
-    delivery = Delivery("parent", DeliveryKind.PARENT_ONLY, 1, "requirements", base, "source", "target")
-    return Kernel.create(tmp_path / "state" / "kernel.sqlite3", RunSpec(
-        "host-run", "example/repository", 1, "requirements", "graph", (delivery,),
-        language="en", repository_root=str(tmp_path / "repository"),
-    ))
 
 
 def _assert_unavailable_manager_precedes_admission(tmp_path: Path, host: SystemdHost, capability: str) -> None:

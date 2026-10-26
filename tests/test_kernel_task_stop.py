@@ -12,7 +12,7 @@ from support.offline import GraphScenario
 from agent_run.storage.tasks import bind_task, locked_task
 from support.requirements_scenarios import independent_source
 from support.core_operations import CoreOperations
-from test_kernel_host_observation import managed_parent
+from support.control_scenarios import managed_parent
 
 
 def test_completed_task_stop_preserves_the_terminal_result_without_an_action(tmp_path: Path) -> None:

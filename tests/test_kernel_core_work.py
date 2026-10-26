@@ -4,7 +4,7 @@ import pytest
 from agent_run.errors import KernelError
 from agent_run.model import HostObservation
 from agent_run.core.operation_contract import EffectIO
-from test_kernel_host_observation import sent_workspaces
+from support.control_scenarios import sent_workspaces
 
 
 def test_work_keeps_initial_members_and_rejects_a_retired_executor(tmp_path):
