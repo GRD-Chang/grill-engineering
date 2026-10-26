@@ -255,8 +255,9 @@ def test_invalid_selector_never_selects_or_changes_task_binding(repository, fiel
     request = parsed(**{field: value})
     before = dump(repository)
     for invoke in (lambda: repository_candidates(request, (repository,)), lambda: select_repository(request, ())):
-        with pytest.raises(QueryError, match='Choose a positive Parent or one exact Run ID'):
+        with pytest.raises(QueryError) as refused:
             invoke()
+        assert refused.value.code == 'run_locator_invalid'
     assert dump(repository) == before
 
 
@@ -266,13 +267,15 @@ def test_ambiguous_same_id_across_repository_roots_is_refused_and_exact_repo_iso
     assert create(foreign, 'A', 1).created
     request = parsed(run_id='A', repo=None)
     candidates = repository_candidates(request, (repository, foreign))
-    with pytest.raises(QueryError, match='Multiple repository Runs match'):
+    with pytest.raises(QueryError) as ambiguous:
         select_repository(request, candidates)
+    assert ambiguous.value.code == 'run_locator_conflict'
     request.repo = 'EXAMPLE/PROJECT'
     selected = select_repository(request, repository_candidates(request, (repository, foreign)))
     assert len(selected) == 1 and selected[0].database == repository.database
-    with pytest.raises(QueryError, match='Duplicate repository database route'):
+    with pytest.raises(QueryError) as duplicate:
         repository_candidates(request, (repository, repository))
+    assert duplicate.value.code == 'run_locator_conflict'
 
 
 def test_unreadable_or_missing_metadata_does_not_mean_new_task_or_initialization(repository, tmp_path, monkeypatch):
