@@ -35,7 +35,7 @@ def test_work_keeps_initial_members_and_rejects_a_retired_executor(tmp_path):
 
 
 def test_one_request_chain_never_selects_a_sibling(tmp_path):
-    from test_kernel_operation_runner import setup
+    from support.core_operations import setup
 
     scenario, ports, runner = setup(tmp_path)
     execute = ports.execute

@@ -1,13 +1,13 @@
-"""Bounded test driving of the real Core runner, without a second selector.
+"""Core runner driving and finite explicit fixture producers.
 
-Callers supply physical OperationPorts. This helper never supplies a subject,
-constructs a World, executes an Agent, or manufactures process-exit evidence.
+CoreOperations leaves selection and authority in the real Runner. The controlled
+credential/output producers are test inputs. settle_agent retains the existing
+synchronous synthetic process observations; it is never OS/Host exit proof.
 """
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import Any, Mapping
 
 from agent_run.model import Commit, AgentCall, AgentPreparation, CreationInputs, Delivery, DeliveryKind, Effect, EffectResult, Execution, Issue, Policy, ParentIssue, Requirements, wire_json, ResourceInspection, ResourceWitness, RunSpec, Step
 from agent_run.core.kernel import Kernel
@@ -15,9 +15,8 @@ from agent_run.core.operation_contract import DeliveryFacts, DeliveryRead, Opera
 from agent_run.core.operation_runner import OperationRunner
 from agent_run.contracts.write_authority import WriteAuthority
 
-
-if TYPE_CHECKING:
-    from support.offline import GraphScenario
+from support.offline import GraphScenario
+from support.requirements_scenarios import independent_source, native_input
 
 
 def prepare_scripted_agent(kernel: Kernel, step: Step | AgentPreparation) -> Step:
@@ -208,3 +207,66 @@ def agent_preparation_fixture(tmp_path: Path, *, concurrency: int = 1):
         if step.call is not None or getattr(step, 'preparation', None) is not None:
             return kernel, runner, ports, step, clock
     raise AssertionError('Core did not reserve Agent work')
+
+
+class Ports:
+    def __init__(self, scenario):
+        self.scenario = scenario
+        self.reads = 0
+
+    def source(self, parent_number):
+        self.reads += 1
+        s = self.scenario
+        assert parent_number == s.requirements.parent.number
+        return s.port.source(s.requirements, parent_number)
+
+    def delivery(self, request):
+        s = self.scenario
+        return s.port.delivery(request, ('none',), [], publisher_identity=s.spec.inputs.runner_identity)
+
+    def inspect(self, resources):
+        return self.scenario.port.inspect_resources(resources)
+
+    def execute(self, effect, authorize):
+        return self.scenario.port.execute(effect, authorize)
+
+    def reconcile(self, effect):
+        return self.scenario.port.reconcile(effect)
+
+    def prepare_publication(self, effect):
+        return self.scenario.port.local.prepare_publication(effect)
+
+    def prepare_retirement(self, effect):
+        return self.scenario.port.prepare_retirement(effect)
+
+
+def setup(tmp_path, *, concurrency=1, dependent=False):
+    source = Requirements.from_wire(native_input()["initial_requirements"]) if dependent else independent_source()
+    s = GraphScenario(tmp_path / "graph", source, policy=Policy(concurrency=concurrency))
+    ports = Ports(s)
+    return s, ports, OperationRunner(s.kernel, s.execution, lambda binding: ports)
+
+
+def settle_agent(s, runner, call):
+    assert s.kernel.dispatch_agent(call)
+    runner.authorize_agent(call)
+    process = {"pid": 4242, "start_token": "synthetic", "pgid": 4242,
+               "host_pid": 4241, "host_start_token": "synthetic-host"}
+    s.kernel.agent_started(call, process)
+    s.select(call.subject)  # Observe the returned call; never choose runnable work.
+    s.kernel.receive(call, s.agent(call))
+    assert not runner.worker_settled(call)
+    s.kernel.agent_exited(call, process, 0)
+    assert runner.worker_settled(call)
+
+
+def dependent_ticket(tmp_path: Path):
+    scenario = GraphScenario(tmp_path / "dependencies", Requirements.from_wire(native_input()["initial_requirements"]))
+    assert scenario.kernel.source_status()["remaining"]["ticket:4"] == "blocked_by_incomplete_tickets"
+    assert scenario.run().kind == "complete"
+    head = scenario.port.remote_commit("refs/heads/run")
+    assert head is not None and head != scenario.initial
+    scenario.select("ticket:4")
+    assert not Path(scenario.delivery.checkout).exists()
+    assert not scenario.port.git.run("for-each-ref", "--format=%(refname)", scenario.delivery.source_ref).stdout
+    return scenario, head

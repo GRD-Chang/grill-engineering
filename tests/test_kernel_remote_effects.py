@@ -323,7 +323,7 @@ def test_real_issue_ack_stays_optional_and_once_across_kernel_reopen(tmp_path, m
     from agent_run.core.kernel import Kernel
     from agent_run.model import Issue, ParentIssue, Requirements
     from support.offline import GraphScenario
-    from test_kernel_operation_runner import Ports, settle_agent
+    from support.core_operations import Ports, settle_agent
     _port, _git, _push, state, calls = _fixture(tmp_path, monkeypatch)
     _change(state, actor="offline-publisher", lose_operation="issue_link" if mode == "ack-lost" else None,
             issue_read_error=mode == "unavailable")
@@ -500,7 +500,7 @@ def test_final_observation_proves_real_current_completions_into_remote_run_befor
     source = Requirements(ParentIssue(1, "Parent", "Whole requirement", (2,)),
                           (Issue(2, "Ticket", "Whole ticket", "OPEN", frozenset({"ready-for-agent"})),))
     scenario = GraphScenario(tmp_path / "graph", source)
-    from test_kernel_operation_runner import Ports, settle_agent
+    from support.core_operations import Ports, settle_agent
     runner = OperationRunner(scenario.kernel, scenario.execution, lambda binding: Ports(scenario))
     for _ in range(100):
         step = prepare_scripted_agent(scenario.kernel, runner.run_once())

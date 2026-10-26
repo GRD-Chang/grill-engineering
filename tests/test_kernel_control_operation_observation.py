@@ -20,7 +20,7 @@ from agent_run.cli.main import _parser
 from agent_run.adapters.remote import RemoteEffects
 from support.systemd_manager import controlled_manager
 from support.ticket_process import isolated_ticket_test
-from test_kernel_operation_runner import setup
+from support.core_operations import setup
 from support.remote_effects import _fixture
 
 

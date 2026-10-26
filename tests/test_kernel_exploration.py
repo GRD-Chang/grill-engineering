@@ -18,7 +18,7 @@ from support.offline import Scenario, review_result
 from agent_run.model import wire_json
 from support.core_operations import CoreOperations, native_agent_fixture, scripted_return
 from support.agent_continuation import ticket_spec
-from support.effect_boundary import EffectBoundary, effect_boundary
+from support.effect_boundary import advance_to_effect
 
 
 
@@ -175,25 +175,6 @@ def test_unknown_successful_pr_write_is_read_back_without_a_second_write(tmp_pat
     assert scenario.run().kind == "complete"
     assert sum(write["operation"] == "pr_write" for write in scenario.port.writes()) == 1
     assert scenario.publication_count == 1
-
-
-def advance_to_effect(scenario: Scenario, monkeypatch, operation: str, *, developments: int = 0,
-                      sent: bool = False) -> EffectBoundary:
-    # The existing runner chooses every subject and transition. Only the real
-    # physical port is held, using the same boundary fixture as remote tests.
-    for _ in range(150):
-        if scenario.development_count >= developments:
-            break
-        scenario.step()
-    with effect_boundary(scenario, monkeypatch, operation, sent=sent):
-        with pytest.raises(EffectBoundary) as boundary:
-            for _ in range(150):
-                step = scenario.step()
-                assert step.kind not in {"paused", "complete", "approval", "waiting"}
-    assert boundary.value.effect.operation == operation and boundary.value.phase == "execute"
-    if sent:
-        assert scenario.kernel.status(boundary.value.effect.subject)["pending_write"]["status"] == "sent"
-    return boundary.value
 
 
 

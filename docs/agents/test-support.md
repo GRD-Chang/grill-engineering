@@ -8,14 +8,14 @@
 | 责任 | 当前支撑模块 | 使用边界 |
 | --- | --- | --- |
 | 用户与 Git 环境隔离 | `environment`、`workspace` | 每例独立 HOME/XDG、目录和环境；不可变 Git 模板按 worker 创建，每例复制后独立修改 |
-| 准备、准入与脚本化 Agent 返回 | `core_operations`、`agent_continuation` | 驱动真实 Core 的准备→准入→Invocation；只读端口不能执行物理写，不能伪造凭据就绪或跳过准备 |
+| 准备、准入与脚本化 Agent 返回 | `core_operations`、`agent_continuation` | `Ports` / `setup` 保留真实 Core 选择和有限依赖场景；驱动准备→准入→Invocation，不跳过凭据准备。`settle_agent` 仅为原单元场景的显式合成进程观察，不是 OS/Host 退出证明 |
 | 合成交付世界 | `offline`、`offline_api`、`offline_git` | `Scenario` / `GraphScenario` 使用真实 Kernel、SQLite、私有 Git；Agent 输出和 GitHub 原始对象是合成输入，不是预期结果权威 |
 | 有限需求场景 | `requirements_scenarios` | `native_input` 每次读取新数据；`independent_source` 仅移除声明的依赖，`source_run` 通过真实 Core 创建库，不补造完成状态 |
 | 已发布 Ticket 的控制前置 | `control_scenarios` | `prepared_control` 只准备准确 PR、合成 HostObservation 及控制观察；调用方自行执行 Requeue/Abandon 并保留逐步和读回断言，不调用其他测试函数 |
 | 资源清理前置与本地 ref 读取 | `cleanup_scenarios` | `_native_scenario`、`_local_head` 保留原种类和准确 ref 语义；`prepared_generation_two_cleanup` 只准备正常 Requeue 与原观察回调，执行和 foreign/退出断言仍由各用例拥有 |
 | 真实 gh 子进程与远端 effect 前置 | `remote_effects` | 唯一 `FAKE_GH` 脚本及 `_fixture`、`_change`、`_pr_effect`、`_publish_pr`、`_source_kernel`；调用方拥有独立仓库、状态、日志及 monkeypatch |
 | GitHub 读取与文本 fixture | `github_requirements`、`github_checks`、`fixture_text` | 保留编号/仓库/父子关系、分页、检查身份及文本路径语义；错误响应仍由真实 reader 拒绝 |
-| 写前边界与外部观察 | `effect_boundary`、`api_observation` | 在原外部 I/O 窗口注入变化，保留 prepare、物理核验和最终 Core 准入；不缓存已通过的许可 |
+| 写前边界与外部观察 | `effect_boundary`、`api_observation` | 在原外部 I/O 窗口注入变化，保留 prepare、物理核验和最终 Core 准入；`workspace_intent` / `advance_to_effect` 只挂起正常选择出的准确 Effect，不缓存已通过的许可 |
 | 合成 systemd 与 Status 端口 | `systemd_manager`、`systemd_exit_manager`、`status_comments` | 只提供声明的外部 manager、sysfs 或评论响应；不将合成观察冒充真实 OS 或 GitHub 验收 |
 | 通知场景、投影与观察 | `notification`、`observer_errors` | `_kernel` / `_operations` 保留有限的冻结配置与只读端口；`_project` 只读实际 history 并调用产品投影；`_enabled_scenario` 保留正常 Core/Git 前置。每例持有发送器，关闭后独立检查观察异常，不能依赖被后台吞掉的 assert |
 | SQLite 故障 | `sqlite_faults`、`sqlite_fault_host` | 仅精确私有 DB/Run/Action；真实事务故障和清理保持，封存前选择的测试 Host 入口不是官方原 argv E2E |
