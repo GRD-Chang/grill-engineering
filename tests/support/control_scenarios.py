@@ -208,3 +208,87 @@ def managed_approval(tmp_path, monkeypatch, *, tickets, language="en", interrupt
     import agent_run.adapters.systemd as adapter
     monkeypatch.setattr(adapter, "SystemdHost", lambda **kwargs: manager)
     return kernel, runner, physical, state, calls, request, subject, source
+
+
+def restorable_public_resume(tmp_path, monkeypatch, missing):
+    """Prepare only the original damaged fixture and installed CLI command."""
+    from types import SimpleNamespace
+    import sys
+    from agent_run.config.paths import app_data_root
+    kernel, _runner, physical, _state, calls, request, subject, _source = managed_approval(
+        tmp_path, monkeypatch, tickets=(), interrupt_development=True)
+    database = kernel.storage.path
+    before = kernel.status(subject)
+    with kernel.storage.transaction(write=False) as tx:
+        inputs = tx.one("SELECT subject,material_id FROM run_inputs")
+        frozen = tx.get(inputs["material_id"], inputs["subject"])
+        attempt = tx.one("SELECT current_attempt FROM subjects WHERE id=?", (subject,))[0]
+        count = tx.one("SELECT count(*) FROM actions")[0]
+    backup = database.read_bytes()
+    checkout = physical.git.root
+    saved_checkout = tmp_path / "trusted-checkout"
+    if missing == "frozen-material":
+        # Physical corruption, not a fabricated business row or a new digest.
+        # SQLite still reads the record; original immutable hash must reject it.
+        prefix = frozen[:128]
+        assert backup.count(prefix) >= 1
+        database.write_bytes(backup.replace(prefix, b"[" + prefix[1:]))
+    else:
+        checkout.rename(saved_checkout)
+    damaged = database.read_bytes()
+    active = app_data_root() / "active" / "current"
+    active.parent.mkdir(parents=True, exist_ok=True)
+    active.symlink_to(Path(lifecycle_cli.__file__).resolve().parents[3], target_is_directory=True)
+    manager_root = tmp_path / "manager"
+    environment = dict(os.environ, PATH=str(manager_root) + os.pathsep + os.environ["PATH"])
+    response = manager_root / "manager-response.json"
+    document = json.loads(response.read_text())
+    document["fields"].update(ActiveState="inactive", SubState="dead", MainPID="0", ControlPID="0", NFileDescriptorStore="0")
+    response.write_text(json.dumps(document))
+    group = manager_root / "cgroups" / document["fields"]["ControlGroup"].lstrip("/")
+    group.mkdir(exist_ok=True, parents=True)
+    (group / "cgroup.events").write_text("populated 0\n")
+    # Separate interpreter, installed public main; only the external systemd
+    # adapter's sysfs root and unused synthetic launch startup are controlled.
+    bootstrap = tmp_path / "resume.py"
+    bootstrap.write_text("""from contextlib import contextmanager
+import sys
+from pathlib import Path
+import agent_run.adapters.systemd as adapter
+import agent_run.runtime.handoff as native
+from agent_run.cli.main import main
+original = adapter.SystemdHost
+adapter.SystemdHost = lambda **kw: original(**kw, cgroup_root=Path(sys.argv[1]))
+@contextmanager
+def handoff(*args, **kwargs):
+    proof = native.prepare_handoff(*args, **kwargs, ttl_seconds=.5)
+    try:
+        yield proof
+    finally:
+        proof.process.wait(timeout=3)
+native.handoff_scope = handoff
+raise SystemExit(main(sys.argv[2:]))
+""")
+    command = [sys.executable, str(bootstrap), str(manager_root / "cgroups"), "resume", request.run_id,
+               "--repo", physical.repository, "--state-dir", str(database), "--json"]
+    return SimpleNamespace(
+        kernel=kernel,
+        physical=physical,
+        request=request,
+        subject=subject,
+        database=database,
+        before=before,
+        inputs=inputs,
+        frozen=frozen,
+        attempt=attempt,
+        count=count,
+        backup=backup,
+        checkout=checkout,
+        saved_checkout=saved_checkout,
+        damaged=damaged,
+        manager_root=manager_root,
+        environment=environment,
+        response=response,
+        document=document,
+        command=command,
+    )

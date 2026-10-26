@@ -1,5 +1,5 @@
 """Manual managed controls share Core observation without an Executor claim."""
-from support.control_scenarios import managed_approval
+from support.control_scenarios import managed_approval, restorable_public_resume
 from agent_run.core.operation_runner import OperationRunner, observe_control
 from dataclasses import replace
 import json
@@ -16,6 +16,7 @@ from agent_run.errors import ObservationSuperseded
 from agent_run.core.operation_contract import ReadUnavailable
 from agent_run.cli.main import _parser
 from support.ticket_process import isolated_ticket_test
+from support.process_scope import guardian_timeout_owners
 from support.core_operations import setup
 
 
@@ -191,64 +192,26 @@ def test_first_public_resume_applies_after_exact_systemd_exit(tmp_path, monkeypa
 def test_public_resume_after_trusted_material_or_checkout_restoration(tmp_path, monkeypatch, missing):
     """Corrupt only isolated fixture bytes; restore the exact original backup."""
     import subprocess
-    import sys
-    from agent_run.config.paths import app_data_root
-    kernel, _runner, physical, _state, calls, request, subject, _source = managed_approval(
-        tmp_path, monkeypatch, tickets=(), interrupt_development=True)
-    database = kernel.storage.path
-    before = kernel.status(subject)
-    with kernel.storage.transaction(write=False) as tx:
-        inputs = tx.one("SELECT subject,material_id FROM run_inputs")
-        frozen = tx.get(inputs["material_id"], inputs["subject"])
-        attempt = tx.one("SELECT current_attempt FROM subjects WHERE id=?", (subject,))[0]
-        count = tx.one("SELECT count(*) FROM actions")[0]
-    backup = database.read_bytes()
-    checkout = physical.git.root
-    saved_checkout = tmp_path / "trusted-checkout"
-    if missing == "frozen-material":
-        # Physical corruption, not a fabricated business row or a new digest.
-        # SQLite still reads the record; original immutable hash must reject it.
-        prefix = frozen[:128]
-        assert backup.count(prefix) >= 1
-        database.write_bytes(backup.replace(prefix, b"[" + prefix[1:]))
-    else:
-        checkout.rename(saved_checkout)
-    damaged = database.read_bytes()
-    active = app_data_root() / "active" / "current"
-    active.parent.mkdir(parents=True, exist_ok=True)
-    active.symlink_to(Path(lifecycle_cli.__file__).resolve().parents[3], target_is_directory=True)
-    manager_root = tmp_path / "manager"
-    environment = dict(os.environ, PATH=str(manager_root) + os.pathsep + os.environ["PATH"])
-    response = manager_root / "manager-response.json"
-    document = json.loads(response.read_text())
-    document["fields"].update(ActiveState="inactive", SubState="dead", MainPID="0", ControlPID="0", NFileDescriptorStore="0")
-    response.write_text(json.dumps(document))
-    group = manager_root / "cgroups" / document["fields"]["ControlGroup"].lstrip("/")
-    group.mkdir(exist_ok=True, parents=True)
-    (group / "cgroup.events").write_text("populated 0\n")
-    # Separate interpreter, installed public main; only the external systemd
-    # adapter's sysfs root and unused synthetic launch startup are controlled.
-    bootstrap = tmp_path / "resume.py"
-    bootstrap.write_text("""from contextlib import contextmanager
-import sys
-from pathlib import Path
-import agent_run.adapters.systemd as adapter
-import agent_run.runtime.handoff as native
-from agent_run.cli.main import main
-original = adapter.SystemdHost
-adapter.SystemdHost = lambda **kw: original(**kw, cgroup_root=Path(sys.argv[1]))
-@contextmanager
-def handoff(*args, **kwargs):
-    proof = native.prepare_handoff(*args, **kwargs, ttl_seconds=.5)
-    try:
-        yield proof
-    finally:
-        proof.process.wait(timeout=3)
-native.handoff_scope = handoff
-raise SystemExit(main(sys.argv[2:]))
-""")
-    command = [sys.executable, str(bootstrap), str(manager_root / "cgroups"), "resume", request.run_id,
-               "--repo", physical.repository, "--state-dir", str(database), "--json"]
+    prepared = restorable_public_resume(tmp_path, monkeypatch, missing)
+    kernel = prepared.kernel
+    physical = prepared.physical
+    request = prepared.request
+    subject = prepared.subject
+    database = prepared.database
+    before = prepared.before
+    inputs = prepared.inputs
+    frozen = prepared.frozen
+    attempt = prepared.attempt
+    count = prepared.count
+    backup = prepared.backup
+    checkout = prepared.checkout
+    saved_checkout = prepared.saved_checkout
+    damaged = prepared.damaged
+    manager_root = prepared.manager_root
+    environment = prepared.environment
+    response = prepared.response
+    document = prepared.document
+    command = prepared.command
     failed = subprocess.run(command, env=environment, cwd=tmp_path, text=True, capture_output=True, timeout=15)
     assert failed.returncode == 2, (failed.stdout, failed.stderr)
     error = json.loads(failed.stdout)
@@ -452,60 +415,28 @@ def _delayed_public_recovery_case(tmp_path, monkeypatch):
                 + "        signal.pause()\n        yield proof")
         return original_write(path, text, *args, **kwargs)
     monkeypatch.setattr(Path, "write_text", delayed)
-    target = getattr(test_public_resume_after_trusted_material_or_checkout_restoration,
-                     "__wrapped__", test_public_resume_after_trusted_material_or_checkout_restoration)
-    target(tmp_path, monkeypatch, "managed-checkout")
+    import subprocess
+    prepared = restorable_public_resume(tmp_path, monkeypatch, "managed-checkout")
+    subprocess.run(prepared.command, env=prepared.environment, cwd=tmp_path,
+                   text=True, capture_output=True, timeout=15)
+    pytest.fail("Delayed recovery returned before the expected guardian timeout")
 
 
 def test_public_resume_timeout_reaps_exact_guardian_without_touching_unrelated_child(tmp_path, monkeypatch):
-    import ctypes
-    import select
-    import signal
     import subprocess
-    import sys
-    from agent_run.runtime.process_cleanup import child_subreaper
     from agent_run.runtime.process_identity import _process_start_token
 
-    receipt = tmp_path / "guardian-owner.json"
-    unrelated = subprocess.Popen([sys.executable, "-I", "-c", "import signal; signal.pause()"], start_new_session=True)
-    try:
-        unrelated_token = _process_start_token(unrelated.pid)
-        with child_subreaper():
-            try:
-                active = ctypes.c_int()
-                assert ctypes.CDLL(None).prctl(37, ctypes.byref(active), 0, 0, 0) == 0 and active.value == 1
-                with pytest.raises((subprocess.TimeoutExpired, pytest.fail.Exception)) as failed:
-                    _delayed_public_recovery_case(tmp_path, monkeypatch)
-                assert "timed out after 15 seconds" in str(failed.value)
-                assert not getattr(failed.value, "__notes__", ()), "Owned cleanup must not fail behind the expected timeout"
-                recorded = json.loads(receipt.read_text())
-                guardian = recorded["guardian"]
-                assert type(guardian["pid"]) is int and guardian["start_token"]
-                assert _process_start_token(recorded["cli"]) is None
-                assert _process_start_token(guardian["pid"]) != guardian["start_token"], "Original guardian was orphaned after CLI timeout"
-                assert unrelated.poll() is None and _process_start_token(unrelated.pid) == unrelated_token
-            finally:
-                # A failed regression still owns its exact orphan. No global PID
-                # sweep or unrelated process group is used as the safety net.
-                if receipt.exists():
-                    guardian = json.loads(receipt.read_text())["guardian"]
-                    pid, token = guardian["pid"], guardian["start_token"]
-                    if _process_start_token(pid) == token:
-                        fd = os.pidfd_open(pid)
-                        try:
-                            assert _process_start_token(pid) == token
-                            if not select.select([fd], [], [], 3)[0]:
-                                signal.pidfd_send_signal(fd, signal.SIGKILL)
-                            os.waitpid(pid, 0)
-                        finally:
-                            os.close(fd)
-    finally:
-        # Guardian cleanup failure must not skip this independently owned child.
-        try:
-            if unrelated.poll() is None:
-                unrelated.terminate()
-        finally:
-            unrelated.wait(timeout=3)
+    with guardian_timeout_owners(tmp_path) as (receipt, unrelated, unrelated_token):
+        with pytest.raises((subprocess.TimeoutExpired, pytest.fail.Exception)) as failed:
+            _delayed_public_recovery_case(tmp_path, monkeypatch)
+        assert "timed out after 15 seconds" in str(failed.value)
+        assert not getattr(failed.value, "__notes__", ()), "Owned cleanup must not fail behind the expected timeout"
+        recorded = json.loads(receipt.read_text())
+        guardian = recorded["guardian"]
+        assert type(guardian["pid"]) is int and guardian["start_token"]
+        assert _process_start_token(recorded["cli"]) is None
+        assert _process_start_token(guardian["pid"]) != guardian["start_token"], "Original guardian was orphaned after CLI timeout"
+        assert unrelated.poll() is None and _process_start_token(unrelated.pid) == unrelated_token
 
 
 @pytest.mark.parametrize("failure", ["subreaper-capability", "guardian-cleanup"])
@@ -551,7 +482,8 @@ def test_public_resume_timeout_owner_cleans_unrelated_child_on_early_failure(tmp
     try:
         expected = AssertionError if failure == "subreaper-capability" else OSError
         with pytest.raises(expected) as failed:
-            test_public_resume_timeout_reaps_exact_guardian_without_touching_unrelated_child(tmp_path, monkeypatch)
+            with guardian_timeout_owners(tmp_path):
+                _delayed_public_recovery_case(tmp_path, monkeypatch)
         if failure == "guardian-cleanup":
             assert "guardian cleanup interrupted" in str(failed.value)
         assert reached_delay == ([] if failure == "subreaper-capability" else [True])
@@ -568,3 +500,69 @@ def test_public_resume_timeout_owner_cleans_unrelated_child_on_early_failure(tmp
                     process.kill()
             finally:
                 process.wait(timeout=3)
+
+
+@pytest.mark.parametrize("failure", [None, ValueError, KeyboardInterrupt, SystemExit], ids=["return", "value-error", "keyboard-interrupt", "system-exit"])
+def test_guardian_timeout_scope_preserves_result_or_body_exception_and_reaps_owned_child(tmp_path, failure):
+    from agent_run.runtime.process_identity import _process_start_token
+
+    error = None if failure is None else failure("owned body interrupted")
+    owned = []
+
+    def invoke():
+        with guardian_timeout_owners(tmp_path) as (receipt, process, token):
+            owned.append((process, token))
+            assert not receipt.exists() and process.poll() is None
+            assert _process_start_token(process.pid) == token
+            if error is not None:
+                raise error
+            return "original result"
+
+    if error is None:
+        assert invoke() == "original result"
+    else:
+        with pytest.raises(failure) as failed:
+            invoke()
+        assert failed.value is error
+    process, token = owned[0]
+    assert process.poll() is not None and _process_start_token(process.pid) != token
+
+
+@pytest.mark.parametrize("matching", [True, False], ids=["exact-exited-owner", "foreign-token"])
+def test_guardian_timeout_scope_reaps_only_its_exact_receipted_child(tmp_path, matching):
+    import select
+    import subprocess
+    import sys
+    from agent_run.runtime.process_identity import _process_start_token
+
+    guardian = None
+    try:
+        with guardian_timeout_owners(tmp_path) as (receipt, unrelated, _unrelated_token):
+            guardian = subprocess.Popen([sys.executable, "-I", "-c", "import signal; signal.pause()"], start_new_session=True)
+            token = _process_start_token(guardian.pid)
+            assert token is not None
+            receipt.write_text(json.dumps({"guardian": {"pid": guardian.pid,
+                "start_token": token if matching else token + "-foreign"}}))
+            if matching:
+                # Observe true exit without reaping; the scope owns the reap.
+                descriptor = os.pidfd_open(guardian.pid)
+                try:
+                    guardian.terminate()
+                    assert select.select([descriptor], [], [], 3)[0] == [descriptor]
+                finally:
+                    os.close(descriptor)
+        assert unrelated.poll() is not None
+        if matching:
+            assert _process_start_token(guardian.pid) != token
+            with pytest.raises(ChildProcessError):
+                os.waitpid(guardian.pid, os.WNOHANG)
+        else:
+            assert guardian.poll() is None and _process_start_token(guardian.pid) == token
+    finally:
+        # Only this test's independently created child, after the verdict.
+        if guardian is not None:
+            try:
+                if guardian.poll() is None:
+                    guardian.terminate()
+            finally:
+                guardian.wait(timeout=3)
