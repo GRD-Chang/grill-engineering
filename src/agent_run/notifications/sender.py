@@ -71,6 +71,7 @@ class NativeNotifications:
         self.enabled = self.feishu_enabled or self.status_enabled
         self._status_dirty = self.status_enabled
         self._status_cancel = threading.Event()
+        self._status_preempt = threading.Event()
         self.condition = threading.Condition()
         self.cancel = threading.Event()
         self.owner = {"pid": os.getpid(), "token": _process_start_token(os.getpid()),
@@ -343,14 +344,34 @@ class NativeNotifications:
             fingerprint = (projection.target.key, hashlib.sha256(projection.body.encode()).hexdigest())
             if self._status_seen.get(subject) == fingerprint:
                 continue
-            self._status_seen[subject] = fingerprint
             # A successful readback may settle an older sent intent. One more
             # opportunity can then apply current copy, without replaying it.
             for _ in range(2):
-                result = self.status.deliver(subject, api=self.status_api, cancelled=self._status_cancel.is_set)
+                result = self.status.deliver(subject, api=self.status_api,
+                    cancelled=lambda: self._status_cancel.is_set() or self._status_preempt.is_set())
+                if self._status_preempt.is_set():
+                    # A queued important notification keeps its original
+                    # window. Interrupted Status retains its intent for later
+                    # readback, and is not cached as already observed.
+                    with self.condition:
+                        self._status_dirty = True
+                    return
                 if result != "confirmed":
                     break
+            self._status_seen[subject] = fingerprint
         self.status_failure_reason = None
+
+    def _wake_pending(self, document: dict[str, Any]) -> None:
+        """Give existing important Feishu claims priority over display reads."""
+        pending = document["pending"]
+        if self.exit_notice is not None:
+            pending = [item for item in pending if item["event"]["id"] == self.exit_event_id]
+        with self.condition:
+            if any(item.get("important") and not item.get("cancelled") for item in pending):
+                self._status_preempt.set()
+            else:
+                self._status_preempt.clear()
+            self.condition.notify_all()
 
     def _pause(self, error: Exception) -> None:
         reason = bounded_error(str(error))
@@ -451,6 +472,7 @@ class NativeNotifications:
                         outbox.retire(document, item)
                     document["seen"].append(event["id"])
                     del document["seen"][:-outbox.MAX_RECORDS]
+        self._wake_pending(document)
         self._more = False
         return True
 
@@ -473,6 +495,7 @@ class NativeNotifications:
                         if ((journal.exists() or journal.is_symlink())
                                 and document.get("native_binding") != [self.run_id, *self.binding]):
                             raise ValueError("existing notification journal has no native receipt")
+                        document["native_binding"] = [self.run_id, *self.binding]
                         started = datetime.fromtimestamp(self.state["created_at"], UTC).isoformat()
                         event = event_envelope(self.state, "run_start", self.run_id,
                                                event_copy(self.state, "run_start"), started_at=started)
@@ -493,8 +516,7 @@ class NativeNotifications:
                             if not self._same_binding(*self._run(tx)):
                                 raise ValueError("notification Run or recipient binding changed")
                             self._compress_progress(tx, document, read_boundaries(tx, time.time()), added=True)
-                with self.condition:
-                    self.condition.notify_all()
+                self._wake_pending(document)
                 self._more = more
                 if not more or full or boundary_more:
                     return True
@@ -511,8 +533,9 @@ class NativeNotifications:
         while not self._shutdown:
             try:
                 with self.condition:
-                    status_dirty = self._status_dirty
-                    self._status_dirty = False
+                    status_dirty = self._status_dirty and not self._status_preempt.is_set()
+                    if status_dirty:
+                        self._status_dirty = False
                 if status_dirty:
                     try:
                         self._send_status()
@@ -537,7 +560,7 @@ class NativeNotifications:
                         self.condition.wait()
                     if self._shutdown:
                         return
-                    if self._status_dirty:
+                    if self._status_dirty and not self._status_preempt.is_set():
                         continue
                     recovering = self.failure_reason is not None
                     if recovering and not self._recovery_requested:
@@ -598,7 +621,7 @@ class NativeNotifications:
                     self.failure_reason = None
                     self.cancel.clear()
                     if event is None:
-                        if self._status_dirty:
+                        if self._status_dirty and not self._status_preempt.is_set():
                             continue
                         if self.closing and not pending and not self._more:
                             return

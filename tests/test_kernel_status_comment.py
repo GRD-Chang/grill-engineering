@@ -738,3 +738,202 @@ def test_status_repository_case_uses_one_identity_and_still_rejects_foreign_obje
     assert [command[1] for command in api.commands] == ["POST"]
     assert sender.deliver(subject, api=api) == "confirmed"
     assert [command[1] for command in api.commands] == ["POST", "PATCH"]
+
+
+def test_pending_important_card_keeps_its_budget_before_slow_status_and_status_recovers(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import time
+    import agent_run.notifications.sender as notifications
+    import agent_run.notifications.status_comment as status_module
+    from agent_run.storage.notification_outbox import DELIVERY_LIFETIME_SECONDS
+
+    scenario = published(tmp_path, monkeypatch, notifications={"enabled": True, "mode": "concise",
+                         "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
+    database, subject = scenario.kernel.storage.path, scenario.delivery.key
+    scenario.kernel.control("stop", "important-card-before-status", subject=subject)
+    # The public Status producer first creates this journal and immutable intent;
+    # no fabricated native receipt or foreign-journal adoption is involved.
+    StatusComments(database).stage(subject)
+    clock = [time.time()]
+    # Replace only these module clocks before starting their actual worker;
+    # other Python threads and the product's Core clock are unchanged.
+    monkeypatch.setattr(notifications, "time", SimpleNamespace(time=lambda: clock[0]))
+    monkeypatch.setattr(status_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    api = CommentsAPI(project_status(database, subject).target)
+    original_object = api.object
+    delayed = []
+    sent = []
+    def delayed_object(endpoint):
+        if not delayed:
+            delayed.append(endpoint)
+            clock[0] += DELIVERY_LIFETIME_SECONDS + 1  # One expired Status opportunity, without wall-clock sleep.
+        return original_object(endpoint)
+    api.object = delayed_object
+    def transport(_config, rendered, *_args, **_kwargs):
+        sent.append(rendered)
+        return {"outcome": "success", "reason": None}
+    observer = notifications.NativeNotifications(database, database.parent, transport=transport, status_api=api)
+    try:
+        observer.close()
+        document = outbox.read_notifications(database.parent, scenario.spec.run_id)
+        important = [row for row in document["records"] if row.get("important") and not row.get("cancelled")]
+        assert important and all(row["outcome"] == "success" and row["attempts"] == 1 for row in important)
+        assert all(row["deadline_at"] - row["created_at"] == DELIVERY_LIFETIME_SECONDS for row in important)
+        assert sent and delayed and not observer.thread.is_alive()
+    finally:
+        observer.close(drain=False)
+    # The timeout did not disable Status or turn an unsent request into sent.
+    api.object = original_object
+    recovered = notifications.NativeNotifications(database, database.parent, transport=transport, status_api=api)
+    try:
+        recovered.close()
+        assert not recovered.thread.is_alive()
+        assert [row[1] for row in api.commands] == ["POST"]
+        assert "operator_stopped" in api.comments[0]["body"]
+    finally:
+        recovered.close(drain=False)
+
+
+def test_fresh_enabled_sender_binds_its_own_journal_before_status(tmp_path, monkeypatch):
+    from agent_run.notifications.sender import NativeNotifications
+    scenario = published(tmp_path, monkeypatch, notifications={"enabled": True, "mode": "concise",
+                         "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
+    database, subject = scenario.kernel.storage.path, scenario.delivery.key
+    before = database.read_bytes()
+    assert not outbox.notification_path(database.parent, scenario.spec.run_id).exists()
+    api = CommentsAPI(project_status(database, subject).target)
+    def transport(*_args, **_kwargs):
+        return {"outcome": "success", "reason": None}
+    observer = NativeNotifications(database, database.parent, status_api=api, transport=transport)
+    try:
+        observer.close()
+        document = outbox.read_notifications(database.parent, scenario.spec.run_id)
+        assert document["native_binding"] == [scenario.spec.run_id, scenario.spec.repository, 1]
+        assert [row[1] for row in api.commands] == ["POST"]
+        assert not observer.thread.is_alive()
+        assert database.read_bytes() == before
+    finally:
+        observer.close(drain=False)
+
+
+def test_new_important_card_preempts_actual_status_read_and_same_sender_continues(tmp_path, monkeypatch):
+    import json
+    import os
+    import sys
+    from threading import Event
+    from agent_run.notifications.sender import NativeNotifications
+    from support.worker_process_timing import wait_until
+    scenario = published(tmp_path, monkeypatch, notifications={"enabled": True, "mode": "concise",
+                         "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
+    database, subject = scenario.kernel.storage.path, scenario.delivery.key
+    target = project_status(database, subject).target
+    StatusComments(database).stage(subject)
+    state, calls, blocked = tmp_path / "remote.json", tmp_path / "requests.jsonl", tmp_path / "read-pid"
+    state.write_text(json.dumps({"comments": []}))
+    binary = tmp_path / "status-cli"
+    binary.mkdir()
+    program = '''import json,os,signal,sys
+from pathlib import Path
+state,calls,blocked=map(Path,sys.argv[1:4]);args=sys.argv[4:]
+assert args[0]=='api'
+endpoint=args[1];method=args[args.index('--method')+1] if '--method' in args else 'GET'
+with calls.open('a') as log:log.write(json.dumps([method,endpoint])+'\\n')
+if endpoint=='user' and not blocked.exists():
+ temporary=blocked.with_suffix('.new');temporary.write_text(str(os.getpid()));temporary.replace(blocked)
+ signal.pause()
+document=json.loads(state.read_text())
+if endpoint=='user':result={'login':'offline-publisher'}
+elif endpoint==REPO+'/pulls/'+str(NUMBER):
+ result=PR
+elif endpoint==REPO+'/issues/'+str(NUMBER)+'/comments?per_page=100' and method=='GET':
+ result=[document['comments']]
+elif endpoint==REPO+'/issues/'+str(NUMBER)+'/comments' and method=='POST':
+ assert document['comments']==[]
+ body=json.loads(Path(args[args.index('--input')+1]).read_text())
+ result={'id':100,'body':body['body'],'user':{'login':'offline-publisher'},'issue_url':'https://api.github.com/'+REPO+'/issues/'+str(NUMBER)}
+ document['comments'].append(result);temporary=state.with_suffix('.new');temporary.write_text(json.dumps(document));temporary.replace(state)
+else:raise AssertionError('Unexpected synthetic endpoint')
+print(json.dumps(result))
+'''
+    pr = {"number": target.pr_number, "user": {"login": target.actor},
+          "head": {"ref": target.source_ref.removeprefix("refs/heads/"), "repo": {"full_name": target.repository}},
+          "base": {"ref": target.target_ref.removeprefix("refs/heads/"), "repo": {"full_name": target.repository}}}
+    executable = binary / "gh"
+    executable.write_text("#!" + sys.executable + "\nimport sys\nsys.argv[1:1]=" + repr([str(state), str(calls), str(blocked)]) +
+                          "\nREPO=" + repr("repos/" + target.repository) + "\nNUMBER=" + repr(target.pr_number) + "\nPR=" + repr(pr) + "\n" + program)
+    executable.chmod(0o700)
+    monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
+    stopped, delivered = Event(), Event()
+    def transport(*_args, **_kwargs):
+        if stopped.is_set():
+            delivered.set()
+        return {"outcome": "success", "reason": None}
+    observer = NativeNotifications(database, database.parent, transport=transport)
+    try:
+        wait_until(blocked.exists, timeout=5)
+        pid = int(blocked.read_text())
+        scenario.kernel.control("stop", "important-during-native-read", subject=subject)
+        stopped.set()
+        observer.observe_committed()
+        assert delivered.wait(5), "Important card waited behind an active Status child"
+        wait_until(lambda: len(json.loads(state.read_text())["comments"]) == 1, timeout=5)
+        observer.close()
+        assert not observer.thread.is_alive()
+        rows = [json.loads(line) for line in calls.read_text().splitlines()]
+        assert rows.count(["POST", f"repos/{target.repository}/issues/{target.pr_number}/comments"]) == 1
+        assert "operator_stopped" in json.loads(state.read_text())["comments"][0]["body"]
+        with pytest.raises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)
+    finally:
+        observer.close(drain=False)
+
+
+
+
+def test_preempted_unknown_post_keeps_original_intent_and_never_creates_twice(tmp_path, monkeypatch):
+    from threading import Event
+    from agent_run.notifications.sender import NativeNotifications
+    from support.worker_process_timing import wait_until
+    scenario = published(tmp_path, monkeypatch, notifications={"enabled": True, "mode": "concise",
+                         "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
+    database, subject = scenario.kernel.storage.path, scenario.delivery.key
+    api = CommentsAPI(project_status(database, subject).target)
+    posted, release, stopped, delivered = Event(), Event(), Event(), Event()
+    real_write = api.write
+    def lost_response(endpoint, method, body):
+        result = real_write(endpoint, method, body)
+        if method == "POST":
+            posted.set()
+            assert release.wait(5)
+            raise OSError("Synthetic lost response after actual comment creation")
+        return result
+    api.write = lost_response
+    def transport(*_args, **_kwargs):
+        if stopped.is_set():
+            delivered.set()
+        return {"outcome": "success", "reason": None}
+    observer = NativeNotifications(database, database.parent, transport=transport, status_api=api)
+    try:
+        assert posted.wait(5)
+        document = outbox.read_notifications(database.parent, scenario.spec.run_id)
+        entry, = document["remote_status"]["bindings"].values()
+        original = dict(entry["intent"])
+        assert original["sent"] is True and "operator_stopped" not in original["body"]
+        scenario.kernel.control("stop", "important-after-physical-post", subject=subject)
+        before = database.read_bytes()
+        stopped.set()
+        observer.observe_committed()
+        unresolved, = outbox.read_notifications(database.parent, scenario.spec.run_id)["remote_status"]["bindings"].values()
+        assert unresolved["intent"] == original
+        release.set()
+        assert delivered.wait(5)
+        wait_until(lambda: "operator_stopped" in api.comments[0]["body"], timeout=5)
+        observer.close()
+        assert not observer.thread.is_alive()
+        assert [command[1] for command in api.commands] == ["POST", "PATCH"]
+        assert len(api.comments) == 1 and database.read_bytes() == before
+        final, = outbox.read_notifications(database.parent, scenario.spec.run_id)["remote_status"]["bindings"].values()
+        assert final["intent"] is None and final["comment_id"] == 100 and "claim" not in final
+    finally:
+        release.set()
+        observer.close(drain=False)
