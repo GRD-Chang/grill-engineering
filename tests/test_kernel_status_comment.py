@@ -1238,3 +1238,58 @@ def test_older_observer_cannot_clear_newer_important_status_preemption(tmp_path,
         if thread.ident is not None:
             thread.join(timeout=5)
         observer.close(drain=False)
+
+
+@pytest.mark.parametrize("run_id", ["plain", "a`b`c", "a```b"])
+def test_status_displayed_markdown_round_trips_exact_run_argv(tmp_path, monkeypatch, run_id):
+    from dataclasses import replace
+    import json
+    import os
+    import subprocess
+    import sys
+    from markdown_it import MarkdownIt
+    from agent_run.cli.main import _parser
+    from support.offline import OfflinePort
+    original = OfflinePort.prepare
+    def named_prepare(*args, **kwargs):
+        spec, delivery = original(*args, **kwargs)
+        return replace(spec, run_id=run_id), delivery
+    with monkeypatch.context() as patch:
+        patch.setattr(OfflinePort, "prepare", named_prepare)
+        scenario = published(tmp_path, monkeypatch)
+    database, subject = scenario.kernel.storage.path, scenario.delivery.key
+    scenario.kernel.control("stop", "exact-displayed-status-action", subject=subject)
+    before = database.read_bytes()
+    api = CommentsAPI(project_status(database, subject).target)
+    assert StatusComments(database).deliver(subject, api=api) == "confirmed"
+    body = api.comments[0]["body"]
+    displayed = []
+    for token in MarkdownIt().parse(body):
+        if token.type in {"fence", "code_block"}:
+            displayed.extend(token.content.rstrip("\n").splitlines())
+        elif token.type == "inline":
+            displayed.extend("".join("\n" if item.type in {"softbreak", "hardbreak"} else item.content
+                                     for item in token.children or []
+                                     if item.type in {"text", "code_inline", "softbreak", "hardbreak"}).splitlines())
+    commands = [line.removeprefix("Next action: ") for line in displayed
+                if line.startswith(("agent-run ", "Next action: agent-run "))]
+    assert commands, displayed
+    binary = tmp_path / "argv-bin"
+    binary.mkdir()
+    executable = binary / "agent-run"
+    executable.write_text(f"#!{sys.executable} -I\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n")
+    executable.chmod(0o700)
+    received = []
+    for command in commands:
+        result = subprocess.run(["/bin/sh", "-c", command], cwd=tmp_path,
+            env={"PATH": str(binary), "HOME": str(tmp_path)}, text=True, capture_output=True, timeout=5)
+        assert result.returncode == 0, result.stderr
+        for output in result.stdout.splitlines():
+            argv = json.loads(output)
+            if argv[0] == "resume":
+                received.append(argv)
+                selected = _parser("en").parse_args(argv)
+                assert selected.run_id == run_id and selected.repo == scenario.spec.repository
+    assert received == [["resume", "--repo", scenario.spec.repository, "--", run_id]]
+    assert [row[1] for row in api.commands] == ["POST"]
+    assert database.read_bytes() == before

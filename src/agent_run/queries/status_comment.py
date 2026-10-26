@@ -1,5 +1,7 @@
 """Concise Status from current committed facts and original publication proof."""
+import json
 from pathlib import Path
+import re
 import sqlite3
 import time
 
@@ -77,7 +79,9 @@ def project_status(database: Path, subject: str) -> StatusProjection:
                     and not tx.rows("SELECT owner FROM retired_executors WHERE status!='exited' LIMIT 1")):
                 host = "exited"
         cleanup = boundary["delivery_cleanup"]
-        lines = ["## Agent Run Status", f"Run: `{run['id']}` / {job['kind']} #{job['issue']}",
+        literal_run = json.dumps(run["id"], ensure_ascii=False)
+        delimiter = "`" * (1 + max((len(part) for part in re.findall(r"`+", literal_run)), default=0))
+        lines = ["## Agent Run Status", f"Run: {delimiter} {literal_run} {delimiter} / {job['kind']} #{job['issue']}",
                  f"Delivery: {job['phase']}; Run: {boundaries['status']}; gates: {gates}",
                  f"Candidate: `{job['candidate_sha'] or 'not_recorded'}`",
                  f"Recorded PR head: `{pr['head']['sha']}`; base: `{pr['base']['sha']}`",
@@ -88,7 +92,12 @@ def project_status(database: Path, subject: str) -> StatusProjection:
         if remaining is not None:
             actions.extend(item["recovery_action"] for item in remaining["items"]
                            if item["kind"] == job["kind"] and item["branch"] == target.source_ref)
-        lines.append("Next action: " + ("; ".join(dict.fromkeys(actions)) or "automatic / none"))
+        lines.append("Next action:" if actions else "Next action: automatic / none")
+        for action in dict.fromkeys(actions):
+            # Render the authoritative command literally. Markdown inline code
+            # otherwise removes legal backticks from the displayed selector.
+            fence = "`" * max(3, 1 + max((len(part) for part in re.findall(r"`+", action)), default=0))
+            lines.extend(("", fence, action, fence))
         body = "\n".join(lines)
         if len(body.encode()) > 8192:
             raise ValueError("Status projection exceeds limit")
