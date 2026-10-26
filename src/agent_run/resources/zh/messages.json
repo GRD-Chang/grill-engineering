@@ -1153,5 +1153,6 @@
   "presentation.status.review_state_stale": "当前版本待复验；上次验收结论仅适用于旧范围。",
   "presentation.status.review_state_pending": "当前验收尚无已消费的结论。",
   "presentation.status.review_state_unknown": "已记录验收不足以确认当前版本的结论。",
-  "presentation.status.review_state_not_recorded": "尚未记录验收结论。"
+  "presentation.status.review_state_not_recorded": "尚未记录验收结论。",
+  "presentation.status.recorded_worker_exit": "  已记录 Worker 退出：{stamp}（{zone}）"
 }

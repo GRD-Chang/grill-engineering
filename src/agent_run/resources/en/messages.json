@@ -1153,5 +1153,6 @@
   "presentation.status.review_state_stale": "Current version awaits review; the previous conclusion applies to an earlier scope.",
   "presentation.status.review_state_pending": "Current Review awaits a consumed conclusion.",
   "presentation.status.review_state_unknown": "The recorded Review cannot establish a conclusion for the current version.",
-  "presentation.status.review_state_not_recorded": "No Review conclusion recorded yet."
+  "presentation.status.review_state_not_recorded": "No Review conclusion recorded yet.",
+  "presentation.status.recorded_worker_exit": "  Recorded Worker exit: {stamp} ({zone})"
 }
