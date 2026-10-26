@@ -19,7 +19,7 @@ SUBJECT = "parent:1"
 
 def _attempt(db, run, *, identity="attempt", thread="thread"):
     """Persist only the exact record shapes consumed by continuation policy."""
-    tx = RunTransaction(db, run)
+    tx = RunTransaction(Transaction(db), run)
     profile = tx.put(SUBJECT, "profile", wire_json({"profiles": {"development": {"model": run}}}))
     db.execute("UPDATE profile_revisions SET material_id=? WHERE run_id=? AND id=1", (profile, run))
     insert(db, "threads", {"run_id": run, "id": thread, "subject": SUBJECT,
@@ -46,7 +46,7 @@ def database():
 
 
 def _output(db, run, identity, basis, *, predecessor=None, recovery=None, ordinal=0):
-    tx = RunTransaction(db, run)
+    tx = RunTransaction(Transaction(db), run)
     raw = tx.put(SUBJECT, "raw", (run + " original raw\r\n").encode())
     insert(db, "invocations", {"run_id": run, "id": identity, "attempt": "attempt", "thread": "thread",
         "executor": "owner-" + run, "epoch": 1, "status": "failed", "allocated_at": 100.,
@@ -63,7 +63,7 @@ def _output(db, run, identity, basis, *, predecessor=None, recovery=None, ordina
 def test_binding_and_loading_same_ids_do_not_use_or_modify_the_sibling_run(database):
     bases = {run: _attempt(database, run) for run in ("A", "B")}
     sibling = tuple(database.execute("SELECT * FROM attempts WHERE run_id='B'").fetchone())
-    a = RunTransaction(database, "A")
+    a = RunTransaction(Transaction(database), "A")
     bind_attempt_continuation(a, "attempt", bases["A"])
     changes = database.total_changes
     bind_attempt_continuation(a, "attempt", bases["A"])
@@ -71,20 +71,20 @@ def test_binding_and_loading_same_ids_do_not_use_or_modify_the_sibling_run(datab
     assert tuple(database.execute("SELECT * FROM attempts WHERE run_id='B'").fetchone()) == sibling
     assert database.execute("SELECT count(*) FROM invocations").fetchone()[0] == 0
     assert database.execute("SELECT count(*) FROM leases").fetchone()[0] == 0
-    bind_attempt_continuation(RunTransaction(database, "B"), "attempt", bases["B"])
+    bind_attempt_continuation(RunTransaction(Transaction(database), "B"), "attempt", bases["B"])
     for run in ("A", "B"):
-        facts = load_continuation(RunTransaction(database, run), "attempt")
+        facts = load_continuation(RunTransaction(Transaction(database), run), "attempt")
         assert facts.context["human_responses"] == ["original " + run]
         assert facts.prior is None and facts.output_ordinal == 0
         assert (facts.ordinary_used, facts.capacity_count, facts.semantic_used) == (0, 0, 0)
-        assert recorded_profile(RunTransaction(database, run), 1)["profiles"]["development"]["model"] == run
+        assert recorded_profile(RunTransaction(Transaction(database), run), 1)["profiles"]["development"]["model"] == run
     assert database.execute("PRAGMA foreign_key_check").fetchone() is None
 
 
 def test_lineage_outputs_counts_and_original_raw_stay_with_the_selected_run(database):
     bases = {run: _attempt(database, run) for run in ("A", "B")}
     for run in ("A", "B"):
-        bind_attempt_continuation(RunTransaction(database, run), "attempt", bases[run])
+        bind_attempt_continuation(RunTransaction(Transaction(database), run), "attempt", bases[run])
         _output(database, run, "first", bases[run])
     raw_a = _output(database, "A", "second", bases["A"], predecessor="first", recovery="ordinary", ordinal=1)
     raw_b = _output(database, "B", "second", bases["B"], predecessor="first", recovery="capacity", ordinal=2)
@@ -92,7 +92,7 @@ def test_lineage_outputs_counts_and_original_raw_stay_with_the_selected_run(data
     for run, ordinal, counts, raw, code, deadline in (
         ("A", 1, (1, 0), raw_a, 23, 107.), ("B", 2, (0, 1), raw_b, 24, 207.),
     ):
-        tx = RunTransaction(database, run)
+        tx = RunTransaction(Transaction(database), run)
         facts = load_continuation(tx, "attempt")
         assert facts.prior is not None and facts.prior.invocation_id == "second"
         assert (facts.prior.ordinal, facts.output_ordinal) == (ordinal, ordinal)
@@ -105,10 +105,10 @@ def test_lineage_outputs_counts_and_original_raw_stay_with_the_selected_run(data
 
 def test_sibling_invocation_does_not_prevent_an_unstarted_attempt_binding(database):
     bases = {run: _attempt(database, run) for run in ("A", "B")}
-    bind_attempt_continuation(RunTransaction(database, "B"), "attempt", bases["B"])
+    bind_attempt_continuation(RunTransaction(Transaction(database), "B"), "attempt", bases["B"])
     _output(database, "B", "first", bases["B"])
-    bind_attempt_continuation(RunTransaction(database, "A"), "attempt", bases["A"])
-    facts = load_continuation(RunTransaction(database, "A"), "attempt")
+    bind_attempt_continuation(RunTransaction(Transaction(database), "A"), "attempt", bases["A"])
+    facts = load_continuation(RunTransaction(Transaction(database), "A"), "attempt")
     assert facts.prior is None and facts.output_ordinal == 0
     assert (facts.ordinary_used, facts.capacity_count) == (0, 0)
     assert database.execute("SELECT count(*) FROM invocations WHERE run_id='A'").fetchone()[0] == 0
@@ -117,23 +117,23 @@ def test_sibling_invocation_does_not_prevent_an_unstarted_attempt_binding(databa
 def test_missing_output_cannot_use_same_named_sibling_output(database):
     for run in ("A", "B"):
         basis = _attempt(database, run)
-        bind_attempt_continuation(RunTransaction(database, run), "attempt", basis)
+        bind_attempt_continuation(RunTransaction(Transaction(database), run), "attempt", basis)
         _output(database, run, "first", basis)
     database.execute("DELETE FROM invocation_outputs WHERE run_id='A'")
     before = database.total_changes
     with pytest.raises(KernelError, match="missing_or_ambiguous_fact"):
-        load_continuation(RunTransaction(database, "A"), "attempt")
+        load_continuation(RunTransaction(Transaction(database), "A"), "attempt")
     assert database.total_changes == before
-    assert load_continuation(RunTransaction(database, "B"), "attempt").prior is not None
+    assert load_continuation(RunTransaction(Transaction(database), "B"), "attempt").prior is not None
 
 
 def test_failed_binding_transaction_rolls_back_only_its_own_material_and_binding(database):
     bases = {run: _attempt(database, run) for run in ("A", "B")}
-    bind_attempt_continuation(RunTransaction(database, "B"), "attempt", bases["B"])
+    bind_attempt_continuation(RunTransaction(Transaction(database), "B"), "attempt", bases["B"])
     sibling = tuple(database.execute("SELECT * FROM attempts WHERE run_id='B'").fetchone())
     database.execute("BEGIN")
     try:
-        bind_attempt_continuation(RunTransaction(database, "A"), "attempt", bases["A"])
+        bind_attempt_continuation(RunTransaction(Transaction(database), "A"), "attempt", bases["A"])
         raise ValueError("controlled caller rollback")
     except ValueError:
         database.rollback()
@@ -153,15 +153,15 @@ def test_missing_selected_record_never_falls_back_to_a_sibling(database, foreign
     before = database.total_changes
     with pytest.raises(KernelError):
         if foreign == "attempt":
-            bind_attempt_continuation(RunTransaction(database, "A"), "foreign-attempt", b)
+            bind_attempt_continuation(RunTransaction(Transaction(database), "A"), "foreign-attempt", b)
         elif foreign == "thread":
-            bind_attempt_continuation(RunTransaction(database, "A"), "attempt",
+            bind_attempt_continuation(RunTransaction(Transaction(database), "A"), "attempt",
                                       AttemptContinuationBasis("foreign-thread", a.context_id))
         elif foreign == "context":
-            bind_attempt_continuation(RunTransaction(database, "A"), "attempt",
+            bind_attempt_continuation(RunTransaction(Transaction(database), "A"), "attempt",
                                       AttemptContinuationBasis("thread", b.context_id))
         else:
-            recorded_profile(RunTransaction(database, "A"), 2)
+            recorded_profile(RunTransaction(Transaction(database), "A"), 2)
     assert database.total_changes == before
     assert database.execute("SELECT count(*) FROM material WHERE purpose='attempt_continuation_opening'").fetchone()[0] == 0
 
@@ -177,7 +177,7 @@ def test_unscoped_or_unknown_transaction_cannot_choose_repository_records(databa
 
 def test_retargeted_scope_cannot_reuse_an_existing_consumer(database):
     basis = _attempt(database, "A")
-    tx = RunTransaction(database, "A")
+    tx = RunTransaction(Transaction(database), "A")
     database.execute("UPDATE runs SET parent_issue=99 WHERE id='A'")
     before = database.total_changes
     with pytest.raises(KernelError, match="run_scope_changed"):

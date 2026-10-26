@@ -9,6 +9,7 @@ from agent_run.queries import run as query
 from agent_run.queries.execution import activity, execution_facts, worker_activity_start
 from agent_run.queries.resume_facts import resume_facts
 from agent_run.storage.run_scope import RunTransaction
+from agent_run.storage.sqlite import Transaction
 from support.repository_scope import connection, insert, seed
 from support.environment import durable_snapshot
 
@@ -22,7 +23,7 @@ def database():
         db.execute("BEGIN")
         for run in ("A", "B"):
             seed(db, run)
-            tx = RunTransaction(db, run)
+            tx = RunTransaction(Transaction(db), run)
             profile = tx.put(SUBJECT, "profile", wire_json(resolve_profiles(overrides={"development_model": "model-" + run})))
             db.execute("UPDATE profile_revisions SET material_id=? WHERE run_id=?", (profile, run))
             insert(db, "threads", {"run_id": run, "id": "same-thread", "subject": SUBJECT,
@@ -38,7 +39,7 @@ def test_settings_thread_profile_and_frozen_defaults_never_include_a_sibling(dat
     before = database.total_changes
     for run in ("A", "B"):
         header = dict(database.execute("SELECT * FROM runs WHERE id=?", (run,)).fetchone())
-        document = query._frozen_settings(RunTransaction(database, run), header)
+        document = query._frozen_settings(RunTransaction(Transaction(database), run), header)
         binding, = document["bindings"]
         assert binding["thread_identity"] == "same-thread" and binding["thread_id"] == "physical-" + run
         assert binding["model"] == "model-" + run
@@ -50,7 +51,7 @@ def test_history_page_and_has_more_use_only_the_selected_runs_records(database):
     before = database.total_changes
     owners = [{"subject": SUBJECT, "kind": "parent_only"}]
     for run, position in (("A", 1), ("B", 2)):
-        tx = RunTransaction(database, run)
+        tx = RunTransaction(Transaction(database), run)
         page = query._native_history(tx, owners, after=0, limit=1)
         event, = page["events"]
         assert event["evidence"] == {"original": run} and event["position"] == position
@@ -62,7 +63,7 @@ def test_history_page_and_has_more_use_only_the_selected_runs_records(database):
 
 def _document_facts(db):
     for run, used in (("A", 1), ("B", 4)):
-        tx = RunTransaction(db, run)
+        tx = RunTransaction(Transaction(db), run)
         insert(db, "requirement_versions", {"run_id": run, "issue": 1, "revision": "r",
             "title": "original title " + run, "body": "original body " + run})
         insert(db, "budgets", {"run_id": run, "subject": SUBJECT, "purpose": "requirements", "window": 1,
@@ -83,7 +84,7 @@ def test_complete_snapshot_projects_exact_run_without_mutation_or_new_opening(da
     database.execute("BEGIN")
     try:
         for run, used in (("A", 1), ("B", 4)):
-            document = query.read_snapshot(RunTransaction(database, run), tmp_path / "kernel.sqlite3", kind,
+            document = query.read_snapshot(RunTransaction(Transaction(database), run), tmp_path / "kernel.sqlite3", kind,
                 expected_run=run, expected_repository="example/project", limit=1)
             assert document.kind == kind and document.data["run_id"] == run
             if kind == "settings":
@@ -107,7 +108,7 @@ def test_complete_snapshot_projects_exact_run_without_mutation_or_new_opening(da
 
 
 def test_snapshot_expected_identity_and_page_bounds_fail_without_sibling_fallback(database, tmp_path):
-    tx = RunTransaction(database, "A")
+    tx = RunTransaction(Transaction(database), "A")
     with pytest.raises(query.QueryError, match="active database snapshot"):
         query.read_snapshot(tx, tmp_path / "kernel.sqlite3", "status")
     database.execute("BEGIN")
@@ -128,7 +129,7 @@ def _reject_snapshot_identity(tx, tmp_path):
 
 
 def _resume(db, run):
-    tx = RunTransaction(db, run)
+    tx = RunTransaction(Transaction(db), run)
     for kind, identity, stamp, material in (("paused", "human_blocker", 105., None),):
         insert(db, "history", {"run_id": run, "subject": SUBJECT, "kind": kind, "identity": identity,
             "generation": 1, "created_at": stamp, "material_id": material})
@@ -148,7 +149,7 @@ def test_same_action_ids_keep_original_receipt_and_progress_interval(database):
     rows = {run: _resume(database, run) for run in ("A", "B")}
     before = database.total_changes
     for run in ("A", "B"):
-        latest, = query._control_history(RunTransaction(database, run))
+        latest, = query._control_history(RunTransaction(Transaction(database), run))
         assert latest["payload"] == {"original": run}
         assert latest["receipt"] == {"applied": True, "original": run}
         assert latest["resume"]["applied"] is True
@@ -157,12 +158,12 @@ def test_same_action_ids_keep_original_receipt_and_progress_interval(database):
         assert facts["source_material_id"] == rows[run]["material_id"]
         assert facts["resume_outcome"] == "failed" and facts["reason_code"] == "worker_unavailable"
     with pytest.raises(ValueError, match="different Run"):
-        resume_facts(RunTransaction(database, "A"), dict(rows["B"]))
+        resume_facts(RunTransaction(Transaction(database), "A"), dict(rows["B"]))
     assert database.total_changes == before
 
 
 def _invocation(db, run):
-    tx = RunTransaction(db, run)
+    tx = RunTransaction(Transaction(db), run)
     context = tx.put(SUBJECT, "role_context", wire_json({"original": run}))
     raw = tx.put(SUBJECT, "raw", wire_json({"original raw": run}))
     process = tx.put(SUBJECT, "process", wire_json({"original identity": run}))
@@ -194,7 +195,7 @@ def test_same_invocation_output_and_activity_ids_preserve_original_run_and_profi
         _invocation(database, run)
     before = database.total_changes
     for run, seconds in (("A", 2.), ("B", 4.)):
-        tx = RunTransaction(database, run)
+        tx = RunTransaction(Transaction(database), run)
         segment = activity(tx, "same-invocation", 0, SUBJECT)
         assert segment["elapsed_seconds"] == seconds
         assert all(item["evidence"]["original"] == run for item in segment["events"])
@@ -211,7 +212,7 @@ def test_same_invocation_output_and_activity_ids_preserve_original_run_and_profi
         assert output["raw_return"] == {"original raw": run} and output["elapsed_seconds"] == seconds
     for row in ({"run_id": "B"}, {}):
         with pytest.raises(ValueError, match="different Run"):
-            execution_facts(RunTransaction(database, "A"), row)
+            execution_facts(RunTransaction(Transaction(database), "A"), row)
     assert database.total_changes == before
 
 
@@ -230,7 +231,7 @@ def test_historical_binding_anchor_is_not_suppressed_by_a_sibling_run(database, 
         insert(database, "history", {"run_id": "B", "subject": SUBJECT, "kind": "control_applied",
             "identity": "foreign-control", "generation": 1, "created_at": 100.7})
     before = database.total_changes
-    first = worker_activity_start(RunTransaction(database, "A"), SUBJECT)
+    first = worker_activity_start(RunTransaction(Transaction(database), "A"), SUBJECT)
     assert first is not None and first["run_id"] == "A"
     assert first["started_at"] == 101. and first["invocation_id"] == "same-invocation"
     assert database.total_changes == before

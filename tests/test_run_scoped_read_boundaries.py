@@ -26,7 +26,7 @@ def database():
 
 
 def _gate(db, run, code, detail):
-    evidence = RunTransaction(db, run).put(SUBJECT, "gate", wire_json(detail))
+    evidence = RunTransaction(Transaction(db), run).put(SUBJECT, "gate", wire_json(detail))
     insert(db, "gates", {"run_id": run, "subject": SUBJECT, "code": code, "evidence": evidence})
 
 
@@ -36,7 +36,7 @@ def _history(db, run, identity):
 
 
 def _wait(db, run, *, padding=""):
-    scope = RunTransaction(db, run).put(SUBJECT, "supervision_scope",
+    scope = RunTransaction(Transaction(db), run).put(SUBJECT, "supervision_scope",
         wire_json({"run": run, "subject": SUBJECT, "detail": padding}))
     deadline = 200. if run == "A" else 400.
     insert(db, "waits", {"run_id": run, "subject": SUBJECT, "kind": "required_checks", "scope_id": scope,
@@ -51,7 +51,7 @@ def test_header_and_operator_gate_projection_use_only_the_selected_run(database)
         _gate(database, run, "human_blocker", {"human_blockers": ["original " + run]})
         _history(database, run, "same-history-identity")
     before = database.total_changes
-    a, b = RunTransaction(database, "A"), RunTransaction(database, "B")
+    a, b = RunTransaction(Transaction(database), "A"), RunTransaction(Transaction(database), "B")
     first, second = read_header(a), read_header(b)
     assert (first["run_id"], first["language"], first["is_terminal"]) == ("A", "zh", False)
     assert (second["run_id"], second["language"], second["is_terminal"]) == ("B", "en", True)
@@ -70,7 +70,7 @@ def test_sibling_abandon_action_cannot_fence_the_selected_run(database):
         insert(database, "actions", {"run_id": run, "id": "same-action", "kind": kind,
             "subject": SUBJECT, "status": "complete"})
     before = database.total_changes
-    a, b = (read_boundaries(RunTransaction(database, run), 100.) for run in ("A", "B"))
+    a, b = (read_boundaries(RunTransaction(Transaction(database), run), 100.) for run in ("A", "B"))
     assert a["abandonment"] is None and a["status"] == "parent_delivery_pending"
     assert b["abandonment"] == {"action": "same-action", "status": "complete"}
     assert b["status"] == "abandoned" and not b["actions"]
@@ -81,8 +81,8 @@ def test_supervision_keeps_original_scope_deadline_and_timeout_evidence(database
     scopes = {run: _wait(database, run) for run in ("A", "B")}
     _gate(database, "B", "supervision_timeout", {"scope_id": scopes["B"], "kind": "required_checks"})
     before = database.total_changes
-    a, = supervision(RunTransaction(database, "A"), 120.)
-    b, = supervision(RunTransaction(database, "B"), 120.)
+    a, = supervision(RunTransaction(Transaction(database), "A"), 120.)
+    b, = supervision(RunTransaction(Transaction(database), "B"), 120.)
     assert (a["scope_id"], a["deadline"], a["remaining_seconds"], a["timed_out"]) == (scopes["A"], 200., 80, False)
     assert (b["scope_id"], b["deadline"], b["remaining_seconds"], b["timed_out"]) == (scopes["B"], 400., 0, True)
     assert a["scope"]["run"] == "A" and b["scope"]["run"] == "B"
@@ -93,19 +93,19 @@ def test_supervision_keeps_original_scope_deadline_and_timeout_evidence(database
 def test_global_timeout_history_and_null_subject_wait_cannot_cross_runs(database):
     scopes = {}
     for run in ("A", "B"):
-        tx = RunTransaction(database, run)
+        tx = RunTransaction(Transaction(database), run)
         scope = tx.put(SUBJECT, "supervision_scope", wire_json({"run": run, "subject": None}))
         scopes[run] = scope
         insert(database, "waits", {"run_id": run, "subject": None, "kind": "github_convergence",
             "scope_id": scope, "started_at": 100., "deadline": 700.})
-    tx = RunTransaction(database, "B")
+    tx = RunTransaction(Transaction(database), "B")
     timeout = tx.put(SUBJECT, "supervision_timeout", wire_json({"scope_id": scopes["B"], "kind": "github_convergence"}))
     insert(database, "history", {"run_id": "B", "subject": SUBJECT, "kind": "paused",
         "identity": "supervision_timeout", "material_id": timeout, "generation": 1, "created_at": 110.})
     database.execute("UPDATE runs SET blocked='supervision_timeout'")
     before = database.total_changes
-    first, = supervision(RunTransaction(database, "A"), 120.)
-    second, = supervision(RunTransaction(database, "B"), 120.)
+    first, = supervision(RunTransaction(Transaction(database), "A"), 120.)
+    second, = supervision(RunTransaction(Transaction(database), "B"), 120.)
     assert first["subject"] is None and first["timeout"] is None and not first["timed_out"]
     assert second["subject"] is None and second["timed_out"]
     assert second["timeout"] == {"scope_id": scopes["B"], "kind": "github_convergence"}
@@ -115,7 +115,7 @@ def test_global_timeout_history_and_null_subject_wait_cannot_cross_runs(database
 
 def test_sibling_cleanup_and_confirmed_close_are_not_the_selected_runs_receipt(database):
     for run in ("A", "B"):
-        tx = RunTransaction(database, run)
+        tx = RunTransaction(Transaction(database), run)
         payload = tx.put(SUBJECT, "payload", wire_json({"run": run}))
         receipt = tx.put(SUBJECT, "receipt", wire_json({"original": run}))
         insert(database, "effects", {"run_id": run, "id": "same-effect", "subject": SUBJECT,
@@ -129,10 +129,10 @@ def test_sibling_cleanup_and_confirmed_close_are_not_the_selected_runs_receipt(d
             "outcome": "original " + run})
     before = database.total_changes
     for run, number in (("A", 10), ("B", 20)):
-        view = read_boundaries(RunTransaction(database, run), 100.)
+        view = read_boundaries(RunTransaction(Transaction(database), run), 100.)
         close, = view["closures"]
         assert close["pr_number"] == number and close["effect_id"] == "same-effect"
-        assert RunTransaction(database, run).get(close["receipt_id"], SUBJECT) == wire_json({"original": run})
+        assert RunTransaction(Transaction(database), run).get(close["receipt_id"], SUBJECT) == wire_json({"original": run})
         cleanup, = view["delivery_cleanup"]["items"]
         assert cleanup["branch"] == "branch-" + run and cleanup["last_error"] == "original " + run
         assert "-- " + run in cleanup["recovery_action"]
@@ -144,23 +144,23 @@ def test_unselected_wait_body_does_not_exhaust_the_selected_query_budget(databas
     _wait(database, "B", padding="unselected" * 2000)
     import agent_run.storage.sqlite as storage
     monkeypatch.setattr(storage, "QUERY_LIMIT", 8192)
-    a = RunTransaction(database, "A")
+    a = RunTransaction(Transaction(database), "A")
     assert len(supervision(a, 120.)) == 1 and a.bytes_read < 8192
     with pytest.raises(KernelError, match="query_limit"):
-        supervision(RunTransaction(database, "B"), 120.)
+        supervision(RunTransaction(Transaction(database), "B"), 120.)
 
 
 def test_unscoped_or_retargeted_read_boundary_fails_before_projection(database):
     with pytest.raises(KernelError, match="run_scope_required"):
         read_boundaries(Transaction(database), 100.)
-    tx = RunTransaction(database, "A")
+    tx = RunTransaction(Transaction(database), "A")
     database.execute("UPDATE runs SET parent_issue=99 WHERE id='A'")
     with pytest.raises(KernelError, match="run_scope_changed"):
         read_boundaries(tx, 100.)
 
 
 def _bound_attempt(db, run, *, role="development"):
-    tx = RunTransaction(db, run)
+    tx = RunTransaction(Transaction(db), run)
     profile = resolve_profiles()
     material = tx.put(SUBJECT, "profile", wire_json(profile))
     db.execute("UPDATE profile_revisions SET material_id=? WHERE run_id=?", (material, run))
@@ -187,10 +187,10 @@ def test_review_applicability_uses_selected_candidate_and_rejects_foreign_input_
                    dict(database.execute("SELECT * FROM subjects WHERE run_id=?", (run,)).fetchone()))
              for run in ("A", "B")}
     before = database.total_changes
-    assert recorded_review(RunTransaction(database, "A"), *facts["A"]) == "pending"
-    assert recorded_review(RunTransaction(database, "B"), *facts["B"]) == "stale"
+    assert recorded_review(RunTransaction(Transaction(database), "A"), *facts["A"]) == "pending"
+    assert recorded_review(RunTransaction(Transaction(database), "B"), *facts["B"]) == "stale"
     with pytest.raises(QueryError, match="different Run"):
-        recorded_review(RunTransaction(database, "A"), *facts["B"])
+        recorded_review(RunTransaction(Transaction(database), "A"), *facts["B"])
     assert database.total_changes == before
 
 
@@ -211,16 +211,16 @@ def test_preparation_bindings_are_run_scoped_without_inventing_a_supervision_win
             scope["execution"] = {"run_id": "B", "owner": "owner-B", "epoch": 1}
         if run == "A" and damage == "thread":
             scope["thread_id"] = "foreign-thread"
-        material = RunTransaction(database, run).put(SUBJECT, "agent_preparation", wire_json(scope))
+        material = RunTransaction(Transaction(database), run).put(SUBJECT, "agent_preparation", wire_json(scope))
         insert(database, "waits", {"run_id": run, "subject": SUBJECT, "kind": "agent_preparation",
             "scope_id": material, "started_at": 100., "deadline": 110.})
     before = database.total_changes
     if damage is None:
-        assert supervision(RunTransaction(database, "A"), 105.) == []
+        assert supervision(RunTransaction(Transaction(database), "A"), 105.) == []
     else:
         with pytest.raises(QueryError, match="preparation scope"):
-            supervision(RunTransaction(database, "A"), 105.)
-    assert supervision(RunTransaction(database, "B"), 105.) == []
+            supervision(RunTransaction(Transaction(database), "A"), 105.)
+    assert supervision(RunTransaction(Transaction(database), "B"), 105.) == []
     assert database.execute("SELECT count(*) FROM invocations").fetchone()[0] == 0
     assert database.execute("SELECT count(*) FROM leases").fetchone()[0] == 0
     assert database.total_changes == before

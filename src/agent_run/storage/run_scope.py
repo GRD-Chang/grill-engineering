@@ -8,7 +8,6 @@ There is no SQL rewriting, cached business state or second writable store here.
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
-import sqlite3
 from typing import Any, Sequence
 
 from agent_run.contracts.repository import normalize_repository
@@ -33,8 +32,13 @@ class RunTransaction(Transaction):
     Current Core, CLI, Host and protocol selection do not construct this class.
     """
 
-    def __init__(self, connection: sqlite3.Connection, run_id: str) -> None:
-        super().__init__(connection)
+    def __init__(self, transaction: Transaction, run_id: str) -> None:
+        if not isinstance(transaction, Transaction):
+            raise KernelError("run_scope_transaction_required")
+        # The original Storage context owns this exact transaction. Counters
+        # and poison stay there, including when another Run view is selected.
+        self._transaction = transaction
+        self.connection = transaction.connection
         if type(run_id) is not str or not run_id:
             raise KernelError("run_scope_invalid")
         columns = self.execute("PRAGMA table_info(material)").fetchmany(32)
@@ -42,6 +46,30 @@ class RunTransaction(Transaction):
         if primary != ["run_id", "id"]:
             raise KernelError("run_scope_schema_required")
         self._scope = self._read_scope(run_id)
+
+    @property
+    def bytes_read(self) -> int:
+        return self._transaction.bytes_read
+
+    @bytes_read.setter
+    def bytes_read(self, value: int) -> None:
+        self._transaction.bytes_read = value
+
+    @property
+    def rows_read(self) -> int:
+        return self._transaction.rows_read
+
+    @rows_read.setter
+    def rows_read(self, value: int) -> None:
+        self._transaction.rows_read = value
+
+    @property
+    def failed(self) -> bool:
+        return self._transaction.failed
+
+    @failed.setter
+    def failed(self, value: bool) -> None:
+        self._transaction.failed = self._transaction.failed or value
 
     @property
     def run_id(self) -> str:
