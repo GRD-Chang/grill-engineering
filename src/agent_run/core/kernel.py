@@ -3516,6 +3516,8 @@ class Kernel:
     def _gate(self, tx: Transaction, subject: str, code: str, *, purpose: str | None = None, evidence: str | None = None) -> None:
         tx.execute("INSERT OR IGNORE INTO gates VALUES (?,?,?,?)", (subject, code, purpose, evidence))
         tx.execute("DELETE FROM work_queue WHERE subject=?", (subject,))
+        # The existing release guard still fences any unsettled formal write.
+        self._release_integration(tx, subject)
         self._event(tx, subject, "paused", code, evidence)
 
     def _current(self, tx: Transaction, job: sqlite3.Row, run: sqlite3.Row, world: World) -> bool:
@@ -5123,7 +5125,8 @@ class Kernel:
             # Keep the exact CI trigger for a later CI-waiver Publication. The
             # current integration repair receives only its actual Git failure;
             # _context selects that responsibility from purpose/repair_source.
-            self._release_integration(tx, subject)
+            if operation != "integrate" or result["raw"].get("merge_conflict") is not True:
+                self._release_integration(tx, subject)
             return Step("progress", subject)
         if operation in {"workspace", "validation_checkout", "candidate", "integrate", "publication_commit", "merge"} and not commit:
             raise KernelError("effect_receipt_incomplete", operation)

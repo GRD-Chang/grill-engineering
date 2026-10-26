@@ -162,3 +162,16 @@ Python 实际加载的 SQLite 必须包含 WAL-reset 修复：3.51.3 及以上�
 连接属于一次事务边界，成功和失败都关闭本次连接；不会缓存跨事务状态事实。
 协议调整不授权操作真实旧 Run。Host、Worker、通知及临时材料仍由其实际拥有者收口，
 不能把 SQLite 连接关闭或数据库提交当作进程退出证明。
+
+## 集成席位与纯冲突
+
+`runs.integration_holder` 与既有持久队列是唯一席位权威。
+本地 `integrate` 失败中，只有 adapter 确认本次目标的 `MERGE_HEAD` 和真实未合并索引，
+在原回执给出 `raw.merge_conflict=true` 时，当前 Ticket 保留席位完成有界冲突处理；
+执行返回与丢回复后的原意图读回使用相同物理标准，不从错误文字猜测。
+其他 Git 失败、CI 代码修复及 Review Findings 不因此保席。
+冲突 Development 仍使用现有累计集成额度；不恢复免费调用，也不刷新原 Invocation 截止。
+
+无法继续、人工阻塞或异常暂停经既有释放函数让位，显式 Stop/Abandon 保留原控制边界；
+其中未结算的正式写入仍由原 pending-effect 检查阻止释放，须先按原意图读回。
+恢复后按原队列规则重新竞争，不能恢复旧优先级；预算、Thread、Attempt 与资源义务分别保留。

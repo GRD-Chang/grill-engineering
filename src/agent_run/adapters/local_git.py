@@ -157,7 +157,8 @@ class LocalEffects:
                     diff = self.git.run("diff", "--name-only", "--diff-filter=U", cwd=checkout)
                     return EffectResult("failure", commit=self.git.commit(current), raw={
                         "head": current, "merge_head": target, "command": ["git", "diff", "--name-only", "--diff-filter=U"],
-                        "returncode": diff.returncode, "stdout": diff.stdout, "stderr": diff.stderr})
+                        "returncode": diff.returncode, "stdout": diff.stdout, "stderr": diff.stderr,
+                        "merge_conflict": bool(diff.stdout)})
                 if self.git.run("status", "--porcelain", "--untracked-files=all", cwd=checkout).stdout:
                     return EffectResult("third")
                 return EffectResult("prior", commit=self.git.commit(current))
@@ -334,6 +335,8 @@ class LocalEffects:
                     if error.code != "integration_failed":
                         raise
                     raw = writer.conflict_checkout(checkout, target)
+                    raw["merge_conflict"] = (raw["returncode"] == 1 and raw["merge_head"] == target
+                        and bool(writer.run("diff", "--name-only", "--diff-filter=U", cwd=checkout).stdout))
                     return EffectResult("failure", commit=self.git.commit(str(raw["head"])), raw=raw)
                 writer.install_checkout(checkout, current.sha)
         elif effect.operation == "publication_commit":
