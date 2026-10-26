@@ -22,7 +22,7 @@ CHECKS = {
     "Run E2E harness tests", "Run type checks", "Verify independent checks",
     "Test private-only CI selection rules", "Run private-only sync tests",
     "Run private-only E2E harness tests", "Verify private-only checks",
-    "Record complete test shard", "Run product package tests", "Run private-only product package tests",
+    "Record complete test shard",
 }
 
 

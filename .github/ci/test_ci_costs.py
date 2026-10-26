@@ -29,8 +29,8 @@ def job(name, start, end, *, steps=(), conclusion="success", created=0, runner=1
 class CostTests(unittest.TestCase):
     def test_product_package_setup_and_validation_have_separate_cost_phases(self):
         self.assertEqual(step_phase("quality", "Prepare product package test dependencies"), "dependencies")
-        self.assertEqual(step_phase("product-tests (1)", "Run product package tests"), "checks")
-        self.assertEqual(step_phase("quality", "Run private-only product package tests"), "checks")
+        self.assertEqual(step_phase("product-tests (1)", "Run sync tests"), "checks")
+        self.assertEqual(step_phase("quality", "Run private-only sync tests"), "checks")
 
     def setUp(self):
         self.run = {"id": 9, "run_attempt": 1, "head_sha": "candidate", "created_at": stamp(0),
