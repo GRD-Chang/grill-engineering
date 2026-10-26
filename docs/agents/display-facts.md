@@ -23,7 +23,9 @@ Status、History、CLI 和通知投影从已提交事实派生，不另存展示
 
 `QueryDocument` 是显示结果，不是另一套可保存或推进的 Run。
 `executor_control.live_status` 与 Invocation 的 `live_status` 为 `unknown`；查询不探测或恢复
-Host，不能由持久 `running` 记录推断进程仍存活。`scheduling` 保存实际席位、并发上限、
+Host，不能由持久 `running` 记录推断进程仍存活。普通 Status 可单独显示同一物理输出
+已记录的准确 Worker 退出及其时间；只消费原输出的启动、退出字段，不将旧 Invocation
+的退出改写成当前 Host 或新 epoch 的活性证明。`scheduling` 保存实际席位、并发上限、
 集成持有者及两条 FIFO；不再另造 scheduler 或 Ticket 活性镜像。
 通知观察者与 Host 的真实活动证据分别核验，不由显示布局倒推执行许可。
 

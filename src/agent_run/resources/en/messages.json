@@ -1162,5 +1162,6 @@
   "presentation.history.role_subject_ticket": "Ticket",
   "presentation.history.role_subject_parent": "Parent-only",
   "presentation.history.role_subject_run": "Whole-Run",
-  "notification.event.unavailable_development_continues": "Feishu notifications unavailable; development continues: {reason}"
+  "notification.event.unavailable_development_continues": "Feishu notifications unavailable; development continues: {reason}",
+  "presentation.status.recorded_worker_exit": "  Recorded Worker exit: {stamp} ({zone})"
 }
