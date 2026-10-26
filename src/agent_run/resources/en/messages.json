@@ -1120,5 +1120,6 @@
   "cli.receipt.host_exited": "The existing Host was confirmed exited",
   "cli.receipt.target": "Target: {target}",
   "cli.receipt.boundary": "This receipt does not prove that an Agent has started or delivery has completed.",
-  "cli.receipt.next": "Inspect the existing work: {command}"
+  "cli.receipt.next": "Inspect the existing work: {command}",
+  "cli.receipt.failed": "Request processing failed"
 }

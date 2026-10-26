@@ -1120,5 +1120,6 @@
   "cli.receipt.host_exited": "已确认原 Host 退出",
   "cli.receipt.target": "目标: {target}",
   "cli.receipt.boundary": "此回执不表示 Agent 已启动或交付已完成。",
-  "cli.receipt.next": "核对原工作: {command}"
+  "cli.receipt.next": "核对原工作: {command}",
+  "cli.receipt.failed": "请求处理失败"
 }
