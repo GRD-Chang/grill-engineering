@@ -136,6 +136,33 @@ OperationRunner 将读回证据交给 Core 核验和消费，数据库提交不�
 Stop/Abandon、冲突拒绝、不可取消批准及集成单席合同不变。
 作用域只选择入口，不能替代准确授权。
 
+业务保存通过 `Storage.transaction` 的进程内 FIFO 取得资格。顺序的线性化点是
+同一普通数据库文件身份（device/inode）的 ticket 登记；同库不同 `Storage` 实例及
+允许的目录别名共用入口，不承诺调用尚未登记时的墙钟顺序，也不承诺跨进程 FIFO。
+Worker 的 Thread/活动/原始返回/退出记录，以及 Core 的工作分配、观察消费、
+正式写意图与读回保存使用这一入口；完整业务操作仍可能包含若干独立短事务。
+ticket 不保存业务正文、权限或待重放闭包，原调用线程取得资格后才打开写连接，
+沿原逻辑重读身份、代次、Stop 栅栏、协议和资源界限，事务体只执行一次。
+
+生命周期 Action 的 `requeue`、`admit_host`、`control_host`、`stop_task`、
+`abandon_task`、`control`、`configure_profiles`，以及排他初始化 `create` 和
+共享故障撤权 `_retire_failed_executor` 显式使用 `ordered=False`。这些控制入口
+不等待业务 ticket，因此不会在持有 Task/admission 锁时等待业务保存资格；
+它们仍受原 SQLite 写锁、全部校验及原子提交约束，不保证瞬时抢占已开启的事务。
+只读查询不排队。工作/集成 FIFO、控制 Action 和保存 ticket 各有既有职责。
+
+资格等待、preflight 和取得 writer lock 共用从写入口开始的 **1 秒**竞争预算，
+SQLite 连接只接收剩余时间，不在排队后重新增加一秒；这不是事务体、Agent 或
+业务等待窗口的运行期限。每库最多保留 128 个业务 ticket（含当前头部），满额
+或到期在事务体执行前返回 `storage_busy`，不自动重放 Agent、SQL 事务或外部动作。
+该元数据额度不改变材料、查询、数据库或冻结业务 Policy 的容量限制。
+
+`cancelled` Event 仅撤销尚未进入事务体的保存等待；Stop 不会笼统丢弃应保留的
+原始返回和退出收口，它们继续由 Core 分别授权。异常、取消、超时均撤销准确 ticket，
+提交/回滚且连接关闭后才释放资格，空闲 registry 项立即移除；fork 子进程重置
+进程内协调对象。同线程嵌套写以 `storage_busy` 拒绝，不复用另一笔事务或改变
+SQL 错误 poison/rollback 合同。等待期间文件身份改变仍拒绝，不接管替换数据库。
+
 正常推进与在途结果、取消、真实退出收口分别核验。Stop 已生效、租约已释放或
 旧 Executor 被替换后，原 Invocation 仍可在准确身份、代次、Thread 与 Attempt
 核验后保存结果及退出事实；阶段、预算、Candidate、gate 和队列保持当前值。

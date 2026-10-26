@@ -46,7 +46,7 @@ class UnsupportedState(KernelError):
 
 
 @contextmanager
-def read_state(path: Path) -> Iterator[sqlite3.Connection]:
+def read_state(path: Path, *, timeout: float = 1.0) -> Iterator[sqlite3.Connection]:
     """Open an existing ordinary file with WAL visibility and no recovery writes.
 
     A rollback journal may require recovery even for a reader: refuse it rather
@@ -81,7 +81,7 @@ def read_state(path: Path) -> Iterator[sqlite3.Connection]:
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or suffix == "-journal" and metadata.st_size:
                 raise UnsupportedState(path, "uncertain_state")
         db = sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True,
-                             isolation_level=None, timeout=1.0)
+                             isolation_level=None, timeout=timeout)
     except (OSError, sqlite3.Error) as error:
         raise UnsupportedState(path, "unreadable_state") from error
     try:
@@ -153,7 +153,7 @@ def require_supported_connection(db: sqlite3.Connection, path: Path) -> str:
         raise UnsupportedState(path, "uncertain_state") from error
 
 
-def require_supported_state(path: Path) -> str:
+def require_supported_state(path: Path, *, timeout: float = 1.0) -> str:
     """Return a supported native protocol, otherwise raise a located refusal."""
-    with read_state(path) as db:
+    with read_state(path, timeout=timeout) as db:
         return require_supported_connection(db, path)

@@ -44,7 +44,8 @@ def test_transaction_classifies_only_supported_native_busy_codes(tmp_path, monke
 
     def open_connection(*args, **kwargs):
         if '?mode=rw' in str(args[0]):
-            assert kwargs['timeout'] == 1.0
+            # Save admission/preflight already spent part of the same budget.
+            assert 0 < kwargs['timeout'] <= 1.0
             return connect(*args, **kwargs, factory=Connection)
         return connect(*args, **kwargs)
 
