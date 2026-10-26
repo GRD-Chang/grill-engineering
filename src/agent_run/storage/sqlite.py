@@ -160,7 +160,7 @@ CREATE TABLE invocations (
  id TEXT PRIMARY KEY, attempt TEXT NOT NULL REFERENCES attempts(id), thread TEXT NOT NULL REFERENCES threads(id),
  executor TEXT NOT NULL, epoch INTEGER NOT NULL, status TEXT NOT NULL, allocated_at REAL NOT NULL,
  deadline_seconds REAL NOT NULL, deadline_at REAL NOT NULL,
- predecessor TEXT REFERENCES invocations(id), recovery_kind TEXT CHECK(recovery_kind IN ('ordinary','capacity','explicit')),
+ predecessor TEXT REFERENCES invocations(id), recovery_kind TEXT CHECK(recovery_kind IN ('ordinary','capacity','explicit','semantic')),
  action_id TEXT REFERENCES actions(id)
 );
 CREATE TABLE invocation_outputs (

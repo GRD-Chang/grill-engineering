@@ -69,6 +69,7 @@ _Avoid_: gh 请求代理、命令白名单、向 Worker 注入 App 私钥、静�
 
 **Agent Artifact（Agent 产物）**:
 Codex Worker 返回的结构化意图、判断与证据。它可以包含代码变更的语义说明及待发布内容，但本身不授权任何外部写入或完成状态。
+Development 用 `development` 表示工作已完成，用 `incomplete`、非空 summary 与 null human_blockers 如实表示没有外部人工阻塞的未完成工作。Controller 不解析摘要措辞；准确最终返回、Thread 和真实退出证明齐全时，同一 Attempt 最多自动语义续接一次，保留原 Thread 与绝对截止，并与异常恢复、容量等待及只读格式修复分别计数。缺证、到期或用尽后保留原证据并暂停，显式 Resume 不重扣本次 Development。完成但无代码变化可复用准确现有 commit 进入独立 Review，不制造空提交，也不借 Ticket fallback 跳过这次必要复核；Human Response 原文不授予免审或合并权限。
 _Avoid_: GitHub 状态、完成证明、自由文本交接
 
 **验收 Finding（Acceptance Finding）**:
@@ -763,7 +764,7 @@ checkout 只读，使用按角色区分的短格式 Prompt，且不增加领域 
 _Avoid_: Development Attempt、自动替代 Thread、领域 retry
 
 **Semantic Agent Attempt（语义 Agent 尝试）**:
-Development、Reviewer 或 Publication 角色针对一个准确 Work Subject、Job Generation、Currentness Boundary 与角色序号完成的一轮语义工作。它在首个 Codex 进程前分配，可跨越初始 Invocation、successor Invocation、Thread 替换与 Output Repair；执行失败、Human Blocker 或前台中断都不创建新 Attempt。Development 在分配时占用一次 Development Budget，Reviewer 在形成合法 Acceptance Artifact 时占用一次 Review Budget，Publication 在分配时计入一次 Publication Attempt；三者的 Resume 均不重复计数。已持久且尚未收口的 pending Attempt 优先于新 Attempt 的预算门禁：即使窗口计数已达上限，Controller 也必须先继续该 pending Attempt，不得将它拒绝为预算耗尽。只有当前 Attempt 已形成完整角色结果，或其 Currentness Boundary 失效并按规则收口后，才能分配后继 Attempt。
+Development、Reviewer 或 Publication 角色针对一个准确 Work Subject、Job Generation、Currentness Boundary 与角色序号完成的一轮语义工作。它在首个 Codex 进程前分配，可跨越初始 Invocation、successor Invocation、Thread 替换与 Output Repair；执行失败、Human Blocker 或前台中断都不创建新 Attempt。Development 在凭据就绪、实际 Worker 最终放行准入时占用一次 Development Budget，或由准确实际返回工作证据补齐尚未记账的一次用量；凭据准备失败不计费，Reviewer 在形成合法 Acceptance Artifact 时占用一次 Review Budget，Publication 在分配时计入一次 Publication Attempt；三者的 Resume 均不重复计数。已持久且尚未收口的 pending Attempt 优先于新 Attempt 的预算门禁：即使窗口计数已达上限，Controller 也必须先继续该 pending Attempt，不得将它拒绝为预算耗尽。只有当前 Attempt 已形成完整角色结果，或其 Currentness Boundary 失效并按规则收口后，才能分配后继 Attempt。
 _Avoid_: Agent Invocation、Output Attempt、Codex 进程启动次数、Thread 序号
 
 **Reviewer Invocation（审查调用）**:

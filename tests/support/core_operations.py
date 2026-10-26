@@ -9,7 +9,7 @@ from pathlib import Path
 
 from typing import TYPE_CHECKING, Any, Mapping
 
-from agent_run.model import AgentCall, CreationInputs, Delivery, DeliveryKind, Effect, EffectResult, Execution, Issue, Policy, ParentIssue, Requirements, ResourceInspection, ResourceWitness, RunSpec, Step
+from agent_run.model import Commit, AgentCall, AgentPreparation, CreationInputs, Delivery, DeliveryKind, Effect, EffectResult, Execution, Issue, Policy, ParentIssue, Requirements, wire_json, ResourceInspection, ResourceWitness, RunSpec, Step
 from agent_run.core.kernel import Kernel
 from agent_run.core.operation_contract import DeliveryFacts, DeliveryRead, OperationBinding, OperationPorts
 from agent_run.core.operation_runner import OperationRunner
@@ -18,6 +18,34 @@ from agent_run.contracts.write_authority import WriteAuthority
 
 if TYPE_CHECKING:
     from support.offline import GraphScenario
+
+
+def prepare_scripted_agent(kernel: Kernel, step: Step | AgentPreparation) -> Step:
+    """Deliver controlled native credentials before admitting a fixture Agent.
+
+    This is the external issuer substitute for Core/SQLite/Git contract tests,
+    not a ready flag or process/exit witness. Native transport tests keep the
+    original preparation and use their actual Codex capture instead.
+    """
+    if isinstance(step, Step) and step.preparation is None:
+        return step
+    import json
+    import tempfile
+    import time
+    from agent_run.adapters.auth.credential_lifecycle import ReadCredential
+    from agent_run.adapters.auth.worker_credentials import NativeCredentialDelivery
+
+    preparation = step if isinstance(step, AgentPreparation) else step.preparation
+    assert preparation is not None
+    with tempfile.TemporaryDirectory(prefix='controlled-credential-') as temporary:
+        directory = Path(temporary) / 'gh'
+        credential = ReadCredential('controlled-native-unit-credential', time.time() + 3600)
+        with NativeCredentialDelivery(lambda: credential, directory) as delivery:
+            delivery.start(guard=lambda: kernel.guard_preparation(preparation),
+                deadline=time.monotonic() + max(0, preparation.preparation_deadline-kernel.clock()))
+            config = json.loads((directory / 'hosts.yml').read_text())
+            assert config['github.com']['oauth_token'] == credential.token
+            return kernel.admit_agent(preparation)
 
 
 def scripted_return(kernel: Kernel, runner: OperationRunner, call: AgentCall,
@@ -124,12 +152,15 @@ def final_scenario(root: Path, *, policy: Policy | None = None,
 
 class CoreOperations:
     def __init__(self, kernel: Kernel, execution: Execution,
-                 make_ports: Callable[[OperationBinding], OperationPorts]) -> None:
+                 make_ports: Callable[[OperationBinding], OperationPorts], *, prepare_agents: bool = True) -> None:
+        self.prepare_agents = prepare_agents
         self.runner = OperationRunner(kernel, execution, make_ports)
         self.steps: list[Step] = []
 
     def once(self, *, agent_capacity: int = 1) -> Step:
         step = self.runner.run_once(agent_capacity=agent_capacity)
+        if self.prepare_agents:
+            step = prepare_scripted_agent(self.runner.kernel, step)
         self.steps.append(step)
         return step
 
@@ -139,6 +170,41 @@ class CoreOperations:
             step = self.once(agent_capacity=agent_capacity)
             if predicate(step):
                 return step
-            if step.call is not None:
-                raise AssertionError(f"Test must handle the allocated AgentCall: {step}")
+            if step.call is not None or step.preparation is not None:
+                raise AssertionError(f"Test must handle the reserved Agent work: {step}")
         raise AssertionError(f"Core did not reach the expected boundary in {limit} operations: {self.steps}")
+
+
+def observed_call(kernel: Kernel, request: AgentPreparation) -> AgentCall:
+    """Read the real admitted identity after native transport ran, never admit.
+
+    Tests use the actual Invocation/output bound to this original seat. No
+    execution, credential readiness, raw result or exit evidence is fabricated.
+    """
+    with kernel.storage.transaction(write=False) as tx:
+        row = tx.one("SELECT i.id,i.deadline_seconds,i.deadline_at,o.ordinal,o.context_id FROM invocations i "
+                     "JOIN invocation_outputs o ON o.invocation=i.id WHERE o.lease=?", (request.reservation_id,))
+        assert tx.get(row['context_id'], request.subject) == wire_json(request.context)
+        return AgentCall(request.attempt_id, row['id'], request.subject, request.role, request.purpose,
+            request.thread_id, request.reservation_id, request.execution, request.context, request.profile,
+            row['deadline_seconds'], row['deadline_at'], request.mode, request.reported_thread,
+            row['ordinal'], request.profile_revision, request.profile_reference)
+
+
+def agent_preparation_fixture(tmp_path: Path, *, concurrency: int = 1):
+    base = Commit('base', 'tree')
+    spec = RunSpec('preparation', 'example/repository', 1, 'parent', 'graph', (
+        Delivery('ticket:2', DeliveryKind.TICKET, 2, 'original', base,
+                 'refs/heads/ticket', 'refs/heads/run', checkout=str(tmp_path)),
+    ), Policy(ticket_rounds=1, development_deadline_seconds=120, concurrency=concurrency))
+    (tmp_path / 'state').mkdir()
+    kernel, ports = native_agent_fixture(tmp_path / 'state' / 'kernel.sqlite3', spec)
+    clock = [1000.0]
+    kernel.clock = lambda: clock[0]
+    owner = kernel.claim_executor('preparation-owner')
+    runner = OperationRunner(kernel, owner, lambda _: ports)
+    for _ in range(6):
+        step = runner.run_once()
+        if step.call is not None or getattr(step, 'preparation', None) is not None:
+            return kernel, runner, ports, step, clock
+    raise AssertionError('Core did not reserve Agent work')

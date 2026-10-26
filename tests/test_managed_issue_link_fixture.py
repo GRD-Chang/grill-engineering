@@ -1,4 +1,5 @@
 """Managed Parent/Ticket links use known identities and real private Git refs."""
+from support.core_operations import prepare_scripted_agent
 import json
 import subprocess
 
@@ -91,7 +92,7 @@ def test_normal_core_final_link_is_unknown_only_after_injected_response_loss(
     monkeypatch.setattr(ports, 'execute', execute)
     runner = OperationRunner(scenario.kernel, scenario.execution, lambda binding: ports)
     for _ in range(120):
-        step = runner.run_once()
+        step = prepare_scripted_agent(scenario.kernel, runner.run_once())
         if step.call is not None:
             settle_agent(scenario, runner, step.call)
         assert step.kind not in {'paused', 'waiting'}
@@ -109,7 +110,7 @@ def test_normal_core_final_link_is_unknown_only_after_injected_response_loss(
     final = scenario.kernel.status('final:1')
     assert final['issue_link']['state'] == ('indeterminate' if lose_final_response else 'linked')
     assert final['phase'] == 'checks' and not final['gates']
-    runner.run_once()
+    prepare_scripted_agent(scenario.kernel, runner.run_once())
     assert scenario.kernel.status('final:1')['phase'] == 'approval'
     with scenario.kernel.storage.transaction(write=False) as tx:
         row = tx.one('SELECT status,attempts FROM effects WHERE id=?', (effect.effect_id,))

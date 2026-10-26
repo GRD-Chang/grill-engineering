@@ -11,20 +11,20 @@ from typing import Any
 
 import pytest
 
-from agent_run.model import AgentCall, Commit, Delivery, DeliveryKind, Policy, Profile, RunSpec
+from agent_run.model import AgentCall, AgentPreparation, Commit, Delivery, DeliveryKind, Policy, Profile, RunSpec
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.runtime.codex import execute_codex
 from agent_run.runtime.execution import ProcessExit
 from support.offline import fixture_inputs, review_result
 from agent_run.contracts.agent_profiles import resolve_profiles
-from support.core_operations import CoreOperations, ReadOnlyPorts, final_scenario, native_agent_fixture
+from support.core_operations import CoreOperations, ReadOnlyPorts, final_scenario, native_agent_fixture, observed_call
 
 
 RAW = b'{"result_kind":"development","summary":"Implemented by the local CLI process.","human_blockers":null}'
 
 
-def allocated_codex(tmp_path: Path) -> tuple[Kernel, AgentCall, ReadOnlyPorts]:
+def allocated_codex(tmp_path: Path) -> tuple[Kernel, AgentPreparation, ReadOnlyPorts]:
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     state = tmp_path / "runner-state"
@@ -42,12 +42,12 @@ def allocated_codex(tmp_path: Path) -> tuple[Kernel, AgentCall, ReadOnlyPorts]:
         "publication_model": "bound-publication-model", "publication_effort": "high"}))
     kernel, ports = native_agent_fixture(state / "kernel.sqlite3", replace(spec, inputs=inputs))
     execution = kernel.claim_executor("local-cli-executor")
-    call = CoreOperations(kernel, execution, lambda binding: ports).until(lambda step: step.call is not None).call
+    call = CoreOperations(kernel, execution, lambda binding: ports, prepare_agents=False).until(lambda step: step.preparation is not None).preparation
     assert call is not None
     return kernel, call, ports
 
 
-def local_codex(kernel: Kernel, call: AgentCall, tmp_path: Path, program: str) -> ProcessExit | None:
+def local_codex(kernel: Kernel, call: AgentPreparation, tmp_path: Path, program: str) -> ProcessExit | None:
     executable = tmp_path / "local-codex"
     executable.write_text(f"#!{sys.executable}\n" + "import json, os, sys\nfrom pathlib import Path\n" + program)
     executable.chmod(0o700)
@@ -57,7 +57,7 @@ def local_codex(kernel: Kernel, call: AgentCall, tmp_path: Path, program: str) -
     return execute_codex(
         kernel, call, executable=str(executable), prompt="Continue the allocated task.",
         environment={"PATH": os.defpath, "HOME": str(tmp_path)}, credential_file=credential,
-        hidden_paths=(), authorize_source=lambda: None, timeout=5,
+        hidden_paths=(), authorize_source=lambda admitted: None, timeout=5,
     )
 
 
@@ -78,13 +78,15 @@ raise SystemExit(7)
     assert before["phase"] == "development" and before["pending_attempt"] == call.attempt_id
     assert before["budgets"]["requirements"]["developments_used"] == 1
     assert reopened.operation_state().active == ()
-    step = CoreOperations(reopened, call.execution, lambda binding: ports).once(agent_capacity=0)
+    step = CoreOperations(reopened, call.execution, lambda binding: ports, prepare_agents=False).once(agent_capacity=0)
     assert step.kind == ("progress" if raw == RAW else "needs_agent")
     assert reopened.status(call.subject)["gates"] == []
     if raw != RAW:
-        step = CoreOperations(reopened, call.execution, lambda binding: ports).until(lambda step: step.call is not None)
-        assert step.call is not None and step.call.mode == "resume"
-        assert step.call.invocation_id != call.invocation_id and step.call.thread_id == call.thread_id
+        step = CoreOperations(reopened, call.execution, lambda binding: ports, prepare_agents=False).until(lambda step: step.preparation is not None)
+        assert step.preparation is not None and step.preparation.mode == "resume"
+        assert step.preparation.reservation_id != call.reservation_id and step.preparation.thread_id == call.thread_id
+        with reopened.storage.transaction(write=False) as tx:
+            assert tx.one("SELECT count(*) FROM invocations")[0] == 1  # Credentials not ready yet.
 
 
 @pytest.mark.parametrize("events", [
@@ -103,10 +105,10 @@ raise SystemExit(1)
     reopened = Kernel(kernel.storage.path)
     assert reopened.status(first.subject)["gates"] == []
     assert reopened.operation_state().active == ()
-    resumed = CoreOperations(reopened, first.execution, lambda binding: ports).until(lambda step: step.call is not None).call
+    resumed = CoreOperations(reopened, first.execution, lambda binding: ports, prepare_agents=False).until(lambda step: step.preparation is not None).preparation
     assert resumed is not None and resumed.mode == "resume"
     assert resumed.reported_thread == "original-thread" and resumed.thread_id == first.thread_id
-    assert resumed.attempt_id == first.attempt_id and resumed.invocation_id != first.invocation_id
+    assert resumed.attempt_id == first.attempt_id and resumed.reservation_id != first.reservation_id
     assert resumed.profile == first.profile
     program = f"""\
 assert sys.argv[1:4] == ['exec', 'resume', '--json']
@@ -124,6 +126,7 @@ for thread in {events!r}:
     else:
         with pytest.raises(ValueError, match="different Thread ID"):
             local_codex(reopened, resumed, tmp_path, program)
+    assert observed_call(kernel, resumed).invocation_id != observed_call(kernel, first).invocation_id
     after = Kernel(kernel.storage.path)
     status = after.status(first.subject)
     assert status["pending_return"] is (events == ("original-thread",))
@@ -131,10 +134,10 @@ for thread in {events!r}:
     assert status["budgets"]["requirements"]["developments_used"] == 1
     assert after.operation_state().active == ()
     exits = [event["identity"] for event in after.history(first.subject) if event["kind"] == "worker_exited"]
-    assert exits == [first.invocation_id, resumed.invocation_id]
-    after.bind_thread(resumed, "original-thread")
+    assert exits == [observed_call(kernel, first).invocation_id, observed_call(kernel, resumed).invocation_id]
+    after.bind_thread(observed_call(kernel, resumed), "original-thread")
     with pytest.raises(KernelError, match="thread_identity_changed"):
-        after.bind_thread(resumed, "different-thread")
+        after.bind_thread(observed_call(kernel, resumed), "different-thread")
 
 
 @pytest.mark.parametrize("replacement", ["missing", "symlink"])
@@ -157,19 +160,19 @@ if {replacement!r} == 'symlink':
     assert status["pending_attempt"] == call.attempt_id and status["candidate"] is None
     assert status["budgets"]["requirements"]["developments_used"] == 1
     assert reopened.operation_state().active == ()
-    assert any(event["kind"] == "worker_exited" and event["identity"] == call.invocation_id
+    assert any(event["kind"] == "worker_exited" and event["identity"] == observed_call(kernel, call).invocation_id
                for event in reopened.history(call.subject))
     assert not any(event["kind"] == "raw_returned" for event in reopened.history(call.subject))
 
 
 def test_kernel_allocated_reviewer_cannot_write_checkout_but_can_return_final(tmp_path: Path) -> None:
     scenario = final_scenario(tmp_path / "scenario")
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports, prepare_agents=False)
     def review_ready(step):
-        if step.call is None:
+        if step.preparation is None:
             assert step.kind in {"effect", "progress"}, step
-        return step.call is not None
-    call = operations.until(review_ready).call
+        return step.preparation is not None
+    call = operations.until(review_ready).preparation
     assert call is not None and call.role.value == "review" and call.context["readonly"] is True
     checkout = Path(call.context["checkout"])
     original = (checkout / "README.md").read_bytes()
@@ -215,7 +218,7 @@ def test_codex_jsonl_binds_real_thread_and_only_owned_final_file_is_the_return(t
         "development_model": "bound-model", "development_effort": "high"}))
     created, ports = native_agent_fixture(path, replace(spec, inputs=inputs))
     execution = created.claim_executor("local-cli-executor")
-    call = CoreOperations(created, execution, lambda binding: ports).until(lambda step: step.call is not None).call
+    call = CoreOperations(created, execution, lambda binding: ports, prepare_agents=False).until(lambda step: step.preparation is not None).preparation
     assert call is not None and call.mode == "fresh" and call.reported_thread is None
     runner = tmp_path / "runner-private"
     runner.mkdir()
@@ -300,7 +303,7 @@ output.write_bytes({RAW!r})
                      "GH_TOKEN": "Wrong-inherited-identity", "GITHUB_TOKEN": "Wrong-fallback",
                      "CUSTOM_RUNNER_PAT": "Runner-private-token", "AGENT_RUN_INTERNAL_CONTROL_TOKEN": "Runner-control"},
         credential_file=credential, hidden_paths=(runner,), hidden_environment=("CUSTOM_RUNNER_PAT",),
-        timeout=5, authorize_source=authorize_source,
+        timeout=5, authorize_source=lambda admitted: authorize_source(),
     )
     assert result is not None and result.returncode == 0 and result.raw == RAW
     assert checks == 2 and int(started.read_text()) != os.getpid()
@@ -309,8 +312,8 @@ output.write_bytes({RAW!r})
     assert reopened.status(call.subject)["budgets"]["requirements"]["developments_used"] == 1
     assert reopened.operation_state().active == ()
     with pytest.raises(KernelError, match="thread_identity_changed"):
-        reopened.bind_thread(call, "another-thread")
-    assert CoreOperations(reopened, call.execution, lambda binding: ports).once(agent_capacity=0).kind == "progress"
+        reopened.bind_thread(observed_call(created, call), "another-thread")
+    assert CoreOperations(reopened, call.execution, lambda binding: ports, prepare_agents=False).once(agent_capacity=0).kind == "progress"
 
 
 @pytest.mark.parametrize("error,capacity", [
@@ -336,7 +339,7 @@ raise SystemExit(7)
     assert result is not None and result.returncode == 7 and result.raw == b""
     assert kernel.operation_state().active == ()
     with kernel.storage.transaction(write=False) as tx:
-        output = tx.one("SELECT * FROM invocation_outputs WHERE invocation=? AND ordinal=?", (first.invocation_id, first.output_ordinal))
+        output = tx.one("SELECT * FROM invocation_outputs WHERE invocation=? AND ordinal=?", (observed_call(kernel, first).invocation_id, first.output_ordinal))
         assert output["failure_kind"] == ("capacity" if capacity else "ordinary")
         assert tx.get(output["raw_id"], first.subject) == b""
         failure = json.loads(tx.get(output["start_evidence"], first.subject))
@@ -345,25 +348,27 @@ raise SystemExit(7)
         else:
             assert failure["diagnostic"]["message"] == error["message"]
             assert failure["diagnostic"]["machine_present"] is ("codex_error_info" in error)
-        rows = tx.rows("SELECT active FROM worker_activity WHERE invocation=? ORDER BY identity", (first.invocation_id,))
+        rows = tx.rows("SELECT active FROM worker_activity WHERE invocation=? ORDER BY identity", (observed_call(kernel, first).invocation_id,))
         assert [row[0] for row in rows] == ([1] if error is None else [1, 0])
     kernel.configure_profiles("later-model", overrides={"development_model": "new-model"})
     exited_at = now[0]
     now[0] = exited_at + (29.999 if capacity else 2)
     if capacity:
-        assert CoreOperations(kernel, first.execution, lambda binding: ports).once().kind == "waiting"
+        assert CoreOperations(kernel, first.execution, lambda binding: ports, prepare_agents=False).once().kind == "waiting"
         assert kernel.operation_state().active == ()
         now[0] = exited_at + 30
-    recovered = CoreOperations(kernel, first.execution, lambda binding: ports).until(lambda step: step.call is not None).call
+    recovered = CoreOperations(kernel, first.execution, lambda binding: ports, prepare_agents=False).until(lambda step: step.preparation is not None).preparation
     assert recovered is not None and recovered.mode == "resume"
     assert recovered.attempt_id == first.attempt_id and recovered.thread_id == first.thread_id
-    assert recovered.invocation_id != first.invocation_id and recovered.output_ordinal == 0
-    assert recovered.deadline_at == now[0] + first.deadline_seconds
+    assert recovered.reservation_id != first.reservation_id and recovered.output_ordinal == 0
+    assert recovered.deadline_seconds == first.deadline_seconds
     assert recovered.profile == first.profile and recovered.profile_revision == first.profile_revision
     assert recovered.profile_reference == first.profile_reference
     second = local_codex(kernel, recovered, tmp_path, program)
     assert second is not None and second.returncode == 7
-    next_step = CoreOperations(kernel, first.execution, lambda binding: ports).once()
+    assert observed_call(kernel, recovered).invocation_id != observed_call(kernel, first).invocation_id
+    assert observed_call(kernel, recovered).deadline_at == now[0] + first.deadline_seconds
+    next_step = CoreOperations(kernel, first.execution, lambda binding: ports, prepare_agents=False).once()
     assert next_step.kind == ("waiting" if capacity else "paused")
     assert kernel.status(first.subject)["budgets"]["requirements"]["developments_used"] == 1
     assert kernel.operation_state().active == ()
@@ -381,10 +386,11 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_bytes({raw!r})
     assert result is not None and result.raw == raw and result.returncode == 0
     kernel.configure_profiles("later-model", overrides={"development_model": "new-model"})
     now[0] += 2
-    repair = CoreOperations(kernel, first.execution, lambda binding: ports).until(lambda step: step.call is not None).call
+    repair = CoreOperations(kernel, first.execution, lambda binding: ports, prepare_agents=False).until(lambda step: step.preparation is not None).preparation
     assert repair is not None and repair.mode == "output-repair"
-    assert repair.invocation_id == first.invocation_id and repair.output_ordinal == first.output_ordinal + 1
-    assert repair.deadline_at == first.deadline_at and repair.deadline_seconds == first.deadline_seconds
+    assert repair.output_ordinal == first.output_ordinal + 1
+    assert repair.preparation_deadline == min(now[0] + 600, observed_call(kernel, first).deadline_at)
+    assert repair.deadline_seconds == first.deadline_seconds
     assert repair.thread_id == first.thread_id and repair.reported_thread == "original-thread"
     assert repair.profile == first.profile and repair.profile_revision == first.profile_revision
     assert repair.profile_reference == first.profile_reference and repair.context["readonly"] is True
@@ -402,13 +408,15 @@ print(json.dumps({{'type': 'thread.started', 'thread_id': 'original-thread'}}), 
 Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_bytes({RAW!r})
 """)
     assert repaired is not None and repaired.raw == RAW and repaired.returncode == 0
+    assert observed_call(kernel, repair).invocation_id == observed_call(kernel, first).invocation_id
+    assert observed_call(kernel, repair).deadline_at == observed_call(kernel, first).deadline_at
     with kernel.storage.transaction(write=False) as tx:
-        outputs = tx.rows("SELECT * FROM invocation_outputs WHERE invocation=? ORDER BY ordinal", (first.invocation_id,))
+        outputs = tx.rows("SELECT * FROM invocation_outputs WHERE invocation=? ORDER BY ordinal", (observed_call(kernel, first).invocation_id,))
         assert [row["ordinal"] for row in outputs] == [0, 1]
         assert [tx.get(row["raw_id"], first.subject) for row in outputs] == [raw, RAW]
         assert all(row["exit_code"] == 0 and row["dispatch_state"] == "exited" for row in outputs)
         assert outputs[0]["process_identity"] != outputs[1]["process_identity"]
-    assert CoreOperations(kernel, first.execution, lambda binding: ports).once().kind == "progress"
+    assert CoreOperations(kernel, first.execution, lambda binding: ports, prepare_agents=False).once().kind == "progress"
     assert kernel.status(first.subject)["budgets"]["requirements"]["developments_used"] == 1
 
 
@@ -423,13 +431,13 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_bytes({RAW!r})
 """)
     assert result is not None and result.returncode == 0
     with kernel.storage.transaction(write=False) as tx:
-        rows = tx.rows("SELECT * FROM worker_activity WHERE invocation=? ORDER BY identity", (call.invocation_id,))
+        rows = tx.rows("SELECT * FROM worker_activity WHERE invocation=? ORDER BY identity", (observed_call(kernel, call).invocation_id,))
         assert [row["active"] for row in rows] == [int(event == "turn.started") for event in events]
         assert all(row["ordinal"] == call.output_ordinal for row in rows)
         evidence = [json.loads(tx.get(row["evidence"], call.subject)) for row in rows]
         assert [item["type"] for item in evidence] == list(events)
         assert "private tool output" not in repr(evidence)
-        assert tx.one("SELECT exit_code FROM invocation_outputs WHERE invocation=?", (call.invocation_id,))[0] == 0
+        assert tx.one("SELECT exit_code FROM invocation_outputs WHERE invocation=?", (observed_call(kernel, call).invocation_id,))[0] == 0
 
 
 def test_real_failure_diagnostic_projects_redacts_and_bounds_before_persistence(tmp_path: Path) -> None:
@@ -448,7 +456,7 @@ raise SystemExit(7)
 """)
     assert result is not None and result.returncode == 7
     with kernel.storage.transaction(write=False) as tx:
-        output = tx.one("SELECT start_evidence FROM invocation_outputs WHERE invocation=?", (call.invocation_id,))
+        output = tx.one("SELECT start_evidence FROM invocation_outputs WHERE invocation=?", (observed_call(kernel, call).invocation_id,))
         stored = tx.get(output[0], call.subject)
         diagnostic = json.loads(stored)["diagnostic"]
         assert diagnostic["machine"] == '"usage_limit"'
@@ -489,10 +497,10 @@ raise SystemExit(7)
     assert observed.exists()
     assert kernel.status(call.subject)["gates"] == ["execution_failed"]
     # The already recorded fatal gate leaves no public runnable operation.
-    assert CoreOperations(kernel, call.execution, lambda binding: ports).once().kind == "quiescent"
+    assert CoreOperations(kernel, call.execution, lambda binding: ports, prepare_agents=False).once().kind == "quiescent"
     assert kernel.operation_state().active == ()
     with kernel.storage.transaction(write=False) as tx:
-        output = tx.one("SELECT * FROM invocation_outputs WHERE invocation=?", (call.invocation_id,))
+        output = tx.one("SELECT * FROM invocation_outputs WHERE invocation=?", (observed_call(kernel, call).invocation_id,))
         assert output["failure_kind"] == "fatal" and output["raw_id"] is None
         failure = json.loads(tx.get(output["start_evidence"], call.subject))
         assert failure["diagnostic"]["machine"] == '"server_overloaded"'
@@ -505,11 +513,11 @@ def test_real_format_repair_process_uses_only_the_original_remaining_deadline(tm
 print(json.dumps({'type': 'thread.started', 'thread_id': 'original-thread'}), flush=True)
 """)
     assert result is not None and result.raw == b""
-    remaining = first.deadline_at - 0.5
+    remaining = observed_call(kernel, first).deadline_at - 0.5
     kernel.clock = lambda: remaining
-    repair = CoreOperations(kernel, first.execution, lambda binding: ports).until(lambda step: step.call is not None).call
-    assert repair is not None and repair.invocation_id == first.invocation_id and repair.output_ordinal == 1
-    assert repair.deadline_at == first.deadline_at
+    repair = CoreOperations(kernel, first.execution, lambda binding: ports, prepare_agents=False).until(lambda step: step.preparation is not None).preparation
+    assert repair is not None and repair.output_ordinal == 1
+    assert repair.preparation_deadline == observed_call(kernel, first).deadline_at
     started = time.monotonic()
     with pytest.raises(TimeoutError):
         local_codex(kernel, repair, tmp_path, """\
@@ -519,9 +527,11 @@ print(json.dumps({'type': 'thread.started', 'thread_id': 'original-thread'}), fl
 time.sleep(10)
 """)
     assert time.monotonic() - started < 2, "Repair reset the original remaining deadline"
+    assert observed_call(kernel, repair).invocation_id == observed_call(kernel, first).invocation_id
+    assert observed_call(kernel, repair).deadline_at == observed_call(kernel, first).deadline_at
     assert kernel.operation_state().active == ()
     with kernel.storage.transaction(write=False) as tx:
-        outputs = tx.rows("SELECT * FROM invocation_outputs WHERE invocation=? ORDER BY ordinal", (first.invocation_id,))
+        outputs = tx.rows("SELECT * FROM invocation_outputs WHERE invocation=? ORDER BY ordinal", (observed_call(kernel, first).invocation_id,))
         assert len(outputs) == 2 and outputs[1]["dispatch_state"] == "exited"
         identity = json.loads(tx.get(outputs[1]["process_identity"], first.subject))
         with pytest.raises(ChildProcessError):

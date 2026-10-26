@@ -25,6 +25,8 @@ POLICY_VALUE_FIELDS = {
     "required_checks_wait_seconds": "required_checks_wait_seconds",
 }
 
+AGENT_PREPARATION_SECONDS = 600
+
 
 def positive_integer(value: Any, name: str) -> int:
     if type(value) is not int or value <= 0:

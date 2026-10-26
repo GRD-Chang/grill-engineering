@@ -1,4 +1,5 @@
 """Native Issue inputs through the shared Core operation runner."""
+from support.core_operations import prepare_scripted_agent
 
 from dataclasses import replace
 import json
@@ -45,7 +46,7 @@ def test_closed_local_dependency_without_completion_never_unblocks_or_creates_fi
     assert state["frontier"] == []
     assert state["remaining"] == {"ticket:3": "ticket_closed", "ticket:4": "blocked_by_incomplete_tickets"}
     assert state["final_subject"] is None
-    assert scenario.runner().run_once().call is None
+    assert prepare_scripted_agent(kernel, scenario.runner().run_once()).call is None
     assert kernel.status("ticket:4")["pending_attempt"] is None
 
 
@@ -333,7 +334,7 @@ def test_final_parent_drift_retires_old_work_and_restarts_full_review_without_re
     source = replace(original, parent=replace(original.parent, sub_issue_numbers=(3,)), issues=(original.issues[0],))
     scenario = GraphScenario(tmp_path / "graph", source, reviews=("pass", "fail", "pass") if dirty_repair else ("pass",))
     assert scenario.run().kind == "complete"
-    activation = scenario.runner().run_once()
+    activation = prepare_scripted_agent(scenario.kernel, scenario.runner().run_once())
     assert activation.reason == "final_activated"
     scenario.select(activation.subject)
     if dirty_repair:
@@ -357,7 +358,7 @@ def test_final_parent_drift_retires_old_work_and_restarts_full_review_without_re
     # The formal lifecycle entry requires explicit requeue at final_refresh.
     # An automatic operation must retain that gate and the old generation.
     calls_before, writes_before = len(scenario.role_calls), len(scenario.port.writes())
-    blocked = scenario.runner().run_once()
+    blocked = prepare_scripted_agent(scenario.kernel, scenario.runner().run_once())
     assert blocked.kind in {"paused", "quiescent"}
     assert scenario.kernel.status(scenario.delivery.key) == refreshed
     assert len(scenario.role_calls) == calls_before
@@ -545,7 +546,7 @@ def test_final_requirement_refresh_never_reuses_old_generation_human_response(tm
     source = replace(original, parent=replace(original.parent, sub_issue_numbers=(3,)), issues=(original.issues[0],))
     scenario = GraphScenario(tmp_path / "graph", source, reviews=("pass", "blocked", "pass"))
     assert scenario.run().kind == "complete"
-    activation = scenario.runner().run_once()
+    activation = prepare_scripted_agent(scenario.kernel, scenario.runner().run_once())
     assert activation.reason == "final_activated"
     scenario.select(activation.subject)
     assert scenario.run().reason == "human_blocker"
@@ -555,7 +556,7 @@ def test_final_requirement_refresh_never_reuses_old_generation_human_response(tm
     fresh = scenario.world()
     before = scenario.kernel.status(final)
     calls_before, writes_before = len(scenario.role_calls), len(scenario.port.writes())
-    blocked = scenario.runner().run_once()
+    blocked = prepare_scripted_agent(scenario.kernel, scenario.runner().run_once())
     assert blocked.kind in {"paused", "quiescent"}
     assert scenario.kernel.status(final) == before
     assert len(scenario.role_calls) == calls_before

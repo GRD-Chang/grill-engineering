@@ -1,4 +1,5 @@
 """Managed abandonment retains exact recovery obligations and authority."""
+from support.core_operations import prepare_scripted_agent
 from agent_run.core.operation_runner import OperationRunner
 
 import json
@@ -184,7 +185,7 @@ def test_abandon_continuation_settles_the_original_sent_intent_before_fresh_insp
     assert events[-2][0] == "execute" and events[-2][1].operation == "inspect_resources"
     assert not [write for write in scenario.port.writes() if write["operation"] == "retire_pr"]
     for _ in range(64):
-        step = scenario.runner().run_once()
+        step = prepare_scripted_agent(kernel, scenario.runner().run_once())
         if step.call is not None:
             scripted_return(kernel, scenario.runner(), step.call, scenario.agent)
         if step.kind == "complete":
@@ -262,9 +263,9 @@ def test_abandon_continuation_reinspects_after_a_late_dirty_observation(tmp_path
         return execute(effect, authorize)
 
     monkeypatch.setattr(scenario.port, "execute", record_inspection)
-    assert scenario.runner().run_once().kind == "progress"
+    assert prepare_scripted_agent(kernel, scenario.runner().run_once()).kind == "progress"
     inspected, = inspections_seen
-    assert scenario.runner().run_once().kind == "quiescent"
+    assert prepare_scripted_agent(kernel, scenario.runner().run_once()).kind == "quiescent"
     with kernel.storage.transaction(write=False) as tx:
         receipt = tx.one("SELECT receipt_id,subject FROM effects WHERE operation='inspect_resources' ORDER BY rowid DESC LIMIT 1")
         observed = json.loads(tx.get(receipt["receipt_id"], receipt["subject"]))
@@ -285,12 +286,12 @@ def test_abandon_continuation_reinspects_after_a_late_dirty_observation(tmp_path
     assert kernel.observe_host(continuation, HostObservation("running", continuation.unit_name, "new", "/new-host", "boot",
                                                            43, "new-start", usage_ready=True)) == "running"
     scenario.execution = Execution(continuation.run_id, continuation.owner, continuation.epoch)
-    assert scenario.runner().run_once().kind == "progress"
+    assert prepare_scripted_agent(kernel, scenario.runner().run_once()).kind == "progress"
     fresh = inspections_seen[-1]
     assert fresh.operation == "inspect_resources" and len(inspections_seen) == 2
     assert fresh.effect_id != inspected.effect_id
     for _ in range(32):
-        step = scenario.runner().run_once()
+        step = prepare_scripted_agent(kernel, scenario.runner().run_once())
         if step.call is not None:
             scripted_return(kernel, scenario.runner(), step.call, scenario.agent)
         if step.kind == "complete":
@@ -347,7 +348,7 @@ def test_managed_abandon_refuses_dirty_before_action_then_recovers_own_ticket(tm
     now = [1000.25]
     kernel.clock = lambda: now[0]
     for _ in range(100):
-        step = scenario.runner().run_once()
+        step = prepare_scripted_agent(kernel, scenario.runner().run_once())
         assert step.call is None
         if step.kind == "waiting" and step.retry_at is not None:
             now[0] = step.retry_at

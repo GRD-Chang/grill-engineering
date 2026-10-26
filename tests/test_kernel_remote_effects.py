@@ -1,4 +1,5 @@
 """Remote effects through real bare Git and an isolated stateful gh executable."""
+from support.core_operations import prepare_scripted_agent
 
 from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.core.operation_runner import OperationRunner
@@ -377,7 +378,7 @@ def test_real_issue_ack_stays_optional_and_once_across_kernel_reopen(tmp_path, m
             status = scenario.kernel.status("ticket:2")
             if status["phase"] == "complete" and status["resource_cleanup"]["state"] == "complete":
                 return
-            step = runner.run_once()
+            step = prepare_scripted_agent(scenario.kernel, runner.run_once())
             if step.call is not None:
                 settle_agent(scenario, runner, step.call)
         raise AssertionError("original Ticket did not complete with mandatory cleanup")
@@ -549,7 +550,7 @@ def test_final_observation_proves_real_current_completions_into_remote_run_befor
     from test_kernel_operation_runner import Ports, settle_agent
     runner = OperationRunner(scenario.kernel, scenario.execution, lambda binding: Ports(scenario))
     for _ in range(100):
-        step = runner.run_once()
+        step = prepare_scripted_agent(scenario.kernel, runner.run_once())
         if step.call is not None:
             settle_agent(scenario, runner, step.call)
         status = scenario.kernel.status("ticket:2")
@@ -595,7 +596,7 @@ def test_final_observation_proves_real_current_completions_into_remote_run_befor
     world = runner.observe(None)
     assert world.source == latest and world.target == default
     assert (completed[0]["merge_sha"], latest.sha) in world.ancestry
-    step = runner.run_once()
+    step = prepare_scripted_agent(scenario.kernel, runner.run_once())
     assert step.kind == "progress" and step.reason == "final_activated" and step.call is None
     final = step.subject
     assert scenario.kernel.delivery(final).base == latest

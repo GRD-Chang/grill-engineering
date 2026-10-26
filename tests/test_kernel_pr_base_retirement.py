@@ -1,4 +1,5 @@
 """Retirement proof, not an arbitrary CLOSED flag, permits stale-base closeout."""
+from support.core_operations import prepare_scripted_agent
 from dataclasses import replace
 import json
 
@@ -97,7 +98,7 @@ def test_closed_ancestor_base_never_replaces_original_retirement_proof(tmp_path,
         return
 
     assert kernel.control('requeue', 'owned-requeue', subject=subject, replacement=replacement, world=world) == 'pending'
-    assert scenario.runner().run_once().kind == 'progress'
+    assert prepare_scripted_agent(kernel, scenario.runner().run_once()).kind == 'progress'
     original, payload, receipt = _retirement(scenario)
     assert original['attempts'] == 1 and receipt['disposition'] == 'target'
     action = 'owned-requeue'
@@ -105,7 +106,7 @@ def test_closed_ancestor_base_never_replaces_original_retirement_proof(tmp_path,
         scenario.requirements = replace(scenario.requirements,
             parent=replace(scenario.requirements.parent, body=scenario.requirements.parent.body + '\nLatest requirement.'))
         scenario.world()
-        assert scenario.runner().run_once().reason == 'requeue_scope_changed'
+        assert prepare_scripted_agent(kernel, scenario.runner().run_once()).reason == 'requeue_scope_changed'
         assert _retirement(scenario)[0]['status'] == 'confirmed'
         scenario.port.external_pr_transition(old.pr.number, 'OPEN', 'another-maintainer')
         scenario.port.external_pr_transition(old.pr.number, 'CLOSED', 'another-maintainer')
@@ -147,7 +148,7 @@ def test_closed_ancestor_base_never_replaces_original_retirement_proof(tmp_path,
     for _ in range(8):
         if 'requeue_retirement_changed' in kernel.status(subject)['gates']:
             break
-        step = scenario.runner().run_once()
+        step = prepare_scripted_agent(kernel, scenario.runner().run_once())
         assert step.call is None
     assert kernel.status(subject)['generation'] == 1
     assert 'requeue_retirement_changed' in kernel.status(subject)['gates']

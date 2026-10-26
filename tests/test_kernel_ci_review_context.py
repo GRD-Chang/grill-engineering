@@ -1,4 +1,5 @@
 """Review repair inputs retain the active work budget and original CI facts."""
+from support.core_operations import prepare_scripted_agent
 import json
 from pathlib import Path
 
@@ -28,7 +29,7 @@ def test_ci_review_findings_reach_next_development_with_original_ci_and_budget(t
     first_budget = None
     failed_review = None
     for _ in range(160):
-        step = runner.run_once()
+        step = prepare_scripted_agent(kernel, runner.run_once())
         call = step.call
         if call is None:
             assert step.kind not in {'paused', 'waiting', 'approval', 'complete'}, step
@@ -53,7 +54,7 @@ def test_ci_review_findings_reach_next_development_with_original_ci_and_budget(t
                 assert call.context['ci_evidence'] == original == first_ci.context['ci_evidence']
                 assert now['ci']['window'] == first_budget['ci']['window']
                 assert now['ci']['development_limit'] == first_budget['ci']['development_limit'] == 3
-                assert now['ci']['developments_used'] == first_budget['ci']['developments_used'] + 1 == 2
+                assert now['ci']['developments_used'] == first_budget['ci']['developments_used'] + 1 == 1
                 assert now['ci']['reviews_used'] == first_budget['ci']['reviews_used'] + 1 == 1
                 assert {key: value for key, value in now.items() if key != 'ci'} == {
                     key: value for key, value in first_budget.items() if key != 'ci'}
@@ -67,6 +68,8 @@ def test_ci_review_findings_reach_next_development_with_original_ci_and_budget(t
                 assert call.context['acceptance_artifact'] == latest
                 assert call.context['repair_source'] == 'acceptance' and call.context['work_source'] == 'ci'
                 assert 'Raw synthetic failed job log' in prompt
+                scripted_return(kernel, runner, call, scenario.agent)
+                assert budgets(scenario)['ci']['developments_used'] == 2
                 return
         runner.authorize_agent(call)
         raw = json.loads(scenario.agent(call))
@@ -102,7 +105,9 @@ def test_non_ci_review_failure_keeps_acceptance_input_and_requirement_budget(tmp
     assert after['ci'] == before['ci'] and after['integration'] == before['integration']
     assert after['requirements']['window'] == before['requirements']['window']
     assert after['requirements']['development_limit'] == before['requirements']['development_limit']
-    assert after['requirements']['developments_used'] == before['requirements']['developments_used'] + 1 == 2
+    assert after['requirements']['developments_used'] == before['requirements']['developments_used'] + 1 == 1
+    scripted_return(kernel, operations.runner, repair, scenario.agent)
+    assert budgets(scenario)['requirements']['developments_used'] == 2
     assert after['requirements']['reviews_used'] == before['requirements']['reviews_used'] + 1 == 1
 
 

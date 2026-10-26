@@ -155,9 +155,9 @@ def test_prompt_preparation_failure_durably_releases_only_its_original_allocatio
     from test_kernel_requirements import independent_source
     scenario = GraphScenario(tmp_path / "preparation", independent_source())
     kernel = scenario.kernel
-    operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
+    operations = CoreOperations(kernel, scenario.execution, scenario.make_ports, prepare_agents=False)
     runner = operations.runner
-    call = operations.until(lambda step: step.call is not None).call
+    call = operations.until(lambda step: step.preparation is not None).preparation
     assert call is not None
     driver = executor._Executor(kernel, runner, {})
 
@@ -173,9 +173,11 @@ def test_prompt_preparation_failure_durably_releases_only_its_original_allocatio
     assert runner.worker_settled(call)
     status = kernel.status(call.subject)
     assert status["pending_attempt"] == call.attempt_id
-    assert status["budgets"]["requirements"]["developments_used"] == 1
+    assert status["budgets"]["requirements"]["developments_used"] == 0
     assert "worker_unavailable" in status["gates"]
-    assert kernel.operation_state().active == ()
+    assert kernel.operation_state().active == () and kernel.operation_state().preparing == ()
+    with kernel.storage.transaction(write=False) as tx:
+        assert not tx.rows("SELECT id FROM invocations")
 
 
 def test_stop_between_dispatch_and_write_does_not_invent_a_command_failure(

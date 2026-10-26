@@ -4,6 +4,7 @@ Agent calls before the cut are fixture files/raw; no Agent starts during either
 operational observation. Git/SQLite and the admitted executor.run loop remain real. A
 controlled systemd process and OS sandbox acceptance are separate obligations.
 """
+from support.core_operations import prepare_scripted_agent
 import os
 from pathlib import Path
 
@@ -78,7 +79,7 @@ def test_direct_claim_quiesces_at_unknown_push_and_resume_reads_its_original(
 
     kernel.control("resume", "resume-original-push", subject=scenario.delivery.key)
     for _ in range(12):
-        step = runner.run_once()
+        step = prepare_scripted_agent(kernel, runner.run_once())
         assert step.call is None
         if kernel.status(scenario.delivery.key)["phase"] == "approval":
             break

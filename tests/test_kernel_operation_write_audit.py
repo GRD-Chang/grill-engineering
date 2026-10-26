@@ -1,4 +1,5 @@
 """A nonzero physical write remains audited when exact readback succeeds."""
+from support.core_operations import prepare_scripted_agent
 from agent_run.core.operation_runner import OperationRunner
 import json
 from pathlib import Path
@@ -37,7 +38,7 @@ def test_actual_nonzero_push_is_audited_once_despite_target_readback(tmp_path, m
     agents = Scenario(tmp_path / "agents", DeliveryKind.PARENT_ONLY)
     agents.kernel, agents.port.git = kernel, git
     for _ in range(60):
-        step = runner.run_once()
+        step = prepare_scripted_agent(kernel, runner.run_once())
         if step.call is not None:
             runner.authorize_agent(step.call)
             kernel.receive(step.call, agents.agent(step.call))
@@ -56,7 +57,7 @@ def test_actual_nonzero_push_is_audited_once_despite_target_readback(tmp_path, m
         assert "Original successful push lost its acknowledgement" in diagnostic["message"]
         assert len(tx.rows("SELECT position FROM history WHERE kind='effect_failed' AND identity=?", (effect["id"],))) == 1
     # Another committed transition may not repeat or erase the audit.
-    assert runner.run_once().kind == "progress"
+    assert prepare_scripted_agent(kernel, runner.run_once()).kind == "progress"
     with kernel.storage.transaction(write=False) as tx:
         assert tx.one("SELECT count(*) FROM effect_failures")[0] == 1
 

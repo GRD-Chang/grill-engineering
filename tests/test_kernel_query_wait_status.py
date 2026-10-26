@@ -1,4 +1,5 @@
 """Public waiting status follows the recorded wait, without running Core."""
+from support.core_operations import prepare_scripted_agent
 from dataclasses import replace
 import json
 import time
@@ -54,7 +55,7 @@ def test_public_checks_status_reads_the_original_committed_wait(
     if later is not None:
         observed[0], now[0] = later, 105.25
         for _ in range(4):
-            step = scenario.runner().run_once()
+            step = prepare_scripted_agent(scenario.kernel, scenario.runner().run_once())
             if step.kind == 'waiting':
                 assert step.reason == wait_kind
                 break

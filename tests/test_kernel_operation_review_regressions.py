@@ -8,6 +8,7 @@ The native push cases execute an actual local command and inspect its actual
 exit status. They never replace a CompletedProcess or forge write_returncode.
 """
 from __future__ import annotations
+from support.core_operations import prepare_scripted_agent
 
 from agent_run.contracts.write_authority import WriteAuthority
 
@@ -80,12 +81,12 @@ def test_a_read_finishing_after_the_absolute_wait_deadline_allocates_no_agent(
         state = kernel.status(scenario.delivery.key)
         if state["phase"] == "development" and state["pending_attempt"] is None:
             break
-        assert runner.run_once().call is None
+        assert prepare_scripted_agent(kernel, runner.run_once()).call is None
     else:
         raise AssertionError("Normal workspace operations never reached Development")
     with monkeypatch.context() as outage:
         outage.setattr(runner.ports, "source", _outage)
-        assert runner.run_once().retry_at == 105.25
+        assert prepare_scripted_agent(kernel, runner.run_once()).retry_at == 105.25
     assert _window(scenario)["deadline"] == 700.25
     before = kernel.status(scenario.delivery.key)
     physical_read = getattr(runner.ports, stage)
@@ -97,7 +98,7 @@ def test_a_read_finishing_after_the_absolute_wait_deadline_allocates_no_agent(
 
     monkeypatch.setattr(runner.ports, stage, finishes_late)
     now[0] = 105.25
-    step = runner.run_once()
+    step = prepare_scripted_agent(kernel, runner.run_once())
     after = kernel.status(scenario.delivery.key)
     # Independently check absence of allocation before the returned category.
     assert step.call is None
@@ -182,7 +183,7 @@ raise SystemExit(response.returncode)
     monkeypatch.setattr(runner.ports, "reconcile", lambda effect:
                         native.reconcile(effect) if effect.operation == "push" else reconcile(effect))
     for _ in range(48):
-        step = runner.run_once()
+        step = prepare_scripted_agent(scenario.kernel, runner.run_once())
         if step.call is not None:
             scripted_return(scenario.kernel, runner, step.call, scenario.agent)
         if observed:
@@ -206,7 +207,7 @@ raise SystemExit(response.returncode)
         assert len(_failures(scenario)) == (1 if command_exit else 0)
         marker.unlink()
         now[0] = 106.25
-        runner.run_once(agent_capacity=0)  # Only read back this original intent.
+        prepare_scripted_agent(scenario.kernel, runner.run_once(agent_capacity=0))  # Only read back this original intent.
     else:
         assert isinstance(physical, EffectResult)
         assert physical.disposition == "target"
@@ -278,7 +279,7 @@ def test_formal_graph_completion_final_still_retires_the_remote_run_branch(tmp_p
     for _ in range(12):
         if scenario.kernel.source_status()["final_subject"] is not None:
             break
-        assert runner.run_once().call is None
+        assert prepare_scripted_agent(scenario.kernel, runner.run_once()).call is None
     else:
         raise AssertionError("The real Completion never admitted Final")
     scenario.select(scenario.kernel.source_status()["final_subject"])

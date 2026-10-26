@@ -1,4 +1,5 @@
 """Physical read outages become Core waits without importing concrete adapters."""
+from support.core_operations import prepare_scripted_agent
 from agent_run.core.operation_runner import OperationRunner
 import os
 from pathlib import Path
@@ -23,7 +24,7 @@ def test_bootstrap_read_outage_retains_original_wait_and_lease(tmp_path):
     from agent_run.core.operation_contract import ReadUnavailable
     s, ports, runner = setup(tmp_path, dependent=True)
     for _ in range(12):
-        step = runner.run_once()
+        step = prepare_scripted_agent(s.kernel, runner.run_once())
         if step.call is not None:
             call = step.call
             break
@@ -99,7 +100,7 @@ def test_slow_successful_read_cannot_allocate_past_the_original_wait_deadline(tm
         raise ReadUnavailable("github_read_failed", "Original source outage")
 
     ports.source = unavailable
-    assert runner.run_once().retry_at == 105.25
+    assert prepare_scripted_agent(s.kernel, runner.run_once()).retry_at == 105.25
     ports.source = source
     read = source if physical_read == "source" else delivery
 
@@ -110,7 +111,7 @@ def test_slow_successful_read_cannot_allocate_past_the_original_wait_deadline(tm
 
     setattr(ports, physical_read, slow)
     now[0] = 105.25
-    expired = runner.run_once()
+    expired = prepare_scripted_agent(s.kernel, runner.run_once())
     assert expired.reason == "supervision_timeout" and expired.call is None
     with s.kernel.storage.transaction(write=False) as tx:
         assert tuple(tx.one("SELECT started_at,deadline FROM waits")) == (100.25, 700.25)

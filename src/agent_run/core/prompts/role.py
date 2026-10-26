@@ -13,7 +13,7 @@ from agent_run.core.prompts.publication import publication_continuation_prompt, 
 from agent_run.core.prompts.review import review_continuation_prompt, review_prompt
 from agent_run.config.resources import selected_language
 
-from agent_run.model import AgentCall, DeliveryKind, Purpose, Role
+from agent_run.model import AgentCall, AgentPreparation, DeliveryKind, Purpose, Role
 from agent_run.errors import KernelError
 
 
@@ -83,7 +83,7 @@ def render_prompt(request: dict[str, Any], role: str, *, continuation: bool = Fa
     raise KernelError("prompt_role")
 
 
-def render_role_prompt(call: AgentCall) -> str:
+def render_role_prompt(call: AgentCall | AgentPreparation) -> str:
     """No current settings, Git reads, state writes or successor decisions."""
     context = call.context
     # Never let the legacy pure renderers' optional resource fallback read a

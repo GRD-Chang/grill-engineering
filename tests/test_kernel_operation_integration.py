@@ -1,4 +1,5 @@
 """Actual Core operation runner through Host; Agent and GitHub are synthetic."""
+from support.core_operations import prepare_scripted_agent
 from agent_run.core.operation_runner import OperationRunner
 from agent_run.errors import KernelError
 import pytest
@@ -49,11 +50,15 @@ def test_host_real_core_original_merge_readback_final_approval_and_cleanup(tmp_p
     scenario.port.lose_response.add("merge")
     monkeypatch.setattr(executor, "_make_ports", lambda binding: ports)
 
-    def execute(kernel, call, **kwargs):
+    def execute(kernel, preparation, **kwargs):
+        call = prepare_scripted_agent(kernel, preparation).call
+        assert call is not None
         assert kernel.dispatch_agent(call)
-        kwargs["authorize_source"]()
+        kwargs["authorize_source"](call)
         process = {"pid": 4242, "start_token": "synthetic-worker", "pgid": 4242, **host}
         kernel.agent_started(call, process)
+        kwargs["authorize_source"](call)
+        kernel.agent_source_ready(call)
         try:
             scenario.select(call.subject)  # Metadata for the call Core already allocated.
             kernel.receive(call, scenario.agent(call))
@@ -116,7 +121,7 @@ def test_bootstrap_source_outage_keeps_original_call_and_bounded_read_wait(tmp_p
             assert not tx.rows("SELECT * FROM effect_failures")
         assert not runner.worker_settled(call)
         assert kernel.status(call.subject)["pending_attempt"] == call.attempt_id
-        assert kernel.status(call.subject)["budgets"]["requirements"]["developments_used"] == 1
+        assert kernel.status(call.subject)["budgets"]["requirements"]["developments_used"] == 0
     failing[0] = False
     _change(state, read_error=False)
     now[0] = 120.25
@@ -144,7 +149,7 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
     for _ in range(80):
         if scenario.kernel.status("ticket:3")["phase"] == "checks":
             break
-        step = runner.run_once()
+        step = prepare_scripted_agent(scenario.kernel, runner.run_once())
         if step.call is not None:
             # Preserve the synthetic producer's exact start/return/exit hooks,
             # with a process witness belonging to this already admitted Host.
@@ -185,11 +190,15 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
         return facts
     monkeypatch.setattr(ports, "delivery", read)
     monkeypatch.setattr(executor, "_make_ports", lambda binding: ports)
-    def execute(kernel, call, **kwargs):
+    def execute(kernel, preparation, **kwargs):
+        call = prepare_scripted_agent(kernel, preparation).call
+        assert call is not None
         assert kernel.dispatch_agent(call)
-        kwargs["authorize_source"]()
+        kwargs["authorize_source"](call)
         process = {"pid": 5252, "start_token": "synthetic-worker", "pgid": 5252, **host}
         kernel.agent_started(call, process)
+        kwargs["authorize_source"](call)
+        kernel.agent_source_ready(call)
         try:
             if call.subject == "ticket:4" and not entered.is_set():
                 now[0] = 111.25
@@ -226,12 +235,16 @@ def test_real_core_future_failure_and_raw_cannot_release_unknown_process(tmp_pat
     ports = Ports(scenario)
     selected = []
     monkeypatch.setattr(executor, "_make_ports", lambda binding: ports)
-    def execute(kernel, call, **kwargs):
+    def execute(kernel, preparation, **kwargs):
+        call = prepare_scripted_agent(kernel, preparation).call
+        assert call is not None
         selected.append(call)
         assert kernel.dispatch_agent(call)
-        kwargs["authorize_source"]()
+        kwargs["authorize_source"](call)
         process = {"pid": 6262, "start_token": "synthetic-worker", "pgid": 6262, **host}
         kernel.agent_started(call, process)
+        kwargs["authorize_source"](call)
+        kernel.agent_source_ready(call)
         scenario.select(call.subject)
         kernel.receive(call, scenario.agent(call))
         raise RuntimeError("synthetic exit observation unavailable")

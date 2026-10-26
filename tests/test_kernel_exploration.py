@@ -17,17 +17,10 @@ from agent_run.errors import KernelError
 from support.offline import Scenario, review_result
 from agent_run.model import wire_json
 from support.core_operations import CoreOperations, native_agent_fixture, scripted_return
+from support.agent_continuation import ticket_spec
 from support.effect_boundary import EffectBoundary, effect_boundary
 
 
-def ticket_spec() -> RunSpec:
-    base = Commit("base", "base-tree")
-    return RunSpec(
-        "offline-run", "example/repository", 1, "parent-v1", "graph-v1",
-        (Delivery("ticket:2", DeliveryKind.TICKET, 2, "ticket-v1", base,
-                  "refs/heads/ticket-2", "refs/heads/run"),),
-        Policy(ticket_rounds=1),
-    )
 
 
 def test_return_is_durable_before_consumption_and_resume_does_not_charge_twice(tmp_path: Path) -> None:

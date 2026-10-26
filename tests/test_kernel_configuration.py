@@ -1,4 +1,5 @@
 """Creation defaults become native facts; existing Threads never read new defaults."""
+from support.core_operations import prepare_scripted_agent
 
 from agent_run.contracts.write_authority import WriteAuthority
 
@@ -204,7 +205,7 @@ raise SystemExit(response.returncode)
 
     monkeypatch.setattr(runner.ports, "execute", execute_original)
     for _ in range(48):
-        step = runner.run_once()
+        step = prepare_scripted_agent(scenario.kernel, runner.run_once())
         if step.call is not None:
             scripted_return(scenario.kernel, runner, step.call, scenario.agent)
         if observed:

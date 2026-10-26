@@ -1,4 +1,5 @@
 """Public Core operation seam: selection, bounded I/O and durable settlement."""
+from support.core_operations import prepare_scripted_agent
 from agent_run.core.operation_runner import OperationRunner, observe_control
 from agent_run.contracts.write_authority import WriteAuthority
 from pathlib import Path
@@ -103,12 +104,17 @@ def test_allocated_agent_returns_immediately_without_post_allocation_read(tmp_pa
     ports.source, ports.delivery = slow_source, slow_delivery
     for _ in range(20):
         step = runner.run_once()
-        if step.call is not None:
-            assert s.kernel.status(step.subject)["pending_attempt"] == step.call.attempt_id
-            assert step.call.deadline_at == now[0] + step.call.deadline_seconds
-            assert not runner.worker_settled(step.call)
+        if step.preparation is not None:
+            assert s.kernel.status(step.subject)["pending_attempt"] == step.preparation.attempt_id
+            assert step.call is None
+            assert step.preparation.preparation_deadline == now[0] + 600
+            with s.kernel.storage.transaction(write=False) as tx:
+                assert not tx.rows("SELECT id FROM invocations")
+            admitted = prepare_scripted_agent(s.kernel, step).call
+            assert admitted is not None and admitted.deadline_at == now[0] + admitted.deadline_seconds
+            assert not runner.worker_settled(step.preparation)
             return
-    raise AssertionError("Core did not return the allocated AgentCall")
+    raise AssertionError("Core did not return the reserved AgentPreparation")
 
 
 def settle_agent(s, runner, call):
@@ -128,7 +134,7 @@ def test_one_operation_returns_committed_publication_final_and_cleanup_boundarie
     s, ports, runner = setup(tmp_path)
     published = set()
     for _ in range(160):
-        step = runner.run_once()
+        step = prepare_scripted_agent(s.kernel, runner.run_once())
         if step.call is not None:
             settle_agent(s, runner, step.call)
         if step.subject and s.kernel.status(step.subject)["phase"] == "publish":
@@ -150,7 +156,7 @@ def test_one_operation_returns_committed_publication_final_and_cleanup_boundarie
             assert s.kernel.status(final)["phase"] == "complete"
             assert s.kernel.status(final)["resource_cleanup"]["state"] == "complete"
             return
-        step = runner.run_once()
+        step = prepare_scripted_agent(s.kernel, runner.run_once())
         if step.call is not None:
             settle_agent(s, runner, step.call)
     raise AssertionError("Approved Final did not close and settle its resources")
@@ -158,7 +164,7 @@ def test_one_operation_returns_committed_publication_final_and_cleanup_boundarie
 
 def drive_until(s, runner, predicate):
     for _ in range(160):
-        step = runner.run_once()
+        step = prepare_scripted_agent(s.kernel, runner.run_once())
         if predicate(step):
             return step
         if step.call is not None:
@@ -264,7 +270,7 @@ def test_expired_unlaunched_allocation_needs_no_slow_source_read(tmp_path):
     ports.source = forbidden_read
     assert runner.state().disposition == "ready"
     assert runner.state().wake_at is None
-    assert runner.run_once().reason == "invocation_deadline_exceeded"
+    assert prepare_scripted_agent(s.kernel, runner.run_once()).reason == "invocation_deadline_exceeded"
     assert runner.worker_settled(selected.call)
 
 
@@ -291,7 +297,7 @@ def test_n1_long_agent_keeps_independent_ci_poll_and_exact_seat(tmp_path):
     s.kernel.agent_started(selected.call, process)
     before = len(polled)
     now[0] = 106.25
-    step = runner.run_once(agent_capacity=0)
+    step = prepare_scripted_agent(s.kernel, runner.run_once(agent_capacity=0))
     assert step.call is None and len(polled) > before
     assert s.kernel.status("ticket:3")["holds_integration"]
     assert runner.state().active == (selected.call.lease_id,)
@@ -304,7 +310,7 @@ def test_ready_fifo_is_preserved_while_host_has_no_new_agent_slot(tmp_path):
     assert first.call.subject == "ticket:3"
     before = s.kernel.status("ticket:4")["budgets"]
     for _ in range(8):
-        step = runner.run_once(agent_capacity=0)
+        step = prepare_scripted_agent(s.kernel, runner.run_once(agent_capacity=0))
         assert step.call is None
         if step.kind == "needs_agent" and step.subject == "ticket:4":
             break
@@ -366,7 +372,7 @@ def test_sent_merge_can_settle_a_late_readback_without_new_write_or_attempt(tmp_
 
     ports.execute = lost
     for _ in range(100):
-        step = runner.run_once()
+        step = prepare_scripted_agent(s.kernel, runner.run_once())
         if step.call is not None:
             settle_agent(s, runner, step.call)
         if sent:
@@ -376,7 +382,7 @@ def test_sent_merge_can_settle_a_late_readback_without_new_write_or_attempt(tmp_
     effect, = sent
     assert step.reason == "original_write_readback_required"
     ports.reconcile = lambda selected: EffectResult(uncertain) if selected == effect else reconcile(selected)
-    assert runner.run_once().kind == "paused"
+    assert prepare_scripted_agent(s.kernel, runner.run_once()).kind == "paused"
     with s.kernel.storage.transaction(write=False) as tx:
         attempts = tx.one("SELECT count(*) FROM attempts")[0]
         original = tuple(tx.one("SELECT status,attempts FROM effects WHERE id=?", (effect.effect_id,)))
@@ -385,7 +391,7 @@ def test_sent_merge_can_settle_a_late_readback_without_new_write_or_attempt(tmp_
     # A known manual gate does not turn Host supervision into a busy poll.
     assert runner.state().disposition == "quiescent"
     ports.reconcile = reconcile
-    assert runner.run_once().kind == "progress"
+    assert prepare_scripted_agent(s.kernel, runner.run_once()).kind == "progress"
     with s.kernel.storage.transaction(write=False) as tx:
         assert tx.one("SELECT count(*) FROM attempts")[0] == attempts
         assert tuple(tx.one("SELECT status,attempts FROM effects WHERE id=?", (effect.effect_id,))) == ("observed", 1)
@@ -401,7 +407,7 @@ def test_original_approved_prior_merge_continues_new_review_without_a_new_contro
     ports = Ports(s)
     runner = OperationRunner(s.kernel, s.execution, lambda binding: ports)
     for _ in range(120):
-        step = runner.run_once()
+        step = prepare_scripted_agent(s.kernel, runner.run_once())
         if step.call is not None:
             settle_agent(s, runner, step.call)
         if s.kernel.source_status()["final_subject"] is not None and s.kernel.status("final:1")["phase"] == "approval":
@@ -421,7 +427,7 @@ def test_original_approved_prior_merge_continues_new_review_without_a_new_contro
 
     ports.execute = interrupted
     for _ in range(10):
-        runner.run_once()
+        prepare_scripted_agent(s.kernel, runner.run_once())
         if sent:
             break
     effect, = sent
@@ -429,13 +435,13 @@ def test_original_approved_prior_merge_continues_new_review_without_a_new_contro
     s.requirements = replace(source, parent=replace(source.parent, body="Changed after the original approval"))
     runner.observe("final:1")
     ports.execute = execute
-    assert runner.run_once().kind == "progress"
+    assert prepare_scripted_agent(s.kernel, runner.run_once()).kind == "progress"
     assert s.kernel.source_status()["blocked"] == "final_refresh"
     with pytest.raises(KernelError, match="final_approval_noncancellable"):
         s.kernel.control("requeue", "cannot-replace-approval", subject="final:1", world=observe_control(s.kernel, "final:1", lambda binding: ports))
     assert runner.state().disposition == "ready"
     for _ in range(80):
-        step = runner.run_once()
+        step = prepare_scripted_agent(s.kernel, runner.run_once())
         if step.call is not None:
             settle_agent(s, runner, step.call)
         status = s.kernel.status("final:1")
@@ -476,7 +482,7 @@ def test_cleanup_records_foreign_observation_and_keeps_absence_admission(tmp_pat
 
     ports.execute = changed
     for _ in range(100):
-        step = runner.run_once()
+        step = prepare_scripted_agent(s.kernel, runner.run_once())
         if step.call is not None:
             settle_agent(s, runner, step.call)
         if inspected:
@@ -497,5 +503,5 @@ def test_cleanup_records_foreign_observation_and_keeps_absence_admission(tmp_pat
         else:
             assert step.kind == "progress" and row["status"] == "observed" and row["receipt_id"]
     if external_change == "absent":
-        assert runner.run_once().kind == "progress"
+        assert prepare_scripted_agent(s.kernel, runner.run_once()).kind == "progress"
         assert s.kernel.status(effect.subject)["resource_cleanup"]["stage"] == 2

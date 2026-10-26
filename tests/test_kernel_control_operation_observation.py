@@ -1,4 +1,5 @@
 """Manual managed controls share Core observation without an Executor claim."""
+from support.core_operations import prepare_scripted_agent
 from agent_run.core.operation_runner import OperationRunner, observe_control
 from dataclasses import replace
 import json
@@ -119,7 +120,7 @@ def managed_approval(tmp_path, monkeypatch, *, tickets, language="en"):
     agents.kernel, agents.port.git = kernel, physical.git
     subject = "final:1" if tickets else "parent:1"
     for _ in range(180):
-        step = runner.run_once()
+        step = prepare_scripted_agent(kernel, runner.run_once())
         if step.call is not None:
             runner.authorize_agent(step.call)
             kernel.receive(step.call, agents.agent(step.call))

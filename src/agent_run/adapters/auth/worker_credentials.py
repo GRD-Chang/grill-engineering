@@ -29,7 +29,7 @@ class NativeCredentialDelivery:
             provider, on_update=self._write, on_exhausted=self._exhausted,
         )
 
-    def start(self) -> None:
+    def start(self, *, guard: Callable[[], None] | None = None, deadline: float | None = None) -> None:
         with self._lock:
             if self._closed:
                 raise InitialCredentialUnavailable("Credential delivery is closed")
@@ -37,7 +37,7 @@ class NativeCredentialDelivery:
             self.directory.chmod(0o700)
             # Declare the native schema before gh can try an online user migration.
             self._replace_config("config.yml", {"version": "1"})
-        self.lifecycle.start()
+        self.lifecycle.start(guard=guard, deadline=deadline)
 
     def _write(self, credential: ReadCredential) -> None:
         self._replace_config("hosts.yml", {"github.com": {
