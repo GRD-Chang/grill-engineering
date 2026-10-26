@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shlex
 from typing import Any
 
 from agent_run.contracts.copy import selected_language, text
@@ -29,7 +30,8 @@ def event_envelope(state: dict[str, Any], kind: str, identity: object, title: st
         "phase": event_copy(state, "delivery"), "round": None, "duration_seconds": None,
         "summary": "", "next_step": "", "current": False,
         "url": f"https://github.com/{repository}/issues/{number}" if number else None,
-        "query": f"agent-run history {state.get('run_id')} --details", **facts,
+        "query": shlex.join(["agent-run", "history", "--repo", repository, "--details", "--",
+                             str(state.get("run_id"))]), **facts,
     }
 
 

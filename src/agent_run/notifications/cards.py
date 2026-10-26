@@ -1,7 +1,9 @@
 """Fixed Feishu Card 2.0 compact template; no model-generated formatting."""
 from __future__ import annotations
 
+import json
 import re
+import unicodedata
 from typing import Any
 from urllib.parse import urlparse
 
@@ -23,6 +25,24 @@ def card(event: dict[str, Any]) -> dict[str, Any]:
 
     def copy(key: str, **values: object) -> str:
         return text("card." + key, language=language, **values)
+
+    # Bound the combined addition of literal guidance, including JSON escapes.
+    guidance_remaining = 4096
+
+    def guidance(value: object) -> str:
+        # Guidance may be executable. Never fold/truncate it or infer its shell
+        # syntax. A code fence preserves literal whitespace and Markdown bytes.
+        nonlocal guidance_remaining
+        literal = str(value)
+        if any(unicodedata.category(character) in {"Cc", "Cf"} for character in literal):
+            return copy("guidance_unavailable")
+        fence = "`" * max(3, 1 + max((len(run) for run in re.findall(r"`+", literal)), default=0))
+        content = f"\n{fence}\n{literal}\n{fence}"
+        size = len(json.dumps(content, ensure_ascii=False).encode("utf-8"))
+        if size > guidance_remaining:
+            return copy("guidance_too_long")
+        guidance_remaining -= size
+        return content
 
     def duration(value: int) -> str:
         minutes, seconds = divmod(value, 60)
@@ -56,7 +76,7 @@ def card(event: dict[str, Any]) -> dict[str, Any]:
         target = f"#{action['issue']}" if action["issue"] else repository
         lines.append(copy("field", label=copy("boundary." + action["scope"]), value=_markdown(target)))
         lines.extend(_markdown(reason) for reason in action["reasons"])
-        lines.append(copy("field", label=copy("next_step"), value=_markdown(action["next_action"])))
+        lines.append(copy("field", label=copy("next_step"), value=guidance(action["next_action"])))
     checks = event.get("checks") or {}
     labels = {name: copy("check." + name) for name in ("e2e", "standards", "review", "spec")}
     results = {result: copy("result." + result) for result in ("pass", "fail", "blocked")}
@@ -115,17 +135,17 @@ def card(event: dict[str, Any]) -> dict[str, Any]:
             if facts.get("shared_rounds"):
                 lines.append(copy("effort.shared_rounds"))
     if event.get("next_step"):
-        lines.append(copy("field", label=f"**{copy('next_step')}**", value=_markdown(event["next_step"])))
+        lines.append(copy("field", label=f"**{copy('next_step')}**", value=guidance(event["next_step"])))
     if event.get("status_query") and event["status_query"] != event.get("next_step"):
-        lines.append(copy("field", label=copy("current_status"), value=_markdown(event["status_query"])))
+        lines.append(copy("field", label=copy("current_status"), value=guidance(event["status_query"])))
     elements: list[dict[str, Any]] = [{"tag": "markdown", "content": "\n".join(lines)}]
     if effort or any(len(str(event.get(key) or "")) > 260 for key in ("summary", "next_step")):
-        elements.append({"tag": "markdown", "content": copy("field", label=copy("full_record"), value=f"`{_text(event.get('query', ''), 160).replace('`', '')}`")})
+        elements.append({"tag": "markdown", "content": copy("field", label=copy("full_record"), value=guidance(event.get('query', '')))})
     url = event.get("url")
     if isinstance(url, str) and urlparse(url).scheme == "https" and urlparse(url).hostname == "github.com":
         elements.append({"tag": "button", "text": {"tag": "plain_text", "content": copy("open_pr" if "/pull/" in url else "open_issue")},
                          "type": "default", "behaviors": [{"type": "open_url", "default_url": url}]})
-    return {
+    result = {
         "schema": "2.0",
         "config": {"width_mode": "compact", "summary": {"content": _text(f"{repository} #{number} · {event['title']}", 160)}},
         "header": {"title": {"tag": "plain_text", "content": _text(event["title"], 100)},
@@ -133,3 +153,8 @@ def card(event: dict[str, Any]) -> dict[str, Any]:
                    "template": event.get("color", "blue")},
         "body": {"direction": "vertical", "padding": "12px", "elements": elements},
     }
+    # Do not send a partial card or silently drop blockers to fit Feishu's 30KB
+    # message limit. The sender already records rendering failures as failures.
+    if len(json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) > 30_000:
+        raise ValueError(copy("payload_too_large"))
+    return result
