@@ -16,10 +16,41 @@ from typing import Any, Mapping, Sequence
 from agent_run.contracts.agent_profiles import resolve_profiles
 from agent_run.contracts.policy import positive_seconds
 from agent_run.errors import AgentProfileError
-from agent_run.model import AgentPreparation, Execution, Purpose, Role
+from agent_run.model import AgentPreparation, Execution, Purpose, Role, artifact, review_outcome
 from agent_run.queries.execution import recorded_profile
 from agent_run.storage.sqlite import Transaction
 from agent_run.contracts.copy import text
+
+
+def recorded_review(tx: Transaction, run: Mapping[str, Any], job: Mapping[str, Any]) -> str:
+    """Describe recorded applicability, never claim a fresh remote observation."""
+    current = (tx.one("SELECT * FROM attempts WHERE id=? AND subject=?", (job["current_attempt"], job["id"]))
+               if job["current_attempt"] else None)
+    active = current is not None and current["role"] == "review"
+    review = current if active else (tx.one("SELECT * FROM attempts WHERE id=? AND subject=?",
+        (job["review_attempt"], job["id"])) if job["review_attempt"] else None)
+    if review is None:
+        return "not_recorded"
+    snapshots = tx.rows("SELECT target_sha FROM integration_snapshots WHERE subject=? ORDER BY window DESC LIMIT 1", (job["id"],))
+    base = snapshots[0][0] if snapshots else job["integration_target"] or job["base_sha"]
+    revision = (tx.one("SELECT revision FROM issue_facts WHERE issue=?", (job["issue"],))[0]
+                if job["kind"] == "ticket" else run["observed_parent_revision"])
+    if (review["role"] != "review" or review["generation"] != job["generation"]
+            or review["revision"] != job["revision"] or review["revision"] != revision
+            or review["parent_revision"] != run["parent_revision"] or review["parent_revision"] != run["observed_parent_revision"]
+            or review["graph_revision"] != run["graph_revision"] or review["graph_revision"] != run["observed_graph_revision"]
+            or review["base_sha"] != base or any(review[key] != job[key] for key in (
+                "candidate_sha", "candidate_tree", "expected_tree", "completion_revision"))
+            or review["candidate_sha"] is None or review["candidate_tree"] is None):
+        return "stale"
+    if active and review["status"] in {"allocated", "running", "returned", "continuing"}:
+        return "pending"
+    if review["status"] != "consumed" or review["result_id"] is None or review["outcome"] not in {"pass", "fail"}:
+        return "unknown"
+    result = artifact(Role.REVIEW, tx.get(review["result_id"], job["id"]))
+    if review_outcome(result) != review["outcome"]:
+        return "unknown"
+    return "pass" if review["outcome"] == "pass" else "request_changes"
 
 
 class QueryError(ValueError):
