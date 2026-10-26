@@ -173,6 +173,6 @@ def _review_ranges(request: dict[str, Any]) -> str:
         }
     displayed = {
         "facts": displayed_facts,
-        **{key: context[key] for key in ("full_range", "focus_range", "has_complete_baseline")},
+        "review_range": context["review_range"],
     }
-    return resource(request, "review/context-ranges").format(pretty(displayed))
+    return resource(request, "review/fixed-range").format(pretty(displayed))

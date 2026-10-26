@@ -79,13 +79,16 @@ def test_original_integration_receipt_survives_review_continuation_and_findings(
     assert record['receipt'] == original
     assert record['subject'] == repair.subject and record['generation'] == 1
     assert record['development_attempt'] == repair.attempt_id and record['development_summary'] == summary
+    assert review.context['review_context']['review_range'] == {
+        'base_sha': record['target_sha'], 'candidate_sha': review.context['reviewed_commit']}
+    assert 'development_summary' not in review.context['review_context']['facts']
     with scenario.kernel.storage.transaction(write=False) as tx:
         effect = tx.one('SELECT subject,generation,receipt_id,status FROM effects WHERE id=?', (record['effect_id'],))
         assert tuple(effect) == (repair.subject, 1, record['receipt_id'], 'confirmed')
         assert json.loads(tx.get(record['receipt_id'], repair.subject)) == original
         assert json.loads(tx.get(record['development_result'], repair.subject))['summary'] == summary
     prompt = render_role_prompt(review)
-    assert summary in prompt and 'merge_head' in prompt and record['receipt_id'] in prompt
+    assert prompt.count(summary) == 1 and 'merge_head' in prompt and record['receipt_id'] in prompt
     assert review.context['review_context']['facts']['current_review_identity']['reviewed_candidate_sha'] == review.context['reviewed_commit']
     runner.authorize_agent(review)
     scenario.kernel.receive(review, wire_json(review_result('blocked')))
@@ -120,6 +123,10 @@ def test_original_integration_receipt_survives_review_continuation_and_findings(
     assert updated['development_summary'] == json.loads(followup_raw)['summary']
     assert rereview.attempt_id != review.attempt_id and rereview.thread_id != continued.thread_id
     assert rereview.context['review_context']['facts']['previous_acceptance_artifact'] == review_result('fail')
+    assert rereview.context['review_context']['review_range'] == {
+        'base_sha': review.context['reviewed_commit'], 'candidate_sha': rereview.context['reviewed_commit']}
+    assert 'development_summary' not in rereview.context['review_context']['facts']
+    assert render_role_prompt(rereview).count(updated['development_summary']) == 1
     if not new_thread:
         from dataclasses import replace
         runner.authorize_agent(rereview)

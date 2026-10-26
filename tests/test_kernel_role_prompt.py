@@ -148,7 +148,7 @@ def test_same_thread_new_development_attempt_keeps_complete_repair_method(tmp_pa
             assert first is not None and not reviewed
             prompt = run_prompt_call(scenario.kernel, call, tmp_path, json.dumps(review_result("fail")).encode())
             context = call.context["review_context"]
-            assert context["full_range"]["candidate_sha"] in prompt
+            assert context["review_range"]["candidate_sha"] in prompt
             reviewed = True
         elif call.role == Role.DEVELOPMENT:
             raw = b'{"result_kind":"development","summary":"Implemented the allocated task.","human_blockers":null}'

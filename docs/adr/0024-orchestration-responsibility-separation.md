@@ -16,7 +16,7 @@ status: accepted
 
 预算固定归属于交付对象：Ticket 使用自身额度，完整 Parent（包括 Parent-only）使用自身额度；按既有用途、角色和窗口分别计数。Repair Job 使用所属对象的预算，不搬移或复制可变预算。此合同取代 Run Review Budget 在 Run Acceptance 与 Repair Job 之间移交、归还的持久归属要求，并消除 CI 预算双位置保存后依赖内存别名重绑的实现责任；额度上限、消费时点、累计范围和续期授权不变。固定归属切片已实施：Ticket 与 Parent-only 使用自身 Job，完整 Parent 使用 Run Acceptance 中的 Review Budget、历史与 CI Recovery；Repair Job 不保存这些可变字段。Repair 的集成 resync 额度也保存在 Run 的 `repair_integration_budgets`，按修复代次保持既有窗口隔离；不能与主线 source/target 窗口合并。归属在创建、暂停、重载与修复完成后保持不变，显式 resume 仅续期适用耗尽额度并保留历史。新状态使用 `review_budget_protocol=2`，旧状态拒绝兼容读取，不自动迁移或删除成果。
 
-Review Context 的准备与返回结论绑定由共同职责处理。上下文区分需求范围、完整交付范围和本轮重点变化，提供准确提交、适用前次结论与 Findings、CI 或集成证据；完整 Parent 还保留实际预期合并结果、Ticket Graph 与 Completion。程序固定真实事实，Reviewer 自主决定审查深度及扩大范围，不由程序解析 Findings 并生成具体检查计划。此职责集中复用既有身份与证据，不增加另一套审核状态。实现将调用前的 Review Context 保存于既有 Semantic Attempt，按原身份形成 Acceptance Record，随有界历史保留；完整范围和重点变化独立表达。恢复使用同一快照并附加原始 Human Blocker Artifact 与本次人工回复，既有 currentness 负责否决不适用结论。
+Review Context 的准备与返回结论绑定由共同职责处理。按 #441/#443/#444 固定本轮唯一比较范围：首次开发使用开发起点，Findings 复审使用紧邻实际审核提交，首次 CI 使用失败 head，首次集成使用目标快照，均到实际审核提交；当前开发说明与准确结果、原始 Findings、CI 或集成证据同属该快照。完整 Parent 还保留实际预期合并结果、Ticket Graph 与 Completion。完整需求与历史成果是背景，不形成第二个比较范围或通过旧 full/focus 适用性回退到首次全量。Reviewer 在固定范围内自主决定审查深度，不由程序解析 Findings 并生成具体检查计划；首次审核保留规格要求的完整首次范围，当前结论不能伪造缺失的完整证据。此职责集中复用既有身份与证据，不增加另一套审核状态。调用前的 Review Context 保存于既有 Semantic Attempt，按原交付身份形成 Acceptance Record，随有界历史保留；比较起点不改写交付基准。恢复使用同一快照并附加原始 Human Blocker Artifact 与本次人工回复，既有 currentness 负责否决不适用结论。
 
 本轮集中已有错误处理、Agent 修复、程序等待/对账、暂停与恢复规则，并修正已确认的执行不一致；不扩大 Agent 自动调查范围，不新增普通提交、部分 Parent fetch 或发布操作失败后的 Development 调查流程。相关权限、材料或外部条件问题继续通过现有暂停与人工 resume 处理。这项范围限制使共同机制的深化与新增修复能力分别验收。
 

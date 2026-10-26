@@ -63,17 +63,16 @@ def render_role_prompt(call: AgentCall) -> str:
     if call.role == Role.REVIEW:
         review = context.get("review_context")
         if (not isinstance(review, dict) or not isinstance(review.get("facts"), dict)
-                or not isinstance(review.get("full_range"), dict)
-                or not isinstance(review.get("focus_range"), dict)
-                or type(review.get("has_complete_baseline")) is not bool):
+                or not isinstance(review.get("review_range"), dict)):
             raise KernelError("review_context_unavailable")
         if (not isinstance(review["facts"].get("current_review_identity"), dict)
                 or not review["facts"]["current_review_identity"]
-                or any(not isinstance(review[key].get(field), str) or not review[key][field]
-                       for key in ("full_range", "focus_range") for field in ("base_sha", "candidate_sha"))):
+                or any(not isinstance(review["review_range"].get(field), str) or not review["review_range"][field]
+                       for field in ("base_sha", "candidate_sha"))
+                or review["review_range"]["candidate_sha"] != context["reviewed_commit"]):
             raise KernelError("review_context_identity_unavailable")
-        # These facts were selected and persisted by Kernel, including whether
-        # a previous result is an applicable baseline. Rendering cannot infer it.
+        # Kernel selected and persisted this single comparison. Rendering must
+        # not substitute a delivery base or infer another scope from history.
         for key in ("_prompt_resources", "language", "_invocation_mode", "thread_id", "acceptance_scope",
                     "work_source", "parent_issue_url", "task_issue_url", "checkout"):
             if key in review["facts"] and review["facts"][key] != request.get(key):
