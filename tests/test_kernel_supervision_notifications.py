@@ -8,7 +8,7 @@ from agent_run.model import DeliveryKind
 from agent_run.notifications.sender import NativeNotifications
 from agent_run.core.operation_contract import ReadUnavailable
 from support.core_operations import CoreOperations
-from test_kernel_notification_lifecycle import _enabled_scenario
+from support.notification import _enabled_scenario
 from support.environment import durable_snapshot as _snapshot
 
 

@@ -9,7 +9,7 @@ from support.core_operations import CoreOperations, scripted_return
 from agent_run.model import Issue, ParentIssue, Requirements
 from agent_run.model import wire_json
 from support.offline import GraphScenario
-from test_kernel_notification_events import _project
+from support.notification import _project
 from support.notification import recorded_agents as _recorded_agents
 
 

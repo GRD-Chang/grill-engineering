@@ -62,7 +62,7 @@ def test_killed_original_host_notice_is_exact_current_and_business_read_only(tmp
     import subprocess
     from agent_run.runtime.process_identity import _process_start_token
     from agent_run.runtime.execution import _cgroup
-    from test_kernel_notifications import _kernel
+    from support.notification import _kernel
 
     kernel = _kernel(tmp_path)
     private = tmp_path / "private"
@@ -165,7 +165,7 @@ def test_startup_exit_requires_exact_manager_identity_when_readiness_was_never_r
     import subprocess
     from agent_run.queries.host_exit import host_exit_notice, host_exit_current
     from support.systemd_manager import controlled_manager
-    from test_kernel_notifications import _kernel
+    from support.notification import _kernel
 
     kernel = _kernel(tmp_path)
     manager, _, response, _ = controlled_manager(tmp_path)
@@ -236,7 +236,7 @@ def test_enabled_host_arms_only_the_exact_bounded_exit_command_without_private_e
     from agent_run.core.kernel import Kernel
     from agent_run.config.creation import freeze_creation
     from support.systemd_manager import controlled_manager
-    from test_kernel_notifications import _kernel
+    from support.notification import _kernel
 
     kernel = _kernel(tmp_path)
     manager, fixture, _, calls = controlled_manager(tmp_path)
@@ -302,7 +302,7 @@ def test_real_post_exit_entry_restores_only_original_environment_and_calls_the_o
     from agent_run.runtime.process_identity import _process_start_token
     from agent_run.runtime.package_lease import runner_management_lease
     from agent_run.runtime.execution import _cgroup
-    from test_kernel_notifications import _kernel
+    from support.notification import _kernel
     import agent_run.runtime.handoff as native
 
     kernel = _kernel(tmp_path)

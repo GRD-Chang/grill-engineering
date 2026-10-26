@@ -17,7 +17,7 @@
 | GitHub 读取与文本 fixture | `github_requirements`、`github_checks`、`fixture_text` | 保留编号/仓库/父子关系、分页、检查身份及文本路径语义；错误响应仍由真实 reader 拒绝 |
 | 写前边界与外部观察 | `effect_boundary`、`api_observation` | 在原外部 I/O 窗口注入变化，保留 prepare、物理核验和最终 Core 准入；不缓存已通过的许可 |
 | 合成 systemd 与 Status 端口 | `systemd_manager`、`systemd_exit_manager`、`status_comments` | 只提供声明的外部 manager、sysfs 或评论响应；不将合成观察冒充真实 OS 或 GitHub 验收 |
-| 通知观察 | `notification`、`observer_errors` | 启动、关闭和异常归属由每例持有；发送器关闭后独立检查观察异常，不能依赖被后台吞掉的 assert |
+| 通知场景、投影与观察 | `notification`、`observer_errors` | `_kernel` / `_operations` 保留有限的冻结配置与只读端口；`_project` 只读实际 history 并调用产品投影；`_enabled_scenario` 保留正常 Core/Git 前置。每例持有发送器，关闭后独立检查观察异常，不能依赖被后台吞掉的 assert |
 | SQLite 故障 | `sqlite_faults`、`sqlite_fault_host` | 仅精确私有 DB/Run/Action；真实事务故障和清理保持，封存前选择的测试 Host 入口不是官方原 argv E2E |
 | 安装及运行库身份 | `installed_runtime`、`offline_install`、`fast_runner_installer`、`native_runtime` | 验证非 editable 安装及源码字节；安装 fixture 使用本地固定依赖，不读取真实账号或在 pytest 内联网准备依赖 |
 | 进程及同步 | `process_scope`、`readiness`、`worker_process_timing`、`worker_sigint_probe` | 只管理明确归属的进程/句柄，先断言真实退出再执行失败兜底；屏障有界且失败时释放 |

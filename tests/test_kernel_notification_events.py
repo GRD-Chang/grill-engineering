@@ -1,31 +1,12 @@
 """Pure native event projection uses real committed Core producers."""
-from copy import deepcopy
 from pathlib import Path
-from typing import Any
 
 import pytest
 
 from agent_run.model import AgentCall, DeliveryKind, Issue, ParentIssue, Requirements, Role, Step
-from agent_run.core.kernel import Kernel
 from agent_run.model import wire_json
-from agent_run.notifications.event_projection import project_event
 from support.offline import GraphScenario, Scenario
-from support.notification import recorded_agents as _recorded_agents
-
-
-def _project(kernel: Kernel, mode: str) -> list[dict[str, Any]]:
-    with kernel.storage.transaction(write=False) as tx:
-        run = tx.one("SELECT id,repository,parent_issue,parent_revision,language,created_at FROM runs")
-        title = tx.rows("SELECT title FROM requirement_versions WHERE issue=? AND revision=?",
-                        (run["parent_issue"], run["parent_revision"]))
-        state = {"run_id": run["id"], "repository": run["repository"],
-                 "parent": {"number": run["parent_issue"], "title": title[0][0] if title else ""},
-                 "language": run["language"], "created_at": run["created_at"]}
-        frozen = deepcopy(state)
-        result = [projected.content for row in tx.all("SELECT * FROM history ORDER BY position")
-                  for projected in project_event(tx, dict(row), state, mode) if projected.visible]
-        assert state == frozen
-        return result
+from support.notification import recorded_agents as _recorded_agents, _project
 
 
 @pytest.mark.parametrize("mode", ["detailed", "concise"])

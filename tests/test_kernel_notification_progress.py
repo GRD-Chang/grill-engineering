@@ -12,7 +12,7 @@ from agent_run.notifications.envelope import event_envelope
 from agent_run.notifications.progress import obsolete_progress
 from agent_run.notifications.event_projection import event_state, project_event
 from support.offline import GraphScenario
-from test_kernel_notification_events import _project
+from support.notification import _project
 from support.notification import recorded_agents as _recorded_agents
 
 

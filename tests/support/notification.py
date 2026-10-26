@@ -1,16 +1,25 @@
-"""Small notification projection scenarios; no transport or persistent fixtures."""
+"""Notification fixtures and committed projections over caller-owned Core state."""
 from __future__ import annotations
 
 from collections.abc import Callable
+from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import pytest
 
-from agent_run.model import AgentCall, Issue, ParentIssue, Requirements, wire_json
+from agent_run.model import AgentCall, Commit, Delivery, DeliveryKind, Issue, ParentIssue, Requirements, RunSpec, wire_json
 
-if TYPE_CHECKING:
-    from support.offline import GraphScenario
+from agent_run.contracts.prompt import RESOURCE_KEYS
+from agent_run.config.defaults import UserDefaultsStore
+from agent_run.core.kernel import Kernel
+from agent_run.config.creation import freeze_creation
+from agent_run.core.operation_contract import DeliveryFacts
+from agent_run.notifications.event_projection import project_event
+from support.core_operations import CoreOperations, ReadOnlyPorts
+from support.offline import GraphScenario, Scenario
+from support.requirements_scenarios import independent_source
 
 
 def state_with_round(role: str = "development", outcome: str = "candidate") -> dict[str, Any]:
@@ -119,3 +128,83 @@ def continued_round(tmp_path: Path, monkeypatch, request):
     assert len(calls) == 2 and calls[0].attempt_id == calls[1].attempt_id
     assert calls[0].thread_id != calls[1].thread_id
     return scenario, calls, timing
+
+
+def _source(count: int = 1) -> Requirements:
+    return Requirements(ParentIssue(1, "Parent", "Original notification requirement", tuple(range(2, count + 2))),
+        tuple(Issue(number, "Ticket", "ticket-v1", "OPEN", frozenset({"ready-for-agent"}))
+              for number in range(2, count + 2)))
+
+
+def _operations(kernel, execution, *, count: int = 1) -> CoreOperations:
+    ports = ReadOnlyPorts(_source(count), "refs/heads/source", "refs/heads/target",
+                          DeliveryFacts(Commit("base", "tree"), None))
+    return CoreOperations(kernel, execution, lambda binding: ports)
+
+
+def _kernel(root: Path, count: int = 1) -> Kernel:
+    defaults = UserDefaultsStore(root / "defaults.json")
+    defaults.configure(language="en", notifications={"enabled": False, "mode": "detailed"})
+    base = Commit("base", "tree")
+    delivery = Delivery("native-ticket", DeliveryKind.TICKET, 2, "ticket-v1", base,
+                        "refs/heads/source", "refs/heads/target")
+    deliveries = ((delivery,) if count == 1 else tuple(
+        replace(delivery, key=f"native-ticket-{index}", issue=index + 2) for index in range(count)))
+    spec = freeze_creation(RunSpec("run-native", "example/project", 1, "parent-v1", "graph-v1",
+                                   deliveries, repository_root=str(root)), defaults,
+                           prompt_resources={key: "Frozen " + key for key in RESOURCE_KEYS})
+    assert spec.inputs is not None
+    inputs = replace(spec.inputs, notifications={"enabled": True, "mode": "detailed",
+                                                 "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
+    final = Delivery("notification-final", DeliveryKind.FINAL_RUN, 1, "unread", base,
+                     delivery.target_ref, "refs/heads/main")
+    return Kernel.create(root / "kernel.sqlite3", replace(spec, inputs=inputs, deliveries=(*deliveries, final)),
+                         requirements=_source(count))
+
+
+def _project(kernel: Kernel, mode: str) -> list[dict[str, Any]]:
+    with kernel.storage.transaction(write=False) as tx:
+        run = tx.one("SELECT id,repository,parent_issue,parent_revision,language,created_at FROM runs")
+        title = tx.rows("SELECT title FROM requirement_versions WHERE issue=? AND revision=?",
+                        (run["parent_issue"], run["parent_revision"]))
+        state = {"run_id": run["id"], "repository": run["repository"],
+                 "parent": {"number": run["parent_issue"], "title": title[0][0] if title else ""},
+                 "language": run["language"], "created_at": run["created_at"]}
+        frozen = deepcopy(state)
+        result = [projected.content for row in tx.all("SELECT * FROM history ORDER BY position")
+                  for projected in project_event(tx, dict(row), state, mode) if projected.visible]
+        assert state == frozen
+        return result
+
+
+def _enabled_scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: DeliveryKind,
+                      *, reviews: tuple[str, ...] = ("pass",)) -> Scenario:
+    defaults = UserDefaultsStore(tmp_path / "defaults.json")
+    defaults.configure(language="en", notifications={"enabled": False, "mode": "concise"})
+    original_create = Kernel.create
+
+    def create(_cls: type[Kernel], path: Path, spec: RunSpec, **kwargs: Any) -> Kernel:
+        spec = freeze_creation(spec, defaults,
+                               prompt_resources={key: "Frozen " + key for key in RESOURCE_KEYS})
+        assert spec.inputs is not None
+        inputs = replace(spec.inputs, notifications={"enabled": True, "mode": "concise",
+                         "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
+        return original_create(path, replace(spec, language="en", inputs=inputs), **kwargs)
+
+    source = independent_source()
+    if kind == DeliveryKind.PARENT_ONLY:
+        source = replace(source, parent=replace(source.parent, sub_issue_numbers=()), issues=())
+    else:
+        first = source.issues[0]
+        source = replace(source, parent=replace(source.parent, sub_issue_numbers=(first.number,)), issues=(first,))
+    # Freeze only input configuration. Workspace and local marker ownership are
+    # produced by the real Core/effect path, never by a synthetic receipt.
+    with monkeypatch.context() as patch:
+        patch.setattr(Kernel, "create", classmethod(create))
+        if kind == DeliveryKind.FINAL_RUN:
+            # d847 builds and retains actual historical Ticket Completion.
+            scenario = Scenario(tmp_path, kind, reviews=reviews)
+            assert len(scenario.kernel.source_status()["completions"]) == 1
+        else:
+            scenario = GraphScenario(tmp_path, source, reviews=reviews if kind == DeliveryKind.PARENT_ONLY else ("pass",))
+    return scenario
