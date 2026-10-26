@@ -9,6 +9,7 @@ import pytest
 import agent_run.storage.notification_outbox as outbox
 from agent_run.model import DeliveryKind
 from agent_run.notifications.sender import NativeNotifications
+from agent_run.config.defaults import UserDefaultsStore
 from support.notification import _enabled_scenario
 
 
