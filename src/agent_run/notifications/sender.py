@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import sqlite3
 import threading
@@ -18,6 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from agent_run.contracts.repository import normalize_repository
 from agent_run.storage import notification_outbox as outbox
 from agent_run.errors import bounded_error, KernelError
 from agent_run.notifications.cards import card
@@ -39,6 +41,16 @@ from agent_run.storage.sqlite import Storage, Transaction
 
 CLOSE_TIMEOUT_SECONDS = 60.0
 Send = Callable[..., Mapping[str, Any]]
+
+
+def _pull_request_identity(url: object) -> tuple[str, int] | None:
+    match = re.fullmatch(r"https://github[.]com/([^/]+/[^/]+)/pull/([1-9][0-9]*)", url) if isinstance(url, str) else None
+    if match is None:
+        return None
+    try:
+        return normalize_repository(match[1]), int(match[2])
+    except ValueError:
+        return None
 
 
 class NativeNotifications:
@@ -279,6 +291,12 @@ class NativeNotifications:
                                    scope=action["scope"],
                                    summary="; ".join(str(value) for value in action["reasons"]),
                                    next_step=action["next_action"])
+            if reason == "final_approval":
+                owner = next(job for job in view["subjects"] if job["subject"] == action["subject"])
+                number = owner["pr_number"]
+                if type(number) is int and number > 0:
+                    event.update(approval_pr=number,
+                                 url=f"https://github.com/{self.state['repository']}/pull/{number}")
             facts = resumes.get(key)
             if facts:
                 event.update(facts)
@@ -320,6 +338,25 @@ class NativeNotifications:
                         break
                     if item in document["pending"]:
                         outbox.cancel_item(document, item, "pending capacity")
+
+    @staticmethod
+    def _coalesce_final_pr(document: dict[str, Any]) -> None:
+        # Only an already-enqueued current approval card with the exact PR identity
+        # replaces an unsent creation card. Sending/unknown payloads keep their
+        # original identity and delivery budget.
+        approvals = {(item["event"]["work_subject"], item["event"]["generation"], identity)
+                     for item in document["pending"] if item["event"]["kind"] == "boundary" and item["event"].get("current")
+                     and type(item["event"].get("approval_pr")) is int
+                     and (identity := _pull_request_identity(item["event"].get("url"))) is not None
+                     and identity[1] == item["event"]["approval_pr"]
+                     and not item.get("cancelled") and not item.get("exhausted")}
+        for item in list(document["pending"]):
+            event = item["event"]
+            identity = _pull_request_identity(event.get("url"))
+            if (event["kind"] == "pr_created" and item["attempts"] == 0 and item["outcome"] == "pending"
+                    and identity is not None
+                    and (event.get("work_subject"), event.get("generation"), identity) in approvals):
+                outbox.cancel_item(document, item, "included in current Final PR approval")
 
     def observe_committed(self) -> None:
         """Observe healthy facts, or request one sender-owned fault recovery."""
@@ -398,7 +435,7 @@ class NativeNotifications:
                     document["delivery_error"] = {"reason": reason, "observed_at": time.time()}
             except Exception:
                 pass  # Best effort after the original transaction rolled back.
-        print(f"飞书通知不可用（开发继续）：{reason}", file=sys.stderr)
+        print(event_copy(self.state, "unavailable_development_continues", reason=reason), file=sys.stderr)
 
     @staticmethod
     def _enqueue_history(document: dict[str, Any], event: dict[str, Any], now: float) -> None:
@@ -516,6 +553,7 @@ class NativeNotifications:
                     for event in events:
                         self._enqueue_history(document, event, time.time())
                     document["native_cursor"] = position
+                    self._coalesce_final_pr(document)
                     if events and any(item["outcome"] in {"failed", "unknown"} and not item.get("important")
                                       for item in document["pending"]):
                         with self.storage.transaction(write=False) as tx:

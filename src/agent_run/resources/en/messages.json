@@ -1153,5 +1153,14 @@
   "presentation.status.review_state_stale": "Current version awaits review; the previous conclusion applies to an earlier scope.",
   "presentation.status.review_state_pending": "Current Review awaits a consumed conclusion.",
   "presentation.status.review_state_unknown": "The recorded Review cannot establish a conclusion for the current version.",
-  "presentation.status.review_state_not_recorded": "No Review conclusion recorded yet."
+  "presentation.status.review_state_not_recorded": "No Review conclusion recorded yet.",
+  "presentation.history.historical_budget_unknown": "    Budget at round start: not recorded",
+  "presentation.history.truncated": "… (truncated; --details retains the original)",
+  "presentation.history.unsplit_finding": "Unable to reliably separate the problem; original: {finding}",
+  "presentation.history.page_role_rounds": "Role rounds in this history page",
+  "presentation.history.role_round_count": "  {subject} · {role}: {count}",
+  "presentation.history.role_subject_ticket": "Ticket",
+  "presentation.history.role_subject_parent": "Parent-only",
+  "presentation.history.role_subject_run": "Whole-Run",
+  "notification.event.unavailable_development_continues": "Feishu notifications unavailable; development continues: {reason}"
 }

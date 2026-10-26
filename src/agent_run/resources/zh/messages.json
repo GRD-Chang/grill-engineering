@@ -1153,5 +1153,14 @@
   "presentation.status.review_state_stale": "当前版本待复验；上次验收结论仅适用于旧范围。",
   "presentation.status.review_state_pending": "当前验收尚无已消费的结论。",
   "presentation.status.review_state_unknown": "已记录验收不足以确认当前版本的结论。",
-  "presentation.status.review_state_not_recorded": "尚未记录验收结论。"
+  "presentation.status.review_state_not_recorded": "尚未记录验收结论。",
+  "presentation.history.historical_budget_unknown": "    当时预算：未记录",
+  "presentation.history.truncated": "…（已截断；--details 保留原文）",
+  "presentation.history.unsplit_finding": "未能可靠拆分，保留原文：{finding}",
+  "presentation.history.page_role_rounds": "本页历史角色轮次",
+  "presentation.history.role_round_count": "  {subject} · {role}: {count}",
+  "presentation.history.role_subject_ticket": "Ticket",
+  "presentation.history.role_subject_parent": "Parent-only",
+  "presentation.history.role_subject_run": "整体交付",
+  "notification.event.unavailable_development_continues": "飞书通知不可用（开发继续）：{reason}"
 }

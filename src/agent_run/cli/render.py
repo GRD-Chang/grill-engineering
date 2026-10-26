@@ -133,6 +133,27 @@ def _body(value: Any) -> str:
     return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
+def _history_excerpt(value: Any, language: str) -> str:
+    original = safe_text(_body(value))
+    return original if len(original) <= 400 else original[:400] + text(
+        "presentation.history.truncated", language=language)
+
+
+def _history_problem(finding: str, language: str) -> str:
+    # This is display-only extraction. Ambiguous/unstructured Agent originals
+    # remain visible, rather than being interpreted as another result schema.
+    labels = list(re.finditer(
+        r"(?im)^(问题|problem|证据|evidence|必须修复|required fix|复验|复测|retest|reverification)\s*[:：]\s*", finding))
+    groups = ({"问题", "problem"}, {"证据", "evidence"}, {"必须修复", "required fix"},
+              {"复验", "复测", "retest", "reverification"})
+    if (len(labels) == 4 and not finding[:labels[0].start()].strip()
+            and all(label.group(1).lower() in group for label, group in zip(labels, groups))
+            and all(finding[label.end():labels[i + 1].start() if i < 3 else len(finding)].strip()
+                    for i, label in enumerate(labels))):
+        return finding[labels[0].end():labels[1].start()].strip()
+    return text("presentation.history.unsplit_finding", language=language, finding=finding)
+
+
 def _notification_lines(document: QueryDocument) -> Iterator[str]:
     facts = document.data.get("notifications")
     if not isinstance(facts, Mapping):
@@ -200,6 +221,7 @@ def _history_round(attempt: Mapping[str, Any], issue: int, language: str, detail
     yield text("presentation.history.time_range", language=language,
                v1=f"{first or copy['unknown']} → {last or copy['unknown']} ({zone})")
     yield from _history_timing(attempt["invocations"], language)
+    yield text("presentation.history.historical_budget_unknown", language=language)
     previous = None
     for index, invocation in enumerate(attempt["invocations"], 1):
         configuration = (invocation["model"], invocation["effort"], invocation["profile_reference"])
@@ -236,12 +258,16 @@ def _history_round(attempt: Mapping[str, Any], issue: int, language: str, detail
             yield text("presentation.history.acceptance_" + outcome, language=language)
         if attempt["status"] == "stale":
             yield text("presentation.history.historical_result", language=language)
+        yield text("presentation.history.findings_64", language=language,
+                   v1=sum(len(lane["findings"]) for lane in result["checks"].values()))
         for name, lane in result["checks"].items():
             yield f"  {text('card.check.' + name, language=language)}: {text('card.result.' + lane['status'], language=language)}"
             if details or lane["status"] == "blocked":
-                yield f"  {copy['evidence']}: {lane['evidence']}"
+                evidence = lane["evidence"] if details else _history_excerpt(lane["evidence"], language)
+                yield f"  {copy['evidence']}: {evidence}"
             for finding in lane["findings"]:
-                yield text("presentation.history.finding_166", language=language, v1=finding)
+                yield text("presentation.history.finding_166", language=language,
+                           v1=finding if details else _history_problem(finding, language))
     elif result.get("summary"):
         yield text("presentation.history.development_summary", language=language) + ": " + result["summary"]
     elif result.get("pr_title"):
@@ -251,7 +277,8 @@ def _history_round(attempt: Mapping[str, Any], issue: int, language: str, detail
                 label = "commit_message" if field == "commit_message" else "pr_body"
                 yield f"  {text('presentation.history.' + label, language=language)}: {result[field]}"
     for blocker in result.get("human_blockers") or []:
-        yield text("presentation.history.finding_166", language=language, v1=blocker)
+        yield text("presentation.history.finding_166", language=language,
+                   v1=blocker if details else _history_excerpt(blocker, language))
 
 
 def _history_lines(document: QueryDocument, details: bool) -> Iterator[str]:
@@ -289,7 +316,10 @@ def _history_lines(document: QueryDocument, details: bool) -> Iterator[str]:
         subject = f"#{owners[event['subject']]}" if event["subject"] in owners else copy["global"]
         yield f"{stamp or copy['unknown']} [{zone}] {subject} {kind}"
         if event["evidence"] is not None and (details or event["kind"] == "human_response"):
-            yield _body(event["evidence"])
+            yield _body(event["evidence"]) if details else _history_excerpt(event["evidence"], document.language)
+        elif not details and event["kind"] == "paused" and isinstance(event["evidence"], Mapping):
+            for blocker in event["evidence"].get("human_blockers") or []:
+                yield _history_excerpt(blocker, document.language)
     if history["has_more"]:
         yield f"{copy['more']}: --after {history['next_after']}"
     if details:
@@ -298,6 +328,13 @@ def _history_lines(document: QueryDocument, details: bool) -> Iterator[str]:
             if job["budgets"]:
                 yield f"{copy['subject']}: #{job['issue']}"
                 yield from _budget_lines(job, document.language)
+    yield text("presentation.history.page_role_rounds", language=document.language)
+    for key, count in sorted(history["rounds"].items()):
+        subject, role = key.split("_", 1)
+        yield text("presentation.history.role_round_count", language=document.language,
+                   subject=text("presentation.history.role_subject_" + subject, language=document.language),
+                   role=copy[role], count=count)
+    yield f"{copy['duration']}: {document.data['elapsed_seconds'] if document.data['elapsed_seconds'] is not None else copy['incomplete']}"
 
 
 def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
