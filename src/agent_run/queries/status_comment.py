@@ -83,8 +83,12 @@ def project_status(database: Path, subject: str) -> StatusProjection:
                  f"Recorded PR head: `{pr['head']['sha']}`; base: `{pr['base']['sha']}`",
                  f"Integration gate: {job['gate_mode'] or 'not_recorded'}; Required Checks: {checks}",
                  f"Cleanup: {cleanup['state'] if cleanup else 'not_recorded'}; Host exit: {host}"]
-        actions = [item["operation"] for item in boundaries["actions"] if item["subject"] in {None, subject}]
-        lines.append("Next action: " + (", ".join(dict.fromkeys(actions)) or "automatic / none"))
+        actions = [item["next_action"] for item in boundaries["actions"] if item["subject"] in {None, subject}]
+        remaining = boundaries["delivery_cleanup"]
+        if remaining is not None:
+            actions.extend(item["recovery_action"] for item in remaining["items"]
+                           if item["kind"] == job["kind"] and item["branch"] == target.source_ref)
+        lines.append("Next action: " + ("; ".join(dict.fromkeys(actions)) or "automatic / none"))
         body = "\n".join(lines)
         if len(body.encode()) > 8192:
             raise ValueError("Status projection exceeds limit")

@@ -26,7 +26,7 @@ from agent_run.adapters.notification_transport import send
 from agent_run.runtime.process_identity import _process_start_token
 
 from agent_run.queries.execution import execution_facts
-from agent_run.notifications.event_projection import event_state, project_event
+from agent_run.notifications.event_projection import completion_context, event_state, project_event
 from agent_run.queries.resume_facts import resume_facts
 from agent_run.notifications.progress import obsolete_progress
 from agent_run.notifications.status_comment import StatusComments
@@ -158,9 +158,8 @@ class NativeNotifications:
                               event_copy(self.state, "cleanup" if pending else "completed"),
                               "yellow" if pending else "green", current=True, terminal=True,
                               status_code="completed", summary=summary,
-                              next_step=f"agent-run resume {self.run_id}" if pending else "",
                               url=f"https://github.com/{self.binding[0]}/pull/{number}",
-                              execution_timing_complete=False)
+                              execution_timing_complete=False, **completion_context(view, self.state))
 
     def _boundaries(self, document: dict[str, Any]) -> bool:
         """Track notification occurrences, not an alternate writable Run state.

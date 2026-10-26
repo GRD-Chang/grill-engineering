@@ -1010,3 +1010,97 @@ def test_attach_updates_same_status_only_after_original_domain_and_usage_release
     finally:
         if handoff is not None and handoff.process.poll() is None:
             handoff.process.terminate(); handoff.process.wait(timeout=3)
+
+
+@pytest.mark.parametrize("run_id", ["a'  b", "123", "a\nb"], ids=["literal", "numeric", "control"])
+def test_terminal_sender_and_status_share_exact_cleanup_guidance(tmp_path, monkeypatch, run_id):
+    from dataclasses import replace
+    import json
+    import shlex
+    from agent_run.notifications.sender import NativeNotifications
+    from support.offline import OfflinePort
+    original_prepare = OfflinePort.prepare
+    def named_prepare(*args, **kwargs):
+        spec, delivery = original_prepare(*args, **kwargs)
+        return replace(spec, run_id=run_id), delivery
+    with monkeypatch.context() as patch:
+        patch.setattr(OfflinePort, "prepare", named_prepare)
+        scenario = published(tmp_path, monkeypatch, notifications={"enabled": True, "mode": "concise",
+                             "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
+    kernel, subject = scenario.kernel, scenario.delivery.key
+    assert scenario.spec.run_id == run_id
+    assert kernel.control("approve", "original-cleanup-approval", subject=subject, world=scenario.world()) == "pending"
+    for _ in range(100):
+        if kernel.status(subject)["phase"] == "complete":
+            break
+        assert scenario.step().kind not in {"paused", "waiting", "approval"}
+    else:
+        pytest.fail("The original close was not consumed")
+    database = kernel.storage.path
+    with kernel.storage.transaction(write=False) as tx:
+        closure = dict(tx.one("SELECT id,receipt_id FROM effects WHERE operation='close' AND status='confirmed'"))
+        assert tx.one("SELECT state FROM resource_cleanup WHERE subject=?", (subject,))[0] != "complete"
+    before = database.read_bytes()
+    captured = []
+    def transport(_config, rendered, *_args, **_kwargs):
+        document = outbox.read_notifications(database.parent, run_id)
+        active, = [row["event"] for row in document["pending"] if row["outcome"] == "sending"]
+        captured.append((active, rendered))
+        return {"outcome": "success", "reason": None}
+    api = CommentsAPI(project_status(database, subject).target)
+    observer = NativeNotifications(database, database.parent, transport=transport, status_api=api)
+    try:
+        observer.close()
+        terminal, = [(event, rendered) for event, rendered in captured if event.get("terminal")]
+        event, rendered = terminal
+        guidance = event["next_step"]
+        if run_id == "a'  b":
+            assert shlex.split(guidance) == ["agent-run", "resume", "--repo", scenario.spec.repository, "--", run_id]
+        else:
+            assert not guidance.startswith("agent-run ") and json.dumps(run_id) in guidance
+        assert event["parent_only"] is True and event["ticket_progress"] is None
+        assert event["completion_actions"] == []
+        assert guidance in project_status(database, subject).body
+        assert scenario.spec.repository in json.dumps(rendered, ensure_ascii=False)
+        assert [row[1] for row in api.commands] == ["POST"]
+        assert database.read_bytes() == before
+        with kernel.storage.transaction(write=False) as tx:
+            assert dict(tx.one("SELECT id,receipt_id FROM effects WHERE operation='close' AND status='confirmed'")) == closure
+        assert not observer.thread.is_alive()
+    finally:
+        observer.close(drain=False)
+
+
+def test_actual_sender_keeps_ticket_completion_receipt_summary_and_parent_progress(tmp_path, monkeypatch):
+    import json
+    from agent_run.notifications.sender import NativeNotifications
+    scenario = published(tmp_path, monkeypatch, kind=DeliveryKind.TICKET,
+        notifications={"enabled": True, "mode": "concise", "profile": "fixture",
+                       "open_id": "ou_fixture", "app_id": "app_fixture"})
+    database, subject = scenario.kernel.storage.path, scenario.delivery.key
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        original = tx.one("SELECT e.receipt_id,c.development_attempt FROM completions c "
+                          "JOIN effects e ON e.id=c.close_effect WHERE c.subject=?", (subject,))
+        receipt = original["receipt_id"]
+    before = database.read_bytes()
+    captured = []
+    def transport(_config, rendered, *_args, **_kwargs):
+        active, = [row["event"] for row in outbox.read_notifications(database.parent, scenario.spec.run_id)["pending"]
+                   if row["outcome"] == "sending"]
+        captured.append((active, rendered))
+        return {"outcome": "success", "reason": None}
+    api = CommentsAPI(project_status(database, subject).target)
+    observer = NativeNotifications(database, database.parent, status_api=api, transport=transport)
+    try:
+        observer.close()
+        event, rendered = next(item for item in captured if item[0]["kind"] == "ticket_completed")
+        assert sum(item[0]["kind"] == "ticket_completed" for item in captured) == 1
+        assert event["source_material_id"] == receipt
+        assert event["summary"] == "Changed synthetic behavior 1"
+        assert event["ticket_progress"] == {"completed": 1, "total": 1} and event["parent_only"] is False
+        assert event["status_query"] == "agent-run status --repo example/repository -- offline-run"
+        assert event["total_seconds"] is None and event["execution_timing_complete"] is False
+        assert "子任务已完成 1/1" in json.dumps(rendered, ensure_ascii=False)
+        assert not observer.thread.is_alive() and database.read_bytes() == before
+    finally:
+        observer.close(drain=False)
