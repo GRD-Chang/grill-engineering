@@ -394,28 +394,27 @@ def execute(parsed: argparse.Namespace, *, language: str) -> dict[str, Any]:
                                     runner_identity=inputs["runner_identity"])
             kernel.refresh(lambda: read_requirements(reader, run["parent_issue"]))
             source = kernel.source_status()
-        with kernel.storage.transaction(write=False) as tx:
-            if parsed.command == "abandon":
-                targets = []
-            elif parsed.command == "requeue":
-                if source["blocked"] == "final_refresh" and source["final_subject"] is not None:
-                    targets = tx.all("SELECT id FROM subjects WHERE id=?", (source["final_subject"],))
+        if parsed.command == "resume":
+            subject = kernel.resume_subject(ticket=parsed.ticket)
+        else:
+            with kernel.storage.transaction(write=False) as tx:
+                if parsed.command == "abandon":
+                    targets = []
+                elif parsed.command == "requeue":
+                    if source["blocked"] == "final_refresh" and source["final_subject"] is not None:
+                        targets = tx.all("SELECT id FROM subjects WHERE id=?", (source["final_subject"],))
+                    else:
+                        targets = tx.all("SELECT DISTINCT s.id FROM subjects s JOIN gates g ON g.subject=s.id "
+                                         "WHERE g.code='requeue_required' ORDER BY s.id")
+                elif parsed.command == "approve":
+                    targets = tx.all("SELECT id FROM subjects WHERE kind!='ticket' AND phase='approval'")
+                elif parsed.command == "revise":
+                    targets = tx.all("SELECT id FROM subjects WHERE kind='final_run' AND phase='approval'")
                 else:
-                    targets = tx.all("SELECT DISTINCT s.id FROM subjects s JOIN gates g ON g.subject=s.id "
-                                     "WHERE g.code='requeue_required' ORDER BY s.id")
-            elif parsed.command == "approve":
-                targets = tx.all("SELECT id FROM subjects WHERE kind!='ticket' AND phase='approval'")
-            elif parsed.command == "revise":
-                targets = tx.all("SELECT id FROM subjects WHERE kind='final_run' AND phase='approval'")
-            elif getattr(parsed, "ticket", None) is not None:
-                targets = tx.all("SELECT id FROM subjects WHERE kind='ticket' AND issue=?", (parsed.ticket,))
-            elif run["stopped"]:
-                targets = []
-            else:
-                targets = tx.all("SELECT DISTINCT s.id FROM subjects s JOIN gates g ON g.subject=s.id ORDER BY s.id")
-            if len(targets) > 1 or (not targets and not (parsed.command == "abandon" or parsed.command == "resume" and run["stopped"])):
-                raise KernelError("control_subject_ambiguous", "Select an exact Ticket or current Parent boundary")
-            subject = None if not targets else str(targets[0]["id"])
+                    targets = tx.all("SELECT DISTINCT s.id FROM subjects s JOIN gates g ON g.subject=s.id ORDER BY s.id")
+                if len(targets) > 1 or (not targets and parsed.command != "abandon"):
+                    raise KernelError("control_subject_ambiguous", "Select an exact Ticket or current Parent boundary")
+                subject = None if not targets else str(targets[0]["id"])
         world = None
         replacement = None
         if parsed.command in {"approve", "revise", "requeue"}:
