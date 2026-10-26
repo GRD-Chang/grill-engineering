@@ -4,11 +4,12 @@ from __future__ import annotations
 from agent_run.adapters.foreground import DomainUnknown
 
 import argparse
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from functools import partial
 import json
 import os
 from pathlib import Path
+import shlex
 import sys
 from typing import Any, Literal, NoReturn, Sequence
 
@@ -89,15 +90,16 @@ def _parser(language: str) -> argparse.ArgumentParser:
             child.add_argument("--after", type=int, default=0)
             child.add_argument("--limit", type=int)
     doctor = commands.add_parser("doctor", language=language,
-        help="只读运行环境诊断" if language == "zh" else "Read-only runtime diagnostics")
-    doctor.add_argument("--json", action="store_true", dest="as_json")
+        help=text("cli.doctor_help", language=language), description=text("cli.doctor_help", language=language))
+    doctor.add_argument("--json", action="store_true", dest="as_json", help=text("cli.doctor_json_help", language=language))
     verification = doctor.add_mutually_exclusive_group()
-    verification.add_argument("--local", action="store_true", help="仅本地检查，不读取 token 或调用认证服务")
-    verification.add_argument("--online", action="store_true", help="显式验证所选 GitHub 身份，不调用模型")
-    doctor.add_argument("--mode", choices=("background", "foreground"), default="background")
-    doctor.add_argument("--repo")
-    doctor.add_argument("--run", dest="run_id", help="检查此 Run 的冻结身份，而非新任务默认")
-    doctor.add_argument("--state-dir", type=Path)
+    verification.add_argument("--local", action="store_true", help=text("cli.doctor_local_help", language=language))
+    verification.add_argument("--online", action="store_true", help=text("cli.doctor_online_help", language=language))
+    doctor.add_argument("--mode", choices=("background", "foreground"), default="background",
+                        help=text("cli.doctor_mode_help", language=language))
+    doctor.add_argument("--repo", help=text("cli.repo_help", language=language))
+    doctor.add_argument("--run", dest="run_id", help=text("cli.doctor_run_help", language=language))
+    doctor.add_argument("--state-dir", type=Path, help=text("cli.state_dir_help", language=language))
     personal_settings.add_parsers(commands, language)
     from agent_run.cli import profiles as run_profile_cli
     run_profile_cli.add_parser(commands, language)
@@ -106,6 +108,39 @@ def _parser(language: str) -> argparse.ArgumentParser:
     from agent_run.cli.lifecycle import add_parsers
     add_parsers(commands, language)
     return parser
+
+
+def _print_receipt(parsed: argparse.Namespace, output: Mapping[str, Any], language: str) -> None:
+    """Describe the submitted request, never infer Agent or delivery success."""
+    def copy(key: str, **values: object) -> str:
+        return text("cli.receipt." + key, language=language, **values)
+
+    print(safe_text(copy("attached" if output["result"] == "attached" else "accepted", command=parsed.command)))
+    status = {"action_pending": "pending", "action_applied": "applied", "action_complete": "complete",
+              "action_updating": "updating", "action_superseded": "superseded"}.get(output["status"], "unknown")
+    print(copy("status", status=copy(status)))
+    host = output["host"] if output["host"] in {"running", "exited"} else "unknown"
+    print(copy("host_" + host))
+    parent = getattr(parsed, "parent", None)
+    selector = getattr(parsed, "run_id", None)
+    if parent is None and isinstance(selector, str) and selector.isdecimal():
+        parent = int(selector)
+    target = [parsed.repo] if parsed.repo else []
+    if parent is not None:
+        target.append(f"Parent #{parent}")
+    if getattr(parsed, "ticket", None) is not None:
+        target.append(text("presentation.status.ticket_v1", language=language, v1=parsed.ticket))
+    if target:
+        print(safe_text(copy("target", target=" / ".join(target))))
+    command = ["agent-run", "status" if parent is not None else "runs"]
+    if parsed.repo:
+        command.extend(("--repo", parsed.repo))
+    elif parent is None:
+        command.append("--help")
+    if parent is not None:
+        command.extend(("--parent", str(parent)))
+    print(copy("boundary"))
+    print(safe_text(copy("next", command=shlex.join(command))))
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
@@ -129,12 +164,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             if parsed.as_json:
                 print(json.dumps(output, ensure_ascii=False, sort_keys=True))
             else:
-                if output["result"] == "attached":
-                    label = "已附着原请求；本次操作未应用" if language == "zh" else "Attached to original request; new action not applied"
-                else:
-                    label = "请求已受理" if language == "zh" else "Request accepted"
-                host_label = "宿主" if language == "zh" else "Host"
-                print(safe_text(f"{label}: {output['run_id']} {output['status']} [{output['action_id']}] {host_label}: {output['host']}"))
+                _print_receipt(parsed, output, language)
             return 0
         if parsed.command == "doctor":
             from agent_run.install.doctor import run as diagnose
@@ -206,7 +236,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 root = error_candidate["repository_root"] or ("未记录" if language == "zh" else "Not recorded")
                 scope = (f"{error_candidate['repository']} Parent #{error_candidate['parent']} "
                          if error_candidate["repository"] is not None and error_candidate["parent"] is not None else "")
-                print(safe_text(f"{scope}{error_candidate['run_id']} {root} [{error_candidate['state_dir']}]"))
+                print(safe_text(f"{scope}{root} [{error_candidate['state_dir']}]"))
         return 2
     except KeyboardInterrupt:
         return 130

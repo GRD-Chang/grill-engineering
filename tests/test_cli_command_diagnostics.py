@@ -101,3 +101,112 @@ def test_missing_run_keeps_current_code_and_explains_discovery_before_creation(
     assert "agent-run run PARENT --repo OWNER/NAME" in message
     assert store.path.read_bytes() == original
     assert not (tmp_path / ".agent-run").exists()
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_doctor_help_localizes_every_option_without_running_a_probe(monkeypatch, capsys, language: str) -> None:
+    from agent_run.config.defaults import UserDefaultsStore
+    from agent_run.cli.main import main
+    import agent_run.install.doctor as doctor
+
+    store = UserDefaultsStore()
+    store.configure(language=language)
+    before = store.path.read_bytes()
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Doctor help must not execute local or online probes")
+
+    monkeypatch.setattr(doctor, "run", forbidden)
+    assert main(["doctor", "--help"]) == 0
+    output = capsys.readouterr()
+    assert output.err == ""
+    for option in ("--local", "--online", "--mode", "--repo", "--run", "--state-dir", "--json"):
+        assert option in output.out
+    prose = " ".join(output.out.split())
+    if language == "en":
+        assert not any("\u4e00" <= character <= "\u9fff" for character in output.out)
+        assert "without reading tokens" in prose
+        assert "without calling a model" in prose
+        assert "frozen identities" in prose
+    else:
+        assert "不读取 token" in output.out
+        assert "不调用模型" in output.out
+        assert "冻结身份" in output.out
+    assert store.path.read_bytes() == before
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+@pytest.mark.parametrize("as_json", [False, True], ids=["human", "json"])
+@pytest.mark.parametrize("exact", [False, True], ids=["parent", "exact-run"])
+def test_stop_receipt_uses_frozen_language_and_keeps_internal_identity_only_in_json(
+    git_repo: Path, capsys, language: str, as_json: bool, exact: bool,
+) -> None:
+    from agent_run.adapters.workspace import ManagedWorkspace, read_git_identity
+    from agent_run.config.creation import freeze_creation
+    from agent_run.config.defaults import UserDefaultsStore
+    from agent_run.core.kernel import Kernel
+    from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
+    from agent_run.cli.main import main
+
+    store = UserDefaultsStore()
+    store.configure(language=language)
+    workspace = ManagedWorkspace.for_repository("example/project")
+    root = workspace.ensure_path(str(git_repo), identity=read_git_identity(git_repo))
+    from agent_run.adapters.git_objects import LocalGit
+    base = LocalGit(root).commit("HEAD")
+    delivery = Delivery("parent:12", DeliveryKind.PARENT_ONLY, 12, "original", Commit(base.sha, base.tree),
+                        "refs/heads/task", "refs/heads/main")
+    spec = freeze_creation(RunSpec("private-run-identity", workspace.repository, 12, "parent", "graph", (delivery,),
+                                   repository_root=str(root)), store)
+    kernel = Kernel.create_task(workspace.state_root / spec.run_id / "kernel.sqlite3", spec,
+                               requirements=Requirements(ParentIssue(12, "Original Parent", "Original requirement"), ()))
+    store.configure(language="en" if language == "zh" else "zh")
+    assert main(["stop", spec.run_id if exact else "12", "--repo", workspace.repository,
+                 *(["--state-dir", str(kernel.storage.path)] if exact else []),
+                 *(["--json"] if as_json else [])]) == 0
+    output = capsys.readouterr()
+    assert output.err == ""
+    with kernel.storage.transaction(write=False) as tx:
+        action = dict(tx.one("SELECT id,status FROM actions WHERE kind='stop'"))
+        assert tx.one("SELECT stopped FROM runs")[0] == 1
+        assert tx.one("SELECT count(*) FROM hosts")[0] == 0
+    if as_json:
+        assert json.loads(output.out) == {"result": "accepted", "status": "action_applied", "run_id": spec.run_id,
+                                         "action_id": action["id"], "action": "stop", "host": "unknown"}
+    else:
+        assert spec.run_id not in output.out and action["id"] not in output.out
+        assert "action_applied" not in output.out
+        assert "example/project" in output.out
+        if exact:
+            assert "agent-run runs --repo example/project" in output.out
+        else:
+            assert "Parent #12" in output.out
+            assert "agent-run status --repo example/project --parent 12" in output.out
+        assert ("请求已受理" if language == "zh" else "Request accepted") in output.out
+        assert ("不表示 Agent 已启动或交付已完成" if language == "zh" else
+                "does not prove that an Agent has started or delivery has completed") in output.out
+        assert ("Host 状态未确认" if language == "zh" else "Host state unconfirmed") in output.out
+
+
+def test_ambiguous_run_error_keeps_locations_and_machine_identity_without_repeating_private_ids(tmp_path: Path, capsys) -> None:
+    from agent_run.cli.main import main
+    from test_kernel_query_cli import _create, _snapshot
+
+    kernels = [_create(tmp_path, identity) for identity in ("private-one", "private-two")]
+    before = _snapshot(tmp_path)
+    arguments = ["status", "--repo", "example/project", "--parent", "1", "--data-root", str(tmp_path)]
+    assert main(arguments) == 2
+    human = capsys.readouterr().out
+    assert "run_locator_conflict" in human and "example/project Parent #1" in human
+    for kernel in kernels:
+        # A necessary filesystem location may itself contain the Run directory
+        # name; it remains copyable, without a separate private-ID column.
+        location = str(kernel.storage.path.parent)
+        assert location in human
+        human = human.replace(location, "")
+    assert "private-one" not in human and "private-two" not in human
+    assert main([*arguments, "--json"]) == 2
+    machine = json.loads(capsys.readouterr().out)
+    assert machine["diagnostics"][0]["code"] == "run_locator_conflict"
+    assert {item["run_id"] for item in machine["candidates"]} == {"private-one", "private-two"}
+    assert _snapshot(tmp_path) == before
