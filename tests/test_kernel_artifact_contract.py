@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+from dataclasses import replace
 
 import pytest
 
@@ -13,6 +14,8 @@ from agent_run.errors import ArtifactContractError
 from agent_run.runtime.codex import _CodexCapture
 from agent_run.model import ParentIssue, Requirements, wire_json
 from support.offline import GraphScenario, review_result
+from agent_run.core.kernel import Kernel
+from agent_run.config.resources import resolve_resources
 
 
 def publication(body="Recorded validation and user impact.", *, message="feat: change"):
@@ -179,3 +182,38 @@ def test_invalid_repair_is_gated_and_both_original_outputs_remain(tmp_path):
         outputs = tx.rows("SELECT raw_id FROM invocation_outputs WHERE invocation=? ORDER BY ordinal", (first.invocation_id,))
         assert [tx.get(row[0], first.subject) for row in outputs] == rejected
         assert not tx.rows("SELECT id FROM effects WHERE operation='publication_commit'")
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+@pytest.mark.parametrize("role", [Role.DEVELOPMENT, Role.REVIEW, Role.PUBLICATION])
+def test_frozen_run_accepts_complete_artifacts_in_the_other_language(tmp_path, language, role):
+    scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Deliver change"), ()))
+    assert scenario.spec.inputs is not None
+    resources = resolve_resources(language)
+    scenario.spec = replace(scenario.spec, language=language,
+                            inputs=replace(scenario.spec.inputs, prompt_resources=resources))
+    scenario.kernel = Kernel.create(tmp_path / "configured.sqlite3", scenario.spec, requirements=scenario.requirements)
+    scenario.execution = scenario.kernel.claim_executor("configured-language")
+    call = next_call(scenario, role)
+    assert call.context["language"] == language and call.context["_prompt_resources"] == resources
+    prose = "Keep this English evidence / API unchanged." if language == "zh" else "保留这段中文证据 / API unchanged。"
+    if role == Role.DEVELOPMENT:
+        value = dict(result_kind="development", summary=prose, human_blockers=None)
+    elif role == Role.REVIEW:
+        value = {"checks": {lane: {"status": "fail" if lane == "spec" else "pass",
+                  "evidence": prose, "findings": [prose] if lane == "spec" else []}
+                  for lane in ("e2e", "standards", "spec")}}
+    else:
+        value = publication(prose, message="feat: " + prose)
+        value["pr_title"] = prose
+    raw = b"\n" + wire_json(value) + b"\n"
+    returned(scenario, call, raw)
+    step = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports).once(agent_capacity=0)
+    assert step.kind == "progress" and step.call is None
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        attempt = tx.one("SELECT status,result_id FROM attempts WHERE id=?", (call.attempt_id,))
+        assert attempt["status"] == "consumed"
+        assert tx.get(attempt["result_id"], call.subject) == raw
+        assert json.loads(tx.get(attempt["result_id"], call.subject)) == value
+        assert len(tx.rows("SELECT id FROM invocations WHERE attempt=?", (call.attempt_id,))) == 1
+    assert scenario.kernel.status(call.subject)["gates"] == []
