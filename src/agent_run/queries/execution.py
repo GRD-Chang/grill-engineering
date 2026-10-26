@@ -1,5 +1,5 @@
 """Shared read-only interpretation of recorded Worker segments and Thread bindings."""
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 import json
 import math
@@ -68,6 +68,13 @@ def _timing(samples: list[dict[str, Any]]) -> dict[str, Any]:
     if known:
         result["recorded_execution_seconds"] = int(sum(known))
     return result
+
+
+def invocation_timing(invocations: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Summarize loaded activity facts; an open output cannot prove a total."""
+    return _timing([{"elapsed_seconds": output["elapsed_seconds"] if output["exited_at"] is not None else None,
+                     "recorded_execution_seconds": output["recorded_execution_seconds"]}
+                    for invocation in invocations for output in invocation["outputs"]])
 
 
 def execution_facts(tx: Transaction, row: Mapping[str, Any], *, attempt_id: str | None = None,
