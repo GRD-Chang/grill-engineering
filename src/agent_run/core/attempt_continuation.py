@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 import sqlite3
 from typing import Any, Mapping
 
@@ -46,6 +47,8 @@ class ContinuationFacts:
     ordinary_used: int
     capacity_count: int
     output_ordinal: int
+    semantic_used: int
+    semantic_deadline: float | None
 
 
 def _thread(tx: Transaction, attempt: sqlite3.Row, thread_id: str) -> sqlite3.Row:
@@ -104,6 +107,45 @@ def bind_attempt_continuation(tx: Transaction, attempt_id: str, basis: AttemptCo
                (basis.thread_id, material, basis.context_id, attempt_id))
 
 
+def _semantic_history(tx: Transaction, attempt: sqlite3.Row) -> tuple[int, float | None]:
+    # Transaction.all already enforces the common query/row/byte limits. A
+    # predecessor is meaningful only within this one Attempt's linear history.
+    rows = tx.all("SELECT id,thread,predecessor,recovery_kind,deadline_at FROM invocations WHERE attempt=?", (attempt['id'],))
+    by_id = {row['id']: row for row in rows}
+    cursor, seen, chain = attempt['current_invocation'], set(), []
+    while cursor is not None:
+        if cursor in seen or cursor not in by_id:
+            raise KernelError('continuation_lineage')
+        seen.add(cursor)
+        row = by_id[cursor]
+        chain.append(row)
+        cursor = row['predecessor']
+    if len(seen) != len(rows) or len(by_id) != len(rows):
+        raise KernelError('continuation_lineage')
+    used, deadline, parent = 0, None, None
+    threads = set()
+    for row in reversed(chain):
+        if row['thread'] not in threads:
+            _thread(tx, attempt, row['thread'])
+            threads.add(row['thread'])
+        if (not isinstance(row['deadline_at'], (int, float)) or not math.isfinite(row['deadline_at'])
+                or row['recovery_kind'] not in {None, 'ordinary', 'capacity', 'explicit', 'semantic'}):
+            raise KernelError('continuation_lineage')
+        if row['recovery_kind'] == 'explicit':
+            deadline = None
+        elif row['recovery_kind'] == 'semantic':
+            if parent is None or row['thread'] != parent['thread']:
+                raise KernelError('continuation_lineage')
+            used += 1
+            deadline = parent['deadline_at']
+        elif parent is None and row['recovery_kind'] in {'ordinary', 'capacity'}:
+            raise KernelError('continuation_lineage')
+        if used > 1 or deadline is not None and row['deadline_at'] != deadline:
+            raise KernelError('continuation_lineage')
+        parent = row
+    return used, deadline
+
+
 def load_continuation(tx: Transaction, attempt_id: str) -> ContinuationFacts:
     attempt = tx.one("SELECT * FROM attempts WHERE id=?", (attempt_id,))
     if attempt['thread_id'] is None or attempt['opening_id'] is None:
@@ -123,4 +165,6 @@ def load_continuation(tx: Transaction, attempt_id: str) -> ContinuationFacts:
                     "FROM invocations WHERE attempt=?", (attempt_id,))
     ordinal = tx.one("SELECT coalesce(max(o.ordinal),0) FROM invocation_outputs o JOIN invocations i ON i.id=o.invocation "
                      "WHERE i.attempt=?", (attempt_id,))[0]
-    return ContinuationFacts(attempt['thread_id'], context, prior, counts[0], counts[1], ordinal)
+    semantic_used, semantic_deadline = _semantic_history(tx, attempt)
+    return ContinuationFacts(attempt['thread_id'], context, prior, counts[0], counts[1], ordinal,
+                             semantic_used, semantic_deadline)

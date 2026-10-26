@@ -51,7 +51,7 @@ def role_schema(role: str) -> dict[str, Any]:
         checks = _object_schema({name: {"$ref": "#/$defs/lane"} for name in _LANES})
         return {**_object_schema({"checks": checks}), "$defs": {"lane": lane}}
     return _object_schema({
-        "result_kind": {"type": "string", "enum": [role, "human_blocker"]},
+        "result_kind": {"type": "string", "enum": [role, "human_blocker", *(["incomplete"] if role == "development" else [])]},
         **{name: _text_schema(nullable=True) for name in _CONTENT[role]},
         "human_blockers": {"type": ["array", "null"], "minItems": 1,
                            "maxItems": MAX_HUMAN_BLOCKERS,
@@ -140,12 +140,12 @@ def parse_artifact(role: str, raw: bytes) -> dict[str, Any]:
         if any(len(item) > MAX_HUMAN_BLOCKER_LENGTH for item in blockers):
             raise ArtifactContractError(f"each human blocker must contain at most {MAX_HUMAN_BLOCKER_LENGTH} characters")
         return data
-    if kind != role:
+    if kind != role and not (role == "development" and kind == "incomplete"):
         raise ArtifactContractError(f"invalid {role} result_kind")
     if data["human_blockers"] is not None:
         raise ArtifactContractError(f"{role} result human_blockers must be null")
     result: dict[str, Any] = {
-        "result_kind": role,
+        "result_kind": kind,
         **{name: _commit_message(data[name]) if name == "commit_message" else _text(data[name], name)
            for name in content},
         "human_blockers": None,

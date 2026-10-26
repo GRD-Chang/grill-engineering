@@ -3558,7 +3558,8 @@ class Kernel:
     def _allocate(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, work: Work,
                   world: World, pending: sqlite3.Row | None = None,
                   *, continuation: ContinuationFacts | None = None, recovery_kind: str | None = None,
-                  output_error: str | None = None, retain_period: bool = False) -> Step | IORequest:
+                  output_error: str | None = None, retain_period: bool = False,
+                  retain_deadline: bool = False) -> Step | IORequest:
         execution, allow_agent = work.execution, work.allow_agent
         subject = job["id"]
         if self._agent_seats(tx, subject):
@@ -3614,6 +3615,13 @@ class Kernel:
         attempt_id = pending["id"] if pending is not None else identity()
         facts = None if pending is None else continuation or load_continuation(tx, pending["id"])
         previous = None if facts is None else facts.prior
+        # A semantic successor and its automatic recoveries share one absolute
+        # clock, but only format repair reuses the previous Invocation/output.
+        inherited = (retain_period or retain_deadline or facts is not None
+                     and facts.semantic_deadline is not None and pending is not None
+                     and pending["resume_action"] is None)
+        if inherited and previous is None:
+            raise KernelError("continuation_deadline_missing")
         thread_id = None
         if pending is not None and not pending["new_thread"]:
             assert facts is not None
@@ -3684,7 +3692,7 @@ class Kernel:
                             and tx.rows("SELECT id FROM invocations WHERE id=? AND executor=? AND epoch=? AND thread=?",
                                         (previous.invocation_id, execution.owner, execution.epoch, thread_id)))
         started = self.clock()
-        deadline = min(started + AGENT_PREPARATION_SECONDS, previous.deadline_at) if retain_period and previous is not None else started + AGENT_PREPARATION_SECONDS
+        deadline = min(started + AGENT_PREPARATION_SECONDS, previous.deadline_at) if inherited and previous is not None else started + AGENT_PREPARATION_SECONDS
         preparation = AgentPreparation(identity(), attempt_id, subject, role, Purpose(job["purpose"]), thread_id,
             execution, context, profile, duration, deadline, mode, backend_thread, ordinal,
             binding["profile_revision"], reference)
@@ -3692,7 +3700,7 @@ class Kernel:
         for key in ("context", "profile", "preparation_deadline"):
             del data[key]
         data.update(context_id=context_id, previous_invocation=None if previous is None else previous.invocation_id,
-                    retained_deadline=previous.deadline_at if retain_period and previous is not None else None,
+                    retained_deadline=previous.deadline_at if inherited and previous is not None else None,
                     owned_period=owned_period, recovery_kind=recovery_kind,
                     resume_action=None if pending is None else pending["resume_action"],
                     new_thread=False if pending is None else bool(pending["new_thread"]))
@@ -4021,6 +4029,8 @@ class Kernel:
             tx.execute("UPDATE attempts SET status='human',outcome=? WHERE id=?", (outcome, attempt["id"]))
             self._gate(tx, subject, "human_blocker", evidence=attempt["result_id"])
             return Step("paused", subject, "human_blocker")
+        if role == Role.DEVELOPMENT and outcome == "incomplete":
+            return self._continue_incomplete(tx, run, job, attempt, world, work)
         if role == Role.DEVELOPMENT:
             phase = "candidate"
         elif role == Role.REVIEW:
@@ -4042,6 +4052,33 @@ class Kernel:
         tx.execute("UPDATE subjects SET current_attempt=NULL,phase=?,version=version+1 WHERE id=?", (phase, subject))
         self._event(tx, subject, "role_consumed", attempt["id"], attempt["result_id"])
         return Step("progress", subject)
+
+    def _continue_incomplete(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row,
+                             attempt: sqlite3.Row, world: World, work: Work) -> Step | IORequest:
+        facts = load_continuation(tx, attempt["id"])
+        prior = facts.prior
+        backend = tx.one("SELECT backend_id FROM threads WHERE id=?", (facts.thread_id,))[0]
+        reason = None
+        if (prior is None or prior.raw_id != attempt["result_id"] or prior.dispatch_state != "exited"
+                or prior.exit_code != 0 or prior.process_identity is None or not backend):
+            reason = "semantic_continuation_unavailable"
+        elif attempt["resume_action"] is not None:
+            # Explicit continuation uses existing control authority. An old
+            # read-only formatting context stays read-only, never promoted.
+            return self._allocate(tx, run, job, work, world, attempt, continuation=facts)
+        elif facts.context.get("readonly") or facts.output_ordinal:
+            reason = "semantic_incomplete_readonly"
+        elif facts.semantic_used:
+            reason = "semantic_incomplete_limit"
+        elif self.clock() >= prior.deadline_at:
+            reason = "invocation_deadline_exceeded"
+        if reason is not None:
+            evidence = tx.put(job["id"], "semantic_incomplete", wire_json({"reason": reason,
+                "attempt": attempt["id"], "result_id": attempt["result_id"]}))
+            self._gate(tx, job["id"], "execution_failed", evidence=evidence)
+            return Step("paused", job["id"], reason)
+        return self._allocate(tx, run, job, work, world, attempt, continuation=facts,
+                              recovery_kind="semantic", retain_deadline=True)
 
     def _repair_output(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, attempt: sqlite3.Row,
                        world: World, work: Work, error: str) -> Step | IORequest:
@@ -4964,7 +5001,7 @@ class Kernel:
                 phase = "integration"
                 tx.execute("UPDATE subjects SET gate_mode='ci_waiver' WHERE id=?", (subject,))
             elif (job["kind"] == DeliveryKind.TICKET and job["purpose"] == Purpose.REQUIREMENTS
-                    and budget["reviews_used"] >= budget["review_limit"]):
+                    and budget["reviews_used"] >= budget["review_limit"] and not result["raw"].get("no_change")):
                 if not job["review_attempt"]:
                     raise KernelError("fallback_without_prior_review")
                 previous = tx.one("SELECT outcome FROM attempts WHERE id=?", (job["review_attempt"],))

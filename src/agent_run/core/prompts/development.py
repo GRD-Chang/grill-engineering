@@ -94,6 +94,7 @@ def development_prompt(
                 evidence,
                 review_budget(request, reviewer=False) if repair else "",
                 human_continuation(request),
+                resource(request, "development/output"),
             )
             if block
         )

@@ -70,12 +70,14 @@ Correct only the result format. Do not restart development, review or validation
         'zh': """提交：只整理当前工作树，不暂存、commit、改写 Git 历史或执行 GitHub 写入；可以使用只读 Git。
 
 最后只输出符合指定输出 schema 的完整 JSON。正常完成时 result_kind 为 development，summary 记录实际改动、实际验证及已知限制，human_blockers 为 null。
+若工作确实尚未完成且没有外部人工阻塞，使用 result_kind incomplete、非空 summary 如实说明未完成工作，human_blockers 为 null；不要用 development 声称完成。无需代码修改时也要如实说明，不制造空改动或凭人工回复宣称审核通过。
 summary 简要记录实际命令、结果、验证对象与必要环境，不把未执行或旧代码的通过当作本次结果，不另交逐条问题处理表。
 只有确实需要人提供产品决定、权限、凭据或不可替代的外部操作时，result_kind 为 human_blocker，summary 为 null；human_blockers 说明发生了什么、已尝试什么、人必须做什么。
 可在当前职责内解决的问题继续处理。""",
         'en': """Submission: prepare only the current working tree. Do not stage, commit, rewrite Git history or perform GitHub writes. Read-only Git is allowed.
 
 Output only complete JSON conforming to the supplied output schema. On completion, use result_kind development; summary records actual changes, actual validation and known limitations; human_blockers is null.
+If work is genuinely unfinished without an external human blocker, use result_kind incomplete with a nonempty summary describing unfinished work and null human_blockers; do not claim completion with development. Report no-code-change work honestly without manufacturing edits or treating a human response as review approval.
 The summary must briefly record actual commands, results, validation targets and necessary environment. Do not present checks that were not run, or passes on old code, as results for this delivery. Do not provide a separate issue-by-issue disposition table.
 Only when a human must provide a product decision, permission, credentials or an irreplaceable external action, use result_kind human_blocker and null summary; human_blockers describes what happened, what was tried and what the human must do.
 Continue addressing problems that can be resolved within your responsibilities.""",
