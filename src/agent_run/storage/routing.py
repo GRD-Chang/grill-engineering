@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import sqlite3
+import os
+import stat
 from pathlib import Path
 from typing import Final, Literal, TYPE_CHECKING
 
@@ -19,6 +21,7 @@ from agent_run.errors import KernelError
 from agent_run.model import Requirements, RunSpec
 from agent_run.storage.sqlite import Storage, Transaction
 from agent_run.storage.tasks import read_repository_task
+from agent_run.storage.preflight import UnsupportedState
 
 if TYPE_CHECKING:
     from agent_run.adapters.workspace import ManagedWorkspace
@@ -88,6 +91,24 @@ class RepositoryRoute:
         """Canonical assembly from trusted workspace metadata, not directory discovery."""
         return cls(workspace.state_root / "kernel.sqlite3", workspace.repository_root, workspace.repository)
 
+    @classmethod
+    def from_database(cls, database: Path) -> RepositoryRoute:
+        """Read only admitted namespace metadata; never infer a Run from a path.
+
+        Used by explicit state-directory queries. The stored namespace, not a
+        directory label or JSON body, supplies repository identity. Each later
+        selected opening revalidates that namespace through the same Storage.
+        """
+        database = database.absolute()
+        if not database.exists() and not database.is_symlink():
+            cls._require_vacant_root(database)
+        with Storage._repository(database).transaction(write=False) as owner:
+            row = owner.one("SELECT repository,repository_root FROM repository_binding WHERE singleton=1")
+            route = cls(database, Path(row["repository_root"]), row["repository"])
+            if (row["repository"], row["repository_root"]) != (route.repository, str(route.repository_root)):
+                raise KernelError("repository_namespace_changed")
+        return route
+
     def __post_init__(self) -> None:
         if not self.database.is_absolute() or not self.repository_root.is_absolute():
             raise ValueError("Exact managed repository paths are required")
@@ -95,11 +116,38 @@ class RepositoryRoute:
         object.__setattr__(self, "repository", normalize_repository(self.repository))
 
     def metadata(self) -> Storage:
+        if not self.database.exists() and not self.database.is_symlink():
+            self._require_vacant_root(self.database)
         return Storage._repository(self.database,
             namespace=(self.repository, str(self.repository_root)))
 
+    @staticmethod
+    def _require_vacant_root(database: Path) -> None:
+        """Fresh initialization refuses every occupied root without reading it.
+
+        This is no old-state reader or migration. Old per-Run databases, orphan
+        sidecars and raw/material directories must never become an empty new
+        repository merely because the canonical filename is absent. A failed
+        inspection is unknown, not permission to create. No directory/file is
+        created, removed, repaired or renamed by this check.
+        """
+        directory = database.parent
+        try:
+            try:
+                info = directory.lstat()
+            except FileNotFoundError:
+                return
+            if not stat.S_ISDIR(info.st_mode):
+                raise UnsupportedState(directory, "repository_state_occupied")
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    raise UnsupportedState(Path(entry.path), "repository_state_occupied")
+        except OSError as error:
+            raise UnsupportedState(directory, "unreadable_state") from error
+
     def initialize(self) -> Storage:
         """Explicit exclusive initialization only, never a read-error repair."""
+        self._require_vacant_root(self.database)
         Storage.create(self.database, _repository=True,
             _namespace=(self.repository, str(self.repository_root)))
         return self.metadata()

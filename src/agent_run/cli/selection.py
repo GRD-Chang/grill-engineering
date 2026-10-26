@@ -27,6 +27,17 @@ def _repository(value: str) -> str:
         raise QueryError("run_locator_invalid", "Repository must be OWNER/NAME") from error
 
 
+def control_selection(parsed: argparse.Namespace, *, language: str) -> argparse.Namespace:
+    """The existing public numeric-Parent/exact-Run convention, without I/O."""
+    from agent_run.cli.settings import _positive
+    selection = argparse.Namespace(**vars(parsed))
+    selection.parent = None
+    if selection.run_id.isdecimal():
+        selection.parent = _positive(selection.run_id, language=language)
+        selection.run_id = None
+    return selection
+
+
 def _cwd_repository() -> str | None:
     try:
         env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
@@ -267,3 +278,62 @@ def select_repository(parsed: argparse.Namespace, candidates: Sequence[RunLocati
     if len(matches) != 1:
         raise QueryError("run_locator_conflict", "Multiple repository Runs match; select an exact repository and Run")
     return matches
+
+
+def repository_route_for(location: RunLocation, routes: Sequence[RepositoryRoute]) -> RepositoryRoute:
+    """Match typed identity, never a display body or a directory-named Run."""
+    matches = [route for route in routes
+               if route.database.resolve() == location.database.resolve()
+               and (route.repository, route.repository_root) == (location.task.repository, location.task.workspace)]
+    if len(matches) != 1:
+        raise QueryError("run_locator_conflict", "Run metadata has no unique repository route")
+    return matches[0]
+
+
+def repository_target(parsed: argparse.Namespace, routes: Sequence[RepositoryRoute]) -> tuple[RepositoryRoute, RunLocation]:
+    selected = select_repository(parsed, repository_candidates(parsed, routes))
+    if len(selected) != 1:
+        raise QueryError("run_locator_conflict", "Select one exact repository Run")
+    return repository_route_for(selected[0], routes), selected[0]
+
+
+def managed_repository_routes(parsed: argparse.Namespace) -> tuple[RepositoryRoute, ...]:
+    """Read-only default route assembly, not yet selected by public dispatch.
+
+    Enumerate only the existing bounded managed-repository registry. No Run
+    directories, JSON publications, credentials or checkout contents are read.
+    Explicit state directories use the admitted database namespace instead of
+    deriving repository/Run identity from their names. Failed/old state is never
+    replaced, initialized or silently treated as an empty repository.
+    """
+    repository = _repository(parsed.repo) if parsed.repo else None
+    state = getattr(parsed, "state_dir", None)
+    data = getattr(parsed, "data_root", None)
+    if state is not None:
+        route = RepositoryRoute.from_database(state.absolute() / "kernel.sqlite3")
+        if repository is not None and route.repository != repository:
+            raise QueryError("run_locator_conflict", "Selected state belongs to another repository")
+        return (route,)
+    if data is not None and ((data / "kernel.sqlite3").exists() or (data / "kernel.sqlite3").is_symlink()):
+        route = RepositoryRoute.from_database(data.absolute() / "kernel.sqlite3")
+        if repository is not None and route.repository != repository:
+            raise QueryError("run_locator_conflict", "Selected state belongs to another repository")
+        return (route,)
+    if repository is None and data is None and not getattr(parsed, "run_id", None):
+        repository = _cwd_repository()
+    routes = []
+    base = app_data_root() / "repositories"
+    for root in _managed_state_roots(repository):
+        if data is not None and not root.absolute().is_relative_to(data.absolute()):
+            continue
+        relative = root.relative_to(base)
+        if len(relative.parts) != 3 or relative.parts[2] != "state":
+            raise QueryError("run_locator_conflict", "Invalid managed repository state root")
+        namespace = _repository(relative.parts[0] + "/" + relative.parts[1])
+        routes.append(RepositoryRoute.for_workspace(ManagedWorkspace.for_repository(namespace)))
+    if data is not None and not routes:
+        # An occupied explicit root outside the known registry is not proof of
+        # an empty repository. Preserve it and report refusal, never hide old
+        # per-Run databases merely because the new canonical file is absent.
+        RepositoryRoute._require_vacant_root(data.absolute() / "kernel.sqlite3")
+    return tuple(routes)

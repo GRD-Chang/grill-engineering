@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from uuid import uuid4
 
 from agent_run.errors import AgentProfileError
@@ -17,6 +18,10 @@ from agent_run.queries.execution import recorded_profile
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.cli.render import safe_text
+from agent_run.storage.run_scope import selected_statement
+
+if TYPE_CHECKING:
+    from agent_run.storage.routing import RepositoryRoute
 
 
 def add_parser(commands: Any, language: str) -> None:
@@ -29,23 +34,34 @@ def add_parser(commands: Any, language: str) -> None:
     parser.add_argument("--json", action="store_true", dest="as_json")
 
 
-def execute(parsed: argparse.Namespace) -> int:
-    from agent_run.cli.selection import _candidates, _select
+def execute(parsed: argparse.Namespace, *, repository_routes: Sequence[RepositoryRoute] | None = None) -> int:
+    from agent_run.cli.selection import _candidates, _select, repository_target
+    from agent_run.storage import routing
+
+    if repository_routes is not None and not routing.REPOSITORY_PUBLIC_READY:
+        raise KernelError("repository_activation_incomplete")
 
     selection = argparse.Namespace(**vars(parsed))
     selection.parent = None
     if selection.run_id.isdecimal():
         selection.parent = int(selection.run_id)
         selection.run_id = None
-    candidate = _select(selection, _candidates(selection))[0]
-    database = Path(candidate["database"]).resolve()
-    kernel = Kernel(database)
+    if repository_routes is None:
+        candidate = _select(selection, _candidates(selection))[0]
+        database = Path(candidate["database"]).resolve()
+        kernel = Kernel(database)
+        expected_run, expected_repository = candidate["run_id"], candidate["repository"].lower()
+    else:
+        route, location = repository_target(selection, repository_routes)
+        database, kernel = location.database, route.kernel(location.run_id)
+        expected_run, expected_repository = location.run_id, location.task.repository
     with kernel.storage.transaction(write=False) as tx:
-        run = tx.one("SELECT id,repository,parent_issue,language,repository_root FROM runs")
+        run = tx.one(*selected_statement(tx, "SELECT id,repository,parent_issue,language,repository_root FROM runs",
+            "SELECT id,repository,parent_issue,language,repository_root FROM runs WHERE id=?"))
         if run["language"] not in {"zh", "en"} or run["repository_root"] is None:
             raise KernelError("creation_metadata_missing")
         parsed._run_language = language = run["language"]
-        if run["id"] != candidate["run_id"] or run["repository"].lower() != candidate["repository"].lower():
+        if run["id"] != expected_run or run["repository"].lower() != expected_repository:
             raise KernelError("managed_state_identity")
         workspace = workspace_for_root(Path(run["repository_root"]))
         if not database.is_relative_to(workspace.state_root.resolve()):

@@ -331,7 +331,7 @@ def execute(parsed: argparse.Namespace, *, language: str,
     from agent_run.adapters.systemd import SystemdHost, HostUnavailable
     from agent_run.core.kernel import Kernel
     from agent_run.errors import KernelError
-    from agent_run.cli.selection import _candidates, _select, repository_candidates, select_repository
+    from agent_run.cli.selection import _candidates, _select, control_selection, repository_target
     from agent_run.adapters.remote import RemoteEffects
 
     if parsed.command not in {"run", "resume", "approve", "stop", "revise", "requeue", "abandon"}:
@@ -349,11 +349,7 @@ def execute(parsed: argparse.Namespace, *, language: str,
             manager = _manager_for(None, parsed, environment)
             options: dict[str, Any] = {} if repository_route is None else {"repository_route": repository_route}
             return _run(parsed, manager=manager, environment=environment, runner_lock=runner_lock, **options)
-        selection = argparse.Namespace(**vars(parsed))
-        selection.parent = None
-        if selection.run_id.isdecimal():
-            selection.parent = personal_settings._positive(selection.run_id, language=language)
-            selection.run_id = None
+        selection = control_selection(parsed, language=language)
         if repository_route is None:
             candidate = _select(selection, _candidates(selection))[0]
             database = Path(candidate["database"]).resolve()
@@ -366,9 +362,9 @@ def execute(parsed: argparse.Namespace, *, language: str,
                     or parsed.repo is not None and normalize_repository(parsed.repo) != repository_route.repository
                     or parsed.state_dir is not None and parsed.state_dir.resolve() != workspace.state_root.resolve()):
                 raise KernelError("managed_state_identity")
-            location = select_repository(selection, repository_candidates(selection, (repository_route,)))[0]
+            selected_route, location = repository_target(selection, (repository_route,))
             database = location.database
-            kernel = repository_route.kernel(location.run_id)
+            kernel = selected_route.kernel(location.run_id)
         with kernel.storage.transaction(write=False) as tx:
             run = tx.one(*selected_statement(tx, 'SELECT * FROM runs',
                       'SELECT * FROM runs WHERE id=?', ()))

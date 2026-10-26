@@ -24,6 +24,7 @@ from agent_run.queries.read_facts import QueryError as QueryError, all_rows as _
 from agent_run.queries.read_facts import action_guidance, recorded_review
 from agent_run.queries.read_facts import _one, _rows
 from agent_run.storage.run_scope import selected_statement
+from agent_run.storage.routing import open_run
 
 
 @dataclass(frozen=True)
@@ -58,10 +59,12 @@ def review_findings(value: Any) -> list[str]:
     return result
 
 
-def header(path: Path) -> dict[str, Any]:
+def header(path: Path, *, storage: Storage | None = None) -> dict[str, Any]:
     try:
-        require_supported_state(path)
-        with Storage(path).transaction(write=False) as tx:
+        if storage is None:
+            require_supported_state(path)
+        selected = Storage(path) if storage is None else open_run(path, storage=storage)
+        with selected.transaction(write=False) as tx:
             return _header(tx, path)
     except UnsupportedState:
         raise
@@ -547,13 +550,16 @@ def read_snapshot(tx: Transaction, path: Path, kind: Literal["status", "history"
 
 
 def read(path: Path, kind: Literal["status", "history", "settings"], *, after: int = 0, limit: int | None = None,
-         expected_run: str | None = None, expected_repository: str | None = None) -> QueryDocument:
+         expected_run: str | None = None, expected_repository: str | None = None,
+         storage: Storage | None = None) -> QueryDocument:
     """Read native facts without granting control or interpreting other formats."""
     if after < 0 or (limit is not None and not 1 <= limit <= 128):
         raise QueryError("query_limit", "History requires after >= 0 and an optional limit between 1 and 128")
     try:
-        require_supported_state(path)
-        with Storage(path).transaction(write=False) as tx:
+        if storage is None:
+            require_supported_state(path)
+        selected = Storage(path) if storage is None else open_run(path, storage=storage)
+        with selected.transaction(write=False) as tx:
             return read_snapshot(tx, path, kind, after=after, limit=limit,
                                  expected_run=expected_run, expected_repository=expected_repository)
     except QueryError:

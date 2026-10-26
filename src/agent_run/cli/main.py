@@ -4,14 +4,14 @@ from __future__ import annotations
 from agent_run.adapters.foreground import DomainUnknown
 
 import argparse
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from functools import partial
 import json
 import os
 from pathlib import Path
 import shlex
 import sys
-from typing import Any, Literal, NoReturn, Sequence
+from typing import Any, Literal, NoReturn, TYPE_CHECKING
 
 from agent_run.cli.messages import personal_language as _personal_language
 from agent_run.errors import error_detail
@@ -25,10 +25,14 @@ from agent_run.adapters.systemd import HostUnavailable
 from agent_run.runtime.handoff import HandoffError
 
 from agent_run.cli import selection as cli_selection, settings as personal_settings
-from agent_run.queries.run import QueryDocument, read
+from agent_run.queries.run import QueryDocument, read, header
 from agent_run.queries.read_facts import QueryError
 from agent_run.cli.render import render, render_settings, safe_text
 from agent_run.storage.preflight import UnsupportedState
+from agent_run.storage.sqlite import QUERY_LIMIT
+
+if TYPE_CHECKING:
+    from agent_run.storage.routing import RepositoryRoute
 
 
 class _HelpFormatter(argparse.HelpFormatter):
@@ -149,7 +153,30 @@ def _print_receipt(parsed: argparse.Namespace, output: Mapping[str, Any], langua
     print(safe_text(copy("next", command=shlex.join(command))))
 
 
-def main(arguments: Sequence[str] | None = None) -> int:
+def _repository_query(parsed: argparse.Namespace, routes: Sequence[RepositoryRoute], language: str) -> QueryDocument:
+    """Read from typed selection; never initialize or turn display into control."""
+    if parsed.command == "runs":
+        locations = cli_selection.select_repository(parsed, cli_selection.repository_candidates(parsed, routes))
+        headers = []
+        size = 0
+        for location in locations:
+            item = header(location.database,
+                storage=cli_selection.repository_route_for(location, routes).at_run(location.run_id))
+            size += len(json.dumps(item, ensure_ascii=False, allow_nan=False).encode())
+            if size > QUERY_LIMIT:
+                raise QueryError("query_limit", "Run listing exceeds its bounded response limit")
+            headers.append(item)
+        return QueryDocument("runs", language, {"result": "runs", "runs": headers})
+    if parsed.command not in {"status", "history", "settings"}:
+        raise QueryError("run_locator_invalid", "Unknown repository query")
+    route, location = cli_selection.repository_target(parsed, routes)
+    kind: Literal["status", "history", "settings"] = (
+        "history" if parsed.command == "history" else "settings" if parsed.command == "settings" else "status")
+    return read(location.database, kind, after=getattr(parsed, "after", 0), limit=getattr(parsed, "limit", None),
+        expected_run=location.run_id, expected_repository=location.task.repository, storage=route.at_run(location.run_id))
+
+
+def main(arguments: Sequence[str] | None = None, *, repository_routes: Sequence[RepositoryRoute] | None = None) -> int:
     language = _personal_language()
     parser = _parser(language)
     try:
@@ -157,15 +184,37 @@ def main(arguments: Sequence[str] | None = None) -> int:
     except SystemExit as error:
         return int(error.code) if isinstance(error.code, int) else 2
     try:
+        if repository_routes is not None:
+            from agent_run.storage import routing
+            selected_settings = parsed.command == "settings" and parsed.settings_command == "show" and (
+                parsed.run_id is not None or parsed.parent is not None)
+            uses_repository = parsed.command in {"configure", "config", "profile", "run", "resume", "approve",
+                "requeue", "revise", "stop", "abandon", "runs", "status", "history"} or selected_settings or (
+                parsed.command == "doctor" and parsed.run_id is not None)
+            if uses_repository and not routing.REPOSITORY_PUBLIC_READY:
+                raise KernelError("repository_activation_incomplete")
         if parsed.command in {"configure", "config", "profile"}:
             from agent_run.cli import profiles as run_profile_cli
-            return run_profile_cli.execute(parsed)
+            options: dict[str, Any] = {} if repository_routes is None else {"repository_routes": repository_routes}
+            return run_profile_cli.execute(parsed, **options)
         if parsed.command == "prompts":
             from agent_run.cli import prompts as prompt_cli
             return prompt_cli.execute(parsed)
         if parsed.command in {"run", "resume", "approve", "requeue", "revise", "stop", "abandon"}:
             from agent_run.cli.lifecycle import execute
-            output = execute(parsed, language=language)
+            if repository_routes is None:
+                output = execute(parsed, language=language)
+            else:
+                if parsed.command == "run":
+                    repository = cli_selection._repository(parsed.repo) if parsed.repo else cli_selection._cwd_repository()
+                    matches = [route for route in repository_routes if route.repository == repository]
+                    if len(matches) != 1:
+                        raise QueryError("run_locator_conflict", "Select one exact managed repository")
+                    selected_route = matches[0]
+                else:
+                    selection = cli_selection.control_selection(parsed, language=language)
+                    selected_route, _ = cli_selection.repository_target(selection, repository_routes)
+                output = execute(parsed, language=language, repository_route=selected_route)
             language = output.pop("language", language)
             if parsed.as_json:
                 print(json.dumps(output, ensure_ascii=False, sort_keys=True))
@@ -179,29 +228,41 @@ def main(arguments: Sequence[str] | None = None) -> int:
             frozen = None
             if parsed.run_id is not None:
                 parsed.parent = None
-                candidate = cli_selection._select(parsed, cli_selection._candidates(parsed))[0]
-                frozen = read(Path(candidate["database"]), "settings", expected_run=candidate["run_id"],
-                              expected_repository=candidate["repository"].lower()).data
-                parsed.repo = candidate["repository"]
+                if repository_routes is None:
+                    candidate = cli_selection._select(parsed, cli_selection._candidates(parsed))[0]
+                    frozen = read(Path(candidate["database"]), "settings", expected_run=candidate["run_id"],
+                                  expected_repository=candidate["repository"].lower()).data
+                    parsed.repo = candidate["repository"]
+                else:
+                    route, location = cli_selection.repository_target(parsed, repository_routes)
+                    frozen = read(location.database, "settings", expected_run=location.run_id,
+                        expected_repository=location.task.repository, storage=route.at_run(location.run_id)).data
+                    parsed.repo = location.task.repository
             return diagnose(as_json=parsed.as_json, local=parsed.local, online=parsed.online,
                             mode=parsed.mode, repository=parsed.repo, frozen=frozen)
         if parsed.command == "settings":
             if parsed.settings_command == "show" and (parsed.run_id is not None or parsed.parent is not None):
-                candidate = cli_selection._select(parsed, cli_selection._candidates(parsed))[0]
-                if candidate.get("language") in {"zh", "en"}:
-                    language = candidate["language"]
-                document = read(Path(candidate["database"]), "settings", expected_run=candidate["run_id"],
-                                expected_repository=candidate["repository"].lower())
+                if repository_routes is None:
+                    candidate = cli_selection._select(parsed, cli_selection._candidates(parsed))[0]
+                    if candidate.get("language") in {"zh", "en"}:
+                        language = candidate["language"]
+                    document = read(Path(candidate["database"]), "settings", expected_run=candidate["run_id"],
+                                    expected_repository=candidate["repository"].lower())
+                else:
+                    document = _repository_query(parsed, repository_routes, language)
                 settings = dict(document.data)
                 language = document.language
             else:
                 settings = personal_settings.execute(parsed)
             render_settings(settings, as_json=parsed.as_json, stream=sys.stdout)
             return 0
-        selected = cli_selection._select(parsed, cli_selection._candidates(parsed))
-        if parsed.command == "runs":
+        if repository_routes is not None:
+            document = _repository_query(parsed, repository_routes, language)
+        elif parsed.command == "runs":
+            selected = cli_selection._select(parsed, cli_selection._candidates(parsed))
             document = QueryDocument("runs", language, {"result": "runs", "runs": selected})
         else:
+            selected = cli_selection._select(parsed, cli_selection._candidates(parsed))
             candidate = selected[0]
             if candidate.get("language") in {"zh", "en"}:
                 language = candidate["language"]
