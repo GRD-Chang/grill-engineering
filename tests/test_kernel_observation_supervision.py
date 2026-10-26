@@ -110,8 +110,14 @@ def test_worker_read_wait_keeps_original_call_and_one_process(tmp_path, monkeypa
         assert not canary.exists()
         status = kernel.status(call.subject)
         assert status["gates"] == []
-        assert status["budgets"]["requirements"]["developments_used"] == 1
+        # Admission and bootstrap binding precede Go; neither proves work.
+        assert status["budgets"]["requirements"]["developments_used"] == 0
         with kernel.storage.transaction(write=False) as tx:
+            assert tx.one("SELECT accounted FROM attempts WHERE id=?", (call.attempt_id,))[0] == 0
+            period = dict(tx.one("SELECT id,attempt,thread,deadline_at FROM invocations WHERE id=?",
+                                 (call.invocation_id,)))
+            assert period == {"id": call.invocation_id, "attempt": call.attempt_id,
+                              "thread": call.thread_id, "deadline_at": call.deadline_at}
             row = tx.one("SELECT process_identity,dispatch_state FROM invocation_outputs WHERE invocation=? AND ordinal=?",
                          (call.invocation_id, call.output_ordinal))
             assert row["dispatch_state"] == ("sent" if window == 1 else "started")
@@ -140,7 +146,12 @@ def test_worker_read_wait_keeps_original_call_and_one_process(tmp_path, monkeypa
     assert not thread.is_alive()
     expected_starts = 1 if outcome == "converge" else window - 1
     assert sum(event["kind"] == "worker_started" for event in kernel.history(call.subject)) == expected_starts
-    assert kernel.status(call.subject)["budgets"]["requirements"]["developments_used"] == 1
+    charged = int(outcome == "converge")  # Only convergence reaches actual Go.
+    assert kernel.status(call.subject)["budgets"]["requirements"]["developments_used"] == charged
+    with kernel.storage.transaction(write=False) as tx:
+        assert tx.one("SELECT accounted FROM attempts WHERE id=?", (call.attempt_id,))[0] == charged
+        assert [dict(row) for row in tx.rows(
+            "SELECT id,attempt,thread,deadline_at FROM invocations WHERE attempt=?", (call.attempt_id,))] == [period]
     assert kernel.operation_state().active == ()
     if outcome != "converge":
         assert results == [] and len(failures) == 1
