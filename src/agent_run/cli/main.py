@@ -117,7 +117,8 @@ def _print_receipt(parsed: argparse.Namespace, output: Mapping[str, Any], langua
 
     print(safe_text(copy("attached" if output["result"] == "attached" else "accepted", command=parsed.command)))
     status = {"action_pending": "pending", "action_applied": "applied", "action_complete": "complete",
-              "action_updating": "updating", "action_superseded": "superseded"}.get(output["status"], "unknown")
+              "action_updating": "updating", "action_superseded": "superseded",
+              "action_failed": "failed"}.get(output["status"], "unknown")
     print(copy("status", status=copy(status)))
     host = output["host"] if output["host"] in {"running", "exited"} else "unknown"
     print(copy("host_" + host))
@@ -236,7 +237,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 root = error_candidate["repository_root"] or ("未记录" if language == "zh" else "Not recorded")
                 scope = (f"{error_candidate['repository']} Parent #{error_candidate['parent']} "
                          if error_candidate["repository"] is not None and error_candidate["parent"] is not None else "")
-                print(safe_text(f"{scope}{root} [{error_candidate['state_dir']}]"))
+                print(safe_text(f"{scope}{root} [{error_candidate['database']}]"))
         return 2
     except KeyboardInterrupt:
         return 130

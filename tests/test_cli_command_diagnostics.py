@@ -210,3 +210,43 @@ def test_ambiguous_run_error_keeps_locations_and_machine_identity_without_repeat
     assert machine["diagnostics"][0]["code"] == "run_locator_conflict"
     assert {item["run_id"] for item in machine["candidates"]} == {"private-one", "private-two"}
     assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_receipt_distinguishes_known_failed_action_from_unconfirmed_state(capsys, language: str) -> None:
+    from argparse import Namespace
+    from agent_run.cli.main import _print_receipt
+
+    _print_receipt(Namespace(command="resume", repo="example/project", run_id="12", ticket=None, state_dir=None),
+                   {"result": "accepted", "status": "action_failed", "host": "exited"}, language)
+    output = capsys.readouterr().out
+    assert ("请求处理失败" if language == "zh" else "Request processing failed") in output
+    assert ("已记录请求状态: 未确认" if language == "zh" else "Stored request state: Unconfirmed") not in output
+    assert "action_failed" not in output
+
+
+def test_ambiguous_databases_in_the_same_directory_have_distinct_copyable_locations(tmp_path: Path, capsys) -> None:
+    from agent_run.cli.main import main
+    from agent_run.core.kernel import Kernel
+    from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
+    from support.offline import fixture_inputs
+    from test_kernel_query_cli import _snapshot
+
+    delivery = Delivery("parent:1", DeliveryKind.PARENT_ONLY, 1, "original", Commit("base", "tree"),
+                        "refs/heads/task", "refs/heads/main")
+    source = Requirements(ParentIssue(1, "Parent", "Original requirement"), ())
+    for name, identity in (("kernel.sqlite3", "first-private-id"), ("state.sqlite3", "second-private-id")):
+        Kernel.create(tmp_path / name, RunSpec(identity, "example/project", 1, "parent", "graph", (delivery,),
+                      language="en", repository_root=str(tmp_path / "checkout"), inputs=fixture_inputs()), requirements=source)
+    before = _snapshot(tmp_path)
+    arguments = ["status", "--repo", "example/project", "--parent", "1", "--state-dir", str(tmp_path)]
+    assert main(arguments) == 2
+    output = capsys.readouterr().out
+    assert f"[{tmp_path / 'kernel.sqlite3'}]" in output
+    assert f"[{tmp_path / 'state.sqlite3'}]" in output
+    assert "first-private-id" not in output and "second-private-id" not in output
+    assert main([*arguments, "--json"]) == 2
+    candidates = json.loads(capsys.readouterr().out)["candidates"]
+    assert {item["database"] for item in candidates} == {str(tmp_path / name) for name in ("kernel.sqlite3", "state.sqlite3")}
+    assert {item["run_id"] for item in candidates} == {"first-private-id", "second-private-id"}
+    assert _snapshot(tmp_path) == before
