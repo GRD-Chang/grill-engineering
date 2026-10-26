@@ -211,6 +211,11 @@ def _history_round(attempt: Mapping[str, Any], issue: int, language: str, detail
         if details:
             yield from _history_timing([invocation], language)
             for output in invocation["outputs"]:
+                if output["raw_id"] is not None:
+                    yield text("presentation.history.original_return", language=language,
+                               invocation=invocation["id"], ordinal=output["ordinal"],
+                               mode=output["mode"], material=output["raw_id"])
+                    yield _body(output["raw_return"])
                 for event in output["activity"]:
                     stamp, zone = _time(event["observed_at"])
                     yield text("presentation.history.activity_start" if event["active"] else
@@ -222,7 +227,7 @@ def _history_round(attempt: Mapping[str, Any], issue: int, language: str, detail
     if attempt["status"] == "returned" or attempt["outcome"] is None or not isinstance(result, Mapping):
         yield text("presentation.history.return_awaits_consumption" if attempt["status"] == "returned" else
                    "presentation.history.result_not_recorded", language=language)
-        if details:
+        if details and not any(output["raw_id"] == attempt["result_id"] for output in outputs):
             yield _body(result)
         return
     if attempt["role"] == "review":

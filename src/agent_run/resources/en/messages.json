@@ -1124,6 +1124,7 @@
   "cli.receipt.failed": "Request processing failed",
   "presentation.history.round_identity": "#{issue} {role} #{ordinal} · Generation {generation} · Window {window} ({purpose})",
   "presentation.history.invocation": "  Invocation {ordinal} in this round",
+  "presentation.history.original_return": "    Original return · Invocation {invocation} · Output {ordinal} ({mode}) · {material}:",
   "presentation.history.activity_start": "    Activity started: {stamp} ({zone})",
   "presentation.history.activity_end": "    Activity ended: {stamp} ({zone})",
   "presentation.history.timing_unknown": "    Execution timing not recorded",

@@ -1124,6 +1124,7 @@
   "cli.receipt.failed": "请求处理失败",
   "presentation.history.round_identity": "#{issue} {role} #{ordinal} · 代次 {generation} · 窗口 {window} ({purpose})",
   "presentation.history.invocation": "  本轮调用 {ordinal}",
+  "presentation.history.original_return": "    原始返回 · Invocation {invocation} · 输出 {ordinal}（{mode}）· {material}：",
   "presentation.history.activity_start": "    活动开始: {stamp} ({zone})",
   "presentation.history.activity_end": "    活动结束: {stamp} ({zone})",
   "presentation.history.timing_unknown": "    执行耗时未记录",
