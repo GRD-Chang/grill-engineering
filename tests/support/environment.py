@@ -82,3 +82,11 @@ def _assert_python_and_git_environment() -> None:
     assert {
         key: value for key, value in os.environ.items() if key.startswith("GIT_CONFIG")
     } == {"GIT_CONFIG_NOSYSTEM": "1"}
+
+
+def durable_snapshot(root: Path) -> dict[str, bytes]:
+    # SQLite SHM is coordination, not durable business state. Retain all WAL
+    # bytes if present; a read is not allowed to append durable frames.
+    return {str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*")
+            if path.is_file() and not path.name.endswith("-shm") and
+            not (path.name.endswith("-wal") and path.stat().st_size == 0)}

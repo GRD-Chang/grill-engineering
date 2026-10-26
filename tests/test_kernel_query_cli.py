@@ -17,6 +17,7 @@ from agent_run.core.kernel import Kernel
 import agent_run.queries.run as query
 from agent_run.cli.main import main
 from support.offline import Scenario, fixture_inputs
+from support.environment import durable_snapshot as _snapshot
 from agent_run.core.operation_contract import DeliveryFacts
 from agent_run.core.operation_runner import OperationRunner
 from support.core_operations import CoreOperations, ReadOnlyPorts
@@ -103,14 +104,6 @@ def test_valid_large_queue_dependency_set_and_default_history_are_not_truncated(
     first = query.read(kernel.storage.path, "history", limit=17).data
     assert len(first["history"]["events"]) == 17 and first["history"]["has_more"] is True
     assert _snapshot(tmp_path) == before
-
-
-def _snapshot(root: Path) -> dict[str, bytes]:
-    # SQLite SHM is coordination, not durable business state. Retain all WAL
-    # bytes if present; a read is not allowed to append durable frames.
-    return {str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*")
-            if path.is_file() and not path.name.endswith("-shm") and
-            not (path.name.endswith("-wal") and path.stat().st_size == 0)}
 
 
 def _arguments(kernel: Kernel, command: str = "status", *extra: str) -> list[str]:

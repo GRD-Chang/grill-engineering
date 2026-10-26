@@ -1125,5 +1125,17 @@
   "cli.receipt.failed": "Request processing failed",
   "cli.settings.field.required_checks_wait_seconds": "Required Checks wait (seconds)",
   "cli.required_checks_wait_help": "Required Checks wait per PR/head: positive seconds or s/m/h/d, at most 7d (default 45m; frozen when creating a Run)",
-  "policy.error.checks_wait_range": "required_checks_wait_seconds must be positive and at most 7 days"
+  "policy.error.checks_wait_range": "required_checks_wait_seconds must be positive and at most 7 days",
+  "presentation.history.round_identity": "#{issue} {role} #{ordinal} · Generation {generation} · Window {window} ({purpose})",
+  "presentation.history.invocation": "  Invocation {ordinal} in this round",
+  "presentation.history.original_return": "    Original return · Invocation {invocation} · Output {ordinal} ({mode}) · {material}:",
+  "presentation.history.activity_start": "    Activity started: {stamp} ({zone})",
+  "presentation.history.activity_end": "    Activity ended: {stamp} ({zone})",
+  "presentation.history.timing_unknown": "    Execution timing not recorded",
+  "presentation.history.result_not_recorded": "    Round result not recorded",
+  "presentation.history.return_awaits_consumption": "    Round result returned; awaiting Controller consumption",
+  "presentation.history.historical_result": "    Historical result; not authorization for the current delivery",
+  "presentation.history.acceptance_installed": "Accepted result installed at the delivery boundary",
+  "presentation.history.allowance_records": "Recorded allowance windows (not round-start budget snapshots)",
+  "presentation.history.page_round_unavailable": "Round details unavailable on this page; expand the history range"
 }
