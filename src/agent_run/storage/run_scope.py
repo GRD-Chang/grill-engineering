@@ -69,6 +69,11 @@ class RunTransaction(Transaction):
         if self._read_scope(self.run_id) != self.scope:
             raise KernelError("run_scope_changed")
 
+    def require_scope(self) -> RunScope:
+        """Revalidate the selected identity for a migrated fact consumer."""
+        self._require_scope()
+        return self.scope
+
     def _material_identity(self, subject: str, purpose: str, digest: str) -> str:
         return hashlib.sha256(wire_json([self.run_id, subject, purpose, digest])).hexdigest()
 

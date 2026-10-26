@@ -6,6 +6,7 @@ import math
 from typing import Any
 
 from agent_run.storage.sqlite import Transaction
+from agent_run.storage.attempts import AttemptRecords
 
 
 def worker_activity_start(tx: Transaction, subject: str | None, *, position: int | None = None,
@@ -94,7 +95,7 @@ def activity(tx: Transaction, invocation: str, ordinal: int, subject: str,
 
 
 def recorded_profile(tx: Transaction, revision: int) -> dict[str, Any]:
-    row = tx.one("SELECT subject,material_id FROM profile_revisions WHERE id=?", (revision,))
+    row = AttemptRecords(tx).profile_revision(revision)
     value = json.loads(tx.get(row["material_id"], row["subject"]))
     if not isinstance(value, dict) or not isinstance(value.get("profiles"), dict):
         raise ValueError("Invalid recorded Profile Revision")
