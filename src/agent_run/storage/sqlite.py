@@ -7,17 +7,20 @@ rolls back as a whole, including when a nested failure was caught by a caller.
 from __future__ import annotations
 
 
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 import hashlib
 import mmap
 from pathlib import Path
 import sqlite3
+from threading import Event
+from time import monotonic
 from typing import Any, Iterator, Sequence
 
 from agent_run.storage.sqlite_runtime import require_wal_runtime
 
 from agent_run.errors import KernelError
 from agent_run.storage.preflight import PROTOCOL, UnsupportedState, read_state, require_supported_connection, require_supported_state
+from agent_run.storage.save_order import WRITE_CONTENTION_SECONDS, check_cancelled, database_identity, remaining, save_turn
 
 MATERIAL_LIMIT = 4 * 1024 * 1024
 CURRENT_LIMIT = 256 * 1024
@@ -370,13 +373,21 @@ class Storage:
         return cls(path)
 
     @contextmanager
-    def transaction(self, *, write: bool = True) -> Iterator[Transaction]:
+    def transaction(self, *, write: bool = True, ordered: bool = True,
+                    cancelled: Event | None = None) -> Iterator[Transaction]:
         require_wal_runtime()
-        if write:
-            require_supported_state(self.path)
-        scope = (closing(sqlite3.connect(self.path.absolute().as_uri() + "?mode=rw", uri=True,
-                                        isolation_level=None, timeout=1.0)) if write else read_state(self.path))
-        with scope as connection:
+        deadline = monotonic() + WRITE_CONTENTION_SECONDS
+        with ExitStack() as scopes:
+            identity = None
+            if write:
+                identity = scopes.enter_context(save_turn(self.path, ordered=ordered,
+                    deadline=deadline, cancelled=cancelled))
+                require_supported_state(self.path, timeout=remaining(deadline))
+                if database_identity(self.path) != identity:
+                    raise UnsupportedState(self.path, "uncertain_state")
+            scope = (closing(sqlite3.connect(self.path.absolute().as_uri() + "?mode=rw", uri=True,
+                                            isolation_level=None, timeout=remaining(deadline))) if write else read_state(self.path))
+            connection = scopes.enter_context(scope)
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA trusted_schema=OFF")
             connection.execute("PRAGMA foreign_keys=ON")
@@ -385,13 +396,21 @@ class Storage:
             transaction = Transaction(connection)
             try:
                 if write:
+                    check_cancelled(cancelled)
+                    connection.execute(f"PRAGMA busy_timeout={int(remaining(deadline) * 1000)}")
                     connection.execute("BEGIN IMMEDIATE")
+                    if database_identity(self.path) != identity:
+                        raise UnsupportedState(self.path, "uncertain_state")
                 require_supported_connection(connection, self.path)
                 self._capacity(connection)
+                if write:
+                    check_cancelled(cancelled)
                 yield transaction
                 if transaction.failed:
                     raise KernelError("transaction_aborted", "a caught SQL failure poisoned this transaction")
                 if write:
+                    if database_identity(self.path) != identity:
+                        raise UnsupportedState(self.path, "uncertain_state")
                     require_supported_connection(connection, self.path)
                 self._capacity(connection, committing=write)
                 connection.commit()

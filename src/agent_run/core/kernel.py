@@ -750,7 +750,7 @@ class Kernel:
         policy = cls._policy_values(spec.policy)
         Storage.create(path)
         kernel = cls(path)
-        with kernel.storage.transaction() as tx:
+        with kernel.storage.transaction(ordered=False) as tx:
             if requirements is not None and fixture_evidence is not None:
                 raise KernelError("mixed_source_authority")
             if requirements is not None:
@@ -1465,7 +1465,7 @@ class Kernel:
 
     def requeue(self, subject: str, action_id: str, replacement: Delivery, world: World) -> str:
         """Explicitly retire one stale generation, retaining its work and siblings."""
-        with self.storage.transaction() as tx:
+        with self.storage.transaction(ordered=False) as tx:
             return self._control(tx, "requeue", action_id, subject=subject, world=world, replacement=replacement)
 
     def _validate_requeue(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row,
@@ -1830,7 +1830,7 @@ class Kernel:
             if prior != (run_id, self.storage.path.resolve()):
                 bind_task(location, run_id, self.storage.path)
             # A crash here preserves the bound, fully created Run even without a PID.
-            with self.storage.transaction() as tx:
+            with self.storage.transaction(ordered=False) as tx:
                 old = tx.rows("SELECT * FROM hosts WHERE action_id=?", (action_id,))
                 if old:
                     value = json.loads(tx.get(old[0]["request_id"], old[0]["subject"]))
@@ -1921,7 +1921,7 @@ class Kernel:
         with locked_admission(task, wait=False) as location:
             if read_task(location) != (run_id, self.storage.path.resolve()):
                 raise KernelError("task_location_identity")
-            with self.storage.transaction() as tx:
+            with self.storage.transaction(ordered=False) as tx:
                 self._host(tx, request)
                 run = tx.one("SELECT * FROM runs")
                 abandoned = self._abandon_action(tx)
@@ -1955,7 +1955,7 @@ class Kernel:
             # An unfinished or unknown Host still needs the durable Stop fence.
             if terminal and self._replaceable(task, run_id):
                 return "complete"
-            with self.storage.transaction() as tx:
+            with self.storage.transaction(ordered=False) as tx:
                 return self._control(tx, "stop", action_id, subject=subject)
 
     def abandon_task(self, action_id: str, *, resource_inspections: tuple[ResourceInspection, ...],
@@ -1967,7 +1967,7 @@ class Kernel:
         with locked_admission(task) as location:
             if read_task(location) != (run_id, self.storage.path.resolve()):
                 raise KernelError("task_location_identity")
-            with self.storage.transaction() as tx:
+            with self.storage.transaction(ordered=False) as tx:
                 return self._control(tx, "abandon", action_id, resource_inspections=resource_inspections,
                                      discard_worktree=discard_worktree)
 
@@ -2231,7 +2231,7 @@ class Kernel:
                         retain_lock()
 
     def _retire_failed_executor(self, execution: Execution, error: BaseException) -> None:
-        with self.storage.transaction() as tx:
+        with self.storage.transaction(ordered=False) as tx:
             run = tx.one("SELECT * FROM runs")
             if run["id"] != execution.run_id:
                 raise KernelError("executor_fenced")
@@ -3122,7 +3122,7 @@ class Kernel:
         The offline prototype calls this trusted interface directly. Host launch,
         public capability isolation and process-exit proofs are separate adapters.
         """
-        with self.storage.transaction() as tx:
+        with self.storage.transaction(ordered=False) as tx:
             return self._control(tx, kind, action_id, subject=subject, world=world, message=message,
                                  new_thread=new_thread, policy_overrides=policy_overrides, replacement=replacement,
                                   resource_inspections=resource_inspections, discard_worktree=discard_worktree)
@@ -3647,7 +3647,7 @@ class Kernel:
 
     def configure_profiles(self, action_id: str, *, preset: str | None = None, overrides: ProfileOverrides | None = None) -> int:
         """An explicit immutable revision applies only when a new Thread is allocated."""
-        with self.storage.transaction() as tx:
+        with self.storage.transaction(ordered=False) as tx:
             run = tx.one("SELECT * FROM runs")
             owner = tx.one("SELECT subject FROM profile_revisions WHERE id=?", (run["profile_revision"],))[0]
             payload = wire_json({"kind": "configure_profiles", "preset": preset, "overrides": dict(overrides or {})})
