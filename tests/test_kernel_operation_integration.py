@@ -180,13 +180,15 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
     delivery = ports.delivery
     def read(request):
         facts = delivery(request)
-        if request.check_head is not None and facts.pr is not None and facts.pr.source_ref == "refs/heads/ticket-3":
-            if entered.is_set():
+        if facts.pr is not None and facts.pr.state == "OPEN" and facts.pr.source_ref == "refs/heads/ticket-3":
+            if request.check_head is not None and entered.is_set() and not polled.is_set():
                 with scenario.kernel.storage.transaction(write=False) as tx:
                     assert len(tx.rows("SELECT id FROM leases")) == 1
                     assert tx.one("SELECT integration_holder FROM runs")[0] == "ticket:3"
                 polled.set()
-            return replace(facts, checks=Checks(facts.pr.number, facts.pr.head.sha, "none" if polled.is_set() else "pending"))
+            conclusion = "pass" if polled.is_set() else "pending"
+            return replace(facts, checks=Checks(facts.pr.number, facts.pr.head.sha, conclusion,
+                                               (("quality", conclusion),)))
         return facts
     monkeypatch.setattr(ports, "delivery", read)
     monkeypatch.setattr(executor, "_make_ports", lambda binding: ports)
