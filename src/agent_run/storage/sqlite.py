@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack, closing, contextmanager
 import hashlib
+import math
 import mmap
 from pathlib import Path
 import sqlite3
@@ -374,9 +375,13 @@ class Storage:
 
     @contextmanager
     def transaction(self, *, write: bool = True, ordered: bool = True,
-                    cancelled: Event | None = None) -> Iterator[Transaction]:
+                    cancelled: Event | None = None, deadline: float | None = None) -> Iterator[Transaction]:
         require_wal_runtime()
-        deadline = monotonic() + WRITE_CONTENTION_SECONDS
+        if deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline)):
+            raise ValueError("A finite absolute transaction deadline is required")
+        # A caller coordinating commit readback may shorten, never renew, the
+        # original contention allowance. Default callers keep their old budget.
+        deadline = min(monotonic() + WRITE_CONTENTION_SECONDS, deadline) if deadline is not None else monotonic() + WRITE_CONTENTION_SECONDS
         with ExitStack() as scopes:
             identity = None
             if write:

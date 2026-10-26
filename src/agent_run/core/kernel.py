@@ -33,7 +33,7 @@ from agent_run.model import (
 )
 from agent_run.errors import KernelError, ObservationSuperseded, bounded_error
 from agent_run.storage.sqlite import CURRENT_LIMIT, Storage, Transaction
-from agent_run.storage.run_scope import selected_statement, transaction_scope
+from agent_run.storage.run_scope import RunTransaction, selected_statement, transaction_scope
 from agent_run.core.attempt_continuation import (AttemptContinuationBasis, ContinuationFacts,
                                    bind_attempt_continuation, load_continuation)
 from agent_run.contracts.policy_values import checkpoint_policy
@@ -857,9 +857,8 @@ class Kernel:
             bind_task(location, spec.run_id, kernel.storage.path)
             return kernel
 
-    @classmethod
-    def create(cls, path: Path, spec: RunSpec, *, requirements: Requirements | None = None,
-               fixture_evidence: Mapping[str, Any] | None = None) -> Kernel:
+    @staticmethod
+    def _creation_profiles(spec: RunSpec) -> dict[str, Any]:
         if not spec.deliveries or len({delivery.key for delivery in spec.deliveries}) != len(spec.deliveries):
             raise ValueError("one or more uniquely identified deliveries are required")
         profiles = ({"preset": None, "profiles": {
@@ -879,61 +878,84 @@ class Kernel:
             validate_resources(dict(spec.inputs.prompt_resources))
             validate_identity_snapshot(spec.inputs.worker_identity)
             validate_identity_snapshot(spec.inputs.runner_identity)
-        policy = cls._policy_values(spec.policy)
+        return profiles
+
+    @classmethod
+    def create(cls, path: Path, spec: RunSpec, *, requirements: Requirements | None = None,
+               fixture_evidence: Mapping[str, Any] | None = None) -> Kernel:
+        profiles = cls._creation_profiles(spec)
+        policy_values = cls._policy_values(spec.policy)
         Storage.create(path)
         kernel = cls(path)
         with kernel.storage.transaction(ordered=False) as tx:
-            if requirements is not None and fixture_evidence is not None:
-                raise KernelError("mixed_source_authority")
-            if requirements is not None:
-                if requirements.parent.number != spec.parent_issue:
-                    raise KernelError("parent_identity")
-                parent_revision, graph_revision = kernel._source_revisions(requirements)
-                spec = replace(spec, parent_revision=parent_revision, graph_revision=graph_revision)
-                tickets = {delivery.issue for delivery in spec.deliveries if delivery.kind == DeliveryKind.TICKET}
-                if tickets != set(requirements.parent.sub_issue_numbers):
-                    raise KernelError("delivery_scope")
-                if len([delivery for delivery in spec.deliveries if delivery.kind == DeliveryKind.FINAL_RUN]) != bool(tickets):
-                    raise KernelError("final_target_required")
-                if tickets:
-                    final = next(delivery for delivery in spec.deliveries if delivery.kind == DeliveryKind.FINAL_RUN)
-                    if any(delivery.target_ref != final.source_ref or delivery.base != final.base
-                           for delivery in spec.deliveries if delivery.kind == DeliveryKind.TICKET):
-                        raise KernelError("run_branch_identity")
-            tx.execute("INSERT INTO runs(id,repository,parent_issue,parent_revision,graph_revision,accepted_parent_revision,concurrency,policy,language,repository_root,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                       (spec.run_id, spec.repository, spec.parent_issue, spec.parent_revision,
-                        spec.graph_revision, spec.parent_revision, spec.policy.concurrency, wire_json(policy),
-                        spec.language, None if spec.repository_root is None else str(Path(spec.repository_root).resolve()), kernel.clock()))
-            for delivery in spec.deliveries:
-                if requirements is not None and delivery.kind == DeliveryKind.FINAL_RUN:
-                    tx.execute("INSERT INTO final_target VALUES (?,?,?,?,?,?)", (delivery.key, delivery.source_ref, delivery.target_ref, delivery.checkout, delivery.owned_root, delivery.common_git_dir))
-                    continue
-                if requirements is not None:
-                    issue = next((issue for issue in requirements.issues if issue.number == delivery.issue), None)
-                    revision = spec.parent_revision if delivery.kind == DeliveryKind.PARENT_ONLY else (
-                        "unread" if issue is None else kernel._fingerprint({"title": issue.title, "body": issue.body}))
-                    delivery = replace(delivery, revision=revision, dependencies=())
-                kernel._add_delivery(tx, spec.run_id, spec.policy, delivery)
-                if requirements is not None and delivery.owned_root:
-                    tx.execute("UPDATE subjects SET phase='workspace' WHERE id=?", (delivery.key,))
-            owner = tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
-            kernel._store_profiles(tx, owner, profiles, {"operation": "create"})
-            if spec.inputs is not None:
-                values: dict[str, Any] = {name: dict(getattr(spec.inputs, name)) for name in (
-                    "prompt_resources", "worker_identity", "runner_identity", "notifications", "provenance")}
-                values["repository_remote"] = spec.inputs.repository_remote
-                material = tx.put(owner, "creation_inputs", wire_json(values))
-                tx.execute("INSERT INTO run_inputs VALUES (?,?,?)", (spec.run_id, owner, material))
-            if requirements is None:
-                for delivery in spec.deliveries:
-                    for predecessor in delivery.dependencies:
-                        tx.execute("INSERT INTO dependencies VALUES (?,?)", (delivery.key, predecessor))
-            if requirements is not None:
-                kernel._refresh(tx, requirements, initial=True)
-            if fixture_evidence is not None:
-                for delivery in spec.deliveries:
-                    tx.put(delivery.key, "fixture_evidence", wire_json(fixture_evidence))
+            kernel._create_run(tx, spec, profiles, requirements=requirements,
+                fixture_evidence=fixture_evidence, policy_values=policy_values)
         return kernel
+
+    def _create_run(self, tx: Transaction, spec: RunSpec, profiles: Mapping[str, Any], *,
+                    requirements: Requirements | None = None,
+                    fixture_evidence: Mapping[str, Any] | None = None, scoped: bool = False,
+                    policy_values: Mapping[str, Any] | None = None) -> None:
+        """Freeze one complete Run on the caller's original writer; no physical I/O."""
+        policy = self._policy_values(spec.policy) if policy_values is None else policy_values
+        if requirements is not None and fixture_evidence is not None:
+            raise KernelError("mixed_source_authority")
+        if requirements is not None:
+            if requirements.parent.number != spec.parent_issue:
+                raise KernelError("parent_identity")
+            parent_revision, graph_revision = self._source_revisions(requirements)
+            spec = replace(spec, parent_revision=parent_revision, graph_revision=graph_revision)
+            tickets = {delivery.issue for delivery in spec.deliveries if delivery.kind == DeliveryKind.TICKET}
+            if tickets != set(requirements.parent.sub_issue_numbers):
+                raise KernelError("delivery_scope")
+            if len([delivery for delivery in spec.deliveries if delivery.kind == DeliveryKind.FINAL_RUN]) != bool(tickets):
+                raise KernelError("final_target_required")
+            if tickets:
+                final = next(delivery for delivery in spec.deliveries if delivery.kind == DeliveryKind.FINAL_RUN)
+                if any(delivery.target_ref != final.source_ref or delivery.base != final.base
+                       for delivery in spec.deliveries if delivery.kind == DeliveryKind.TICKET):
+                    raise KernelError("run_branch_identity")
+        tx.execute("INSERT INTO runs(id,repository,parent_issue,parent_revision,graph_revision,accepted_parent_revision,concurrency,policy,language,repository_root,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                   (spec.run_id, spec.repository, spec.parent_issue, spec.parent_revision,
+                    spec.graph_revision, spec.parent_revision, spec.policy.concurrency, wire_json(policy),
+                    spec.language, None if spec.repository_root is None else str(Path(spec.repository_root).resolve()), self.clock()))
+        if scoped:
+            tx = RunTransaction(tx, spec.run_id)
+        for delivery in spec.deliveries:
+            if requirements is not None and delivery.kind == DeliveryKind.FINAL_RUN:
+                tx.execute(*selected_statement(tx, "INSERT INTO final_target VALUES (?,?,?,?,?,?)",
+                    "INSERT INTO final_target(id,source_ref,target_ref,checkout,owned_root,common_git_dir,run_id) VALUES (?,?,?,?,?,?,?)",
+                    (delivery.key, delivery.source_ref, delivery.target_ref, delivery.checkout, delivery.owned_root, delivery.common_git_dir), run_last=True))
+                continue
+            if requirements is not None:
+                issue = next((issue for issue in requirements.issues if issue.number == delivery.issue), None)
+                revision = spec.parent_revision if delivery.kind == DeliveryKind.PARENT_ONLY else (
+                    "unread" if issue is None else self._fingerprint({"title": issue.title, "body": issue.body}))
+                delivery = replace(delivery, revision=revision, dependencies=())
+            self._add_delivery(tx, spec.run_id, spec.policy, delivery)
+            if requirements is not None and delivery.owned_root:
+                tx.execute(*selected_statement(tx, "UPDATE subjects SET phase='workspace' WHERE id=?",
+                    "UPDATE subjects SET phase='workspace' WHERE id=? AND run_id=?", (delivery.key,), run_last=True))
+        owner = tx.one(*selected_statement(tx, "SELECT id FROM subjects ORDER BY id LIMIT 1",
+            "SELECT id FROM subjects WHERE run_id=? ORDER BY id LIMIT 1", (), run_last=True))[0]
+        self._store_profiles(tx, owner, profiles, {"operation": "create"})
+        if spec.inputs is not None:
+            values: dict[str, Any] = {name: dict(getattr(spec.inputs, name)) for name in (
+                "prompt_resources", "worker_identity", "runner_identity", "notifications", "provenance")}
+            values["repository_remote"] = spec.inputs.repository_remote
+            material = tx.put(owner, "creation_inputs", wire_json(values))
+            tx.execute("INSERT INTO run_inputs VALUES (?,?,?)", (spec.run_id, owner, material))
+        if requirements is None:
+            for delivery in spec.deliveries:
+                for predecessor in delivery.dependencies:
+                    tx.execute(*selected_statement(tx, "INSERT INTO dependencies VALUES (?,?)",
+                        "INSERT INTO dependencies(subject,predecessor,run_id) VALUES (?,?,?)",
+                        (delivery.key, predecessor), run_last=True))
+        if requirements is not None:
+            self._refresh(tx, requirements, initial=True)
+        if fixture_evidence is not None:
+            for delivery in spec.deliveries:
+                tx.put(delivery.key, "fixture_evidence", wire_json(fixture_evidence))
 
     def _add_delivery(self, tx: Transaction, run_id: str, policy: Policy, delivery: Delivery) -> None:
         selected = transaction_scope(tx)
@@ -2132,19 +2154,37 @@ class Kernel:
 
     def _replaceable(self, task: TaskKey, run_id: str) -> bool:
         with self.storage.transaction(write=False) as tx:
-            run = tx.one("SELECT * FROM runs")
-            if run["id"] != run_id or self._task(run) != task:
-                raise KernelError("task_location_identity")
-            abandoned = self._abandon_action(tx)
-            completed_abandonment = bool(abandoned is not None and abandoned["status"] == "complete")
-            return bool(run["executor"] is None
-                and (completed_abandonment or not tx.rows("SELECT id FROM subjects WHERE phase!='complete' LIMIT 1"))
-                and (completed_abandonment or not tx.rows("SELECT id FROM final_target WHERE id NOT IN (SELECT id FROM subjects WHERE kind='final_run' AND phase='complete') LIMIT 1"))
-                and not self._agent_seats(tx)
-                and not tx.rows("SELECT owner FROM retired_executors WHERE status!='exited' LIMIT 1")
-                and not tx.rows("SELECT owner FROM hosts WHERE status!='exited' OR usage_released=0 LIMIT 1")
-                and not tx.rows("SELECT id FROM effects WHERE status IN ('prepared','sent','observed') AND operation!='issue_link' LIMIT 1")
-                and (completed_abandonment or not tx.rows("SELECT subject FROM resource_cleanup WHERE state!='complete' LIMIT 1")))
+            return self._replaceable_in(tx, task, run_id)
+
+    def _replaceable_in(self, tx: Transaction, task: TaskKey, run_id: str) -> bool:
+        """The original predicate, also usable inside an atomic Task writer."""
+        selected = transaction_scope(tx)
+        if selected is not None and selected.run_id != run_id:
+            raise KernelError("task_location_identity")
+        run = tx.one(*selected_statement(tx, "SELECT * FROM runs",
+            "SELECT * FROM runs WHERE id=?", (), run_last=True))
+        if run["id"] != run_id or self._task(run) != task:
+            raise KernelError("task_location_identity")
+        abandoned = self._abandon_action(tx)
+        completed_abandonment = bool(abandoned is not None and abandoned["status"] == "complete")
+        return bool(run["executor"] is None
+            and (completed_abandonment or not tx.rows(*selected_statement(tx,
+                "SELECT id FROM subjects WHERE phase!='complete' LIMIT 1",
+                "SELECT id FROM subjects WHERE phase!='complete' AND run_id=? LIMIT 1", (), run_last=True)))
+            and (completed_abandonment or not tx.rows(*selected_statement(tx,
+                "SELECT id FROM final_target WHERE id NOT IN (SELECT id FROM subjects WHERE kind='final_run' AND phase='complete') LIMIT 1",
+                "SELECT id FROM final_target WHERE run_id=? AND id NOT IN (SELECT id FROM subjects WHERE run_id=? AND kind='final_run' AND phase='complete') LIMIT 1",
+                () if selected is None else (run_id,))))
+            and not self._agent_seats(tx)
+            and not tx.rows(*selected_statement(tx, "SELECT owner FROM retired_executors WHERE status!='exited' LIMIT 1",
+                "SELECT owner FROM retired_executors WHERE status!='exited' AND run_id=? LIMIT 1", (), run_last=True))
+            and not tx.rows(*selected_statement(tx, "SELECT owner FROM hosts WHERE status!='exited' OR usage_released=0 LIMIT 1",
+                "SELECT owner FROM hosts WHERE (status!='exited' OR usage_released=0) AND run_id=? LIMIT 1", (), run_last=True))
+            and not tx.rows(*selected_statement(tx, "SELECT id FROM effects WHERE status IN ('prepared','sent','observed') AND operation!='issue_link' LIMIT 1",
+                "SELECT id FROM effects WHERE status IN ('prepared','sent','observed') AND operation!='issue_link' AND run_id=? LIMIT 1", (), run_last=True))
+            and (completed_abandonment or not tx.rows(*selected_statement(tx,
+                "SELECT subject FROM resource_cleanup WHERE state!='complete' LIMIT 1",
+                "SELECT subject FROM resource_cleanup WHERE state!='complete' AND run_id=? LIMIT 1", (), run_last=True))))
 
     @classmethod
     def open_task(cls, task: TaskKey) -> Kernel | None:

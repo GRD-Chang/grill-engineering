@@ -650,3 +650,34 @@ CREATE INDEX history_action_facts ON history(run_id,kind,identity);
 CREATE INDEX source_observation_run_page ON source_observations(run_id,sequence);
 CREATE INDEX history_run_page ON history(run_id,position);
 """
+
+# Additive Task layer of the SAME inactive repository database. Earlier
+# Run-domain fixtures intentionally use the Run-only foundation above; neither
+# definition is selected by public Storage/CLI/Host until activation is complete.
+REPOSITORY_TASK_SCHEMA = """
+CREATE UNIQUE INDEX repository_run_task_identity
+ ON runs(id,repository,repository_root,parent_issue);
+CREATE TABLE tasks (
+ id TEXT PRIMARY KEY NOT NULL,
+ repository TEXT NOT NULL,
+ repository_root TEXT NOT NULL,
+ parent_issue INTEGER NOT NULL CHECK(parent_issue>0),
+ current_run TEXT,
+ UNIQUE(repository,repository_root,parent_issue),
+ UNIQUE(id,repository,repository_root,parent_issue),
+ FOREIGN KEY(id,current_run) REFERENCES task_runs(task_id,run_id)
+  DEFERRABLE INITIALLY DEFERRED
+);
+CREATE TABLE task_runs (
+ task_id TEXT NOT NULL,
+ run_id TEXT NOT NULL UNIQUE,
+ repository TEXT NOT NULL,
+ repository_root TEXT NOT NULL,
+ parent_issue INTEGER NOT NULL,
+ PRIMARY KEY(task_id,run_id),
+ FOREIGN KEY(task_id,repository,repository_root,parent_issue)
+  REFERENCES tasks(id,repository,repository_root,parent_issue),
+ FOREIGN KEY(run_id,repository,repository_root,parent_issue)
+  REFERENCES runs(id,repository,repository_root,parent_issue)
+);
+"""
