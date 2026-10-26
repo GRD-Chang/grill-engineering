@@ -103,9 +103,18 @@ def supervision(tx: Transaction, now: float) -> list[dict[str, Any]]:
     result = []
     for row in rows:
         scope = material(tx, row["scope_id"], row["scope_owner"])
-        if row["scope_purpose"] != "supervision_scope" or not isinstance(scope, dict) or scope.get("subject") != row["subject"]:
+        preparing = row["kind"] == "agent_preparation"
+        if (row["kind"] not in {"agent_preparation", "github_convergence", "required_checks"}
+                or row["scope_purpose"] != ("agent_preparation" if preparing else "supervision_scope")
+                or not isinstance(scope, dict) or scope.get("subject") != row["subject"]
+                or row["subject"] is not None and row["scope_owner"] != row["subject"]
+                or preparing and (row["subject"] is None or row["evidence"] is not None)
+                or not preparing and scope.get("run") != run["id"]):
             raise QueryError("incompatible_run_state", "Invalid recorded supervision scope")
-        if row["evidence"] is not None and row["evidence_purpose"] != "github_read_observation":
+        if preparing:
+            continue  # An Agent preparation seat is not a GitHub supervision window.
+        if row["evidence"] is not None and (row["evidence_purpose"] != "github_read_observation"
+                                          or row["evidence_owner"] != row["scope_owner"]):
             raise QueryError("incompatible_run_state", "Invalid recorded supervision observation")
         timeout = timeouts.get(row["subject"])
         timed_out = isinstance(timeout, dict) and timeout.get("scope_id") == row["scope_id"] and timeout.get("kind") == row["kind"]
