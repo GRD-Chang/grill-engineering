@@ -133,6 +133,10 @@ def test_recovery_keeps_only_the_latest_actual_start_among_independent_live_tick
             assert scenario.kernel.dispatch_agent(call)
             scenario.kernel.agent_started(call, {"pid": 21 + len(calls), "pgid": 21 + len(calls),
                 "start_token": call.subject, "host_pid": 10, "host_start_token": "synthetic-host"})
+            operations.runner.authorize_agent(call)
+            scenario.kernel.agent_source_ready(call)
+            scenario.kernel.observe_worker_activity(call, "actual-turn", active=True, observed_at=101.0 + len(calls),
+                                                   evidence={"type": "turn.started"})
             calls.append(call)
             if len(calls) == 2:
                 break

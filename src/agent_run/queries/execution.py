@@ -8,6 +8,48 @@ from typing import Any
 from agent_run.storage.sqlite import Transaction
 
 
+def worker_activity_start(tx: Transaction, subject: str | None, *, position: int | None = None,
+                          attempt: str | None = None, role: str | None = None,
+                          after: int | None = None, action: str | None = None) -> dict[str, Any] | None:
+    """Read the first provable backend activity, not the bootstrap's lifetime.
+
+    Earlier v21 writers have only the binding history anchor. Its actual
+    activity must be within that original control interval; ambiguous old
+    facts remain unknown. The optional observer trigger is never authority.
+    Activity at or after its original Invocation deadline is not a start.
+    """
+    sql = (
+        "SELECT a.*,i.id AS invocation_id,i.action_id,o.ordinal AS output_ordinal,o.dispatch_state,o.exit_code,"
+        "w.observed_at AS started_at,w.rowid AS activity_position,w.evidence AS activity_evidence,h.position AS source_position "
+        "FROM invocation_outputs o JOIN invocations i ON i.id=o.invocation "
+        "JOIN attempts a ON a.id=i.attempt JOIN threads t ON t.id=i.thread AND t.subject=a.subject "
+        "JOIN worker_activity w ON w.invocation=o.invocation AND w.ordinal=o.ordinal "
+        "JOIN history h ON h.subject=a.subject AND h.generation=a.generation "
+        "WHERE o.process_identity IS NOT NULL AND o.started_at IS NOT NULL AND w.active=1 "
+        "AND w.observed_at<i.deadline_at "
+        "AND w.rowid=(SELECT min(rowid) FROM worker_activity WHERE invocation=o.invocation AND ordinal=o.ordinal AND active=1) "
+        "AND ((h.kind='worker_active' AND h.identity=o.invocation || ':' || o.ordinal AND h.material_id=w.evidence) "
+        "OR (h.kind='worker_started' AND h.identity=i.id AND h.material_id=o.process_identity "
+        "AND json_extract(h.status,'$.stopped')=0 AND json_extract(h.status,'$.blocked') IS NULL "
+        "AND json_array_length(json_extract(h.status,'$.gates'))=0 AND w.observed_at>=h.created_at "
+        "AND NOT EXISTS (SELECT 1 FROM history n WHERE n.kind='worker_active' AND n.identity=o.invocation || ':' || o.ordinal) "
+        "AND NOT EXISTS (SELECT 1 FROM history c JOIN actions act ON act.id=c.identity "
+        "WHERE c.kind='control_applied' AND c.position>h.position AND c.created_at<=w.observed_at "
+        "AND (act.subject IS NULL OR act.subject=a.subject))))")
+    values: list[Any] = []
+    for column, value in (("a.subject", subject), ("h.position", position), ("a.id", attempt), ("a.role", role), ("i.action_id", action)):
+        if value is not None:
+            sql += f" AND {column}=?"
+            values.append(value)
+    if after is not None:
+        sql += " AND h.position>?"
+        values.append(after)
+    records = tx.rows(sql + " ORDER BY w.rowid,h.position LIMIT 1", values)
+    if records:
+        tx.get(records[0]["activity_evidence"], records[0]["subject"])
+    return dict(records[0]) if records else None
+
+
 def activity(tx: Transaction, invocation: str, ordinal: int, subject: str,
              *, until: float | None = None) -> dict[str, Any]:
     sql = "SELECT * FROM worker_activity WHERE invocation=? AND ordinal=?"

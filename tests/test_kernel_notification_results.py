@@ -52,7 +52,7 @@ def test_resume_waits_for_its_own_invocation_and_ignores_a_sibling_start(tmp_pat
     assert len(results) == 1
     assert results[0]["resume_id"] == "resume-original-target" and results[0]["resume_outcome"] == "started"
     assert results[0]["work_subject"] == "ticket:2" and results[0]["generation"] == 1
-    assert results[0]["attempt_id"] == resumed.call.attempt_id and results[0]["evidence"] == "worker_started"
+    assert results[0]["attempt_id"] == resumed.call.attempt_id and results[0]["evidence"] == "worker_active"
 
 
 def test_approval_update_is_the_original_invalidation_not_a_second_approval_request(tmp_path, monkeypatch):
@@ -108,7 +108,7 @@ def test_effort_keeps_closed_partial_unknown_segments_and_original_thread_config
             scenario.kernel.observe_worker_activity(call, "turn-2-start", active=True, observed_at=start + 4, evidence={"type": "turn.started"})
         now[0] += 5
 
-    _recorded_agents(scenario, monkeypatch, agent, started)
+    _recorded_agents(scenario, monkeypatch, agent, started, activity=False)
     assert scenario.run().kind == "paused"
     before = next(event for event in _project(scenario.kernel, "detailed") if event["kind"] == "stage_end")
     assert before["execution_timing_complete"] is False and before["duration_seconds"] is None

@@ -105,7 +105,7 @@ def test_sender_terminal_uses_original_close_whole_effort_and_keeps_unknown_publ
             scenario.kernel.observe_worker_activity(call, "end", active=False, observed_at=now[0] + 1 + seconds, evidence={"type": "turn.completed"})
         now[0] += seconds + 2
 
-    _recorded_agents(scenario, monkeypatch, started=started)
+    _recorded_agents(scenario, monkeypatch, started=started, activity=False)
     assert scenario.run(approve=True).kind == "complete"
     with scenario.kernel.storage.transaction(write=False) as tx:
         assert tx.one("SELECT count(*) FROM history WHERE kind='worker_started'")[0] == 3
@@ -212,6 +212,10 @@ def test_sender_one_poll_replaces_failed_live_start_with_the_newer_real_sibling_
     assert first is not None and kernel.dispatch_agent(first)
     process = {"pid": 21, "pgid": 21, "start_token": "first", "host_pid": 10, "host_start_token": "host"}
     kernel.agent_started(first, process)
+    operations.runner.authorize_agent(first)
+    kernel.agent_source_ready(first)
+    kernel.observe_worker_activity(first, "first-turn", active=True, observed_at=kernel.clock(),
+                                   evidence={"type": "turn.started"})
     returned, newer_entered, release = Event(), Event(), Event()
     original = []
 
@@ -245,6 +249,10 @@ def test_sender_one_poll_replaces_failed_live_start_with_the_newer_real_sibling_
         second_call = call
         second[0] = call.attempt_id
         kernel.agent_started(call, {**process, "pid": 22, "pgid": 22, "start_token": "second"})
+        operations.runner.authorize_agent(call)
+        kernel.agent_source_ready(call)
+        kernel.observe_worker_activity(call, "second-turn", active=True, observed_at=kernel.clock(),
+                                       evidence={"type": "turn.started"})
         observer.observe_committed()
         assert newer_entered.wait(5)
         document = outbox.read_notifications(tmp_path, "run-native")

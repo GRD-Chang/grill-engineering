@@ -7,6 +7,7 @@ from agent_run.notifications.envelope import event_envelope
 
 from agent_run.notifications.event_projection import event_state, project_event
 from agent_run.storage.sqlite import Transaction
+from agent_run.queries.execution import worker_activity_start
 
 
 def _source(tx: Transaction, event: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -46,7 +47,7 @@ def obsolete_progress(
             run = tx.one("SELECT id,created_at,language FROM runs")
             identity = event_envelope(dict(run) | {"run_id": run["id"]}, "run_start", run["id"], "")["id"]
             if event["id"] == identity:
-                started = tx.rows("SELECT position FROM history WHERE kind='worker_started' LIMIT 1")
+                started = worker_activity_start(tx, None)
                 known[identity] = (-1, not started)  # Original Run start precedes history.
             continue
         row = _source(tx, event)

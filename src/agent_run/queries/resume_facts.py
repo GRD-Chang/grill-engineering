@@ -2,20 +2,17 @@ from collections.abc import Mapping
 from typing import Any
 
 from agent_run.storage.sqlite import Transaction
+from agent_run.queries.execution import worker_activity_start
 
 
 def resume_facts(tx: Transaction, row: Mapping[str, Any]) -> dict[str, Any]:
     """Bind a real outcome to the original target, reopening receipt and control interval."""
-    progress = {"worker_started", "effect_consumed", "checks_observed", "role_consumed"}
+    progress = {"worker_started", "worker_active", "effect_consumed", "checks_observed", "role_consumed"}
     if row["kind"] not in progress | {"paused"} or row["identity"] == "operator_stopped":
         return {}
-    worker = []
-    if row["kind"] == "worker_started":
-        worker = tx.rows("SELECT i.action_id,i.attempt,a.role,a.ordinal FROM invocations i "
-                         "JOIN attempts a ON a.id=i.attempt JOIN invocation_outputs o ON o.invocation=i.id "
-                         "WHERE i.id=? AND a.subject=? AND a.generation=? AND o.process_identity=? "
-                         "AND o.started_at IS NOT NULL", (row["identity"], row["subject"], row["generation"], row["material_id"]))
-        if not worker:
+    worker = worker_activity_start(tx, row["subject"], position=row["position"])
+    if row["kind"] in {"worker_started", "worker_active"}:
+        if worker is None:
             return {}
     elif row["kind"] == "effect_consumed" and not tx.rows(
         "SELECT id FROM effects WHERE id=? AND subject=? AND generation=? AND status='confirmed' AND receipt_id=?",
@@ -29,7 +26,7 @@ def resume_facts(tx: Transaction, row: Mapping[str, Any]) -> dict[str, Any]:
         "SELECT id FROM attempts WHERE id=? AND subject=? AND generation=? AND result_id=?",
         (row["identity"], row["subject"], row["generation"], row["material_id"])):
         return {}
-    action_id = worker[0]["action_id"] if worker else None
+    action_id = worker["action_id"] if worker else None
     sql = ("SELECT c.id,c.subject,h.position,h.material_id FROM actions c JOIN history h ON h.identity=c.id "
            "AND h.kind='control_applied' AND h.material_id=c.receipt_id WHERE c.kind='resume' AND h.position<? AND ")
     values: tuple[Any, ...] = (row["position"],)
@@ -44,6 +41,17 @@ def resume_facts(tx: Transaction, row: Mapping[str, Any]) -> dict[str, Any]:
         return {}
     action = actions[0]
     whole = action["subject"] is None
+    first_worker = worker_activity_start(tx, None if whole else row["subject"], action=action["id"])
+    if worker is not None and (first_worker is None or first_worker["activity_position"] != worker["activity_position"]):
+        return {}
+    if row["kind"] == "worker_started" and worker is not None:
+        scope = "" if whole else " AND subject=?"
+        values = (action["position"], worker["started_at"]) + (() if whole else (row["subject"],))
+        if tx.rows("SELECT position FROM history WHERE position>? AND created_at<=?" + scope +
+                   " AND kind IN ('effect_consumed','checks_observed','role_consumed') LIMIT 1", values):
+            return {}  # The old binding position cannot precede an actual earlier result.
+    if worker is None and row["kind"] != "paused" and first_worker is not None and first_worker["started_at"] < row["created_at"]:
+        return {}
     if action["subject"] not in {None, row["subject"]}:
         return {}
     interval = "" if whole else " AND (c.subject=? OR c.subject IS NULL)"
@@ -69,9 +77,9 @@ def resume_facts(tx: Transaction, row: Mapping[str, Any]) -> dict[str, Any]:
     scope_values: tuple[Any, ...] = (action["position"],)
     if not whole:
         scope_values += (row["subject"], row["generation"])
-    kinds = "('paused')" if row["kind"] == "paused" else "('worker_started','effect_consumed','checks_observed','role_consumed')"
+    kinds = "('paused')" if row["kind"] == "paused" else "('worker_active','effect_consumed','checks_observed','role_consumed')"
     first = tx.one("SELECT min(position) FROM history WHERE position>?" + scope + " AND kind IN " + kinds, scope_values)[0]
-    if first != row["position"]:
+    if row["kind"] != "worker_started" and first != row["position"]:
         return {}
     failures = {"worker_unavailable", "execution_failed", "worker_start_unknown", "supervision_timeout"}
     outcome = ("failed" if row["identity"] in failures else "human_action") if row["kind"] == "paused" else "started"
@@ -86,8 +94,8 @@ def resume_facts(tx: Transaction, row: Mapping[str, Any]) -> dict[str, Any]:
     if row["kind"] == "paused":
         facts["reason_code"] = row["identity"]
     if worker:
-        facts.update(attempt_id=worker[0]["attempt"], invocation_id=row["identity"],
-                     role=worker[0]["role"], round=worker[0]["ordinal"])
+        facts.update(attempt_id=worker["id"], invocation_id=worker["invocation_id"],
+                     role=worker["role"], round=worker["ordinal"])
     elif row["kind"] == "effect_consumed":
         facts["effect_id"] = row["identity"]
     return facts

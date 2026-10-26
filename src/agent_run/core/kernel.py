@@ -2995,8 +2995,22 @@ class Kernel:
                 if (old[0]["active"], old[0]["observed_at"], old[0]["evidence"]) != (active, observed_at, material):
                     raise KernelError("conflicting_activity_observation")
                 return
+            first_active = active and not tx.rows(
+                "SELECT identity FROM worker_activity WHERE invocation=? AND ordinal=? AND active=1 LIMIT 1",
+                (call.invocation_id, call.output_ordinal))
             tx.execute("INSERT INTO worker_activity VALUES (?,?,?,?,?,?)",
                        (call.invocation_id, call.output_ordinal, observation_id, active, observed_at, material))
+            if first_active:
+                try:
+                    self._agent_authority(tx, call)
+                except KernelError as error:
+                    if error.code not in {"executor_fenced", "host_usage_unproven", "agent_authority_changed",
+                                          "invocation_deadline_exceeded"}:
+                        raise
+                    # Late activity is still evidence, never a current start.
+                else:
+                    self._event(tx, call.subject, "worker_active", f"{call.invocation_id}:{call.output_ordinal}",
+                                material, generation=output["generation"])
 
     def _process_exit(self, tx: Transaction, call: AgentCall, invocation: sqlite3.Row, returncode: int, failure: str | None,
                       failure_kind: str, diagnostic: Mapping[str, Any] | None = None) -> None:
