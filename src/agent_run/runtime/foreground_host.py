@@ -73,13 +73,14 @@ def _observation(request: HostLaunch, record: Mapping[str, Any], disposition: Li
         namespace_exit_status=record.get('namespace_exit_code'), exit_evidence=record.get('exit_basis', ''))
 
 
-def _bound_record(request: HostLaunch, lock: Path) -> tuple[Path, dict[str, Any]]:
+def _bound_record(request: HostLaunch, lock: Path, database: Path) -> tuple[Path, dict[str, Any]]:
     path = record_root(lock) / (request.nonce + '.json')
     record = read_record(path)
     receipt = record['receipt']
     if (receipt['request_digest'] != _digest(request) or receipt['nonce'] != request.nonce
             or receipt['runner'] != _runner_witness(lock)
-            or record['binding'] != [request.run_id, request.owner, request.epoch, request.nonce]):
+            or record['binding'] != [request.run_id, request.owner, request.epoch, request.nonce]
+            or record.get('database') != str(database.resolve())):
         raise DomainUnknown('Foreground record belongs to another launch or Runner')
     return path, record
 
@@ -168,7 +169,7 @@ class ForegroundHost:
         if original is not None and original.disposition == 'exited' and original.usage_released:
             return HostInspection(request, original, 'recorded_exit')
         try:
-            _, record = _bound_record(request, lock)
+            _, record = _bound_record(request, lock, kernel.storage.path)
             result = self._inspect(request, original, record)
             if (kernel.host_usage(action) != original or _current_execution(kernel) != current
                     or result.observation.disposition == 'running'
@@ -204,6 +205,8 @@ class ForegroundHost:
             if observed.observation.disposition == 'exited':
                 disposition, source = 'exited', 'host_exit'
             elif domain is not None and valid_foreground_domain(domain, request.nonce):
+                _, record = _bound_record(request, lock, kernel.storage.path)
+                if record.get('domain') != domain:return result('unknown', 'unavailable')
                 anchor = observer_anchor()
                 expected = {'boot_id': process['boot_id'], 'pid_namespace': process['host_namespace'],
                             'pid1_start': domain['init']['start_token']}
@@ -235,14 +238,14 @@ class ForegroundHost:
         original = kernel.host_usage(kernel.host_action(request))
         try:
             if original is not None and original.disposition == 'exited' and original.usage_released:
-                try:path, record = _bound_record(request, lock)
+                try:path, record = _bound_record(request, lock, kernel.storage.path)
                 except FileNotFoundError:return original
                 if (record['phase'] != 'exited' or not record.get('notice_settled')
                         or _observation(request, record, 'exited', released=True) != original):
                     raise DomainUnknown('Physical closure does not match committed exit settlement')
                 _remove_record(path)
                 return original
-            path, record = _bound_record(request, lock)
+            path, record = _bound_record(request, lock, kernel.storage.path)
             if record.get('domain') is None:
                 raise DomainUnknown('Original namespace identity was not durably established')
             if record['phase'] != 'exited':

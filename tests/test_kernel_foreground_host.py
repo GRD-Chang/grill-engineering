@@ -228,6 +228,27 @@ def test_readonly_host_inspection_downgrades_epoch_change_during_probe(inspectio
     assert closed == [True]
 
 
+def test_copied_database_cannot_borrow_the_original_local_process_observation(inspection_worker, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import shutil
+    kernel, request, call, _, domain, lock, _ = inspection_worker
+    copied = tmp_path / 'copied.sqlite3'
+    shutil.copyfile(kernel.storage.path, copied)
+    snapshot = Kernel(copied)
+    monkeypatch.setattr(foreground_host, 'recover_init', lambda _: 'running')
+    monkeypatch.setattr(foreground_host, 'observer_anchor', lambda: {
+        'boot_id': 'test-boot', 'pid_namespace': 'pid:[20]', 'pid1_start': domain['init']['start_token']})
+    def pin(pid, expected=None):
+        return SimpleNamespace(identity=SimpleNamespace(start_token='203' if pid in {2, 202} else 'worker',
+            boot_id='test-boot', pid_namespace='pid:[20]'), observe=lambda: 'running', close=lambda: None)
+    monkeypatch.setattr(foreground_host.ProcessPin, 'open', pin)
+    before = durable_snapshot(tmp_path)
+    manager = ForegroundHost(environment={})
+    assert manager.inspect(snapshot, request, lock).observation.disposition == 'unknown'
+    assert manager.inspect_worker(snapshot, request, call, lock).disposition == 'unknown'
+    assert durable_snapshot(tmp_path) == before
+
+
 def test_foreground_admission_is_frozen_stop_fences_and_null_exit_does_not_become_zero(tmp_path):
     kernel = task_run(tmp_path, 'foreground')[0]
     args = dict(kind='run', command=('/usr/bin/python3',), environment_carrier=tmp_path / 'carrier',
