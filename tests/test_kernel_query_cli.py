@@ -117,6 +117,73 @@ def _arguments(kernel: Kernel, command: str = "status", *extra: str) -> list[str
     return [command, kernel.storage.path.parent.name, "--state-dir", str(kernel.storage.path), *extra]
 
 
+def test_status_shows_ticket_progress_without_claiming_whole_delivery_complete(tmp_path: Path, capsys) -> None:
+    kernel = _create(tmp_path)
+    before = _snapshot(tmp_path)
+    assert main(_arguments(kernel, "status", "--plain")) == 0
+    output = capsys.readouterr().out
+    assert "Completed 0 / 1 Tickets" in output
+    assert "Status: Active" in output
+    assert "Executor liveness is unconfirmed" in output
+    assert _snapshot(tmp_path) == before
+
+
+def test_parent_only_status_keeps_recorded_pass_evidence_and_hides_completed_allowances(
+    tmp_path: Path, capsys,
+) -> None:
+    from io import StringIO
+    from agent_run.cli.render import render
+    from support.offline import GraphScenario
+
+    scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Original scope", ()), ()))
+    # Both languages render the same canonical facts; no new Run or translated
+    # Agent evidence is manufactured to exercise a different display channel.
+    assert scenario.run().kind == "approval"
+    document = query.read(scenario.kernel.storage.path, "status")
+    before = _snapshot(tmp_path)
+    for language, progress, passed in (("zh", "无子任务，直接推进需求", "已记录验收结论: 通过"),
+                                      ("en", "No Tickets; working directly on the requirement", "Recorded review: Passed")):
+        for style in ("plain", "rich"):
+            output = StringIO()
+            render(replace(document, language=language), style=style, details=False, stream=output)
+            value = output.getvalue()
+            assert progress in value
+            assert passed in value
+            assert value.count("Known synthetic acceptance evidence") == 3
+            assert "当前问题" not in value and "Current findings" not in value
+    assert _snapshot(tmp_path) == before
+    assert scenario.run(approve=True).kind == "complete"
+    before = _snapshot(tmp_path)
+    assert main(["status", scenario.spec.run_id, "--state-dir", str(scenario.kernel.storage.path), "--plain"]) == 0
+    output = capsys.readouterr().out
+    assert "累计用量" not in output
+    assert "Known synthetic acceptance evidence" in output
+    assert query.read(scenario.kernel.storage.path, "status").data["subjects"][0]["budgets"]
+    history = query.read(scenario.kernel.storage.path, "history")
+    assert len(history.data["subjects"][0]["budgets"]) == 3
+    for language, label in (("zh", "累计用量:"), ("en", "Cumulative usage:")):
+        for style in ("plain", "rich"):
+            historical_output = StringIO()
+            render(replace(history, language=language), style=style, details=True, stream=historical_output)
+            assert historical_output.getvalue().count(label) == 3
+            assert "W1 D 0/3" in historical_output.getvalue()
+            assert "W1 D 1/10 R 1/10" in historical_output.getvalue()
+    assert _snapshot(tmp_path) == before
+
+
+def test_missing_progress_facts_are_not_called_parent_only(tmp_path: Path) -> None:
+    from io import StringIO
+    from agent_run.cli.render import render
+
+    document = query.read(_create(tmp_path).storage.path, "status")
+    # A partial display document cannot prove either delivery shape. This is a
+    # renderer input, not a modification of the authoritative Run.
+    output = StringIO()
+    render(replace(document, data={**document.data, "subjects": []}), style="plain", details=False, stream=output)
+    assert "Progress cannot be confirmed" in output.getvalue()
+    assert "No Tickets" not in output.getvalue()
+
+
 def _human(kernel: Kernel, message: str = "Need the original decision / 保留原文", *,
            deliveries: tuple[Delivery, ...] | None = None) -> None:
     execution = kernel.claim_executor("query-executor")

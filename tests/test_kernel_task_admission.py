@@ -118,6 +118,22 @@ def test_public_run_only_attaches_the_original_unknown_host(occupied_task, monke
     assert_original_only(kernel, workspace, spec, calls, before)
 
 
+def test_human_attach_receipt_does_not_claim_a_new_action_or_expose_private_identity(occupied_task, monkeypatch, capsys):
+    kernel, workspace, spec, _requirements, _manager, calls, request = occupied_task
+    before = admission_snapshot(kernel, workspace)
+    UserDefaultsStore().configure(language='zh')  # The existing Run remains English.
+    forbid_new_launches(monkeypatch)
+    assert main(['run', '1', '--repo', workspace.repository]) == 0
+    output = capsys.readouterr()
+    assert output.err == ''
+    assert f': {spec.run_id} ' not in output.out and ORIGINAL_ACTION not in output.out
+    assert request.unit_name not in output.out and request.nonce not in output.out
+    assert 'new action not applied' in output.out
+    assert 'Host state unconfirmed' in output.out
+    assert 'agent-run status --repo example/project --parent 1' in output.out
+    assert_original_only(kernel, workspace, spec, calls, before)
+
+
 @pytest.mark.parametrize('entry', ['open', 'create', 'admit', 'run'])
 def test_unreadable_current_task_pointer_refuses_before_new_state(
     occupied_task, tmp_path, monkeypatch, capsys, entry,
