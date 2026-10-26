@@ -1718,3 +1718,211 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
         assert _git(origin, "diff", "--name-only", base, ticket_pr["merge_commit_sha"]).splitlines() == ["managed-delivery.txt"]
         assert remote["source_graph"]["issues"]["2"]["state"] == "CLOSED"
         assert _git(origin, "rev-parse", "refs/heads/main") == base
+
+
+def test_public_local_worker_failure_preserves_completed_and_independent_tickets(
+    git_repo: Path, tmp_path: Path, monkeypatch, record_property,
+) -> None:
+    """A completes, B fails while C publishes, and B's dependent D never starts."""
+    from agent_run.adapters.foreground import read_record, record_root, subreaper
+
+    classification = """schema = json.loads(Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text())
+role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commit_message' in schema['properties'] else 'development'
+import re
+issue = int(re.search(r'https://github.com/example/project/issues/(\\d+)', prompt).group(1))
+"""
+    codex = _CODEX[:_CODEX.index('if prompt.startswith')] + classification + _CODEX[_CODEX.index('thread = '):]
+    codex = codex.replace("'managed-entry-' + role)", "'managed-entry-' + role + '-' + os.urandom(16).hex())")
+    codex = codex.replace("content = 'Implementation from the managed native Worker.\\n'",
+                          "content = f'Original delivery for Ticket {issue}.\\n'")
+    codex = codex.replace("Path('managed-delivery.txt')", "Path('delivery-' + str(issue) + '.txt')")
+    held = r"""if (issue, role) in {(3, 'development'), (4, 'publication')}:
+    import socket
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
+        control.settimeout(90)
+        control.connect('\0' + os.environ['ENTRY_WORKER_CONTROL'][1:])
+        control.sendall(json.dumps({'role': role, 'subject': 'ticket-' + str(issue),
+            'thread': thread, 'checkout': str(Path.cwd()), 'head': head}).encode())
+        control.shutdown(socket.SHUT_WR)
+        assert control.recv(1) == b'1'
+    if issue == 3:
+        print('Controlled local Ticket B failure.', file=sys.stderr, flush=True)
+        raise SystemExit(23)
+"""
+    codex = codex.replace('content = ', held + '\ncontent = ', 1)
+    held_roles = {('ticket-3', 'development'), ('ticket-4', 'publication')}
+    with _worker_controls(tmp_path, held_roles=held_roles) as (address, arrivals), subreaper(), ExitStack() as processes:
+        monkeypatch.setenv('ENTRY_WORKER_CONTROL', address)
+        environment, remote = _control_environment(git_repo, tmp_path, monkeypatch, codex=codex, tickets=(2, 3, 4, 5))
+        source = json.loads(remote.read_text())
+        source['source_graph']['issues']['5']['blocked_by'] = [3]
+        remote.write_text(json.dumps(source))
+        gh = tmp_path / 'control-bin' / 'gh'
+        provider = gh.read_text()
+        empty = "'blockedBy':{'nodes':[]"
+        assert provider.count(empty) == 1
+        provider = provider.replace(empty, "'blockedBy':{'nodes':[{'number':n,'state':graph['issues'][str(n)]['state']} for n in p.get('blocked_by',[])]")
+        # Model read-only GitHub GETs; concurrent identity reads cannot rewrite
+        # an older copy over the local provider's actual mutation receipts.
+        provider = provider.replace('write_text(state,json.dumps(d))', "if method!='GET':write_text(state,json.dumps(d))")
+        gh.write_text(provider)
+        child, child_fd = processes.enter_context(_control_process(
+            [sys.executable, '-m', 'agent_run', 'run', '1', '--foreground', '--no-notifications',
+             '--repo', 'example/project', '--json'], cwd=git_repo, env=environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+        deadline = time.monotonic() + 90
+        pins, observations = [], {}
+
+        def remaining():
+            return max(0.01, deadline - time.monotonic())
+
+        def public(command):
+            result = subprocess.run([sys.executable, '-m', 'agent_run', command, '--parent', '1',
+                '--repo', 'example/project', '--json'], cwd=git_repo, env=environment,
+                capture_output=True, text=True, timeout=min(20, remaining()))
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            return json.loads(result.stdout)
+
+        def subjects(document):
+            return {row['subject']: row for row in document['subjects']}
+
+        try:
+            ready = [arrivals.get(timeout=min(60, remaining())) for _ in range(2)]
+            channels = {event['subject']: (event, channel) for event, channel in ready}
+            assert set(channels) == {'ticket-3', 'ticket-4'}
+            before = public('status')
+            jobs = subjects(before)
+            assert jobs['ticket:2']['phase'] == 'complete' and not jobs['ticket:2']['gates']
+            assert jobs['ticket:2']['delivery_cleanup']['state'] == 'complete'
+            assert before['focus_subject'] == 'ticket:4'
+            lock = default_runner_lock_path(environment)
+            record, = (read_record(path) for path in record_root(lock).glob('*.json'))
+            assert record['binding'][0] == before['run_id'] and record['phase'] == 'running'
+            _pin_control_host(record, pins)
+            kernel = Kernel(Path(record['database']))
+            # There is no mutable observer selection in the new architecture.
+            # Selecting completed A for a read cannot own B's later failure.
+            selected_a = kernel.status('ticket:2')
+            assert selected_a['phase'] == 'complete'
+            completion_a, = [row for row in kernel.source_status()['completions'] if row['subject'] == 'ticket:2']
+            state_a = json.loads(remote.read_text())
+            pr_a, = state_a['prs']
+            assert pr_a['merged'] and state_a['source_graph']['issues']['2']['state'] == 'CLOSED'
+            history = public('history')['history']
+            completed_history_a = [row for row in history['events'] if row['subject'] == 'ticket:2'
+                and row['kind'] in {'role_consumed', 'effect_consumed', 'worker_exited'}]
+            attempt_b, = [row for row in history['attempts'] if row['subject'] == 'ticket:3']
+            attempt_c, = [row for row in history['attempts'] if row['subject'] == 'ticket:4' and row['role'] == 'publication']
+            invocation_b, = attempt_b['invocations']
+            invocation_c, = attempt_c['invocations']
+            assert invocation_b['backend_id'] == channels['ticket-3'][0]['thread']
+            assert invocation_c['backend_id'] == channels['ticket-4'][0]['thread']
+            assert all(pin.observe() == 'running' for pin in pins)
+            observations.update(run=before['run_id'], before=before, completion_a=completion_a,
+                pr_a=pr_a, original_b=attempt_b, original_c=attempt_c,
+                original_record=record, original_pins=[pin.identity.wire() for pin in pins])
+            channels['ticket-3'][1].sendall(b'1')
+
+            def b_failed():
+                value = public('status')
+                return value if any(gate['code'] == 'execution_failed'
+                    for gate in subjects(value)['ticket:3']['gates']) else None
+            failed = wait_until(b_failed, timeout=min(15, remaining()))
+            failed_jobs = subjects(failed)
+            assert failed['run_id'] == before['run_id'] and failed['executor_control']['blocked'] is None
+            assert failed['focus_subject'] == 'ticket:4' and child.poll() is None
+            assert not failed_jobs['ticket:2']['gates'] and not failed_jobs['ticket:4']['gates']
+            assert failed_jobs['ticket:3']['budgets'] == jobs['ticket:3']['budgets']
+            gate, = failed_jobs['ticket:3']['gates']
+            assert gate['subject'] == 'ticket:3' and gate['detail']['returncode'] == 23
+            assert gate['detail']['kind'] == 'ordinary'
+            assert failed_jobs['ticket:5']['blocked_by'] == [3]
+            assert not any(row['pending_attempt'] for name, row in failed_jobs.items() if name == 'ticket:5')
+            observations['after_b_failure'] = failed
+            channels['ticket-4'][1].sendall(b'1')
+            out, err = child.communicate(timeout=remaining())
+            assert child.returncode == 0, (out, err)
+            accepted = json.loads(out)
+            assert accepted['run_id'] == before['run_id'] and accepted['host'] == 'exited'
+            final = public('status')
+            completed = subjects(final)
+            assert final['run_id'] == before['run_id'] and final['status'] != 'completed'
+            assert final['executor_control']['blocked'] is None
+            assert all(completed[s]['phase'] == 'complete' and not completed[s]['gates']
+                and completed[s]['delivery_cleanup']['state'] == 'complete' for s in ('ticket:2', 'ticket:4'))
+            assert completed['ticket:3']['gates'] == failed_jobs['ticket:3']['gates']
+            assert completed['ticket:3']['budgets'] == jobs['ticket:3']['budgets']
+            assert completed['ticket:5']['blocked_by'] == [3] and completed['ticket:5']['pending_attempt'] is None
+            assert all(row['developments_used'] == row['reviews_used'] == 0 for row in completed['ticket:5']['budgets'])
+            fresh_history = public('history')['history']
+            assert not any(row['subject'] == 'ticket:5' for row in fresh_history['attempts'])
+            current_b, = [row for row in fresh_history['attempts'] if row['id'] == attempt_b['id']]
+            current_c, = [row for row in fresh_history['attempts'] if row['id'] == attempt_c['id']]
+            # Native preparation creates an empty last-message file. Exit23
+            # therefore saves empty raw and permits one ordinary recovery;
+            # neither invocation is a successful Development result.
+            assert current_b['subject'] == 'ticket:3' and current_b['result'] == '' and current_b['outcome'] is None
+            assert current_b['status'] == 'returned'
+            first_b, recovery_b = current_b['invocations']
+            assert first_b['id'] == invocation_b['id'] and first_b['recovery_kind'] is None
+            assert first_b['predecessor'] is None
+            assert recovery_b['recovery_kind'] == 'ordinary' and recovery_b['predecessor'] == first_b['id']
+            assert current_b['current_invocation'] == recovery_b['id']
+            assert recovery_b['allocated_at'] >= first_b['outputs'][0]['exited_at']
+            assert first_b['deadline_at'] == invocation_b['deadline_at']
+            assert recovery_b['deadline_seconds'] == first_b['deadline_seconds'] == invocation_b['deadline_seconds']
+            for invocation in (first_b, recovery_b):
+                assert invocation['subject'] == 'ticket:3' and invocation['attempt'] == attempt_b['id']
+                assert all(invocation[key] == invocation_b[key] for key in (
+                    'thread', 'backend_id', 'profile_revision', 'model', 'effort', 'executor', 'epoch'))
+                output, = invocation['outputs']
+                assert output['dispatch_state'] == 'exited' and output['exit_code'] == 23
+                assert output['raw_return'] == '' and output['raw_id'] is not None
+                assert output['failure_evidence']['returncode'] == 23 and output['failure_kind'] == 'ordinary'
+            exited_b = [row for row in fresh_history['events'] if row['kind'] == 'worker_exited'
+                        and row['identity'] in {first_b['id'], recovery_b['id']}]
+            assert len(exited_b) == 2 and all(row['subject'] == 'ticket:3' for row in exited_b)
+            assert {row['identity'] for row in exited_b} == {first_b['id'], recovery_b['id']}
+            assert gate['detail'] == recovery_b['outputs'][0]['failure_evidence']
+            assert current_c['status'] == 'consumed' and current_c['result'] is not None
+            completed_c, = current_c['invocations']
+            assert all(completed_c[key] == invocation_c[key] for key in (
+                'id', 'attempt', 'thread', 'backend_id', 'profile_revision', 'model', 'effort',
+                'executor', 'epoch', 'deadline_at'))
+            output_c, = completed_c['outputs']
+            assert output_c['dispatch_state'] == 'exited' and output_c['exit_code'] == 0
+            assert output_c['failure_kind'] is None and output_c['raw_return']['result_kind'] == 'publication'
+            assert [row for row in fresh_history['events'] if row['subject'] == 'ticket:2'
+                    and row['kind'] in {'role_consumed', 'effect_consumed', 'worker_exited'}] == completed_history_a
+            assert not any(row['kind'] == 'role_consumed' and row['identity'] == attempt_b['id']
+                           for row in fresh_history['events'])
+            reopened = Kernel(Path(record['database']))
+            assert reopened.status('ticket:3')['gates'] == ['execution_failed']
+            assert next(row for row in reopened.source_status()['completions'] if row['subject'] == 'ticket:2') == completion_a
+            assert all(completed['ticket:2'][key] == jobs['ticket:2'][key] for key in (
+                'phase', 'generation', 'candidate_sha', 'pr_number', 'budgets', 'delivery_cleanup'))
+            final_remote = json.loads(remote.read_text())
+            assert next(row for row in final_remote['prs'] if row['number'] == pr_a['number']) == pr_a
+            assert final_remote['source_graph']['issues']['2']['state'] == final_remote['source_graph']['issues']['4']['state'] == 'CLOSED'
+            assert final_remote['source_graph']['issues']['3']['state'] == final_remote['source_graph']['issues']['5']['state'] == 'OPEN'
+            assert len(final_remote['prs']) == 2 and all(row['merged'] for row in final_remote['prs'])
+            target = kernel.delivery('ticket:2').target_ref
+            assert target == kernel.delivery('ticket:4').target_ref
+            assert all('refs/heads/' + row['base']['ref'] == target for row in final_remote['prs'])
+            default = _git(tmp_path / 'origin.git', 'symbolic-ref', 'HEAD')
+            assert default != target
+            assert _git(tmp_path / 'origin.git', 'rev-parse', default) == pr_a['base']['sha']
+            assert _git(tmp_path / 'origin.git', 'show', target + ':delivery-2.txt') == 'Original delivery for Ticket 2.'
+            assert _git(tmp_path / 'origin.git', 'show', target + ':delivery-4.txt') == 'Original delivery for Ticket 4.'
+            _git(tmp_path / 'origin.git', 'merge-base', '--is-ancestor', pr_a['merge_commit_sha'], target)
+            assert all(pin.observe() == 'exited' for pin in pins)
+            assert not list(record_root(lock).glob('*.json'))
+            with runner_management_lease(lock):
+                pass
+            observations.update(final=final, history=fresh_history, remote=final_remote,
+                                physical_exit=[pin.observe() for pin in pins])
+        finally:
+            try:
+                record_property('mixed_subject_failure', json.dumps(observations))
+            finally:
+                _finish_control_host(child, pins, child_fd=child_fd)
