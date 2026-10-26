@@ -507,10 +507,11 @@ class Storage:
             clock = SaveClock()
         except (OSError, ValueError, DomainUnknown) as error:
             raise KernelError('storage_clock_domain', 'Comparable save clock is unavailable') from error
-        request = RepositorySave(clock, self._run_id, deadline)
+        request: RepositorySave | None = None
         original: BaseException | None = None
         may_be_registered = False
         try:
+            request = RepositorySave(clock, self._run_id, deadline)
             registration = SaveCommit()
             try:
                 self._save_metadata(request, identity, cancelled, 'register', registration)
@@ -552,7 +553,7 @@ class Storage:
             raise
         finally:
             try:
-                if may_be_registered and not request.commit.confirmed:
+                if request is not None and may_be_registered and not request.commit.confirmed:
                     try:
                         # A set cancellation flag must not forbid exact cleanup;
                         # the original absolute budget still bounds acquisition.
@@ -567,7 +568,7 @@ class Storage:
                 except OSError as cleanup:
                     if original is not None:
                         original.add_note('Save clock cleanup unavailable: ' + type(cleanup).__name__)
-                    elif request.commit.confirmed:
+                    elif request is not None and request.commit.confirmed:
                         _save_warning()
                     else:
                         raise

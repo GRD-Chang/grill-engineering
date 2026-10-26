@@ -461,3 +461,20 @@ def test_clock_pin_requires_same_domain_and_closes_its_descriptor_once(monkeypat
             clock.require()
             clock.close()
     assert closed == [123] and len(calls) >= 2
+
+
+def test_clock_ownership_is_closed_when_request_construction_fails(repository, monkeypatch):
+    clocks = []
+    class RecordedClock(DecisionClock):
+        def __init__(self):
+            super().__init__()
+            clocks.append(self)
+    def unavailable(*args):
+        raise OSError('controlled request construction failure before any registration')
+    monkeypatch.setattr(storage_module, 'SaveClock', RecordedClock)
+    monkeypatch.setattr(storage_module, 'RepositorySave', unavailable)
+    with pytest.raises(OSError):
+        with repository.at_run('A').transaction():
+            pytest.fail('Business entered without a request')
+    assert len(clocks) == 1 and clocks[0].closed
+    assert scalar(repository, 'SELECT count(*) FROM save_admissions') == 0
