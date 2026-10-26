@@ -76,8 +76,12 @@ class StatusComments:
             entry = self._entry(document, projection)
             if entry.get("failure") is not None:
                 raise ValueError("Status delivery paused")
-            if entry.get("claim"):
-                return cast(dict[str, Any] | None, deepcopy(entry["intent"]))
+            owner = entry.get("claim")
+            if owner:
+                if _process_binding_status(owner["pid"], owner["token"]) != "absent":
+                    return cast(dict[str, Any] | None, deepcopy(entry["intent"]))
+                entry.pop("claim")  # Only a proved-absent sender relinquishes preparation.
+
             body = entry["marker"] + "\n" + projection.body
             intent = entry["intent"]
             if intent is not None and intent["sent"]:
@@ -125,7 +129,8 @@ class StatusComments:
                 # Slow transport/credential preparation and remote reads are
                 # already finished. No remote I/O follows this final check.
                 current = project_status(self.database, subject)
-                if stopped() or current != projection or Kernel(self.database).operation_binding() != binding:
+                if (stopped() or current != projection or intent["body"] != marker + "\n" + current.body
+                        or Kernel(self.database).operation_binding() != binding):
                     raise ValueError("Status authority changed")
                 with outbox.transaction(self.database.parent, target.run_id) as document:
                     active = self._entry(document, current)

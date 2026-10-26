@@ -313,7 +313,8 @@ def test_status_capacity_and_damaged_records_leave_business_untouched(tmp_path, 
     assert api.reads == count
 
 
-def test_status_real_sender_exit_retains_sent_intent_through_journal_compaction(tmp_path, monkeypatch):
+@pytest.mark.parametrize("dispatched", [True, False], ids=["sent", "prepared"])
+def test_status_real_sender_exit_retains_sent_intent_through_journal_compaction(tmp_path, monkeypatch, dispatched):
     import json
     import os
     import subprocess
@@ -328,7 +329,11 @@ from test_kernel_status_comment import CommentsAPI
 from agent_run.queries.status_comment import project_status
 from agent_run.notifications.status_comment import StatusComments
 p,subject,output=Path(sys.argv[1]),sys.argv[2],Path(sys.argv[3])
+dispatched=sys.argv[4]=='True'
 class Interrupted(CommentsAPI):
+ def object(self,endpoint):
+  if not dispatched:os._exit(18)
+  return super().object(endpoint)
  def write(self,*args):
   super().write(*args)
   output.write_text(json.dumps({'comments':self.comments,'commands':self.commands}))
@@ -338,14 +343,15 @@ StatusComments(p).deliver(subject,api=a)
 raise AssertionError('physical dispatch was not reached')
 '''
     before = database.read_bytes()
-    result = subprocess.run([sys.executable, "-c", script, str(database), subject, str(evidence)],
+    result = subprocess.run([sys.executable, "-c", script, str(database), subject, str(evidence), str(dispatched)],
                             env=dict(os.environ), capture_output=True, text=True, timeout=20)
-    assert result.returncode == 17, result.stderr
-    physical = json.loads(evidence.read_text())
-    assert len(physical["commands"]) == 1
+    assert result.returncode == (17 if dispatched else 18), result.stderr
+    assert database.read_bytes() == before
+    physical = json.loads(evidence.read_text()) if dispatched else {"comments": [], "commands": []}
+    assert len(physical["commands"]) == int(dispatched)
     with outbox.transaction(database.parent, scenario.spec.run_id) as document:
         entry, = document["remote_status"]["bindings"].values()
-        assert entry["intent"]["sent"] and entry["claim"]["pid"] != os.getpid()
+        assert entry["intent"]["sent"] is dispatched and entry["claim"]["pid"] != os.getpid()
         original_intent = dict(entry["intent"])
         for n in range(outbox.MAX_RECORDS + 1):
             outbox.enqueue(document, {"id": f"other-{n}", "kind": "stage_start"}, 0)
@@ -353,10 +359,16 @@ raise AssertionError('physical dispatch was not reached')
             outbox.settle(document, 0)
         assert len(document["records"]) == outbox.MAX_RECORDS
         assert entry["intent"] == original_intent
+    if not dispatched:
+        scenario.kernel.control("stop", "after-preparation-exit", subject=subject)
+        before = database.read_bytes()
     api = CommentsAPI(project_status(database, subject).target)
     api.comments = physical["comments"]
     assert StatusComments(database).deliver(subject, api=api) == "confirmed"
-    assert api.commands == []  # Readback after a real process exit, not a second POST.
+    if dispatched:
+        assert api.commands == []  # Readback after a real process exit, not a second POST.
+    else:
+        assert len(api.commands) == 1 and "operator_stopped" in api.comments[0]["body"]
     assert database.read_bytes() == before
 
 
@@ -425,3 +437,21 @@ def test_status_and_existing_enabled_sender_share_one_original_run_binding(tmp_p
     assert document["pending"] == []
     assert len(document["remote_status"]["bindings"]) == 1
     assert database.read_bytes() == before
+
+
+def test_status_state_change_between_staging_and_claim_fences_original_copy(tmp_path, monkeypatch):
+    scenario = published(tmp_path, monkeypatch)
+    database, subject = scenario.kernel.storage.path, scenario.delivery.key
+    sender = StatusComments(database)
+    api = CommentsAPI(project_status(database, subject).target)
+    stage = sender.stage
+    def changed_after_stage(owner):
+        original = stage(owner)
+        scenario.kernel.control("stop", "between-status-stage-and-claim", subject=subject)
+        return original
+    with monkeypatch.context() as patch:
+        patch.setattr(sender, "stage", changed_after_stage)
+        assert sender.deliver(subject, api=api) == "unavailable"
+    assert api.commands == []
+    assert sender.deliver(subject, api=api) == "confirmed"
+    assert len(api.comments) == 1 and "operator_stopped" in api.comments[0]["body"]
