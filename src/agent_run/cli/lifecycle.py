@@ -99,17 +99,24 @@ def add_parsers(commands: Any, language: str) -> None:
             notify.add_argument("--no-notifications", action="store_true", help=text("cli.no_notifications_help", language=language))
 
 
-def _runtime_directory(action_id: str, environment: Mapping[str, str]) -> Path:
+def _runtime_directory(action_id: str, environment: Mapping[str, str], *, run_partition: str | None = None) -> Path:
     from agent_run.config.paths import app_runtime_root
     if not re.fullmatch(r"[A-Za-z0-9_-]+", action_id):
         raise ValueError("Expected an exact Action identity")
+    if run_partition is not None and not re.fullmatch(r"[a-f0-9]{64}", run_partition):
+        raise ValueError("Expected an exact Run carrier partition")
     root = app_runtime_root(environment)
-    for directory in (root, root / "native-host"):
+    host_root = root / "native-host"
+    directories = [root, host_root]
+    if run_partition is not None:
+        host_root = host_root / run_partition
+        directories.append(host_root)
+    for directory in directories:
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = directory.lstat()
         if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077):
             raise ValueError("Host runtime directory must be private and owned")
-    directory = root / "native-host" / action_id
+    directory = host_root / action_id
     directory.mkdir(mode=0o700)
     return directory
 
@@ -132,7 +139,8 @@ def submit(kernel: Kernel, kind: str, *, action_id: str, command: tuple[str, ...
     from agent_run.runtime.handoff import handoff_scope, launch_handoff
     with runner_usage_lease(runner_lock) as terminal:
         manager.preflight()  # Before creating a carrier directory or accepting Action.
-        directory = _runtime_directory(action_id, environment)
+        locations = kernel.run_paths()
+        directory = _runtime_directory(action_id, environment, run_partition=locations.host_partition)
         carrier = directory / "environment.json"
         request = kernel.admit_host(action_id, kind=kind, command=command, environment_carrier=carrier,
                                     preflight=manager.preflight, subject=subject, world=world,
