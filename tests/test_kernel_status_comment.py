@@ -937,3 +937,76 @@ def test_preempted_unknown_post_keeps_original_intent_and_never_creates_twice(tm
     finally:
         release.set()
         observer.close(drain=False)
+def test_attach_updates_same_status_only_after_original_domain_and_usage_release(tmp_path, monkeypatch):
+    import json
+    import os
+    import subprocess
+    import sys
+    import agent_run.notifications.sender as notifications
+    from agent_run.cli.lifecycle import attach
+    from agent_run.model import HostObservation
+    from agent_run.runtime.handoff import prepare_handoff
+    from agent_run.runtime.package_lease import runner_usage_lease
+    from support.systemd_manager import controlled_manager
+    scenario = published(tmp_path, monkeypatch)
+    kernel, subject = scenario.kernel, scenario.delivery.key
+    kernel.control("stop", "retire-offline-for-managed-release")
+    kernel.confirm_executor_exit(scenario.execution)
+    kernel.control("resume", "original-managed-release-resume")
+    manager_root = tmp_path / "release-manager"
+    manager_root.mkdir()
+    manager, _, response, _ = controlled_manager(manager_root)
+    private = tmp_path / "release-private"
+    private.mkdir(mode=0o700)
+    lock = tmp_path / "runner-release.lock"
+    command = (sys.executable, "-I", "-c", "raise SystemExit(0)")
+    request = kernel.admit_host("original-status-release", kind="run", command=command,
+                               environment_carrier=private / "environment.json", preflight=manager.preflight)
+    api = CommentsAPI(project_status(kernel.storage.path, subject).target)
+    original_sender = notifications.NativeNotifications
+    monkeypatch.setattr(notifications, "NativeNotifications",
+                        lambda *args, **kwargs: original_sender(*args, **kwargs, status_api=api))
+    handoff = None
+    try:
+        with runner_usage_lease(lock) as terminal:
+            handoff = prepare_handoff(request, {"PATH": os.defpath}, runner_lock=lock, terminal_lease=terminal, ttl_seconds=.5)
+            assert kernel.dispatch_host(request)
+            receipt = json.dumps(handoff.receipt, sort_keys=True, separators=(",", ":"))
+            assert kernel.observe_host(request, HostObservation("unknown", request.unit_name,
+                                        usage_pending=True, evidence=receipt)) == "unknown"
+            assert StatusComments(kernel.storage.path).deliver(subject, api=api) == "confirmed"
+            comment_id = api.comments[0]["id"]
+            assert "Host exit: exit_unproven" in api.comments[0]["body"]
+            child = subprocess.Popen(command, start_new_session=True)
+            assert child.wait(timeout=3) == 0
+            assert handoff.process.wait(timeout=3) == 1
+            state = json.loads(response.read_text())
+            # Existing external-manager/sysfs seam is synthetic. The local
+            # child and original guardian really exited; this is not live
+            # systemd/cgroup validation in the container's shared cgroup.
+            state["fields"].update(Id=request.unit_name, Description=request.description,
+                ActiveState="inactive", SubState="dead", ExecMainStatus="0", NFileDescriptorStore="1")
+            response.write_text(json.dumps(state))
+            group_events = manager.cgroup_root / "unit-group" / "cgroup.events"
+            group_events.write_text("populated 1\nfrozen 0\n")
+            original = attach(kernel, requested_action="resume", manager=manager,
+                              environment={"PATH": os.defpath}, runner_lock=lock)
+            assert original["host"] == "unknown" and kernel.host_usage("original-status-release").usage_released is False
+            assert [row[1] for row in api.commands] == ["POST"]
+            group_events.write_text("populated 0\nfrozen 0\n")
+            held = attach(kernel, requested_action="resume", manager=manager,
+                          environment={"PATH": os.defpath}, runner_lock=lock)
+            assert held["host"] == "exited" and kernel.host_usage("original-status-release").usage_released is False
+            assert "Host exit: exit_unproven" in project_status(kernel.storage.path, subject).body
+            assert [row[1] for row in api.commands] == ["POST"]
+            state["fields"]["NFileDescriptorStore"] = "0"
+            response.write_text(json.dumps(state))
+            released = attach(kernel, requested_action="resume", manager=manager,
+                              environment={"PATH": os.defpath}, runner_lock=lock)
+            assert released["host"] == "exited" and released["requested_action_applied"] is False
+            assert kernel.host_usage("original-status-release").usage_released is True
+            assert [row[1] for row in api.commands] == ["POST", "PATCH"]
+            assert api.comments[0]["id"] == comment_id and "Host exit: exited" in api.comments[0]["body"]
+    finally:
+        if handoff is not None and handoff.process.poll() is None:
+            handoff.process.terminate(); handoff.process.wait(timeout=3)
