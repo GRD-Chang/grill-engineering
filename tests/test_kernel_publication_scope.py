@@ -52,9 +52,10 @@ def test_publication_ranges_reach_runtime_and_public_preview_from_real_work(tmp_
             prompt = render_role_prompt(call)
             visible = json.dumps({"publication_context": expected}, ensure_ascii=False, indent=2, sort_keys=True)
             assert visible in prompt
-            for field in ("acceptance_identity", "ticket_completions", "ci_evidence"):
-                if field in call.context:
-                    assert json.dumps(call.context[field], ensure_ascii=False, indent=2, sort_keys=True) in prompt
+            facts = {field: call.context[field] for field in ("acceptance_identity", "ticket_completions", "ci_evidence")
+                     if field in call.context}
+            if facts:
+                assert json.dumps(facts, ensure_ascii=False, indent=2, sort_keys=True) in prompt
             assert ("整个 PR" if language == "zh" else "entire PR") in prompt
             if kind == DeliveryKind.FINAL_RUN:
                 assert ("不用于创建提交" if language == "zh" else "not used to create a commit") in prompt
