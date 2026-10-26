@@ -402,6 +402,11 @@ class Storage:
                             sqlite3.SQLITE_BUSY_SNAPSHOT, sqlite3.SQLITE_BUSY_TIMEOUT,
                         )):
                     raise KernelError("storage_busy", "SQLite transaction is locked; retry the command") from error
+                if isinstance(error, sqlite3.OperationalError):
+                    code = getattr(error, "sqlite_errorcode", None)
+                    if code in (sqlite3.SQLITE_FULL, sqlite3.SQLITE_INTERRUPT):
+                        diagnostic = "storage_limit" if code == sqlite3.SQLITE_FULL else "transaction_aborted"
+                        raise KernelError(diagnostic, f"{error.sqlite_errorname}: {error}") from error
                 raise
 
     def _capacity(self, connection: sqlite3.Connection) -> None:
