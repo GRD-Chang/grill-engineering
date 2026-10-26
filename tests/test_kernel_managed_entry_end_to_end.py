@@ -1926,3 +1926,292 @@ issue = int(re.search(r'https://github.com/example/project/issues/(\\d+)', promp
                 record_property('mixed_subject_failure', json.dumps(observations))
             finally:
                 _finish_control_host(child, pins, child_fd=child_fd)
+
+
+def test_explicit_fault_host_entry_preserves_native_admission_without_fault(
+    git_repo: Path, tmp_path: Path, monkeypatch,
+) -> None:
+    """Controlled test entry, not the official CLI's unchanged argv contract.
+
+    Only the initial Host module is selected differently before admission.
+    Namespace/lease/channel/Worker authorization and installed runtime are real.
+    """
+    from uuid import uuid4
+    from agent_run.adapters.foreground import subreaper
+    from agent_run.cli.lifecycle import prepare_creation, submit
+    from agent_run.runtime import executor
+    from agent_run.runtime.foreground_host import ForegroundHost
+    from support.sqlite_fault_host import command
+    from support.sqlite_faults import FaultScope, sqlite_fault
+
+    classification = """schema = json.loads(Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text())
+role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commit_message' in schema['properties'] else 'development'
+"""
+    codex = _CODEX[:_CODEX.index('if prompt.startswith')] + classification + _CODEX[_CODEX.index('thread = '):]
+    environment, _ = _control_environment(git_repo, tmp_path, monkeypatch, codex=codex, tickets=())
+    database, spec, requirements = prepare_creation(1, 'example/project', source_directory=git_repo,
+        defaults=UserDefaultsStore(), disable_notifications=True)
+    kernel = Kernel.create_task(database, spec, requirements=requirements)
+    action = uuid4().hex
+    lock = default_runner_lock_path(environment)
+    scope, digest = FaultScope.create(tmp_path / 'fault-scope', database, spec.run_id, action)
+    selected = command(database, action, lock, environment, scope.manifest, digest)
+    assert selected != executor.command(database, action, lock, environment)
+    with subreaper(), sqlite_fault(monkeypatch, database, 'commit-interrupt', scope=scope) as failures:
+        result = submit(kernel, 'run', action_id=action, command=selected,
+            manager=ForegroundHost(environment=environment), environment=environment, runner_lock=lock)
+    assert failures == [] and not scope.active()
+    assert result['run_id'] == spec.run_id and result['host'] == 'exited'
+    assert result['host_backend'] == 'foreground'
+    assert kernel.host_request(action).command == selected
+    receipt = kernel.host_usage(action)
+    assert receipt is not None and receipt.usage_released
+    assert receipt.exit_status == 0 and receipt.namespace_exit_status == 0
+    assert kernel.status('parent:1')['phase'] == 'approval'
+    with kernel.storage.transaction(write=False) as tx:
+        assert tx.one('SELECT count(*) FROM leases')[0] == 0
+        assert not tx.rows("SELECT owner FROM hosts WHERE status!='exited' OR usage_released=0")
+        assert {row['role'] for row in tx.rows('SELECT role FROM attempts')} == {'development', 'review', 'publication'}
+        assert tx.one('SELECT count(*) FROM invocation_outputs')[0] == 3
+        assert tx.one('SELECT count(*) FROM invocation_outputs WHERE exit_code IS NULL OR exit_code!=0')[0] == 0
+    events = [json.loads(line) for line in scope.manifest.with_suffix('.events.jsonl').read_text().splitlines()]
+    assert [event['event'] for event in events] == ['factory_loaded', 'factory_closed']
+    assert events[0]['pid'] != os.getpid() and events[0]['sqlite_code'] is None
+    with runner_management_lease(lock):
+        pass
+    assert not list((lock.parent / 'foreground-hosts').iterdir())
+
+
+
+def test_controlled_native_commit_failure_reaps_both_workers_before_disarm_and_public_resume(
+    git_repo: Path, tmp_path: Path, monkeypatch, record_property,
+) -> None:
+    """Controlled pre-sealed test Host, not official CLI argv E2E.
+
+    The factory affects only the exact private DB in the original controller
+    and native Host. The subsequent Resume uses the unmodified public CLI.
+    Fault activation is owned by this test and never touches a user database.
+    """
+    from uuid import uuid4
+    from agent_run.adapters.foreground import read_record, record_root, subreaper
+    from agent_run.cli.lifecycle import prepare_creation
+    from support.sqlite_fault_host import command
+    from support.sqlite_faults import FaultScope
+
+    classification = """schema = json.loads(Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text())
+role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commit_message' in schema['properties'] else 'development'
+import re
+issue = int(re.search(r'https://github.com/example/project/issues/(\\d+)', prompt).group(1))
+"""
+    codex = _CODEX[:_CODEX.index('if prompt.startswith')] + classification + _CODEX[_CODEX.index('thread = '):]
+    codex = codex.replace("'managed-entry-' + role)", "'managed-entry-' + role + '-' + os.urandom(16).hex())")
+    codex = codex.replace("content = 'Implementation from the managed native Worker.\\n'",
+                          "content = f'Original delivery for Ticket {issue}.\\n'")
+    codex = codex.replace("Path('managed-delivery.txt')", "Path('delivery-' + str(issue) + '.txt')")
+    held = r"""if role == 'development':
+    import socket
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
+        control.settimeout(90)
+        control.connect('\0' + os.environ['ENTRY_WORKER_CONTROL'][1:])
+        control.sendall(json.dumps({'role': role, 'subject': 'ticket-' + str(issue),
+            'thread': thread, 'checkout': str(Path.cwd())}).encode())
+        control.shutdown(socket.SHUT_WR)
+        assert control.recv(1) == b'1'
+"""
+    codex = codex.replace('content = ', held + '\ncontent = ', 1)
+    produced = "Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text(json.dumps(result))"
+    assert codex.count(produced) == 1
+    codex = codex.replace(produced, produced + """
+if role == 'development':
+    with open(os.environ['ENTRY_ROLE_TRACE'], 'a') as log:
+        log.write(json.dumps({'event': 'worker_produced', 'subject': 'ticket-' + str(issue),
+            'thread': thread, 'checkout': str(Path.cwd())}) + chr(10))
+""")
+    ticket_check = "assert Path('delivery-' + str(issue) + '.txt').read_text() == content"
+    assert codex.count(ticket_check) == 2
+    codex = codex.replace(ticket_check, """if issue == 1:
+        for number in (2, 3):
+            assert Path('delivery-' + str(number) + '.txt').read_text() == f'Original delivery for Ticket {number}.' + chr(10)
+    else:
+        """ + ticket_check)
+    program = '''import json, os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import pytest
+from agent_run.cli.lifecycle import submit
+from agent_run.core.kernel import Kernel
+from agent_run.runtime.foreground_host import ForegroundHost
+from support.installed_runtime import require_current_installation
+from support.sqlite_fault_host import command
+from support.sqlite_faults import FaultScope, sqlite_fault
+require_current_installation()
+database, manifest, lock = map(Path, sys.argv[2:5])
+run, action, digest = sys.argv[5:8]
+scope = FaultScope.load(manifest, digest, database, run, action)
+selected = command(database, action, lock, os.environ, manifest, digest)
+try:
+    with pytest.MonkeyPatch.context() as patch:
+        with sqlite_fault(patch, database, 'commit-interrupt', scope=scope):
+            result = submit(Kernel(database), 'run', action_id=action, command=selected,
+                manager=ForegroundHost(environment=os.environ), environment=os.environ, runner_lock=lock)
+except Exception as error:
+    print(json.dumps({'error_type': type(error).__name__, 'code': getattr(error, 'code', None),
+                      'notes': getattr(error, '__notes__', [])}), flush=True)
+    raise SystemExit(2)
+else:
+    print(json.dumps(result), flush=True)
+'''
+    observations, pins = {}, []
+    with _worker_controls(tmp_path, held_roles={('ticket-2', 'development'), ('ticket-3', 'development')}) as (address, arrivals), subreaper(), ExitStack() as processes:
+        monkeypatch.setenv('ENTRY_WORKER_CONTROL', address)
+        environment, _ = _control_environment(git_repo, tmp_path, monkeypatch, codex=codex, tickets=(2, 3))
+        database, spec, requirements = prepare_creation(1, 'example/project', source_directory=git_repo,
+            defaults=UserDefaultsStore(), disable_notifications=True)
+        kernel = Kernel.create_task(database, spec, requirements=requirements)
+        action = uuid4().hex
+        lock = default_runner_lock_path(environment)
+        scope, digest = FaultScope.create(tmp_path / 'fault-scope', database, spec.run_id, action)
+        selected = command(database, action, lock, environment, scope.manifest, digest)
+        unrelated, unrelated_fd = processes.enter_context(_control_process(
+            [sys.executable, '-I', '-c', 'import time; time.sleep(180)'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+        child, child_fd = processes.enter_context(_control_process(
+            [sys.executable, '-I', '-c', program, str(Path(__file__).parent), str(database),
+             str(scope.manifest), str(lock), spec.run_id, action, digest],
+            cwd=git_repo, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+        deadline = time.monotonic() + 90
+
+        def remaining():
+            return max(0.01, deadline - time.monotonic())
+
+        try:
+            ready = [arrivals.get(timeout=min(60, remaining())) for _ in range(2)]
+            channels = {event['subject']: (event, channel) for event, channel in ready}
+            assert set(channels) == {'ticket-2', 'ticket-3'}
+            record, = (read_record(path) for path in record_root(lock).glob('*.json'))
+            assert record['binding'][0] == spec.run_id and record['phase'] == 'running'
+            _pin_control_host(record, pins)
+            assert all(pin.observe() == 'running' for pin in pins)
+            assert kernel.host_request(action).command == selected
+            before = {subject: kernel.status(subject) for subject in ('ticket:2', 'ticket:3')}
+            history_read = subprocess.run([sys.executable, '-m', 'agent_run', 'history', spec.run_id,
+                '--repo', 'example/project', '--json'], cwd=git_repo, env=environment,
+                text=True, capture_output=True, timeout=min(20, remaining()))
+            assert history_read.returncode == 0, (history_read.stdout, history_read.stderr)
+            history = {row['subject']: row for row in json.loads(history_read.stdout)['history']['attempts']}
+            assert set(history) == {'ticket:2', 'ticket:3'}
+            for subject, event in (('ticket:2', channels['ticket-2'][0]), ('ticket:3', channels['ticket-3'][0])):
+                invocation, = history[subject]['invocations']
+                assert invocation['backend_id'] == event['thread']
+                output, = invocation['outputs']
+                assert output['dispatch_state'] == 'started' and output['started_at'] is not None
+                assert output['raw_id'] is None and output['raw_return'] is None
+                budget = before[subject]['budgets'][history[subject]['purpose']]
+                assert (budget['developments_used'], budget['reviews_used']) == (1, 0)
+            scope.set_active(True)
+            armed_at = time.monotonic()
+            channels['ticket-2'][1].sendall(b'1')  # A returns raw; B remains genuinely in flight.
+            out, err = child.communicate(timeout=remaining())
+            stderr_tail = err[-8192:]
+            observations['original_host_stderr'] = {
+                'tail_char_limit': 8192, 'original_characters': len(err), 'truncated': len(err) > 8192,
+                'tokens': {marker: stderr_tail.count(marker) for marker in (
+                    'Executor admission not durably revoked:', 'transaction_aborted',
+                    'Worker outcome was not durably settled', 'KernelError', 'ProcessExitUnknown', 'OperationalError')}}
+            assert child.returncode == 2, (out, err)
+            assert json.loads(out)['code'] == 'transaction_aborted'
+            observations['original_controller_error_type'] = json.loads(out)['error_type']
+            assert all(pin.observe() == 'exited' for pin in pins)
+            assert not select.select([unrelated_fd], [], [], 0)[0]
+            assert scope.active()  # Actual domain exit precedes disarming and every fallback.
+            exited_at = time.monotonic()
+            closed, = (read_record(path) for path in record_root(lock).glob('*.json'))
+            assert closed['phase'] == 'exited' and closed['domain'] == record['domain']
+            assert closed['exit_basis'] == 'retained_namespace_pidfd'
+            audit = [json.loads(line) for line in scope.manifest.with_suffix('.events.jsonl').read_text().splitlines()]
+            failures = [event for event in audit if event['event'] == 'commit_failed']
+            observations['commit_failure_summary'] = {
+                'count': len(failures), 'sqlite_codes': sorted({event['sqlite_code'] for event in failures})}
+            assert len(failures) >= 3 and {event['sqlite_code'] for event in failures} == {9}
+            assert len({event['pid'] for event in failures}) >= 2
+            assert 'Executor admission not durably revoked:' in err
+            # External producer acknowledgement says only that the Worker
+            # wrote its temporary output. It contains no copy of that output
+            # and cannot establish that Core durably saved a return.
+            produced, = [event for event in map(json.loads, (tmp_path / 'roles.jsonl').read_text().splitlines())
+                         if event.get('event') == 'worker_produced']
+            assert produced['subject'] == 'ticket-2' and produced['thread'] == channels['ticket-2'][0]['thread']
+            with kernel.storage.transaction(write=False) as tx:
+                durable_outputs = {}
+                for original in history.values():
+                    invocation, = original['invocations']
+                    output = dict(tx.one('SELECT raw_id,exit_code FROM invocation_outputs WHERE invocation=? AND ordinal=0',
+                                         (invocation['id'],)))
+                    assert output == {'raw_id': None, 'exit_code': None}
+                    assert tx.one('SELECT result_id FROM attempts WHERE id=?', (original['id'],))[0] is None
+                    durable_outputs[invocation['id']] = output
+            assert {subject: kernel.status(subject)['budgets'] for subject in before} == {
+                subject: before[subject]['budgets'] for subject in before}
+            observations.update(run=spec.run_id, original_action=action, before=before,
+                original_history=history, domain=closed, audit=audit, armed_at=armed_at,
+                external_producer_only=produced, durable_outputs_after_fault=durable_outputs,
+                actual_exit_at=exited_at, unrelated_alive_before_disarm=True)
+            scope.set_active(False)
+            observations['disarmed_at'] = time.monotonic()
+            resumed = subprocess.run([sys.executable, '-m', 'agent_run', 'resume', spec.run_id,
+                '--foreground', '--repo', 'example/project', '--json'], cwd=git_repo, env=environment,
+                text=True, capture_output=True, timeout=remaining())
+            assert resumed.returncode == 0, (resumed.stdout, resumed.stderr)
+            receipt = json.loads(resumed.stdout)
+            assert receipt['run_id'] == spec.run_id and receipt['host'] == 'exited'
+            assert receipt['action_id'] != action and receipt['action'] == 'resume'
+            fresh_read = subprocess.run([sys.executable, '-m', 'agent_run', 'history', spec.run_id,
+                '--repo', 'example/project', '--json'], cwd=git_repo, env=environment,
+                text=True, capture_output=True, timeout=min(20, remaining()))
+            assert fresh_read.returncode == 0, (fresh_read.stdout, fresh_read.stderr)
+            attempts = json.loads(fresh_read.stdout)['history']['attempts']
+            for original in history.values():
+                subject = original['subject']
+                retained, = [row for row in attempts if row['subject'] == subject and row['role'] == 'development']
+                assert retained['id'] == original['id']
+                old, = original['invocations']
+                current, = [item for item in retained['invocations'] if item['id'] == old['id']]
+                assert all(current[key] == old[key] for key in (
+                    'id', 'attempt', 'subject', 'thread', 'backend_id', 'profile_revision',
+                    'model', 'effort', 'executor', 'epoch', 'deadline_at', 'deadline_seconds'))
+                assert len(retained['invocations']) >= 2
+                assert all(item['thread'] == old['thread'] and item['backend_id'] == old['backend_id']
+                           for item in retained['invocations'])
+                output, = current['outputs']
+                assert output['raw_id'] is None and output['raw_return'] is None and output['exit_code'] is None
+                assert retained['status'] == 'consumed' and retained['result']['result_kind'] == 'development'
+            assert all(kernel.status(subject)['phase'] == 'complete' for subject in before)
+            source = kernel.source_status()
+            assert kernel.status(source['final_subject'])['phase'] == 'approval'
+            assert not select.select([unrelated_fd], [], [], 0)[0]
+            assert not list(record_root(lock).glob('*.json'))
+            for subject in before:
+                current = kernel.status(subject)['budgets']
+                assert set(before[subject]['budgets']) == set(current)
+                review, = [row for row in attempts if row['subject'] == subject and row['role'] == 'review']
+                assert review['purpose'] == history[subject]['purpose']
+                assert review['window'] == before[subject]['budgets'][review['purpose']]['window']
+                assert review['status'] == 'consumed'
+                assert all(check['status'] == 'pass' for check in review['result']['checks'].values())
+                for purpose, old in before[subject]['budgets'].items():
+                    new = current[purpose]
+                    assert new['window'] == old['window']
+                    assert new['developments_used'] == old['developments_used']
+                    assert new['reviews_used'] == old['reviews_used'] + int(purpose == review['purpose'])
+            observations.update(first_public_resume=receipt, after=source,
+                                unrelated_alive_after_resume=True, cleanup_fallback_needed=False)
+        finally:
+            try:
+                # Failure cleanup may disarm first; that path cannot satisfy the
+                # earlier exit-before-disarm assertions or manufacture success.
+                scope.set_active(False)
+            finally:
+                try:
+                    _finish_control_host(child, pins, child_fd=child_fd)
+                finally:
+                    record_property('shared_commit_failure', json.dumps(observations))

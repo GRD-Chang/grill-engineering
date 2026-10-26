@@ -1,5 +1,5 @@
 """Real bounded SQLite faults, not fabricated database/business records."""
-from contextlib import closing, contextmanager
+from contextlib import closing
 from pathlib import Path
 import json
 import os
@@ -18,58 +18,9 @@ from agent_run.runtime.execution import execute
 from support.core_operations import CoreOperations, native_agent_fixture
 from support.offline import fixture_inputs
 from support.workspace import prepare_workspace
+from support.sqlite_faults import sqlite_fault
 
 
-@contextmanager
-def sqlite_fault(monkeypatch, database: Path, fault: str):
-    """Limit only this private database, or interrupt its real COMMIT VM."""
-    connect = sqlite3.connect
-    connections, failures = [], []
-
-    class Connection(sqlite3.Connection):
-        def execute(self, *args, **kwargs):
-            try:
-                return super().execute(*args, **kwargs)
-            except sqlite3.OperationalError as error:
-                failures.append(error)
-                raise
-
-        def commit(self):
-            interrupt = fault == 'commit-interrupt' and self.in_transaction and self.total_changes
-            if interrupt:
-                self.set_progress_handler(lambda: 1, 1)
-            try:
-                return super().commit()
-            except sqlite3.Error as error:
-                failures.append(error)
-                raise
-            finally:
-                if interrupt:
-                    self.set_progress_handler(None, 0)
-
-    def limited(path, *args, **kwargs):
-        if str(path).split('?', 1)[0] not in {str(database), database.as_uri()}:
-            return connect(path, *args, **kwargs)
-        connection = connect(path, *args, factory=Connection, **kwargs)
-        connections.append(connection)
-        try:
-            if fault == 'full' and 'mode=ro' not in str(path):
-                pages = connection.execute('PRAGMA page_count').fetchone()[0]
-                assert connection.execute(f'PRAGMA max_page_count={pages}').fetchone()[0] == pages
-        except BaseException:
-            connection.close()
-            raise
-        return connection
-
-    try:
-        with monkeypatch.context() as patch:
-            patch.setattr(sqlite3, 'connect', limited)
-            yield failures
-    finally:
-        assert connections
-        for connection in connections:
-            with pytest.raises(sqlite3.ProgrammingError, match='closed'):
-                connection.execute('SELECT 1')
 
 
 def logical_state(database: Path):
