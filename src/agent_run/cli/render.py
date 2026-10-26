@@ -328,10 +328,10 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
     yield f"{text('presentation.status.overall_progress', language=document.language)}: {progress}"
     yield f"{copy['duration']}: {data['elapsed_seconds'] if data['elapsed_seconds'] is not None else copy['incomplete']}"
     yield copy["unknown_live"]
+    yield from _notification_lines(document)
     if document.kind == "history":
         yield from _history_lines(document, details)
         return
-    yield from _notification_lines(document)
     for window in data.get("supervision_windows", []):
         target = window["subject"] or copy["global"]
         deadline, zone = _time(window["deadline"])
