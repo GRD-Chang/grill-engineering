@@ -271,3 +271,34 @@ def test_durable_original_raw_is_consumed_before_any_replacement_invocation(tmp_
         row=tx.one('SELECT status,result_id,thread_id FROM attempts WHERE id=?',(original.attempt_id,))
         assert row['status']=='consumed' and row['thread_id']==original.thread_id
         assert tx.get(row['result_id'],original.subject)==raw
+
+
+def test_host_exit_does_not_block_continuation_of_an_already_approved_final_action(tmp_path):
+    scenario=Scenario(tmp_path/'scenario',DeliveryKind.PARENT_ONLY)
+    kernel,host,running,_=managed_run(scenario,tmp_path)
+    assert scenario.run().kind=='approval'
+    assert kernel.control('approve','original-final-grant',subject=scenario.delivery.key,world=scenario.world())=='pending'
+    for _ in range(5):
+        scenario.step()
+        pending=kernel.status(scenario.delivery.key)['pending_write']
+        if pending and pending['operation']=='merge':
+            break
+    assert pending and pending['operation']=='merge'
+    with kernel.storage.transaction(write=False) as tx:
+        grant=tx.one('SELECT grant_id FROM subjects WHERE id=?',(scenario.delivery.key,))[0]
+    assert kernel.observe_host(host,replace(running,disposition='exited',exit_status=137,
+        ended_at=time.time(),usage_released=True))=='exited'
+    assert kernel.status(scenario.delivery.key)['gates']==[]
+    # This is continuation of the existing noncancellable approved Action,
+    # not a new Resume/approval or an implicit replacement grant.
+    replacement=kernel.admit_host('approved-continuation-host',kind='run',command=('controlled-host',),
+        environment_carrier=tmp_path/'approved-carrier',preflight=lambda:None)
+    assert kernel.dispatch_host(replacement)
+    assert kernel.observe_host(replacement,replace(running,unit_name=replacement.unit_name,
+        invocation_id='replacement',main_pid=43,start_token='next-start'))=='running'
+    scenario.execution=Execution(replacement.run_id,replacement.owner,replacement.epoch)
+    assert scenario.run().kind=='complete'
+    with kernel.storage.transaction(write=False) as tx:
+        assert tx.one('SELECT count(*) FROM grants')[0]==1
+        assert tx.one('SELECT action FROM grants WHERE id=?',(grant,))[0]=='original-final-grant'
+        assert tx.one('SELECT status FROM actions WHERE id=\'original-final-grant\'')[0]=='complete'

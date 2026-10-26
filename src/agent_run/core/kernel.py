@@ -2109,6 +2109,7 @@ class Kernel:
             tx.execute("UPDATE hosts SET status=?,observation_id=?,exit_status=?,ended_at=? WHERE run_id=? AND epoch=?",
                        (disposition, material, observation.exit_status if exited else None, observation.ended_at if exited else None, request.run_id, request.epoch))
             if exited:
+                business = tx.one("SELECT stopped,final_action FROM runs")
                 interrupted: set[str] = set()
                 self._host_preparations_exited(tx, Execution(request.run_id, request.owner, request.epoch), {"host_observation": material})
                 for output in tx.all("SELECT o.*,l.subject FROM leases l JOIN invocation_outputs o ON o.lease=l.id WHERE l.executor=? AND l.epoch=?", (request.owner, request.epoch)):
@@ -2127,7 +2128,7 @@ class Kernel:
                                "WHERE s.id=? AND a.current_invocation=? AND a.generation=s.generation",
                                (output["subject"], output["invocation"])):
                         interrupted.add(output["subject"])
-                if not tx.one("SELECT stopped FROM runs")[0]:
+                if not business["stopped"] and business["final_action"] is None:
                     interrupted.update(item["id"] for item in tx.rows(
                         "SELECT s.id FROM subjects s JOIN attempts a ON a.id=s.current_attempt "
                         "JOIN invocations i ON i.id=a.current_invocation WHERE a.generation=s.generation "
@@ -2139,7 +2140,8 @@ class Kernel:
                         "AND e.status IN ('prepared','sent','observed') AND e.operation!='issue_link' "
                         "AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.subject=s.id)", (request.owner, request.epoch)))
                 for subject in sorted(interrupted):
-                    if not tx.rows("SELECT code FROM gates WHERE subject=? AND code='execution_failed'", (subject,)):
+                    if (business["final_action"] is None
+                            and not tx.rows("SELECT code FROM gates WHERE subject=? AND code='execution_failed'", (subject,))):
                         proof = tx.put(subject, "worker_host_exit", wire_json({"host_nonce": request.nonce, "observation": asdict(observation)}))
                         self._gate(tx, subject, "execution_failed", evidence=proof)
                 tx.execute("INSERT OR IGNORE INTO retired_executors VALUES (?,?,?,'exited')", (request.run_id, request.owner, request.epoch))
