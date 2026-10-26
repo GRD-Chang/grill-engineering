@@ -7,6 +7,7 @@ import pytest
 
 from agent_run.cli.main import main
 from agent_run.core.operation_contract import ReadUnavailable
+from agent_run.errors import KernelError
 from agent_run.model import Issue, ParentIssue, Policy, Requirements
 from agent_run.queries import read_facts
 from agent_run.queries.read_facts import QueryError
@@ -89,9 +90,12 @@ def test_sibling_required_checks_still_has_its_original_window_during_preparatio
     scenario.checks[:] = ["pending"]
     kernel, runner = scenario.kernel, scenario.runner()
     held = None
+    observed_roles = set()
     for _ in range(80):
         step = runner.run_once(agent_capacity=1)
         if step.preparation is not None:
+            observed_roles.add(step.preparation.role)
+            assert read(kernel.storage.path, "status").data["supervision_windows"] == []
             if step.subject == "ticket:3":
                 held = step.preparation
             else:
@@ -111,6 +115,7 @@ def test_sibling_required_checks_still_has_its_original_window_during_preparatio
             assert sibling.subject == "ticket:3"
             held = sibling.preparation
     assert held is not None and step.subject == "ticket:2"
+    assert observed_roles == {"development", "review", "publication"}
     with kernel.storage.transaction(write=False) as tx:
         original = dict(tx.one("SELECT * FROM waits WHERE kind='required_checks'"))
     before = _durable(kernel)
@@ -128,6 +133,8 @@ def test_sibling_required_checks_still_has_its_original_window_during_preparatio
 @pytest.mark.parametrize("family,fault", [
     ("preparation", "kind"), ("preparation", "scope_purpose"),
     ("preparation", "scope_owner"), ("preparation", "scope"),
+    ("preparation", "foreign_execution"), ("preparation", "foreign_attempt"),
+    ("preparation", "minimal_scope"),
     ("supervision", "kind"), ("supervision", "preparation_kind"),
     ("supervision", "scope_purpose"), ("supervision", "scope_owner"),
     ("supervision", "scope"), ("supervision", "scope_subject"),
@@ -179,6 +186,12 @@ def test_query_rejects_invalid_typed_wait_reads_without_mutating_records(tmp_pat
                 return {**value, "subject": "fixture-final"}
             if fault == "scope_run":
                 return {**value, "run": "foreign-run"}
+            if fault == "foreign_execution":
+                return {**value, "execution": {**value["execution"], "run_id": "foreign-run"}}
+            if fault == "foreign_attempt":
+                return {**value, "attempt_id": "foreign-attempt"}
+            if fault == "minimal_scope":
+                return {"subject": subject}
         return value
 
     monkeypatch.setattr(read_facts, "all_rows", rows)
@@ -187,4 +200,50 @@ def test_query_rejects_invalid_typed_wait_reads_without_mutating_records(tmp_pat
         read(kernel.storage.path, "status")
     assert rejected.value.code == "incompatible_run_state"
     assert observed == [scope_id]
+    assert _durable(kernel) == before
+
+
+def test_recorded_preparation_remains_readable_after_its_execution_epoch_is_revoked(tmp_path):
+    kernel, runner, _, step, _ = agent_preparation_fixture(tmp_path)
+    request = step.preparation
+    assert request is not None
+    kernel.control("stop", "stop-held-preparation")
+    with kernel.storage.transaction(write=False) as tx:
+        assert tx.one("SELECT epoch FROM runs")[0] != request.execution.epoch
+    with pytest.raises(KernelError):
+        kernel.guard_preparation(request)
+    before = _durable(kernel)
+    document = read(kernel.storage.path, "status")
+    assert document.data["supervision_windows"] == []
+    assert runner.state().preparing == (request.reservation_id,)
+    assert not kernel.worker_settled(request)
+    assert _durable(kernel) == before
+
+
+@pytest.mark.parametrize("repair", ["output-repair", "new-thread"])
+def test_status_preserves_pending_continuation_bindings(tmp_path, repair):
+    kernel, runner, _, first, _ = agent_preparation_fixture(tmp_path)
+    original = prepare_scripted_agent(kernel, first).call
+    assert original is not None
+    kernel.bind_thread(original, "original-worker-thread")
+    raw = (b'{"summary":"missing required result kind"}' if repair == "output-repair" else
+           b'{"result_kind":"human_blocker","summary":null,"human_blockers":["Choose formatting"]}')
+    returned = execute(kernel, original, arguments=[sys.executable, "-I", "-c",
+        f"import sys; sys.stdout.buffer.write({raw!r})"], cwd=tmp_path, prompt="",
+        environment={"PATH": os.defpath}, timeout=5,
+        authorize_source=lambda: runner.authorize_agent(original))
+    assert returned is not None and returned.returncode == 0 and kernel.worker_settled(original)
+    if repair == "new-thread":
+        assert runner.run_once().reason == "human_blocker"
+        kernel.control("resume", "answer-original-attempt", subject=original.subject,
+                       message="Use the original formatting", new_thread=True)
+    pending = runner.run_once().preparation
+    assert pending is not None and pending.attempt_id == original.attempt_id
+    assert (pending.thread_id != original.thread_id) == (repair == "new-thread")
+    if repair == "output-repair":
+        assert pending.mode == repair and pending.output_ordinal == 1
+    before = _durable(kernel)
+    assert read(kernel.storage.path, "status").data["supervision_windows"] == []
+    assert runner.state().preparing == (pending.reservation_id,)
+    assert kernel.status(pending.subject)["budgets"]["requirements"]["developments_used"] == 1
     assert _durable(kernel) == before

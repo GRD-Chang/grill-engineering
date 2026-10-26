@@ -11,6 +11,8 @@ import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from agent_run.model import AgentPreparation, Execution, Purpose, Role
+from agent_run.queries.execution import recorded_profile
 from agent_run.storage.sqlite import Transaction
 
 
@@ -82,9 +84,65 @@ def read_header(tx: Transaction, path: Path | None = None) -> dict[str, Any]:
     return result
 
 
+def _preparation_scope(tx: Transaction, run: Mapping[str, Any], row: Mapping[str, Any], scope: dict[str, Any]) -> None:
+    """Validate the recorded request's identity, without granting current authority."""
+    required = (AgentPreparation.__dataclass_fields__.keys() - {"context", "profile", "preparation_deadline"}) | {
+        "context_id", "previous_invocation", "resume_action", "new_thread", "owned_period", "retained_deadline", "recovery_kind"}
+    invalid = QueryError("incompatible_run_state", "Invalid recorded Agent preparation scope")
+    if not required <= scope.keys() or not isinstance(scope["execution"], dict):
+        raise invalid
+    try:
+        execution = Execution(**scope["execution"])
+        role, purpose = Role(scope["role"]), Purpose(scope["purpose"])
+    except (TypeError, ValueError):
+        raise invalid from None
+    if (execution.run_id != run["id"] or not isinstance(execution.owner, str) or not execution.owner
+            or type(execution.epoch) is not int or execution.epoch < 1
+            or any(not isinstance(scope[key], str) or not scope[key]
+                   for key in ("reservation_id", "attempt_id", "thread_id", "context_id"))
+            or type(scope["new_thread"]) is not bool or type(scope["owned_period"]) is not bool
+            or type(scope["profile_revision"]) is not int or scope["profile_revision"] < 1
+            or type(scope["output_ordinal"]) is not int or scope["output_ordinal"] < 0
+            or type(scope["deadline_seconds"]) not in {int, float}
+            or not math.isfinite(scope["deadline_seconds"]) or scope["deadline_seconds"] <= 0
+            or scope["mode"] not in {"fresh", "resume", "output-repair", "execution-recovery"}
+            or scope["reported_thread"] is not None and (
+                not isinstance(scope["reported_thread"], str) or not scope["reported_thread"])):
+        raise invalid
+    bindings = tx.rows("SELECT a.role,a.purpose,a.thread_id,a.current_invocation,a.resume_action,a.new_thread,"
+                       "s.kind,t.role AS thread_role,t.profile_revision FROM attempts a "
+                       "JOIN subjects s ON s.id=a.subject JOIN threads t ON t.id=? AND t.subject=a.subject "
+                       "JOIN material m ON m.id=? AND m.subject=a.subject AND m.purpose='role_context' "
+                       "WHERE a.id=? AND a.subject=? AND s.run_id=? AND s.current_attempt=a.id",
+                       (scope["thread_id"], scope["context_id"], scope["attempt_id"], row["subject"], run["id"]))
+    if len(bindings) != 1:
+        raise invalid
+    bound = bindings[0]
+    if ((role, purpose) != (bound["role"], bound["purpose"])
+            or scope["previous_invocation"] != bound["current_invocation"]
+            or scope["resume_action"] != bound["resume_action"] or scope["new_thread"] != bool(bound["new_thread"])
+            or not scope["new_thread"] and scope["thread_id"] != bound["thread_id"]
+            or scope["profile_revision"] != bound["profile_revision"]
+            or not (role == bound["thread_role"] or role == Role.PUBLICATION
+                    and bound["thread_role"] == Role.DEVELOPMENT and bound["kind"] != "final_run")):
+        raise invalid
+    profile = recorded_profile(tx, bound["profile_revision"])["profiles"][bound["thread_role"]]
+    if scope["profile_reference"] != profile["reference"]:
+        raise invalid
+    # Stop/failure may already have fenced the original epoch. Its recorded
+    # identity remains readable while cleanup still owns the preparation seat.
+    identity = (execution.run_id, execution.owner, execution.epoch)
+    if not ((run["executor"], run["epoch"]) == (execution.owner, execution.epoch)
+            or tx.rows("SELECT owner FROM retired_executors WHERE run_id=? AND owner=? AND epoch=?", identity)
+            or tx.rows("SELECT owner FROM hosts WHERE run_id=? AND owner=? AND epoch=?", identity)):
+        raise invalid
+    timestamp(row["started_at"])
+    timestamp(row["deadline"])
+
+
 def supervision(tx: Transaction, now: float) -> list[dict[str, Any]]:
     """Read canonical wait scopes; only a recorded Core gate proves timeout."""
-    run = tx.one("SELECT * FROM runs")
+    run = dict(tx.one("SELECT * FROM runs"))
     timeouts: dict[str | None, Any] = {}
     if run["blocked"] == "supervision_timeout":
         paused = tx.rows("SELECT h.material_id,h.subject FROM history h JOIN material m ON m.id=h.material_id "
@@ -112,6 +170,7 @@ def supervision(tx: Transaction, now: float) -> list[dict[str, Any]]:
                 or not preparing and scope.get("run") != run["id"]):
             raise QueryError("incompatible_run_state", "Invalid recorded supervision scope")
         if preparing:
+            _preparation_scope(tx, run, row, scope)
             continue  # An Agent preparation seat is not a GitHub supervision window.
         if row["evidence"] is not None and (row["evidence_purpose"] != "github_read_observation"
                                           or row["evidence_owner"] != row["scope_owner"]):
