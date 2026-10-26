@@ -1,0 +1,169 @@
+"""Explicit opening and repository metadata routing on the one Storage owner.
+
+Public switching is CLOSED. No environment/CLI option changes this constant.
+The staged route accepts only the unactivated marker and exact owned schema;
+public Storage/Kernel/queries continue refusing that marker. Final activation
+requires the complete caller map, explicit Host argv, FIFO and refusal proofs.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+from pathlib import Path
+from typing import Final, Literal, TYPE_CHECKING
+
+from agent_run.contracts.repository import normalize_repository
+from agent_run.contracts.task import TaskKey
+from agent_run.errors import KernelError
+from agent_run.model import Requirements, RunSpec
+from agent_run.storage.sqlite import Storage, Transaction
+from agent_run.storage.tasks import read_repository_task
+
+if TYPE_CHECKING:
+    from agent_run.core.kernel import Kernel
+    from agent_run.core.task_creation import TaskRun
+    from agent_run.queries.run import QueryDocument
+
+
+REPOSITORY_PUBLIC_READY: Final = False
+
+
+def open_run(database: Path, *, run_id: str | None = None) -> Storage:
+    """The public opening seam; no unactivated repository fallback or guessing."""
+    if REPOSITORY_PUBLIC_READY:
+        # Flipping a boolean alone must not activate half the consumer chain.
+        raise KernelError("repository_activation_incomplete")
+    return Storage(database, run_id=run_id) if run_id is not None else Storage(database)
+
+
+@dataclass(frozen=True)
+class TaskLocation:
+    task: TaskKey
+    database: Path
+    current_run: str | None
+
+
+@dataclass(frozen=True)
+class RunLocation:
+    task: TaskKey
+    database: Path
+    run_id: str
+    current: bool
+    created_at: float
+
+
+@dataclass(frozen=True)
+class RunPage:
+    items: tuple[RunLocation, ...]
+    has_more: bool
+    next_after: str | None
+
+
+@dataclass(frozen=True)
+class RepositoryRoute:
+    """INTERNAL staged route from an already validated managed workspace.
+
+    Caller supplies workspace.state_root/'kernel.sqlite3', repository_root and
+    repository from that workspace's trusted metadata, outside any transaction.
+    Missing/read-failed storage never calls initialize implicitly. No method
+    publishes JSON, creates a new proposal ID or rereads personal defaults.
+    """
+    database: Path
+    repository_root: Path
+    repository: str
+
+    def __post_init__(self) -> None:
+        if not self.database.is_absolute() or not self.repository_root.is_absolute():
+            raise ValueError("Exact managed repository paths are required")
+        object.__setattr__(self, "repository_root", self.repository_root.resolve())
+        object.__setattr__(self, "repository", normalize_repository(self.repository))
+
+    def metadata(self) -> Storage:
+        return Storage._repository(self.database,
+            namespace=(self.repository, str(self.repository_root)))
+
+    def initialize(self) -> Storage:
+        """Explicit exclusive initialization only, never a read-error repair."""
+        Storage.create(self.database, _repository=True,
+            _namespace=(self.repository, str(self.repository_root)))
+        return self.metadata()
+
+    def _task(self, task: TaskKey) -> None:
+        if (task.repository, task.workspace) != (self.repository, self.repository_root):
+            raise KernelError("task_location_identity")
+
+    def _location(self, owner: Transaction, run_id: str) -> RunLocation:
+        row = owner.one("SELECT repository,repository_root,parent_issue,created_at FROM runs WHERE id=?", (run_id,))
+        task = TaskKey(Path(row["repository_root"]), row["repository"], row["parent_issue"])
+        self._task(task)
+        task_row = read_repository_task(owner, task)
+        link = owner.one("SELECT task_id FROM task_runs WHERE run_id=?", (run_id,))
+        if task_row is None or link["task_id"] != task.fingerprint:
+            raise KernelError("task_location_identity")
+        created = row["created_at"]
+        if type(created) not in (int, float) or not math.isfinite(created):
+            raise KernelError("run_scope_invalid")
+        return RunLocation(task, self.database, run_id, task_row["current_run"] == run_id, float(created))
+
+    def task(self, task: TaskKey) -> TaskLocation | None:
+        self._task(task)
+        with self.metadata().transaction(write=False) as owner:
+            row = read_repository_task(owner, task)
+            if row is None:
+                return None
+            current = row["current_run"]
+            if current is not None:
+                if type(current) is not str or not current or self._location(owner, current).task != task:
+                    raise KernelError("task_location_identity")
+            return TaskLocation(task, self.database, current)
+
+    def at_run(self, run_id: str) -> Storage:
+        if type(run_id) is not str or not run_id:
+            raise KernelError("run_scope_invalid")
+        metadata = self.metadata()
+        with metadata.transaction(write=False) as owner:
+            self._location(owner, run_id)
+        return metadata.at_run(run_id)
+
+    def kernel(self, run_id: str) -> Kernel:
+        from agent_run.core.kernel import Kernel
+        return Kernel._from_storage(self.at_run(run_id))
+
+    def read(self, run_id: str, kind: Literal["status", "history", "settings"], *,
+             after: int = 0, limit: int | None = None) -> QueryDocument:
+        """A display consumer only; creation/control never parse this projection."""
+        from agent_run.queries.run import read_snapshot
+        if kind not in {"status", "history", "settings"}:
+            raise ValueError("Unknown Run query")
+        with self.at_run(run_id).transaction(write=False) as owner:
+            return read_snapshot(owner, self.database, kind,
+                after=after, limit=limit, expected_run=run_id, expected_repository=self.repository)
+
+    def idle(self, task: TaskKey) -> None:
+        from agent_run.core.task_creation import ensure_idle_task
+        self._task(task)
+        with self.metadata().transaction(ordered=False) as owner:
+            ensure_idle_task(owner, task)
+
+    def create(self, task: TaskKey, spec: RunSpec, requirements: Requirements) -> TaskRun:
+        from agent_run.core.kernel import Kernel
+        from agent_run.core.task_creation import create_repository_task
+        self._task(task)
+        return create_repository_task(Kernel._from_storage(self.metadata()), task, spec, requirements)
+
+    def reconcile(self, task: TaskKey, proposal_run_id: str, *, deadline: float | None = None) -> TaskRun:
+        from agent_run.core.kernel import Kernel
+        from agent_run.core.task_creation import reconcile_repository_task
+        self._task(task)
+        return reconcile_repository_task(Kernel._from_storage(self.metadata()), task,
+            proposal_run_id, deadline=deadline)
+
+    def discover(self, *, after: str = "", limit: int = 128) -> RunPage:
+        if type(after) is not str or type(limit) is not int or not 1 <= limit <= 128:
+            raise KernelError("query_limit")
+        with self.metadata().transaction(write=False) as owner:
+            rows = owner.rows("SELECT id FROM runs WHERE id>? ORDER BY id LIMIT ?", (after, limit), limit=limit)
+            items = tuple(self._location(owner, row["id"]) for row in rows)
+            more = bool(items and owner.rows("SELECT id FROM runs WHERE id>? ORDER BY id LIMIT 1",
+                (items[-1].run_id,), limit=1))
+            return RunPage(items, more, items[-1].run_id if more else None)

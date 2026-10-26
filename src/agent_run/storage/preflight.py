@@ -15,6 +15,7 @@ import stat
 from typing import Iterator
 
 from agent_run.errors import KernelError
+from agent_run.storage.repository_schema import STAGED_REPOSITORY_PROTOCOL, repository_schema_objects
 
 
 PROTOCOL = "independent-delivery-kernel-v21"
@@ -125,7 +126,7 @@ def _protocol(db: sqlite3.Connection, table: str, path: Path) -> str:
     return SOURCE_FENCE_PREFIX + "<fenced>" if protocol.startswith(SOURCE_FENCE_PREFIX) else protocol
 
 
-def require_supported_connection(db: sqlite3.Connection, path: Path) -> str:
+def require_supported_connection(db: sqlite3.Connection, path: Path, *, _repository: bool = False) -> str:
     """The same predicate before opening for writes and under the write lock."""
     try:
         old = db.execute("SELECT 1 FROM sqlite_schema WHERE name='schema_meta'").fetchone()
@@ -135,8 +136,14 @@ def require_supported_connection(db: sqlite3.Connection, path: Path) -> str:
                       "fenced_source" if protocol.startswith(SOURCE_FENCE_PREFIX) else "unknown_protocol")
             raise UnsupportedState(path, reason, protocol)
         protocol = _protocol(db, "meta", path)
-        if protocol != PROTOCOL:
+        expected = STAGED_REPOSITORY_PROTOCOL if _repository else PROTOCOL
+        if protocol != expected:
             raise UnsupportedState(path, "unknown_protocol", protocol)
+        if _repository:
+            objects = db.execute("SELECT type,name,sql FROM sqlite_schema WHERE sql IS NOT NULL AND name NOT GLOB 'sqlite_*'").fetchmany(128)
+            actual = {(row[0], row[1]): row[2] for row in objects}
+            if actual != repository_schema_objects():
+                raise UnsupportedState(path, "uncertain_state", protocol)
         for table, column in (("history", "kind"), ("material", "purpose")):
             kind = db.execute("SELECT type,sql FROM sqlite_schema WHERE name=?", (table,)).fetchall()
             if (len(kind) != 1 or kind[0][0] != "table" or not isinstance(kind[0][1], str)
@@ -153,7 +160,8 @@ def require_supported_connection(db: sqlite3.Connection, path: Path) -> str:
         raise UnsupportedState(path, "uncertain_state") from error
 
 
-def require_supported_state(path: Path, *, timeout: float = 1.0) -> str:
+def require_supported_state(path: Path, *, timeout: float = 1.0, _repository: bool = False) -> str:
     """Return a supported native protocol, otherwise raise a located refusal."""
     with read_state(path, timeout=timeout) as db:
-        return require_supported_connection(db, path)
+        return (require_supported_connection(db, path, _repository=True) if _repository
+                else require_supported_connection(db, path))

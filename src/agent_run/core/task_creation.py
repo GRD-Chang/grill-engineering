@@ -20,6 +20,7 @@ from agent_run.model import CreationInputs, Requirements, RunSpec
 from agent_run.storage.run_scope import RunTransaction
 from agent_run.storage.save_order import WRITE_CONTENTION_SECONDS, remaining
 from agent_run.storage.sqlite import Transaction
+from agent_run.storage.tasks import read_repository_task as _task_row
 
 if TYPE_CHECKING:
     from agent_run.core.kernel import Kernel
@@ -54,17 +55,6 @@ def _writer(owner: Transaction) -> None:
             or [row["name"] for row in task_columns] != ["id", "repository", "repository_root", "parent_issue", "current_run"]
             or [row["name"] for row in link_columns] != ["task_id", "run_id", "repository", "repository_root", "parent_issue"]):
         raise KernelError("task_creation_schema_required")
-
-
-def _task_row(owner: Transaction, task: TaskKey) -> sqlite3.Row | None:
-    rows = owner.rows("SELECT * FROM tasks WHERE id=?", (task.fingerprint,), limit=1)
-    if not rows:
-        return None
-    row = rows[0]
-    if (row["repository"], row["repository_root"], row["parent_issue"]) != (
-            task.repository, str(task.workspace), task.parent_number):
-        raise KernelError("task_location_identity")
-    return row
 
 
 def ensure_idle_task(owner: Transaction, task: TaskKey) -> None:

@@ -35,6 +35,7 @@ from agent_run.errors import KernelError, ObservationSuperseded, bounded_error
 from agent_run.storage.sqlite import CURRENT_LIMIT, Storage, Transaction
 from agent_run.storage.run_scope import RunTransaction, selected_statement, transaction_scope
 from agent_run.storage.run_paths import RunPaths, run_paths
+from agent_run.storage.routing import open_run
 from agent_run.core.attempt_continuation import (AttemptContinuationBasis, ContinuationFacts,
                                    bind_attempt_continuation, load_continuation)
 from agent_run.contracts.policy_values import checkpoint_policy
@@ -54,11 +55,21 @@ class Kernel:
     CLEANUP = ("cleanup_worktree", "cleanup_local_ref", "cleanup_remote_ref")
     ABANDON_EFFECTS = ("inspect_resources", "retire_pr", "reopen_ticket", "recovery_comment", "abandon_worktree")
     REMOTE = ("push", "run_branch", "pr_write", "merge", "completion_comment", "close", "issue_link", "cleanup_remote_ref", "retire_pr", "reopen_ticket", "recovery_comment")
-    def __init__(self, path: Path) -> None:
-        self.storage = Storage(path)
+    def __init__(self, path: Path, *, run_id: str | None = None) -> None:
+        self._attach_storage(open_run(path, run_id=run_id))
+
+    def _attach_storage(self, storage: Storage) -> None:
+        self.storage = storage
         self.clock: Callable[[], float] = time.time
         self._observation: _ObservationPass | None = None
         self._observation_lock = RLock()
+
+    @classmethod
+    def _from_storage(cls, storage: Storage) -> Kernel:
+        """Internal staged route, not a public protocol/CLI activation."""
+        kernel = cls.__new__(cls)
+        kernel._attach_storage(storage)
+        return kernel
 
     def run_paths(self, *, expected_run: str | None = None) -> RunPaths:
         """Derive file locations from selected facts, granting no execution."""
@@ -4289,12 +4300,20 @@ class Kernel:
         with self.storage.transaction(write=False) as tx:
             job = self._job(tx, subject)
             run = tx.one("SELECT * FROM runs WHERE id=?", (job["run_id"],))
-            budgets = tx.rows("SELECT * FROM budgets WHERE subject=? AND current=1", (subject,))
-            pending = None if not job["current_attempt"] else tx.one("SELECT * FROM attempts WHERE id=?", (job["current_attempt"],))
-            observed = tx.rows("SELECT revision FROM issue_facts WHERE issue=?", (job["issue"],))
+            budgets = tx.rows(*selected_statement(tx, 'SELECT * FROM budgets WHERE subject=? AND current=1',
+                          'SELECT * FROM budgets WHERE subject=? AND current=1 AND run_id=?',
+                          (subject,), run_last=True))
+            pending = None if not job["current_attempt"] else tx.one(*selected_statement(tx, 'SELECT * FROM attempts WHERE id=?',
+                                                                  'SELECT * FROM attempts WHERE id=? AND run_id=?',
+                                                                  (job["current_attempt"],), run_last=True))
+            observed = tx.rows(*selected_statement(tx, 'SELECT revision FROM issue_facts WHERE issue=?',
+                           'SELECT revision FROM issue_facts WHERE issue=? AND run_id=?',
+                           (job["issue"],), run_last=True))
             reviewed_checkout = None
             if job["review_attempt"]:
-                original = tx.one("SELECT context_id FROM attempts WHERE id=?", (job["review_attempt"],))[0]
+                original = tx.one(*selected_statement(tx, 'SELECT context_id FROM attempts WHERE id=?',
+                               'SELECT context_id FROM attempts WHERE id=? AND run_id=?',
+                               (job["review_attempt"],), run_last=True))[0]
                 reviewed_checkout = json.loads(tx.get(original, subject))["checkout"]
             return {
                 "subject": subject, "kind": job["kind"], "phase": job["phase"], "purpose": job["purpose"],
@@ -4315,9 +4334,15 @@ class Kernel:
                 else {"operation": effect["operation"], "status": effect["status"], "id": effect["id"]},
                 "budgets": {row["purpose"]: {**{key: row[key] for key in ("window", "developments_used", "reviews_used", "development_limit", "review_limit")},
                                            "review_required": bool(row["review_required"])} for row in budgets},
-                "resource_cleanup": next((dict(row) for row in tx.rows("SELECT * FROM resource_cleanup WHERE subject=? AND generation=?", (subject, job["generation"]))), None),
-                "issue_link": next((dict(row) for row in tx.rows("SELECT * FROM issue_links WHERE subject=?", (subject,))), None),
-                "retired_generations": [dict(row) for row in tx.all("SELECT * FROM retired_generations WHERE subject=? ORDER BY generation", (subject,))],
+                "resource_cleanup": next((dict(row) for row in tx.rows(*selected_statement(tx, 'SELECT * FROM resource_cleanup WHERE subject=? AND generation=?',
+                                                                   'SELECT * FROM resource_cleanup WHERE subject=? AND generation=? AND run_id=?',
+                                                                   (subject, job["generation"]), run_last=True))), None),
+                "issue_link": next((dict(row) for row in tx.rows(*selected_statement(tx, 'SELECT * FROM issue_links WHERE subject=?',
+                                                             'SELECT * FROM issue_links WHERE subject=? AND run_id=?',
+                                                             (subject,), run_last=True))), None),
+                "retired_generations": [dict(row) for row in tx.all(*selected_statement(tx, 'SELECT * FROM retired_generations WHERE subject=? ORDER BY generation',
+                                                                 'SELECT * FROM retired_generations WHERE subject=? AND run_id=? ORDER BY generation',
+                                                                 (subject,), run_last=True))],
             }
 
     def history(self, subject: str, *, after: int = 0, limit: int = 128) -> list[dict[str, Any]]:
@@ -4325,7 +4350,9 @@ class Kernel:
             raise KernelError("query_limit")
         with self.storage.transaction(write=False) as tx:
             self._job(tx, subject)
-            rows = tx.rows("SELECT * FROM history WHERE subject=? AND position>? ORDER BY position LIMIT ?", (subject, after, limit))
+            rows = tx.rows(*selected_statement(tx, 'SELECT * FROM history WHERE subject=? AND position>? ORDER BY position LIMIT ?',
+                       'SELECT * FROM history WHERE run_id=? AND subject=? AND position>? ORDER BY position LIMIT ?',
+                       (subject, after, limit), run_last=False))
             return [dict(row) for row in rows]
 
     def _owned(self, tx: Transaction, subject: str, execution: Execution) -> tuple[sqlite3.Row, sqlite3.Row]:

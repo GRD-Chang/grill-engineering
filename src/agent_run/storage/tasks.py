@@ -5,15 +5,31 @@ from contextlib import contextmanager
 import fcntl
 import json
 import os
+import sqlite3
 from pathlib import Path
 import tempfile
-from typing import Callable, Iterator
+from typing import TYPE_CHECKING, Callable, Iterator
 
 from agent_run.config.paths import app_data_root
 from agent_run.contracts.task import TaskKey
 
 from agent_run.errors import KernelError
 from agent_run.model import wire_json
+
+if TYPE_CHECKING:
+    from agent_run.storage.sqlite import Transaction
+
+
+def read_repository_task(owner: "Transaction", task: TaskKey) -> sqlite3.Row | None:
+    """Canonical staged Task metadata, without JSON publication or Run inference."""
+    rows = owner.rows("SELECT * FROM tasks WHERE id=?", (task.fingerprint,), limit=1)
+    if not rows:
+        return None
+    row = rows[0]
+    if (row["repository"], row["repository_root"], row["parent_issue"]) != (
+            task.repository, str(task.workspace), task.parent_number):
+        raise KernelError("task_location_identity")
+    return row
 
 
 def task_path(task: TaskKey) -> Path:

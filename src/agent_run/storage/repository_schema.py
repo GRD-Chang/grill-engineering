@@ -1,11 +1,15 @@
 """Staged Run-owned relations for the repository database transition.
 
-Not selected by Storage.create, protocol discovery, CLI or Host launch. The
+Not selected by public Storage admission, protocol discovery, CLI or Host launch. The
 current protocol remains untouched until all Run consumers, Task publication
 and per-Run artifacts have moved together. This definition will replace the
 existing schema at that single activation point, never run beside it as a
 second writable authority or serve as an old-protocol migration path.
 """
+
+# Development-only admission marker, never accepted by the public protocol.
+# Final protocol selection waits all producers/consumers and refusal gates.
+STAGED_REPOSITORY_PROTOCOL = "independent-delivery-repository-unactivated"
 
 REPOSITORY_RUN_SCHEMA = """
 CREATE TABLE meta (protocol TEXT NOT NULL);
@@ -681,3 +685,52 @@ CREATE TABLE task_runs (
   REFERENCES runs(id,repository,repository_root,parent_issue)
 );
 """
+
+
+REPOSITORY_ROUTING_SCHEMA = """
+CREATE TABLE repository_binding (
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+ repository TEXT NOT NULL,
+ repository_root TEXT NOT NULL
+);
+CREATE TRIGGER repository_binding_single_insert BEFORE INSERT ON repository_binding
+WHEN EXISTS (SELECT 1 FROM repository_binding)
+BEGIN SELECT RAISE(ABORT,'repository binding is immutable'); END;
+CREATE TRIGGER repository_binding_immutable_update BEFORE UPDATE ON repository_binding
+BEGIN SELECT RAISE(ABORT,'repository binding is immutable'); END;
+CREATE TRIGGER repository_binding_immutable_delete BEFORE DELETE ON repository_binding
+BEGIN SELECT RAISE(ABORT,'repository binding is immutable'); END;
+CREATE TRIGGER repository_run_insert BEFORE INSERT ON runs
+WHEN NOT EXISTS (SELECT 1 FROM repository_binding WHERE singleton=1 AND repository=NEW.repository AND repository_root=NEW.repository_root)
+BEGIN SELECT RAISE(ABORT,'repository namespace mismatch'); END;
+CREATE TRIGGER repository_run_update BEFORE UPDATE OF repository,repository_root ON runs
+WHEN NOT EXISTS (SELECT 1 FROM repository_binding WHERE singleton=1 AND repository=NEW.repository AND repository_root=NEW.repository_root)
+BEGIN SELECT RAISE(ABORT,'repository namespace mismatch'); END;
+CREATE TRIGGER repository_task_insert BEFORE INSERT ON tasks
+WHEN NOT EXISTS (SELECT 1 FROM repository_binding WHERE singleton=1 AND repository=NEW.repository AND repository_root=NEW.repository_root)
+BEGIN SELECT RAISE(ABORT,'repository namespace mismatch'); END;
+CREATE TRIGGER repository_task_update BEFORE UPDATE OF repository,repository_root ON tasks
+WHEN NOT EXISTS (SELECT 1 FROM repository_binding WHERE singleton=1 AND repository=NEW.repository AND repository_root=NEW.repository_root)
+BEGIN SELECT RAISE(ABORT,'repository namespace mismatch'); END;
+"""
+
+
+def repository_schema_objects() -> dict[tuple[str, str], str]:
+    """Exact owned DDL for staged admission; parse only, never execute a model."""
+    import re
+    import sqlite3
+    result: dict[tuple[str, str], str] = {}
+    statement = ""
+    for line in (REPOSITORY_RUN_SCHEMA + REPOSITORY_TASK_SCHEMA + REPOSITORY_ROUTING_SCHEMA).splitlines(keepends=True):
+        statement += line
+        if not sqlite3.complete_statement(statement):
+            continue
+        sql = statement.strip().removesuffix(";").strip()
+        match = re.fullmatch(r"CREATE (?:UNIQUE )?(TABLE|INDEX|TRIGGER) (\w+)[\s\S]*", sql)
+        if match is None:
+            raise RuntimeError("Unrecognized staged schema declaration")
+        result[(match[1].lower(), match[2])] = sql
+        statement = ""
+    if statement.strip():
+        raise RuntimeError("Incomplete staged schema declaration")
+    return result

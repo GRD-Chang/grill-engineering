@@ -340,17 +340,28 @@ class Transaction:
 
 
 class Storage:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, run_id: str | None = None, _repository: bool = False,
+                 _namespace: tuple[str, str] | None = None) -> None:
         require_wal_runtime()
+        if run_id is not None and (type(run_id) is not str or not run_id):
+            raise KernelError("run_scope_invalid")
         self.path = path
+        self._run_id = run_id
+        self._repository_mode = _repository
+        if _namespace is not None and not _repository:
+            raise KernelError("repository_namespace_required")
+        self._namespace = _namespace
         if not path.is_file():
             raise KernelError("missing_database", str(path))
         with self.transaction(write=False):
             pass
 
     @classmethod
-    def create(cls, path: Path) -> Storage:
+    def create(cls, path: Path, *, _repository: bool = False,
+               _namespace: tuple[str, str] | None = None) -> Storage:
         require_wal_runtime()
+        if (_repository and _namespace is None) or (_namespace is not None and not _repository):
+            raise KernelError("repository_namespace_required")
         if any(Path(str(path) + suffix).exists() or Path(str(path) + suffix).is_symlink()
                for suffix in ("-wal", "-shm", "-journal")):
             raise UnsupportedState(path, "uncertain_state")
@@ -363,15 +374,49 @@ class Storage:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=FULL")
             connection.execute("PRAGMA foreign_keys=ON")
-            connection.executescript("BEGIN IMMEDIATE;\n" + SCHEMA)
-            connection.execute("INSERT INTO meta VALUES (?)", (PROTOCOL,))
+            if _repository:
+                from agent_run.storage.repository_schema import (
+                    REPOSITORY_RUN_SCHEMA, REPOSITORY_TASK_SCHEMA, REPOSITORY_ROUTING_SCHEMA, STAGED_REPOSITORY_PROTOCOL,
+                )
+                schema = REPOSITORY_RUN_SCHEMA + REPOSITORY_TASK_SCHEMA + REPOSITORY_ROUTING_SCHEMA
+                protocol = STAGED_REPOSITORY_PROTOCOL
+            else:
+                schema, protocol = SCHEMA, PROTOCOL
+            connection.executescript("BEGIN IMMEDIATE;\n" + schema)
+            connection.execute("INSERT INTO meta VALUES (?)", (protocol,))
+            if _repository:
+                assert _namespace is not None
+                connection.execute("INSERT INTO repository_binding VALUES (1,?,?)", _namespace)
             connection.commit()
         except BaseException:
             connection.rollback()
             raise
         finally:
             connection.close()
-        return cls(path)
+        return cls(path, _repository=True, _namespace=_namespace) if _repository else cls(path)
+
+    @classmethod
+    def _repository(cls, path: Path, *, run_id: str | None = None,
+                    namespace: tuple[str, str] | None = None) -> Storage:
+        """Internal staged opening only; public admission still rejects its marker."""
+        return cls(path, run_id=run_id, _repository=True, _namespace=namespace)
+
+    @property
+    def run_id(self) -> str | None:
+        return self._run_id
+
+    def at_run(self, run_id: str) -> Storage:
+        """Select explicitly without mutating this handle or guessing current work."""
+        return type(self)(self.path, run_id=run_id, _repository=self._repository_mode, _namespace=self._namespace)
+
+    def _require_namespace(self, owner: Transaction) -> None:
+        if not self._repository_mode:
+            return
+        # One immutable file namespace, not work state, a locator or a scan of
+        # every historical Run. Canonical SQL constraints enforce row ownership.
+        row = owner.one("SELECT singleton,repository,repository_root FROM repository_binding")
+        if row[0] != 1 or self._namespace is not None and (row[1], row[2]) != self._namespace:
+            raise KernelError("repository_namespace_changed")
 
     @contextmanager
     def transaction(self, *, write: bool = True, ordered: bool = True,
@@ -387,7 +432,10 @@ class Storage:
             if write:
                 identity = scopes.enter_context(save_turn(self.path, ordered=ordered,
                     deadline=deadline, cancelled=cancelled))
-                require_supported_state(self.path, timeout=remaining(deadline))
+                if self._repository_mode:
+                    require_supported_state(self.path, timeout=remaining(deadline), _repository=True)
+                else:
+                    require_supported_state(self.path, timeout=remaining(deadline))
                 if database_identity(self.path) != identity:
                     raise UnsupportedState(self.path, "uncertain_state")
             scope = (closing(sqlite3.connect(self.path.absolute().as_uri() + "?mode=rw", uri=True,
@@ -406,18 +454,33 @@ class Storage:
                     connection.execute("BEGIN IMMEDIATE")
                     if database_identity(self.path) != identity:
                         raise UnsupportedState(self.path, "uncertain_state")
-                require_supported_connection(connection, self.path)
+                if self._repository_mode:
+                    require_supported_connection(connection, self.path, _repository=True)
+                else:
+                    require_supported_connection(connection, self.path)
                 self._capacity(connection)
+                self._require_namespace(transaction)
+                exposed = transaction
+                if self._repository_mode and self._run_id is not None:
+                    from agent_run.storage.run_scope import RunTransaction
+                    exposed = RunTransaction(transaction, self._run_id)
+                elif self._run_id is not None:
+                    if transaction.one("SELECT id FROM runs")[0] != self._run_id:
+                        raise KernelError("run_scope_changed")
                 if write:
                     check_cancelled(cancelled)
                     remaining(deadline)
-                yield transaction
+                yield exposed
                 if transaction.failed:
                     raise KernelError("transaction_aborted", "a caught SQL failure poisoned this transaction")
                 if write:
                     if database_identity(self.path) != identity:
                         raise UnsupportedState(self.path, "uncertain_state")
-                    require_supported_connection(connection, self.path)
+                    if self._repository_mode:
+                        require_supported_connection(connection, self.path, _repository=True)
+                    else:
+                        require_supported_connection(connection, self.path)
+                    self._require_namespace(transaction)
                 self._capacity(connection, committing=write)
                 connection.commit()
             except BaseException as error:

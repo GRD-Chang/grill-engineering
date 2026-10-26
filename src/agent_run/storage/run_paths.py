@@ -21,6 +21,17 @@ class RunPaths:
     journal_root: Path
     host_partition: str | None
 
+    @classmethod
+    def for_run(cls, database: Path, run_id: str, *, repository_layout: bool) -> "RunPaths":
+        """Pure projection; callers supply an already validated header identity."""
+        if type(run_id) is not str or not run_id:
+            raise KernelError("run_path_binding")
+        root = database.absolute().parent
+        if not repository_layout:
+            return cls(run_id, root, root, None)
+        partition = hashlib.sha256(run_id.encode("utf-8")).hexdigest()
+        return cls(run_id, root / "runs" / partition, root, partition)
+
 
 def run_paths(owner: Transaction, database: Path, *, expected_run: str | None = None) -> RunPaths:
     selected = transaction_scope(owner)
@@ -29,10 +40,4 @@ def run_paths(owner: Transaction, database: Path, *, expected_run: str | None = 
     run_id = row["id"]
     if type(run_id) is not str or not run_id or expected_run is not None and run_id != expected_run:
         raise KernelError("run_path_binding")
-    root = database.absolute().parent
-    if selected is None:
-        # Preserve the current per-Run artifact layout after reading its exact
-        # single header; the directory name is never interpreted as an identity.
-        return RunPaths(run_id, root, root, None)
-    partition = hashlib.sha256(run_id.encode("utf-8")).hexdigest()
-    return RunPaths(run_id, root / "runs" / partition, root, partition)
+    return RunPaths.for_run(database, run_id, repository_layout=selected is not None)

@@ -20,7 +20,8 @@ from agent_run.errors import AgentProfileError
 from agent_run.model import AgentPreparation, Execution, Purpose, Role, artifact, review_outcome
 from agent_run.queries.execution import recorded_profile
 from agent_run.storage.sqlite import Transaction
-from agent_run.storage.run_scope import selected_statement, transaction_scope
+from agent_run.storage.run_scope import RunTransaction, selected_statement, transaction_scope
+from agent_run.storage.run_paths import RunPaths
 from agent_run.contracts.copy import text
 
 
@@ -167,7 +168,9 @@ def read_header(tx: Transaction, path: Path | None = None) -> dict[str, Any]:
             "phases": phases, "is_terminal": terminal, "abandonment": abandonment,
             "stopped": bool(run["stopped"]), "blocked": run["blocked"]}
     if path is not None:
-        result.update(state_dir=str(path.parent), database=str(path))
+        locations = RunPaths.for_run(path, run["id"], repository_layout=isinstance(tx, RunTransaction))
+        result.update(state_dir=str(locations.artifacts) if isinstance(tx, RunTransaction) else str(path.parent),
+                      database=str(path))
     return result
 
 
