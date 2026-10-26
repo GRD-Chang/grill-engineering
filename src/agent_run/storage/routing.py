@@ -20,6 +20,7 @@ from agent_run.storage.sqlite import Storage, Transaction
 from agent_run.storage.tasks import read_repository_task
 
 if TYPE_CHECKING:
+    from agent_run.adapters.workspace import ManagedWorkspace
     from agent_run.core.kernel import Kernel
     from agent_run.core.task_creation import TaskRun
     from agent_run.queries.run import QueryDocument
@@ -28,8 +29,17 @@ if TYPE_CHECKING:
 REPOSITORY_PUBLIC_READY: Final = False
 
 
-def open_run(database: Path, *, run_id: str | None = None) -> Storage:
-    """The public opening seam; no unactivated repository fallback or guessing."""
+def open_run(database: Path, *, run_id: str | None = None, storage: Storage | None = None) -> Storage:
+    """Open publicly, or carry an explicit existing internal selection unchanged.
+
+    Supplying an owned handle is not protocol discovery or an activation flag.
+    It must name this exact database/Run; callers never substitute a root handle
+    after failure. A staged handle is supplied only by RepositoryRoute.at_run.
+    """
+    if storage is not None:
+        if storage.path.absolute() != database.absolute() or run_id is not None and storage.run_id != run_id:
+            raise KernelError("run_scope_changed")
+        return storage
     if REPOSITORY_PUBLIC_READY:
         # Flipping a boolean alone must not activate half the consumer chain.
         raise KernelError("repository_activation_incomplete")
@@ -71,6 +81,11 @@ class RepositoryRoute:
     database: Path
     repository_root: Path
     repository: str
+
+    @classmethod
+    def for_workspace(cls, workspace: ManagedWorkspace) -> RepositoryRoute:
+        """Canonical assembly from trusted workspace metadata, not directory discovery."""
+        return cls(workspace.state_root / "kernel.sqlite3", workspace.repository_root, workspace.repository)
 
     def __post_init__(self) -> None:
         if not self.database.is_absolute() or not self.repository_root.is_absolute():
@@ -128,6 +143,28 @@ class RepositoryRoute:
     def kernel(self, run_id: str) -> Kernel:
         from agent_run.core.kernel import Kernel
         return Kernel._from_storage(self.at_run(run_id))
+
+    def open_task(self, task: TaskKey) -> Kernel | None:
+        """The existing replaceability predicate in one canonical metadata snapshot.
+
+        This observation neither binds nor replaces. Atomic create rechecks the
+        pointer and predicate in its original writer after external preparation.
+        Missing/unreadable database or incomplete facts do not mean new work.
+        """
+        from agent_run.core.kernel import Kernel
+        from agent_run.storage.run_scope import RunTransaction
+        self._task(task)
+        metadata = self.metadata()
+        with metadata.transaction(write=False) as owner:
+            row = read_repository_task(owner, task)
+            if row is None or row["current_run"] is None:
+                return None
+            run_id = row["current_run"]
+            if self._location(owner, run_id).task != task:
+                raise KernelError("task_location_identity")
+            if Kernel._from_storage(metadata)._replaceable_in(RunTransaction(owner, run_id), task, run_id):
+                return None
+        return Kernel._from_storage(metadata.at_run(run_id))
 
     def read(self, run_id: str, kind: Literal["status", "history", "settings"], *,
              after: int = 0, limit: int | None = None) -> QueryDocument:

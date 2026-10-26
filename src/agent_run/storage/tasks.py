@@ -32,6 +32,29 @@ def read_repository_task(owner: "Transaction", task: TaskKey) -> sqlite3.Row | N
     return row
 
 
+def run_is_current(owner: "Transaction", database: Path) -> bool:
+    """Recheck publication from facts in the original selected snapshot.
+
+    The current protocol's existing locator is unchanged until the one-way
+    switch. Repository mode uses only its canonical Task and Run relations;
+    displayed status, directory names and external notices never choose a Run.
+    """
+    from agent_run.storage.run_scope import selected_statement, transaction_scope
+    selected = transaction_scope(owner)
+    run = owner.one(*selected_statement(owner, "SELECT id,repository,repository_root,parent_issue FROM runs",
+        "SELECT id,repository,repository_root,parent_issue FROM runs WHERE id=?"))
+    task = TaskKey(Path(run["repository_root"]), run["repository"], run["parent_issue"])
+    if selected is None:
+        return read_task(task_path(task)) == (run["id"], database)
+    row = read_repository_task(owner, task)
+    links = owner.rows("SELECT task_id,repository,repository_root,parent_issue FROM task_runs WHERE run_id=?",
+        (selected.run_id,), limit=1)
+    if (row is None or len(links) != 1
+            or tuple(links[0]) != (task.fingerprint, task.repository, str(task.workspace), task.parent_number)):
+        raise KernelError("task_location_identity")
+    return row["current_run"] == selected.run_id
+
+
 def task_path(task: TaskKey) -> Path:
     """Name the existing identity pointer without creating any directory."""
     return app_data_root() / "native-task-locations" / (task.fingerprint + ".json")

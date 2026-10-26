@@ -7,13 +7,16 @@ from pathlib import Path
 import time
 from typing import Any
 
+from agent_run.storage.run_scope import selected_statement, transaction_scope
 from agent_run.notifications.envelope import event_copy, event_envelope
 from agent_run.contracts.copy import selected_language, text
 from agent_run.contracts.repository import same_repository
 
 from agent_run.queries.execution import execution_facts, worker_activity_start
 from agent_run.queries.read_facts import read_boundaries
-from agent_run.storage.sqlite import Transaction
+from agent_run.storage.sqlite import Storage, Transaction
+from agent_run.storage.routing import open_run
+from agent_run.errors import KernelError
 from agent_run.queries.read_facts import action_guidance
 from agent_run.queries.resume_facts import resume_facts
 
@@ -32,9 +35,10 @@ class EventProjection:
 
 
 def event_state(tx: Transaction) -> dict[str, Any]:
-    run = tx.one("SELECT id,repository,parent_issue,parent_revision,language,created_at FROM runs")
-    title = tx.rows("SELECT title FROM requirement_versions WHERE issue=? AND revision=?",
-                    (run["parent_issue"], run["parent_revision"]))
+    run = tx.one(*selected_statement(tx, 'SELECT id,repository,parent_issue,parent_revision,language,created_at FROM runs',
+              'SELECT id,repository,parent_issue,parent_revision,language,created_at FROM runs WHERE id=?', ()))
+    title = tx.rows(*selected_statement(tx, 'SELECT title FROM requirement_versions WHERE issue=? AND revision=?',
+                'SELECT title FROM requirement_versions WHERE run_id=? AND issue=? AND revision=?', (run["parent_issue"], run["parent_revision"])))
     return {"run_id": run["id"], "repository": run["repository"],
             "parent": {"number": run["parent_issue"], "title": title[0][0] if title else ""},
             "language": run["language"], "created_at": run["created_at"]}
@@ -67,24 +71,16 @@ def completion_context(view: Mapping[str, Any], state: dict[str, Any]) -> dict[s
 
 
 def _live_attempt(tx: Transaction, subject: str, generation: int, attempt: str) -> bool:
-    return bool(tx.rows("SELECT a.id FROM subjects s JOIN runs r ON r.id=s.run_id JOIN attempts a ON a.id=s.current_attempt "
-                        "JOIN invocations i ON i.id=a.current_invocation JOIN leases l ON l.invocation=i.id "
-                        "JOIN invocation_outputs o ON o.invocation=i.id AND o.lease=l.id "
-                        "WHERE s.id=? AND s.generation=? AND a.id=? AND a.result_id IS NULL "
-                        "AND r.stopped=0 AND r.blocked IS NULL AND r.executor=i.executor AND r.epoch=i.epoch "
-                        "AND NOT EXISTS (SELECT 1 FROM gates WHERE subject=s.id) "
-                        "AND o.ordinal=(SELECT max(ordinal) FROM invocation_outputs WHERE invocation=i.id) "
-                        "AND o.dispatch_state='started' AND o.process_identity IS NOT NULL "
-                        "AND o.started_at IS NOT NULL AND o.exited_at IS NULL",
-                        (subject, generation, attempt)))
+    return bool(tx.rows(*selected_statement(tx, "SELECT a.id FROM subjects s JOIN runs r ON r.id=s.run_id JOIN attempts a ON a.id=s.current_attempt JOIN invocations i ON i.id=a.current_invocation JOIN leases l ON l.invocation=i.id JOIN invocation_outputs o ON o.invocation=i.id AND o.lease=l.id WHERE s.id=? AND s.generation=? AND a.id=? AND a.result_id IS NULL AND r.stopped=0 AND r.blocked IS NULL AND r.executor=i.executor AND r.epoch=i.epoch AND NOT EXISTS (SELECT 1 FROM gates WHERE subject=s.id) AND o.ordinal=(SELECT max(ordinal) FROM invocation_outputs WHERE invocation=i.id) AND o.dispatch_state='started' AND o.process_identity IS NOT NULL AND o.started_at IS NOT NULL AND o.exited_at IS NULL",
+                    "SELECT a.id FROM subjects s JOIN runs r ON r.id=s.run_id JOIN attempts a ON a.run_id=s.run_id AND a.id=s.current_attempt JOIN invocations i ON i.run_id=a.run_id AND i.id=a.current_invocation JOIN leases l ON l.run_id=i.run_id AND l.invocation=i.id JOIN invocation_outputs o ON o.run_id=i.run_id AND o.invocation=i.id AND o.lease=l.id WHERE s.run_id=? AND s.id=? AND s.generation=? AND a.id=? AND a.result_id IS NULL AND r.stopped=0 AND r.blocked IS NULL AND r.executor=i.executor AND r.epoch=i.epoch AND NOT EXISTS (SELECT 1 FROM gates WHERE run_id=s.run_id AND subject=s.id) AND o.ordinal=(SELECT max(ordinal) FROM invocation_outputs WHERE run_id=i.run_id AND invocation=i.id) AND o.dispatch_state='started' AND o.process_identity IS NOT NULL AND o.started_at IS NOT NULL AND o.exited_at IS NULL", (subject, generation, attempt))))
 
 
 def _subject_facts(tx: Transaction, subject: Mapping[str, Any], revision: str,
                    state: dict[str, Any]) -> dict[str, Any]:
     if subject["kind"] != "ticket":
         return {}
-    title = tx.rows("SELECT title FROM requirement_versions WHERE issue=? AND revision=?",
-                    (subject["issue"], revision))
+    title = tx.rows(*selected_statement(tx, 'SELECT title FROM requirement_versions WHERE issue=? AND revision=?',
+                'SELECT title FROM requirement_versions WHERE run_id=? AND issue=? AND revision=?', (subject["issue"], revision)))
     return {"task_number": subject["issue"], "task_title": title[0][0] if title else f"#{subject['issue']}",
             "url": f"https://github.com/{state['repository']}/issues/{subject['issue']}"}
 
@@ -139,10 +135,8 @@ def _started(tx: Transaction, row: Mapping[str, Any], subject: Mapping[str, Any]
 
 
 def _first_repair(tx: Transaction, subject: str) -> dict[str, Any] | None:
-    rows = tx.rows("SELECT h.position,h.generation,h.material_id,h.identity FROM history h JOIN attempts a ON a.id=h.identity "
-                   "WHERE h.subject=? AND a.subject=h.subject AND a.generation=h.generation "
-                   "AND h.kind='role_consumed' AND h.phase='development' AND h.purpose='integration' "
-                   "AND a.role='review' AND a.outcome='fail' ORDER BY h.position LIMIT 1", (subject,))
+    rows = tx.rows(*selected_statement(tx, "SELECT h.position,h.generation,h.material_id,h.identity FROM history h JOIN attempts a ON a.id=h.identity WHERE h.subject=? AND a.subject=h.subject AND a.generation=h.generation AND h.kind='role_consumed' AND h.phase='development' AND h.purpose='integration' AND a.role='review' AND a.outcome='fail' ORDER BY h.position LIMIT 1",
+               "SELECT h.position,h.generation,h.material_id,h.identity FROM history h JOIN attempts a ON a.run_id=h.run_id AND a.id=h.identity WHERE h.run_id=? AND h.subject=? AND a.subject=h.subject AND a.generation=h.generation AND h.kind='role_consumed' AND h.phase='development' AND h.purpose='integration' AND a.role='review' AND a.outcome='fail' ORDER BY h.position LIMIT 1", (subject,)))
     return dict(rows[0]) if rows else None
 
 
@@ -150,9 +144,8 @@ def _repair_event(tx: Transaction, subject: Mapping[str, Any], state: dict[str, 
                   failure: Mapping[str, Any], attempt_id: str | None = None) -> EventProjection:
     applicable = (subject["generation"] == failure["generation"]
                   and subject["repair_source"] in {"acceptance", "integration"}
-                  and subject["last_failure"] == failure["material_id"] and not tx.rows(
-                      "SELECT position FROM history WHERE subject=? AND generation=? AND kind='acceptance_promoted' AND position>? LIMIT 1",
-                      (subject["id"], failure["generation"], failure["position"])))
+                  and subject["last_failure"] == failure["material_id"] and not tx.rows(*selected_statement(tx, "SELECT position FROM history WHERE subject=? AND generation=? AND kind='acceptance_promoted' AND position>? LIMIT 1",
+                                                                                    "SELECT position FROM history WHERE run_id=? AND subject=? AND generation=? AND kind='acceptance_promoted' AND position>? LIMIT 1", (subject["id"], failure["generation"], failure["position"]))))
     return EventProjection(event_envelope(state, "acceptance_repair", state["run_id"],
                           event_copy(state, "acceptance_repair_active" if live else "acceptance_repair_planned"),
                           "orange", live=live, work_subject=subject["id"], generation=failure["generation"],
@@ -162,8 +155,8 @@ def _repair_event(tx: Transaction, subject: Mapping[str, Any], state: dict[str, 
 
 def _consumed(tx: Transaction, row: Mapping[str, Any], subject: Mapping[str, Any],
               state: dict[str, Any], mode: str) -> list[EventProjection]:
-    attempt = dict(tx.one("SELECT * FROM attempts WHERE id=? AND subject=? AND generation=? AND result_id=?",
-                          (row["identity"], row["subject"], row["generation"], row["material_id"])))
+    attempt = dict(tx.one(*selected_statement(tx, 'SELECT * FROM attempts WHERE id=? AND subject=? AND generation=? AND result_id=?',
+                       'SELECT * FROM attempts WHERE run_id=? AND id=? AND subject=? AND generation=? AND result_id=?', (row["identity"], row["subject"], row["generation"], row["material_id"]))))
     if subject["kind"] == "final_run":
         failed = _first_repair(tx, row["subject"])
         if failed is not None and failed["position"] == row["position"]:
@@ -173,9 +166,8 @@ def _consumed(tx: Transaction, row: Mapping[str, Any], subject: Mapping[str, Any
     role = attempt["role"]
     # A formal promotion is a separate committed fact. Its milestone replaces
     # this same Review result when both are visible in the original snapshot.
-    promoted = role == "review" and bool(tx.rows("SELECT position FROM history WHERE subject=? AND generation=? "
-                                                "AND kind='acceptance_promoted' AND identity=? LIMIT 1",
-                                                (row["subject"], row["generation"], attempt["id"])))
+    promoted = role == "review" and bool(tx.rows(*selected_statement(tx, "SELECT position FROM history WHERE subject=? AND generation=? AND kind='acceptance_promoted' AND identity=? LIMIT 1",
+                                             "SELECT position FROM history WHERE run_id=? AND subject=? AND generation=? AND kind='acceptance_promoted' AND identity=? LIMIT 1", (row["subject"], row["generation"], attempt["id"]))))
     return _result(tx, row, subject, state, attempt, human=False, visible=not promoted)
 
 
@@ -185,11 +177,8 @@ def _human(tx: Transaction, row: Mapping[str, Any], subject: Mapping[str, Any],
         return []
     # Resume can clear result_id and replace current_invocation. The original
     # allocation preceding this gate binds its own validated material forever.
-    attempt = dict(tx.one("SELECT a.* FROM history h JOIN invocations i ON i.id=h.identity "
-                          "JOIN attempts a ON a.id=i.attempt JOIN invocation_outputs o ON o.invocation=i.id "
-                          "WHERE h.subject=? AND h.generation=? AND a.subject=h.subject AND a.generation=h.generation "
-                          "AND o.raw_id=? AND h.kind='agent_allocated' AND h.position<? ORDER BY h.position DESC LIMIT 1",
-                          (row["subject"], row["generation"], row["material_id"], row["position"])))
+    attempt = dict(tx.one(*selected_statement(tx, "SELECT a.* FROM history h JOIN invocations i ON i.id=h.identity JOIN attempts a ON a.id=i.attempt JOIN invocation_outputs o ON o.invocation=i.id WHERE h.subject=? AND h.generation=? AND a.subject=h.subject AND a.generation=h.generation AND o.raw_id=? AND h.kind='agent_allocated' AND h.position<? ORDER BY h.position DESC LIMIT 1",
+                       "SELECT a.* FROM history h JOIN invocations i ON i.run_id=h.run_id AND i.id=h.identity JOIN attempts a ON a.run_id=i.run_id AND a.id=i.attempt JOIN invocation_outputs o ON o.run_id=i.run_id AND o.invocation=i.id WHERE h.run_id=? AND h.subject=? AND h.generation=? AND a.subject=h.subject AND a.generation=h.generation AND o.raw_id=? AND h.kind='agent_allocated' AND h.position<? ORDER BY h.position DESC LIMIT 1", (row["subject"], row["generation"], row["material_id"], row["position"]))))
     return _result(tx, row, subject, state, attempt, human=True)
 
 
@@ -239,15 +228,15 @@ def _project(tx: Transaction, row: Mapping[str, Any], state: dict[str, Any], mod
     """Project this original history record without changing its source facts."""
     if row["kind"] not in {"worker_started", "worker_active", "role_consumed", "paused", "effect_consumed", "acceptance_promoted", "boundary_update"}:
         return []
-    subject = dict(tx.one("SELECT * FROM subjects WHERE id=?", (row["subject"],)))
+    subject = dict(tx.one(*selected_statement(tx, 'SELECT * FROM subjects WHERE id=?',
+                       'SELECT * FROM subjects WHERE run_id=? AND id=?', (row["subject"],))))
     if row["kind"] == "boundary_update":
-        previous = tx.rows("SELECT position,phase FROM history WHERE subject=? AND generation=? AND position<? "
-                           "AND phase IS NOT NULL ORDER BY position DESC LIMIT 1",
-                           (row["subject"], row["generation"], row["position"]))
+        previous = tx.rows(*selected_statement(tx, 'SELECT position,phase FROM history WHERE subject=? AND generation=? AND position<? AND phase IS NOT NULL ORDER BY position DESC LIMIT 1',
+                       'SELECT position,phase FROM history WHERE run_id=? AND subject=? AND generation=? AND position<? AND phase IS NOT NULL ORDER BY position DESC LIMIT 1', (row["subject"], row["generation"], row["position"])))
         if subject["kind"] == "ticket" or not previous or previous[0]["phase"] != "approval":
             return []
-        latest = tx.one("SELECT max(position) FROM history WHERE subject=? AND generation=? AND kind='boundary_update'",
-                        (row["subject"], row["generation"]))[0]
+        latest = tx.one(*selected_statement(tx, "SELECT max(position) FROM history WHERE subject=? AND generation=? AND kind='boundary_update'",
+                     "SELECT max(position) FROM history WHERE run_id=? AND subject=? AND generation=? AND kind='boundary_update'", (row["subject"], row["generation"])))[0]
         applicable = subject["generation"] == row["generation"] and latest == row["position"] and subject["phase"] == row["phase"]
         return [EventProjection(event_envelope(state, "approval_update", [row["subject"], row["generation"], row["position"]],
                                event_copy(state, "approval_update"), "orange",
@@ -261,8 +250,8 @@ def _project(tx: Transaction, row: Mapping[str, Any], state: dict[str, Any], mod
         return _human(tx, row, subject, state, mode)
     if row["kind"] == "acceptance_promoted":
         promotion = json.loads(tx.get(row["material_id"], row["subject"]))
-        review = tx.one("SELECT * FROM attempts WHERE id=? AND subject=? AND generation=? AND role='review'",
-                        (row["identity"], row["subject"], row["generation"]))
+        review = tx.one(*selected_statement(tx, "SELECT * FROM attempts WHERE id=? AND subject=? AND generation=? AND role='review'",
+                     "SELECT * FROM attempts WHERE run_id=? AND id=? AND subject=? AND generation=? AND role='review'", (row["identity"], row["subject"], row["generation"])))
         if (subject["kind"] == "ticket" or promotion["review_attempt"] != review["id"]
                 or review["outcome"] != "pass" or review["result_id"] is None):
             raise ValueError("formal acceptance notification has no original Review")
@@ -278,9 +267,8 @@ def _project(tx: Transaction, row: Mapping[str, Any], state: dict[str, Any], mod
                                attempt_id=review["id"], round=review["ordinal"],
                                phase=event_copy(state, "role_review"), duration_seconds=duration, **effort), applicable)]
     if mode == "detailed":
-        original = tx.rows("SELECT payload_id FROM effects WHERE id=? AND subject=? AND generation=? "
-                           "AND operation='pr_write' AND status='confirmed' AND receipt_id=?",
-                           (row["identity"], row["subject"], row["generation"], row["material_id"]))
+        original = tx.rows(*selected_statement(tx, "SELECT payload_id FROM effects WHERE id=? AND subject=? AND generation=? AND operation='pr_write' AND status='confirmed' AND receipt_id=?",
+                       "SELECT payload_id FROM effects WHERE run_id=? AND id=? AND subject=? AND generation=? AND operation='pr_write' AND status='confirmed' AND receipt_id=?", (row["identity"], row["subject"], row["generation"], row["material_id"])))
         if original:
             intent = json.loads(tx.get(original[0]["payload_id"], row["subject"]))
             if "prior" not in intent or intent["prior"] is not None:
@@ -295,12 +283,12 @@ def _project(tx: Transaction, row: Mapping[str, Any], state: dict[str, Any], mod
             return [EventProjection(event_envelope(state, "pr_created", number, event_copy(state, "pr_created", number=number), "green",
                                    summary=event_copy(state, "pr_summary"),
                                    url=f"https://github.com/{pr['repository']}/pull/{number}"), False)]
-    completion = tx.rows("SELECT revision,development_attempt FROM completions WHERE subject=? AND generation=? AND close_effect=?",
-                         (row["subject"], row["generation"], row["identity"])) if subject["kind"] == "ticket" else []
+    completion = tx.rows(*selected_statement(tx, 'SELECT revision,development_attempt FROM completions WHERE subject=? AND generation=? AND close_effect=?',
+                     'SELECT revision,development_attempt FROM completions WHERE run_id=? AND subject=? AND generation=? AND close_effect=?', (row["subject"], row["generation"], row["identity"]))) if subject["kind"] == "ticket" else []
     if completion:
         facts = _subject_facts(tx, subject, completion[0]["revision"], state)
-        development = tx.rows("SELECT result_id FROM attempts WHERE id=? AND subject=? AND generation=? AND role='development'",
-                              (completion[0]["development_attempt"], row["subject"], row["generation"]))
+        development = tx.rows(*selected_statement(tx, "SELECT result_id FROM attempts WHERE id=? AND subject=? AND generation=? AND role='development'",
+                          "SELECT result_id FROM attempts WHERE run_id=? AND id=? AND subject=? AND generation=? AND role='development'", (completion[0]["development_attempt"], row["subject"], row["generation"])))
         summary = (json.loads(tx.get(development[0]["result_id"], row["subject"])).get("summary")
                    if development and development[0]["result_id"] is not None else None)
         effort = execution_facts(tx, row)
@@ -332,6 +320,14 @@ def _resumed(tx: Transaction, row: Mapping[str, Any], state: dict[str, Any],
 
 def project_event(tx: Transaction, row: Mapping[str, Any], state: dict[str, Any], mode: str) -> list[EventProjection]:
     """Project one visible event and keep suppressed original facts for rechecks."""
+    scope = transaction_scope(tx)
+    if scope is not None:
+        if state.get("run_id") != scope.run_id:
+            raise KernelError("run_scope_changed")
+        original = tx.one("SELECT subject,kind,identity,generation,material_id,created_at,phase,purpose FROM history WHERE run_id=? AND position=?",
+            (scope.run_id, row["position"]))
+        if any(original[key] != row[key] for key in original.keys()):
+            raise KernelError("notification_history_binding")
     ordinary = _project(tx, row, state, mode)
     result = _resumed(tx, row, state, [item for item in ordinary if item.visible])
     result.extend(item for item in ordinary if not item.visible)
@@ -344,17 +340,18 @@ def project_event(tx: Transaction, row: Mapping[str, Any], state: dict[str, Any]
     return result
 
 
-def host_exit_event(database: Path, notice: Mapping[str, Any]) -> dict[str, Any] | None:
+def host_exit_event(database: Path, notice: Mapping[str, Any], *, storage: Storage | None = None) -> dict[str, Any] | None:
     """Use the original notification envelope and stable Host exit identity."""
-    from agent_run.core.kernel import Kernel
     from agent_run.queries.host_exit import host_exit_current
 
-    if not host_exit_current(database, notice):
+    options: dict[str, Any] = {} if storage is None else {"storage": storage}
+    if not host_exit_current(database, notice, **options):
         return None
-    with Kernel(database).storage.transaction(write=False) as tx:
-        run = tx.one("SELECT id,repository,parent_issue,parent_revision,language,created_at FROM runs")
-        title = tx.rows("SELECT title FROM requirement_versions WHERE issue=? AND revision=?",
-                        (run["parent_issue"], run["parent_revision"]))
+    with open_run(database, storage=storage).transaction(write=False) as tx:
+        run = tx.one(*selected_statement(tx, 'SELECT id,repository,parent_issue,parent_revision,language,created_at FROM runs',
+                  'SELECT id,repository,parent_issue,parent_revision,language,created_at FROM runs WHERE id=?', ()))
+        title = tx.rows(*selected_statement(tx, 'SELECT title FROM requirement_versions WHERE issue=? AND revision=?',
+                    'SELECT title FROM requirement_versions WHERE run_id=? AND issue=? AND revision=?', (run["parent_issue"], run["parent_revision"])))
         state = {"run_id": run["id"], "repository": run["repository"], "language": run["language"],
                  "created_at": run["created_at"],
                  "parent": {"number": run["parent_issue"], "title": title[0][0] if title else ""}}

@@ -7,6 +7,7 @@ from agent_run.notifications.envelope import event_envelope
 
 from agent_run.notifications.event_projection import event_state, project_event
 from agent_run.storage.sqlite import Transaction
+from agent_run.storage.run_scope import selected_statement
 from agent_run.queries.execution import worker_activity_start
 
 
@@ -16,13 +17,16 @@ def _source(tx: Transaction, event: Mapping[str, Any]) -> dict[str, Any] | None:
             or not isinstance(event["work_subject"], str) or type(event["generation"]) is not int
             or event["source_material_id"] is not None and not isinstance(event["source_material_id"], str)):
         return None
-    rows = tx.rows("SELECT * FROM history WHERE position=? AND subject=? AND generation=? AND material_id IS ?",
-                   (event["source_position"], event["work_subject"], event["generation"], event["source_material_id"]))
+    rows = tx.rows(*selected_statement(tx,
+        "SELECT * FROM history WHERE position=? AND subject=? AND generation=? AND material_id IS ?",
+        "SELECT * FROM history WHERE run_id=? AND position=? AND subject=? AND generation=? AND material_id IS ?",
+        (event["source_position"], event["work_subject"], event["generation"], event["source_material_id"])))
     if not rows:
         return None
     row = dict(rows[0])
     if row["material_id"] is not None:
-        if not tx.rows("SELECT id FROM material WHERE id=?", (row["material_id"],)):
+        if not tx.rows(*selected_statement(tx, "SELECT id FROM material WHERE id=?",
+            "SELECT id FROM material WHERE run_id=? AND id=?", (row["material_id"],))):
             return None
         tx.get(row["material_id"], row["subject"])  # Corruption is a read failure, never an obsolete card.
     return row
@@ -44,7 +48,8 @@ def obsolete_progress(
         if not isinstance(event.get("id"), str) or not isinstance(event.get("kind"), str):
             continue
         if event["kind"] == "run_start":
-            run = tx.one("SELECT id,created_at,language FROM runs")
+            run = tx.one(*selected_statement(tx, "SELECT id,created_at,language FROM runs",
+                "SELECT id,created_at,language FROM runs WHERE id=?"))
             identity = event_envelope(dict(run) | {"run_id": run["id"]}, "run_start", run["id"], "")["id"]
             if event["id"] == identity:
                 started = worker_activity_start(tx, None)

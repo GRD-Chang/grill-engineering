@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 from typing import Any, TYPE_CHECKING
 
+from agent_run.storage.run_scope import selected_statement
 from agent_run.errors import error_message, KernelError
 from agent_run.contracts.copy import text
 
@@ -24,6 +25,7 @@ from agent_run.runtime.foreground_host import ForegroundHost
 from agent_run.model import Commit, Delivery, DeliveryKind, HostObservation, Requirements, ResourceInspection, RunSpec, World
 
 if TYPE_CHECKING:
+    from agent_run.storage.routing import RepositoryRoute
     from agent_run.core.kernel import Kernel
     from agent_run.adapters.systemd import SystemdHost
     from agent_run.config.defaults import UserDefaultsStore
@@ -154,11 +156,13 @@ def submit(kernel: Kernel, kind: str, *, action_id: str, command: tuple[str, ...
             observed = manager.launch(kernel, request, lock=runner_lock, lease=terminal)
         else:
             from agent_run.cli.host_exit import exit_properties
-            properties = exit_properties(kernel.storage.path, action_id, request, runner_lock, environment)
+            properties = exit_properties(kernel.storage.path, action_id, request, runner_lock, environment,
+                **({"storage": kernel.storage} if getattr(kernel.storage, "run_id", None) is not None else {}))
             with handoff_scope(request, environment, runner_lock=runner_lock, terminal_lease=terminal) as handoff:
                 observed = launch_handoff(kernel, action_id, manager, handoff, exit_properties=properties)
         with kernel.storage.transaction(write=False) as tx:
-            action_status = tx.one("SELECT status FROM actions WHERE id=?", (action_id,))[0]
+            action_status = tx.one(*selected_statement(tx, 'SELECT status FROM actions WHERE id=?',
+                                'SELECT status FROM actions WHERE run_id=? AND id=?', (action_id,)))[0]
         return {"result": "accepted", "status": "action_" + action_status, "run_id": request.run_id,
                 "action_id": action_id, "action": kind,
                 "host": "unknown" if observed is None else observed.disposition,
@@ -193,14 +197,17 @@ def attach(kernel: Kernel, *, requested_action: str, manager: SystemdHost | Fore
             observed = reconcile_handoff(kernel, action_id, manager)
         else:
             from agent_run.cli.host_exit import exit_properties
-            properties = exit_properties(kernel.storage.path, action_id, request, runner_lock, environment)
+            properties = exit_properties(kernel.storage.path, action_id, request, runner_lock, environment,
+                **({"storage": kernel.storage} if getattr(kernel.storage, "run_id", None) is not None else {}))
             with handoff_scope(request, environment, runner_lock=runner_lock, terminal_lease=terminal) as handoff:
                 observed = launch_handoff(kernel, action_id, manager, handoff, exit_properties=properties)
         with kernel.storage.transaction(write=False) as tx:
-            action = tx.one("SELECT kind,status FROM actions WHERE id=?", (action_id,))
+            action = tx.one(*selected_statement(tx, 'SELECT kind,status FROM actions WHERE id=?',
+                         'SELECT kind,status FROM actions WHERE run_id=? AND id=?', (action_id,)))
         if observed is not None and observed.disposition == "exited" and observed.usage_released:
             from agent_run.notifications.sender import notify_committed
-            notify_committed(kernel.storage.path)
+            notify_committed(kernel.storage.path,
+                **({"storage": kernel.storage} if getattr(kernel.storage, "run_id", None) is not None else {}))
         return {"result": "attached", "status": "action_" + action["status"], "run_id": request.run_id,
                 "action_id": action_id, "action": action["kind"],
                 "requested_action": requested_action, "requested_action_applied": False,
@@ -233,7 +240,8 @@ def _active_runner() -> bool:
 
 
 def _run(parsed: argparse.Namespace, *, manager: SystemdHost | ForegroundHost,
-         environment: Mapping[str, str], runner_lock: Path) -> dict[str, Any]:
+         environment: Mapping[str, str], runner_lock: Path,
+         repository_route: RepositoryRoute | None = None) -> dict[str, Any]:
     """Freeze creation inputs outside the sole Core Task creation transaction."""
     from uuid import uuid4
     from agent_run.adapters.github import GhGitHubReader
@@ -244,6 +252,11 @@ def _run(parsed: argparse.Namespace, *, manager: SystemdHost | ForegroundHost,
     from agent_run.core.kernel import Kernel
     from agent_run.errors import KernelError
     from agent_run.runtime.executor import command
+    from agent_run.storage.routing import RepositoryRoute
+    from agent_run.storage import routing
+
+    if repository_route is not None and not routing.REPOSITORY_PUBLIC_READY:
+        raise KernelError("repository_activation_incomplete")
 
     directory = Path.cwd()
     repository = parsed.repo or GhGitHubReader(working_directory=directory).repository_hint()
@@ -252,7 +265,10 @@ def _run(parsed: argparse.Namespace, *, manager: SystemdHost | ForegroundHost,
     workspace = ManagedWorkspace.for_repository(repository)
     if parsed.state_dir is not None and parsed.state_dir.resolve() != workspace.state_root.resolve():
         raise KernelError("managed_state_identity", "run requires the repository's managed state directory")
-    kernel = Kernel.open_task(TaskKey(workspace.repository_root, workspace.repository, parsed.parent))
+    if repository_route is not None and repository_route != RepositoryRoute.for_workspace(workspace):
+        raise KernelError("managed_state_identity")
+    task = TaskKey(workspace.repository_root, workspace.repository, parsed.parent)
+    kernel = Kernel.open_task(task) if repository_route is None else repository_route.open_task(task)
     if kernel is None:
         manager.preflight()
         overrides: dict[str, str | bool | None] = {
@@ -268,9 +284,14 @@ def _run(parsed: argparse.Namespace, *, manager: SystemdHost | ForegroundHost,
             notification_mode=parsed.notification_mode)
         # A competing creator can win during external preparation. Use only
         # Core's returned Run, including its frozen identity and language.
-        kernel = Kernel.create_task(database, spec, requirements=requirements)
+        if repository_route is None:
+            kernel = Kernel.create_task(database, spec, requirements=requirements)
+        else:
+            created = repository_route.create(task, spec, requirements)
+            kernel = repository_route.kernel(created.run_id)
     with kernel.storage.transaction(write=False) as tx:
-        run = tx.one("SELECT id,language,repository_root FROM runs")
+        run = tx.one(*selected_statement(tx, 'SELECT id,language,repository_root FROM runs',
+                  'SELECT id,language,repository_root FROM runs WHERE id=?', ()))
         if run["language"] not in {"en", "zh"} or run["repository_root"] != str(workspace.repository_root):
             raise KernelError("creation_metadata_missing")
         parsed._run_language = run["language"]
@@ -283,19 +304,30 @@ def _run(parsed: argparse.Namespace, *, manager: SystemdHost | ForegroundHost,
         return original
     action_id = uuid4().hex
     result = submit(kernel, "run", action_id=action_id,
-        command=command(kernel.storage.path, action_id, runner_lock, environment),
+        command=command(kernel.storage.path, action_id, runner_lock, environment,
+            **({"run_id": kernel.storage.run_id} if getattr(kernel.storage, "run_id", None) is not None else {})),
         manager=manager, environment=environment, runner_lock=runner_lock)
     result["language"] = run["language"]
     return result
 
 
-def execute(parsed: argparse.Namespace, *, language: str) -> dict[str, Any]:
-    """Locate an exact managed Run and submit through sole Kernel admission."""
+def execute(parsed: argparse.Namespace, *, language: str,
+            repository_route: RepositoryRoute | None = None) -> dict[str, Any]:
+    """Locate an exact managed Run and submit through sole Kernel admission.
+
+    repository_route is the inactive internal assembly seam, never a parser or
+    environment option. Public dispatch still supplies None until every Core
+    publication guard, selector and protocol gate is switched together.
+    """
     import json
     import os
     import shutil
     from uuid import uuid4
-    from agent_run.adapters.workspace import workspace_for_root
+    from agent_run.adapters.workspace import ManagedWorkspace, workspace_for_root
+    from agent_run.contracts.repository import normalize_repository
+    from agent_run.contracts.task import TaskKey
+    from agent_run.storage.routing import RepositoryRoute
+    from agent_run.storage import routing
     from agent_run.runtime.package_lease import default_runner_lock_path, runner_usage_lease
     from agent_run.adapters.systemd import SystemdHost, HostUnavailable
     from agent_run.core.kernel import Kernel
@@ -305,6 +337,8 @@ def execute(parsed: argparse.Namespace, *, language: str) -> dict[str, Any]:
 
     if parsed.command not in {"run", "resume", "approve", "stop", "revise", "requeue", "abandon"}:
         raise KernelError("lifecycle_not_connected", parsed.command)
+    if repository_route is not None and not routing.REPOSITORY_PUBLIC_READY:
+        raise KernelError("repository_activation_incomplete")
     _require_github_host()
     policy_overrides = personal_settings._policy_values(parsed)
     environment = dict(os.environ)
@@ -314,39 +348,61 @@ def execute(parsed: argparse.Namespace, *, language: str) -> dict[str, Any]:
             if not _active_runner():
                 raise HostUnavailable("Lifecycle commands require the installed Active Runner")
             manager = _manager_for(None, parsed, environment)
-            return _run(parsed, manager=manager, environment=environment, runner_lock=runner_lock)
+            options: dict[str, Any] = {} if repository_route is None else {"repository_route": repository_route}
+            return _run(parsed, manager=manager, environment=environment, runner_lock=runner_lock, **options)
         selection = argparse.Namespace(**vars(parsed))
         selection.parent = None
         if selection.run_id.isdecimal():
             selection.parent = personal_settings._positive(selection.run_id, language=language)
             selection.run_id = None
-        candidate = _select(selection, _candidates(selection))[0]
-        database = Path(candidate["database"]).resolve()
-        kernel = Kernel(database)
+        if repository_route is None:
+            candidate = _select(selection, _candidates(selection))[0]
+            database = Path(candidate["database"]).resolve()
+            kernel = Kernel(database, run_id=candidate["run_id"])
+        else:
+            # Only canonical metadata selects control work. No status JSON is
+            # interpreted as a Task pointer and no directory supplies a Run ID.
+            workspace = ManagedWorkspace.for_repository(repository_route.repository)
+            if (repository_route != RepositoryRoute.for_workspace(workspace)
+                    or parsed.repo is not None and normalize_repository(parsed.repo) != repository_route.repository
+                    or parsed.state_dir is not None and parsed.state_dir.resolve() != workspace.state_root.resolve()):
+                raise KernelError("managed_state_identity")
+            run_id = selection.run_id
+            if run_id is None:
+                if selection.parent is None:
+                    raise KernelError("control_subject_ambiguous", "Select an exact Run or Parent")
+                location = repository_route.task(TaskKey(workspace.repository_root, workspace.repository, selection.parent))
+                if location is None or location.current_run is None:
+                    raise KernelError("task_run_unpublished")
+                run_id = location.current_run
+            database = repository_route.database
+            kernel = repository_route.kernel(run_id)
         with kernel.storage.transaction(write=False) as tx:
-            run = tx.one("SELECT * FROM runs")
+            run = tx.one(*selected_statement(tx, 'SELECT * FROM runs',
+                      'SELECT * FROM runs WHERE id=?', ()))
             if run["language"] not in {"zh", "en"} or run["repository_root"] is None:
                 raise KernelError("creation_metadata_missing")
             parsed._run_language = run["language"]
             workspace = workspace_for_root(Path(run["repository_root"]))
             if not database.is_relative_to(workspace.state_root.resolve()):
                 raise KernelError("managed_state_identity")
-            from agent_run.storage.tasks import read_task, task_path
-            from agent_run.contracts.task import TaskKey
-            task = TaskKey(Path(run["repository_root"]), run["repository"], run["parent_issue"])
-            if read_task(task_path(task)) != (run["id"], database):
+            from agent_run.storage.tasks import run_is_current
+            if not run_is_current(tx, database):
                 raise KernelError("task_run_unpublished", "This database is not the published Run for its Task")
-            stored = tx.one("SELECT subject,material_id FROM run_inputs")
+            stored = tx.one(*selected_statement(tx, 'SELECT subject,material_id FROM run_inputs',
+                         'SELECT subject,material_id FROM run_inputs WHERE run_id=?', ()))
             inputs = json.loads(tx.get(stored["material_id"], stored["subject"]))
-            abandoned = tx.rows("SELECT id,status FROM actions WHERE kind='abandon'", limit=1) if parsed.command == "abandon" else []
+            abandoned = tx.rows(*selected_statement(tx, "SELECT id,status FROM actions WHERE kind='abandon'",
+                            "SELECT id,status FROM actions WHERE run_id=? AND kind='abandon'", ()), limit=1) if parsed.command == "abandon" else []
             abandonment = dict(abandoned[0]) if abandoned else None
-            unknown_host = bool(parsed.command == "abandon" and tx.rows(
-                "SELECT owner FROM hosts WHERE (status!='exited' OR usage_released=0) AND status!='running' LIMIT 1"))
+            unknown_host = bool(parsed.command == "abandon" and tx.rows(*selected_statement(tx, "SELECT owner FROM hosts WHERE (status!='exited' OR usage_released=0) AND status!='running' LIMIT 1",
+                                                                    "SELECT owner FROM hosts WHERE run_id=? AND (status!='exited' OR usage_released=0) AND status!='running' LIMIT 1", ())))
         if parsed.command == "stop":
             subject = None
             if parsed.ticket is not None:
                 with kernel.storage.transaction(write=False) as tx:
-                    targets = tx.all("SELECT id FROM subjects WHERE kind='ticket' AND issue=?", (parsed.ticket,))
+                    targets = tx.all(*selected_statement(tx, "SELECT id FROM subjects WHERE kind='ticket' AND issue=?",
+                                  "SELECT id FROM subjects WHERE run_id=? AND kind='ticket' AND issue=?", (parsed.ticket,)))
                     if len(targets) != 1:
                         raise KernelError("control_subject_ambiguous", "Select an exact Ticket")
                     subject = str(targets[0]["id"])
@@ -357,7 +413,7 @@ def execute(parsed: argparse.Namespace, *, language: str) -> dict[str, Any]:
                         "action_id": None, "action": "stop", "host": "exited", "language": run["language"]}
             if action_status != "complete":
                 from agent_run.notifications.sender import notify_committed
-                notify_committed(database)
+                notify_committed(database, storage=kernel.storage)
             return {"result": "accepted", "status": "action_" + action_status, "run_id": run["id"],
                     "action_id": action_id, "action": "stop", "host": "unknown", "language": run["language"]}
         inspections = None
@@ -420,16 +476,20 @@ def execute(parsed: argparse.Namespace, *, language: str) -> dict[str, Any]:
                     targets = []
                 elif parsed.command == "requeue":
                     if source["blocked"] == "final_refresh" and source["final_subject"] is not None:
-                        targets = tx.all("SELECT id FROM subjects WHERE id=?", (source["final_subject"],))
+                        targets = tx.all(*selected_statement(tx, 'SELECT id FROM subjects WHERE id=?',
+                                      'SELECT id FROM subjects WHERE run_id=? AND id=?', (source["final_subject"],)))
                     else:
-                        targets = tx.all("SELECT DISTINCT s.id FROM subjects s JOIN gates g ON g.subject=s.id "
-                                         "WHERE g.code='requeue_required' ORDER BY s.id")
+                        targets = tx.all(*selected_statement(tx, "SELECT DISTINCT s.id FROM subjects s JOIN gates g ON g.subject=s.id WHERE g.code='requeue_required' ORDER BY s.id",
+                                      "SELECT DISTINCT s.id FROM subjects s JOIN gates g ON g.run_id=s.run_id AND g.subject=s.id WHERE s.run_id=? AND g.code='requeue_required' ORDER BY s.id", ()))
                 elif parsed.command == "approve":
-                    targets = tx.all("SELECT id FROM subjects WHERE kind!='ticket' AND phase='approval'")
+                    targets = tx.all(*selected_statement(tx, "SELECT id FROM subjects WHERE kind!='ticket' AND phase='approval'",
+                                  "SELECT id FROM subjects WHERE run_id=? AND kind!='ticket' AND phase='approval'", ()))
                 elif parsed.command == "revise":
-                    targets = tx.all("SELECT id FROM subjects WHERE kind='final_run' AND phase='approval'")
+                    targets = tx.all(*selected_statement(tx, "SELECT id FROM subjects WHERE kind='final_run' AND phase='approval'",
+                                  "SELECT id FROM subjects WHERE run_id=? AND kind='final_run' AND phase='approval'", ()))
                 else:
-                    targets = tx.all("SELECT DISTINCT s.id FROM subjects s JOIN gates g ON g.subject=s.id ORDER BY s.id")
+                    targets = tx.all(*selected_statement(tx, 'SELECT DISTINCT s.id FROM subjects s JOIN gates g ON g.subject=s.id ORDER BY s.id',
+                                  'SELECT DISTINCT s.id FROM subjects s JOIN gates g ON g.run_id=s.run_id AND g.subject=s.id WHERE s.run_id=? ORDER BY s.id', ()))
                 if len(targets) > 1 or (not targets and parsed.command != "abandon"):
                     raise KernelError("control_subject_ambiguous", "Select an exact Ticket or current Parent boundary")
                 subject = None if not targets else str(targets[0]["id"])
@@ -474,12 +534,14 @@ def execute(parsed: argparse.Namespace, *, language: str) -> dict[str, Any]:
                 replacement=replacement,
                 discard_worktree=getattr(parsed, "discard_worktree", False))
             with kernel.storage.transaction(write=False) as tx:
-                action_status = tx.one("SELECT status FROM actions WHERE id=?", (action_id,))[0]
+                action_status = tx.one(*selected_statement(tx, 'SELECT status FROM actions WHERE id=?',
+                                    'SELECT status FROM actions WHERE run_id=? AND id=?', (action_id,)))[0]
             result = {"result": "accepted", "status": "action_" + action_status, "run_id": run["id"],
                 "action_id": action_id, "action": parsed.command, "host": "running", "host_unit": request.unit_name, "host_backend": request.backend}
         else:
             result = submit(kernel, parsed.command, action_id=action_id,
-                            command=command(database, action_id, runner_lock, environment), manager=manager,
+                            command=command(database, action_id, runner_lock, environment,
+                                run_id=kernel.storage.run_id), manager=manager,
                             environment=environment, runner_lock=runner_lock, subject=subject, world=world,
                             message=getattr(parsed, "message", None), new_thread=getattr(parsed, "new_thread", False),
                             policy_overrides=policy_overrides, resource_inspections=inspections,

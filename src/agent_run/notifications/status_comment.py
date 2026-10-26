@@ -18,11 +18,21 @@ from agent_run.errors import GitHubReadError, KernelError
 from agent_run.runtime.process_identity import _process_binding_status, _process_start_token
 from agent_run.queries.status_comment import project_status
 from agent_run.storage import notification_outbox as outbox
+from agent_run.storage.routing import open_run
+from agent_run.storage.sqlite import Storage
 
 
 class StatusComments:
-    def __init__(self, database: Path) -> None:
+    def __init__(self, database: Path, *, storage: Storage | None = None) -> None:
         self.database = database.absolute()
+        self._storage = open_run(self.database, storage=storage) if storage is not None else None
+
+    def _projection(self, subject: str) -> StatusProjection:
+        return (project_status(self.database, subject) if self._storage is None else
+                project_status(self.database, subject, storage=self._storage))
+
+    def _kernel(self) -> Kernel:
+        return Kernel(self.database) if self._storage is None else Kernel._from_storage(self._storage)
 
     @staticmethod
     def _entry(document: dict[str, Any], projection: StatusProjection) -> dict[str, Any]:
@@ -72,7 +82,7 @@ class StatusComments:
         return entry
 
     def stage(self, subject: str) -> dict[str, Any] | None:
-        projection = project_status(self.database, subject)
+        projection = self._projection(subject)
         with outbox.transaction(self.database.parent, projection.target.run_id) as document:
             entry = self._entry(document, projection)
             if entry.get("failure") is not None:
@@ -118,7 +128,7 @@ class StatusComments:
             intent = self.stage(subject)
             if intent is None:
                 return "unchanged"
-            projection = project_status(self.database, subject)
+            projection = self._projection(subject)
             target = projection.target
             with outbox.transaction(self.database.parent, target.run_id) as document:
                 entry = self._entry(document, projection)
@@ -136,15 +146,15 @@ class StatusComments:
                 entry["claim"] = claim
                 intent = deepcopy(current_intent)
                 marker = entry["marker"]
-            binding = Kernel(self.database).operation_binding()
+            binding = self._kernel().operation_binding()
             remote = RemoteEffects(binding.repository_root, binding.repository,
                                    runner_identity=binding.inputs.runner_identity, api=api, cancelled=stopped)
             def admit() -> None:
                 # Slow transport/credential preparation and remote reads are
                 # already finished. No remote I/O follows this final check.
-                current = project_status(self.database, subject)
+                current = self._projection(subject)
                 if (stopped() or current != projection or intent["body"] != marker + "\n" + current.body
-                        or Kernel(self.database).operation_binding() != binding):
+                        or self._kernel().operation_binding() != binding):
                     raise ValueError("Status authority changed")
                 with outbox.transaction(self.database.parent, target.run_id) as document:
                     active = self._entry(document, current)

@@ -30,7 +30,7 @@ from agent_run.core.prompts.role import render_role_prompt
 
 
 def command(database: Path, action: str, runner_lock: Path,
-            environment: Mapping[str, str]) -> tuple[str, ...]:
+            environment: Mapping[str, str], *, run_id: str | None = None) -> tuple[str, ...]:
     """Seal the selected interpreter and its SQLite loader path before launch.
 
     Preserve the venv executable spelling: resolving its symlink would select
@@ -43,6 +43,13 @@ def command(database: Path, action: str, runner_lock: Path,
         raise ValueError("An exact native Host command is required")
     arguments = (sys.executable, "-m", "agent_run.runtime.executor", "--database", str(database),
                  "--action", action, "--runner-lock", str(runner_lock))
+    if run_id is not None:
+        if type(run_id) is not str or not run_id or "\0" in run_id:
+            raise ValueError("An exact native Host Run identity is required")
+        # Equals-form preserves arbitrary legal selectors as one argv item,
+        # including a Run whose first character is '-'. It is part of the
+        # original persisted Host command/digest, never rebuilt on attach.
+        arguments += ("--run-id=" + run_id,)
     library = environment.get("LD_LIBRARY_PATH", "")
     if "\0" in library:
         raise ValueError("Invalid captured library path")
@@ -86,7 +93,8 @@ def run(kernel: Kernel, execution: Execution, environment: Mapping[str, str]) ->
     state = runner.state()
     workers: dict[str, tuple[AgentPreparation, Future[None], threading.Event]] = {}
     operation: Future[Step] | None = None
-    notifications = NativeNotifications(kernel.storage.path, kernel.storage.path.parent)
+    notification_options: dict[str, Any] = {"storage": kernel.storage} if getattr(kernel.storage, "run_id", None) is not None else {}
+    notifications = NativeNotifications(kernel.storage.path, kernel.storage.path.parent, **notification_options)
     drain_notifications = False
     try:
         with kernel.executor_scope(execution) as close_admission, \
@@ -161,6 +169,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     parser.add_argument("--database", type=Path, required=True)
     parser.add_argument("--action", required=True)
     parser.add_argument("--runner-lock", type=Path, required=True)
+    parser.add_argument("--run-id")
     parsed = parser.parse_args(arguments)
     try:
         credential_directory, notify_socket = os.environ.get("CREDENTIALS_DIRECTORY"), os.environ.get("NOTIFY_SOCKET")
@@ -170,7 +179,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         # Both backends still prove their original handshake and physical lease.
         if not (credential_directory and notify_socket) and not foreground_channel:
             raise KernelError("managed_host_required")
-        kernel = Kernel(parsed.database)
+        kernel = Kernel(parsed.database) if parsed.run_id is None else Kernel(parsed.database, run_id=parsed.run_id)
         request = kernel.host_request(parsed.action)
         if request.backend == "foreground":
             if not foreground_channel:
