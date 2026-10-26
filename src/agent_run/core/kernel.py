@@ -84,7 +84,12 @@ class Kernel:
                                     tuple(paths), tuple(variables))
 
     def _read_fence(self, tx: Transaction, subject: str | None, execution: Execution | None, cleanup: bool) -> ReadFence:
-        run = tx.one("SELECT * FROM runs")
+        selected = transaction_scope(tx)
+        if selected is not None and execution is not None and execution.run_id != selected.run_id:
+            raise KernelError("effect_binding")
+        run = tx.one(*selected_statement(tx, "SELECT * FROM runs",
+                  'SELECT * FROM runs WHERE id=?',
+                  (), run_last=True))
         return ReadFence(execution, subject, cleanup, wire_json(self._automatic_scope(tx, run, subject, cleanup)),
                          run["source_sequence"], tuple(run[key] for key in ("executor", "epoch", "stopped", "blocked", "final_action")))
 
@@ -96,9 +101,13 @@ class Kernel:
                     raise KernelError("invocation_binding")
                 self._agent_authority(tx, call)
             if execution is not None:
-                self._automatic_owned(tx, tx.one("SELECT * FROM runs"), execution)
+                self._automatic_owned(tx, tx.one(*selected_statement(tx, "SELECT * FROM runs",
+                                              'SELECT * FROM runs WHERE id=?',
+                                              (), run_last=True)), execution)
             fence = self._read_fence(tx, subject, execution, cleanup)
-            parent = tx.one("SELECT parent_issue FROM runs")[0]
+            parent = tx.one(*selected_statement(tx, "SELECT parent_issue FROM runs",
+                         'SELECT parent_issue FROM runs WHERE id=?',
+                         (), run_last=True))[0]
         if execution is not None:
             waiting = self._guard_automatic_step(fence, execution)
             if waiting is not None:
@@ -172,10 +181,14 @@ class Kernel:
     def effect_observation_prepared(self, effect: Effect, fence: ReadFence) -> bool:
         with self.storage.transaction(write=False) as tx:
             self._check_operation(tx, fence, effect.execution)
-            return bool(tx.one("SELECT status FROM effects WHERE id=?", (effect.effect_id,))[0] == "prepared")
+            return bool(tx.one(*selected_statement(tx, "SELECT status FROM effects WHERE id=?",
+                            'SELECT status FROM effects WHERE id=? AND run_id=?',
+                            (effect.effect_id,), run_last=True))[0] == "prepared")
 
     def _local_cleanup_effect(self, tx: Transaction, effect: Effect) -> None:
-        row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
+        row = tx.one(*selected_statement(tx, "SELECT * FROM effects WHERE id=? AND subject=?",
+                  'SELECT * FROM effects WHERE id=? AND subject=? AND run_id=?',
+                  (effect.effect_id, effect.subject), run_last=True))
         job = self._job(tx, effect.subject)
         if (effect.operation not in {"cleanup_worktree", "cleanup_local_ref"}
                 or self._abandon_action(tx) is not None or row["control_action"] is not None
@@ -191,7 +204,9 @@ class Kernel:
         """
         with self.storage.transaction(write=False) as tx:
             self._effect_owned(tx, effect, effect.execution)
-            row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
+            row = tx.one(*selected_statement(tx, "SELECT * FROM effects WHERE id=? AND subject=?",
+                      'SELECT * FROM effects WHERE id=? AND subject=? AND run_id=?',
+                      (effect.effect_id, effect.subject), run_last=True))
             if self._effect(tx, row, effect.execution) != effect:
                 raise KernelError("effect_binding")
             local = row["operation"] in {"cleanup_worktree", "cleanup_local_ref"} and row["control_action"] is None
@@ -300,14 +315,18 @@ class Kernel:
             return None
 
     def _operation_token(self, tx: Transaction, subject: str | None, cleanup: bool = False) -> str:
-        run = tx.one("SELECT * FROM runs")
+        run = tx.one(*selected_statement(tx, "SELECT * FROM runs",
+                  'SELECT * FROM runs WHERE id=?',
+                  (), run_last=True))
         return wire_json({"scope": self._automatic_scope(tx, run, subject, cleanup),
                           "progress": self._automatic_progress(tx, run, subject, cleanup),
                           "source_sequence": run["source_sequence"],
                           "control_version": [run[key] for key in ("executor", "epoch", "stopped", "blocked", "final_action")]}).decode()
 
     def _check_operation(self, tx: Transaction, token: str | ReadFence, execution: Execution | None) -> None:
-        value, run = self._automatic_token(token), tx.one("SELECT * FROM runs")
+        value, run = self._automatic_token(token), tx.one(*selected_statement(tx, "SELECT * FROM runs",
+                                                       'SELECT * FROM runs WHERE id=?',
+                                                       (), run_last=True))
         if isinstance(token, ReadFence) and token.execution != execution:
             raise KernelError("observation_binding")
         if execution is not None:
@@ -525,9 +544,13 @@ class Kernel:
     def _observe_work(self, tx: Transaction, work: Work, subject: str, *,
                       after: EffectIO | None = None, result: EffectResult | None = None) -> ObserveIO:
         work = replace(work, subject=subject)
-        self._automatic_owned(tx, tx.one("SELECT * FROM runs"), work.execution)
+        self._automatic_owned(tx, tx.one(*selected_statement(tx, "SELECT * FROM runs",
+                                      'SELECT * FROM runs WHERE id=?',
+                                      (), run_last=True)), work.execution)
         fence = self._read_fence(tx, subject, work.execution, work.cleanup)
-        parent = tx.one("SELECT parent_issue FROM runs")[0]
+        parent = tx.one(*selected_statement(tx, "SELECT parent_issue FROM runs",
+                     'SELECT parent_issue FROM runs WHERE id=?',
+                     (), run_last=True))[0]
         return ObserveIO(work, RequirementsRead(fence, parent), after, result)
 
     def _route_work(self, work: Work, world: World | None = None, fence: ReadFence | None = None) -> Step | IORequest:
@@ -559,7 +582,9 @@ class Kernel:
 
     def _record_readback(self, effect: Effect, result: EffectResult) -> None:
         with self.storage.transaction() as tx:
-            row = tx.one("SELECT * FROM effects WHERE id=?", (effect.effect_id,))
+            row = tx.one(*selected_statement(tx, "SELECT * FROM effects WHERE id=?",
+                      'SELECT * FROM effects WHERE id=? AND run_id=?',
+                      (effect.effect_id,), run_last=True))
             if self._effect(tx, row, effect.execution) != effect:
                 raise KernelError("effect_binding")
             evidence = tx.put(effect.subject, "effect_readback", wire_json({"dispatch_serial": effect.dispatch_serial, "result": asdict(result)}))
@@ -1093,23 +1118,32 @@ class Kernel:
         return None if not rows else rows[0]
 
     def _abandon_scope(self, tx: Transaction, action: sqlite3.Row) -> dict[str, Any]:
-        owner = action["subject"] or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
+        selected = transaction_scope(tx)
+        if selected is not None and action["run_id"] != selected.run_id:
+            raise KernelError("effect_binding")
+        owner = action["subject"] or tx.one(*selected_statement(tx, "SELECT id FROM subjects ORDER BY id LIMIT 1",
+                                         'SELECT id FROM subjects WHERE run_id=? ORDER BY id LIMIT 1',
+                                         (), run_last=True))[0]
         return dict(json.loads(tx.get(action["receipt_id"], owner))["abandonment"])
 
     def _abandon_discard(self, tx: Transaction, action: sqlite3.Row) -> bool:
         if self._abandon_scope(tx, action)["discard_worktree"]:
             return True
-        for row in tx.all("SELECT subject,receipt_id FROM actions WHERE kind='abandon_continue' AND status='applied'"):
+        for row in tx.all(*selected_statement(tx, "SELECT subject,receipt_id FROM actions WHERE kind='abandon_continue' AND status='applied'",
+                       "SELECT subject,receipt_id FROM actions WHERE kind='abandon_continue' AND status='applied' AND run_id=?",
+                       (), run_last=True)):
             receipt = json.loads(tx.get(row["receipt_id"], row["subject"]))
             if receipt.get("continuation_of") == action["id"] and receipt.get("discard_worktree") is True:
                 return True
         return False
 
     def _abandon_inspection(self, tx: Transaction, action: sqlite3.Row) -> sqlite3.Row | None:
-        rows = tx.rows("SELECT e.* FROM effects e JOIN history h ON h.identity=e.id AND h.kind='effect_prepared' "
+        rows = tx.rows(*selected_statement(tx, "SELECT e.* FROM effects e JOIN history h ON h.identity=e.id AND h.kind='effect_prepared' "
                        "WHERE e.control_action=? AND e.operation='inspect_resources' AND h.position>"
                        "COALESCE((SELECT MAX(position) FROM history WHERE kind='abandon_continued' AND identity=?),0) "
-                       "ORDER BY h.position DESC LIMIT 1", (action["id"], action["id"]))
+                       "ORDER BY h.position DESC LIMIT 1",
+                   "SELECT e.* FROM effects e JOIN history h ON h.run_id=e.run_id AND h.identity=e.id AND h.kind='effect_prepared' WHERE e.control_action=? AND e.operation='inspect_resources' AND h.position>COALESCE((SELECT MAX(position) FROM history WHERE run_id=e.run_id AND kind='abandon_continued' AND identity=?),0) AND e.run_id=? ORDER BY h.position DESC LIMIT 1",
+                   (action["id"], action["id"]), run_last=True))
         return rows[0] if rows else None
 
     def _check_abandon_inspection(self, tx: Transaction, action: sqlite3.Row, row: sqlite3.Row) -> None:
@@ -1125,7 +1159,9 @@ class Kernel:
         # exact original receipt can advance that resource's known HEAD; it
         # cannot add another checkout, owner or generation to this Action.
         for effect_id in scope["unsettled"]:
-            row = tx.one("SELECT * FROM effects WHERE id=?", (effect_id,))
+            row = tx.one(*selected_statement(tx, "SELECT * FROM effects WHERE id=?",
+                      'SELECT * FROM effects WHERE id=? AND run_id=?',
+                      (effect_id,), run_last=True))
             if row["status"] != "confirmed" or row["receipt_id"] is None or row["operation"] not in {"workspace", "candidate", "integrate", "publication_commit", "validation_checkout"}:
                 continue
             result = json.loads(tx.get(row["receipt_id"], row["subject"]))
@@ -1138,8 +1174,13 @@ class Kernel:
         return tuple(resources)
 
     def _abandon_owned(self, tx: Transaction, action: sqlite3.Row, execution: Execution) -> None:
+        selected = transaction_scope(tx)
+        if selected is not None and execution.run_id != selected.run_id:
+            raise KernelError("executor_fenced")
         scope = self._abandon_scope(tx, action)
-        run = tx.one("SELECT * FROM runs")
+        run = tx.one(*selected_statement(tx, "SELECT * FROM runs",
+                  'SELECT * FROM runs WHERE id=?',
+                  (), run_last=True))
         hosts = tx.rows("SELECT * FROM hosts WHERE run_id=? AND owner=? AND epoch=?", (execution.run_id, execution.owner, execution.epoch))
         original = bool(scope["execution"]["owner"] and scope["execution"] == asdict(execution)
                         and run["executor"] == execution.owner and run["epoch"] == execution.epoch + 1)
@@ -1148,30 +1189,45 @@ class Kernel:
                 and run["epoch"] == execution.epoch):
             request = json.loads(tx.get(hosts[0]["request_id"], hosts[0]["subject"]))
             admitted = (hosts[0]["action_id"] == action["id"] or request["intent"].get("continuation_of") == action["id"])
-        if (not (original or admitted) or (not hosts and tx.rows("SELECT owner FROM hosts LIMIT 1"))
+        if (not (original or admitted) or (not hosts and tx.rows(*selected_statement(tx, "SELECT owner FROM hosts LIMIT 1",
+                                                             'SELECT owner FROM hosts WHERE run_id=? LIMIT 1',
+                                                             (), run_last=True)))
                 or (hosts and (hosts[0]["status"] != "running" or not hosts[0]["usage_ready"]))):
             raise KernelError("executor_fenced")
 
     def _abandon_effects(self, tx: Transaction, action: sqlite3.Row) -> list[sqlite3.Row]:
-        return tx.all("SELECT * FROM effects WHERE control_action=? ORDER BY rowid", (action["id"],))
+        selected = transaction_scope(tx)
+        if selected is not None and action["run_id"] != selected.run_id:
+            raise KernelError("effect_binding")
+        return tx.all(*selected_statement(tx, "SELECT * FROM effects WHERE control_action=? ORDER BY rowid",
+                   'SELECT * FROM effects WHERE control_action=? AND run_id=? ORDER BY rowid',
+                   (action["id"],), run_last=True))
 
     def _abandon_prs(self, tx: Transaction, action: sqlite3.Row) -> list[dict[str, Any]]:
         scope = self._abandon_scope(tx, action)
         generations = {tuple(value) for value in scope["generations"]}
-        generations.update((row["subject"], row["generation"]) for row in tx.all("SELECT subject,generation FROM retired_generations"))
+        generations.update((row["subject"], row["generation"]) for row in tx.all(*selected_statement(tx, "SELECT subject,generation FROM retired_generations",
+                                                                              'SELECT subject,generation FROM retired_generations WHERE run_id=?',
+                                                                              (), run_last=True)))
         latest: dict[tuple[str, int], dict[str, Any]] = {}
-        for row in tx.all("SELECT * FROM effects WHERE operation='pr_write' AND status='confirmed' AND receipt_id IS NOT NULL ORDER BY rowid"):
+        for row in tx.all(*selected_statement(tx, "SELECT * FROM effects WHERE operation='pr_write' AND status='confirmed' AND receipt_id IS NOT NULL ORDER BY rowid",
+                       "SELECT * FROM effects WHERE operation='pr_write' AND status='confirmed' AND receipt_id IS NOT NULL AND run_id=? ORDER BY rowid",
+                       (), run_last=True)):
             key = (row["subject"], row["generation"])
             if key not in generations:
                 continue
             result = json.loads(tx.get(row["receipt_id"], row["subject"]))
             if result["disposition"] == "target" and result["pr"] is not None:
                 latest[key] = {"subject": row["subject"], "generation": row["generation"], "prior_pr": result["pr"]}
-        settled = {(row["subject"], row["generation"], row["pr_number"]) for row in tx.all(
-            "SELECT subject,generation,pr_number FROM effects WHERE operation IN ('merge','retire_pr') AND status='confirmed'")}
+        settled = {(row["subject"], row["generation"], row["pr_number"]) for row in tx.all(*selected_statement(tx, "SELECT subject,generation,pr_number FROM effects WHERE operation IN ('merge','retire_pr') AND status='confirmed'",
+                                                                                        "SELECT subject,generation,pr_number FROM effects WHERE operation IN ('merge','retire_pr') AND status='confirmed' AND run_id=?",
+                                                                                        (), run_last=True))}
         return [value for key, value in latest.items() if (*key, value["prior_pr"]["number"]) not in settled]
 
     def _abandon_control_scope(self, tx: Transaction, action: sqlite3.Row, row: sqlite3.Row) -> bool:
+        selected = transaction_scope(tx)
+        if selected is not None and (action["run_id"] != selected.run_id or row["run_id"] != selected.run_id):
+            raise KernelError("effect_binding")
         if action["status"] != "pending" or row["control_action"] != action["id"] or row["operation"] not in self.ABANDON_EFFECTS:
             return False
         payload = json.loads(tx.get(row["payload_id"], row["subject"]))
@@ -1194,12 +1250,14 @@ class Kernel:
         completion = payload.get("completion")
         if row["operation"] not in {"reopen_ticket", "recovery_comment"} or not isinstance(completion, dict):
             return False
-        records = tx.rows("SELECT * FROM completions WHERE subject=? AND generation=? AND close_effect=?",
-                          (row["subject"], row["generation"], completion.get("close_effect")))
+        records = tx.rows(*selected_statement(tx, "SELECT * FROM completions WHERE subject=? AND generation=? AND close_effect=?",
+                      'SELECT * FROM completions WHERE subject=? AND generation=? AND close_effect=? AND run_id=?',
+                      (row["subject"], row["generation"], completion.get("close_effect")), run_last=True))
         if not records or dict(records[0]) != completion:
             return False
-        closed = tx.one("SELECT * FROM effects WHERE id=? AND subject=? AND generation=? AND operation='close' AND status='confirmed'",
-                        (completion["close_effect"], row["subject"], row["generation"]))
+        closed = tx.one(*selected_statement(tx, "SELECT * FROM effects WHERE id=? AND subject=? AND generation=? AND operation='close' AND status='confirmed'",
+                     "SELECT * FROM effects WHERE id=? AND subject=? AND generation=? AND operation='close' AND status='confirmed' AND run_id=?",
+                     (completion["close_effect"], row["subject"], row["generation"]), run_last=True))
         close_payload = json.loads(tx.get(closed["payload_id"], row["subject"]))
         if (payload.get("issue") != self._job(tx, row["subject"])["issue"]
                 or payload.get("close_receipt") != json.loads(tx.get(closed["receipt_id"], row["subject"]))
@@ -1207,9 +1265,10 @@ class Kernel:
             return False
         if row["operation"] == "reopen_ticket":
             return True
-        reopened = tx.rows("SELECT * FROM effects WHERE id=? AND subject=? AND generation=? AND control_action=? "
+        reopened = tx.rows(*selected_statement(tx, "SELECT * FROM effects WHERE id=? AND subject=? AND generation=? AND control_action=? "
                            "AND operation='reopen_ticket' AND status='confirmed'",
-                           (payload.get("reopen_effect"), row["subject"], row["generation"], action["id"]))
+                       "SELECT * FROM effects WHERE id=? AND subject=? AND generation=? AND control_action=? AND operation='reopen_ticket' AND status='confirmed' AND run_id=?",
+                       (payload.get("reopen_effect"), row["subject"], row["generation"], action["id"]), run_last=True))
         if not reopened:
             return False
         prior = reopened[0]
@@ -1221,7 +1280,9 @@ class Kernel:
     def _abandon_control_authority(self, tx: Transaction, action: sqlite3.Row, row: sqlite3.Row) -> bool:
         if not self._abandon_control_scope(tx, action, row):
             return False
-        if (tx.one("SELECT blocked FROM runs")[0] == "supervision_timeout"
+        if (tx.one(*selected_statement(tx, "SELECT blocked FROM runs",
+                'SELECT blocked FROM runs WHERE id=?',
+                (), run_last=True))[0] == "supervision_timeout"
                 or any(gate["code"] == "supervision_timeout" for gate in self._gates(tx, row["subject"]))):
             return False
         if row["operation"] != "inspect_resources":
@@ -1246,14 +1307,21 @@ class Kernel:
         return False
 
     def _effect_owned(self, tx: Transaction, effect: Effect, execution: Execution) -> tuple[sqlite3.Row, sqlite3.Row]:
+        selected = transaction_scope(tx)
+        if selected is not None and (effect.execution.run_id != selected.run_id or execution.run_id != selected.run_id):
+            raise KernelError("effect_binding")
         action = self._abandon_action(tx)
         if action is None:
             return self._owned(tx, effect.subject, execution)
         self._abandon_owned(tx, action, execution)
-        row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
+        row = tx.one(*selected_statement(tx, "SELECT * FROM effects WHERE id=? AND subject=?",
+                  'SELECT * FROM effects WHERE id=? AND subject=? AND run_id=?',
+                  (effect.effect_id, effect.subject), run_last=True))
         if not self._abandon_control_authority(tx, action, row):
             raise KernelError("executor_fenced")
-        return tx.one("SELECT * FROM runs"), self._job(tx, effect.subject)
+        return tx.one(*selected_statement(tx, "SELECT * FROM runs",
+                   'SELECT * FROM runs WHERE id=?',
+                   (), run_last=True)), self._job(tx, effect.subject)
 
     def _abandon_write_current(self, tx: Transaction, action: sqlite3.Row, row: sqlite3.Row,
                                inspections: tuple[ResourceInspection, ...] | None) -> None:
@@ -1267,7 +1335,12 @@ class Kernel:
     def effect_resources(self, effect: Effect) -> tuple[ResourceWitness, ...] | None:
         """Read the original Action's local witnesses for a fresh write guard."""
         with self.storage.transaction(write=False) as tx:
-            row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
+            selected = transaction_scope(tx)
+            if selected is not None and effect.execution.run_id != selected.run_id:
+                raise KernelError("effect_binding")
+            row = tx.one(*selected_statement(tx, "SELECT * FROM effects WHERE id=? AND subject=?",
+                      'SELECT * FROM effects WHERE id=? AND subject=? AND run_id=?',
+                      (effect.effect_id, effect.subject), run_last=True))
             if self._effect(tx, row, effect.execution) != effect:
                 raise KernelError("effect_binding")
             action = self._abandon_action(tx)
@@ -1298,19 +1371,26 @@ class Kernel:
     def _prepare_abandon_effect(self, tx: Transaction, run: sqlite3.Row, action: sqlite3.Row, subject: str,
                                 generation: int, work: Work, world: World, operation: str, *, before: str,
                                 payload: dict[str, Any]) -> PrepareIO | EffectIO:
+        selected = transaction_scope(tx)
+        if selected is not None and action["run_id"] != selected.run_id:
+            raise KernelError("effect_binding")
         execution = work.execution
         job = self._job(tx, subject)
         step = self._prepare_effect(tx, run, job, work, world, operation, before=before,
                                     payload={**payload, "control_action": action["id"]})
         if operation == "retire_pr":
             prior = payload["prior_pr"]
-            tx.execute("UPDATE effects SET generation=?,source_ref=?,target_ref=?,pr_number=?,base_sha=?,base_tree=? WHERE id=?",
-                       (generation, prior["source_ref"], prior["target_ref"], prior["number"], prior["base"]["sha"], prior["base"]["tree"], step.effect.effect_id))
+            tx.execute(*selected_statement(tx, "UPDATE effects SET generation=?,source_ref=?,target_ref=?,pr_number=?,base_sha=?,base_tree=? WHERE id=?",
+                'UPDATE effects SET generation=?,source_ref=?,target_ref=?,pr_number=?,base_sha=?,base_tree=? WHERE id=? AND run_id=?',
+                (generation, prior["source_ref"], prior["target_ref"], prior["number"], prior["base"]["sha"], prior["base"]["tree"], step.effect.effect_id), run_last=True))
         else:
             resource = payload.get("resource")
-            tx.execute("UPDATE effects SET generation=?,source_ref=? WHERE id=?",
-                       (generation, job["source_ref"] if resource is None else resource["source_ref"], step.effect.effect_id))
-        return replace(step, effect=self._effect(tx, tx.one("SELECT * FROM effects WHERE id=?", (step.effect.effect_id,)), execution))
+            tx.execute(*selected_statement(tx, "UPDATE effects SET generation=?,source_ref=? WHERE id=?",
+                'UPDATE effects SET generation=?,source_ref=? WHERE id=? AND run_id=?',
+                (generation, job["source_ref"] if resource is None else resource["source_ref"], step.effect.effect_id), run_last=True))
+        return replace(step, effect=self._effect(tx, tx.one(*selected_statement(tx, "SELECT * FROM effects WHERE id=?",
+                                                         'SELECT * FROM effects WHERE id=? AND run_id=?',
+                                                         (step.effect.effect_id,), run_last=True)), execution))
 
     def _advance_abandon(self, tx: Transaction, run: sqlite3.Row, action: sqlite3.Row, subject: str,
                          work: Work, world: World | None) -> Step | IORequest:
@@ -1543,10 +1623,15 @@ class Kernel:
         self._event(tx, subject, "generation_requeued", action_id, payload)
 
     def _pending_requeue(self, tx: Transaction, subject: str) -> sqlite3.Row | None:
-        rows = tx.rows("SELECT * FROM actions WHERE kind='requeue' AND subject=? AND status='pending'", (subject,), limit=1)
+        rows = tx.rows(*selected_statement(tx, "SELECT * FROM actions WHERE kind='requeue' AND subject=? AND status='pending'",
+                   "SELECT * FROM actions WHERE kind='requeue' AND subject=? AND status='pending' AND run_id=?",
+                   (subject,), run_last=True), limit=1)
         return None if not rows else rows[0]
 
     def _requeue_scope(self, tx: Transaction, action: sqlite3.Row) -> dict[str, Any]:
+        selected = transaction_scope(tx)
+        if selected is not None and action["run_id"] != selected.run_id:
+            raise KernelError("effect_binding")
         return dict(json.loads(tx.get(action["receipt_id"], action["subject"]))["requeue"])
 
     def _recorded_retirement(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, world: World) -> sqlite3.Row:
@@ -1610,7 +1695,9 @@ class Kernel:
                 observed = asdict(result)
         material = tx.put(job["id"], "retirement_readback", wire_json({"effect": row["id"], "receipt": row["receipt_id"], "result": observed}))
         if result.disposition == "target":
-            previous = tx.rows("SELECT material_id FROM history WHERE kind='retirement_rechecked' AND identity=? ORDER BY position DESC LIMIT 1", (action["id"],))
+            previous = tx.rows(*selected_statement(tx, "SELECT material_id FROM history WHERE kind='retirement_rechecked' AND identity=? ORDER BY position DESC LIMIT 1",
+                           "SELECT material_id FROM history WHERE kind='retirement_rechecked' AND identity=? AND run_id=? ORDER BY position DESC LIMIT 1",
+                           (action["id"],), run_last=True))
             if not previous or previous[0][0] != material:
                 self._event(tx, job["id"], "retirement_rechecked", action["id"], material)
             return Step("progress", job["id"])
@@ -1618,7 +1705,9 @@ class Kernel:
             self._gate(tx, job["id"], "write_result_unknown", evidence=material)
             self._event(tx, job["id"], "retirement_recheck_pending", action["id"], material)
             return Step("paused", job["id"], "write_result_unknown")
-        tx.execute("UPDATE actions SET status='superseded' WHERE id=?", (action["id"],))
+        tx.execute(*selected_statement(tx, "UPDATE actions SET status='superseded' WHERE id=?",
+            "UPDATE actions SET status='superseded' WHERE id=? AND run_id=?",
+            (action["id"],), run_last=True))
         self._gate(tx, job["id"], "requeue_retirement_changed", evidence=material)
         self._event(tx, job["id"], "requeue_superseded", action["id"], material)
         return Step("progress", job["id"], "requeue_retirement_changed")
@@ -1626,7 +1715,9 @@ class Kernel:
     def _requeue_versions_current(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row,
                                   action: sqlite3.Row, world: World | None) -> bool:
         scope = self._requeue_scope(tx, action)
-        facts = tx.rows("SELECT revision FROM issue_facts WHERE issue=?", (job["issue"],))
+        facts = tx.rows(*selected_statement(tx, "SELECT revision FROM issue_facts WHERE issue=?",
+                    'SELECT revision FROM issue_facts WHERE issue=? AND run_id=?',
+                    (job["issue"],), run_last=True))
         revision = run["observed_parent_revision"] if job["kind"] != DeliveryKind.TICKET else None if not facts else facts[0][0]
         return bool(scope["generation"] == job["generation"] and scope["revision"] == revision
                     and scope["parent_revision"] == run["observed_parent_revision"]
@@ -2437,13 +2528,18 @@ class Kernel:
             self._abandon_owned(tx, abandoned, execution)
 
     def _automatic_scope(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool) -> dict[str, Any]:
+        selected = transaction_scope(tx)
+        if selected is not None and run["id"] != selected.run_id:
+            raise KernelError("effect_binding")
         scope: dict[str, Any] = {"run": run["id"], "parent_revision": run["parent_revision"],
                                  "graph_revision": run["graph_revision"], "subject": subject, "cleanup": cleanup}
         abandoned = self._abandon_action(tx)
         if abandoned is not None:
             scope["abandon_action"] = abandoned["id"]
         if subject is None:
-            scope["final_target"] = [dict(row) for row in tx.rows("SELECT * FROM final_target")]
+            scope["final_target"] = [dict(row) for row in tx.rows(*selected_statement(tx, "SELECT * FROM final_target",
+                                                              'SELECT * FROM final_target WHERE run_id=?',
+                                                              (), run_last=True))]
         else:
             job = self._job(tx, subject)
             scope["delivery"] = {key: job[key] for key in (
@@ -2464,46 +2560,67 @@ class Kernel:
             job = self._job(tx, subject)
             return bool(job["kind"] == DeliveryKind.FINAL_RUN and job["phase"] == "refresh_final"
                         and job["refresh_revision"] == run["observed_parent_revision"] and not self._gates(tx, subject)
-                        and tx.rows("SELECT id FROM actions WHERE id=? AND subject=? AND status='pending' AND kind IN ('approve','resume')",
-                                    (run["final_action"], subject)))
+                        and tx.rows(*selected_statement(tx, "SELECT id FROM actions WHERE id=? AND subject=? AND status='pending' AND kind IN ('approve','resume')",
+                                "SELECT id FROM actions WHERE id=? AND subject=? AND status='pending' AND kind IN ('approve','resume') AND run_id=?",
+                                (run["final_action"], subject), run_last=True)))
         # Retirement still checks accepted versions, PR identity and publisher.
         return bool(not run["final_action"] and run["blocked"] == "requeue_required"
                     and self._pending_requeue(tx, subject) is not None
                     and all(gate["code"] == "requeue_required" for gate in self._gates(tx, subject)))
 
     def _automatic_progress(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool) -> str:
+        selected = transaction_scope(tx)
+        if selected is not None and run["id"] != selected.run_id:
+            raise KernelError("effect_binding")
         # No sequence counters, diagnostics, history, clocks, polling attempts
         # or sibling records can make a stalled operation appear to progress.
         abandoned = self._abandon_action(tx)
         if abandoned is not None:
             unsettled = self._abandon_scope(tx, abandoned)["unsettled"]
             facts: Any = {"action": abandoned["id"], "status": abandoned["status"],
-                          "effects": [dict(row) for row in tx.all(
-                              "SELECT id,status,receipt_id FROM effects WHERE control_action=? ORDER BY id", (abandoned["id"],))],
-                          "originals": [dict(tx.one("SELECT id,status,receipt_id FROM effects WHERE id=?", (effect_id,)))
+                          "effects": [dict(row) for row in tx.all(*selected_statement(tx, "SELECT id,status,receipt_id FROM effects WHERE control_action=? ORDER BY id",
+                                                               'SELECT id,status,receipt_id FROM effects WHERE control_action=? AND run_id=? ORDER BY id',
+                                                               (abandoned["id"],), run_last=True))],
+                          "originals": [dict(tx.one(*selected_statement(tx, "SELECT id,status,receipt_id FROM effects WHERE id=?",
+                                                 'SELECT id,status,receipt_id FROM effects WHERE id=? AND run_id=?',
+                                                 (effect_id,), run_last=True)))
                                         for effect_id in unsettled]}
         elif subject is None:
-            facts = [dict(row) for row in tx.rows("SELECT id,generation,phase FROM subjects WHERE kind='final_run'")]
+            facts = [dict(row) for row in tx.rows(*selected_statement(tx, "SELECT id,generation,phase FROM subjects WHERE kind='final_run'",
+                                              "SELECT id,generation,phase FROM subjects WHERE kind='final_run' AND run_id=?",
+                                              (), run_last=True))]
         else:
             job = self._job(tx, subject)
             facts = {"delivery": {key: job[key] for key in job.keys() if key not in {"version", "last_failure", "checks_id"}},
-                     "attempt": [dict(row) for row in tx.rows(
-                         "SELECT id,status,result_id,accounted,outcome,current_invocation,resume_action,new_thread "
-                         "FROM attempts WHERE id=?", (job["current_attempt"],))],
-                     "effects": [dict(row) for row in tx.all(
-                         "SELECT id,operation,status,receipt_id FROM effects WHERE subject=? AND status IN ('prepared','sent','observed') ORDER BY id", (subject,))],
-                     "gates": [dict(row) for row in tx.rows("SELECT code,purpose FROM gates WHERE subject=? ORDER BY code", (subject,))],
-                     "work_queue": bool(tx.rows("SELECT subject FROM work_queue WHERE subject=?", (subject,))),
-                     "integration_queue": bool(tx.rows("SELECT subject FROM integration_queue WHERE subject=?", (subject,))),
+                     "attempt": [dict(row) for row in tx.rows(*selected_statement(tx, "SELECT id,status,result_id,accounted,outcome,current_invocation,resume_action,new_thread "
+                         "FROM attempts WHERE id=?",
+                                                          'SELECT id,status,result_id,accounted,outcome,current_invocation,resume_action,new_thread FROM attempts WHERE id=? AND run_id=?',
+                                                          (job["current_attempt"],), run_last=True))],
+                     "effects": [dict(row) for row in tx.all(*selected_statement(tx, "SELECT id,operation,status,receipt_id FROM effects WHERE subject=? AND status IN ('prepared','sent','observed') ORDER BY id",
+                                                          "SELECT id,operation,status,receipt_id FROM effects WHERE subject=? AND status IN ('prepared','sent','observed') AND run_id=? ORDER BY id",
+                                                          (subject,), run_last=True))],
+                     "gates": [dict(row) for row in tx.rows(*selected_statement(tx, "SELECT code,purpose FROM gates WHERE subject=? ORDER BY code",
+                                                        'SELECT code,purpose FROM gates WHERE subject=? AND run_id=? ORDER BY code',
+                                                        (subject,), run_last=True))],
+                     "work_queue": bool(tx.rows(*selected_statement(tx, "SELECT subject FROM work_queue WHERE subject=?",
+                                            'SELECT subject FROM work_queue WHERE subject=? AND run_id=?',
+                                            (subject,), run_last=True))),
+                     "integration_queue": bool(tx.rows(*selected_statement(tx, "SELECT subject FROM integration_queue WHERE subject=?",
+                                                   'SELECT subject FROM integration_queue WHERE subject=? AND run_id=?',
+                                                   (subject,), run_last=True))),
                      "integration_seat": run["integration_holder"] == subject,
-                     "cleanup": [dict(row) for row in tx.rows("SELECT generation,stage,state,effect_id,outcome FROM resource_cleanup WHERE subject=? AND generation=?", (subject, job["generation"]))],
-                     "link": [dict(row) for row in tx.rows("SELECT generation,state,effect_id FROM issue_links WHERE subject=?", (subject,))]}
+                     "cleanup": [dict(row) for row in tx.rows(*selected_statement(tx, "SELECT generation,stage,state,effect_id,outcome FROM resource_cleanup WHERE subject=? AND generation=?",
+                                                          'SELECT generation,stage,state,effect_id,outcome FROM resource_cleanup WHERE subject=? AND generation=? AND run_id=?',
+                                                          (subject, job["generation"]), run_last=True))],
+                     "link": [dict(row) for row in tx.rows(*selected_statement(tx, "SELECT generation,state,effect_id FROM issue_links WHERE subject=?",
+                                                       'SELECT generation,state,effect_id FROM issue_links WHERE subject=? AND run_id=?',
+                                                       (subject,), run_last=True))]}
             requeue = self._pending_requeue(tx, subject)
             # This exact current-Action witness is consumed by _advance_requeue
             # before generation replacement; unrelated audit events never count.
-            facts["requeue_readback"] = None if requeue is None else [dict(row) for row in tx.rows(
-                "SELECT material_id FROM history WHERE kind='retirement_rechecked' AND identity=? ORDER BY position DESC LIMIT 1",
-                (requeue["id"],))]
+            facts["requeue_readback"] = None if requeue is None else [dict(row) for row in tx.rows(*selected_statement(tx, "SELECT material_id FROM history WHERE kind='retirement_rechecked' AND identity=? ORDER BY position DESC LIMIT 1",
+                                                                                               "SELECT material_id FROM history WHERE kind='retirement_rechecked' AND identity=? AND run_id=? ORDER BY position DESC LIMIT 1",
+                                                                                               (requeue["id"],), run_last=True))]
         return self._fingerprint(facts)
 
     @staticmethod
@@ -2527,7 +2644,9 @@ class Kernel:
         value = self._automatic_token(token)
         scope = value["scope"]
         with self.storage.transaction() as tx:
-            run = tx.one("SELECT * FROM runs")
+            run = tx.one(*selected_statement(tx, "SELECT * FROM runs",
+                      'SELECT * FROM runs WHERE id=?',
+                      (), run_last=True))
             self._automatic_owned(tx, run, execution)
             if scope != self._automatic_scope(tx, run, scope["subject"], scope["cleanup"]):
                 raise ObservationSuperseded("automatic_step_superseded")
@@ -2535,7 +2654,9 @@ class Kernel:
                     gate["code"] == "supervision_timeout" for gate in self._gates(tx, scope["subject"]))):
                 return Step("paused", scope["subject"] or "", "supervision_timeout")
             if readback is not None:
-                row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (readback.effect_id, scope["subject"]))
+                row = tx.one(*selected_statement(tx, "SELECT * FROM effects WHERE id=? AND subject=?",
+                          'SELECT * FROM effects WHERE id=? AND subject=? AND run_id=?',
+                          (readback.effect_id, scope["subject"]), run_last=True))
                 if row["status"] != "sent" or self._effect(tx, row, execution) != readback:
                     raise KernelError("effect_binding")
             if (readback is None and self._abandon_action(tx) is None
@@ -2549,14 +2670,22 @@ class Kernel:
         with self.storage.transaction() as tx:
             self._check_operation(tx, token, execution)
             scope = self._automatic_token(token)["scope"]
-            return self._operation_read_wait(tx, tx.one("SELECT * FROM runs"), scope, after_read=True)
+            return self._operation_read_wait(tx, tx.one(*selected_statement(tx, "SELECT * FROM runs",
+                                                     'SELECT * FROM runs WHERE id=?',
+                                                     (), run_last=True)), scope, after_read=True)
 
     def _operation_read_wait(self, tx: Transaction, run: sqlite3.Row, scope: dict[str, Any], *,
                              after_read: bool) -> Step | None:
-        owner = scope["subject"] or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
-        rows = tx.rows("SELECT w.* FROM waits w JOIN material m ON m.id=w.scope_id "
+        selected = transaction_scope(tx)
+        if selected is not None and (run["id"] != selected.run_id or scope.get("run") != selected.run_id):
+            raise KernelError("effect_binding")
+        owner = scope["subject"] or tx.one(*selected_statement(tx, "SELECT id FROM subjects ORDER BY id LIMIT 1",
+                                        'SELECT id FROM subjects WHERE run_id=? ORDER BY id LIMIT 1',
+                                        (), run_last=True))[0]
+        rows = tx.rows(*selected_statement(tx, "SELECT w.* FROM waits w JOIN material m ON m.id=w.scope_id "
                        "WHERE m.subject=? AND m.purpose='supervision_scope' AND m.body=? ORDER BY w.deadline LIMIT 1",
-                       (owner, wire_json(scope)))
+                   "SELECT w.* FROM waits w JOIN material m ON m.run_id=w.run_id AND m.id=w.scope_id WHERE m.subject=? AND m.purpose='supervision_scope' AND m.body=? AND w.run_id=? ORDER BY w.deadline LIMIT 1",
+                   (owner, wire_json(scope)), run_last=True))
         if rows:
             row = rows[0]
             if self.clock() >= row["deadline"]:
@@ -2571,16 +2700,25 @@ class Kernel:
         value = self._automatic_token(token)
         scope, subject = value["scope"], value["scope"]["subject"]
         with self.storage.transaction() as tx:
-            run = tx.one("SELECT * FROM runs")
+            selected = transaction_scope(tx)
+            if selected is not None and scope.get("run") != selected.run_id:
+                raise ObservationSuperseded("automatic_step_superseded")
+            run = tx.one(*selected_statement(tx, "SELECT * FROM runs",
+                      'SELECT * FROM runs WHERE id=?',
+                      (), run_last=True))
             self._automatic_owned(tx, run, execution)
             if subject is not None and step.subject != subject and self._abandon_action(tx) is None:
                 raise KernelError("automatic_step_identity")
             if step.kind == "progress" and value["progress"] == self._automatic_progress(tx, run, subject, scope["cleanup"]):
-                owner = subject or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
+                owner = subject or tx.one(*selected_statement(tx, "SELECT id FROM subjects ORDER BY id LIMIT 1",
+                                       'SELECT id FROM subjects WHERE run_id=? ORDER BY id LIMIT 1',
+                                       (), run_last=True))[0]
                 evidence = tx.put(owner, "execution_failure", wire_json({"code": "controller_no_progress",
                     "message": "Controller returned Progress without changing its durable business identity", "scope": scope}))
                 if subject is None:
-                    tx.execute("UPDATE runs SET blocked='execution_failed'")
+                    tx.execute(*selected_statement(tx, "UPDATE runs SET blocked='execution_failed'",
+                        "UPDATE runs SET blocked='execution_failed' WHERE id=?",
+                        (), run_last=True))
                     self._event(tx, owner, "paused", "controller_no_progress", evidence)
                 else:
                     self._gate(tx, subject, "execution_failed", evidence=evidence)
@@ -2590,7 +2728,9 @@ class Kernel:
                                 and scope == self._automatic_scope(tx, run, subject, scope["cleanup"]))
             if (step.kind not in {"waiting", "observe", "reconcile", "agent", "effect"}
                     and step.reason != "supervision_timeout" and not checks_unchanged):
-                tx.execute("DELETE FROM waits WHERE subject IS ? AND kind='github_convergence'", (subject,))
+                tx.execute(*selected_statement(tx, "DELETE FROM waits WHERE subject IS ? AND kind='github_convergence'",
+                    "DELETE FROM waits WHERE subject IS ? AND kind='github_convergence' AND run_id=?",
+                    (subject,), run_last=True))
             return step
 
     def _wait_for_read(self, token: str | ReadFence, execution: Execution, code: str, message: str, *, readback: Effect | None = None) -> Step:
@@ -2600,7 +2740,9 @@ class Kernel:
         value = self._automatic_token(token)
         scope, subject = value["scope"], value["scope"]["subject"]
         with self.storage.transaction() as tx:
-            run = tx.one("SELECT * FROM runs")
+            run = tx.one(*selected_statement(tx, "SELECT * FROM runs",
+                      'SELECT * FROM runs WHERE id=?',
+                      (), run_last=True))
             self._automatic_owned(tx, run, execution)
             if scope != self._automatic_scope(tx, run, subject, scope["cleanup"]):
                 return Step("waiting", subject or "", "observation_superseded")
@@ -2608,7 +2750,9 @@ class Kernel:
             abandoned = self._abandon_action(tx)
             requeue = self._automatic_control_read(tx, run, subject, scope["cleanup"])
             if readback is not None:
-                original = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (readback.effect_id, subject))
+                original = tx.one(*selected_statement(tx, "SELECT * FROM effects WHERE id=? AND subject=?",
+                               'SELECT * FROM effects WHERE id=? AND subject=? AND run_id=?',
+                               (readback.effect_id, subject), run_last=True))
                 if original["status"] != "sent" or self._effect(tx, original, execution) != readback:
                     raise KernelError("effect_binding")
             timed_out = run["blocked"] == "supervision_timeout" or any(gate["code"] == "supervision_timeout" for gate in gates)
@@ -2616,20 +2760,28 @@ class Kernel:
                     or ((abandoned is None or abandoned["status"] != "pending") and not requeue and readback is None
                         and (run["stopped"] or run["blocked"] or gates))):
                 return Step("paused", subject or "", "supervision_timeout" if timed_out else run["blocked"] or "operator_gate")
-            owner = subject or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
+            owner = subject or tx.one(*selected_statement(tx, "SELECT id FROM subjects ORDER BY id LIMIT 1",
+                                   'SELECT id FROM subjects WHERE run_id=? ORDER BY id LIMIT 1',
+                                   (), run_last=True))[0]
             evidence = tx.put(owner, "github_read_observation", wire_json({"code": code, "message": bounded_error(message)}))
             scope_id = tx.put(owner, "supervision_scope", wire_json(scope))
-            pending = tx.rows("SELECT id,attempts,generation FROM effects WHERE subject=? "
-                              "AND status IN ('prepared','sent') AND operation!='issue_link' ORDER BY rowid LIMIT 1", (owner,))
+            pending = tx.rows(*selected_statement(tx, "SELECT id,attempts,generation FROM effects WHERE subject=? "
+                              "AND status IN ('prepared','sent') AND operation!='issue_link' ORDER BY rowid LIMIT 1",
+                          "SELECT id,attempts,generation FROM effects WHERE subject=? AND status IN ('prepared','sent') AND operation!='issue_link' AND run_id=? ORDER BY rowid LIMIT 1",
+                          (owner,), run_last=True))
             identity = scope_id if not pending else f"{scope_id}:{pending[0]['id']}:{pending[0]['attempts']}"
-            if not tx.rows("SELECT position FROM history WHERE subject=? AND kind='github_read_observation' "
-                           "AND identity=? AND material_id=? LIMIT 1", (owner, identity, evidence)):
+            if not tx.rows(*selected_statement(tx, "SELECT position FROM history WHERE subject=? AND kind='github_read_observation' "
+                           "AND identity=? AND material_id=? LIMIT 1",
+                       "SELECT position FROM history WHERE subject=? AND kind='github_read_observation' AND identity=? AND material_id=? AND run_id=? LIMIT 1",
+                       (owner, identity, evidence), run_last=True)):
                 self._event(tx, owner, "github_read_observation", identity, evidence,
                             generation=None if not pending else pending[0]["generation"])
             if code in {"ambiguous_run_pr", "invalid_fixture", "invalid_parent", "missing_parent", "stale_run_pr",
                         "foreign_run_pr", "github_invalid_response", "change_pr_identity_mismatch", "change_pr_head_drift", "parent_close_external_conflict"}:
                 if subject is None:
-                    tx.execute("UPDATE runs SET blocked='deterministic_contradiction'")
+                    tx.execute(*selected_statement(tx, "UPDATE runs SET blocked='deterministic_contradiction'",
+                        "UPDATE runs SET blocked='deterministic_contradiction' WHERE id=?",
+                        (), run_last=True))
                     self._event(tx, owner, "paused", code, evidence)
                 else:
                     self._gate(tx, subject, "deterministic_contradiction", evidence=evidence)
@@ -2638,16 +2790,24 @@ class Kernel:
 
     def _supervised_wait(self, tx: Transaction, run: sqlite3.Row, subject: str | None, scope: Mapping[str, Any],
                          kind: str, seconds: float, evidence: str | None = None) -> Step:
-        owner = subject or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
+        selected = transaction_scope(tx)
+        if selected is not None and (run["id"] != selected.run_id or scope.get("run") != selected.run_id):
+            raise KernelError("effect_binding")
+        owner = subject or tx.one(*selected_statement(tx, "SELECT id FROM subjects ORDER BY id LIMIT 1",
+                               'SELECT id FROM subjects WHERE run_id=? ORDER BY id LIMIT 1',
+                               (), run_last=True))[0]
         scope_id = tx.put(owner, "supervision_scope", wire_json(scope))
         now = self.clock()
         # Actual pending checks establish their own frozen Policy window. Later
         # uncertainty reuses it; an earlier convergence wait cannot shorten it.
         checks_scope = scope.get("delivery", {}).get("phase") in {"checks", "merge"}
-        rows = tx.rows("SELECT * FROM waits WHERE scope_id=? AND (kind=? OR ?) ORDER BY deadline LIMIT 1",
-                       (scope_id, kind, checks_scope))
+        rows = tx.rows(*selected_statement(tx, "SELECT * FROM waits WHERE scope_id=? AND (kind=? OR ?) ORDER BY deadline LIMIT 1",
+                   'SELECT * FROM waits WHERE scope_id=? AND (kind=? OR ?) AND run_id=? ORDER BY deadline LIMIT 1',
+                   (scope_id, kind, checks_scope), run_last=True))
         if checks_scope and kind == "required_checks" and rows and rows[0]["kind"] == "github_convergence":
-            tx.execute("DELETE FROM waits WHERE scope_id=?", (scope_id,))
+            tx.execute(*selected_statement(tx, "DELETE FROM waits WHERE scope_id=?",
+                'DELETE FROM waits WHERE scope_id=? AND run_id=?',
+                (scope_id,), run_last=True))
             rows = []
         if rows:
             kind = rows[0]["kind"]
@@ -2655,24 +2815,35 @@ class Kernel:
         if not rows:
             # One current identity per subject and wait kind. Retain immutable
             # evidence, but never let an obsolete object govern a new candidate.
-            tx.execute("DELETE FROM waits WHERE subject IS ? AND kind=?", (subject, kind))
-            tx.execute("INSERT INTO waits(subject,kind,scope_id,started_at,deadline,evidence) VALUES (?,?,?,?,?,?)",
-                       (subject, kind, scope_id, now, now + seconds, evidence))
-        row = tx.one("SELECT * FROM waits WHERE scope_id=? AND kind=?", (scope_id, kind))
+            tx.execute(*selected_statement(tx, "DELETE FROM waits WHERE subject IS ? AND kind=?",
+                'DELETE FROM waits WHERE subject IS ? AND kind=? AND run_id=?',
+                (subject, kind), run_last=True))
+            tx.execute(*selected_statement(tx, "INSERT INTO waits(subject,kind,scope_id,started_at,deadline,evidence) VALUES (?,?,?,?,?,?)",
+                'INSERT INTO waits(subject,kind,scope_id,started_at,deadline,evidence,run_id) VALUES (?,?,?,?,?,?,?)',
+                (subject, kind, scope_id, now, now + seconds, evidence), run_last=True))
+        row = tx.one(*selected_statement(tx, "SELECT * FROM waits WHERE scope_id=? AND kind=?",
+                  'SELECT * FROM waits WHERE scope_id=? AND kind=? AND run_id=?',
+                  (scope_id, kind), run_last=True))
         if now >= row["deadline"]:
             detail = tx.put(owner, "supervision_timeout", wire_json({"kind": kind, "scope_id": scope_id,
                 "started_at": row["started_at"], "deadline": row["deadline"], "budget_seconds": seconds,
                 "retry_count": row["retry_count"], "latest_observation": evidence or row["evidence"]}))
             if evidence is not None:
-                tx.execute("UPDATE waits SET evidence=? WHERE scope_id=? AND kind=?", (evidence, scope_id, kind))
+                tx.execute(*selected_statement(tx, "UPDATE waits SET evidence=? WHERE scope_id=? AND kind=?",
+                    'UPDATE waits SET evidence=? WHERE scope_id=? AND kind=? AND run_id=?',
+                    (evidence, scope_id, kind), run_last=True))
             if subject is None:
-                tx.execute("UPDATE runs SET blocked='supervision_timeout'")
+                tx.execute(*selected_statement(tx, "UPDATE runs SET blocked='supervision_timeout'",
+                    "UPDATE runs SET blocked='supervision_timeout' WHERE id=?",
+                    (), run_last=True))
                 self._event(tx, owner, "paused", "supervision_timeout", detail)
             else:
                 self._gate(tx, subject, "supervision_timeout", evidence=detail)
             abandoned = self._abandon_action(tx)
             if abandoned is not None:
-                for pending in tx.rows("SELECT id FROM effects WHERE subject IS ? AND status='sent'", (subject,)):
+                for pending in tx.rows(*selected_statement(tx, "SELECT id FROM effects WHERE subject IS ? AND status='sent'",
+                                   "SELECT id FROM effects WHERE subject IS ? AND status='sent' AND run_id=?",
+                                   (subject,), run_last=True)):
                     self._event(tx, owner, "abandon_reconciliation_pending", pending["id"], detail)
             self._finish_final_failure(tx, run)
             return Step("paused", subject or "", "supervision_timeout")
@@ -2681,8 +2852,9 @@ class Kernel:
         if retry_at is None or now >= retry_at:
             retries += 1
             retry_at = min(now + min(60, 5 * 2 ** min(retries - 1, 4)), row["deadline"])
-        tx.execute("UPDATE waits SET retry_count=?,next_retry_at=?,evidence=COALESCE(?,evidence) WHERE scope_id=? AND kind=?",
-                   (retries, retry_at, evidence, scope_id, kind))
+        tx.execute(*selected_statement(tx, "UPDATE waits SET retry_count=?,next_retry_at=?,evidence=COALESCE(?,evidence) WHERE scope_id=? AND kind=?",
+            'UPDATE waits SET retry_count=?,next_retry_at=?,evidence=COALESCE(?,evidence) WHERE scope_id=? AND kind=? AND run_id=?',
+            (retries, retry_at, evidence, scope_id, kind), run_last=True))
         return Step("waiting", subject or "", kind, retry_at=retry_at)
 
     def agent_source_ready(self, call: AgentCall) -> None:
@@ -2772,7 +2944,9 @@ class Kernel:
         return step
 
     def _cleanup_current(self, tx: Transaction, job: sqlite3.Row, row: sqlite3.Row) -> bool:
-        records = tx.rows("SELECT * FROM resource_cleanup WHERE subject=? AND generation=?", (job["id"], row["generation"]))
+        records = tx.rows(*selected_statement(tx, "SELECT * FROM resource_cleanup WHERE subject=? AND generation=?",
+                      'SELECT * FROM resource_cleanup WHERE subject=? AND generation=? AND run_id=?',
+                      (job["id"], row["generation"]), run_last=True))
         return bool(records and job["phase"] == "complete" and job["generation"] == row["generation"]
                     and records[0]["effect_id"] == row["id"] and records[0]["stage"] < len(self.CLEANUP)
                     and self.CLEANUP[records[0]["stage"]] == row["operation"] and records[0]["source_ref"] == row["source_ref"])
@@ -2780,15 +2954,21 @@ class Kernel:
     def acknowledge_link(self, effect: Effect, result: EffectResult) -> None:
         """Accept the original call's acknowledgement; never promote a readback."""
         with self.storage.transaction() as tx:
-            row = tx.one("SELECT * FROM effects WHERE id=? AND operation='issue_link'", (effect.effect_id,))
+            row = tx.one(*selected_statement(tx, "SELECT * FROM effects WHERE id=? AND operation='issue_link'",
+                      "SELECT * FROM effects WHERE id=? AND operation='issue_link' AND run_id=?",
+                      (effect.effect_id,), run_last=True))
             if self._effect(tx, row, effect.execution) != effect or row["status"] != "sent":
                 raise KernelError("effect_binding")
             status = result.raw.get("acknowledged_status")
             if status not in {"linked", "unavailable"}:
                 return
             receipt = tx.put(effect.subject, "issue_link_ack", wire_json(asdict(result)))
-            tx.execute("UPDATE issue_links SET state=? WHERE effect_id=?", (status, effect.effect_id))
-            tx.execute("UPDATE effects SET status='confirmed',receipt_id=? WHERE id=?", (receipt, effect.effect_id))
+            tx.execute(*selected_statement(tx, "UPDATE issue_links SET state=? WHERE effect_id=?",
+                'UPDATE issue_links SET state=? WHERE effect_id=? AND run_id=?',
+                (status, effect.effect_id), run_last=True))
+            tx.execute(*selected_statement(tx, "UPDATE effects SET status='confirmed',receipt_id=? WHERE id=?",
+                "UPDATE effects SET status='confirmed',receipt_id=? WHERE id=? AND run_id=?",
+                (receipt, effect.effect_id), run_last=True))
             self._event(tx, effect.subject, "issue_link_acknowledged", effect.effect_id, receipt)
 
     def receive(self, call: AgentCall, raw: bytes) -> None:
@@ -3134,7 +3314,9 @@ class Kernel:
         with self.storage.transaction(write=False) as tx:
             self._check_operation(tx, token, execution)
             run, job = self._effect_owned(tx, effect, execution)
-            row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
+            row = tx.one(*selected_statement(tx, "SELECT * FROM effects WHERE id=? AND subject=?",
+                      'SELECT * FROM effects WHERE id=? AND subject=? AND run_id=?',
+                      (effect.effect_id, effect.subject), run_last=True))
             self._guard_publisher(tx, run, row, world)
             abandoned = self._abandon_action(tx)
             if abandoned is not None:
@@ -4502,7 +4684,9 @@ class Kernel:
             return False
         if self._final_closing(tx, run, job) and row["operation"] in {"merge", "completion_comment", "close"}:
             return False
-        facts = tx.rows("SELECT revision FROM issue_facts WHERE issue=?", (job["issue"],))
+        facts = tx.rows(*selected_statement(tx, "SELECT revision FROM issue_facts WHERE issue=?",
+                    'SELECT revision FROM issue_facts WHERE issue=? AND run_id=?',
+                    (job["issue"],), run_last=True))
         return bool(row["generation"] != job["generation"] or row["parent_revision"] != run["observed_parent_revision"]
                     or row["graph_revision"] != run["observed_graph_revision"] or job["refresh_revision"] is not None
                     or (job["kind"] == DeliveryKind.TICKET and facts and row["revision"] != facts[0][0])
@@ -4528,9 +4712,12 @@ class Kernel:
         if (job["kind"] != DeliveryKind.FINAL_RUN or not job["grant_id"]
                 or run["observed_graph_revision"] not in {None, run["graph_revision"]}):
             return None
-        grant = tx.one("SELECT * FROM grants WHERE id=? AND subject=?", (job["grant_id"], job["id"]))
-        intents = tx.rows("SELECT * FROM effects WHERE subject=? AND generation=? AND operation='merge' AND status IN ('sent','observed','confirmed') ORDER BY rowid DESC LIMIT 1",
-                          (job["id"], job["generation"]))
+        grant = tx.one(*selected_statement(tx, "SELECT * FROM grants WHERE id=? AND subject=?",
+                    'SELECT * FROM grants WHERE id=? AND subject=? AND run_id=?',
+                    (job["grant_id"], job["id"]), run_last=True))
+        intents = tx.rows(*selected_statement(tx, "SELECT * FROM effects WHERE subject=? AND generation=? AND operation='merge' AND status IN ('sent','observed','confirmed') ORDER BY rowid DESC LIMIT 1",
+                      "SELECT * FROM effects WHERE subject=? AND generation=? AND operation='merge' AND status IN ('sent','observed','confirmed') AND run_id=? ORDER BY rowid DESC LIMIT 1",
+                      (job["id"], job["generation"]), run_last=True))
         if not intents:
             return None
         intent = intents[0]
@@ -4641,27 +4828,46 @@ class Kernel:
 
     def _settle_stale_effect(self, tx: Transaction, job: sqlite3.Row, row: sqlite3.Row) -> Step:
         """Save the original outcome without granting any successor operation."""
+        selected = transaction_scope(tx)
+        if selected is not None and (job["run_id"] != selected.run_id or row["run_id"] != selected.run_id
+                                     or row["subject"] != job["id"]):
+            raise KernelError("effect_binding")
         result = json.loads(tx.get(row["receipt_id"], job["id"]))
-        self._validate_target(tx, tx.one("SELECT * FROM runs"), job, row, result)
+        self._validate_target(tx, tx.one(*selected_statement(tx, "SELECT * FROM runs",
+                                      'SELECT * FROM runs WHERE id=?',
+                                      (), run_last=True)), job, row, result)
         commit = result["commit"]
         operation = row["operation"]
         if result["disposition"] == "target":
             if operation in {"candidate", "integrate"} and commit:
-                tx.execute("UPDATE subjects SET workspace_sha=? WHERE id=?", (commit["sha"], job["id"]))
+                tx.execute(*selected_statement(tx, "UPDATE subjects SET workspace_sha=? WHERE id=?",
+                    'UPDATE subjects SET workspace_sha=? WHERE id=? AND run_id=?',
+                    (commit["sha"], job["id"]), run_last=True))
             elif operation == "push" or operation == "run_branch" and job["kind"] == DeliveryKind.FINAL_RUN:
-                tx.execute("UPDATE subjects SET source_sha=? WHERE id=?", (row["after_sha"], job["id"]))
+                tx.execute(*selected_statement(tx, "UPDATE subjects SET source_sha=? WHERE id=?",
+                    'UPDATE subjects SET source_sha=? WHERE id=? AND run_id=?',
+                    (row["after_sha"], job["id"]), run_last=True))
                 self._record_source_write(tx, job["id"], row["source_ref"], row["after_sha"])
             elif operation == "publication_commit" and commit:
-                tx.execute("UPDATE subjects SET publication_sha=?,publication_tree=?,workspace_sha=? WHERE id=?",
-                           (commit["sha"], commit["tree"], commit["sha"], job["id"]))
+                tx.execute(*selected_statement(tx, "UPDATE subjects SET publication_sha=?,publication_tree=?,workspace_sha=? WHERE id=?",
+                    'UPDATE subjects SET publication_sha=?,publication_tree=?,workspace_sha=? WHERE id=? AND run_id=?',
+                    (commit["sha"], commit["tree"], commit["sha"], job["id"]), run_last=True))
             elif operation == "pr_write" and result["pr"]:
-                tx.execute("UPDATE subjects SET pr_number=? WHERE id=?", (result["pr"]["number"], job["id"]))
+                tx.execute(*selected_statement(tx, "UPDATE subjects SET pr_number=? WHERE id=?",
+                    'UPDATE subjects SET pr_number=? WHERE id=? AND run_id=?',
+                    (result["pr"]["number"], job["id"]), run_last=True))
             elif operation == "merge" and commit:
-                tx.execute("UPDATE subjects SET merge_sha=? WHERE id=?", (commit["sha"], job["id"]))
+                tx.execute(*selected_statement(tx, "UPDATE subjects SET merge_sha=? WHERE id=?",
+                    'UPDATE subjects SET merge_sha=? WHERE id=? AND run_id=?',
+                    (commit["sha"], job["id"]), run_last=True))
             elif operation == "validation_checkout":
                 payload = json.loads(tx.get(row["payload_id"], job["id"]))
-                tx.execute("UPDATE subjects SET validation_cleanup=? WHERE id=?", (payload["checkout"], job["id"]))
-        tx.execute("UPDATE effects SET status='confirmed' WHERE id=?", (row["id"],))
+                tx.execute(*selected_statement(tx, "UPDATE subjects SET validation_cleanup=? WHERE id=?",
+                    'UPDATE subjects SET validation_cleanup=? WHERE id=? AND run_id=?',
+                    (payload["checkout"], job["id"]), run_last=True))
+        tx.execute(*selected_statement(tx, "UPDATE effects SET status='confirmed' WHERE id=?",
+            "UPDATE effects SET status='confirmed' WHERE id=? AND run_id=?",
+            (row["id"],), run_last=True))
         self._event(tx, job["id"], "stale_intent_settled", row["id"], row["receipt_id"])
         return Step("progress", job["id"], "original_outcome_retained")
 
@@ -4698,8 +4904,13 @@ class Kernel:
             tx.execute("UPDATE subjects SET validation_cleanup=validation_checkout,validation_checkout=NULL WHERE id=?", (job["id"],))
 
     def _effect(self, tx: Transaction, row: sqlite3.Row, execution: Execution) -> Effect:
+        selected = transaction_scope(tx)
+        if selected is not None and (row["run_id"] != selected.run_id or execution.run_id != selected.run_id):
+            raise KernelError("effect_binding")
         return Effect(row["id"], row["subject"], row["operation"],
-                      tx.one("SELECT repository FROM runs")[0], row["source_ref"], row["target_ref"],
+                      tx.one(*selected_statement(tx, "SELECT repository FROM runs",
+                          'SELECT repository FROM runs WHERE id=?',
+                          (), run_last=True))[0], row["source_ref"], row["target_ref"],
                       row["before_sha"], row["after_sha"],
                       None if row["candidate_sha"] is None else Commit(row["candidate_sha"], row["candidate_tree"]),
                       Commit(row["base_sha"], row["base_tree"]), row["pr_number"], row["actor"],
@@ -4886,7 +5097,9 @@ class Kernel:
         return header + narrative.strip()
 
     def _last_attempt(self, tx: Transaction, subject: str, role: Role) -> str:
-        return str(tx.one("SELECT id FROM attempts WHERE subject=? AND role=? ORDER BY ordinal DESC LIMIT 1", (subject, role.value))[0])
+        return str(tx.one(*selected_statement(tx, "SELECT id FROM attempts WHERE subject=? AND role=? ORDER BY ordinal DESC LIMIT 1",
+                       'SELECT id FROM attempts WHERE subject=? AND role=? AND run_id=? ORDER BY ordinal DESC LIMIT 1',
+                       (subject, role.value), run_last=True))[0])
 
     def _checks_wait(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, checks: Checks | None) -> Step | None:
         if checks is None or checks.pr_number != job["pr_number"] or checks.head_sha != job["publication_sha"]:
@@ -4911,8 +5124,13 @@ class Kernel:
         return self._supervised_wait(tx, run, job["id"], self._automatic_scope(tx, run, job["id"], False), kind, seconds)
 
     def _finish_final_failure(self, tx: Transaction, run: sqlite3.Row, result: str = "failed") -> None:
+        selected = transaction_scope(tx)
+        if selected is not None and run["id"] != selected.run_id:
+            raise KernelError("effect_binding")
         if run["final_action"]:
-            tx.execute("UPDATE actions SET status=? WHERE id=?", (result, run["final_action"]))
+            tx.execute(*selected_statement(tx, "UPDATE actions SET status=? WHERE id=?",
+                'UPDATE actions SET status=? WHERE id=? AND run_id=?',
+                (result, run["final_action"]), run_last=True))
             tx.execute("UPDATE runs SET final_action=NULL WHERE id=?", (run["id"],))
 
     def _integration_seat(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row) -> bool:
@@ -4943,8 +5161,9 @@ class Kernel:
     def _integration_origin(self, tx: Transaction, job: sqlite3.Row) -> Commit:
         if job["workspace_sha"] == job["candidate_sha"] and job["candidate_tree"]:
             return Commit(job["candidate_sha"], job["candidate_tree"])
-        receipts = tx.rows("SELECT receipt_id FROM effects WHERE subject=? AND generation=? AND status='confirmed' AND operation IN ('candidate','integrate','publication_commit') ORDER BY rowid DESC LIMIT 1",
-                           (job["id"], job["generation"]))
+        receipts = tx.rows(*selected_statement(tx, "SELECT receipt_id FROM effects WHERE subject=? AND generation=? AND status='confirmed' AND operation IN ('candidate','integrate','publication_commit') ORDER BY rowid DESC LIMIT 1",
+                       "SELECT receipt_id FROM effects WHERE subject=? AND generation=? AND status='confirmed' AND operation IN ('candidate','integrate','publication_commit') AND run_id=? ORDER BY rowid DESC LIMIT 1",
+                       (job["id"], job["generation"]), run_last=True))
         if receipts:
             result = json.loads(tx.get(receipts[0][0], job["id"]))
             commit = result.get("commit")
@@ -4955,17 +5174,24 @@ class Kernel:
     def _prepare_effect(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, work: Work,
                         world: World, operation: str, *, before: str, after: str | None = None,
                         payload: dict[str, Any] | None = None) -> PrepareIO | EffectIO:
+        selected = transaction_scope(tx)
+        if selected is not None and (run["id"] != selected.run_id or job["run_id"] != selected.run_id
+                                     or work.execution.run_id != selected.run_id):
+            raise KernelError("effect_binding")
         execution = work.execution
         subject, effect_id = job["id"], identity()
         actor = self._publisher_actor(tx, run, world) if operation in self.REMOTE else None
         initial = operation == "run_branch" and job["kind"] == DeliveryKind.TICKET
         if initial:
-            target = tx.one("SELECT * FROM final_target")
+            target = tx.one(*selected_statement(tx, "SELECT * FROM final_target",
+                         'SELECT * FROM final_target WHERE run_id=?',
+                         (), run_last=True))
             source_ref, target_ref = target["source_ref"], target["target_ref"]
             base = Commit(job["base_sha"], job["base_tree"])
         elif operation in self.CLEANUP:
-            closed = tx.one("SELECT source_ref,target_ref,base_sha,base_tree FROM effects WHERE subject=? AND generation=? AND operation='close' AND status='confirmed'",
-                            (subject, job["generation"]))
+            closed = tx.one(*selected_statement(tx, "SELECT source_ref,target_ref,base_sha,base_tree FROM effects WHERE subject=? AND generation=? AND operation='close' AND status='confirmed'",
+                         "SELECT source_ref,target_ref,base_sha,base_tree FROM effects WHERE subject=? AND generation=? AND operation='close' AND status='confirmed' AND run_id=?",
+                         (subject, job["generation"]), run_last=True))
             source_ref, target_ref = closed["source_ref"], closed["target_ref"]
             base = Commit(closed["base_sha"], closed["base_tree"])
         elif operation in {"inspect_resources", "abandon_worktree"}:
@@ -4993,16 +5219,19 @@ class Kernel:
             origin = self._integration_origin(tx, job)
             candidate_sha, candidate_tree = origin.sha, origin.tree
         payload_id = tx.put(subject, "effect_intent", wire_json(body))
-        tx.execute("""INSERT INTO effects(id,subject,operation,status,executor,epoch,parent_revision,
+        tx.execute(*selected_statement(tx, """INSERT INTO effects(id,subject,operation,status,executor,epoch,parent_revision,
             graph_revision,revision,generation,source_ref,target_ref,before_sha,after_sha,candidate_sha,
             candidate_tree,base_sha,base_tree,pr_number,actor,payload_id,control_action)
             VALUES (?,?,?,'prepared',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                   (effect_id, subject, operation, execution.owner, execution.epoch, run["parent_revision"],
+            "INSERT INTO effects(id,subject,operation,status,executor,epoch,parent_revision,graph_revision,revision,generation,source_ref,target_ref,before_sha,after_sha,candidate_sha,candidate_tree,base_sha,base_tree,pr_number,actor,payload_id,control_action,run_id) VALUES (?,?,?,'prepared',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (effect_id, subject, operation, execution.owner, execution.epoch, run["parent_revision"],
                     run["graph_revision"], job["revision"], job["generation"], source_ref, target_ref,
                     before, after, candidate_sha, candidate_tree, base.sha, base.tree,
-                    job["pr_number"], actor, payload_id, body.get("control_action")))
+                    job["pr_number"], actor, payload_id, body.get("control_action")), run_last=True))
         self._event(tx, subject, "effect_prepared", effect_id, payload_id)
-        row = tx.one("SELECT * FROM effects WHERE id=?", (effect_id,))
+        row = tx.one(*selected_statement(tx, "SELECT * FROM effects WHERE id=?",
+                  'SELECT * FROM effects WHERE id=? AND run_id=?',
+                  (effect_id,), run_last=True))
         return self._effect_work(tx, work, row)
 
     def _publisher_actor(self, tx: Transaction, run: sqlite3.Row, world: World) -> str:
@@ -5012,8 +5241,9 @@ class Kernel:
                 or world.publisher_identity != selected):
             raise KernelError("publisher_identity_unproven")
         placeholders = ",".join("?" for _ in self.REMOTE)
-        previous = tx.rows(f"SELECT actor FROM effects WHERE operation IN ({placeholders}) AND actor IS NOT NULL AND actor!=? LIMIT 1",
-                           (*self.REMOTE, actor))
+        previous = tx.rows(*selected_statement(tx, f"SELECT actor FROM effects WHERE operation IN ({placeholders}) AND actor IS NOT NULL AND actor!=? LIMIT 1",
+                       f'SELECT actor FROM effects WHERE operation IN ({placeholders}) AND actor IS NOT NULL AND actor!=? AND run_id=? LIMIT 1',
+                       (*self.REMOTE, actor), run_last=True))
         if previous:
             raise KernelError("publisher_identity_changed")
         return actor
@@ -5032,7 +5262,9 @@ class Kernel:
         """Persist the original Git object bytes before the first physical write."""
         with self.storage.transaction() as tx:
             run, job = self._owned(tx, effect.subject, execution)
-            row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
+            row = tx.one(*selected_statement(tx, "SELECT * FROM effects WHERE id=? AND subject=?",
+                      'SELECT * FROM effects WHERE id=? AND subject=? AND run_id=?',
+                      (effect.effect_id, effect.subject), run_last=True))
             stored = self._effect(tx, row, execution)
             payload = dict(stored.payload)
             prior = payload.pop("publication_commit_intent", None)
@@ -5056,9 +5288,13 @@ class Kernel:
                 raise KernelError("publication_commit_intent_changed")
             payload["publication_commit_intent"] = dict(witness)
             material = tx.put(effect.subject, "effect_intent", wire_json(payload))
-            tx.execute("UPDATE effects SET payload_id=? WHERE id=?", (material, effect.effect_id))
+            tx.execute(*selected_statement(tx, "UPDATE effects SET payload_id=? WHERE id=?",
+                'UPDATE effects SET payload_id=? WHERE id=? AND run_id=?',
+                (material, effect.effect_id), run_last=True))
             self._event(tx, effect.subject, "publication_commit_prepared", effect.effect_id, material)
-            return self._effect(tx, tx.one("SELECT * FROM effects WHERE id=?", (effect.effect_id,)), execution)
+            return self._effect(tx, tx.one(*selected_statement(tx, "SELECT * FROM effects WHERE id=?",
+                                        'SELECT * FROM effects WHERE id=? AND run_id=?',
+                                        (effect.effect_id,), run_last=True)), execution)
 
     def _retirement_authority(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row,
                               row: sqlite3.Row, world: World) -> bool:
@@ -5075,7 +5311,9 @@ class Kernel:
         """Bind a read-only PR/event watermark before any retirement write."""
         with self.storage.transaction() as tx:
             run, job = self._effect_owned(tx, effect, execution)
-            row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
+            row = tx.one(*selected_statement(tx, "SELECT * FROM effects WHERE id=? AND subject=?",
+                      'SELECT * FROM effects WHERE id=? AND subject=? AND run_id=?',
+                      (effect.effect_id, effect.subject), run_last=True))
             if (effect.operation != "retire_pr" or row["status"] != "prepared" or row["attempts"]
                     or self._effect(tx, row, execution) != effect or not self._retirement_authority(tx, run, job, row, world)):
                 raise KernelError("retirement_intent_boundary")
@@ -5100,9 +5338,13 @@ class Kernel:
                 return effect
             payload["retirement_intent"] = intent
             material = tx.put(effect.subject, "effect_intent", wire_json(payload))
-            tx.execute("UPDATE effects SET payload_id=? WHERE id=?", (material, effect.effect_id))
+            tx.execute(*selected_statement(tx, "UPDATE effects SET payload_id=? WHERE id=?",
+                'UPDATE effects SET payload_id=? WHERE id=? AND run_id=?',
+                (material, effect.effect_id), run_last=True))
             self._event(tx, effect.subject, "retirement_intent_prepared", effect.effect_id, material)
-            return self._effect(tx, tx.one("SELECT * FROM effects WHERE id=?", (effect.effect_id,)), execution)
+            return self._effect(tx, tx.one(*selected_statement(tx, "SELECT * FROM effects WHERE id=?",
+                                        'SELECT * FROM effects WHERE id=? AND run_id=?',
+                                        (effect.effect_id,), run_last=True)), execution)
 
     def _dispatch(self, effect: Effect, execution: Execution, world: World | LocalCleanupObservation, *,
                  resource_inspections: tuple[ResourceInspection, ...] | None = None, token: str | ReadFence) -> bool:
@@ -5110,7 +5352,9 @@ class Kernel:
         with self.storage.transaction() as tx:
             self._check_operation(tx, token, execution)
             run, job = self._effect_owned(tx, effect, execution)
-            row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
+            row = tx.one(*selected_statement(tx, "SELECT * FROM effects WHERE id=? AND subject=?",
+                      'SELECT * FROM effects WHERE id=? AND subject=? AND run_id=?',
+                      (effect.effect_id, effect.subject), run_last=True))
             if row["status"] != "prepared":
                 return False
             if self._effect(tx, row, execution) != effect:
@@ -5124,7 +5368,9 @@ class Kernel:
                 if effect.operation == "retire_pr" and not effect.payload.get("retirement_intent"):
                     raise KernelError("retirement_intent_required")
                 self._abandon_write_current(tx, abandoned, row, resource_inspections)
-                tx.execute("UPDATE effects SET status='sent',attempts=attempts+1 WHERE id=?", (effect.effect_id,))
+                tx.execute(*selected_statement(tx, "UPDATE effects SET status='sent',attempts=attempts+1 WHERE id=?",
+                    "UPDATE effects SET status='sent',attempts=attempts+1 WHERE id=? AND run_id=?",
+                    (effect.effect_id,), run_last=True))
                 self._event(tx, effect.subject, "effect_dispatched", effect.effect_id, generation=row["generation"])
                 return True
             if effect.operation == "retire_pr":
@@ -5134,7 +5380,9 @@ class Kernel:
                     raise KernelError("retirement_intent_required")
                 if not self._retirement_authority(tx, run, job, row, world):
                     return False
-                tx.execute("UPDATE effects SET status='sent',attempts=attempts+1 WHERE id=?", (effect.effect_id,))
+                tx.execute(*selected_statement(tx, "UPDATE effects SET status='sent',attempts=attempts+1 WHERE id=?",
+                    "UPDATE effects SET status='sent',attempts=attempts+1 WHERE id=? AND run_id=?",
+                    (effect.effect_id,), run_last=True))
                 self._event(tx, effect.subject, "effect_dispatched", effect.effect_id)
                 return True
             if run["stopped"] or run["blocked"] or self._gates(tx, effect.subject):
@@ -5142,7 +5390,9 @@ class Kernel:
             if effect.operation in self.CLEANUP:
                 if not self._cleanup_current(tx, job, row):
                     return False
-                tx.execute("UPDATE effects SET status='sent',attempts=attempts+1 WHERE id=?", (effect.effect_id,))
+                tx.execute(*selected_statement(tx, "UPDATE effects SET status='sent',attempts=attempts+1 WHERE id=?",
+                    "UPDATE effects SET status='sent',attempts=attempts+1 WHERE id=? AND run_id=?",
+                    (effect.effect_id,), run_last=True))
                 self._event(tx, effect.subject, "effect_dispatched", effect.effect_id)
                 return True
             if not isinstance(world, World):
@@ -5157,7 +5407,9 @@ class Kernel:
                 if effect.operation == "run_branch" and job["kind"] == DeliveryKind.TICKET:
                     self._gate(tx, effect.subject, "target_branch_changed")
                     return False
-                tx.execute("UPDATE effects SET status='retired' WHERE id=?", (effect.effect_id,))
+                tx.execute(*selected_statement(tx, "UPDATE effects SET status='retired' WHERE id=?",
+                    "UPDATE effects SET status='retired' WHERE id=? AND run_id=?",
+                    (effect.effect_id,), run_last=True))
                 if effect.operation != "integrate":
                     self._update_boundary(tx, run, job)
                 return False
@@ -5169,11 +5421,17 @@ class Kernel:
                 return False
             if effect.operation == "merge" and (not self._published(tx, run, job, world)
                                                    or not self._merge_authority(tx, run, job, world)):
-                tx.execute("UPDATE effects SET status='retired' WHERE id=?", (effect.effect_id,))
+                tx.execute(*selected_statement(tx, "UPDATE effects SET status='retired' WHERE id=?",
+                    "UPDATE effects SET status='retired' WHERE id=? AND run_id=?",
+                    (effect.effect_id,), run_last=True))
                 return False
-            tx.execute("UPDATE effects SET status='sent',attempts=attempts+1 WHERE id=?", (effect.effect_id,))
+            tx.execute(*selected_statement(tx, "UPDATE effects SET status='sent',attempts=attempts+1 WHERE id=?",
+                "UPDATE effects SET status='sent',attempts=attempts+1 WHERE id=? AND run_id=?",
+                (effect.effect_id,), run_last=True))
             if effect.operation == "issue_link":
-                tx.execute("UPDATE issue_links SET state='indeterminate' WHERE effect_id=?", (effect.effect_id,))
+                tx.execute(*selected_statement(tx, "UPDATE issue_links SET state='indeterminate' WHERE effect_id=?",
+                    "UPDATE issue_links SET state='indeterminate' WHERE effect_id=? AND run_id=?",
+                    (effect.effect_id,), run_last=True))
             self._event(tx, effect.subject, "effect_dispatched", effect.effect_id)
             return True
 
@@ -5186,11 +5444,16 @@ class Kernel:
         effect, work = request.effect, request.work
         execution = work.execution
         with self.storage.transaction() as tx:
+            selected = transaction_scope(tx)
+            if selected is not None and (effect.execution.run_id != selected.run_id or execution.run_id != selected.run_id):
+                raise KernelError("effect_binding")
             if world is not None:
                 if token is None:
                     raise KernelError("operation_scope_required")
                 self._check_operation(tx, token, execution)
-            row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
+            row = tx.one(*selected_statement(tx, "SELECT * FROM effects WHERE id=? AND subject=?",
+                      'SELECT * FROM effects WHERE id=? AND subject=? AND run_id=?',
+                      (effect.effect_id, effect.subject), run_last=True))
             if row["status"] in {"confirmed", "observed"}:
                 requeue = self._pending_requeue(tx, effect.subject)
                 if (row["status"] == "confirmed" and requeue is not None
@@ -5207,7 +5470,9 @@ class Kernel:
                 if self._effect(tx, row, execution) != effect or not self._cleanup_current(tx, job, row):
                     raise KernelError("effect_binding")
                 receipt = tx.put(effect.subject, "effect_receipt", wire_json(asdict(result)))
-                tx.execute("UPDATE effects SET status='observed',receipt_id=? WHERE id=?", (receipt, effect.effect_id))
+                tx.execute(*selected_statement(tx, "UPDATE effects SET status='observed',receipt_id=? WHERE id=?",
+                    "UPDATE effects SET status='observed',receipt_id=? WHERE id=? AND run_id=?",
+                    (receipt, effect.effect_id), run_last=True))
                 self._event(tx, effect.subject, "effect_observed", effect.effect_id, receipt)
                 return Step("progress", effect.subject)
             # A foreign cleanup resource is a known observation, not a write.
@@ -5217,7 +5482,9 @@ class Kernel:
                 if self._effect(tx, row, execution) != effect:
                     raise KernelError("effect_binding")
                 evidence = tx.put(effect.subject, "cleanup_observation", wire_json(asdict(result)))
-                tx.execute("UPDATE resource_cleanup SET outcome='third' WHERE effect_id=?", (effect.effect_id,))
+                tx.execute(*selected_statement(tx, "UPDATE resource_cleanup SET outcome='third' WHERE effect_id=?",
+                    "UPDATE resource_cleanup SET outcome='third' WHERE effect_id=? AND run_id=?",
+                    (effect.effect_id,), run_last=True))
                 self._event(tx, effect.subject, "cleanup_pending", effect.effect_id, evidence)
                 return Step("paused", effect.subject, "cleanup_pending")
             original_target = row["status"] == "prepared" and row["attempts"] > 0 and result.disposition == "target"
@@ -5243,19 +5510,27 @@ class Kernel:
                 if result.disposition == "prior" and world is None:
                     return self._observe_work(tx, work, effect.subject, after=request, result=result)
                 evidence = tx.put(effect.subject, "cleanup_observation", wire_json(asdict(result)))
-                tx.execute("UPDATE resource_cleanup SET outcome=? WHERE effect_id=?", (result.disposition, effect.effect_id))
+                tx.execute(*selected_statement(tx, "UPDATE resource_cleanup SET outcome=? WHERE effect_id=?",
+                    'UPDATE resource_cleanup SET outcome=? WHERE effect_id=? AND run_id=?',
+                    (result.disposition, effect.effect_id), run_last=True))
                 self._event(tx, effect.subject, "cleanup_pending", effect.effect_id, evidence)
                 if result.disposition == "prior":
                     run, job = self._owned(tx, effect.subject, execution)
                     if (not run["stopped"] and not run["blocked"] and not self._gates(tx, effect.subject)
                             and self._cleanup_current(tx, job, row) and row["attempts"] < 3):
-                        tx.execute("UPDATE effects SET status='prepared' WHERE id=?", (effect.effect_id,))
-                        tx.execute("UPDATE resource_cleanup SET outcome=NULL WHERE effect_id=?", (effect.effect_id,))
+                        tx.execute(*selected_statement(tx, "UPDATE effects SET status='prepared' WHERE id=?",
+                            "UPDATE effects SET status='prepared' WHERE id=? AND run_id=?",
+                            (effect.effect_id,), run_last=True))
+                        tx.execute(*selected_statement(tx, "UPDATE resource_cleanup SET outcome=NULL WHERE effect_id=?",
+                            'UPDATE resource_cleanup SET outcome=NULL WHERE effect_id=? AND run_id=?',
+                            (effect.effect_id,), run_last=True))
                         return Step("progress", effect.subject)
                 return Step("waiting", effect.subject, "cleanup_pending")
             if result.disposition in {"target", "failure"}:
                 receipt = tx.put(effect.subject, "effect_receipt", wire_json(asdict(result)))
-                tx.execute("UPDATE effects SET status='observed',receipt_id=? WHERE id=?", (receipt, effect.effect_id))
+                tx.execute(*selected_statement(tx, "UPDATE effects SET status='observed',receipt_id=? WHERE id=?",
+                    "UPDATE effects SET status='observed',receipt_id=? WHERE id=? AND run_id=?",
+                    (receipt, effect.effect_id), run_last=True))
                 self._event(tx, effect.subject, "effect_observed", effect.effect_id, receipt)
                 return Step("progress", effect.subject)
             abandoned = self._abandon_action(tx)
@@ -5265,23 +5540,31 @@ class Kernel:
                     payload = json.loads(tx.get(row["payload_id"], effect.subject))
                     if result.disposition == "third" and row["operation"] in {"reopen_ticket", "recovery_comment"} and self._reopen_not_owned(payload, asdict(result)):
                         receipt = tx.put(effect.subject, "effect_receipt", wire_json(asdict(result)))
-                        tx.execute("UPDATE effects SET status='observed',receipt_id=? WHERE id=?", (receipt, effect.effect_id))
+                        tx.execute(*selected_statement(tx, "UPDATE effects SET status='observed',receipt_id=? WHERE id=?",
+                            "UPDATE effects SET status='observed',receipt_id=? WHERE id=? AND run_id=?",
+                            (receipt, effect.effect_id), run_last=True))
                         self._event(tx, effect.subject, "ticket_recovery_not_owned", effect.effect_id, receipt, generation=row["generation"])
                         return Step("progress", effect.subject)
                     if row["operation"] in {"reopen_ticket", "recovery_comment"} and result.disposition in {"prior", "unknown"}:
                         evidence = tx.put(effect.subject, "github_read_observation", wire_json({
                             "code": "github_recovery_observation_pending", "effect": effect.effect_id, "result": asdict(result)}))
-                        run = tx.one("SELECT * FROM runs")
+                        run = tx.one(*selected_statement(tx, "SELECT * FROM runs",
+                                  'SELECT * FROM runs WHERE id=?',
+                                  (), run_last=True))
                         return self._supervised_wait(tx, run, effect.subject,
                             self._automatic_scope(tx, run, effect.subject, False), "github_convergence", 600, evidence)
                     if (result.disposition == "prior" and self._abandon_control_scope(tx, abandoned, row)
                             and row["attempts"] - row["retry_baseline"] < 3):
                         evidence = tx.put(effect.subject, "abandon_prior_observation", wire_json({"dispatch_serial": row["attempts"], "result": asdict(result)}))
                         self._event(tx, effect.subject, "abandon_prior_confirmed", effect.effect_id, evidence, generation=row["generation"])
-                        tx.execute("UPDATE effects SET status='retired' WHERE id=?", (effect.effect_id,))
+                        tx.execute(*selected_statement(tx, "UPDATE effects SET status='retired' WHERE id=?",
+                            "UPDATE effects SET status='retired' WHERE id=? AND run_id=?",
+                            (effect.effect_id,), run_last=True))
                         return Step("progress", effect.subject)
                 elif effect.effect_id in self._abandon_scope(tx, abandoned)["unsettled"] and result.disposition == "prior":
-                    tx.execute("UPDATE effects SET status='retired' WHERE id=?", (effect.effect_id,))
+                    tx.execute(*selected_statement(tx, "UPDATE effects SET status='retired' WHERE id=?",
+                        "UPDATE effects SET status='retired' WHERE id=? AND run_id=?",
+                        (effect.effect_id,), run_last=True))
                     self._event(tx, effect.subject, "abandoned_business_intent_not_applied", effect.effect_id, generation=row["generation"])
                     return Step("progress", effect.subject)
                 evidence = tx.put(effect.subject, "abandon_observation", wire_json(asdict(result)))
@@ -5297,13 +5580,21 @@ class Kernel:
                     if row["attempts"] - row["retry_baseline"] >= 3:
                         self._gate(tx, effect.subject, "publication_retry_exhausted")
                         return Step("paused", effect.subject, "publication_retry_exhausted")
-                    tx.execute("UPDATE effects SET status='prepared' WHERE id=?", (effect.effect_id,))
+                    tx.execute(*selected_statement(tx, "UPDATE effects SET status='prepared' WHERE id=?",
+                        "UPDATE effects SET status='prepared' WHERE id=? AND run_id=?",
+                        (effect.effect_id,), run_last=True))
                     return Step("progress", effect.subject)
                 if self._effect_stale(tx, run, job, row):
-                    tx.execute("UPDATE effects SET status='retired' WHERE id=?", (row["id"],))
+                    tx.execute(*selected_statement(tx, "UPDATE effects SET status='retired' WHERE id=?",
+                        "UPDATE effects SET status='retired' WHERE id=? AND run_id=?",
+                        (row["id"],), run_last=True))
                     if job["kind"] == DeliveryKind.FINAL_RUN and run["observed_graph_revision"] == run["graph_revision"]:
-                        tx.execute("UPDATE subjects SET refresh_revision=?,phase='refresh_final',grant_id=NULL WHERE id=?", (run["observed_parent_revision"], job["id"]))
-                        tx.execute("UPDATE runs SET blocked='final_refresh' WHERE blocked IS NULL OR blocked='final_refresh'")
+                        tx.execute(*selected_statement(tx, "UPDATE subjects SET refresh_revision=?,phase='refresh_final',grant_id=NULL WHERE id=?",
+                            "UPDATE subjects SET refresh_revision=?,phase='refresh_final',grant_id=NULL WHERE id=? AND run_id=?",
+                            (run["observed_parent_revision"], job["id"]), run_last=True))
+                        tx.execute(*selected_statement(tx, "UPDATE runs SET blocked='final_refresh' WHERE blocked IS NULL OR blocked='final_refresh'",
+                            "UPDATE runs SET blocked='final_refresh' WHERE (blocked IS NULL OR blocked='final_refresh') AND id=?",
+                            (), run_last=True))
                     self._event(tx, effect.subject, "stale_intent_not_applied", effect.effect_id)
                     return Step("progress", effect.subject)
                 if run["stopped"] or run["blocked"] or self._gates(tx, effect.subject) or not self._current(tx, job, run, world):
@@ -5313,13 +5604,17 @@ class Kernel:
                     if row["operation"] == "run_branch" and job["kind"] == DeliveryKind.TICKET:
                         self._gate(tx, effect.subject, "target_branch_changed")
                         return Step("paused", effect.subject, "target_branch_changed")
-                    tx.execute("UPDATE effects SET status='retired' WHERE id=?", (effect.effect_id,))
+                    tx.execute(*selected_statement(tx, "UPDATE effects SET status='retired' WHERE id=?",
+                        "UPDATE effects SET status='retired' WHERE id=? AND run_id=?",
+                        (effect.effect_id,), run_last=True))
                     self._update_boundary(tx, run, job)
                     return Step("progress", effect.subject, "updating")
                 if row["attempts"] - row["retry_baseline"] >= 3:
                     self._gate(tx, effect.subject, "publication_retry_exhausted")
                     return Step("paused", effect.subject, "publication_retry_exhausted")
-                tx.execute("UPDATE effects SET status='prepared' WHERE id=?", (effect.effect_id,))
+                tx.execute(*selected_statement(tx, "UPDATE effects SET status='prepared' WHERE id=?",
+                    "UPDATE effects SET status='prepared' WHERE id=? AND run_id=?",
+                    (effect.effect_id,), run_last=True))
                 return Step("progress", effect.subject)
             evidence = tx.put(effect.subject, "effect_observation", wire_json(asdict(result)))
             self._gate(tx, effect.subject, "write_conflict" if result.disposition == "third" else "write_result_unknown", evidence=evidence)
@@ -5329,32 +5624,44 @@ class Kernel:
     def observe_effect_failure(self, effect: Effect, diagnostic: Mapping[str, Any]) -> None:
         """A call failure is an audit fact, not proof of a remote write's outcome."""
         with self.storage.transaction() as tx:
-            row = tx.one("SELECT * FROM effects WHERE id=? AND subject=?", (effect.effect_id, effect.subject))
+            row = tx.one(*selected_statement(tx, "SELECT * FROM effects WHERE id=? AND subject=?",
+                      'SELECT * FROM effects WHERE id=? AND subject=? AND run_id=?',
+                      (effect.effect_id, effect.subject), run_last=True))
             actual = self._effect(tx, row, effect.execution)
             if (replace(effect, dispatch_serial=actual.dispatch_serial) != actual
                     or not 1 <= effect.dispatch_serial <= row["attempts"]):
                 raise KernelError("effect_binding")
             material = tx.put(effect.subject, "effect_failure", wire_json(dict(diagnostic)))
-            old = tx.rows("SELECT evidence FROM effect_failures WHERE effect=? AND dispatch_serial=?",
-                          (effect.effect_id, effect.dispatch_serial))
+            old = tx.rows(*selected_statement(tx, "SELECT evidence FROM effect_failures WHERE effect=? AND dispatch_serial=?",
+                      'SELECT evidence FROM effect_failures WHERE effect=? AND dispatch_serial=? AND run_id=?',
+                      (effect.effect_id, effect.dispatch_serial), run_last=True))
             if old:
                 if old[0][0] != material:
                     raise KernelError("conflicting_effect_failure")
                 return
-            tx.execute("INSERT INTO effect_failures VALUES (?,?,?,?)", (effect.effect_id, effect.dispatch_serial, material, self.clock()))
+            tx.execute(*selected_statement(tx, "INSERT INTO effect_failures VALUES (?,?,?,?)",
+                'INSERT INTO effect_failures(effect,dispatch_serial,evidence,observed_at,run_id) VALUES (?,?,?,?,?)',
+                (effect.effect_id, effect.dispatch_serial, material, self.clock()), run_last=True))
             self._event(tx, effect.subject, "effect_failed", effect.effect_id, material, generation=row["generation"])
 
     def _apply_effect(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, row: sqlite3.Row, world: World) -> Step:
+        selected = transaction_scope(tx)
+        if selected is not None and (run["id"] != selected.run_id or job["run_id"] != selected.run_id
+                                     or row["run_id"] != selected.run_id or row["subject"] != job["id"]):
+            raise KernelError("effect_binding")
         subject, operation = job["id"], row["operation"]
         result = json.loads(tx.get(row["receipt_id"], subject))
         self._validate_target(tx, run, job, row, result)
         commit = result["commit"]
         if result["disposition"] == "failure":
-            tx.execute("UPDATE effects SET status='confirmed' WHERE id=?", (row["id"],))
+            tx.execute(*selected_statement(tx, "UPDATE effects SET status='confirmed' WHERE id=?",
+                "UPDATE effects SET status='confirmed' WHERE id=? AND run_id=?",
+                (row["id"],), run_last=True))
             purpose = Purpose.INTEGRATION.value if operation == "integrate" else job["purpose"]
-            tx.execute("UPDATE subjects SET phase='development',purpose=?,repair_source=?,resume_purpose=?,last_failure=?,integrated_sha=NULL,integrated_tree=NULL,workspace_sha=?,version=version+1 WHERE id=?",
-                       (purpose, "integration" if operation == "integrate" else "git_integrity", job["purpose"], row["receipt_id"],
-                        job["workspace_sha"] if commit is None else commit["sha"], subject))
+            tx.execute(*selected_statement(tx, "UPDATE subjects SET phase='development',purpose=?,repair_source=?,resume_purpose=?,last_failure=?,integrated_sha=NULL,integrated_tree=NULL,workspace_sha=?,version=version+1 WHERE id=?",
+                "UPDATE subjects SET phase='development',purpose=?,repair_source=?,resume_purpose=?,last_failure=?,integrated_sha=NULL,integrated_tree=NULL,workspace_sha=?,version=version+1 WHERE id=? AND run_id=?",
+                (purpose, "integration" if operation == "integrate" else "git_integrity", job["purpose"], row["receipt_id"],
+                        job["workspace_sha"] if commit is None else commit["sha"], subject), run_last=True))
             # Keep the exact CI trigger for a later CI-waiver Publication. The
             # current integration repair receives only its actual Git failure;
             # _context selects that responsibility from purpose/repair_source.
@@ -5371,51 +5678,73 @@ class Kernel:
             payload = json.loads(tx.get(row["payload_id"], subject))
             if commit["sha"] != payload["reviewed_commit"]:
                 raise KernelError("validation_commit_changed")
-            tx.execute("UPDATE subjects SET validation_checkout=? WHERE id=?", (payload["checkout"], subject))
+            tx.execute(*selected_statement(tx, "UPDATE subjects SET validation_checkout=? WHERE id=?",
+                'UPDATE subjects SET validation_checkout=? WHERE id=? AND run_id=?',
+                (payload["checkout"], subject), run_last=True))
             phase = job["phase"]
         elif operation == "validation_cleanup":
-            tx.execute("UPDATE subjects SET validation_cleanup=NULL WHERE id=?", (subject,))
+            tx.execute(*selected_statement(tx, "UPDATE subjects SET validation_cleanup=NULL WHERE id=?",
+                'UPDATE subjects SET validation_cleanup=NULL WHERE id=? AND run_id=?',
+                (subject,), run_last=True))
             phase = job["phase"]
         elif operation == "candidate":
             if job["purpose"] == Purpose.CI and result["raw"].get("no_change"):
-                tx.execute("UPDATE effects SET status='confirmed' WHERE id=?", (row["id"],))
-                tx.execute("UPDATE subjects SET phase='development' WHERE id=?", (subject,))
+                tx.execute(*selected_statement(tx, "UPDATE effects SET status='confirmed' WHERE id=?",
+                    "UPDATE effects SET status='confirmed' WHERE id=? AND run_id=?",
+                    (row["id"],), run_last=True))
+                tx.execute(*selected_statement(tx, "UPDATE subjects SET phase='development' WHERE id=?",
+                    "UPDATE subjects SET phase='development' WHERE id=? AND run_id=?",
+                    (subject,), run_last=True))
                 budget = self._budget(tx, job)
                 self._gate(tx, subject, "ci_development_budget_exhausted" if budget["developments_used"] >= budget["development_limit"]
                            else "ci_investigation_paused", purpose=Purpose.CI.value, evidence=row["receipt_id"])
                 return Step("paused", subject, "ci_investigation")
-            tx.execute("UPDATE subjects SET candidate_sha=?,candidate_tree=?,workspace_sha=?,expected_tree=?,integrated_sha=NULL,integrated_tree=NULL,grant_id=NULL,checks_id=NULL WHERE id=?",
-                       (commit["sha"], commit["tree"], commit["sha"], commit["tree"], subject))
+            tx.execute(*selected_statement(tx, "UPDATE subjects SET candidate_sha=?,candidate_tree=?,workspace_sha=?,expected_tree=?,integrated_sha=NULL,integrated_tree=NULL,grant_id=NULL,checks_id=NULL WHERE id=?",
+                'UPDATE subjects SET candidate_sha=?,candidate_tree=?,workspace_sha=?,expected_tree=?,integrated_sha=NULL,integrated_tree=NULL,grant_id=NULL,checks_id=NULL WHERE id=? AND run_id=?',
+                (commit["sha"], commit["tree"], commit["sha"], commit["tree"], subject), run_last=True))
             budget = self._budget(tx, job)
             if job["purpose"] == Purpose.INTEGRATION:
                 phase = "integration"
             elif job["purpose"] == Purpose.CI and not budget["review_required"]:
                 phase = "integration"
-                tx.execute("UPDATE subjects SET gate_mode='ci_waiver' WHERE id=?", (subject,))
+                tx.execute(*selected_statement(tx, "UPDATE subjects SET gate_mode='ci_waiver' WHERE id=?",
+                    "UPDATE subjects SET gate_mode='ci_waiver' WHERE id=? AND run_id=?",
+                    (subject,), run_last=True))
             elif (job["kind"] == DeliveryKind.TICKET and job["purpose"] == Purpose.REQUIREMENTS
                     and budget["reviews_used"] >= budget["review_limit"] and not result["raw"].get("no_change")):
                 if not job["review_attempt"]:
                     raise KernelError("fallback_without_prior_review")
-                previous = tx.one("SELECT outcome FROM attempts WHERE id=?", (job["review_attempt"],))
+                previous = tx.one(*selected_statement(tx, "SELECT outcome FROM attempts WHERE id=?",
+                               'SELECT outcome FROM attempts WHERE id=? AND run_id=?',
+                               (job["review_attempt"],), run_last=True))
                 if previous["outcome"] != "fail":
                     raise KernelError("fallback_without_findings")
                 phase = "integration"
-                tx.execute("UPDATE subjects SET gate_mode='deterministic_fallback' WHERE id=?", (subject,))
+                tx.execute(*selected_statement(tx, "UPDATE subjects SET gate_mode='deterministic_fallback' WHERE id=?",
+                    "UPDATE subjects SET gate_mode='deterministic_fallback' WHERE id=? AND run_id=?",
+                    (subject,), run_last=True))
             else:
                 phase = "review"
         elif operation == "integrate":
             if not result["expected_tree"]:
                 raise KernelError("integration_receipt_incomplete")
-            tx.execute("UPDATE subjects SET integrated_sha=?,integrated_tree=?,workspace_sha=?,expected_tree=?,integration_target=? WHERE id=?",
-                       (commit["sha"], commit["tree"], commit["sha"], result["expected_tree"], row["base_sha"], subject))
+            tx.execute(*selected_statement(tx, "UPDATE subjects SET integrated_sha=?,integrated_tree=?,workspace_sha=?,expected_tree=?,integration_target=? WHERE id=?",
+                'UPDATE subjects SET integrated_sha=?,integrated_tree=?,workspace_sha=?,expected_tree=?,integration_target=? WHERE id=? AND run_id=?',
+                (commit["sha"], commit["tree"], commit["sha"], result["expected_tree"], row["base_sha"], subject), run_last=True))
             payload = json.loads(tx.get(row["payload_id"], subject))
             live_source = None if world.source is None else world.source.sha
             if row["base_sha"] != self._require_target(world).sha or payload["source_sha"] != live_source:
                 self._observe_integration_snapshot(tx, job, world)
-                tx.execute("UPDATE effects SET status='confirmed' WHERE id=?", (row["id"],))
-                tx.execute("UPDATE subjects SET phase='integration',purpose='integration',repair_source='integration',version=version+1 WHERE id=?", (subject,))
+                tx.execute(*selected_statement(tx, "UPDATE effects SET status='confirmed' WHERE id=?",
+                    "UPDATE effects SET status='confirmed' WHERE id=? AND run_id=?",
+                    (row["id"],), run_last=True))
+                tx.execute(*selected_statement(tx, "UPDATE subjects SET phase='integration',purpose='integration',repair_source='integration',version=version+1 WHERE id=?",
+                    "UPDATE subjects SET phase='integration',purpose='integration',repair_source='integration',version=version+1 WHERE id=? AND run_id=?",
+                    (subject,), run_last=True))
                 return Step("progress", subject, "integration_snapshot_changed")
-            tx.execute("UPDATE integration_snapshots SET open=0 WHERE subject=? AND window=(SELECT max(window) FROM integration_snapshots WHERE subject=?)", (subject, subject))
+            tx.execute(*selected_statement(tx, "UPDATE integration_snapshots SET open=0 WHERE subject=? AND window=(SELECT max(window) FROM integration_snapshots WHERE subject=?)",
+                'UPDATE integration_snapshots SET open=0 WHERE subject=? AND window=(SELECT max(i.window) FROM integration_snapshots i WHERE i.subject=? AND i.run_id=integration_snapshots.run_id) AND run_id=?',
+                (subject, subject), run_last=True))
             latest = self._job(tx, subject)
             if job["kind"] == DeliveryKind.TICKET:
                 phase = "ready_publication"
@@ -5423,30 +5752,41 @@ class Kernel:
                 phase = "ready_publication"
             else:
                 phase = "review"
-                tx.execute("UPDATE subjects SET purpose=? WHERE id=?", (Purpose.CI.value if job["purpose"] == Purpose.CI else Purpose.INTEGRATION.value, subject))
+                tx.execute(*selected_statement(tx, "UPDATE subjects SET purpose=? WHERE id=?",
+                    'UPDATE subjects SET purpose=? WHERE id=? AND run_id=?',
+                    (Purpose.CI.value if job["purpose"] == Purpose.CI else Purpose.INTEGRATION.value, subject), run_last=True))
         elif operation == "run_branch":
             if job["kind"] == DeliveryKind.TICKET:
                 phase = "workspace"
             else:
-                tx.execute("UPDATE subjects SET source_sha=? WHERE id=?", (row["after_sha"], subject))
+                tx.execute(*selected_statement(tx, "UPDATE subjects SET source_sha=? WHERE id=?",
+                    'UPDATE subjects SET source_sha=? WHERE id=? AND run_id=?',
+                    (row["after_sha"], subject), run_last=True))
                 self._record_source_write(tx, subject, row["source_ref"], row["after_sha"])
                 phase = "publish"
         elif operation == "publication_commit":
             if commit["tree"] != job["integrated_tree"]:
                 raise KernelError("publication_tree_changed")
-            tx.execute("UPDATE subjects SET publication_sha=?,publication_tree=?,workspace_sha=? WHERE id=?",
-                       (commit["sha"], commit["tree"], commit["sha"], subject))
+            tx.execute(*selected_statement(tx, "UPDATE subjects SET publication_sha=?,publication_tree=?,workspace_sha=? WHERE id=?",
+                'UPDATE subjects SET publication_sha=?,publication_tree=?,workspace_sha=? WHERE id=? AND run_id=?',
+                (commit["sha"], commit["tree"], commit["sha"], subject), run_last=True))
             phase = "push"
         elif operation == "push":
-            tx.execute("UPDATE subjects SET source_sha=? WHERE id=?", (row["after_sha"], subject))
+            tx.execute(*selected_statement(tx, "UPDATE subjects SET source_sha=? WHERE id=?",
+                'UPDATE subjects SET source_sha=? WHERE id=? AND run_id=?',
+                (row["after_sha"], subject), run_last=True))
             self._record_source_write(tx, subject, row["source_ref"], row["after_sha"])
             phase = "pr"
         elif operation == "pr_write":
             pr = result["pr"]
-            tx.execute("UPDATE subjects SET pr_number=? WHERE id=?", (pr["number"], subject))
+            tx.execute(*selected_statement(tx, "UPDATE subjects SET pr_number=? WHERE id=?",
+                'UPDATE subjects SET pr_number=? WHERE id=? AND run_id=?',
+                (pr["number"], subject), run_last=True))
             phase = "checks" if row["base_sha"] == self._require_target(world).sha else "integration"
         elif operation == "merge":
-            tx.execute("UPDATE subjects SET merge_sha=? WHERE id=?", (commit["sha"], subject))
+            tx.execute(*selected_statement(tx, "UPDATE subjects SET merge_sha=? WHERE id=?",
+                'UPDATE subjects SET merge_sha=? WHERE id=? AND run_id=?',
+                (commit["sha"], subject), run_last=True))
             phase = "completion_comment"
         elif operation == "completion_comment":
             phase = "close"
@@ -5454,26 +5794,37 @@ class Kernel:
             phase = "complete"
             if run["source_sequence"] is not None and job["kind"] == DeliveryKind.TICKET:
                 payload = json.loads(tx.get(row["payload_id"], subject))
-                comment = tx.one("SELECT id FROM effects WHERE id=? AND subject=? AND generation=? AND operation='completion_comment' AND status='confirmed'",
-                                 (payload["close_intent"]["effect_id"], subject, job["generation"]))
+                comment = tx.one(*selected_statement(tx, "SELECT id FROM effects WHERE id=? AND subject=? AND generation=? AND operation='completion_comment' AND status='confirmed'",
+                              "SELECT id FROM effects WHERE id=? AND subject=? AND generation=? AND operation='completion_comment' AND status='confirmed' AND run_id=?",
+                              (payload["close_intent"]["effect_id"], subject, job["generation"]), run_last=True))
                 if not job["merge_sha"] or not job["publication_sha"] or not job["pr_number"] or not job["gate_mode"]:
                     raise KernelError("completion_evidence_missing")
-                tx.execute("INSERT INTO completions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                           (subject, job["generation"], job["revision"], run["parent_revision"], run["graph_revision"], job["publication_sha"],
+                tx.execute(*selected_statement(tx, "INSERT INTO completions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    'INSERT INTO completions(subject,generation,revision,parent_revision,graph_revision,source_sha,merge_sha,tree,pr_number,gate_mode,review_attempt,development_attempt,comment_effect,close_effect,run_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (subject, job["generation"], job["revision"], run["parent_revision"], run["graph_revision"], job["publication_sha"],
                             job["merge_sha"], job["publication_tree"], job["pr_number"], job["gate_mode"], job["review_attempt"],
-                            self._last_attempt(tx, subject, Role.DEVELOPMENT), comment["id"], row["id"]))
+                            self._last_attempt(tx, subject, Role.DEVELOPMENT), comment["id"], row["id"]), run_last=True))
             tx.execute("UPDATE runs SET final_action=NULL WHERE id=?", (run["id"],))
             if run["final_action"]:
-                tx.execute("UPDATE actions SET status='complete' WHERE id=?", (run["final_action"],))
+                tx.execute(*selected_statement(tx, "UPDATE actions SET status='complete' WHERE id=?",
+                    "UPDATE actions SET status='complete' WHERE id=? AND run_id=?",
+                    (run["final_action"],), run_last=True))
             if job["owned_root"] and job["common_git_dir"]:
-                tx.execute("INSERT OR IGNORE INTO resource_cleanup(subject,generation,source_ref,source_sha,checkout,workspace_sha,owned_root,common_git_dir) VALUES (?,?,?,?,?,?,?,?)",
-                           (subject, job["generation"], job["source_ref"], job["publication_sha"], job["checkout"], job["workspace_sha"], job["owned_root"], job["common_git_dir"]))
+                tx.execute(*selected_statement(tx, "INSERT OR IGNORE INTO resource_cleanup(subject,generation,source_ref,source_sha,checkout,workspace_sha,owned_root,common_git_dir) VALUES (?,?,?,?,?,?,?,?)",
+                    'INSERT OR IGNORE INTO resource_cleanup(subject,generation,source_ref,source_sha,checkout,workspace_sha,owned_root,common_git_dir,run_id) VALUES (?,?,?,?,?,?,?,?,?)',
+                    (subject, job["generation"], job["source_ref"], job["publication_sha"], job["checkout"], job["workspace_sha"], job["owned_root"], job["common_git_dir"]), run_last=True))
         else:
             raise KernelError("unknown_effect", operation)
-        tx.execute("UPDATE effects SET status='confirmed' WHERE id=?", (row["id"],))
-        tx.execute("UPDATE subjects SET phase=?,version=version+1 WHERE id=?", (phase, subject))
+        tx.execute(*selected_statement(tx, "UPDATE effects SET status='confirmed' WHERE id=?",
+            "UPDATE effects SET status='confirmed' WHERE id=? AND run_id=?",
+            (row["id"],), run_last=True))
+        tx.execute(*selected_statement(tx, "UPDATE subjects SET phase=?,version=version+1 WHERE id=?",
+            'UPDATE subjects SET phase=?,version=version+1 WHERE id=? AND run_id=?',
+            (phase, subject), run_last=True))
         if phase not in {"development", "review", "publish"}:
-            tx.execute("DELETE FROM work_queue WHERE subject=?", (subject,))
+            tx.execute(*selected_statement(tx, "DELETE FROM work_queue WHERE subject=?",
+                'DELETE FROM work_queue WHERE subject=? AND run_id=?',
+                (subject,), run_last=True))
         if phase == "complete":
             self._release_integration(tx, subject)
         self._event(tx, subject, "effect_consumed", row["id"], row["receipt_id"])
@@ -5482,9 +5833,16 @@ class Kernel:
         return Step("progress", subject)
 
     def _update_boundary(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row) -> None:
-        tx.execute("UPDATE subjects SET phase='integration',purpose='integration',repair_source='integration',integrated_sha=NULL,integrated_tree=NULL,grant_id=NULL,checks_id=NULL,version=version+1 WHERE id=?", (job["id"],))
+        selected = transaction_scope(tx)
+        if selected is not None and (run["id"] != selected.run_id or job["run_id"] != selected.run_id):
+            raise KernelError("effect_binding")
+        tx.execute(*selected_statement(tx, "UPDATE subjects SET phase='integration',purpose='integration',repair_source='integration',integrated_sha=NULL,integrated_tree=NULL,grant_id=NULL,checks_id=NULL,version=version+1 WHERE id=?",
+            "UPDATE subjects SET phase='integration',purpose='integration',repair_source='integration',integrated_sha=NULL,integrated_tree=NULL,grant_id=NULL,checks_id=NULL,version=version+1 WHERE id=? AND run_id=?",
+            (job["id"],), run_last=True))
         if run["final_action"]:
-            tx.execute("UPDATE actions SET status='updating' WHERE id=?", (run["final_action"],))
+            tx.execute(*selected_statement(tx, "UPDATE actions SET status='updating' WHERE id=?",
+                "UPDATE actions SET status='updating' WHERE id=? AND run_id=?",
+                (run["final_action"],), run_last=True))
             tx.execute("UPDATE runs SET final_action=NULL WHERE id=?", (run["id"],))
         self._event(tx, job["id"], "boundary_update", job["candidate_sha"] or job["id"])
 
@@ -5498,8 +5856,9 @@ class Kernel:
                 "target_sha": None if snapshot is None else snapshot["target_sha"]}
 
     def _record_source_write(self, tx: Transaction, subject: str, ref: str, head: str) -> None:
-        tx.execute("UPDATE integration_snapshots SET source_sha=? WHERE subject=? AND source_ref=? AND window=(SELECT max(window) FROM integration_snapshots WHERE subject=?)",
-                   (head, subject, ref, subject))
+        tx.execute(*selected_statement(tx, "UPDATE integration_snapshots SET source_sha=? WHERE subject=? AND source_ref=? AND window=(SELECT max(window) FROM integration_snapshots WHERE subject=?)",
+            'UPDATE integration_snapshots SET source_sha=? WHERE subject=? AND source_ref=? AND window=(SELECT max(i.window) FROM integration_snapshots i WHERE i.subject=? AND i.run_id=integration_snapshots.run_id) AND run_id=?',
+            (head, subject, ref, subject), run_last=True))
 
     def _renew_resync(self, tx: Transaction, job: sqlite3.Row, *, require_exhaustion: bool = True) -> None:
         previous = self._resync_state(tx, job["id"])
@@ -5518,8 +5877,12 @@ class Kernel:
             self._gate(tx, subject, "published_head_changed")
             return False
         source_sha = job["source_sha"] if world.source is None else world.source.sha
-        previous = tx.rows("SELECT * FROM integration_snapshots WHERE subject=? ORDER BY window DESC LIMIT 1", (subject,))
-        allowance = tx.one("SELECT * FROM resync_allowances WHERE subject=? AND current=1", (subject,))
+        previous = tx.rows(*selected_statement(tx, "SELECT * FROM integration_snapshots WHERE subject=? ORDER BY window DESC LIMIT 1",
+                       'SELECT * FROM integration_snapshots WHERE subject=? AND run_id=? ORDER BY window DESC LIMIT 1',
+                       (subject,), run_last=True))
+        allowance = tx.one(*selected_statement(tx, "SELECT * FROM resync_allowances WHERE subject=? AND current=1",
+                        'SELECT * FROM resync_allowances WHERE subject=? AND current=1 AND run_id=?',
+                        (subject,), run_last=True))
         snapshot = previous[0] if previous else None
         first = snapshot is None or snapshot["source_ref"] != job["source_ref"] or snapshot["target_ref"] != job["target_ref"]
         source_changed = snapshot is not None and not first and snapshot["source_sha"] != source_sha
@@ -5536,15 +5899,21 @@ class Kernel:
             return False
         if first or charged:
             window = 1 if snapshot is None else snapshot["window"] + 1
-            tx.execute("INSERT INTO integration_snapshots VALUES (?,?,?,?,?,?,?,1)",
-                       (subject, window, allowance["generation"], job["source_ref"], job["target_ref"], source_sha, target.sha))
+            tx.execute(*selected_statement(tx, "INSERT INTO integration_snapshots VALUES (?,?,?,?,?,?,?,1)",
+                'INSERT INTO integration_snapshots(subject,window,allowance_generation,source_ref,target_ref,source_sha,target_sha,open,run_id) VALUES (?,?,?,?,?,?,?,1,?)',
+                (subject, window, allowance["generation"], job["source_ref"], job["target_ref"], source_sha, target.sha), run_last=True))
             if charged:
-                tx.execute("UPDATE resync_allowances SET used=used+1 WHERE subject=? AND current=1", (subject,))
+                tx.execute(*selected_statement(tx, "UPDATE resync_allowances SET used=used+1 WHERE subject=? AND current=1",
+                    'UPDATE resync_allowances SET used=used+1 WHERE subject=? AND current=1 AND run_id=?',
+                    (subject,), run_last=True))
         elif snapshot is not None and (source_changed or target_changed):
-            tx.execute("UPDATE integration_snapshots SET source_sha=?,target_sha=? WHERE subject=? AND window=?",
-                       (source_sha, target.sha, subject, snapshot["window"]))
+            tx.execute(*selected_statement(tx, "UPDATE integration_snapshots SET source_sha=?,target_sha=? WHERE subject=? AND window=?",
+                'UPDATE integration_snapshots SET source_sha=?,target_sha=? WHERE subject=? AND window=? AND run_id=?',
+                (source_sha, target.sha, subject, snapshot["window"]), run_last=True))
         if world.source is not None and source_sha != job["source_sha"]:
-            tx.execute("UPDATE subjects SET source_sha=? WHERE id=?", (source_sha, subject))
+            tx.execute(*selected_statement(tx, "UPDATE subjects SET source_sha=? WHERE id=?",
+                'UPDATE subjects SET source_sha=? WHERE id=? AND run_id=?',
+                (source_sha, subject), run_last=True))
         if first or source_changed or target_changed:
             evidence = tx.put(subject, "integration_snapshot", wire_json({"source_sha": source_sha, "target_sha": target.sha, "charged": charged}))
             self._event(tx, subject, "integration_snapshot", str(allowance["generation"]), evidence)
@@ -5561,14 +5930,17 @@ class Kernel:
             "review_attempt": job["review_attempt"], "promoted_sha": job["integrated_sha"],
             "promoted_tree": job["integrated_tree"], "source_sha": job["source_sha"],
         }))
-        if not tx.rows("SELECT position FROM history WHERE subject=? AND generation=? AND kind='acceptance_promoted' AND identity=? AND material_id=? LIMIT 1",
-                       (job["id"], job["generation"], job["review_attempt"], material)):
+        if not tx.rows(*selected_statement(tx, "SELECT position FROM history WHERE subject=? AND generation=? AND kind='acceptance_promoted' AND identity=? AND material_id=? LIMIT 1",
+                   "SELECT position FROM history WHERE subject=? AND generation=? AND kind='acceptance_promoted' AND identity=? AND material_id=? AND run_id=? LIMIT 1",
+                   (job["id"], job["generation"], job["review_attempt"], material), run_last=True)):
             self._event(tx, job["id"], "acceptance_promoted", job["review_attempt"], material)
 
     def _review_current(self, tx: Transaction, job: sqlite3.Row, world: World) -> bool:
         if not job["review_attempt"] or world.target is None:
             return False
-        review = tx.one("SELECT * FROM attempts WHERE id=?", (job["review_attempt"],))
+        review = tx.one(*selected_statement(tx, "SELECT * FROM attempts WHERE id=?",
+                     'SELECT * FROM attempts WHERE id=? AND run_id=?',
+                     (job["review_attempt"],), run_last=True))
         return bool(review["outcome"] == "pass" and review["revision"] == job["revision"]
                 and review["candidate_sha"] == job["candidate_sha"] and review["candidate_tree"] == job["candidate_tree"]
                 and review["base_sha"] == self._require_target(world).sha and review["expected_tree"] == job["expected_tree"]
@@ -5613,7 +5985,9 @@ class Kernel:
         if (not self._published_matches(run, job, world) or checks is None or checks.pr_number != job["pr_number"] or checks.head_sha != job["publication_sha"]
                 or checks.result not in {"pass", "none"} or not job["checks_id"]):
             return False
-        recorded = tx.one("SELECT material_id FROM checks WHERE id=?", (job["checks_id"],))
+        recorded = tx.one(*selected_statement(tx, "SELECT material_id FROM checks WHERE id=?",
+                       'SELECT material_id FROM checks WHERE id=? AND run_id=?',
+                       (job["checks_id"],), run_last=True))
         if json.loads(tx.get(recorded[0], job["id"])) != asdict(checks):
             # JSON arrays and dataclass tuples are compared canonically.
             if wire_json(json.loads(tx.get(recorded[0], job["id"]))) != wire_json(asdict(checks)):
@@ -5622,7 +5996,9 @@ class Kernel:
             return job["gate_mode"] in {"review", "deterministic_fallback", "ci_waiver"}
         if not job["grant_id"] or not self._review_current(tx, job, world):
             return False
-        grant = tx.one("SELECT * FROM grants WHERE id=?", (job["grant_id"],))
+        grant = tx.one(*selected_statement(tx, "SELECT * FROM grants WHERE id=?",
+                    'SELECT * FROM grants WHERE id=? AND run_id=?',
+                    (job["grant_id"],), run_last=True))
         return bool(grant["pr_number"] == job["pr_number"] and grant["head_sha"] == job["publication_sha"]
                 and grant["base_sha"] == self._require_target(world).sha and grant["review_attempt"] == job["review_attempt"]
                 and grant["checks_id"] == job["checks_id"] and grant["revision"] == job["revision"]
