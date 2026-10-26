@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+import time
 from typing import Any
 
 from agent_run.notifications.envelope import event_copy, event_envelope
@@ -11,6 +12,7 @@ from agent_run.contracts.copy import selected_language, text
 from agent_run.contracts.repository import same_repository
 
 from agent_run.queries.execution import execution_facts
+from agent_run.queries.read_facts import read_boundaries
 from agent_run.storage.sqlite import Transaction
 from agent_run.queries.resume_facts import resume_facts
 
@@ -35,6 +37,32 @@ def event_state(tx: Transaction) -> dict[str, Any]:
     return {"run_id": run["id"], "repository": run["repository"],
             "parent": {"number": run["parent_issue"], "title": title[0][0] if title else ""},
             "language": run["language"], "created_at": run["created_at"]}
+
+
+def completion_context(view: Mapping[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    """Current progress and guidance from the existing read-only boundary view.
+
+    These facts describe the Run now; they do not change an original completion
+    identity, its summary, or its as-of-event execution totals.
+    """
+    tickets = [job for job in view["subjects"] if job["kind"] == "ticket"]
+    completed = sum(job["phase"] == "complete" for job in tickets)
+    status_query = f"agent-run status {state['parent']['number']} --repo {state['repository']}"
+    actions = [{"issue": item.get("issue"), "scope": item["scope"],
+                "reasons": item["reasons"], "next_action": item["next_action"]}
+               for item in view["actions"]]
+    if actions or view["abandonment"] is not None:
+        next_step = status_query
+    elif view["status"] == "completed":
+        cleanup = view["delivery_cleanup"]
+        next_step = (cleanup["items"][0]["recovery_action"]
+                     if cleanup is not None and cleanup["status"] == "cleanup_pending"
+                     else event_copy(state, "completed_next"))
+    else:
+        next_step = event_copy(state, "ticket_next" if completed < len(tickets) else "overall_next")
+    return {"ticket_progress": {"completed": completed, "total": len(tickets)} if tickets else None,
+            "parent_only": any(job["kind"] == "parent_only" for job in view["subjects"]),
+            "completion_actions": actions, "status_query": status_query, "next_step": next_step}
 
 
 def _live_attempt(tx: Transaction, subject: str, generation: int, attempt: str) -> bool:
@@ -278,14 +306,20 @@ def _project(tx: Transaction, row: Mapping[str, Any], state: dict[str, Any], mod
             return [EventProjection(event_envelope(state, "pr_created", number, event_copy(state, "pr_created", number=number), "green",
                                    summary=event_copy(state, "pr_summary"),
                                    url=f"https://github.com/{pr['repository']}/pull/{number}"), False)]
-    if subject["kind"] == "ticket" and tx.rows("SELECT generation FROM completions WHERE subject=? AND generation=? AND close_effect=?",
-                                             (row["subject"], row["generation"], row["identity"])):
-        facts = _subject_facts(tx, subject, subject["revision"], state)
+    completion = tx.rows("SELECT revision,development_attempt FROM completions WHERE subject=? AND generation=? AND close_effect=?",
+                         (row["subject"], row["generation"], row["identity"])) if subject["kind"] == "ticket" else []
+    if completion:
+        facts = _subject_facts(tx, subject, completion[0]["revision"], state)
+        development = tx.rows("SELECT result_id FROM attempts WHERE id=? AND subject=? AND generation=? AND role='development'",
+                              (completion[0]["development_attempt"], row["subject"], row["generation"]))
+        summary = (json.loads(tx.get(development[0]["result_id"], row["subject"])).get("summary")
+                   if development and development[0]["result_id"] is not None else None)
         effort = execution_facts(tx, row)
         total = effort.pop("execution_seconds", None)
         return [EventProjection(event_envelope(state, "ticket_completed", [str(subject["issue"]), row["generation"]],
                                event_copy(state, "ticket_completed", title=facts["task_title"]), "green",
-                               total_seconds=total, **effort, **facts), False)]
+                               summary=summary or "", total_seconds=total, **effort, **facts,
+                               **completion_context(read_boundaries(tx, time.time()), state)), False)]
     return []
 
 

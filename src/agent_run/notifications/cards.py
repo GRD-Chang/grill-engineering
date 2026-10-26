@@ -47,6 +47,16 @@ def card(event: dict[str, Any]) -> dict[str, Any]:
         lines.append(copy("round", role=role, ordinal=ordinal) if ordinal else role)
     if event.get("summary"):
         lines.append(_markdown(event["summary"]))
+    if event.get("parent_only") is True:
+        lines.append(copy("parent_only"))
+    progress = event.get("ticket_progress")
+    if progress and not event.get("parent_only"):
+        lines.append(copy("progress", completed=progress["completed"], total=progress["total"]))
+    for action in event.get("completion_actions", []):
+        target = f"#{action['issue']}" if action["issue"] else repository
+        lines.append(copy("field", label=copy("boundary." + action["scope"]), value=_markdown(target)))
+        lines.extend(_markdown(reason) for reason in action["reasons"])
+        lines.append(copy("field", label=copy("next_step"), value=_markdown(action["next_action"])))
     checks = event.get("checks") or {}
     labels = {name: copy("check." + name) for name in ("e2e", "standards", "review", "spec")}
     results = {result: copy("result." + result) for result in ("pass", "fail", "blocked")}
@@ -106,6 +116,8 @@ def card(event: dict[str, Any]) -> dict[str, Any]:
                 lines.append(copy("effort.shared_rounds"))
     if event.get("next_step"):
         lines.append(copy("field", label=f"**{copy('next_step')}**", value=_markdown(event["next_step"])))
+    if event.get("status_query") and event["status_query"] != event.get("next_step"):
+        lines.append(copy("field", label=copy("current_status"), value=_markdown(event["status_query"])))
     elements: list[dict[str, Any]] = [{"tag": "markdown", "content": "\n".join(lines)}]
     if effort or any(len(str(event.get(key) or "")) > 260 for key in ("summary", "next_step")):
         elements.append({"tag": "markdown", "content": copy("field", label=copy("full_record"), value=f"`{_text(event.get('query', ''), 160).replace('`', '')}`")})
