@@ -84,6 +84,8 @@ class NativeNotifications:
         self._shutdown = False
         self._recovery_requested = False
         self._fault_serial = 0
+        self._pending_serial = 0  # Ordered by the existing journal transaction lock.
+        self._woken_serial = 0
         if self.enabled:
             self.observe_committed()
             self.thread = threading.Thread(target=self._work, name="kernel-notifications", daemon=True)
@@ -360,12 +362,15 @@ class NativeNotifications:
             self._status_seen[subject] = fingerprint
         self.status_failure_reason = None
 
-    def _wake_pending(self, document: dict[str, Any]) -> None:
+    def _wake_pending(self, document: dict[str, Any], serial: int) -> None:
         """Give existing important Feishu claims priority over display reads."""
         pending = document["pending"]
         if self.exit_notice is not None:
             pending = [item for item in pending if item["event"]["id"] == self.exit_event_id]
         with self.condition:
+            if serial < self._woken_serial:
+                return  # A newer committed snapshot already owns the signal.
+            self._woken_serial = serial
             if any(item.get("important") and not item.get("cancelled") for item in pending):
                 self._status_preempt.set()
             else:
@@ -471,7 +476,9 @@ class NativeNotifications:
                         outbox.retire(document, item)
                     document["seen"].append(event["id"])
                     del document["seen"][:-outbox.MAX_RECORDS]
-        self._wake_pending(document)
+            self._pending_serial += 1
+            serial = self._pending_serial
+        self._wake_pending(document, serial)
         self._more = False
         return True
 
@@ -515,7 +522,9 @@ class NativeNotifications:
                             if not self._same_binding(*self._run(tx)):
                                 raise ValueError("notification Run or recipient binding changed")
                             self._compress_progress(tx, document, read_boundaries(tx, time.time()), added=True)
-                self._wake_pending(document)
+                    self._pending_serial += 1
+                    serial = self._pending_serial
+                self._wake_pending(document, serial)
                 self._more = more
                 if not more or full or boundary_more:
                     return True

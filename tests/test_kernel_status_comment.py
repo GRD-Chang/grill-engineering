@@ -1169,3 +1169,72 @@ def test_status_dirty_journal_fault_keeps_worker_alive_until_explicit_recovery(t
     finally:
         release.set()
         observer.close(drain=False)
+
+
+def test_older_observer_cannot_clear_newer_important_status_preemption(tmp_path, monkeypatch):
+    from threading import Event, Thread, current_thread
+    import agent_run.notifications.sender as notifications
+    from support.worker_process_timing import wait_until
+
+    scenario = published(tmp_path, monkeypatch, notifications={"enabled": True, "mode": "concise",
+        "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
+    database, subject = scenario.kernel.storage.path, scenario.delivery.key
+    api = CommentsAPI(project_status(database, subject).target)
+    reading, read_release, older_ready, older_release = (Event() for _ in range(4))
+    important_sent = Event()
+    ordering, errors = [], []
+    original_object, original_write = api.object, api.write
+    def held_object(endpoint):
+        if not reading.is_set():
+            reading.set()
+            assert read_release.wait(6)
+        return original_object(endpoint)
+    def write(*args):
+        ordering.append("status")
+        return original_write(*args)
+    api.object, api.write = held_object, write
+    def transport(*_args, **_kwargs):
+        if older_ready.is_set():
+            ordering.append("important")
+            important_sent.set()
+        return {"outcome": "success", "reason": None}
+    original_wake = notifications.NativeNotifications._wake_pending
+    def reordered_wake(self, document, *args):
+        if current_thread().name == "older-observation":
+            older_ready.set()
+            assert older_release.wait(5)
+        return original_wake(self, document, *args)
+    monkeypatch.setattr(notifications.NativeNotifications, "_wake_pending", reordered_wake)
+    observer = notifications.NativeNotifications(database, database.parent, transport=transport, status_api=api)
+    def older():
+        try:
+            observer.observe_committed()
+        except BaseException as error:
+            errors.append(error)
+    thread = Thread(target=older, name="older-observation")
+    try:
+        assert reading.wait(5)
+        assert not observer._status_preempt.is_set()
+        thread.start()
+        assert older_ready.wait(5)
+        scenario.kernel.control("stop", "new-important-after-old-observation", subject=subject)
+        observer.observe_committed()
+        assert observer._status_preempt.is_set()
+        older_release.set()
+        thread.join(timeout=5)
+        assert not thread.is_alive() and not errors
+        pending = outbox.read_notifications(database.parent, scenario.spec.run_id)["pending"]
+        assert len([item for item in pending if item.get("important")]) == 1
+        assert observer._status_preempt.is_set(), "Older empty snapshot cleared a newer important claim"
+        read_release.set()
+        assert important_sent.wait(5)
+        wait_until(lambda: len(api.comments) == 1 and "operator_stopped" in api.comments[0]["body"], timeout=5)
+        observer.close()
+        assert ordering[0] == "important"
+        assert [row[1] for row in api.commands] == ["POST"]
+        assert not observer.thread.is_alive()
+    finally:
+        older_release.set(); read_release.set()
+        if thread.ident is not None:
+            thread.join(timeout=5)
+        observer.close(drain=False)
