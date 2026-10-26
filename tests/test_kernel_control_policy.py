@@ -154,6 +154,8 @@ def test_whole_run_resume_forwards_feedback_only_to_the_stopped_work(tmp_path: P
     kernel.bind_thread(first, "original-thread")
     process = {"pid": 23, "start_token": "original-start", "pgid": 23, "host_pid": 11, "host_start_token": "host-start"}
     kernel.agent_started(first, process)
+    # This work actually passed final source admission before the operator Stop.
+    kernel.agent_source_ready(first)
     kernel.control("stop", "whole-stop")
     kernel.agent_exited(first, process, 1, failure="Stopped by the operator")
     kernel.confirm_executor_exit(execution)
