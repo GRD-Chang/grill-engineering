@@ -112,6 +112,13 @@ def test_ticket_policy_window_does_not_change_a_sibling_call_or_its_allowances(t
     resumed = operations.once().call
     assert resumed is not None and resumed.deadline_seconds == 13.0
     assert previous is not None and resumed.attempt_id != previous.attempt_id and resumed.thread_id != previous.thread_id
+    # Release this Worker in the fixture's controlled Host domain; keep its sibling idle.
+    operations.runner.authorize_agent(resumed)
+    assert kernel.dispatch_agent(resumed)
+    kernel.agent_started(resumed, {"pid": 23, "pgid": 23, "start_token": "resumed-ticket-two",
+        "host_pid": 42, "host_start_token": "start", "boot_id": "boot",
+        "host_cgroup": "/host", "cgroup": "/host/worker"})
+    kernel.agent_source_ready(resumed)
     assert kernel.status("ticket:3")["budgets"] == sibling_budget
     assert kernel.dispatch_agent(sibling)
     kernel.guard_agent(sibling)
@@ -261,6 +268,13 @@ def test_two_accepted_whole_run_responses_reach_the_original_work_in_order(tmp_p
     operations = CoreOperations(kernel, execution, lambda binding: ports)
     first = operations.once().call
     assert first is not None
+    # The original Worker reached final release before either accepted Stop.
+    operations.runner.authorize_agent(first)
+    assert kernel.dispatch_agent(first)
+    kernel.agent_started(first, {"pid": 23, "pgid": 23, "start_token": "original-ticket-two",
+        "host_pid": 42, "host_start_token": "start", "boot_id": "boot",
+        "host_cgroup": "/host", "cgroup": "/host/worker"})
+    kernel.agent_source_ready(first)
     for number in (1, 2):
         assert kernel.control_host(request, "stop", f"stop-{number}") == "applied"
         assert kernel.observe_host(request, HostObservation("exited", request.unit_name, "original", "/host", "boot",
