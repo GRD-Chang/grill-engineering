@@ -394,8 +394,13 @@ class Storage:
                     require_supported_connection(connection, self.path)
                 self._capacity(connection)
                 connection.commit()
-            except BaseException:
+            except BaseException as error:
                 connection.rollback()
+                if isinstance(error, sqlite3.OperationalError):
+                    code = getattr(error, "sqlite_errorcode", None)
+                    if code in (sqlite3.SQLITE_FULL, sqlite3.SQLITE_INTERRUPT):
+                        diagnostic = "storage_limit" if code == sqlite3.SQLITE_FULL else "transaction_aborted"
+                        raise KernelError(diagnostic, f"{error.sqlite_errorname}: {error}") from error
                 raise
 
     def _capacity(self, connection: sqlite3.Connection) -> None:
