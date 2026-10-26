@@ -19,6 +19,15 @@ def test_reviewer_contract_keeps_independent_duties_and_safe_final_response(lang
     for command in ("kill", "pkill", "killall"):
         assert command in prompt
     assert ("按 PID" if language == "zh" else "by PID") in prompt
+    assert ("本轮自建子进程" if language == "zh" else "child processes created by this task") in prompt
+    assert ("准确句柄" if language == "zh" else "exact handles") in prompt
+    assert "SIGTERM" in prompt
+    assert ("有界等待退出" if language == "zh" else "wait for exit within a bound") in prompt
+    assert ("祖先进程" if language == "zh" else "ancestors") in prompt
+    assert ("身份不符" if language == "zh" else "identity-mismatched") in prompt
+    assert ("管理域" if language == "zh" else "management domain") in prompt
+    assert ("禁止 kill、pkill、killall、按 PID 清理" if language == "zh"
+            else "Do not use kill, pkill or killall, clean up by PID") not in prompt
     assert ("最终结构化响应" if language == "zh" else "final structured response") in prompt
     assert ("不得继续调用工具" if language == "zh" else "do not call tools afterwards") in prompt
     assert "commentary" in prompt
@@ -27,6 +36,18 @@ def test_reviewer_contract_keeps_independent_duties_and_safe_final_response(lang
                 else 'three independent subagents for Spec, Standards and E2E') in prompt
         assert 'fork_turns: "none"' in prompt
         assert ("明确代码因果证据" if language == "zh" else "clear code-causal evidence") in prompt
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_review_format_repair_never_reopens_process_cleanup_or_tool_permission(language):
+    from agent_run.core.prompts.context import structured_output_repair_prompt
+
+    prompt = structured_output_repair_prompt("Acceptance Artifact", "missing field", request={
+        "language": language, "_prompt_resources": builtin_resources(language)})
+    assert ("调用工具" if language == "zh" else "call tools") in prompt
+    assert ("只修正结果格式" if language == "zh" else "Correct only the result format") in prompt
+    assert "SIGTERM" not in prompt
+    assert ("本轮自建子进程" if language == "zh" else "child processes created by this task") not in prompt
 
 
 @pytest.mark.parametrize("language", ["zh", "en"])

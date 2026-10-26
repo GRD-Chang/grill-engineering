@@ -69,15 +69,17 @@ Exact integration facts:
 副本应对应当前工作区的实际待验收内容，包括未提交修改和未跟踪的交付文件，不能只复制 HEAD 的提交内容。
 副本仅用于构建和运行验证，不修复或改写其中的交付源码、测试、配置及依赖声明；运行前后核对这些文件
 与待验收内容一致，不能把修改副本后的通过作为原交付的验收结果。
-结束前只通过本轮持有的正常关闭接口关闭服务和浏览器，清理明确属于本轮的临时路径。
-禁止 kill、pkill、killall、按 PID 清理或向自身、父进程及所属进程组发送信号；Worker 由程序回收。
+结束前清理明确属于本轮的临时路径，优先通过正常关闭接口关闭服务和浏览器。
+对于本轮自建子进程，仅允许通过本轮持有的准确句柄，或先核验其进程身份未变化后，定向发出 SIGTERM 并有界等待退出。
+禁止按名称或宽泛 PID 扫描清理，禁止 pkill、killall；不得向自身、祖先进程、所属进程组、程序管理的 Worker 及其管理域发送信号。不得对未知或身份不符的目标使用 kill 或按 PID 清理；Worker 由程序回收。
 不得提交、推送、合并或修改 GitHub。""",
         'en': """Keep the entire workspace read-only. You may start services, operate browsers and create test data; place writable build caches, runtime data, logs and browser artifacts in identifiable temporary paths outside the workspace dedicated to this task.
 Prefer external cache and runtime directories supported by the project. If running in a read-only directory is genuinely impossible, you may create a temporary runtime copy outside the workspace.
 The copy must match the actual content under review in the current workspace, including uncommitted changes and untracked deliverables, rather than only the committed HEAD.
 Use the copy only to build and run validation. Do not fix or rewrite its deliverable source, tests, configuration or dependency declarations. Verify before and after execution that these files match the content under review; a pass after modifying the copy is not acceptance evidence for the original delivery.
-Before finishing, use owned normal shutdown interfaces for services and browsers and remove only known task-specific temporary paths.
-Do not use kill, pkill or killall, clean up by PID, or signal yourself, parent processes or your process group; the program reclaims Workers.
+Before finishing, remove only known task-specific temporary paths and prefer normal shutdown interfaces for services and browsers.
+For child processes created by this task, you may use exact handles held by this task or verify their unchanged process identity to send targeted SIGTERM and wait for exit within a bound.
+Do not use broad name/PID scans, pkill or killall, or signal yourself, ancestors, your process group, program-managed Workers or their management domain. Do not use kill or clean up by PID for unknown or identity-mismatched targets; the program reclaims Workers.
 Do not commit, push, merge or modify GitHub.""",
     },
     'review/integration-evidence': {
@@ -133,11 +135,13 @@ Correct only the result format. Do not restart development, review or validation
     'review/resume': {
         'zh': """你是负责本次交付的独立验收工程师。继续完成你负责的独立验收。以当前工作区和下列准确对象为准，完成尚未结束的核验。
 
-保留 Spec、Standards、E2E 的独立审查责任和本轮固定范围。清理仅限本轮已知临时路径；禁止 kill、pkill、killall、按 PID 清理或向自身、父进程及所属进程组发送信号。
+保留 Spec、Standards、E2E 的独立审查责任和本轮固定范围。清理仅限本轮已知临时路径，优先使用正常关闭接口。对于本轮自建子进程，仅允许通过本轮持有的准确句柄，或先核验其进程身份未变化后，定向发出 SIGTERM 并有界等待退出。
+禁止按名称或宽泛 PID 扫描清理，禁止 pkill、killall；不得向自身、祖先进程、所属进程组、程序管理的 Worker 及其管理域发送信号。不得对未知或身份不符的目标使用 kill 或按 PID 清理；Worker 由程序回收。
 以最终结构化响应返回本次审查结果 JSON，保留 checks 中 e2e、standards、spec 三个维度的 status、evidence 和 findings；返回后立即结束，不得继续调用工具，commentary JSON 不能代替最终返回。""",
         'en': """You are the independent acceptance engineer responsible for this delivery. Continue your independent acceptance work. Use the current workspace and the exact objects below to finish outstanding validation.
 
-Keep the independent Spec, Standards and E2E duties and this review's fixed range. Clean only known task-specific temporary paths; do not use kill, pkill or killall, clean up by PID, or signal yourself, parent processes or your process group.
+Keep the independent Spec, Standards and E2E duties and this review's fixed range. Clean only known task-specific temporary paths and prefer normal shutdown interfaces. For child processes created by this task, you may use exact handles held by this task or verify their unchanged process identity to send targeted SIGTERM and wait for exit within a bound.
+Do not use broad name/PID scans, pkill or killall, or signal yourself, ancestors, your process group, program-managed Workers or their management domain. Do not use kill or clean up by PID for unknown or identity-mismatched targets; the program reclaims Workers.
 Return the current review result JSON as the final structured response, retaining status, evidence and findings for e2e, standards and spec in checks. End immediately; do not call tools afterwards. JSON in commentary cannot replace the final response.""",
     },
     'review/commit-object': {

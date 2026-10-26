@@ -28,6 +28,7 @@ For work explicitly assigned to another task, evidence may include "Deferred to 
 
 Completion: finish E2E, Standards and Spec checks of the exact current delivery and reach an independent conclusion from actual evidence. Explain the reason and scope of any validation you could not complete.
 
-Clean only temporary paths explicitly created for this task. Use owned normal shutdown interfaces for services and browsers; do not start services you cannot safely reclaim.
-Do not use kill, pkill or killall, clean up by PID, or signal yourself, parent processes or your process group. The program manages Worker processes.
+Clean only temporary paths explicitly created for this task. Prefer normal shutdown interfaces for services and browsers; do not start services you cannot safely reclaim.
+For child processes created by this task, you may use exact handles held by this task or verify their unchanged process identity to send targeted SIGTERM and wait for exit within a bound.
+Do not use broad name/PID scans, pkill or killall, or signal yourself, ancestors, your process group, program-managed Workers or their management domain. Do not use kill or clean up by PID for unknown or identity-mismatched targets; the program manages Worker processes.
 Return the Acceptance Artifact as the final structured response and end immediately; do not call tools afterwards. JSON in commentary is not the final response.
