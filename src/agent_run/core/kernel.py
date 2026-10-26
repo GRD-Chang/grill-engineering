@@ -332,7 +332,10 @@ class Kernel:
                 if prior.status == "running" and not (prior.dispatch_state == "allocated" and self.clock() >= prior.deadline_at):
                     return Step("waiting", subject, "agent_running")
                 if prior.failure_kind == "capacity" and prior.recovery_ready_at is not None and self.clock() < prior.recovery_ready_at:
-                    return Step("waiting", subject, "capacity_recovery_wait", retry_at=prior.recovery_ready_at)
+                    deadline = None if facts is None else facts.semantic_deadline
+                    if deadline is None or self.clock() < deadline:
+                        retry_at = prior.recovery_ready_at if deadline is None else min(deadline, prior.recovery_ready_at)
+                        return Step("waiting", subject, "capacity_recovery_wait", retry_at=retry_at)
             if tx.rows("SELECT id FROM leases WHERE subject=?", (subject,)) and not (
                     prior is not None and prior.dispatch_state == "allocated" and self.clock() >= prior.deadline_at):
                 return Step("waiting", subject, "previous_invocation_exit")
@@ -3622,6 +3625,9 @@ class Kernel:
                      and pending["resume_action"] is None)
         if inherited and previous is None:
             raise KernelError("continuation_deadline_missing")
+        if inherited and previous is not None and self.clock() >= previous.deadline_at:
+            self._gate(tx, subject, "execution_failed", evidence=previous.start_evidence or previous.raw_id)
+            return Step("paused", subject, "invocation_deadline_exceeded")
         thread_id = None
         if pending is not None and not pending["new_thread"]:
             assert facts is not None
@@ -3831,6 +3837,9 @@ class Kernel:
                 or kind not in {"ordinary", "capacity"} or (kind == "ordinary" and facts.ordinary_used)):
             self._gate(tx, subject, "execution_failed", evidence=previous.start_evidence)
             return Step("paused", subject, "execution_recovery_unavailable")
+        if facts.semantic_deadline is not None and self.clock() >= facts.semantic_deadline:
+            self._gate(tx, subject, "execution_failed", evidence=previous.start_evidence)
+            return Step("paused", subject, "invocation_deadline_exceeded")
         if kind == "capacity" and (previous.recovery_ready_at is None or self.clock() < previous.recovery_ready_at):
             return Step("waiting", subject, "capacity_recovery_wait")
         # Every recovery crosses the same current owner/requirements/eligibility

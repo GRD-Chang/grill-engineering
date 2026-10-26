@@ -240,6 +240,12 @@ Publication Invocation 在首个 Codex 进程启动前写入状态；`thread.sta
 当前概览与历史页在同一只读事务中读取，不将当前状态补作历史结论。
 控制审计不另存 Prompt、transcript 或 Acceptance Artifact；原工作结果通过准确 Attempt 关联读取。
 Ticket、Parent-only 和 Run Repair
+的 Development 可返回 `{"result_kind":"incomplete","summary":"尚未完成的具体工作","human_blockers":null}`。
+这不是格式错误或人工阻塞；准确最终返回、原 Thread 与进程退出可证明时，同一 Attempt 最多自动继续一次，
+原绝对 Invocation 截止覆盖新准备和后续自动异常恢复，不增加 Development 轮次。到期、缺证或已用尽时明确暂停，
+需要显式 `resume`；原材料、预算、Findings 和当前代 Human Response 保留，不能据回复文本跳过独立 Review。
+完成但无代码变化时不制造空提交；需要独立 Review 而名额不足时进入原 Review Budget Checkpoint。
+Ticket、Parent-only 和 Run Repair
 的 Development、Fresh Acceptance 与 Publication 都使用同一 Invocation seam：非法结构化输出会在
 同一 Thread、只读 checkout 中使用角色化短格式 Prompt 最多修复两次，且不增加领域 attempt。进程异常只在
 ADR 0011 的边界内自动同 Thread 续接：普通异常最多一次，准确容量不足可持续恢复；续接使用当前角色的

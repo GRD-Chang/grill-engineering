@@ -50,8 +50,11 @@ def role_schema(role: str) -> dict[str, Any]:
         })
         checks = _object_schema({name: {"$ref": "#/$defs/lane"} for name in _LANES})
         return {**_object_schema({"checks": checks}), "$defs": {"lane": lane}}
+    kinds = [role, "human_blocker"]
+    if role == "development":
+        kinds.append("incomplete")
     return _object_schema({
-        "result_kind": {"type": "string", "enum": [role, "human_blocker", *(["incomplete"] if role == "development" else [])]},
+        "result_kind": {"type": "string", "enum": kinds},
         **{name: _text_schema(nullable=True) for name in _CONTENT[role]},
         "human_blockers": {"type": ["array", "null"], "minItems": 1,
                            "maxItems": MAX_HUMAN_BLOCKERS,

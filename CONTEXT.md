@@ -69,6 +69,7 @@ _Avoid_: gh 请求代理、命令白名单、向 Worker 注入 App 私钥、静�
 
 **Agent Artifact（Agent 产物）**:
 Codex Worker 返回的结构化意图、判断与证据。它可以包含代码变更的语义说明及待发布内容，但本身不授权任何外部写入或完成状态。
+Development 用 `development` 表示工作已完成，用 `incomplete`、非空 summary 与 null human_blockers 如实表示没有外部人工阻塞的未完成工作。Controller 不解析摘要措辞；准确最终返回、Thread 和真实退出证明齐全时，同一 Attempt 最多自动语义续接一次，保留原 Thread 与绝对截止，并与异常恢复、容量等待及只读格式修复分别计数。缺证、到期或用尽后保留原证据并暂停，显式 Resume 不重扣本次 Development。完成但无代码变化可复用准确现有 commit 进入独立 Review，不制造空提交，也不借 Ticket fallback 跳过这次必要复核；Human Response 原文不授予免审或合并权限。
 _Avoid_: GitHub 状态、完成证明、自由文本交接
 
 **验收 Finding（Acceptance Finding）**:
