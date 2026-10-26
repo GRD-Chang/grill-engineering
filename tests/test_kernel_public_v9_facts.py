@@ -190,6 +190,14 @@ def test_resume_application_receipt_does_not_claim_start_before_the_bound_succes
     kernel.bind_thread(successor, 'real-resumed-thread')
     process = {'pid': 21, 'pgid': 21, 'start_token': 'successor', 'host_pid': 10, 'host_start_token': 'host'}
     kernel.agent_started(successor, process)
+    bound_only = next(action for action in read(kernel.storage.path, 'history').data['history']['actions']
+                      if action['kind'] == 'resume')
+    assert bound_only['resume']['started_at'] is None
+    # Synthetic backend activity is distinct from the original process binding.
+    # Use the same native Go/activity producer as the current Worker contract.
+    kernel.agent_source_ready(successor)
+    kernel.observe_worker_activity(successor, 'original-turn-start', active=True,
+        observed_at=100.0, evidence={'type': 'turn.started', 'source': 'synthetic-query-fixture'})
     before = _durable(tmp_path)
     data = read(kernel.storage.path, 'history').data
     resumed = next(action for action in data['history']['actions'] if action['kind'] == 'resume')

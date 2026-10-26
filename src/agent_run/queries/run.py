@@ -22,6 +22,8 @@ from agent_run.storage.preflight import UnsupportedState, require_supported_stat
 from agent_run.storage.tasks import read_task, task_path
 from agent_run.queries.read_facts import QueryError as QueryError, all_rows as _all, material as _material, timestamp as _timestamp, read_header as _header, public_phase as _public_phase, read_boundaries
 from agent_run.queries.read_facts import action_guidance, recorded_review
+from agent_run.queries.read_facts import _one, _rows
+from agent_run.storage.run_scope import selected_statement
 
 
 @dataclass(frozen=True)
@@ -147,18 +149,23 @@ def discover(root: Path, *, published: Mapping[Path, str] | None = None,
 def _invocations(tx: Transaction, subject: str, attempt: str | None = None) -> list[dict[str, Any]]:
     sql = """SELECT i.*,a.role,t.role AS binding_role,t.profile_revision,t.backend_id,t.subject AS thread_subject,a.subject FROM invocations i
              JOIN attempts a ON a.id=i.attempt LEFT JOIN threads t ON t.id=i.thread WHERE a.subject=?"""
-    values: tuple[Any, ...] = (subject,)
+    sql, parameters = selected_statement(tx, sql,
+        "SELECT i.*,a.role,t.role AS binding_role,t.profile_revision,t.backend_id,t.subject AS thread_subject,a.subject "
+        "FROM invocations i JOIN attempts a ON a.run_id=i.run_id AND a.id=i.attempt "
+        "LEFT JOIN threads t ON t.run_id=i.run_id AND t.id=i.thread WHERE i.run_id=? AND a.subject=?", (subject,))
+    values = tuple(parameters)
     if attempt is not None:
         sql += " AND a.id=?"
         values += (attempt,)
-    result = _all(tx, sql + " ORDER BY i.rowid", values)
+    result = [dict(row) for row in tx.all(sql + " ORDER BY i.rowid", values)]
     for row in result:
         if row.pop("thread_subject") != subject:
             raise QueryError("incompatible_run_state", "Invocation has a missing or foreign Thread binding")
         profile = recorded_profile(tx, row["profile_revision"])["profiles"][row["binding_role"]]
         row.update({"model": profile["model"], "effort": profile["reasoning_effort"], "profile_reference": profile["reference"]})
         row["allocated_at"] = _timestamp(row["allocated_at"])
-        outputs = _all(tx, "SELECT * FROM invocation_outputs WHERE invocation=? ORDER BY ordinal", (row["id"],))
+        outputs = _all(tx, "SELECT * FROM invocation_outputs WHERE invocation=? ORDER BY ordinal", (row["id"],),
+            scoped_sql="SELECT * FROM invocation_outputs WHERE run_id=? AND invocation=? ORDER BY ordinal")
         if not outputs:
             raise QueryError("incompatible_run_state", "Invocation has no physical output allocation")
         for output in outputs:
@@ -193,12 +200,15 @@ def _attempt(tx: Transaction, record: sqlite3.Row) -> dict[str, Any]:
 
 def _effect_failures(tx: Transaction, subject: str | None = None, *, effect: str | None = None) -> list[dict[str, Any]]:
     sql = "SELECT f.*,e.subject,e.operation,e.status FROM effect_failures f JOIN effects e ON e.id=f.effect"
-    values: tuple[Any, ...] = () if subject is None else (subject,)
+    sql, parameters = selected_statement(tx, sql,
+        "SELECT f.*,e.subject,e.operation,e.status FROM effect_failures f "
+        "JOIN effects e ON e.run_id=? AND e.run_id=f.run_id AND e.id=f.effect")
+    values = tuple(parameters) + (() if subject is None else (subject,))
     clauses = ["e.subject=?"] if subject is not None else []
     if effect is not None:
         clauses.append("e.id=?")
         values += (effect,)
-    rows = _all(tx, sql + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY f.observed_at,f.effect,f.dispatch_serial", values)
+    rows = [dict(row) for row in tx.all(sql + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY f.observed_at,f.effect,f.dispatch_serial", values)]
     for row in rows:
         row["observed_at"] = _timestamp(row["observed_at"])
         row["evidence"] = _material(tx, row["evidence"], row["subject"])
@@ -206,8 +216,10 @@ def _effect_failures(tx: Transaction, subject: str | None = None, *, effect: str
 
 
 def _resync(tx: Transaction, subject: str) -> dict[str, Any]:
-    allowance = tx.one("SELECT * FROM resync_allowances WHERE subject=? AND current=1", (subject,))
-    snapshots = tx.rows("SELECT * FROM integration_snapshots WHERE subject=? ORDER BY window DESC LIMIT 1", (subject,))
+    allowance = _one(tx, "SELECT * FROM resync_allowances WHERE subject=? AND current=1", (subject,),
+        scoped_sql="SELECT * FROM resync_allowances WHERE run_id=? AND subject=? AND current=1")
+    snapshots = _rows(tx, "SELECT * FROM integration_snapshots WHERE subject=? ORDER BY window DESC LIMIT 1", (subject,),
+        scoped_sql="SELECT * FROM integration_snapshots WHERE run_id=? AND subject=? ORDER BY window DESC LIMIT 1")
     snapshot = dict(snapshots[0]) if snapshots else None
     return {"generation": allowance["generation"], "used": allowance["used"], "limit": allowance["allowance"],
             "window": snapshot["window"] if snapshot else None, "open": bool(snapshot and snapshot["open"]),
@@ -216,22 +228,28 @@ def _resync(tx: Transaction, subject: str) -> dict[str, Any]:
 
 def _subject(tx: Transaction, run: Mapping[str, Any], job: dict[str, Any], boundary: Mapping[str, Any]) -> dict[str, Any]:
     subject = job["id"]
-    budgets = _all(tx, "SELECT * FROM budgets WHERE subject=? ORDER BY purpose,window", (subject,))
+    budgets = _all(tx, "SELECT * FROM budgets WHERE subject=? ORDER BY purpose,window", (subject,),
+        scoped_sql="SELECT * FROM budgets WHERE run_id=? AND subject=? ORDER BY purpose,window")
     pending = None
     if job["current_attempt"]:
-        pending = _attempt(tx, tx.one("SELECT * FROM attempts WHERE id=? AND subject=?", (job["current_attempt"], subject)))
+        pending = _attempt(tx, _one(tx, "SELECT * FROM attempts WHERE id=? AND subject=?", (job["current_attempt"], subject),
+            scoped_sql="SELECT * FROM attempts WHERE run_id=? AND id=? AND subject=?"))
     review = None
     if job["review_attempt"]:
-        attempt = tx.one("SELECT * FROM attempts WHERE id=? AND subject=?", (job["review_attempt"], subject))
+        attempt = _one(tx, "SELECT * FROM attempts WHERE id=? AND subject=?", (job["review_attempt"], subject),
+            scoped_sql="SELECT * FROM attempts WHERE run_id=? AND id=? AND subject=?")
         review = {"attempt_id": attempt["id"], "outcome": attempt["outcome"],
                   "artifact": artifact(Role.REVIEW, tx.get(attempt["result_id"], subject)) if attempt["result_id"] else None}
-    effects = _all(tx, "SELECT id,operation,status,attempts,before_sha,after_sha FROM effects WHERE subject=? AND status IN ('prepared','sent','observed') ORDER BY rowid", (subject,))
+    effects = _all(tx, "SELECT id,operation,status,attempts,before_sha,after_sha FROM effects WHERE subject=? AND status IN ('prepared','sent','observed') ORDER BY rowid", (subject,),
+        scoped_sql="SELECT id,operation,status,attempts,before_sha,after_sha FROM effects WHERE run_id=? AND subject=? AND status IN ('prepared','sent','observed') ORDER BY rowid")
     checks = None
     if job["checks_id"]:
-        check = dict(tx.one("SELECT * FROM checks WHERE id=? AND subject=?", (job["checks_id"], subject)))
+        check = dict(_one(tx, "SELECT * FROM checks WHERE id=? AND subject=?", (job["checks_id"], subject),
+            scoped_sql="SELECT * FROM checks WHERE run_id=? AND id=? AND subject=?"))
         check["evidence"] = _material(tx, check["material_id"], subject)
         checks = check
-    title = tx.rows("SELECT title FROM requirement_versions WHERE issue=? AND revision=?", (job["issue"], job["revision"]))
+    title = _rows(tx, "SELECT title FROM requirement_versions WHERE issue=? AND revision=?", (job["issue"], job["revision"]),
+        scoped_sql="SELECT title FROM requirement_versions WHERE run_id=? AND issue=? AND revision=?")
     return {"subject": subject, "kind": job["kind"], "issue": job["issue"],
             "title": title[0][0] if title else None, "phase": job["phase"], "purpose": job["purpose"],
             "generation": job["generation"], "revision": job["revision"],
@@ -241,8 +259,10 @@ def _subject(tx: Transaction, run: Mapping[str, Any], job: dict[str, Any], bound
             "gates": boundary["gates"], "budgets": budgets, "pending_attempt": pending, "review": review, "review_state": recorded_review(tx, run, job), "required_checks": checks,
             "integration_resync": _resync(tx, subject), "effect_failures": _effect_failures(tx, subject),
             "pending_writes": effects, "delivery_cleanup": boundary["delivery_cleanup"],
-            "blocked_by": [row[0] for row in tx.all("SELECT s.issue FROM dependencies d JOIN subjects s ON s.id=d.predecessor "
-                "WHERE d.subject=? AND s.phase!='complete' ORDER BY s.issue", (subject,))]}
+            "blocked_by": [row[0] for row in tx.all(*selected_statement(tx,
+                "SELECT s.issue FROM dependencies d JOIN subjects s ON s.id=d.predecessor WHERE d.subject=? AND s.phase!='complete' ORDER BY s.issue",
+                "SELECT s.issue FROM dependencies d JOIN subjects s ON s.run_id=d.run_id AND s.id=d.predecessor "
+                "WHERE d.run_id=? AND d.subject=? AND s.phase!='complete' ORDER BY s.issue", (subject,)))]}
 
 
 def _next_action(run: Mapping[str, Any], actions: list[dict[str, Any]], status: str,
@@ -264,13 +284,16 @@ def _next_action(run: Mapping[str, Any], actions: list[dict[str, Any]], status: 
 
 
 def _control_history(tx: Transaction, *, identities: Sequence[str] | None = None) -> list[dict[str, Any]]:
-    actions = (_all(tx, "SELECT * FROM actions WHERE kind='resume' ORDER BY rowid DESC LIMIT 1")
+    actions = (_all(tx, "SELECT * FROM actions WHERE kind='resume' ORDER BY rowid DESC LIMIT 1",
+        scoped_sql="SELECT * FROM actions WHERE run_id=? AND kind='resume' ORDER BY rowid DESC LIMIT 1")
                if identities is None else
-               [dict(row) for identity in identities for row in tx.rows("SELECT * FROM actions WHERE id=?", (identity,))])
+               [dict(row) for identity in identities for row in _rows(tx, "SELECT * FROM actions WHERE id=?", (identity,),
+                   scoped_sql="SELECT * FROM actions WHERE run_id=? AND id=?")])
     for action in actions:
         # A Run-wide scope is not a material owner. The referenced intent keeps
         # its original owner when Final or another subject appears later.
-        owner = action["subject"] or tx.one("SELECT subject FROM material WHERE id=?", (action["payload_id"],))[0]
+        owner = action["subject"] or _one(tx, "SELECT subject FROM material WHERE id=?", (action["payload_id"],),
+            scoped_sql="SELECT subject FROM material WHERE run_id=? AND id=?")[0]
         action["payload"] = _material(tx, action["payload_id"], owner)
         action["receipt"] = _material(tx, action["receipt_id"], owner)
     _resume_progress(tx, actions)
@@ -284,11 +307,14 @@ def _resume_progress(tx: Transaction, control: list[dict[str, Any]]) -> None:
     for action in control:
         if action["kind"] != "resume":
             continue
-        successors = _all(tx, "SELECT id FROM invocations WHERE action_id=? ORDER BY rowid", (action["id"],))
+        successors = _all(tx, "SELECT id FROM invocations WHERE action_id=? ORDER BY rowid", (action["id"],),
+            scoped_sql="SELECT id FROM invocations WHERE run_id=? AND action_id=? ORDER BY rowid")
         receipt = action["receipt"]
-        application = tx.rows("SELECT position,generation FROM history WHERE kind='control_applied' "
+        application = _rows(tx, "SELECT position,generation FROM history WHERE kind='control_applied' "
                               "AND identity=? AND material_id=? ORDER BY position LIMIT 1",
-                              (action["id"], action["receipt_id"]))
+                              (action["id"], action["receipt_id"]),
+                              scoped_sql="SELECT position,generation FROM history WHERE run_id=? AND kind='control_applied' "
+                              "AND identity=? AND material_id=? ORDER BY position LIMIT 1")
         if application:
             applications.append(application[0])
         action["resume"] = {"applied": isinstance(receipt, Mapping) and receipt.get("applied") is True,
@@ -303,7 +329,11 @@ def _resume_progress(tx: Transaction, control: list[dict[str, Any]]) -> None:
     # Archived status bodies/phase copy are never needed by that reader.
     sql = ("SELECT position,kind,identity,subject,generation,material_id,created_at FROM history WHERE position>? "
            "AND kind IN ('worker_started','worker_active','effect_consumed','checks_observed','role_consumed','paused')")
-    values: tuple[Any, ...] = (min(row["position"] for row in applications),)
+    sql, parameters = selected_statement(tx, sql,
+        "SELECT run_id,position,kind,identity,subject,generation,material_id,created_at FROM history WHERE run_id=? AND position>? "
+        "AND kind IN ('worker_started','worker_active','effect_consumed','checks_observed','role_consumed','paused')",
+        (min(row["position"] for row in applications),))
+    values = tuple(parameters)
     if len(resumes) == 1 and resumes[0]["subject"] is not None:
         sql += " AND subject=? AND generation=?"
         values += (resumes[0]["subject"], applications[0]["generation"])
@@ -365,7 +395,8 @@ def _frozen_settings(tx: Transaction, run: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(inputs, dict):
         raise QueryError("incompatible_run_state", "Invalid frozen creation inputs")
     bindings = []
-    for thread in _all(tx, "SELECT * FROM threads ORDER BY rowid"):
+    for thread in _all(tx, "SELECT * FROM threads ORDER BY rowid",
+                       scoped_sql="SELECT * FROM threads WHERE run_id=? ORDER BY rowid"):
         profile = recorded_profile(tx, thread["profile_revision"])["profiles"][thread["role"]]
         bindings.append({"thread_identity": thread["id"], "thread_id": thread["backend_id"],
                          "role": thread["role"], "profile_revision": thread["profile_revision"],
@@ -384,8 +415,10 @@ def _frozen_settings(tx: Transaction, run: Mapping[str, Any]) -> dict[str, Any]:
 
 def _native_history(tx: Transaction, subjects: list[dict[str, Any]], *,
                     after: int, limit: int | None) -> HistoryPage:
-    events = (_all(tx, "SELECT * FROM history WHERE position>? ORDER BY position", (after,)) if limit is None else
-              [dict(row) for row in tx.rows("SELECT * FROM history WHERE position>? ORDER BY position LIMIT ?", (after, limit))])
+    events = (_all(tx, "SELECT * FROM history WHERE position>? ORDER BY position", (after,),
+        scoped_sql="SELECT * FROM history WHERE run_id=? AND position>? ORDER BY position") if limit is None else
+        [dict(row) for row in _rows(tx, "SELECT * FROM history WHERE position>? ORDER BY position LIMIT ?", (after, limit),
+            scoped_sql="SELECT * FROM history WHERE run_id=? AND position>? ORDER BY position LIMIT ?")])
     identities = list(dict.fromkeys(event["identity"] for event in events))
     for event in events:
         if (type(event["position"]) is not int or type(event["generation"]) is not int or event["generation"] < 1
@@ -396,11 +429,15 @@ def _native_history(tx: Transaction, subjects: list[dict[str, Any]], *,
         event["evidence"] = _material(tx, event["material_id"], event["subject"])
     identities.extend(event["identity"].rsplit(":", 1)[0] for event in events if event["kind"] == "worker_active")
     next_after = events[-1]["position"] if events else after
-    has_more = bool(tx.rows("SELECT position FROM history WHERE position>? LIMIT 1", (next_after,)))
-    attempt_ids = {row[0] for identity in identities for row in tx.rows(
+    has_more = bool(_rows(tx, "SELECT position FROM history WHERE position>? LIMIT 1", (next_after,),
+        scoped_sql="SELECT position FROM history WHERE run_id=? AND position>? LIMIT 1"))
+    attempt_ids = {row[0] for identity in identities for row in _rows(tx,
         "SELECT id FROM attempts WHERE id=? UNION SELECT attempt FROM invocations WHERE id=?",
-        (identity, identity)) if row[0] is not None}
-    attempts = [_attempt(tx, tx.one("SELECT * FROM attempts WHERE id=?", (identity,))) for identity in sorted(attempt_ids)]
+        (identity, identity), scoped_sql="WITH selected_run(id) AS (VALUES(?)) "
+        "SELECT id FROM attempts WHERE run_id=(SELECT id FROM selected_run) AND id=? "
+        "UNION SELECT attempt FROM invocations WHERE run_id=(SELECT id FROM selected_run) AND id=?") if row[0] is not None}
+    attempts = [_attempt(tx, _one(tx, "SELECT * FROM attempts WHERE id=?", (identity,),
+        scoped_sql="SELECT * FROM attempts WHERE run_id=? AND id=?")) for identity in sorted(attempt_ids)]
     owners = {job["subject"]: job for job in subjects}
     rounds: dict[str, int] = {}
     for attempt in attempts:
@@ -409,11 +446,104 @@ def _native_history(tx: Transaction, subjects: list[dict[str, Any]], *,
         rounds[key] = rounds.get(key, 0) + 1
     return {"events": events, "attempts": attempts, "time_zone": "UTC",
             "effect_failures": [failure for identity in identities for failure in _effect_failures(tx, effect=identity)],
-            "effects": [dict(row) for identity in sorted(identities) for row in tx.rows(
-                "SELECT id,subject,operation,attempts,status FROM effects WHERE id=?", (identity,))],
+            "effects": [dict(row) for identity in sorted(identities) for row in _rows(tx,
+                "SELECT id,subject,operation,attempts,status FROM effects WHERE id=?", (identity,),
+                scoped_sql="SELECT id,subject,operation,attempts,status FROM effects WHERE run_id=? AND id=?")],
             "actions": _control_history(tx, identities=identities), "rounds": rounds,
             "after": after, "next_after": next_after, "has_more": has_more}
 
+
+
+def read_snapshot(tx: Transaction, path: Path, kind: Literal["status", "history", "settings"], *,
+                  after: int = 0, limit: int | None = None, expected_run: str | None = None,
+                  expected_repository: str | None = None) -> QueryDocument:
+    """Project one caller-owned snapshot; opening and protocol gates stay outside.
+
+    Current public read() still opens only the existing native database. The
+    inactive repository caller must supply an explicit RunTransaction. Neither
+    path advances Core, grants control or selects a Run from projected data.
+    """
+    if after < 0 or (limit is not None and not 1 <= limit <= 128):
+        raise QueryError("query_limit", "History requires after >= 0 and an optional limit between 1 and 128")
+    if not tx.connection.in_transaction:
+        raise QueryError("incompatible_run_state", "Query requires an active database snapshot")
+    location = _header(tx, path)
+    run = dict(_one(tx, "SELECT * FROM runs", scoped_sql="SELECT * FROM runs WHERE id=?"))
+    if ((expected_run is not None and run["id"] != expected_run)
+            or (expected_repository is not None and run["repository"].lower() != expected_repository)):
+        raise QueryError("run_locator_conflict", "Selected database no longer matches its Run identity")
+    language = run.get("language")
+    if language not in {"zh", "en"}:
+        raise QueryError("recovery_materials_missing", "Run language is missing or invalid; personal defaults cannot replace it")
+    if kind == "settings":
+        settings = _frozen_settings(tx, run)
+        if len(json.dumps(settings, ensure_ascii=False, allow_nan=False).encode()) > QUERY_LIMIT:
+            raise QueryError("query_limit", "Public response exceeds its bounded limit")
+        return QueryDocument("settings", language, settings)
+    now = time.time()
+    boundaries = read_boundaries(tx, now)
+    by_subject = {job["subject"]: job for job in boundaries["subjects"]}
+    subjects = [_subject(tx, run, job, by_subject[job["id"]]) for job in _all(tx, "SELECT * FROM subjects ORDER BY id",
+        scoped_sql="SELECT * FROM subjects WHERE run_id=? ORDER BY id")]
+    windows = boundaries["supervision_windows"]
+    for subject in subjects:
+        subject_windows = [window for window in windows if window["subject"] == subject["subject"]]
+        subject["supervision_windows"] = subject_windows
+    abandonment = boundaries["abandonment"]
+    actions = boundaries["actions"]
+    title = _rows(tx, "SELECT title,body FROM requirement_versions WHERE issue=? AND revision=?", (run["parent_issue"], run["parent_revision"]),
+        scoped_sql="SELECT title,body FROM requirement_versions WHERE run_id=? AND issue=? AND revision=?")
+    active = [job for job in subjects if job["phase"] not in {"complete", "abandoned"}]
+    complete = boundaries["is_terminal"]
+    status = boundaries["status"]
+    created = _timestamp(run.get("created_at"))
+    closed = _rows(tx, "SELECT max(h.created_at) FROM history h JOIN effects e ON e.id=h.identity WHERE h.kind='effect_consumed' AND e.operation='close'",
+        scoped_sql="SELECT max(h.created_at) FROM history h JOIN effects e ON e.run_id=h.run_id AND e.id=h.identity "
+        "WHERE h.run_id=? AND h.kind='effect_consumed' AND e.operation='close'")
+    end = _timestamp(closed[0][0]) if complete and closed else None
+    elapsed_end = end if complete else now
+    elapsed = elapsed_end - created if created is not None and elapsed_end is not None and elapsed_end >= created else None
+    focused: dict[str, Any] | None = next((job for job in subjects if job["subject"] == run["integration_holder"]), None)
+    if focused is None:
+        if len(active) == 1:
+            focused = active[0]
+        else:
+            focused = next((job for job in subjects if job["kind"] == "final_run" and job["phase"] == "complete"), None)
+    data: RunStatus = {"run_id": run["id"], "repository": run["repository"],
+        "parent": {"number": run["parent_issue"], "title": title[0][0] if title else None,
+                   "body": title[0][1] if title else None, "revision": run["parent_revision"]},
+        "status": status, "phase": status if abandonment is not None else _public_phase(active[0]["phase"]) if len(active) == 1 else "parallel" if active else
+            "merged" if any(job["kind"] == "final_run" and job["phase"] == "complete" for job in subjects) else status,
+        "created_at": created, "elapsed_seconds": elapsed, "repository_root": location["repository_root"],
+        "parent_revision": run["parent_revision"], "graph_revision": run["graph_revision"],
+        "policy_snapshot": json.loads(run["policy"]),
+        "subjects": subjects, "operator_actions": actions,
+        "focus_subject": focused["subject"] if focused else None,
+        "next_action": _next_action(run, actions, status, boundaries["delivery_cleanup"]),
+        "delivery_cleanup": boundaries["delivery_cleanup"], "supervision_windows": windows,
+        "latest_resume": None, "resume_waits": [], "abandonment": abandonment, "unavailable_facts": [],
+        "diagnostics": [], "notifications": _notification_facts(tx, run, path),
+        "executor_control": {"owner": run["executor"], "epoch": run["epoch"], "stopped": bool(run["stopped"]), "blocked": run["blocked"], "live_status": "unknown"},
+        "scheduling": {"concurrency": run["concurrency"], "integration_holder": run["integration_holder"],
+                       "active": _all(tx, "SELECT id,subject,invocation FROM leases ORDER BY subject",
+                           scoped_sql="SELECT id,subject,invocation FROM leases WHERE run_id=? ORDER BY subject"),
+                       "work_fifo": [row["subject"] for row in _all(tx, "SELECT subject FROM work_queue ORDER BY ready",
+                           scoped_sql="SELECT subject FROM work_queue WHERE run_id=? ORDER BY ready")],
+                       "integration_fifo": [row["subject"] for row in _all(tx, "SELECT subject FROM integration_queue ORDER BY ready",
+                           scoped_sql="SELECT subject FROM integration_queue WHERE run_id=? ORDER BY ready")]}}
+    control = _control_history(tx)
+    data["latest_resume"] = control[0] if control else None
+    data["resume_waits"] = _resume_waits(run, subjects, data["scheduling"]["active"])
+    data["unavailable_facts"] = ["host_liveness", "host_activity_segments", "notifications.journal_binding"]
+    if data["notifications"]["journal_state"] != "available":
+        data["unavailable_facts"].append("notifications")
+    if data["notifications"]["configuration"] is None:
+        data["unavailable_facts"].append("notifications.configuration")
+    if kind == "history":
+        data["history"] = _native_history(tx, subjects, after=after, limit=limit)
+    if len(json.dumps(data, ensure_ascii=False, allow_nan=False).encode()) > QUERY_LIMIT:
+        raise QueryError("query_limit", "Public response exceeds its bounded limit")
+    return QueryDocument(kind, language, data)
 
 
 def read(path: Path, kind: Literal["status", "history", "settings"], *, after: int = 0, limit: int | None = None,
@@ -424,76 +554,8 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
     try:
         require_supported_state(path)
         with Storage(path).transaction(write=False) as tx:
-            location = _header(tx, path)
-            run = dict(tx.one("SELECT * FROM runs"))
-            if ((expected_run is not None and run["id"] != expected_run)
-                    or (expected_repository is not None and run["repository"].lower() != expected_repository)):
-                raise QueryError("run_locator_conflict", "Selected database no longer matches its Run identity")
-            language = run.get("language")
-            if language not in {"zh", "en"}:
-                raise QueryError("recovery_materials_missing", "Run language is missing or invalid; personal defaults cannot replace it")
-            if kind == "settings":
-                settings = _frozen_settings(tx, run)
-                if len(json.dumps(settings, ensure_ascii=False, allow_nan=False).encode()) > QUERY_LIMIT:
-                    raise QueryError("query_limit", "Public response exceeds its bounded limit")
-                return QueryDocument("settings", language, settings)
-            now = time.time()
-            boundaries = read_boundaries(tx, now)
-            by_subject = {job["subject"]: job for job in boundaries["subjects"]}
-            subjects = [_subject(tx, run, job, by_subject[job["id"]]) for job in _all(tx, "SELECT * FROM subjects ORDER BY id")]
-            windows = boundaries["supervision_windows"]
-            for subject in subjects:
-                subject_windows = [window for window in windows if window["subject"] == subject["subject"]]
-                subject["supervision_windows"] = subject_windows
-            abandonment = boundaries["abandonment"]
-            actions = boundaries["actions"]
-            title = tx.rows("SELECT title,body FROM requirement_versions WHERE issue=? AND revision=?", (run["parent_issue"], run["parent_revision"]))
-            active = [job for job in subjects if job["phase"] not in {"complete", "abandoned"}]
-            complete = boundaries["is_terminal"]
-            status = boundaries["status"]
-            created = _timestamp(run.get("created_at"))
-            closed = tx.rows("SELECT max(h.created_at) FROM history h JOIN effects e ON e.id=h.identity WHERE h.kind='effect_consumed' AND e.operation='close'")
-            end = _timestamp(closed[0][0]) if complete and closed else None
-            elapsed_end = end if complete else now
-            elapsed = elapsed_end - created if created is not None and elapsed_end is not None and elapsed_end >= created else None
-            focused: dict[str, Any] | None = next((job for job in subjects if job["subject"] == run["integration_holder"]), None)
-            if focused is None:
-                if len(active) == 1:
-                    focused = active[0]
-                else:
-                    focused = next((job for job in subjects if job["kind"] == "final_run" and job["phase"] == "complete"), None)
-            data: RunStatus = {"run_id": run["id"], "repository": run["repository"],
-                "parent": {"number": run["parent_issue"], "title": title[0][0] if title else None,
-                           "body": title[0][1] if title else None, "revision": run["parent_revision"]},
-                "status": status, "phase": status if abandonment is not None else _public_phase(active[0]["phase"]) if len(active) == 1 else "parallel" if active else
-                    "merged" if any(job["kind"] == "final_run" and job["phase"] == "complete" for job in subjects) else status,
-                "created_at": created, "elapsed_seconds": elapsed, "repository_root": location["repository_root"],
-                "parent_revision": run["parent_revision"], "graph_revision": run["graph_revision"],
-                "policy_snapshot": json.loads(run["policy"]),
-                "subjects": subjects, "operator_actions": actions,
-                "focus_subject": focused["subject"] if focused else None,
-                "next_action": _next_action(run, actions, status, boundaries["delivery_cleanup"]),
-                "delivery_cleanup": boundaries["delivery_cleanup"], "supervision_windows": windows,
-                "latest_resume": None, "resume_waits": [], "abandonment": abandonment, "unavailable_facts": [],
-                "diagnostics": [], "notifications": _notification_facts(tx, run, path),
-                "executor_control": {"owner": run["executor"], "epoch": run["epoch"], "stopped": bool(run["stopped"]), "blocked": run["blocked"], "live_status": "unknown"},
-                "scheduling": {"concurrency": run["concurrency"], "integration_holder": run["integration_holder"],
-                               "active": _all(tx, "SELECT id,subject,invocation FROM leases ORDER BY subject"),
-                               "work_fifo": [row["subject"] for row in _all(tx, "SELECT subject FROM work_queue ORDER BY ready")],
-                               "integration_fifo": [row["subject"] for row in _all(tx, "SELECT subject FROM integration_queue ORDER BY ready")]}}
-            control = _control_history(tx)
-            data["latest_resume"] = control[0] if control else None
-            data["resume_waits"] = _resume_waits(run, subjects, data["scheduling"]["active"])
-            data["unavailable_facts"] = ["host_liveness", "host_activity_segments", "notifications.journal_binding"]
-            if data["notifications"]["journal_state"] != "available":
-                data["unavailable_facts"].append("notifications")
-            if data["notifications"]["configuration"] is None:
-                data["unavailable_facts"].append("notifications.configuration")
-            if kind == "history":
-                data["history"] = _native_history(tx, subjects, after=after, limit=limit)
-            if len(json.dumps(data, ensure_ascii=False, allow_nan=False).encode()) > QUERY_LIMIT:
-                raise QueryError("query_limit", "Public response exceeds its bounded limit")
-            return QueryDocument(kind, language, data)
+            return read_snapshot(tx, path, kind, after=after, limit=limit,
+                                 expected_run=expected_run, expected_repository=expected_repository)
     except QueryError:
         raise
     except UnsupportedState:
