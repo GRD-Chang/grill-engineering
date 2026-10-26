@@ -158,10 +158,11 @@ def transaction_scope(transaction: Transaction) -> RunScope | None:
 
 
 def selected_statement(transaction: Transaction, current: str, scoped: str | None,
-                       values: Sequence[Any] = ()) -> tuple[str, Sequence[Any]]:
+                       values: Sequence[Any] = (), *, run_last: bool = False) -> tuple[str, Sequence[Any]]:
     """Choose complete caller-owned SQL; do not generate or rewrite predicates.
 
-    Run-bound statements explicitly put the selected Run parameter first. A
+    Run-bound statements explicitly put the selected Run parameter first, or
+    last when run_last is specified (for SET/VALUES before the Run predicate). A
     consumer not yet migrated must refuse the staged layout rather than issue
     its current-layout statement there. Query budgets still belong to Transaction.
     """
@@ -170,4 +171,4 @@ def selected_statement(transaction: Transaction, current: str, scoped: str | Non
         return current, values
     if scoped is None:
         raise KernelError("run_scope_required")
-    return scoped, (scope.run_id, *values)
+    return scoped, (*values, scope.run_id) if run_last else (scope.run_id, *values)

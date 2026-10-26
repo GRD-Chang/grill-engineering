@@ -33,6 +33,7 @@ from agent_run.model import (
 )
 from agent_run.errors import KernelError, ObservationSuperseded, bounded_error
 from agent_run.storage.sqlite import CURRENT_LIMIT, Storage, Transaction
+from agent_run.storage.run_scope import selected_statement, transaction_scope
 from agent_run.core.attempt_continuation import (AttemptContinuationBasis, ContinuationFacts,
                                    bind_attempt_continuation, load_continuation)
 from agent_run.contracts.policy_values import checkpoint_policy
@@ -945,27 +946,38 @@ class Kernel:
         self._event(tx, owner, "source_refreshed", str(sequence))
 
     def _completion(self, tx: Transaction, job: sqlite3.Row) -> sqlite3.Row | None:
-        rows = tx.rows("SELECT * FROM completions WHERE subject=? AND generation=? AND revision=? AND graph_revision=(SELECT graph_revision FROM runs)",
-                       (job["id"], job["generation"], job["revision"]))
+        rows = tx.rows(*selected_statement(tx, "SELECT * FROM completions WHERE subject=? AND generation=? AND revision=? AND graph_revision=(SELECT graph_revision FROM runs)",
+                   'SELECT c.* FROM completions c JOIN runs r ON r.id=c.run_id WHERE c.subject=? AND c.generation=? AND c.revision=? AND c.graph_revision=r.graph_revision AND c.run_id=?',
+                   (job["id"], job["generation"], job["revision"]), run_last=True))
         return rows[0] if rows and job["phase"] == "complete" else None
 
     def _eligibility(self, tx: Transaction, job: sqlite3.Row) -> str | None:
-        if job["kind"] != DeliveryKind.TICKET or tx.one("SELECT source_sequence FROM runs")[0] is None:
+        if job["kind"] != DeliveryKind.TICKET or tx.one(*selected_statement(tx, "SELECT source_sequence FROM runs",
+                                                     'SELECT source_sequence FROM runs WHERE id=?',
+                                                     (), run_last=True))[0] is None:
             return None
-        facts = tx.rows("SELECT * FROM issue_facts WHERE issue=?", (job["issue"],))
+        facts = tx.rows(*selected_statement(tx, "SELECT * FROM issue_facts WHERE issue=?",
+                    'SELECT * FROM issue_facts WHERE issue=? AND run_id=?',
+                    (job["issue"],), run_last=True))
         if not facts:
             return "missing_ticket"
         if job["phase"] == "complete" and self._completion(tx, job) is not None:
             return "completed"
         # Local dependency authority is Completion, never the live CLOSED flag.
-        for predecessor in tx.all("SELECT s.* FROM dependencies d JOIN subjects s ON s.id=d.predecessor WHERE d.subject=?", (job["id"],)):
+        for predecessor in tx.all(*selected_statement(tx, "SELECT s.* FROM dependencies d JOIN subjects s ON s.id=d.predecessor WHERE d.subject=?",
+                               'SELECT s.* FROM dependencies d JOIN subjects s ON s.run_id=d.run_id AND s.id=d.predecessor WHERE d.subject=? AND d.run_id=?',
+                               (job["id"],), run_last=True)):
             if self._completion(tx, predecessor) is None:
                 return "blocked_by_incomplete_tickets"
         if facts[0]["state"] != "OPEN":
             return "ticket_closed"
-        if tx.rows("SELECT blocker FROM dependency_facts WHERE issue=? AND state!='CLOSED' AND blocker NOT IN (SELECT issue FROM subjects WHERE kind='ticket') LIMIT 1", (job["issue"],)):
+        if tx.rows(*selected_statement(tx, "SELECT blocker FROM dependency_facts WHERE issue=? AND state!='CLOSED' AND blocker NOT IN (SELECT issue FROM subjects WHERE kind='ticket') LIMIT 1",
+               "SELECT blocker FROM dependency_facts d WHERE d.issue=? AND d.state!='CLOSED' AND d.blocker NOT IN (SELECT issue FROM subjects WHERE kind='ticket' AND run_id=d.run_id) AND d.run_id=? LIMIT 1",
+               (job["issue"],), run_last=True)):
             return "blocked_by_open_issues"
-        if not tx.rows("SELECT id FROM attempts WHERE subject=? AND generation=? LIMIT 1", (job["id"], job["generation"])):
+        if not tx.rows(*selected_statement(tx, "SELECT id FROM attempts WHERE subject=? AND generation=? LIMIT 1",
+                   'SELECT id FROM attempts WHERE subject=? AND generation=? AND run_id=? LIMIT 1',
+                   (job["id"], job["generation"]), run_last=True)):
             labels: set[str] = set(json.loads(facts[0]["labels"]))
             disqualifying = sorted(labels & {"needs-triage", "needs-info", "ready-for-human"})
             if disqualifying:
@@ -1075,7 +1087,9 @@ class Kernel:
                 raise KernelError("dirty_worktree", item.resource.checkout)
 
     def _abandon_action(self, tx: Transaction) -> sqlite3.Row | None:
-        rows = tx.rows("SELECT * FROM actions WHERE kind='abandon'", limit=1)
+        rows = tx.rows(*selected_statement(tx, "SELECT * FROM actions WHERE kind='abandon'",
+                   "SELECT * FROM actions WHERE kind='abandon' AND run_id=?",
+                   (), run_last=True), limit=1)
         return None if not rows else rows[0]
 
     def _abandon_scope(self, tx: Transaction, action: sqlite3.Row) -> dict[str, Any]:
@@ -1716,17 +1730,28 @@ class Kernel:
         return Step("progress", subject, "generation_requeued")
 
     def _charge_development(self, tx: Transaction, attempt_id: str) -> None:
-        attempt = tx.one("SELECT * FROM attempts WHERE id=?", (attempt_id,))
+        attempt = tx.one(*selected_statement(tx, "SELECT * FROM attempts WHERE id=?",
+                      'SELECT * FROM attempts WHERE id=? AND run_id=?',
+                      (attempt_id,), run_last=True))
         if attempt["role"] == Role.DEVELOPMENT and not attempt["accounted"]:
-            tx.execute("UPDATE budgets SET developments_used=developments_used+1 WHERE subject=? AND purpose=? AND window=?",
-                       (attempt["subject"], attempt["purpose"], attempt["window"]))
-            tx.execute("UPDATE attempts SET accounted=1 WHERE id=?", (attempt_id,))
+            tx.execute(*selected_statement(tx, "UPDATE budgets SET developments_used=developments_used+1 WHERE subject=? AND purpose=? AND window=?",
+                'UPDATE budgets SET developments_used=developments_used+1 WHERE subject=? AND purpose=? AND window=? AND run_id=?',
+                (attempt["subject"], attempt["purpose"], attempt["window"]), run_last=True))
+            tx.execute(*selected_statement(tx, "UPDATE attempts SET accounted=1 WHERE id=?",
+                'UPDATE attempts SET accounted=1 WHERE id=? AND run_id=?',
+                (attempt_id,), run_last=True))
 
     def _charge_review(self, tx: Transaction, attempt: sqlite3.Row) -> None:
+        selected = transaction_scope(tx)
+        if selected is not None and attempt["run_id"] != selected.run_id:
+            raise KernelError("attempt_binding")
         if attempt["role"] == Role.REVIEW and not attempt["accounted"]:
-            tx.execute("UPDATE budgets SET reviews_used=reviews_used+1 WHERE subject=? AND purpose=? AND window=?",
-                       (attempt["subject"], attempt["purpose"], attempt["window"]))
-            tx.execute("UPDATE attempts SET accounted=1 WHERE id=?", (attempt["id"],))
+            tx.execute(*selected_statement(tx, "UPDATE budgets SET reviews_used=reviews_used+1 WHERE subject=? AND purpose=? AND window=?",
+                'UPDATE budgets SET reviews_used=reviews_used+1 WHERE subject=? AND purpose=? AND window=? AND run_id=?',
+                (attempt["subject"], attempt["purpose"], attempt["window"]), run_last=True))
+            tx.execute(*selected_statement(tx, "UPDATE attempts SET accounted=1 WHERE id=?",
+                'UPDATE attempts SET accounted=1 WHERE id=? AND run_id=?',
+                (attempt["id"],), run_last=True))
 
     def _retire_generation(self, tx: Transaction, job: sqlite3.Row, reason: str) -> None:
         tx.execute("INSERT INTO retired_generations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -2667,7 +2692,9 @@ class Kernel:
             if invocation["dispatch_state"] != "started":
                 raise KernelError("agent_not_started")
             self._charge_development(tx, call.attempt_id)
-            tx.execute("DELETE FROM waits WHERE subject=? AND kind='github_convergence'", (call.subject,))
+            tx.execute(*selected_statement(tx, "DELETE FROM waits WHERE subject=? AND kind='github_convergence'",
+                "DELETE FROM waits WHERE subject=? AND kind='github_convergence' AND run_id=?",
+                (call.subject,), run_last=True))
 
     def _advance_cleanup(self, tx: Transaction, work: Work, world: World | None) -> Step | IORequest:
         """Bounded program work; cleanup never owns an Agent or integration seat."""
@@ -2781,16 +2808,22 @@ class Kernel:
             if invocation["status"] not in {"running", "interrupted"}:
                 raise KernelError("invocation_already_settled")
             self._charge_development(tx, call.attempt_id)
-            tx.execute("UPDATE invocation_outputs SET raw_id=?,returned_at=? WHERE invocation=? AND ordinal=?",
-                       (material, self.clock(), call.invocation_id, call.output_ordinal))
+            tx.execute(*selected_statement(tx, "UPDATE invocation_outputs SET raw_id=?,returned_at=? WHERE invocation=? AND ordinal=?",
+                'UPDATE invocation_outputs SET raw_id=?,returned_at=? WHERE invocation=? AND ordinal=? AND run_id=?',
+                (material, self.clock(), call.invocation_id, call.output_ordinal), run_last=True))
             # A late output or superseded Invocation is history only.
             if self._latest_output(tx, invocation):
-                tx.execute("UPDATE invocations SET status='returned' WHERE id=?", (call.invocation_id,))
-                tx.execute("UPDATE attempts SET result_id=?,status='returned' WHERE id=? AND current_invocation=?",
-                           (material, call.attempt_id, call.invocation_id))
+                tx.execute(*selected_statement(tx, "UPDATE invocations SET status='returned' WHERE id=?",
+                    "UPDATE invocations SET status='returned' WHERE id=? AND run_id=?",
+                    (call.invocation_id,), run_last=True))
+                tx.execute(*selected_statement(tx, "UPDATE attempts SET result_id=?,status='returned' WHERE id=? AND current_invocation=?",
+                    "UPDATE attempts SET result_id=?,status='returned' WHERE id=? AND current_invocation=? AND run_id=?",
+                    (material, call.attempt_id, call.invocation_id), run_last=True))
             current = self._job(tx, call.subject)
             if invocation["generation"] != current["generation"]:
-                attempt = tx.one("SELECT * FROM attempts WHERE id=?", (call.attempt_id,))
+                attempt = tx.one(*selected_statement(tx, "SELECT * FROM attempts WHERE id=?",
+                              'SELECT * FROM attempts WHERE id=? AND run_id=?',
+                              (call.attempt_id,), run_last=True))
                 if attempt["role"] == Role.REVIEW:
                     try:
                         artifact(Role.REVIEW, raw)
@@ -2799,7 +2832,9 @@ class Kernel:
                     else:
                         self._charge_review(tx, attempt)
             if invocation["dispatch_state"] not in {"sent", "started", "unknown"}:
-                tx.execute("DELETE FROM leases WHERE id=? AND invocation=?", (call.lease_id, call.invocation_id))
+                tx.execute(*selected_statement(tx, "DELETE FROM leases WHERE id=? AND invocation=?",
+                    'DELETE FROM leases WHERE id=? AND invocation=? AND run_id=?',
+                    (call.lease_id, call.invocation_id), run_last=True))
             self._event(tx, call.subject, "raw_returned", call.invocation_id, material, generation=invocation["generation"])
 
     def bind_thread(self, call: AgentCall, reported_thread: str) -> None:
@@ -2808,13 +2843,21 @@ class Kernel:
             raise KernelError("missing_thread")
         with self.storage.transaction() as tx:
             self._invocation(tx, call)
-            thread = tx.one("SELECT backend_id FROM threads WHERE id=?", (call.thread_id,))
+            thread = tx.one(*selected_statement(tx, "SELECT backend_id FROM threads WHERE id=?",
+                         'SELECT backend_id FROM threads WHERE id=? AND run_id=?',
+                         (call.thread_id,), run_last=True))
             if thread[0] is not None and thread[0] != reported_thread:
                 raise KernelError("thread_identity_changed")
-            tx.execute("UPDATE threads SET backend_id=? WHERE id=?", (reported_thread, call.thread_id))
+            tx.execute(*selected_statement(tx, "UPDATE threads SET backend_id=? WHERE id=?",
+                'UPDATE threads SET backend_id=? WHERE id=? AND run_id=?',
+                (reported_thread, call.thread_id), run_last=True))
 
     def _invocation(self, tx: Transaction, call: AgentCall) -> sqlite3.Row:
-        row = tx.one("SELECT i.*,o.*,a.subject,a.role,a.purpose,a.generation,a.parent_revision,a.graph_revision,a.revision,a.current_invocation FROM invocations i JOIN invocation_outputs o ON o.invocation=i.id JOIN attempts a ON a.id=i.attempt WHERE i.id=? AND o.ordinal=?", (call.invocation_id, call.output_ordinal))
+        # Opaque IDs and a reused owner/epoch do not imply the Call's Run.
+        # Exact late receipts retain their original Run binding.
+        row = tx.one(*selected_statement(tx, "SELECT i.*,o.*,a.subject,a.role,a.purpose,a.generation,a.parent_revision,a.graph_revision,a.revision,a.current_invocation FROM invocations i JOIN invocation_outputs o ON o.invocation=i.id JOIN attempts a ON a.id=i.attempt WHERE i.id=? AND o.ordinal=?",
+                  'SELECT i.*,o.*,a.subject,a.role,a.purpose,a.generation,a.parent_revision,a.graph_revision,a.revision,a.current_invocation FROM invocations i JOIN invocation_outputs o ON o.run_id=i.run_id AND o.invocation=i.id JOIN attempts a ON a.run_id=i.run_id AND a.id=i.attempt WHERE i.id=? AND o.ordinal=? AND i.run_id=?',
+                  (call.invocation_id, call.output_ordinal), run_last=True))
         if (row["attempt"] != call.attempt_id or row["subject"] != call.subject or row["thread"] != call.thread_id
                 or row["lease"] != call.lease_id or row["executor"] != call.execution.owner or row["epoch"] != call.execution.epoch
                 or row["role"] != call.role or row["purpose"] != call.purpose
@@ -2822,8 +2865,13 @@ class Kernel:
                 or row["deadline_seconds"] != call.deadline_seconds or row["deadline_at"] != call.deadline_at
                 or json.loads(tx.get(row["context_id"], call.subject)) != call.context):
             raise KernelError("invocation_binding")
-        binding = tx.one("SELECT * FROM threads WHERE id=?", (call.thread_id,))
-        if not self._thread_role_matches(self._job(tx, call.subject), call.role, binding):
+        job = self._job(tx, call.subject)
+        if job["run_id"] != call.execution.run_id:
+            raise KernelError("invocation_binding")
+        binding = tx.one(*selected_statement(tx, "SELECT * FROM threads WHERE id=?",
+                      'SELECT * FROM threads WHERE id=? AND run_id=?',
+                      (call.thread_id,), run_last=True))
+        if not self._thread_role_matches(job, call.role, binding):
             raise KernelError("thread_role_binding")
         profile, reference = self._thread_profile(tx, binding)
         if call.profile != profile or call.profile_revision != binding["profile_revision"] or call.profile_reference != reference:
@@ -2831,11 +2879,15 @@ class Kernel:
         return row
 
     def _latest_output(self, tx: Transaction, output: sqlite3.Row) -> bool:
-        return bool(output["ordinal"] == tx.one("SELECT max(ordinal) FROM invocation_outputs WHERE invocation=?", (output["id"],))[0])
+        return bool(output["ordinal"] == tx.one(*selected_statement(tx, "SELECT max(ordinal) FROM invocation_outputs WHERE invocation=?",
+                                             'SELECT max(ordinal) FROM invocation_outputs WHERE invocation=? AND run_id=?',
+                                             (output["id"],), run_last=True))[0])
 
     def _agent_subject_authority(self, tx: Transaction, subject: str, attempt_id: str, execution: Execution) -> None:
         run, job = self._owned(tx, subject, execution)
-        attempt = tx.one("SELECT * FROM attempts WHERE id=?", (attempt_id,))
+        attempt = tx.one(*selected_statement(tx, "SELECT * FROM attempts WHERE id=?",
+                      'SELECT * FROM attempts WHERE id=? AND run_id=?',
+                      (attempt_id,), run_last=True))
         if (run["stopped"] or run["blocked"] or self._gates(tx, subject)
                 or attempt["generation"] != job["generation"] or job["current_attempt"] != attempt_id
                 or attempt["parent_revision"] != run["parent_revision"] or attempt["graph_revision"] != run["graph_revision"]
@@ -2849,19 +2901,30 @@ class Kernel:
             raise KernelError("invocation_deadline_exceeded")
         if (invocation["current_invocation"] != call.invocation_id or not self._latest_output(tx, invocation)
                 or invocation["raw_id"] is not None or invocation["dispatch_state"] not in {"allocated", "sent", "started"}
-                or not tx.rows("SELECT id FROM leases WHERE id=? AND invocation=?", (call.lease_id, call.invocation_id))):
+                or not tx.rows(*selected_statement(tx, "SELECT id FROM leases WHERE id=? AND invocation=?",
+                           'SELECT id FROM leases WHERE id=? AND invocation=? AND run_id=?',
+                           (call.lease_id, call.invocation_id), run_last=True))):
             raise KernelError("agent_authority_changed")
         return invocation
 
     def worker_settled(self, call: AgentCall | AgentPreparation) -> bool:
         with self.storage.transaction(write=False) as tx:
             if isinstance(call, AgentPreparation):
-                for waiting in tx.rows("SELECT * FROM waits WHERE subject=? AND kind='agent_preparation'", (call.subject,)):
+                selected = transaction_scope(tx)
+                if selected is not None and selected.run_id != call.execution.run_id:
+                    raise KernelError("preparation_binding")
+                for waiting in tx.rows(*selected_statement(tx, "SELECT * FROM waits WHERE subject=? AND kind='agent_preparation'",
+                                   "SELECT * FROM waits WHERE subject=? AND kind='agent_preparation' AND run_id=?",
+                                   (call.subject,), run_last=True)):
                     if self._preparation(tx, waiting)[0].reservation_id == call.reservation_id:
                         return False
-                rows = tx.rows("SELECT i.*,o.* FROM invocation_outputs o JOIN invocations i ON i.id=o.invocation WHERE o.lease=?", (call.reservation_id,))
+                rows = tx.rows(*selected_statement(tx, "SELECT i.*,o.* FROM invocation_outputs o JOIN invocations i ON i.id=o.invocation WHERE o.lease=?",
+                           'SELECT i.*,o.* FROM invocation_outputs o JOIN invocations i ON i.run_id=o.run_id AND i.id=o.invocation WHERE o.lease=? AND o.run_id=?',
+                           (call.reservation_id,), run_last=True))
                 if not rows:
-                    for event in tx.rows("SELECT material_id FROM history WHERE kind='agent_preparation_settled' AND identity=? AND subject=?", (call.reservation_id, call.subject)):
+                    for event in tx.rows(*selected_statement(tx, "SELECT material_id FROM history WHERE kind='agent_preparation_settled' AND identity=? AND subject=?",
+                                     "SELECT material_id FROM history WHERE kind='agent_preparation_settled' AND identity=? AND subject=? AND run_id=?",
+                                     (call.reservation_id, call.subject), run_last=True)):
                         proof = json.loads(tx.get(event["material_id"], call.subject))
                         stored, _ = self._preparation(tx, {"scope_id": proof["preparation_scope"],
                             "subject": call.subject, "deadline": proof["deadline"]})
@@ -2877,7 +2940,9 @@ class Kernel:
             else:
                 row = self._invocation(tx, call)
                 lease_id = call.lease_id
-            leased = tx.rows("SELECT id FROM leases WHERE id=? AND invocation=?", (lease_id, row["id"]))
+            leased = tx.rows(*selected_statement(tx, "SELECT id FROM leases WHERE id=? AND invocation=?",
+                         'SELECT id FROM leases WHERE id=? AND invocation=? AND run_id=?',
+                         (lease_id, row["id"]), run_last=True))
             return not leased and (row["dispatch_state"] == "exited" and row["exit_code"] is not None
                                    or row["dispatch_state"] == "unavailable" and row["process_identity"] is None and row["start_evidence"] is not None)
 
@@ -2888,8 +2953,9 @@ class Kernel:
             if invocation["dispatch_state"] != "allocated":
                 return False
             self._agent_authority(tx, call)
-            tx.execute("UPDATE invocation_outputs SET dispatch_state='sent',dispatched_at=? WHERE invocation=? AND ordinal=?",
-                       (self.clock(), call.invocation_id, call.output_ordinal))
+            tx.execute(*selected_statement(tx, "UPDATE invocation_outputs SET dispatch_state='sent',dispatched_at=? WHERE invocation=? AND ordinal=?",
+                "UPDATE invocation_outputs SET dispatch_state='sent',dispatched_at=? WHERE invocation=? AND ordinal=? AND run_id=?",
+                (self.clock(), call.invocation_id, call.output_ordinal), run_last=True))
             self._event(tx, call.subject, "agent_dispatched", call.invocation_id)
             return True
 
@@ -2918,8 +2984,9 @@ class Kernel:
                 return
             if invocation["dispatch_state"] not in {"sent", "unknown"}:
                 raise KernelError("agent_not_dispatched")
-            tx.execute("UPDATE invocation_outputs SET process_identity=?,dispatch_state='started',started_at=? WHERE invocation=? AND ordinal=?",
-                       (witness, self.clock(), call.invocation_id, call.output_ordinal))
+            tx.execute(*selected_statement(tx, "UPDATE invocation_outputs SET process_identity=?,dispatch_state='started',started_at=? WHERE invocation=? AND ordinal=?",
+                "UPDATE invocation_outputs SET process_identity=?,dispatch_state='started',started_at=? WHERE invocation=? AND ordinal=? AND run_id=?",
+                (witness, self.clock(), call.invocation_id, call.output_ordinal), run_last=True))
             self._event(tx, call.subject, "worker_started", call.invocation_id, witness, generation=invocation["generation"])
 
     def agent_start_unknown(self, call: AgentCall, evidence: dict[str, Any]) -> None:
@@ -2934,9 +3001,12 @@ class Kernel:
                 self._process_exit(tx, call, invocation, observed_exit, "start_acknowledgement_unknown", "fatal")
                 return
             material = tx.put(call.subject, "worker_start_unknown", wire_json(evidence))
-            tx.execute("UPDATE invocation_outputs SET dispatch_state='unknown',start_evidence=? WHERE invocation=? AND ordinal=?",
-                       (material, call.invocation_id, call.output_ordinal))
-            run = tx.one("SELECT * FROM runs")
+            tx.execute(*selected_statement(tx, "UPDATE invocation_outputs SET dispatch_state='unknown',start_evidence=? WHERE invocation=? AND ordinal=?",
+                "UPDATE invocation_outputs SET dispatch_state='unknown',start_evidence=? WHERE invocation=? AND ordinal=? AND run_id=?",
+                (material, call.invocation_id, call.output_ordinal), run_last=True))
+            run = tx.one(*selected_statement(tx, "SELECT * FROM runs",
+                      'SELECT * FROM runs WHERE id=?',
+                      (), run_last=True))
             job = self._job(tx, call.subject)
             if (not run["stopped"] and not run["blocked"] and run["executor"] == call.execution.owner and run["epoch"] == call.execution.epoch
                     and job["generation"] == invocation["generation"] and job["current_attempt"] == call.attempt_id
@@ -2956,12 +3026,19 @@ class Kernel:
             if invocation["dispatch_state"] != ("allocated" if before_dispatch else "sent"):
                 raise KernelError("worker_exit_unproven")
             material = tx.put(call.subject, "worker_unavailable", wire_json({"code": code, "evidence": evidence}))
-            tx.execute("UPDATE invocation_outputs SET dispatch_state='unavailable',start_evidence=? WHERE invocation=? AND ordinal=?",
-                       (material, call.invocation_id, call.output_ordinal))
+            tx.execute(*selected_statement(tx, "UPDATE invocation_outputs SET dispatch_state='unavailable',start_evidence=? WHERE invocation=? AND ordinal=?",
+                "UPDATE invocation_outputs SET dispatch_state='unavailable',start_evidence=? WHERE invocation=? AND ordinal=? AND run_id=?",
+                (material, call.invocation_id, call.output_ordinal), run_last=True))
             if self._latest_output(tx, invocation):
-                tx.execute("UPDATE invocations SET status='interrupted' WHERE id=?", (call.invocation_id,))
-            tx.execute("DELETE FROM leases WHERE id=? AND invocation=?", (call.lease_id, call.invocation_id))
-            run = tx.one("SELECT * FROM runs")
+                tx.execute(*selected_statement(tx, "UPDATE invocations SET status='interrupted' WHERE id=?",
+                    "UPDATE invocations SET status='interrupted' WHERE id=? AND run_id=?",
+                    (call.invocation_id,), run_last=True))
+            tx.execute(*selected_statement(tx, "DELETE FROM leases WHERE id=? AND invocation=?",
+                'DELETE FROM leases WHERE id=? AND invocation=? AND run_id=?',
+                (call.lease_id, call.invocation_id), run_last=True))
+            run = tx.one(*selected_statement(tx, "SELECT * FROM runs",
+                      'SELECT * FROM runs WHERE id=?',
+                      (), run_last=True))
             job = self._job(tx, call.subject)
             if (not run["stopped"] and not run["blocked"] and run["executor"] == call.execution.owner and run["epoch"] == call.execution.epoch
                     and not self._gates(tx, call.subject) and job["current_attempt"] == call.attempt_id
@@ -2989,17 +3066,19 @@ class Kernel:
             if output["process_identity"] is None:
                 raise KernelError("worker_start_unproven")
             material = tx.put(call.subject, "worker_activity", wire_json(dict(evidence)))
-            old = tx.rows("SELECT * FROM worker_activity WHERE invocation=? AND ordinal=? AND identity=?",
-                          (call.invocation_id, call.output_ordinal, observation_id))
+            old = tx.rows(*selected_statement(tx, "SELECT * FROM worker_activity WHERE invocation=? AND ordinal=? AND identity=?",
+                      'SELECT * FROM worker_activity WHERE invocation=? AND ordinal=? AND identity=? AND run_id=?',
+                      (call.invocation_id, call.output_ordinal, observation_id), run_last=True))
             if old:
                 if (old[0]["active"], old[0]["observed_at"], old[0]["evidence"]) != (active, observed_at, material):
                     raise KernelError("conflicting_activity_observation")
                 return
-            first_active = active and not tx.rows(
-                "SELECT identity FROM worker_activity WHERE invocation=? AND ordinal=? AND active=1 LIMIT 1",
-                (call.invocation_id, call.output_ordinal))
-            tx.execute("INSERT INTO worker_activity VALUES (?,?,?,?,?,?)",
-                       (call.invocation_id, call.output_ordinal, observation_id, active, observed_at, material))
+            first_active = active and not tx.rows(*selected_statement(tx, "SELECT identity FROM worker_activity WHERE invocation=? AND ordinal=? AND active=1 LIMIT 1",
+                                              'SELECT identity FROM worker_activity WHERE invocation=? AND ordinal=? AND active=1 AND run_id=? LIMIT 1',
+                                              (call.invocation_id, call.output_ordinal), run_last=True))
+            tx.execute(*selected_statement(tx, "INSERT INTO worker_activity VALUES (?,?,?,?,?,?)",
+                'INSERT INTO worker_activity(invocation,ordinal,identity,active,observed_at,evidence,run_id) VALUES (?,?,?,?,?,?,?)',
+                (call.invocation_id, call.output_ordinal, observation_id, active, observed_at, material), run_last=True))
             if first_active:
                 try:
                     self._agent_authority(tx, call)
@@ -3020,19 +3099,27 @@ class Kernel:
             return
         failed = returncode != 0 or failure is not None or invocation["raw_id"] is None
         exited_at = self.clock()
-        tx.execute("UPDATE invocation_outputs SET dispatch_state='exited',exit_code=?,exited_at=?,failure_kind=?,recovery_ready_at=? WHERE invocation=? AND ordinal=?",
-                   (returncode, exited_at, failure_kind if failed else None,
-                    exited_at + 30 if failed and failure_kind == "capacity" else None, call.invocation_id, call.output_ordinal))
-        tx.execute("DELETE FROM leases WHERE id=? AND invocation=?", (call.lease_id, call.invocation_id))
+        tx.execute(*selected_statement(tx, "UPDATE invocation_outputs SET dispatch_state='exited',exit_code=?,exited_at=?,failure_kind=?,recovery_ready_at=? WHERE invocation=? AND ordinal=?",
+            "UPDATE invocation_outputs SET dispatch_state='exited',exit_code=?,exited_at=?,failure_kind=?,recovery_ready_at=? WHERE invocation=? AND ordinal=? AND run_id=?",
+            (returncode, exited_at, failure_kind if failed else None,
+                    exited_at + 30 if failed and failure_kind == "capacity" else None, call.invocation_id, call.output_ordinal), run_last=True))
+        tx.execute(*selected_statement(tx, "DELETE FROM leases WHERE id=? AND invocation=?",
+            'DELETE FROM leases WHERE id=? AND invocation=? AND run_id=?',
+            (call.lease_id, call.invocation_id), run_last=True))
         self._event(tx, call.subject, "worker_exited", call.invocation_id, invocation["process_identity"], generation=invocation["generation"])
         if failed:
             material = tx.put(call.subject, "worker_failure", wire_json({"returncode": returncode, "failure": failure, "kind": failure_kind,
                                                                        "diagnostic": diagnostic}))
-            tx.execute("UPDATE invocation_outputs SET start_evidence=? WHERE invocation=? AND ordinal=?",
-                       (material, call.invocation_id, call.output_ordinal))
+            tx.execute(*selected_statement(tx, "UPDATE invocation_outputs SET start_evidence=? WHERE invocation=? AND ordinal=?",
+                'UPDATE invocation_outputs SET start_evidence=? WHERE invocation=? AND ordinal=? AND run_id=?',
+                (material, call.invocation_id, call.output_ordinal), run_last=True))
             if invocation["raw_id"] is None and self._latest_output(tx, invocation):
-                tx.execute("UPDATE invocations SET status='interrupted' WHERE id=?", (call.invocation_id,))
-            run = tx.one("SELECT * FROM runs")
+                tx.execute(*selected_statement(tx, "UPDATE invocations SET status='interrupted' WHERE id=?",
+                    "UPDATE invocations SET status='interrupted' WHERE id=? AND run_id=?",
+                    (call.invocation_id,), run_last=True))
+            run = tx.one(*selected_statement(tx, "SELECT * FROM runs",
+                      'SELECT * FROM runs WHERE id=?',
+                      (), run_last=True))
             job = self._job(tx, call.subject)
             if (not run["stopped"] and not run["blocked"] and run["executor"] == call.execution.owner and run["epoch"] == call.execution.epoch
                     and not self._gates(tx, call.subject) and job["current_attempt"] == call.attempt_id
@@ -3507,7 +3594,12 @@ class Kernel:
 
     @staticmethod
     def _executor_owned(tx: Transaction, run: sqlite3.Row, execution: Execution) -> None:
-        if tx.rows("SELECT id FROM actions WHERE kind='abandon' LIMIT 1"):
+        selected = transaction_scope(tx)
+        if selected is not None and run["id"] != selected.run_id:
+            raise KernelError("executor_fenced")
+        if tx.rows(*selected_statement(tx, "SELECT id FROM actions WHERE kind='abandon' LIMIT 1",
+               "SELECT id FROM actions WHERE kind='abandon' AND run_id=? LIMIT 1",
+               (), run_last=True)):
             raise KernelError("executor_fenced")
         if (run["id"] != execution.run_id or run["executor"] != execution.owner or run["epoch"] != execution.epoch):
             raise KernelError("executor_fenced")
@@ -3516,20 +3608,28 @@ class Kernel:
             raise KernelError("host_usage_unproven")
 
     def _job(self, tx: Transaction, subject: str) -> sqlite3.Row:
-        row = tx.one("SELECT * FROM subjects WHERE id=?", (subject,))
+        row = tx.one(*selected_statement(tx, "SELECT * FROM subjects WHERE id=?",
+                  'SELECT * FROM subjects WHERE id=? AND run_id=?',
+                  (subject,), run_last=True))
         if sum(len(value.encode()) if isinstance(value, str) else 16 for value in row) > CURRENT_LIMIT:
             raise KernelError("current_record_limit")
         return row
 
     def _gates(self, tx: Transaction, subject: str) -> list[sqlite3.Row]:
-        return tx.rows("SELECT * FROM gates WHERE subject=? ORDER BY code", (subject,))
+        return tx.rows(*selected_statement(tx, "SELECT * FROM gates WHERE subject=? ORDER BY code",
+                   'SELECT * FROM gates WHERE subject=? AND run_id=? ORDER BY code',
+                   (subject,), run_last=True))
 
     def _pause_reason(self, tx: Transaction, subject: str, run: sqlite3.Row) -> str:
         return "operator_stopped" if run["stopped"] else (run["blocked"] or ",".join(row["code"] for row in self._gates(tx, subject)))
 
     def _gate(self, tx: Transaction, subject: str, code: str, *, purpose: str | None = None, evidence: str | None = None) -> None:
-        tx.execute("INSERT OR IGNORE INTO gates VALUES (?,?,?,?)", (subject, code, purpose, evidence))
-        tx.execute("DELETE FROM work_queue WHERE subject=?", (subject,))
+        tx.execute(*selected_statement(tx, "INSERT OR IGNORE INTO gates VALUES (?,?,?,?)",
+            'INSERT OR IGNORE INTO gates(subject,code,purpose,evidence,run_id) VALUES (?,?,?,?,?)',
+            (subject, code, purpose, evidence), run_last=True))
+        tx.execute(*selected_statement(tx, "DELETE FROM work_queue WHERE subject=?",
+            'DELETE FROM work_queue WHERE subject=? AND run_id=?',
+            (subject,), run_last=True))
         # The existing release guard still fences any unsettled formal write.
         self._release_integration(tx, subject)
         self._event(tx, subject, "paused", code, evidence)
@@ -3615,7 +3715,9 @@ class Kernel:
         return int(revision)
 
     def _profile_document(self, tx: Transaction, revision: int) -> dict[str, Any]:
-        row = tx.one("SELECT * FROM profile_revisions WHERE id=?", (revision,))
+        row = tx.one(*selected_statement(tx, "SELECT * FROM profile_revisions WHERE id=?",
+                  'SELECT * FROM profile_revisions WHERE id=? AND run_id=?',
+                  (revision,), run_last=True))
         return dict(json.loads(tx.get(row["material_id"], row["subject"])))
 
     def _thread_profile(self, tx: Transaction, thread: sqlite3.Row) -> tuple[Profile, str | None]:
@@ -3859,13 +3961,20 @@ class Kernel:
 
     @staticmethod
     def _agent_seats(tx: Transaction, subject: str | None = None) -> int:
-        return int(tx.one("SELECT (SELECT count(*) FROM leases WHERE (? IS NULL OR subject=?))+"
+        return int(tx.one(*selected_statement(tx, "SELECT (SELECT count(*) FROM leases WHERE (? IS NULL OR subject=?))+"
                           "(SELECT count(*) FROM waits WHERE kind='agent_preparation' AND (? IS NULL OR subject=?))",
-                          (subject, subject, subject, subject))[0])
+                       "WITH selected_run(id) AS (VALUES(?)) SELECT (SELECT count(*) FROM leases WHERE (? IS NULL OR subject=?) AND run_id=(SELECT id FROM selected_run))+(SELECT count(*) FROM waits WHERE kind='agent_preparation' AND (? IS NULL OR subject=?) AND run_id=(SELECT id FROM selected_run))",
+                       (subject, subject, subject, subject)))[0])
 
     def _preparation(self, tx: Transaction, row: sqlite3.Row | Mapping[str, Any]) -> tuple[AgentPreparation, dict[str, Any]]:
         data = json.loads(tx.get(row["scope_id"], row["subject"]))
-        thread = tx.one("SELECT * FROM threads WHERE id=?", (data["thread_id"],))
+        selected = transaction_scope(tx)
+        if selected is not None and (not isinstance(data.get("execution"), dict)
+                or data["execution"].get("run_id") != selected.run_id):
+            raise KernelError("preparation_binding")
+        thread = tx.one(*selected_statement(tx, "SELECT * FROM threads WHERE id=?",
+                     'SELECT * FROM threads WHERE id=? AND run_id=?',
+                     (data["thread_id"],), run_last=True))
         profile, reference = self._thread_profile(tx, thread)
         if (thread["profile_revision"], reference) != (data["profile_revision"], data["profile_reference"]):
             raise KernelError("preparation_binding")
@@ -3876,7 +3985,9 @@ class Kernel:
         return AgentPreparation(**request), data
 
     def _preparation_record(self, tx: Transaction, preparation: AgentPreparation) -> tuple[sqlite3.Row, dict[str, Any]]:
-        for row in tx.rows("SELECT * FROM waits WHERE subject=? AND kind='agent_preparation'", (preparation.subject,)):
+        for row in tx.rows(*selected_statement(tx, "SELECT * FROM waits WHERE subject=? AND kind='agent_preparation'",
+                       "SELECT * FROM waits WHERE subject=? AND kind='agent_preparation' AND run_id=?",
+                       (preparation.subject,), run_last=True)):
             stored, data = self._preparation(tx, row)
             if stored.reservation_id == preparation.reservation_id:
                 if stored != preparation:
@@ -3891,7 +4002,9 @@ class Kernel:
     def _preparation_authority(self, tx: Transaction, preparation: AgentPreparation) -> tuple[sqlite3.Row, dict[str, Any]]:
         row, data = self._preparation_record(tx, preparation)
         self._agent_subject_authority(tx, preparation.subject, preparation.attempt_id, preparation.execution)
-        attempt = tx.one("SELECT * FROM attempts WHERE id=?", (preparation.attempt_id,))
+        attempt = tx.one(*selected_statement(tx, "SELECT * FROM attempts WHERE id=?",
+                      'SELECT * FROM attempts WHERE id=? AND run_id=?',
+                      (preparation.attempt_id,), run_last=True))
         if (attempt["current_invocation"] != data["previous_invocation"]
                 or attempt["resume_action"] != data["resume_action"] or bool(attempt["new_thread"]) != data["new_thread"]):
             raise KernelError("preparation_binding")
@@ -3911,19 +4024,28 @@ class Kernel:
             if now >= deadline:
                 raise KernelError("invocation_deadline_exceeded")
             if data["owned_period"]:
-                tx.execute("UPDATE invocations SET status='running' WHERE id=?", (invocation_id,))
+                tx.execute(*selected_statement(tx, "UPDATE invocations SET status='running' WHERE id=?",
+                    "UPDATE invocations SET status='running' WHERE id=? AND run_id=?",
+                    (invocation_id,), run_last=True))
             else:
                 kind = data["recovery_kind"] or ("explicit" if data["resume_action"] is not None else None)
-                tx.execute("INSERT INTO invocations(id,attempt,thread,executor,epoch,status,allocated_at,deadline_seconds,deadline_at,predecessor,recovery_kind,action_id) VALUES (?,?,?,?,?,'running',?,?,?,?,?,?)",
-                           (invocation_id, attempt_id, preparation.thread_id, execution.owner, execution.epoch, now,
-                            preparation.deadline_seconds, deadline, data["previous_invocation"], kind, data["resume_action"]))
-            tx.execute("INSERT INTO invocation_outputs(invocation,ordinal,context_id,lease,allocated_at,mode,requested_thread) VALUES (?,?,?,?,?,?,?)",
-                       (invocation_id, preparation.output_ordinal, data["context_id"], preparation.reservation_id, now,
-                        preparation.mode, preparation.reported_thread))
-            tx.execute("INSERT INTO leases VALUES (?,?,?,?,?)", (preparation.reservation_id, subject, invocation_id, execution.owner, execution.epoch))
-            tx.execute("DELETE FROM waits WHERE scope_id=? AND kind='agent_preparation'", (row["scope_id"],))
-            tx.execute("UPDATE attempts SET current_invocation=?,thread_id=?,context_id=?,result_id=NULL,status='running',new_thread=0,resume_action=NULL WHERE id=?",
-                       (invocation_id, preparation.thread_id, data["context_id"], attempt_id))
+                tx.execute(*selected_statement(tx, "INSERT INTO invocations(id,attempt,thread,executor,epoch,status,allocated_at,deadline_seconds,deadline_at,predecessor,recovery_kind,action_id) VALUES (?,?,?,?,?,'running',?,?,?,?,?,?)",
+                    "INSERT INTO invocations(id,attempt,thread,executor,epoch,status,allocated_at,deadline_seconds,deadline_at,predecessor,recovery_kind,action_id,run_id) VALUES (?,?,?,?,?,'running',?,?,?,?,?,?,?)",
+                    (invocation_id, attempt_id, preparation.thread_id, execution.owner, execution.epoch, now,
+                            preparation.deadline_seconds, deadline, data["previous_invocation"], kind, data["resume_action"]), run_last=True))
+            tx.execute(*selected_statement(tx, "INSERT INTO invocation_outputs(invocation,ordinal,context_id,lease,allocated_at,mode,requested_thread) VALUES (?,?,?,?,?,?,?)",
+                'INSERT INTO invocation_outputs(invocation,ordinal,context_id,lease,allocated_at,mode,requested_thread,run_id) VALUES (?,?,?,?,?,?,?,?)',
+                (invocation_id, preparation.output_ordinal, data["context_id"], preparation.reservation_id, now,
+                        preparation.mode, preparation.reported_thread), run_last=True))
+            tx.execute(*selected_statement(tx, "INSERT INTO leases VALUES (?,?,?,?,?)",
+                'INSERT INTO leases(id,subject,invocation,executor,epoch,run_id) VALUES (?,?,?,?,?,?)',
+                (preparation.reservation_id, subject, invocation_id, execution.owner, execution.epoch), run_last=True))
+            tx.execute(*selected_statement(tx, "DELETE FROM waits WHERE scope_id=? AND kind='agent_preparation'",
+                "DELETE FROM waits WHERE scope_id=? AND kind='agent_preparation' AND run_id=?",
+                (row["scope_id"],), run_last=True))
+            tx.execute(*selected_statement(tx, "UPDATE attempts SET current_invocation=?,thread_id=?,context_id=?,result_id=NULL,status='running',new_thread=0,resume_action=NULL WHERE id=?",
+                "UPDATE attempts SET current_invocation=?,thread_id=?,context_id=?,result_id=NULL,status='running',new_thread=0,resume_action=NULL WHERE id=? AND run_id=?",
+                (invocation_id, preparation.thread_id, data["context_id"], attempt_id), run_last=True))
             self._event(tx, subject, "output_repair_allocated" if data["owned_period"] else "agent_allocated",
                         f"{invocation_id}:{preparation.output_ordinal}" if data["owned_period"] else invocation_id,
                         data["context_id"] if data["owned_period"] else None)
@@ -3936,7 +4058,9 @@ class Kernel:
     def preparation_failed(self, preparation: AgentPreparation, code: str, evidence: Mapping[str, Any]) -> None:
         """Caller has closed owned preparation resources; never settle a real lease."""
         with self.storage.transaction() as tx:
-            rows = tx.rows("SELECT * FROM waits WHERE subject=? AND kind='agent_preparation'", (preparation.subject,))
+            rows = tx.rows(*selected_statement(tx, "SELECT * FROM waits WHERE subject=? AND kind='agent_preparation'",
+                       "SELECT * FROM waits WHERE subject=? AND kind='agent_preparation' AND run_id=?",
+                       (preparation.subject,), run_last=True))
             if not any(self._preparation(tx, row)[0].reservation_id == preparation.reservation_id for row in rows):
                 return
             row, data = self._preparation_record(tx, preparation)
@@ -3948,9 +4072,13 @@ class Kernel:
                             code: str, evidence: Mapping[str, Any]) -> None:
         material = tx.put(preparation.subject, "agent_preparation_exit", wire_json({"preparation_scope": row["scope_id"],
             "code": code, "evidence": dict(evidence), "started_at": row["started_at"], "deadline": row["deadline"]}))
-        tx.execute("DELETE FROM waits WHERE scope_id=? AND kind='agent_preparation'", (row["scope_id"],))
+        tx.execute(*selected_statement(tx, "DELETE FROM waits WHERE scope_id=? AND kind='agent_preparation'",
+            "DELETE FROM waits WHERE scope_id=? AND kind='agent_preparation' AND run_id=?",
+            (row["scope_id"],), run_last=True))
         self._event(tx, preparation.subject, "agent_preparation_settled", preparation.reservation_id, material)
-        run = tx.one("SELECT * FROM runs")
+        run = tx.one(*selected_statement(tx, "SELECT * FROM runs",
+                  'SELECT * FROM runs WHERE id=?',
+                  (), run_last=True))
         job = self._job(tx, preparation.subject)
         if (not run["stopped"] and not run["blocked"] and run["executor"] == preparation.execution.owner
                 and run["epoch"] == preparation.execution.epoch and job["current_attempt"] == preparation.attempt_id
@@ -3958,7 +4086,9 @@ class Kernel:
             self._gate(tx, preparation.subject, "execution_failed" if code == "invocation_deadline_exceeded" else "worker_unavailable", evidence=material)
 
     def _host_preparations_exited(self, tx: Transaction, execution: Execution, evidence: Mapping[str, Any]) -> None:
-        for row in tx.all("SELECT * FROM waits WHERE kind='agent_preparation'"):
+        for row in tx.all(*selected_statement(tx, "SELECT * FROM waits WHERE kind='agent_preparation'",
+                       "SELECT * FROM waits WHERE kind='agent_preparation' AND run_id=?",
+                       (), run_last=True)):
             preparation, _ = self._preparation(tx, row)
             if preparation.execution == execution:
                 self._finish_preparation(tx, preparation, row, "executor_exited", evidence)
@@ -4289,7 +4419,9 @@ class Kernel:
                               continuation=facts, output_error=error, retain_period=True)
 
     def _pending_effect(self, tx: Transaction, subject: str) -> sqlite3.Row | None:
-        rows = tx.rows("SELECT * FROM effects WHERE subject=? AND status IN ('prepared','sent','observed') AND operation NOT IN ('cleanup_worktree','cleanup_local_ref','cleanup_remote_ref','issue_link')", (subject,))
+        rows = tx.rows(*selected_statement(tx, "SELECT * FROM effects WHERE subject=? AND status IN ('prepared','sent','observed') AND operation NOT IN ('cleanup_worktree','cleanup_local_ref','cleanup_remote_ref','issue_link')",
+                   "SELECT * FROM effects WHERE subject=? AND status IN ('prepared','sent','observed') AND operation NOT IN ('cleanup_worktree','cleanup_local_ref','cleanup_remote_ref','issue_link') AND run_id=?",
+                   (subject,), run_last=True))
         return rows[0] if rows else None
 
     def _effect_stale(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, row: sqlite3.Row) -> bool:
@@ -4728,8 +4860,12 @@ class Kernel:
 
     def _release_integration(self, tx: Transaction, subject: str) -> None:
         if self._pending_effect(tx, subject) is None:
-            tx.execute("UPDATE runs SET integration_holder=NULL WHERE integration_holder=?", (subject,))
-            tx.execute("DELETE FROM integration_queue WHERE subject=?", (subject,))
+            tx.execute(*selected_statement(tx, "UPDATE runs SET integration_holder=NULL WHERE integration_holder=?",
+                'UPDATE runs SET integration_holder=NULL WHERE integration_holder=? AND id=?',
+                (subject,), run_last=True))
+            tx.execute(*selected_statement(tx, "DELETE FROM integration_queue WHERE subject=?",
+                'DELETE FROM integration_queue WHERE subject=? AND run_id=?',
+                (subject,), run_last=True))
 
     def _integration_origin(self, tx: Transaction, job: sqlite3.Row) -> Commit:
         if job["workspace_sha"] == job["candidate_sha"] and job["candidate_tree"]:
@@ -5421,16 +5557,23 @@ class Kernel:
                 and grant["completion_revision"] == job["completion_revision"])
 
     def _event(self, tx: Transaction, subject: str, kind: str, event_id: str, material: str | None = None, *, generation: int | None = None) -> None:
-        job = tx.one("SELECT generation,phase,purpose,current_attempt FROM subjects WHERE id=?", (subject,))
+        job = tx.one(*selected_statement(tx, "SELECT generation,phase,purpose,current_attempt FROM subjects WHERE id=?",
+                  'SELECT generation,phase,purpose,current_attempt FROM subjects WHERE id=? AND run_id=?',
+                  (subject,), run_last=True))
         if generation is None:
             generation = job["generation"]
         status = None
         if generation == job["generation"]:
-            run = tx.one("SELECT stopped,blocked FROM runs")
+            run = tx.one(*selected_statement(tx, "SELECT stopped,blocked FROM runs",
+                      'SELECT stopped,blocked FROM runs WHERE id=?',
+                      (), run_last=True))
             status = wire_json({"stopped": bool(run["stopped"]), "blocked": run["blocked"],
                                 "gates": [row["code"] for row in self._gates(tx, subject)],
                                 "attempt_status": None if job["current_attempt"] is None else
-                                tx.one("SELECT status FROM attempts WHERE id=?", (job["current_attempt"],))[0]}).decode()
-        tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at,phase,purpose,status) VALUES (?,?,?,?,?,?,?,?,?)",
-                   (subject, kind, event_id, material, generation, self.clock(),
-                    job["phase"] if status is not None else None, job["purpose"] if status is not None else None, status))
+                                tx.one(*selected_statement(tx, "SELECT status FROM attempts WHERE id=?",
+                                    'SELECT status FROM attempts WHERE id=? AND run_id=?',
+                                    (job["current_attempt"],), run_last=True))[0]}).decode()
+        tx.execute(*selected_statement(tx, "INSERT INTO history(subject,kind,identity,material_id,generation,created_at,phase,purpose,status) VALUES (?,?,?,?,?,?,?,?,?)",
+            'INSERT INTO history(subject,kind,identity,material_id,generation,created_at,phase,purpose,status,run_id) VALUES (?,?,?,?,?,?,?,?,?,?)',
+            (subject, kind, event_id, material, generation, self.clock(),
+                    job["phase"] if status is not None else None, job["purpose"] if status is not None else None, status), run_last=True))
