@@ -13,7 +13,7 @@ from agent_run.contracts.write_authority import FinalAdmission, WriteAuthority
 from agent_run.model import Role
 from support.offline import GraphScenario
 from test_kernel_requirements import native_input
-from test_kernel_remote_effects import EffectBoundary, effect_boundary
+from support.effect_boundary import EffectBoundary, effect_boundary
 from support.core_operations import CoreOperations, scripted_return
 
 

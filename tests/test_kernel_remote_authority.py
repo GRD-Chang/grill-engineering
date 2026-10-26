@@ -9,7 +9,7 @@ from agent_run.core.kernel import Kernel
 from support.offline import Scenario
 from support.offline_git import OfflineGit
 from agent_run.core.operation_contract import ReadUnavailable
-from test_kernel_remote_effects import EffectBoundary, effect_boundary
+from support.effect_boundary import EffectBoundary, effect_boundary
 
 
 def merge_intent(scenario: Scenario, monkeypatch: pytest.MonkeyPatch):
