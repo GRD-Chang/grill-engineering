@@ -72,6 +72,21 @@ def test_transport_redacts_failed_and_timed_out_output(
     assert "[REDACTED]" in result.stdout
 
 
+def test_read_timeout_diagnostic_preserves_safe_provenance_without_raw_output(monkeypatch):
+    from agent_run.adapters.github_commands import read_response_error, run_read_command
+    monkeypatch.setattr('agent_run.adapters.github_commands.READ_TIMEOUT_SECONDS', 0.1)
+    monkeypatch.setattr('agent_run.adapters.github_commands.MAX_READ_ATTEMPTS', 1)
+    response = run_read_command([sys.executable, '-I', '-c',
+        "import sys,time;print('private response',flush=True);"
+        "print('Authorization: Bearer private-value',file=sys.stderr,flush=True);time.sleep(5)"],
+        runner_identity={'source': 'host'})
+    error = read_response_error(response)
+    assert error.code == 'github_read_failed'
+    assert 'category=timeout' in error.message and 'exit=None' in error.message
+    assert 'output_shape=text' in error.message
+    assert 'private' not in error.message and len(error.message.encode()) < 512
+
+
 @pytest.mark.parametrize("source", ["pat", "app"])
 def test_selected_initial_clone_uses_https_without_host_login(
     git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str,
