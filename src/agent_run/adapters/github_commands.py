@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import random
+import json
+import re
 import subprocess
 import time
 from collections.abc import Callable, Mapping
@@ -9,12 +11,38 @@ from pathlib import Path
 
 from agent_run.adapters.auth.runner_transport import runner_options
 from agent_run.runtime.command import capture_command
-from agent_run.errors import redact_transport_output
+from agent_run.errors import GitHubReadError, redact_transport_output
 
 
 MAX_READ_ATTEMPTS = 3
 READ_TIMEOUT_SECONDS = 30
 MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
+
+
+class _TimedOutRead(subprocess.CompletedProcess[str]):
+    """Keep timeout provenance while retaining the existing retry result contract."""
+
+
+def read_response_error(response: subprocess.CompletedProcess[str], *, invalid_json: bool = False) -> GitHubReadError:
+    """Fixed safe facts only; no arbitrary command output becomes a diagnostic."""
+    from agent_run.adapters.auth.native_probe import _ErrorEvidence
+
+    output = response.stdout.strip()
+    try:
+        parsed = json.loads(output)
+    except (ValueError, RecursionError):
+        shape = "text" if output else "empty"
+    else:
+        shape = "json_array" if isinstance(parsed, list) else "json_object" if isinstance(parsed, dict) else "json_scalar"
+    evidence = _ErrorEvidence()
+    evidence.feed(response.stderr.encode())
+    timed_out = isinstance(response, _TimedOutRead)
+    category = ("timeout" if timed_out else "invalid_json" if invalid_json else
+                "network" if evidence.network_failure else "command_failed")
+    status = re.search(r"\bHTTP[ /](?:[0-9.]+ )?([1-5][0-9]{2})\b", response.stderr, re.IGNORECASE)
+    detail = f"; HTTP {status[1]}" if status else ""
+    return GitHubReadError("github_invalid_response" if invalid_json else "github_read_failed",
+        f"GitHub observation failed: category={category}; exit={None if timed_out else response.returncode}; output_shape={shape}{detail}")
 
 
 def run_read_command(
@@ -39,7 +67,7 @@ def run_read_command(
                 **cancellation,
             )
         except subprocess.TimeoutExpired as error:
-            result = subprocess.CompletedProcess(
+            result = _TimedOutRead(
                 arguments,
                 1,
                 _text(error.stdout),

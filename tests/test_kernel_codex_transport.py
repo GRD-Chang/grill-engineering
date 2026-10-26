@@ -77,6 +77,12 @@ raise SystemExit(7)
     assert before["pending_return"] is True and before["gates"] == []
     assert before["phase"] == "development" and before["pending_attempt"] == call.attempt_id
     assert before["budgets"]["requirements"]["developments_used"] == 1
+    with reopened.storage.transaction(write=False) as tx:
+        failures = [json.loads(row['body']) for row in tx.rows("SELECT body FROM material WHERE subject=? AND purpose='worker_failure'", (call.subject,))]
+        diagnostic = failures[-1]['diagnostic']
+    assert diagnostic['final_output_exists'] is True and diagnostic['final_output_kind'] == 'regular'
+    assert diagnostic['final_output_bytes'] == len(raw)
+    assert diagnostic['final_output_json_shape'] == 'json_object'  # Shape never accepts an invalid Artifact.
     assert reopened.operation_state().active == ()
     step = CoreOperations(reopened, call.execution, lambda binding: ports, prepare_agents=False).once(agent_capacity=0)
     assert step.kind == ("progress" if raw == RAW else "needs_agent")
@@ -143,10 +149,11 @@ for thread in {events!r}:
 @pytest.mark.parametrize("replacement", ["missing", "symlink"])
 def test_stdout_artifact_cannot_replace_missing_or_symlinked_final(tmp_path: Path, replacement: str) -> None:
     kernel, call, _ = allocated_codex(tmp_path)
-    with pytest.raises(OSError):
+    with pytest.raises(OSError) as failed:
         local_codex(kernel, call, tmp_path, f"""\
 print(json.dumps({{"type": "thread.started", "thread_id": "original-thread"}}), flush=True)
 print({RAW.decode()!r}, flush=True)
+print('private raw stderr secret-fixture-value', file=sys.stderr, flush=True)
 output = Path(sys.argv[sys.argv.index('--output-last-message') + 1])
 output.unlink()
 if {replacement!r} == 'symlink':
@@ -163,6 +170,19 @@ if {replacement!r} == 'symlink':
     assert any(event["kind"] == "worker_exited" and event["identity"] == observed_call(kernel, call).invocation_id
                for event in reopened.history(call.subject))
     assert not any(event["kind"] == "raw_returned" for event in reopened.history(call.subject))
+    from agent_run.queries.run import read
+    document = read(kernel.storage.path, 'status').data
+    action = next(item for item in document['operator_actions'] if item['status_code'] == 'execution_failed')
+    proof = action['evidence']['failure_evidence']
+    assert proof['returncode'] == 0
+    diagnostic = proof['diagnostic']
+    assert diagnostic['final_output_exists'] is (replacement != 'missing')
+    assert diagnostic['final_output_kind'] == replacement
+    assert diagnostic['final_output_json_shape'] == 'not_read'
+    assert diagnostic['thread_observed'] is True and diagnostic['stdout_bytes'] > 0
+    assert diagnostic['stderr_tail_present'] is True and diagnostic['stderr_tail_bytes'] > 0
+    assert 'private raw stderr' not in json.dumps(document) and 'secret-fixture-value' not in json.dumps(document)
+    assert all('private raw stderr' not in note for note in getattr(failed.value, '__notes__', ()))
 
 
 def test_kernel_allocated_reviewer_cannot_write_checkout_but_can_return_final(tmp_path: Path) -> None:

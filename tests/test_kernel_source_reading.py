@@ -823,3 +823,32 @@ def test_repository_fixture_never_falls_back_for_another_ref_or_old_commit_route
     result = repository_response(['api', endpoint], repository='example/project', default_branch='main',
                                  refs={'refs/heads/main': 'a' * 40})
     assert result.returncode == 1 and result.stdout == '' and 'HTTP 404' in result.stderr
+
+
+@pytest.mark.parametrize(('exit_code', 'stdout', 'stderr', 'code', 'category', 'shape'), [
+    (23, '', 'dial tcp: i/o timeout', 'github_read_failed', 'network', 'empty'),
+    (23, '{"private":"payload"}', 'HTTP 403', 'github_read_failed', 'command_failed', 'json_object'),
+    (0, '', '', 'github_invalid_response', 'invalid_json', 'empty'),
+    (0, 'private response text', '', 'github_invalid_response', 'invalid_json', 'text'),
+])
+def test_required_checks_failure_keeps_safe_exit_and_shape(
+    tmp_path, monkeypatch, exit_code, stdout, stderr, code, category, shape,
+):
+    from agent_run.adapters.source import read_required_check_facts
+    reader, _ = _reader(tmp_path, monkeypatch)
+    script = Path(os.environ['PATH'].split(os.pathsep)[0]) / 'gh'
+    original = script.read_text()
+    first, rest = original.split('\n', 1)
+    script.write_text(first + '\nimport sys\n'
+        "if sys.argv[1:3]==['api','graphql']:\n"
+        f' sys.stdout.write({stdout!r});sys.stderr.write({(stderr + " Authorization: Bearer secret-fixture-value")!r});raise SystemExit({exit_code})\n'
+        + rest)
+    monkeypatch.setattr('agent_run.adapters.github_commands.time.sleep', lambda _: None)
+    with pytest.raises(GitHubReadError) as failed:
+        read_required_check_facts(reader, 17, expected_head_sha='2' * 40)
+    assert failed.value.code == code
+    assert f'exit={exit_code}' in failed.value.message
+    assert f'output_shape={shape}' in failed.value.message
+    assert f'category={category}' in failed.value.message
+    assert 'secret-fixture-value' not in failed.value.message and 'private' not in failed.value.message
+    assert len(failed.value.message.encode()) < 512

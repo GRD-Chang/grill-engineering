@@ -13,7 +13,7 @@ from typing import Any, Mapping
 
 from agent_run.adapters.github import GhGitHubReader
 from agent_run.errors import GitHubReadError
-from agent_run.adapters.github_commands import run_read_command
+from agent_run.adapters.github_commands import read_response_error, run_read_command
 
 from agent_run.storage.sqlite import MATERIAL_LIMIT
 from agent_run.adapters.git_objects import LocalGit
@@ -85,7 +85,7 @@ def _read(reader: GhGitHubReader, arguments: list[str], *, allowed: frozenset[in
     identity = validate_identity_snapshot(reader.runner_identity)
     response = run_read_command(['gh', *arguments], cwd=reader.working_directory, runner_identity=identity)
     if response.returncode not in allowed:
-        raise GitHubReadError('github_read_failed', response.stderr.strip() or 'GitHub observation failed')
+        raise read_response_error(response)
     return response
 
 
@@ -94,7 +94,7 @@ def _json_response(response: subprocess.CompletedProcess[str]) -> Any:
     try:
         return json.loads(response.stdout)
     except json.JSONDecodeError as error:
-        raise GitHubReadError('github_invalid_response', 'GitHub returned invalid JSON') from error
+        raise read_response_error(response, invalid_json=True) from error
 
 
 def read_pull_request_facts(reader: GhGitHubReader, pr_number: int) -> dict[str, Any]:
@@ -488,7 +488,7 @@ def read_required_check_facts(reader: GhGitHubReader, pr_number: int, *, expecte
                        allowed=frozenset({0, 1, 404}))
     absent = protection.returncode == 404 or (protection.returncode != 0 and 'http 404' in protection.stderr.lower())
     if protection.returncode and not absent:
-        raise GitHubReadError('github_read_failed', protection.stderr.strip() or 'Branch protection could not be read')
+        raise read_response_error(protection)
     classic_config = None if absent else _object(_json_response(protection))
     classic = None if classic_config is None else _array(classic_config.get('contexts'))
     classic_checks = [] if classic_config is None else _array(classic_config.get('checks'))

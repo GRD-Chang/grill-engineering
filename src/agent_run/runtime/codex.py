@@ -109,6 +109,7 @@ class _CodexCapture:
         self.credential_file = credential_file
         self.identity, self.cancelled = identity, cancelled
         self.credential_exhausted = threading.Event()
+        self.credential_observation: Callable[[], dict[str, Any]] | None = None
         self.inherit_host_auth = False
         self.hidden_paths, self.hidden_environment = tuple(hidden_paths), tuple(hidden_environment)
         self.cwd = Path(preparation.context["checkout"])
@@ -179,11 +180,10 @@ class _CodexCapture:
             )
             return self
         except BaseException as error:
-            from agent_run.adapters.auth.credential_lifecycle import safe_http_status
+            from agent_run.adapters.auth.credential_lifecycle import credential_diagnostic
 
-            failure = error if hasattr(error, "retryable") else error.__cause__
             self.diagnostic = {"source": "worker-preparation", "error_type": type(error).__name__,
-                               "http_status": safe_http_status(getattr(failure, "http_status", None))}
+                               **credential_diagnostic(error)}
             try:
                 self._close()
             except BaseException as cleanup_error:
@@ -232,6 +232,7 @@ class _CodexCapture:
                 delivery = self.resources.enter_context(NativeCredentialDelivery(
                     provider, gh, on_exhausted=lambda _message: self.credential_exhausted.set(),
                 ))
+                self.credential_observation = delivery.lifecycle.diagnostic
                 delivery.start(guard=self._preparation_guard, deadline=self.preparation_deadline)
                 environment = native_worker_environment(git_environment(self.source_environment), gh, host=False)
                 environment.pop("GH_HOST", None)
@@ -266,8 +267,9 @@ class _CodexCapture:
             from agent_run.adapters.auth.credential_lifecycle import WorkerCredentialError
 
             self.failure_kind = "fatal"
-            self.diagnostic = {"source": "worker-credentials", "error_type": "CredentialExhausted"}
-            raise WorkerCredentialError("Selected Worker credential renewal exhausted")
+            self.diagnostic = {"source": "worker-credentials", "error_type": "CredentialExhausted",
+                               **(self.credential_observation() if self.credential_observation is not None else {})}
+            raise WorkerCredentialError("Selected Worker credential renewal exhausted", diagnostic=self.diagnostic)
 
     def __exit__(
         self, exception_type: type[BaseException] | None, exception: BaseException | None,
@@ -391,6 +393,21 @@ class _CodexCapture:
             raise
 
     def finish(self) -> bytes:
+        output: dict[str, Any] = {"final_output_exists": None, "final_output_kind": "not_observed",
+            "final_output_bytes": None, "final_output_json_shape": "not_read",
+            "thread_observed": self.observed_thread is not None, "thread_bound": self.thread is not None,
+            "stdout_bytes": self.stdout_bytes}
+        if self.directory is not None:
+            try:
+                metadata = os.stat("last-message.txt", dir_fd=self.directory, follow_symlinks=False)
+            except FileNotFoundError:
+                output.update(final_output_exists=False, final_output_kind="missing")
+            except OSError:
+                output["final_output_kind"] = "unavailable"
+            else:
+                output.update(final_output_exists=True, final_output_kind="regular" if stat.S_ISREG(metadata.st_mode)
+                              else "symlink" if stat.S_ISLNK(metadata.st_mode) else "other")
+        self.diagnostic = {"source": "codex-output", **(self.diagnostic or {}), **output}
         if self.invalid:
             raise ValueError("Codex execution facts were not accepted")
         self.decoder.decode(b"", final=True)
@@ -404,7 +421,17 @@ class _CodexCapture:
             value = _read_regular(descriptor, _MAX_FINAL_BYTES)
         finally:
             os.close(descriptor)
-        value.decode("utf-8")
+        self.diagnostic.update(final_output_exists=True, final_output_kind="regular", final_output_bytes=len(value))
+        self.diagnostic["final_output_json_shape"] = "invalid_utf8"
+        text = value.decode("utf-8")
+        try:
+            parsed = json.loads(text)
+        except (ValueError, RecursionError):
+            shape = "invalid_json" if value else "empty"
+        else:
+            # Syntactic shape is not Artifact/schema acceptance or work authority.
+            shape = "json_object" if isinstance(parsed, dict) else "json_array" if isinstance(parsed, list) else "json_scalar"
+        self.diagnostic["final_output_json_shape"] = shape
         return value
 
 

@@ -5,7 +5,7 @@ import math
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, TypeVar
+from typing import Any, Callable, Mapping, TypeVar
 
 from agent_run.contracts.policy import AGENT_PREPARATION_SECONDS
 
@@ -20,16 +20,56 @@ def safe_http_status(value: object) -> int | None:
     return value if type(value) is int and 100 <= value <= 599 else None
 
 
+def credential_diagnostic(error: BaseException) -> dict[str, Any]:
+    """Copy only classified, bounded provider facts; never exception text/output."""
+    failure = error if hasattr(error, "retryable") else error.__cause__
+    stored = getattr(error, "diagnostic", None)
+    if not isinstance(stored, Mapping):
+        stored = getattr(failure, "diagnostic", None)
+    def value(key: str) -> Any:
+        return stored.get(key) if isinstance(stored, Mapping) else getattr(failure, key, None)
+    result: dict[str, Any] = {"http_status": safe_http_status(value("http_status"))}
+    category = value("category")
+    if isinstance(category, str) and category in {"timeout", "network", "rate_limited", "unauthorized", "forbidden", "http_error",
+                    "process_error", "command_failed"}:
+        result["category"] = category
+    for key, lower, upper in (("returncode", -255, 255), ("errno", 1, 4095)):
+        number = value(key)
+        if type(number) is int and lower <= number <= upper:
+            result[key] = number
+    retryable = value("retryable")
+    if type(retryable) is bool:
+        result["retryable"] = retryable
+    stage = value("credential_stage")
+    if stage in ("initial", "renewal"):
+        result.setdefault("category", "not_recorded")
+        result["credential_stage"] = stage
+        for key in ("credential_attempts", "credential_retries"):
+            number = value(key)
+            if type(number) is int and 0 <= number <= 2**31 - 1:
+                result[key] = number
+        for key in ("credential_failure_observed", "credential_valid_at_last_failure"):
+            observed = value(key)
+            if observed is None or type(observed) is bool:
+                result[key] = observed
+        remaining = value("credential_remaining_seconds_at_last_failure")
+        if remaining is None or type(remaining) in (int, float) and 0 <= remaining <= 10**12:
+            result["credential_remaining_seconds_at_last_failure"] = remaining
+    return result
+
+
 class WorkerCredentialError(RuntimeError):
     def __init__(
         self, message: str, *, http_status: int | None = None,
         retryable: bool | None = False,
         authorization_failed: bool = False,
+        diagnostic: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.http_status = safe_http_status(http_status)
         self.retryable = retryable
         self.authorization_failed = authorization_failed
+        self.diagnostic = dict(diagnostic) if diagnostic is not None else None
 
 
 class InitialCredentialUnavailable(WorkerCredentialError):
@@ -60,15 +100,29 @@ def prepare_initial_credential(
     until = min(deadline, time.monotonic() + AGENT_PREPARATION_SECONDS)
     delay = 1.0
     last_status: int | None = None
+    last_diagnostic: dict[str, Any] | None = None
+    attempts = 0
+    def summary() -> dict[str, Any]:
+        return {**(last_diagnostic or {}), "credential_stage": "initial",
+                "credential_attempts": attempts, "credential_retries": max(0, attempts - 1),
+                "credential_failure_observed": last_diagnostic is not None,
+                "credential_valid_at_last_failure": False if last_diagnostic is not None else None,
+                "credential_remaining_seconds_at_last_failure": None}
     while True:
         guard()
         if time.monotonic() >= until:
-            raise InitialCredentialUnavailable("Initial Worker credential wait expired", retryable=True, http_status=last_status)
+            raise InitialCredentialUnavailable("Initial Worker credential wait expired", retryable=True,
+                http_status=last_status, diagnostic=summary())
         try:
+            attempts += 1
             result = prepare()
         except Exception as error:
             # Native gh retains only classified safe metadata in its cause.
             failure = error if hasattr(error, "retryable") else error.__cause__
+            last_diagnostic = credential_diagnostic(error)
+            # Exception type/args and retry authority stay untouched. Carry only
+            # safe observations through native and provider wrapping boundaries.
+            error.__dict__["diagnostic"] = summary()
             if getattr(failure, "retryable", False) is not True:
                 raise
             last_status = safe_http_status(getattr(failure, "http_status", None))
@@ -80,7 +134,8 @@ def prepare_initial_credential(
         else:
             guard()
             if time.monotonic() >= until:
-                raise InitialCredentialUnavailable("Initial Worker credential wait expired", retryable=True)
+                raise InitialCredentialUnavailable("Initial Worker credential wait expired", retryable=True,
+                    diagnostic=summary())
             return result
 
 
@@ -108,6 +163,15 @@ class RenewableCredential:
         self.failure_retryable: bool | None = None
         self.failure_authorization_failed = False
         self._attempts = 0
+        self._last_diagnostic: dict[str, Any] | None = None
+
+    def diagnostic(self) -> dict[str, Any]:
+        """Last failed refresh observation, never current token authority/expiry."""
+        with self._condition:
+            return dict(self._last_diagnostic or {"credential_stage": "renewal", "category": "not_recorded",
+                "credential_attempts": 0, "credential_retries": 0,
+                "credential_failure_observed": False, "credential_valid_at_last_failure": None,
+                "credential_remaining_seconds_at_last_failure": None})
 
     def start(self, *, guard: Callable[[], None] | None = None, deadline: float | None = None) -> None:
         control_failure: BaseException | None = None
@@ -146,6 +210,7 @@ class RenewableCredential:
                 http_status=getattr(error, "http_status", None),
                 retryable=getattr(error, "retryable", None),
                 authorization_failed=getattr(error, "authorization_failed", False) is True,
+                diagnostic=credential_diagnostic(error),
             ) from None
         with self._condition:
             if self._closed:
@@ -223,6 +288,7 @@ class RenewableCredential:
             self.failure_retryable = None
             self.failure_authorization_failed = False
             self._credential = value
+            self._last_diagnostic = None
             self._condition.notify_all()
 
     def _renew(self) -> None:
@@ -253,11 +319,19 @@ class RenewableCredential:
             try:
                 self._update()
             except Exception as error:
-                self._last_status = safe_http_status(getattr(error, "http_status", None))
-                self.failure_retryable = getattr(error, "retryable", None)
-                self.failure_authorization_failed = getattr(error, "authorization_failed", False) is True
-                self._attempts += 1
-                now = self._clock()
+                with self._condition:
+                    self._last_status = safe_http_status(getattr(error, "http_status", None))
+                    self.failure_retryable = getattr(error, "retryable", None)
+                    self.failure_authorization_failed = getattr(error, "authorization_failed", False) is True
+                    self._attempts += 1
+                    now = self._clock()
+                    valid = self._credential is not None and not self._closed and now < self._credential.expires_at
+                    remaining = None if self._credential is None else max(0.0, self._credential.expires_at - now)
+                    self._last_diagnostic = {**credential_diagnostic(error), "credential_stage": "renewal",
+                        "credential_attempts": self._attempts, "credential_retries": self._attempts - 1,
+                        "credential_failure_observed": True, "credential_valid_at_last_failure": valid,
+                        "credential_remaining_seconds_at_last_failure": remaining}
+                    self._last_diagnostic.setdefault("category", "not_recorded")
                 if failure_deadline is None:
                     failure_deadline = now + self._window
                 retry_at = min(now + retry_delay, failure_deadline)

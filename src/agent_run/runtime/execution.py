@@ -393,14 +393,14 @@ def _run_dispatched(
     framed = released and failure is None and process.returncode == 0
     capture_failed = False
     if capture is not None and released:
+        capture.diagnostic = {**(capture.diagnostic or {}), "stderr_tail_present": bool(stderr),
+                              "stderr_tail_bytes": len(stderr.encode("utf-8"))}
         try:
             raw = capture.finish()
             framed = True
         except BaseException as output_error:
             capture_failed = True
             framed = False
-            if stderr:
-                output_error.add_note(f"Worker stderr: {stderr}")
             if failure is None:
                 failure = output_error
             else:
