@@ -174,7 +174,7 @@ esac
 
 
 def test_doctor_run_selection_keeps_frozen_identity_and_state(git_repo, tmp_path, monkeypatch, capsys) -> None:
-    from test_kernel_profile_prompt_cli import _published_profile_task
+    from support.cli_fixtures import _published_profile_task
 
     kernel = _published_profile_task(git_repo)
     assert main(["settings", "configure", "--runner-github-source", "pat",

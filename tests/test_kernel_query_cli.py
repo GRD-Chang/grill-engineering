@@ -10,17 +10,16 @@ import sys
 
 import pytest
 
-from agent_run.contracts.agent_profiles import resolve_profiles
-
-from agent_run.model import Blocker, Commit, Delivery, DeliveryKind, Issue, ParentIssue, Policy, Profile, Requirements, RunSpec
+from agent_run.model import Commit, Delivery, DeliveryKind, Issue, ParentIssue, Requirements
 from agent_run.core.kernel import Kernel
 import agent_run.queries.run as query
 from agent_run.cli.main import main
-from support.offline import Scenario, fixture_inputs
+from support.offline import Scenario
 from support.environment import durable_snapshot as _snapshot
 from agent_run.core.operation_contract import DeliveryFacts
 from agent_run.core.operation_runner import OperationRunner
 from support.core_operations import CoreOperations, ReadOnlyPorts
+from support.cli_fixtures import _default_deliveries, _fixture_source, _create
 
 
 def test_missing_exact_query_is_actionable_and_does_not_create_storage(
@@ -34,18 +33,6 @@ def test_missing_exact_query_is_actionable_and_does_not_create_storage(
     assert not missing.exists()
 
 
-def _default_deliveries() -> tuple[Delivery, ...]:
-    return (Delivery("ticket:2", DeliveryKind.TICKET, 2, "ticket-v1", Commit("base", "base-tree"),
-                     "refs/heads/ticket", "refs/heads/run"),)
-
-
-def _fixture_source(deliveries: tuple[Delivery, ...], parent: int = 1) -> Requirements:
-    numbers = {item.key: item.issue for item in deliveries}
-    return Requirements(ParentIssue(parent, "Parent", "Original query requirement", tuple(numbers.values())),
-        tuple(Issue(item.issue, "Ticket", item.revision, "OPEN", frozenset({"ready-for-agent"}),
-                    tuple(Blocker(numbers[key], "OPEN") for key in item.dependencies)) for item in deliveries))
-
-
 def _operations(kernel: Kernel, execution, *, deliveries: tuple[Delivery, ...] | None = None) -> CoreOperations:
     deliveries = deliveries or _default_deliveries()
 
@@ -57,25 +44,6 @@ def _operations(kernel: Kernel, execution, *, deliveries: tuple[Delivery, ...] |
     first = deliveries[0]
     ports = Ports(_fixture_source(deliveries), first.source_ref, first.target_ref, DeliveryFacts(first.base, None))
     return CoreOperations(kernel, execution, lambda binding: ports)
-
-
-def _create(root: Path, run_id: str = "run-query", *, language: str | None = "en",
-            repository: str = "example/project", parent: int = 1,
-            repository_root: Path | None = None, deliveries: tuple[Delivery, ...] | None = None) -> Kernel:
-    deliveries = deliveries or _default_deliveries()
-    spec = RunSpec(run_id, repository, parent, "parent-v1", "graph-v1", deliveries,
-                   Policy(development_profile=Profile("recorded-development-model", "high")),
-                   language=language, repository_root=str(repository_root or root / "checkout"))
-    if language is None:
-        # Explicit incompatible historical reader input; no runner is admitted.
-        return Kernel.create(root / run_id / "kernel.sqlite3", spec)
-    inputs = fixture_inputs()
-    profiles = resolve_profiles(preset="economy", overrides={
-        "development_model": "recorded-development-model", "development_effort": "high"})
-    final = Delivery("query-final", DeliveryKind.FINAL_RUN, parent, "unread", deliveries[0].base,
-                     deliveries[0].target_ref, "refs/heads/query-main")
-    return Kernel.create(root / run_id / "kernel.sqlite3", replace(spec, inputs=replace(inputs, profiles=profiles),
-        deliveries=(*deliveries, final)), requirements=_fixture_source(deliveries, parent))
 
 
 def test_valid_large_queue_dependency_set_and_default_history_are_not_truncated(tmp_path: Path) -> None:

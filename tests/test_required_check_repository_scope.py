@@ -6,7 +6,7 @@ import pytest
 
 from agent_run.adapters.source import normalize_required_checks, read_required_check_facts
 from agent_run.errors import GitHubReadError
-from tests.test_kernel_source_reading import _reader
+from support.remote_effects import _reader
 
 
 def test_required_checks_resolve_repository_once_and_refresh_the_next_observation(tmp_path, monkeypatch):

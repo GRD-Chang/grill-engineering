@@ -12,27 +12,12 @@ import pytest
 import agent_run.config.resources as prompt_resources
 from agent_run.adapters.workspace import ManagedWorkspace
 from agent_run.config.defaults import UserDefaultsStore
-from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
+from agent_run.model import ParentIssue, Requirements
 from agent_run.core.kernel import Kernel
-from agent_run.config.creation import freeze_creation
 from agent_run.cli.main import main
 from agent_run.core.operation_contract import DeliveryFacts
 from support.core_operations import CoreOperations, ReadOnlyPorts
-
-
-def _published_profile_task(git_repo: Path) -> Kernel:
-    workspace = ManagedWorkspace.for_repository('example/project')
-    root = workspace.ensure_path(str(git_repo))
-    defaults = UserDefaultsStore()
-    defaults.configure(language='en', profile={'development_model': 'original-development'})
-    base = Commit(subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),
-                  subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], cwd=root, text=True).strip())
-    delivery = Delivery('parent:1', DeliveryKind.PARENT_ONLY, 1, 'parent-v1', base,
-                        'refs/heads/parent', 'refs/heads/main')
-    spec = freeze_creation(RunSpec('profile-public', workspace.repository, 1, 'parent-v1', 'graph-v1',
-        (delivery,), repository_root=str(workspace.repository_root)), defaults)
-    return Kernel.create_task(workspace.state_root / spec.run_id / 'kernel.sqlite3', spec,
-        requirements=Requirements(ParentIssue(1, 'Profile Parent', 'Frozen original requirement'), ()))
+from support.cli_fixtures import _published_profile_task
 
 
 @pytest.mark.parametrize('command', ['configure', 'config', 'profile'])

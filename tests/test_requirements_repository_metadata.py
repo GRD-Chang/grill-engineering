@@ -5,7 +5,7 @@ import pytest
 
 from agent_run.adapters.source import read_required_check_facts, read_requirements
 from agent_run.errors import GitHubReadError
-from test_kernel_source_reading import _reader
+from support.remote_effects import _reader
 
 
 def test_requirements_do_not_need_an_unconsumed_missing_default_ref(tmp_path, monkeypatch):

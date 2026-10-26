@@ -8,23 +8,13 @@ import pytest
 
 from agent_run.adapters.workspace import ManagedWorkspace
 from agent_run.contracts.task import TaskKey
-from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
-from agent_run.core.kernel import Kernel
+from agent_run.model import DeliveryKind
 from support.offline import OfflinePort, Scenario
 from agent_run.cli.main import main
 from agent_run.storage.tasks import bind_task, locked_task, task_path
-from tests.test_kernel_query_cli import _create
+from support.cli_fixtures import _create
 from support.environment import durable_snapshot as _snapshot
-
-
-def _published(root: Path, run_id: str = "run-query", *, repository: str = "example/project",
-               repository_root: Path | None = None, parent: int = 1) -> Kernel:
-    delivery = Delivery(f"parent:{parent}", DeliveryKind.PARENT_ONLY, parent, "requirement", Commit("base", "tree"),
-                        "refs/heads/parent", "refs/heads/main")
-    spec = RunSpec(run_id, repository, parent, "parent", "graph", (delivery,), language="en",
-                   repository_root=str(repository_root or root.parent / "repository"))
-    return Kernel.create_task(root / run_id / "kernel.sqlite3", spec,
-                              requirements=Requirements(ParentIssue(parent, "Parent", "Requirement"), ()))
+from support.cli_fixtures import _published
 
 
 def test_default_discovery_does_not_walk_a_large_real_managed_clone(

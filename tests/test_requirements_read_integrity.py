@@ -7,7 +7,7 @@ import pytest
 
 from agent_run.adapters.source import read_requirements
 from agent_run.errors import GitHubReadError
-from test_kernel_source_reading import _reader
+from support.remote_effects import _reader
 
 
 @pytest.mark.parametrize('errors', [[{'message': 'Resource not accessible', 'path': ['repository', 'issue']}], None, {}, False])

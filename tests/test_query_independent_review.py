@@ -7,7 +7,7 @@ from agent_run.contracts.task import TaskKey
 from agent_run.queries.run import task_binding
 from agent_run.cli.main import main
 from support.environment import durable_snapshot as _bytes
-from test_kernel_query_discovery import _published
+from support.cli_fixtures import _published
 
 
 def test_retired_empty_run_locator_cannot_override_exact_native_task_binding(tmp_path, capsys):

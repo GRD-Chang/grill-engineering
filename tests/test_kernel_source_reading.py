@@ -1,123 +1,14 @@
 """Real fake-gh transport into native Requirements; Kernel owns all decisions."""
 import json
-import os
 from pathlib import Path
-import sys
 
 import pytest
 
-from agent_run.adapters.github import GhGitHubReader
 from agent_run.errors import GitHubReadError
 from agent_run.model import Commit, Delivery, DeliveryKind, RunSpec
 from agent_run.core.kernel import Kernel
 from agent_run.adapters.source import read_requirements
-from support.github_checks import CHECK_ROLLUP_FAKE, LATEST_CHECK_FAKE
-from support.github_requirements import source_issue
-
-
-def _reader(root: Path, monkeypatch, *, invalid: bool = False) -> tuple[GhGitHubReader, Path]:
-    binary = root / 'bin'
-    binary.mkdir()
-    responses = root / 'responses.json'
-    log = root / 'gh-calls.jsonl'
-    def page(nodes, more=False, cursor=None):
-        return {'nodes': nodes, 'pageInfo': {'hasNextPage': more, 'endCursor': cursor}}
-    initial = {
-        'pull_request': {'number': 17, 'state': 'open', 'title': 'Original PR', 'body': 'Original body\r\n保留原文',
-                         'user': {'login': 'actual-publisher'}, 'merged': False, 'merge_commit_sha': None,
-                         'head': {'ref': 'source', 'sha': '2' * 40, 'repo': {'full_name': 'outside/fork'}},
-                         'base': {'ref': 'main', 'sha': '1' * 40, 'repo': {'full_name': 'example/project'}}},
-        'checks': [], 'rulesets': [], 'classic': [],
-        'repository': 'example/project', 'default_branch': 'main',
-        'refs': {'refs/heads/main': '1' * 40},
-        'parent': {'number': 1, 'title': 'Original Parent', 'body': 'Original Parent body\r\n保留原文',
-                   'subIssues': None if invalid else page([{'number': 9}], True, 'parent-next')},
-        'parent-next': {'number': 1, 'title': 'Original Parent', 'body': 'Original Parent body\r\n保留原文',
-                        'subIssues': page([{'number': 3}])},
-        '9': {'number': 9, 'title': 'Original later ticket', 'body': 'Same original ticket body', 'state': 'OPEN',
-              'labels': page([{'name': 'ready-for-agent'}]),
-              'blockedBy': page([{'number': 99, 'state': 'OPEN'}], True, 'blocker-next')},
-        'blocker-next': {'number': 9, 'title': 'Original later ticket', 'body': 'Same original ticket body', 'state': 'OPEN',
-              'labels': page([{'name': 'ready-for-agent'}]), 'blockedBy': page([{'number': 3, 'state': 'CLOSED'}])},
-        '3': {'number': 3, 'title': 'Original first ticket', 'body': 'Original body', 'state': 'CLOSED',
-              'labels': page([{'name': 'ready-for-agent'}, {'name': 'user-label'}]), 'blockedBy': page([])},
-    }
-    for key in ('parent', 'parent-next', '9', 'blocker-next', '3'):
-        totals = {'subIssues': 2} if key.startswith('parent') else {'blockedBy': 2} if key in ('9', 'blocker-next') else {}
-        initial[key] = source_issue(initial[key], totals=totals)
-    responses.write_text(json.dumps(initial))
-    script = binary / 'gh'
-    script.write_text('#!' + sys.executable + '\n' + f'import sys\nsys.path.insert(0, {str(Path(__file__).parent)!r})\nfrom support.github_checks import repository_response\n' + CHECK_ROLLUP_FAKE + LATEST_CHECK_FAKE + '''import json, os, sys
-args=sys.argv[1:]
-with open(os.environ['SOURCE_TEST_LOG'],'a') as f: f.write(json.dumps(args)+'\\n')
-if args[:2]==['repo','view'] or (args[:1]==['api'] and '/git/ref/heads/' in args[1]):
-    with open(os.environ['SOURCE_TEST_RESPONSES']) as f: data=json.load(f)
-    result=repository_response(args, repository=data['repository'], default_branch=data['default_branch'],
-                               refs=data['refs'], errors=data.get('ref_errors'))
-    print(result.stdout,end='');print(result.stderr,end='',file=sys.stderr)
-    raise SystemExit(result.returncode)
-elif args[:2]==['api','graphql']:
-    fields=dict(value.split('=',1) for index,value in enumerate(args) if index and args[index-1] in ('-F','-f'))
-    if 'CurrentRequiredChecks' in fields['query']:
-        with open(os.environ['SOURCE_TEST_RESPONSES']) as f: data=json.load(f)
-        print(json.dumps(current_checks(data, fields)))
-        raise SystemExit(0)
-    with open(os.environ['SOURCE_TEST_RESPONSES']) as f: control=json.load(f)
-    if control.get('graphql_http'):
-        print('HTTP '+str(control['graphql_http'])+' source unavailable',file=sys.stderr)
-        raise SystemExit(1)
-    key=fields.get('cursor') or fields.get('labelsCursor') or ('parent' if fields['number']=='1' else fields['number'])
-    issue=None if control[key] is None else dict(control[key])
-    if fields['number']!='1' and issue is not None:
-        for field, cursor in [('labels','labelsCursor'),('blockedBy','cursor')]:
-            issue[field]=control[fields.get(cursor) or key][field]
-    from support.github_requirements import source_response
-    result=source_response(issue, control['repository'])
-    with open(os.environ['SOURCE_TEST_RESPONSES']) as f: control=json.load(f)
-    if 'graphql_errors' in control: result['errors']=control['graphql_errors']
-    print(json.dumps(result))
-elif args[:1]==['api'] and '/commits/' in args[1] and args[1].split('?')[0].endswith(('/check-runs','/check-suites','/status')):
-    with open(os.environ['SOURCE_TEST_RESPONSES']) as f: data=json.load(f)
-    print_latest_response(data,args)
-elif args[:2]==['api','repos/example/project/pulls/17']:
-    with open(os.environ['SOURCE_TEST_RESPONSES']) as f: data=json.load(f)
-    pr=data['pull_request']
-    with open(os.environ['SOURCE_TEST_LOG']) as f: count=sum(json.loads(line)[:2]==args[:2] for line in f)
-    if count>1 and 'pr_head_after' in data: pr['head']['sha']=data['pr_head_after']
-    print(json.dumps(pr))
-elif args[:1]==['api'] and args[1].startswith('repos/example/project/actions/jobs/'):
-    with open(os.environ['SOURCE_TEST_RESPONSES']) as f: data=json.load(f)
-    if args[1].endswith('/logs'):
-        if data.get('logs_http'):
-            print('HTTP '+str(data['logs_http']),file=sys.stderr)
-            raise SystemExit(1)
-        print(data['job_logs'],end='')
-    else:
-        print(json.dumps(data['job']))
-elif args[:2]==['pr','checks']:
-    assert '--required' in args
-    with open(os.environ['SOURCE_TEST_RESPONSES']) as f: print(json.dumps(json.load(f)['checks']))
-elif args[:2]==['api','repos/example/project/rulesets']:
-    assert '--paginate' in args and '--slurp' in args
-    with open(os.environ['SOURCE_TEST_RESPONSES']) as f: print(json.dumps([json.load(f)['rulesets']]))
-elif args[:1]==['api'] and args[1].startswith('repos/example/project/rulesets/'):
-    with open(os.environ['SOURCE_TEST_RESPONSES']) as f: print(json.dumps(json.load(f)['ruleset_detail']))
-elif args[:2] in (['api','repos/example/project/branches/main/protection/required_status_checks/contexts'], ['api','repos/example/project/branches/main/protection/required_status_checks']):
-    with open(os.environ['SOURCE_TEST_RESPONSES']) as f: data=json.load(f)
-    if data.get('classic_http'):
-        print('HTTP '+str(data['classic_http']),file=sys.stderr)
-        raise SystemExit(1)
-    print(json.dumps(data['classic'] if args[1].endswith('/contexts') else {'contexts':data['classic'], 'checks':data.get('classic_checks', [{'context':context,'app_id':None} for context in data['classic']])}))
-else:
-    raise SystemExit('Unexpected external command: '+repr(args))
-''')
-    script.chmod(0o755)
-    monkeypatch.setenv('PATH', str(binary) + os.pathsep + os.environ['PATH'])
-    monkeypatch.setenv('SOURCE_TEST_RESPONSES', str(responses))
-    monkeypatch.setenv('SOURCE_TEST_LOG', str(log))
-    for name in ('GH_TOKEN', 'GITHUB_TOKEN'):
-        monkeypatch.delenv(name, raising=False)
-    return GhGitHubReader('example/project', working_directory=root, runner_identity={'source': 'host'}), log
+from support.remote_effects import _reader
 
 
 def test_paginated_source_preserves_native_order_text_and_external_blockers(tmp_path: Path, monkeypatch) -> None:
