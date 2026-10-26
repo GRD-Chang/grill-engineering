@@ -301,6 +301,39 @@ def test_public_status_assembles_the_original_readonly_current_observation(inspe
     assert durable_snapshot(tmp_path) == before
 
 
+@pytest.mark.parametrize('worker_receipt', [False, True], ids=['domain-only', 'recorded-worker-exit'])
+def test_public_domain_exit_observation_is_not_a_recorded_worker_exit(inspection_worker, tmp_path, monkeypatch, worker_receipt):
+    from io import StringIO
+    from agent_run.cli.render import render
+    from agent_run.queries.run import read
+    kernel, request, call, process, domain, _, _ = inspection_worker
+    if worker_receipt:kernel.agent_exited(call, process, 0)
+    monkeypatch.setattr(foreground_host, 'recover_init', lambda value: 'exited' if value == domain else 'unknown')
+    before = durable_snapshot(tmp_path)
+    for kind in ('status', 'history'):
+        document = read(kernel.storage.path, kind)
+        current = document.data['current_observation']
+        assert current['host'] == {'disposition': 'exited', 'source': 'local'}
+        worker, = current['workers']
+        assert worker['disposition'] == 'exited'
+        assert worker['source'] == ('recorded_exit' if worker_receipt else 'host_exit')
+        invocation, = document.data['subjects'][0]['pending_attempt']['invocations']
+        output, = invocation['outputs']
+        assert output['dispatch_state'] == ('exited' if worker_receipt else 'started')
+        assert output['exit_code'] == (0 if worker_receipt else None)
+        assert (output['exited_at'] is not None) is worker_receipt
+        for language, recorded, observed in [('en', 'recorded exit', 'Host-domain exit observed; no Worker exit receipt recorded'),
+                                              ('zh', '已记录退出', '已观察到 Host 域退出；未记录 Worker 退出回执')]:
+            for style in ('plain', 'rich'):
+                stream = StringIO()
+                render(replace(document, language=language), style=style, details=False, stream=stream)
+                text = ' '.join(stream.getvalue().split())  # Rich may wrap the descriptive label.
+                assert (recorded in text) is worker_receipt
+                assert (observed in text) is not worker_receipt
+    assert kernel.active_host_action() == 'launch'
+    assert durable_snapshot(tmp_path) == before
+
+
 @pytest.mark.parametrize('state', ['running', 'exited', 'unknown'])
 def test_public_current_summary_does_not_replace_history_and_renders_both_languages(
     inspection_worker, tmp_path, monkeypatch, capsys, state,

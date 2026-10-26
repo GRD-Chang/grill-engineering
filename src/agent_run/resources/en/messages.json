@@ -1171,5 +1171,6 @@
   "presentation.observation.running": "observed alive",
   "presentation.observation.exited": "observed exited; no exact Worker end time inferred",
   "presentation.observation.recorded_exit": "recorded exit",
+  "presentation.observation.host_exit": "Host-domain exit observed; no Worker exit receipt recorded",
   "presentation.observation.unknown": "unknown; comparable local evidence unavailable"
 }

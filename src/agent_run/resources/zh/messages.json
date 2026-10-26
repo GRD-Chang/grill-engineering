@@ -1171,5 +1171,6 @@
   "presentation.observation.running": "已观察到存活",
   "presentation.observation.exited": "已观察到退出；不推定准确 Worker 结束时间",
   "presentation.observation.recorded_exit": "已记录退出",
+  "presentation.observation.host_exit": "已观察到 Host 域退出；未记录 Worker 退出回执",
   "presentation.observation.unknown": "未知；缺少可比较的本地证据"
 }

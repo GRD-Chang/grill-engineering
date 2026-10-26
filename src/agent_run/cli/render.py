@@ -375,7 +375,7 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
         for item in current['workers']:
             job = next((job for job in data['subjects'] if job['subject'] == item['subject']), None)
             if job is not None:
-                state = ('recorded_exit' if item['disposition'] == 'exited'
+                state = (item['source'] if item['disposition'] == 'exited'
                          and item['source'] in {'recorded_exit', 'host_exit'} else item['disposition'])
                 yield text('presentation.observation.worker', language=document.language, issue=job['issue'],
                            role=copy[item['role']], state=text('presentation.observation.' + state, language=document.language))
