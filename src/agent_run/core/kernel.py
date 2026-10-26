@@ -240,7 +240,7 @@ class Kernel:
         rows = tx.rows("SELECT h.*,a.kind AS action_kind,a.status AS action_status FROM hosts h JOIN actions a ON a.id=h.action_id "
                       "WHERE h.run_id=? AND h.owner=? AND h.epoch=? AND h.status='running' AND h.usage_ready=1 AND h.usage_released=0 AND h.dispatched_at IS NOT NULL AND a.run_id=h.run_id",
                       (execution.run_id, execution.owner, execution.epoch))
-        if (len(rows) != 1 or rows[0]["action_status"] not in {"applied", "pending"}
+        if (len(rows) != 1 or rows[0]["action_status"] not in {"applied", "pending", "updating"}
                 or action_id is not None and rows[0]["action_id"] != action_id):
             raise KernelError("managed_observation_required")
         return rows[0]
@@ -3233,24 +3233,43 @@ class Kernel:
                 raise KernelError("no_approval_boundary")
             assert subject is not None
             if (run["stopped"] or run["blocked"] or self._gates(tx, subject)
-                    or not self._current(tx, job, run, world) or not self._published(tx, run, job, world)
-                    or not self._review_current(tx, job, world)):
+                    or self._pending_effect(tx, subject) is not None
+                    or tx.rows("SELECT id FROM leases WHERE subject=?", (subject,))
+                    or not self._current(tx, job, run, world)):
                 raise KernelError("approval_currentness")
-            checks = world.checks
-            if (checks is None or checks.result not in {"none", "pass"} or checks.head_sha != job["publication_sha"]
-                    or checks.pr_number != job["pr_number"] or not job["checks_id"]):
-                raise KernelError("approval_checks")
-            check = tx.one("SELECT material_id FROM checks WHERE id=?", (job["checks_id"],))
-            if wire_json(json.loads(tx.get(check[0], subject))) != wire_json(asdict(checks)):
-                raise KernelError("approval_checks_changed")
-            grant_id = identity()
-            tx.execute("INSERT INTO grants VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                       (grant_id, subject, action_id, job["pr_number"], job["publication_sha"], self._require_target(world).sha,
-                        job["review_attempt"], job["checks_id"], job["revision"], run["parent_revision"],
-                        run["graph_revision"], job["completion_revision"]))
-            tx.execute("UPDATE subjects SET phase='merge',grant_id=?,version=version+1 WHERE id=?", (grant_id, subject))
-            tx.execute("UPDATE runs SET final_action=? WHERE id=?", (action_id, run["id"]))
-            tx.execute("UPDATE actions SET status='pending' WHERE id=?", (action_id,))
+            updating = bool(world.target is not None and job["integration_target"] and (
+                world.target.sha != job["integration_target"]
+                or world.source is not None and world.source.sha != job["source_sha"]))
+            if updating:
+                if (self._pr_target(run, job, world) is None
+                        or not self._observe_integration_snapshot(tx, job, world)):
+                    raise KernelError("approval_currentness")
+                self._update_boundary(tx, run, job)
+            else:
+                if not self._published(tx, run, job, world) or not self._review_current(tx, job, world):
+                    raise KernelError("approval_currentness")
+                checks = world.checks
+                if (checks is None or checks.result not in {"none", "pass", "fail"}
+                        or checks.head_sha != job["publication_sha"] or checks.pr_number != job["pr_number"]
+                        or not job["checks_id"]):
+                    raise KernelError("approval_checks")
+                if checks.result == "fail":
+                    # The ordinary checks transition owns evidence, waits and
+                    # CI budgets. This control grants no merge or new window.
+                    tx.execute("UPDATE subjects SET phase='checks',grant_id=NULL,version=version+1 WHERE id=?", (subject,))
+                    updating = True
+                else:
+                    check = tx.one("SELECT material_id FROM checks WHERE id=?", (job["checks_id"],))
+                    if wire_json(json.loads(tx.get(check[0], subject))) != wire_json(asdict(checks)):
+                        raise KernelError("approval_checks_changed")
+                    grant_id = identity()
+                    tx.execute("INSERT INTO grants VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                               (grant_id, subject, action_id, job["pr_number"], job["publication_sha"], self._require_target(world).sha,
+                                job["review_attempt"], job["checks_id"], job["revision"], run["parent_revision"],
+                                run["graph_revision"], job["completion_revision"]))
+                    tx.execute("UPDATE subjects SET phase='merge',grant_id=?,version=version+1 WHERE id=?", (grant_id, subject))
+                    tx.execute("UPDATE runs SET final_action=? WHERE id=?", (action_id, run["id"]))
+            tx.execute("UPDATE actions SET status=? WHERE id=?", ("updating" if updating else "pending", action_id))
         receipt = tx.put(material_owner, "control_receipt", wire_json({"action": action_id, "kind": kind, "applied": True,
                                                                      "feedback_scope": feedback_scope, "requeue": requeue_scope, "abandonment": abandonment}))
         tx.execute("UPDATE actions SET receipt_id=? WHERE id=?", (receipt, action_id))

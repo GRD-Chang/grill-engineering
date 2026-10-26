@@ -167,8 +167,10 @@ def test_parent_requires_fresh_review_and_approval_for_the_live_target(tmp_path,
     monkeypatch.setattr(SyntheticGitHub, 'object', stale)
     world = scenario.world()
     assert world.target == newer and world.pr is not None and world.pr.base == old.target
-    with pytest.raises(KernelError, match='approval_currentness'):
-        kernel.control('approve', 'old-review-cannot-approve-new-base', subject=subject, world=world)
+    assert kernel.control('approve', 'old-review-cannot-approve-new-base', subject=subject, world=world) == 'updating'
+    with kernel.storage.transaction(write=False) as tx:
+        assert not tx.rows('SELECT id FROM grants WHERE subject=?', (subject,))
+        assert tx.one('SELECT final_action FROM runs')[0] is None
     assert not any(w['operation'] == 'merge' for w in scenario.writes())
     reviews = scenario.review_count
     assert scenario.run().kind == 'approval'
