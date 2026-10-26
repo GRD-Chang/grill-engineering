@@ -22,6 +22,7 @@ POLICY_VALUE_FIELDS = {
     "ticket_ci_development_limit": "ticket_ci_developments",
     "ticket_ci_review": "ticket_ci_review",
     "parent_ci_development_limit": "parent_ci_developments",
+    "required_checks_wait_seconds": "required_checks_wait_seconds",
 }
 
 
@@ -52,3 +53,11 @@ def positive_seconds(value: Any, name: str) -> float:
 
 def canonical_number(value: float) -> int | float:
     return int(value) if value.is_integer() else value
+
+
+def checks_wait_seconds(value: Any) -> float:
+    seconds = positive_seconds(value, "required_checks_wait_seconds")
+    if seconds > 7 * 86400:
+        raise DeliveryPolicyError(error_message("policy.error.checks_wait_range",
+            audit="required_checks_wait_seconds must be positive and at most 7 days"))
+    return seconds

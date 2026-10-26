@@ -1121,5 +1121,8 @@
   "cli.receipt.target": "目标: {target}",
   "cli.receipt.boundary": "此回执不表示 Agent 已启动或交付已完成。",
   "cli.receipt.next": "核对原工作: {command}",
-  "cli.receipt.failed": "请求处理失败"
+  "cli.receipt.failed": "请求处理失败",
+  "cli.settings.field.required_checks_wait_seconds": "Required Checks 等待时长（秒）",
+  "cli.required_checks_wait_help": "每个 PR/head 的 Required Checks 等待时长：正数秒或 s/m/h/d，最多 7d（默认 45m，创建 Run 时冻结）",
+  "policy.error.checks_wait_range": "required_checks_wait_seconds 必须大于零且不超过 7 天"
 }

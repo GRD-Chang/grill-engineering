@@ -2487,7 +2487,7 @@ class Kernel:
         if rows:
             row = rows[0]
             if self.clock() >= row["deadline"]:
-                seconds = 2700 if row["kind"] == "required_checks" else 600
+                seconds = row["deadline"] - row["started_at"]
                 return self._supervised_wait(tx, run, scope["subject"], scope, row["kind"], seconds)
             if not after_read and row["next_retry_at"] is not None and self.clock() < row["next_retry_at"]:
                 return Step("waiting", scope["subject"] or "", row["kind"], retry_at=row["next_retry_at"])
@@ -2564,11 +2564,11 @@ class Kernel:
             return self._supervised_wait(tx, run, subject, scope, "github_convergence", 600, evidence)
 
     def _supervised_wait(self, tx: Transaction, run: sqlite3.Row, subject: str | None, scope: Mapping[str, Any],
-                         kind: str, seconds: int, evidence: str | None = None) -> Step:
+                         kind: str, seconds: float, evidence: str | None = None) -> Step:
         owner = subject or tx.one("SELECT id FROM subjects ORDER BY id LIMIT 1")[0]
         scope_id = tx.put(owner, "supervision_scope", wire_json(scope))
         now = self.clock()
-        # Actual pending checks establish their own 45-minute window. Later
+        # Actual pending checks establish their own frozen Policy window. Later
         # uncertainty reuses it; an earlier convergence wait cannot shorten it.
         checks_scope = scope.get("delivery", {}).get("phase") in {"checks", "merge"}
         rows = tx.rows("SELECT * FROM waits WHERE scope_id=? AND (kind=? OR ?) ORDER BY deadline LIMIT 1",
@@ -2578,7 +2578,7 @@ class Kernel:
             rows = []
         if rows:
             kind = rows[0]["kind"]
-            seconds = 2700 if kind == "required_checks" else 600
+            seconds = rows[0]["deadline"] - rows[0]["started_at"]
         if not rows:
             # One current identity per subject and wait kind. Retain immutable
             # evidence, but never let an obsolete object govern a new candidate.
@@ -3010,6 +3010,20 @@ class Kernel:
                                  new_thread=new_thread, policy_overrides=policy_overrides, replacement=replacement,
                                   resource_inspections=resource_inspections, discard_worktree=discard_worktree)
 
+    def _checks_timeout_matches(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, evidence: str) -> bool:
+        """Only the original expired checks scope permits a new wait policy."""
+        timeout = json.loads(tx.get(evidence, job["id"]))
+        if not isinstance(timeout, dict) or timeout.get("kind") != "required_checks":
+            return False
+        rows = tx.rows("SELECT * FROM waits WHERE subject=? AND kind='required_checks' AND scope_id=?",
+                       (job["id"], timeout.get("scope_id")))
+        if len(rows) != 1:
+            return False
+        wait = rows[0]
+        return bool(self.clock() >= wait["deadline"]
+                    and (timeout.get("started_at"), timeout.get("deadline")) == (wait["started_at"], wait["deadline"])
+                    and json.loads(tx.get(wait["scope_id"], job["id"])) == self._automatic_scope(tx, run, job["id"], False))
+
     def _control(self, tx: Transaction, kind: str, action_id: str, *, subject: str | None = None,
                  world: World | None = None, message: str | None = None, new_thread: bool = False,
                  policy_overrides: Mapping[str, Any] | None = None, replacement: Delivery | None = None,
@@ -3045,9 +3059,18 @@ class Kernel:
         if message is not None and (not message.strip() or len(message.encode()) > 8192):
             raise KernelError("human_response_boundary")
         if policy_overrides:
-            if (kind != "resume" or job is None or "ticket_development_workers" in policy_overrides
-                    or not any(gate["code"] in {"review_budget_exhausted", "modification_budget_exhausted", "ci_development_budget_exhausted"}
-                               for gate in self._gates(tx, job["id"]))):
+            if kind != "resume" or job is None or "ticket_development_workers" in policy_overrides:
+                raise KernelError("policy_override_boundary")
+            gates = self._gates(tx, job["id"])
+            timeout = next((gate for gate in gates if gate["code"] == "supervision_timeout"), None)
+            if timeout is not None:
+                allowed = (set(policy_overrides) == {"required_checks_wait_seconds"}
+                           and policy_overrides["required_checks_wait_seconds"] is not None
+                           and self._checks_timeout_matches(tx, run, job, timeout["evidence"]))
+            else:
+                allowed = any(gate["code"] in {"review_budget_exhausted", "modification_budget_exhausted", "ci_development_budget_exhausted"}
+                              for gate in gates)
+            if not allowed:
                 raise KernelError("policy_override_boundary")
             policy = checkpoint_policy(self._subject_policy(tx, job), policy_overrides)
             policy_id = tx.put(job["id"], "delivery_policy", wire_json(self._policy_values(policy)))
@@ -3435,6 +3458,10 @@ class Kernel:
 
     def _decode_policy(self, raw: bytes) -> Policy:
         values = json.loads(raw)
+        if isinstance(values, dict):
+            # Existing current-protocol Runs froze the former 45-minute default
+            # implicitly. Do not read personal defaults or change their waits.
+            values.setdefault("required_checks_wait_seconds", Policy().required_checks_wait_seconds)
         if not isinstance(values, dict) or values.keys() != self._policy_values(Policy()).keys():
             raise KernelError("policy_snapshot_invalid")
         return Policy(**values)
@@ -4360,7 +4387,7 @@ class Kernel:
         if checks is None or checks.pr_number != job["pr_number"] or checks.head_sha != job["publication_sha"]:
             return self._wait(tx, run, job, "github_convergence", 600)
         if checks.result == "pending":
-            return self._wait(tx, run, job, "required_checks", 2700)
+            return self._wait(tx, run, job, "required_checks", self._subject_policy(tx, job).required_checks_wait_seconds)
         unfinished = checks.result == "fail" and any(state not in {"pass", "fail"} for _, state in checks.details)
         if checks.result == "unknown" or unfinished:
             if checks.result == "unknown":
@@ -4375,7 +4402,7 @@ class Kernel:
                                          "github_convergence", 600, evidence)
         return None
 
-    def _wait(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, kind: str, seconds: int) -> Step:
+    def _wait(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, kind: str, seconds: float) -> Step:
         return self._supervised_wait(tx, run, job["id"], self._automatic_scope(tx, run, job["id"], False), kind, seconds)
 
     def _finish_final_failure(self, tx: Transaction, run: sqlite3.Row, result: str = "failed") -> None:

@@ -44,6 +44,7 @@ def test_builtin_personal_show_has_current_defaults_without_creating_files(perso
         "ticket_development_workers": 3, "ticket_integration_development_limit": 3,
         "ticket_ci_development_limit": 3, "parent_ci_development_limit": 3,
         "integration_resync_limit": 3, "ticket_ci_review": False,
+        "required_checks_wait_seconds": 2700,
         "development_thread_policy": "reuse",
         "invocation_deadlines": {"development": 18000, "review": 7200, "publication": 3600},
     }

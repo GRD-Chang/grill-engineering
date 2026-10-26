@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Literal, Mapping
 
 from agent_run.errors import DeliveryPolicyError
-from agent_run.contracts.policy import POLICY_VALUE_FIELDS, canonical_number, nonnegative_integer, positive_seconds, positive_integer
+from agent_run.contracts.policy import POLICY_VALUE_FIELDS, canonical_number, checks_wait_seconds, nonnegative_integer, positive_seconds, positive_integer
 
 from agent_run.errors import ArtifactContractError
 from agent_run.contracts.artifact import parse_artifact
@@ -73,6 +73,7 @@ class Policy:
     integration_developments: int = 3
     ticket_ci_developments: int = 3
     parent_ci_developments: int = 3
+    required_checks_wait_seconds: float = 45 * 60
     resync_limit: int = 3
     ticket_ci_review: bool = False
     concurrency: int = 3
@@ -90,6 +91,8 @@ class Policy:
             if key == "ticket_ci_review":
                 if type(value) is not bool:
                     raise DeliveryPolicyError("ticket_ci_review must be boolean")
+            elif key == "required_checks_wait_seconds":
+                object.__setattr__(self, field_name, checks_wait_seconds(value))
             else:
                 validate = nonnegative_integer if key == "integration_resync_limit" else positive_integer
                 object.__setattr__(self, field_name, validate(value, key))
