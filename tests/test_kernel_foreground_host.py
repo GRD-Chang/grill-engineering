@@ -279,6 +279,291 @@ def test_worker_inspection_cannot_bypass_invalid_protection_record(inspection_wo
     assert durable_snapshot(tmp_path) == before
 
 
+def test_public_status_assembles_the_original_readonly_current_observation(inspection_worker, tmp_path, monkeypatch, capsys):
+    import json
+    from agent_run.cli.main import main
+    kernel, request, call, _, _, _, _ = inspection_worker
+    from agent_run.runtime.foreground_host import HostInspection, WorkerInspection
+    monkeypatch.setattr(ForegroundHost, 'inspect', lambda self, k, r, lock:
+        HostInspection(r, kernel.host_usage('launch'), 'local'))
+    monkeypatch.setattr(ForegroundHost, 'inspect_worker', lambda self, k, r, c, lock:
+        WorkerInspection(c.execution, c.invocation_id, c.output_ordinal, 'running', 'local'))
+    before = durable_snapshot(tmp_path)
+    assert main(['status', request.run_id, '--state-dir', str(kernel.storage.path), '--json']) == 0
+    document = json.loads(capsys.readouterr().out)
+    current = document['current_observation']
+    assert current['scope'] == {'run_id': request.run_id, 'owner': request.owner,
+                                'epoch': request.epoch, 'nonce': request.nonce}
+    assert current['host'] == {'disposition': 'running', 'source': 'local'}
+    worker, = current['workers']
+    assert worker['invocation_id'] == call.invocation_id and worker['output_ordinal'] == call.output_ordinal
+    assert worker['disposition'] == 'running' and worker['source'] == 'local'
+    assert durable_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize('state', ['running', 'exited', 'unknown'])
+def test_public_current_summary_does_not_replace_history_and_renders_both_languages(
+    inspection_worker, tmp_path, monkeypatch, capsys, state,
+):
+    import json
+    from io import StringIO
+    from agent_run.cli.main import main
+    from agent_run.cli.render import render
+    from agent_run.queries.run import read
+    from agent_run.runtime.foreground_host import HostInspection, WorkerInspection
+    kernel, request, call, _, _, _, _ = inspection_worker
+    original = kernel.host_usage('launch')
+    monkeypatch.setattr(ForegroundHost, 'inspect', lambda self, k, r, lock:
+        HostInspection(r, HostObservation('unknown', None, backend='foreground'), 'unavailable'))
+    monkeypatch.setattr(ForegroundHost, 'inspect_worker', lambda self, k, r, c, lock:
+        WorkerInspection(c.execution, c.invocation_id, c.output_ordinal, 'unknown', 'unavailable'))
+    frozen = read(kernel.storage.path, 'history').data['history']
+    observed = replace(original, disposition=state, ended_at=None, exit_status=None)
+    source = 'unavailable' if state == 'unknown' else 'local'
+    monkeypatch.setattr(ForegroundHost, 'inspect', lambda self, k, r, lock: HostInspection(r, observed, source))
+    monkeypatch.setattr(ForegroundHost, 'inspect_worker', lambda self, k, r, c, lock:
+        WorkerInspection(c.execution, c.invocation_id, c.output_ordinal, state, source))
+    before = durable_snapshot(tmp_path)
+    status = read(kernel.storage.path, 'status')
+    history = read(kernel.storage.path, 'history')
+    assert status.data['current_observation'] == history.data['current_observation']
+    assert history.data['history'] == frozen
+    assert history.data['executor_control']['live_status'] == 'unknown'
+    assert status.data['executor_control']['live_status'] == state
+    for attempt in history.data['history']['attempts']:
+        assert all(i['live_status'] == 'unknown' for i in attempt['invocations'])
+    pending, = status.data['subjects']
+    invocation, = pending['pending_attempt']['invocations']
+    assert invocation['live_status'] == state and invocation['outputs'][0]['exited_at'] is None
+    for language, heading, alive, exited in [('en', 'Current process observation', 'observed alive', 'observed exited'),
+                                           ('zh', '当前进程观察', '已观察到存活', '已观察到退出')]:
+        for document in (status, history):
+            for style in ('plain', 'rich'):
+                out = StringIO()
+                render(replace(document, language=language), style=style, details=False, stream=out)
+                text = out.getvalue()
+                assert heading in text
+                assert (alive in text) is (state == 'running')
+                assert (exited in text) is (state == 'exited')
+                assert call.invocation_id not in text and request.nonce not in text
+    args = ['status', request.run_id, '--state-dir', str(kernel.storage.path)]
+    assert main([*args, '--json']) == 0
+    assert json.loads(capsys.readouterr().out)['current_observation'] == status.data['current_observation']
+    assert main([*args, '--plain']) == 0
+    assert 'Current process observation' in capsys.readouterr().out
+    assert durable_snapshot(tmp_path) == before
+
+
+def test_public_observation_io_is_outside_readonly_transactions(inspection_worker, tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from agent_run.queries.run import read
+    from agent_run.storage.sqlite import Storage
+    from agent_run.runtime.foreground_host import HostInspection, WorkerInspection
+    kernel, request, _, _, _, _, _ = inspection_worker
+    original, active, reads = Storage.transaction, [], []
+    @contextmanager
+    def transaction(storage, *, write=True, **kwargs):
+        assert write is False, 'A public query attempted a write transaction'
+        with original(storage, write=write, **kwargs) as tx:
+            active.append(storage)
+            try:yield tx
+            finally:active.pop()
+    monkeypatch.setattr(Storage, 'transaction', transaction)
+    def host(self, k, r, lock):
+        assert not active
+        reads.append('host')
+        return HostInspection(r, k.host_usage('launch'), 'local')
+    def worker(self, k, r, c, lock):
+        assert not active
+        reads.append('worker')
+        return WorkerInspection(c.execution, c.invocation_id, c.output_ordinal, 'running', 'local')
+    monkeypatch.setattr(ForegroundHost, 'inspect', host)
+    monkeypatch.setattr(ForegroundHost, 'inspect_worker', worker)
+    def forbidden(*a, **kw):pytest.fail('Public observation called a mutating lifecycle entry')
+    for name in ('observe', 'launch', 'preflight'):monkeypatch.setattr(ForegroundHost, name, forbidden)
+    for name in ('observe_host', 'dispatch_host', 'authorize_host', 'control', 'stop_task'):
+        monkeypatch.setattr(Kernel, name, forbidden)
+    before = durable_snapshot(tmp_path)
+    assert read(kernel.storage.path, 'status').data['current_observation']['host']['disposition'] == 'running'
+    assert reads == ['host', 'worker'] and active == []
+    assert durable_snapshot(tmp_path) == before
+
+
+def test_invalid_recorded_document_is_rejected_before_current_process_io(inspection_worker, tmp_path, monkeypatch):
+    import agent_run.queries.run as query
+    kernel, _, _, _, _, _, _ = inspection_worker
+    original = query._subject
+    def damaged(*args, **kwargs):
+        job = original(*args, **kwargs)
+        job['recorded_value'] = float('inf')
+        return job
+    monkeypatch.setattr(query, '_subject', damaged)
+    def forbidden(*args, **kwargs):pytest.fail('Invalid recorded document reached physical observation')
+    monkeypatch.setattr(ForegroundHost, 'inspect', forbidden)
+    before = durable_snapshot(tmp_path)
+    with pytest.raises(query.QueryError, match='Out of range float values') as failed:
+        query.read(kernel.storage.path, 'status')
+    assert failed.value.code == 'incompatible_run_state'
+    assert durable_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize('fault', ['os', 'domain', 'host-scope', 'worker-scope', 'deadline', 'final-deadline'])
+def test_public_observation_failure_is_unknown_without_losing_recorded_work(inspection_worker, tmp_path, monkeypatch, fault):
+    from types import SimpleNamespace
+    from agent_run.queries.run import read
+    import agent_run.queries.current_observation as current
+    from agent_run.runtime.foreground_host import HostInspection, WorkerInspection
+    kernel, request, _, _, _, _, _ = inspection_worker
+    def host(self, k, r, lock):
+        if fault == 'os':raise PermissionError('controlled private path must not leak')
+        if fault == 'domain':raise physical.DomainUnknown('controlled namespace unavailable')
+        if fault == 'host-scope':r = replace(r, nonce='foreign')
+        return HostInspection(r, kernel.host_usage('launch'), 'local')
+    def worker(self, k, r, c, lock):
+        assert fault != 'deadline', 'Deadline must prevent the Worker probe'
+        execution = replace(c.execution, epoch=c.execution.epoch + 1) if fault == 'worker-scope' else c.execution
+        return WorkerInspection(execution, c.invocation_id, c.output_ordinal, 'running', 'local')
+    monkeypatch.setattr(ForegroundHost, 'inspect', host)
+    monkeypatch.setattr(ForegroundHost, 'inspect_worker', worker)
+    if fault in {'deadline', 'final-deadline'}:
+        ticks = iter((0., 4., 4.) if fault == 'deadline' else (0., 1., 1., 4.))
+        monkeypatch.setattr(current, 'time', SimpleNamespace(monotonic=lambda: next(ticks)))
+    before = durable_snapshot(tmp_path)
+    document = read(kernel.storage.path, 'status')
+    view = document.data['current_observation']
+    assert view['host']['disposition'] == 'unknown' and view['reason'] is not None
+    assert all(worker['disposition'] == 'unknown' for worker in view['workers'])
+    assert document.data['subjects'][0]['pending_attempt'] is not None
+    assert durable_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize('change', ['raw', 'epoch'])
+def test_public_observation_rechecks_the_original_frozen_bindings(inspection_worker, monkeypatch, change):
+    from agent_run.queries.run import read
+    from agent_run.runtime.foreground_host import HostInspection, WorkerInspection
+    kernel, _, call, _, _, _, _ = inspection_worker
+    monkeypatch.setattr(ForegroundHost, 'inspect', lambda self, k, r, lock:
+        HostInspection(r, kernel.host_usage('launch'), 'local'))
+    def worker(self, k, r, c, lock):
+        if change == 'raw':kernel.receive(call, b'original concurrent callback')
+        else:assert kernel.stop_task('concurrent-public-stop') == 'applied'
+        return WorkerInspection(c.execution, c.invocation_id, c.output_ordinal, 'running', 'local')
+    monkeypatch.setattr(ForegroundHost, 'inspect_worker', worker)
+    current = read(kernel.storage.path, 'status').data['current_observation']
+    assert current['host']['disposition'] == 'unknown' and current['reason'] == 'observation_binding_changed'
+    assert all(item['disposition'] == 'unknown' for item in current['workers'])
+    with kernel.storage.transaction(write=False) as tx:
+        assert tx.one('SELECT count(*) FROM leases')[0] == 1
+        if change == 'epoch':assert tx.one('SELECT stopped FROM runs')[0]
+        else:
+            raw_id = tx.one('SELECT raw_id FROM invocation_outputs WHERE invocation=?', (call.invocation_id,))[0]
+            assert tx.get(raw_id, call.subject) == b'original concurrent callback'
+
+
+def test_public_observation_refuses_local_evidence_for_a_copied_database(inspection_worker, tmp_path, monkeypatch):
+    import shutil
+    from agent_run.queries.run import read
+    kernel, _, _, _, _, _, _ = inspection_worker
+    copied = tmp_path / 'public-copy.sqlite3'
+    shutil.copyfile(kernel.storage.path, copied)
+    def forbidden(*args, **kwargs):pytest.fail('A copied DB must not reach local process observation')
+    monkeypatch.setattr(foreground_host, 'recover_init', forbidden)
+    monkeypatch.setattr(foreground_host.ProcessPin, 'open', forbidden)
+    before = durable_snapshot(tmp_path)
+    current = read(copied, 'status').data['current_observation']
+    assert current['host']['disposition'] == 'unknown'
+    assert all(item['disposition'] == 'unknown' for item in current['workers'])
+    assert durable_snapshot(tmp_path) == before
+
+
+def test_public_observation_unsupported_backend_does_not_probe_real_services(tmp_path, monkeypatch):
+    from agent_run.adapters.systemd import SystemdHost
+    from agent_run.queries.run import read
+    kernel, _ = task_run(tmp_path, 'systemd-current')
+    request = kernel.admit_host('launch', kind='run', command=('controlled-executor',),
+        environment_carrier=tmp_path / 'carrier', preflight=lambda: None)
+    assert kernel.dispatch_host(request)
+    assert kernel.observe_host(request, HostObservation('running', request.unit_name, 'a' * 32,
+        '/controlled/host', 'test-boot', 42, 'original', usage_ready=True)) == 'running'
+    def forbidden(*a, **kw):pytest.fail('Unsupported query wiring must not contact a real service')
+    monkeypatch.setattr(SystemdHost, 'observe', forbidden)
+    monkeypatch.setattr(ForegroundHost, 'inspect', forbidden)
+    before = durable_snapshot(tmp_path)
+    current = read(kernel.storage.path, 'status').data['current_observation']
+    assert current['host']['disposition'] == 'unknown' and current['reason'] == 'backend_observation_unavailable'
+    assert durable_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize('language,heading', [('en', 'Current process observation'), ('zh', '当前进程观察')])
+def test_public_current_observation_uses_frozen_run_language(tmp_path, monkeypatch, capsys, language, heading):
+    import json
+    from agent_run.cli.main import main
+    from agent_run.runtime.foreground_host import HostInspection
+    from support.cli_fixtures import _create
+    kernel = _create(tmp_path / 'state', 'current-language', language=language)
+    request = kernel.admit_host('launch', kind='run', command=('controlled-executor',),
+        environment_carrier=tmp_path / 'carrier', preflight=lambda: None, backend='foreground')
+    assert kernel.dispatch_host(request)
+    lock = tmp_path / 'install.lock'
+    with runner_usage_lease(lock):
+        receipt = {'request_digest': _digest(request), 'nonce': request.nonce, 'runner': _runner_witness(lock)}
+    running = HostObservation('running', None, boot_id='test-boot', main_pid=202, start_token='203',
+        backend='foreground', domain=_domain(request.nonce), usage_ready=True, evidence=_encode(receipt).decode())
+    assert kernel.observe_host(request, running) == 'running'
+    monkeypatch.setattr(ForegroundHost, 'inspect', lambda self, k, r, lease: HostInspection(r, running, 'local'))
+    before = durable_snapshot(tmp_path)
+    args = ['status', request.run_id, '--state-dir', str(kernel.storage.path)]
+    assert main([*args, '--plain']) == 0
+    assert heading in capsys.readouterr().out
+    assert main([*args, '--json']) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert document['current_observation']['host']['disposition'] == 'running'
+    assert durable_snapshot(tmp_path) == before
+
+
+def test_public_current_workers_keep_parallel_subject_and_call_bindings(tmp_path, monkeypatch):
+    from agent_run.model import Commit, Delivery, DeliveryKind, Policy, RunSpec
+    from agent_run.queries.run import read
+    from agent_run.runtime.foreground_host import HostInspection, WorkerInspection
+    from support.core_operations import native_agent_fixture, source_operations
+    base = Commit('base', 'tree')
+    deliveries = tuple(Delivery(f'ticket:{n}', DeliveryKind.TICKET, n, 'original', base,
+        f'refs/heads/ticket-{n}', 'refs/heads/run', checkout=str(tmp_path / f'work-{n}')) for n in (2, 3))
+    kernel, ports = native_agent_fixture(tmp_path / 'parallel.sqlite3', RunSpec('parallel-inspection',
+        'example/project', 1, 'parent', 'graph', deliveries, Policy(concurrency=2),
+        language='en', repository_root=str(tmp_path / 'repository')))
+    request = kernel.admit_host('launch', kind='run', command=('controlled-executor',),
+        environment_carrier=tmp_path / 'carrier', preflight=lambda: None, backend='foreground')
+    assert kernel.dispatch_host(request)
+    lock = tmp_path / 'install.lock'
+    with runner_usage_lease(lock):
+        receipt = {'request_digest': _digest(request), 'nonce': request.nonce, 'runner': _runner_witness(lock)}
+    running = HostObservation('running', None, boot_id='test-boot', main_pid=202, start_token='203',
+        backend='foreground', domain=_domain(request.nonce), usage_ready=True, evidence=_encode(receipt).decode())
+    assert kernel.observe_host(request, running) == 'running'
+    operations = source_operations(kernel, ports.requirements, Execution(request.run_id, request.owner, request.epoch))
+    calls = [operations.until(lambda step: step.call is not None).call for _ in range(2)]
+    assert all(call is not None for call in calls)
+    expected = {(call.subject, call.attempt_id, call.invocation_id, call.output_ordinal) for call in calls}
+    assert len(expected) == 2
+    seen = []
+    monkeypatch.setattr(ForegroundHost, 'inspect', lambda self, k, r, lease: HostInspection(r, running, 'local'))
+    def worker(self, k, r, call, lease):
+        seen.append(call)
+        return WorkerInspection(call.execution, call.invocation_id, call.output_ordinal, 'running', 'local')
+    monkeypatch.setattr(ForegroundHost, 'inspect_worker', worker)
+    before = durable_snapshot(tmp_path)
+    document = read(kernel.storage.path, 'status')
+    current = document.data['current_observation']
+    assert {(item['subject'], item['attempt_id'], item['invocation_id'], item['output_ordinal'])
+            for item in current['workers']} == expected
+    assert sorted(seen, key=lambda call: call.invocation_id) == sorted(calls, key=lambda call: call.invocation_id)
+    with kernel.storage.transaction(write=False) as tx:
+        assert all(row[0] == 0 for row in tx.rows("SELECT developments_used FROM budgets WHERE purpose='requirements'"))
+        assert tx.one('SELECT count(*) FROM leases')[0] == 2
+    assert durable_snapshot(tmp_path) == before
+
+
 def test_foreground_admission_is_frozen_stop_fences_and_null_exit_does_not_become_zero(tmp_path):
     kernel = task_run(tmp_path, 'foreground')[0]
     args = dict(kind='run', command=('/usr/bin/python3',), environment_carrier=tmp_path / 'carrier',

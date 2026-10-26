@@ -22,6 +22,8 @@ from agent_run.storage.preflight import UnsupportedState, require_supported_stat
 from agent_run.storage.tasks import read_task, task_path
 from agent_run.queries.read_facts import QueryError as QueryError, all_rows as _all, material as _material, timestamp as _timestamp, read_header as _header, public_phase as _public_phase, read_boundaries
 from agent_run.queries.read_facts import action_guidance, recorded_review
+from agent_run.queries.current_observation import capture as capture_observation, read_current
+from agent_run.core.kernel import Kernel
 
 
 @dataclass(frozen=True)
@@ -493,7 +495,23 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
                 data["history"] = _native_history(tx, subjects, after=after, limit=limit)
             if len(json.dumps(data, ensure_ascii=False, allow_nan=False).encode()) > QUERY_LIMIT:
                 raise QueryError("query_limit", "Public response exceeds its bounded limit")
-            return QueryDocument(kind, language, data)
+            kernel = Kernel(path)
+            observation = capture_observation(kernel, tx)
+            scope = (run['id'], run['executor'], run['epoch'])
+        # No SQLite snapshot/lock is held during local process inspection.
+        data['current_observation'] = current = read_current(kernel, observation, scope)
+        if kind == 'status':
+            data['executor_control']['live_status'] = current['host']['disposition']
+            for job in subjects:
+                pending = job['pending_attempt']
+                if pending is not None:
+                    for invocation in pending['invocations']:
+                        match = next((item for item in current['workers'] if item['invocation_id'] == invocation['id']), None)
+                        if match is not None:invocation['live_status'] = match['disposition']
+        if current['host']['disposition'] != 'unknown':data['unavailable_facts'].remove('host_liveness')
+        if len(json.dumps(data, ensure_ascii=False, allow_nan=False).encode()) > QUERY_LIMIT:
+            raise QueryError("query_limit", "Public response exceeds its bounded limit")
+        return QueryDocument(kind, language, data)
     except QueryError:
         raise
     except UnsupportedState:

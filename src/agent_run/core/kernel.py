@@ -8,7 +8,7 @@ returned request. A raw return and its business consumption commit separately.
 from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 import hashlib
 import json
@@ -46,6 +46,15 @@ from agent_run.core.operation_contract import (OperationBinding, OperationState,
 
 def identity() -> str:
     return uuid4().hex
+
+
+@dataclass(frozen=True)
+class InspectionBindings:
+    """Ephemeral readonly bindings, never a saved state or execution grant."""
+    current: tuple[str, str | None, int]
+    request: HostLaunch | None
+    host: Mapping[str, Any] | None
+    workers: tuple[tuple[AgentCall, Mapping[str, Any]], ...]
 
 
 class Kernel:
@@ -2816,8 +2825,42 @@ class Kernel:
                 raise KernelError("thread_identity_changed")
             tx.execute("UPDATE threads SET backend_id=? WHERE id=?", (reported_thread, call.thread_id))
 
+    @staticmethod
+    def _invocation_output(tx: Transaction, invocation_id: str, ordinal: int) -> sqlite3.Row:
+        return tx.one("SELECT i.*,o.*,a.subject,a.role,a.purpose,a.generation,a.parent_revision,a.graph_revision,a.revision,a.current_invocation FROM invocations i JOIN invocation_outputs o ON o.invocation=i.id JOIN attempts a ON a.id=i.attempt WHERE i.id=? AND o.ordinal=?", (invocation_id, ordinal))
+
+    def inspection_bindings(self, tx: Transaction) -> InspectionBindings:
+        """Read current Call inputs and reuse formal binding checks; no authority."""
+        run = tx.one('SELECT id,executor,epoch FROM runs')
+        current = (run['id'], run['executor'], run['epoch'])
+        hosts = tx.rows('SELECT * FROM hosts WHERE run_id=? AND owner=? AND epoch=?', current)
+        if not hosts:return InspectionBindings(current, None, None, ())
+        request = self._host_launch(tx, hosts[0])
+        if (request.run_id, request.owner, request.epoch) != current:
+            raise KernelError('host_binding_changed')
+        self._host(tx, request)
+        workers = []
+        for item in tx.rows('SELECT i.id,max(o.ordinal) AS ordinal FROM subjects s '
+                'JOIN attempts a ON a.id=s.current_attempt AND a.generation=s.generation '
+                'JOIN invocations i ON i.id=a.current_invocation JOIN invocation_outputs o ON o.invocation=i.id '
+                'WHERE i.executor=? AND i.epoch=? GROUP BY i.id ORDER BY s.id', current[1:]):
+            row = self._invocation_output(tx, item['id'], item['ordinal'])
+            job = self._job(tx, row['subject'])
+            thread = tx.one('SELECT * FROM threads WHERE id=?', (row['thread'],))
+            profile, reference = self._thread_profile(tx, thread)
+            context = json.loads(tx.get(row['context_id'], row['subject']))
+            if not isinstance(context, dict):raise KernelError('invocation_binding')
+            call = AgentCall(row['attempt'], item['id'], row['subject'], Role(row['role']), Purpose(row['purpose']),
+                row['thread'], row['lease'], Execution(job['run_id'], row['executor'], row['epoch']), context,
+                profile, row['deadline_seconds'], row['deadline_at'], row['mode'], row['requested_thread'],
+                item['ordinal'], thread['profile_revision'], reference)
+            if call.execution != Execution(request.run_id, request.owner, request.epoch):
+                raise KernelError('invocation_binding')
+            workers.append((call, dict(self._invocation(tx, call))))
+        return InspectionBindings(current, request, dict(hosts[0]), tuple(workers))
+
     def _invocation(self, tx: Transaction, call: AgentCall) -> sqlite3.Row:
-        row = tx.one("SELECT i.*,o.*,a.subject,a.role,a.purpose,a.generation,a.parent_revision,a.graph_revision,a.revision,a.current_invocation FROM invocations i JOIN invocation_outputs o ON o.invocation=i.id JOIN attempts a ON a.id=i.attempt WHERE i.id=? AND o.ordinal=?", (call.invocation_id, call.output_ordinal))
+        row = self._invocation_output(tx, call.invocation_id, call.output_ordinal)
         if (row["attempt"] != call.attempt_id or row["subject"] != call.subject or row["thread"] != call.thread_id
                 or row["lease"] != call.lease_id or row["executor"] != call.execution.owner or row["epoch"] != call.execution.epoch
                 or row["role"] != call.role or row["purpose"] != call.purpose

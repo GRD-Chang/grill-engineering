@@ -364,7 +364,23 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
             "presentation.status.progress_cannot_be_confirmed", language=document.language)
     yield f"{text('presentation.status.overall_progress', language=document.language)}: {progress}"
     yield f"{copy['duration']}: {data['elapsed_seconds'] if data['elapsed_seconds'] is not None else copy['incomplete']}"
-    yield copy["unknown_live"]
+    current = data.get('current_observation')
+    if isinstance(current, Mapping):
+        yield text('presentation.observation.heading', language=document.language)
+        host = current['host']
+        state = 'recorded_exit' if host['disposition'] == 'exited' and host['source'] == 'recorded_exit' else host['disposition']
+        yield text('presentation.observation.host', language=document.language,
+                   state=text('presentation.observation.' + state, language=document.language))
+        if host['disposition'] == 'unknown':yield copy['unknown_live']
+        for item in current['workers']:
+            job = next((job for job in data['subjects'] if job['subject'] == item['subject']), None)
+            if job is not None:
+                state = ('recorded_exit' if item['disposition'] == 'exited'
+                         and item['source'] in {'recorded_exit', 'host_exit'} else item['disposition'])
+                yield text('presentation.observation.worker', language=document.language, issue=job['issue'],
+                           role=copy[item['role']], state=text('presentation.observation.' + state, language=document.language))
+    else:
+        yield copy["unknown_live"]
     yield from _notification_lines(document)
     if document.kind == "history":
         yield from _history_lines(document, details)

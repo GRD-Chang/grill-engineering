@@ -1164,5 +1164,12 @@
   "presentation.history.role_subject_run": "整体交付",
   "notification.event.unavailable_development_continues": "飞书通知不可用（开发继续）：{reason}",
   "presentation.status.recorded_worker_exit": "  已记录 Worker 退出：{stamp}（{zone}）",
-  "presentation.status.recorded_worker_exit_time_unknown": "  已记录 Worker 退出；准确结束时间未知"
+  "presentation.status.recorded_worker_exit_time_unknown": "  已记录 Worker 退出；准确结束时间未知",
+  "presentation.observation.heading": "当前进程观察（与历史事件分开）",
+  "presentation.observation.host": "  执行者：{state}",
+  "presentation.observation.worker": "  #{issue} {role}：{state}",
+  "presentation.observation.running": "已观察到存活",
+  "presentation.observation.exited": "已观察到退出；不推定准确 Worker 结束时间",
+  "presentation.observation.recorded_exit": "已记录退出",
+  "presentation.observation.unknown": "未知；缺少可比较的本地证据"
 }

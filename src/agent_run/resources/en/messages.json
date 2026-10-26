@@ -1164,5 +1164,12 @@
   "presentation.history.role_subject_run": "Whole-Run",
   "notification.event.unavailable_development_continues": "Feishu notifications unavailable; development continues: {reason}",
   "presentation.status.recorded_worker_exit": "  Recorded Worker exit: {stamp} ({zone})",
-  "presentation.status.recorded_worker_exit_time_unknown": "  Recorded Worker exit; exact end time unknown"
+  "presentation.status.recorded_worker_exit_time_unknown": "  Recorded Worker exit; exact end time unknown",
+  "presentation.observation.heading": "Current process observation (separate from historical events)",
+  "presentation.observation.host": "  Executor: {state}",
+  "presentation.observation.worker": "  #{issue} {role}: {state}",
+  "presentation.observation.running": "observed alive",
+  "presentation.observation.exited": "observed exited; no exact Worker end time inferred",
+  "presentation.observation.recorded_exit": "recorded exit",
+  "presentation.observation.unknown": "unknown; comparable local evidence unavailable"
 }
