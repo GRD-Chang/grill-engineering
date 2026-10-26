@@ -376,8 +376,9 @@ def execute(parsed: argparse.Namespace, *, language: str) -> dict[str, Any]:
         workspace.open_path()
         original = attach(kernel, requested_action=parsed.command, manager=manager,
                           environment=environment, runner_lock=runner_lock)
-        if (original is not None and original["host"] == "exited" and kernel.active_host_action() is None
-                and isinstance(manager, ForegroundHost)):
+        if original is not None and original["host"] == "exited" and kernel.active_host_action() is None:
+            # Complete release permits this request to reach Core admission in
+            # the same invocation, regardless of the original Host backend.
             original = None
         if parsed.command == "abandon":
             if original is not None and original["host"] != "running":

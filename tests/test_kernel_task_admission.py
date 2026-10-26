@@ -20,7 +20,7 @@ from agent_run.errors import KernelError
 from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
 from agent_run.storage.preflight import UnsupportedState
 from agent_run.storage.tasks import read_task, task_path
-from tests.test_kernel_host_adapter import controlled_manager
+from support.systemd_manager import controlled_manager
 
 
 ORIGINAL_ACTION = 'original-start'

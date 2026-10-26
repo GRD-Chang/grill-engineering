@@ -164,7 +164,7 @@ def test_startup_exit_requires_exact_manager_identity_when_readiness_was_never_r
 ) -> None:
     import subprocess
     from agent_run.queries.host_exit import host_exit_notice, host_exit_current
-    from test_kernel_host_adapter import controlled_manager
+    from support.systemd_manager import controlled_manager
     from test_kernel_notifications import _kernel
 
     kernel = _kernel(tmp_path)
@@ -235,7 +235,7 @@ def test_enabled_host_arms_only_the_exact_bounded_exit_command_without_private_e
     from agent_run.model import Commit, Delivery, DeliveryKind, RunSpec
     from agent_run.core.kernel import Kernel
     from agent_run.config.creation import freeze_creation
-    from test_kernel_host_adapter import controlled_manager
+    from support.systemd_manager import controlled_manager
     from test_kernel_notifications import _kernel
 
     kernel = _kernel(tmp_path)
