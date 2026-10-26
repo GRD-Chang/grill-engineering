@@ -15,7 +15,7 @@ from agent_run.config.creation import freeze_creation
 from agent_run.model import Effect, EffectResult
 from support.offline import Scenario
 from support.offline_api import SyntheticGitHub
-from test_kernel_remote_effects import EffectBoundary, effect_boundary
+from support.effect_boundary import EffectBoundary, effect_boundary
 
 
 def publisher_scenario(path: Path, monkeypatch: pytest.MonkeyPatch) -> Scenario:
