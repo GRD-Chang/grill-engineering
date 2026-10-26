@@ -8,10 +8,13 @@ import base64
 from datetime import UTC, datetime
 import json
 import math
+import shlex
+import unicodedata
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from agent_run.storage.sqlite import Transaction
+from agent_run.contracts.copy import text
 
 
 class QueryError(ValueError):
@@ -21,6 +24,32 @@ class QueryError(ValueError):
         self.candidates = list(candidates)
         self.state_diagnostic = state_diagnostic
         super().__init__(detail)
+
+
+def action_guidance(operation: str, *, run_id: str, repository: str,
+                   ticket: int | None = None, details: bool = False, language: str = "en") -> str:
+    """Format guidance using the public CLI's selectors; never grant an action.
+
+    Never substitute a Task selector or emit identity bytes which a display
+    sanitizer would remove. Unsupported identities retain their JSON spelling.
+    """
+    if operation not in {"status", "history", "run", "resume", "stop", "approve", "requeue", "abandon"}:
+        raise ValueError("Unsupported guidance command")
+    if ticket is not None and operation not in {"resume", "stop"} or details and operation != "history":
+        raise ValueError("Unsupported guidance options")
+    if any(unicodedata.category(character) in {"Cc", "Cf"}
+           for value in (run_id, repository) for character in value):
+        identity = json.dumps({"run_id": run_id, "repository": repository}, ensure_ascii=True)
+        return text("guidance.unsafe_identity", language=language, identity=identity)
+    if operation == "run" or operation not in {"status", "history"} and run_id.isdecimal():
+        return text("guidance.exact_action_unavailable", language=language,
+                    identity=json.dumps(run_id, ensure_ascii=True))
+    argv = ["agent-run", operation, "--repo", repository]
+    if ticket is not None:
+        argv.extend(("--ticket", str(ticket)))
+    if details:
+        argv.append("--details")
+    return shlex.join([*argv, "--", run_id])
 
 
 def all_rows(tx: Transaction, sql: str, values: Sequence[Any] = ()) -> list[dict[str, Any]]:
@@ -109,9 +138,8 @@ def supervision(tx: Transaction, now: float) -> list[dict[str, Any]]:
             raise QueryError("incompatible_run_state", "Invalid recorded supervision observation")
         timeout = timeouts.get(row["subject"])
         timed_out = isinstance(timeout, dict) and timeout.get("scope_id") == row["scope_id"] and timeout.get("kind") == row["kind"]
-        command = f"agent-run resume {run['parent_issue']} --repo {run['repository']}"
-        if row["delivery_kind"] == "ticket":
-            command += f" --ticket {row['issue']}"
+        command = action_guidance("resume", run_id=run["id"], repository=run["repository"],
+            ticket=row["issue"] if row["delivery_kind"] == "ticket" else None, language=run["language"])
         deadline = timestamp(row["deadline"])
         result.append({"subject": row["subject"], "kind": row["kind"], "scope_id": row["scope_id"], "scope": scope,
             "started_at": timestamp(row["started_at"]), "deadline": deadline,
@@ -166,9 +194,9 @@ def _operator_actions(run: Mapping[str, Any], subjects: list[dict[str, Any]], *,
         pending = owner["pending_attempt"] if owner else None
         kind = ("final_approval" if operation == "approve" else "review_budget_checkpoint" if "budget_exhausted" in reason
                 else "execution_failure" if reason == "execution_failed" else reason)
-        command = f"agent-run {operation} {run['parent_issue']} --repo {run['repository']}"
-        if local and operation == "resume":
-            command += f" --ticket {item['issue']}"
+        command = (action_guidance(operation, run_id=run["id"], repository=run["repository"],
+            ticket=item["issue"] if local and operation == "resume" else None, language=run["language"])
+            if operation != "inspect" else "Inspect original facts and diagnostics")
         object_label = f"Ticket #{owner['issue']}" if local and owner else f"Parent Issue #{owner['issue']}" if owner and owner["kind"] == "parent_only" else "Delivery Run"
         item.update({"operation": operation, "scope": "local" if local else "global", "work_subject": item["subject"],
             "location": owner["subject"] if local and owner else "parent" if owner and owner["kind"] == "parent_only" else "run_publication" if owner else "run",
@@ -188,7 +216,7 @@ def _operator_actions(run: Mapping[str, Any], subjects: list[dict[str, Any]], *,
                          "human_blockers": artifact.get("human_blockers") if isinstance(artifact, Mapping) else None,
                          "diagnostics": None, "failure_evidence": artifact if reason != "human_blocker" else None,
                          "execution_failure": artifact if reason == "execution_failed" else None, "blocked_reason": reason},
-            "next_action": command if operation != "inspect" else "Inspect original facts and diagnostics"})
+            "next_action": command})
     return result
 
 
@@ -249,7 +277,8 @@ def _cleanup(run: Mapping[str, Any], subjects: list[dict[str, Any]]) -> dict[str
     items = [{"kind": job["kind"], "branch": job["delivery_cleanup"]["source_ref"],
               "checkout": job["delivery_cleanup"]["checkout"], "status": "cleanup_pending",
               "last_error": job["delivery_cleanup"]["outcome"],
-              "recovery_action": f"agent-run resume {run['id']}"}
+              "recovery_action": action_guidance("resume", run_id=run["id"], repository=run["repository"],
+                                                language=run["language"])}
              for job in subjects if job["delivery_cleanup"] and job["delivery_cleanup"]["state"] != "complete"]
     return {"status": "cleanup_pending" if items else "completed",
             "last_error": next((row["outcome"] for row in cleanups if row["outcome"]), None), "items": items}

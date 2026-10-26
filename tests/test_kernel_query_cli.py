@@ -342,7 +342,7 @@ def test_stopped_run_shows_explicit_recovery_without_claiming_executor_exit(tmp_
     assert action["action"]["command"] == "resume"
     assert action["action"]["ticket_number"] is None
     assert document["executor_control"]["live_status"] == "unknown"
-    assert document["next_action"] == "agent-run resume 1 --repo example/project"
+    assert document["next_action"] == "agent-run resume --repo example/project -- run-query"
     assert _snapshot(tmp_path) == before
 
 
@@ -648,7 +648,7 @@ def test_public_delivery_boundaries_match_observed_02_meanings(
         before = _snapshot(tmp_path)
         approval = query.read(scenario.kernel.storage.path, "status").data
         assert approval["phase"] == "ready_for_approval"
-        assert approval["next_action"] == "agent-run approve 1 --repo example/repository"
+        assert approval["next_action"] == "agent-run approve --repo example/repository -- offline-run"
         focused = next(job for job in approval["subjects"] if job["subject"] == approval["focus_subject"])
         assert focused["kind"] != "ticket"
         assert any(budget["current"] and budget["purpose"] ==
@@ -663,7 +663,7 @@ def test_public_delivery_boundaries_match_observed_02_meanings(
     assert focused is None or focused["kind"] != "ticket"
     assert (focused is not None and any(budget["current"] and budget["purpose"] == "integration"
             for budget in focused["budgets"])) == (kind == DeliveryKind.FINAL_RUN)
-    assert document["next_action"] == ("agent-run status 1 --repo example/repository"
+    assert document["next_action"] == ("agent-run status --repo example/repository -- offline-run"
                                        if kind == DeliveryKind.TICKET else "无")
     assert document["delivery_cleanup"]["status"] == "completed"
     assert all(subject["phase"] == "complete" for subject in document["subjects"])

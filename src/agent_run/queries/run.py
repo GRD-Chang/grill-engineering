@@ -21,6 +21,7 @@ from agent_run.storage.sqlite import QUERY_LIMIT, Storage, Transaction
 from agent_run.storage.preflight import UnsupportedState, require_supported_state
 from agent_run.storage.tasks import read_task, task_path
 from agent_run.queries.read_facts import QueryError as QueryError, all_rows as _all, material as _material, timestamp as _timestamp, read_header as _header, public_phase as _public_phase, read_boundaries
+from agent_run.queries.read_facts import action_guidance
 
 
 @dataclass(frozen=True)
@@ -247,19 +248,19 @@ def _subject(tx: Transaction, job: dict[str, Any], boundary: Mapping[str, Any]) 
 def _next_action(run: Mapping[str, Any], actions: list[dict[str, Any]], status: str,
                  cleanup: Mapping[str, Any] | None) -> str:
     if status == "abandonment_pending":
-        return f"agent-run abandon {run['parent_issue']} --repo {run['repository']}"
+        return action_guidance("abandon", run_id=run["id"], repository=run["repository"], language=run["language"])
     if status == "abandoned":
         return "无"
     if actions:
         action = actions[0]
         return str(action["next_action"])
     if cleanup and cleanup["status"] == "cleanup_pending":
-        return f"agent-run resume {run['id']}"
+        return str(cleanup["items"][0]["recovery_action"])
     if status == "ticket_completed":
-        return f"agent-run run {run['parent_issue']}"
+        return action_guidance("run", run_id=run["id"], repository=run["repository"], language=run["language"])
     if status in {"completed", "abandoned"}:
         return "无"  # Stable machine copy; human rendering localizes it.
-    return f"agent-run status {run['parent_issue']} --repo {run['repository']}"
+    return action_guidance("status", run_id=run["id"], repository=run["repository"], language=run["language"])
 
 
 def _control_history(tx: Transaction, *, identities: Sequence[str] | None = None) -> list[dict[str, Any]]:
