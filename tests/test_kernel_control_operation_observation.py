@@ -18,7 +18,7 @@ from support.offline import Scenario
 from agent_run.core.operation_contract import ReadUnavailable
 from agent_run.cli.main import _parser
 from agent_run.adapters.remote import RemoteEffects
-from test_kernel_host_adapter import controlled_manager
+from support.systemd_manager import controlled_manager
 from test_kernel_operation_runner import setup
 from test_kernel_remote_effects import _fixture
 
@@ -82,7 +82,7 @@ def test_control_read_failure_is_a_cli_error_without_a_work_wait_or_claim(tmp_pa
         assert not tx.rows("SELECT subject FROM waits")
 
 
-def managed_approval(tmp_path, monkeypatch, *, tickets):
+def managed_approval(tmp_path, monkeypatch, *, tickets, interrupt_development=False):
     transport = tmp_path / "transport"
     transport.mkdir()
     port, git, push, state, calls = _fixture(transport, monkeypatch)
@@ -103,6 +103,22 @@ def managed_approval(tmp_path, monkeypatch, *, tickets):
     request = kernel.admit_host("original-host", kind="run", command=("fixture-native-host",),
         environment_carrier=manager_root / "original-carrier", preflight=manager.preflight)
     assert kernel.dispatch_host(request)
+    sealed = ""
+    if interrupt_development:
+        from agent_run.runtime.handoff import prepare_handoff
+        from agent_run.runtime.package_lease import default_runner_lock_path, runner_usage_lease
+        from agent_run.model import HostObservation
+        manager_root.chmod(0o700)
+        lock = default_runner_lock_path(dict(os.environ))
+        with runner_usage_lease(lock) as terminal:
+            handoff = prepare_handoff(request, {}, runner_lock=lock, terminal_lease=terminal, ttl_seconds=.5)
+            try:
+                sealed = json.dumps(handoff.receipt, sort_keys=True, separators=(",", ":"))
+                assert kernel.observe_host(request, HostObservation("unknown", request.unit_name,
+                    usage_pending=True, evidence=sealed)) == "unknown"
+            finally:
+                handoff.process.wait(timeout=3)
+        assert not Path(f"/proc/{handoff.process.pid}").exists()
     document = json.loads(response.read_text())
     group = next(line[3:] for line in Path(f"/proc/{os.getpid()}/cgroup").read_text().splitlines() if line.startswith("0::"))
     document["fields"].update(Id=request.unit_name, Description=request.description,
@@ -110,7 +126,7 @@ def managed_approval(tmp_path, monkeypatch, *, tickets):
     response.write_text(json.dumps(document))
     observed = manager.observe(request)
     assert observed.disposition == "running"
-    assert kernel.observe_host(request, replace(observed, usage_ready=True)) == "running"
+    assert kernel.observe_host(request, replace(observed, usage_ready=True, evidence=sealed)) == "running"
     execution = Execution(request.run_id, request.owner, request.epoch)
     physical = RemoteEffects(Path(spec.repository_root), spec.repository, runner_identity=spec.inputs.runner_identity)
     runner = OperationRunner(kernel, execution, lambda binding: physical)
@@ -122,6 +138,8 @@ def managed_approval(tmp_path, monkeypatch, *, tickets):
     for _ in range(180):
         step = prepare_scripted_agent(kernel, runner.run_once())
         if step.call is not None:
+            if interrupt_development:
+                break
             runner.authorize_agent(step.call)
             kernel.receive(step.call, agents.agent(step.call))
         if kernel.source_status()["final_subject"] == subject or not tickets:
@@ -174,3 +192,72 @@ def test_managed_control_observes_without_replacing_a_running_host(tmp_path, mon
         else:
             assert kernel.status(subject)["generation"] == before["generation"]
             assert kernel.status(subject)["pending_write"] is None
+
+
+@pytest.mark.parametrize("proof", ["released", "fdstore", "populated", "foreign"])
+def test_first_public_resume_applies_after_exact_systemd_exit(tmp_path, monkeypatch, proof):
+    """Real Task/SQLite/guardian; manager and cgroup facts remain synthetic."""
+    from contextlib import contextmanager
+    kernel, runner, physical, _state, calls, request, subject, _source = managed_approval(
+        tmp_path, monkeypatch, tickets=(), interrupt_development=True)
+    before = kernel.status(subject)
+    assert before["phase"] == "development" and before["gates"] == []
+    with kernel.storage.transaction(write=False) as tx:
+        original_attempt = tx.one("SELECT current_attempt FROM subjects WHERE id=?", (subject,))[0]
+        original_actions = tx.one("SELECT count(*) FROM actions")[0]
+    manager = lifecycle_cli._manager_for(kernel, _parser("en").parse_args(["resume", request.run_id]), dict(os.environ))
+    response = tmp_path / "manager" / "manager-response.json"
+    document = json.loads(response.read_text())
+    document["fields"].update(ActiveState="inactive", SubState="dead", MainPID="0",
+                              ControlPID="0", NFileDescriptorStore="1" if proof == "fdstore" else "0")
+    if proof == "foreign":
+        document["fields"]["InvocationID"] = "2" * 32
+    response.write_text(json.dumps(document))
+    group = manager.cgroup_root / document["fields"]["ControlGroup"].lstrip("/")
+    group.mkdir(exist_ok=True, parents=True)
+    (group / "cgroup.events").write_text("populated 1\n" if proof == "populated" else "populated 0\n")
+
+    # No real systemd is present. The replacement manager only records launch;
+    # bound the real guardian's unused startup, not any work/wait deadline.
+    @contextmanager
+    def controlled_handoff(*args, **kwargs):
+        from agent_run.runtime.handoff import prepare_handoff
+        handoff = prepare_handoff(*args, **kwargs, ttl_seconds=.5)
+        try:
+            yield handoff
+        finally:
+            handoff.process.wait(timeout=3)
+    import agent_run.runtime.handoff as native
+    monkeypatch.setattr(native, "handoff_scope", controlled_handoff)
+    result = lifecycle_cli.execute(_parser("en").parse_args(
+        ["resume", request.run_id, "--repo", physical.repository, "--state-dir", str(kernel.storage.path), "--json"]), language="en")
+    if proof != "released":
+        assert result["result"] == "attached" and result["requested_action_applied"] is False
+        assert kernel.host_usage("original-host").usage_released is False
+        with kernel.storage.transaction(write=False) as tx:
+            assert tx.one("SELECT count(*) FROM actions")[0] == original_actions
+        return
+    assert result["result"] == "accepted" and result["action"] == "resume"
+    assert result["action_id"] != "original-host"
+    assert kernel.host_usage("original-host").usage_released is True
+    assert kernel.host_dispatched(result["action_id"])
+    assert kernel.status(subject)["budgets"] == before["budgets"]
+    assert kernel.status(subject)["gates"] == []
+    with kernel.storage.transaction(write=False) as tx:
+        assert tx.one("SELECT current_attempt FROM subjects WHERE id=?", (subject,))[0] == original_attempt
+        assert tuple(tx.one("SELECT kind,status FROM actions WHERE id=?", (result["action_id"],))) == ("resume", "applied")
+        assert tx.one("SELECT count(*) FROM actions")[0] == original_actions + 1
+    launches = [json.loads(line) for line in (tmp_path / "manager" / "helper-calls.jsonl").read_text().splitlines()
+                if json.loads(line)[0] == "systemd-run"]
+    assert len(launches) == 1
+    assert [line for line in calls.read_text().splitlines() if "--method" in json.loads(line)] == []
+
+    again = lifecycle_cli.execute(_parser("en").parse_args(
+        ["resume", request.run_id, "--repo", physical.repository, "--state-dir", str(kernel.storage.path), "--json"]), language="en")
+    assert again["result"] == "attached" and again["requested_action_applied"] is False
+    assert again["action_id"] == result["action_id"]
+    launches_after = [json.loads(line) for line in (tmp_path / "manager" / "helper-calls.jsonl").read_text().splitlines()
+                      if json.loads(line)[0] == "systemd-run"]
+    assert launches_after == launches
+    with kernel.storage.transaction(write=False) as tx:
+        assert tx.one("SELECT count(*) FROM actions")[0] == original_actions + 1

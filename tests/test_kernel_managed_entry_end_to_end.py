@@ -25,7 +25,7 @@ from agent_run.config.paths import app_data_root
 from agent_run.runtime.package_lease import RunnerLeaseBusy, default_runner_lock_path, runner_management_lease
 from agent_run.config.defaults import UserDefaultsStore
 from agent_run.core.kernel import Kernel
-from tests.test_kernel_host_adapter import controlled_manager
+from support.systemd_manager import controlled_manager
 from tests.test_kernel_remote_effects import FAKE_GH
 from support.worker_process_timing import wait_until
 
