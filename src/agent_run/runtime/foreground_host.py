@@ -6,7 +6,10 @@ remaining gap if that supervisor is killed. Nothing here selects business work.
 """
 from __future__ import annotations
 
+from contextlib import ExitStack
+from dataclasses import dataclass, replace
 import json
+import math
 import os
 from pathlib import Path
 import select
@@ -21,13 +24,41 @@ from agent_run.adapters.foreground import (DomainUnknown, NamespaceProcess, Proc
     read_record, record_root, recover_init, subreaper, write_record)
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError, bounded_error
-from agent_run.model import Execution, HostLaunch, HostObservation
+from agent_run.model import AgentCall, Execution, HostLaunch, HostObservation
+from agent_run.contracts.host import valid_foreground_domain
 from agent_run.runtime.handoff import _digest, _encode, _environment, _runner_witness
 from agent_run.runtime.package_lease import RunnerLease
 
 
 _CHANNEL = 'AGENT_RUN_FOREGROUND_CHANNEL'
 _LEASE = 'AGENT_RUN_FOREGROUND_LEASE'
+
+
+@dataclass(frozen=True)
+class HostInspection:
+    """Evidence for this exact request, never a current-Run or execution grant."""
+    request: HostLaunch
+    observation: HostObservation
+    source: Literal['local', 'recorded_exit', 'unavailable']
+
+
+@dataclass(frozen=True)
+class WorkerInspection:
+    execution: Execution
+    invocation_id: str
+    output_ordinal: int
+    disposition: Literal['running', 'exited', 'unknown']
+    source: Literal['local', 'recorded_exit', 'host_exit', 'unavailable']
+
+
+def _unavailable(request: HostLaunch) -> HostInspection:
+    return HostInspection(request, HostObservation('unknown', None, backend='foreground'), 'unavailable')
+
+
+def _current_execution(kernel: Kernel) -> tuple[str, str | None, int]:
+    with kernel.storage.transaction(write=False) as tx:
+        row = tx.one('SELECT id,executor,epoch FROM runs')
+        return row['id'], row['executor'], row['epoch']
 
 
 def _observation(request: HostLaunch, record: Mapping[str, Any], disposition: Literal['running', 'exited'], *, released: bool = False) -> HostObservation:
@@ -91,6 +122,114 @@ class ForegroundHost:
             raise DomainUnknown('Foreground execution requires bubblewrap and Linux pidfd')
         observer_anchor()
 
+    def _inspect(self, request: HostLaunch, original: HostObservation | None,
+                 record: Mapping[str, Any]) -> HostInspection:
+        """The caller has authenticated this private record's frozen binding."""
+        domain = record.get('domain')
+        if (record.get('phase') not in {'pending', 'running', 'exited'}
+                or not isinstance(domain, dict) or not valid_foreground_domain(domain, request.nonce)
+                or original is not None and original.domain is not None and original.domain != domain):
+            return _unavailable(request)
+        if record['phase'] == 'exited':
+            ended = record.get('ended_at')
+            if (record.get('exit_basis') not in {'retained_namespace_pidfd', 'same_observer_init_exit'}
+                    or not isinstance(ended, (int, float)) or isinstance(ended, bool)
+                    or not math.isfinite(ended) or ended <= 0
+                    or any(value is not None and type(value) is not int for value in
+                           (record.get('executor_exit_code'), record.get('namespace_exit_code')))):
+                return _unavailable(request)
+            return HostInspection(request, _observation(request, record, 'exited'), 'recorded_exit')
+        disposition = recover_init(domain)
+        if disposition == 'exited':
+            # Discovery proves domain closure, never an exact end timestamp.
+            return HostInspection(request, replace(_observation(request, record, 'exited'),
+                ended_at=None, exit_status=None, namespace_exit_status=None,
+                exit_evidence='same_observer_init_exit'), 'local')
+        if (record['phase'] == 'running' and disposition == 'running' and original is not None
+                and original.usage_ready and original.domain == domain and domain['executor'] is not None):
+            pin = ProcessPin.open(domain['executor']['pid'], domain['executor'])
+            try:
+                if pin.observe() == 'running' and recover_init(domain) == 'running':
+                    return HostInspection(request, replace(_observation(request, record, 'running'),
+                        ended_at=None, exit_status=None, namespace_exit_status=None), 'local')
+            finally:pin.close()
+        return _unavailable(request)
+
+    def inspect(self, kernel: Kernel, request: HostLaunch, lock: Path) -> HostInspection:
+        """Bounded readonly evidence; never settle, signal, notify or unlink.
+
+        The result names the original request. Only unchanged current ownership
+        may yield running; a recorded exit remains scoped to its old request.
+        """
+        if request.backend != 'foreground':raise KernelError('host_backend_changed')
+        action = kernel.host_action(request)  # Exact frozen request validation.
+        original = kernel.host_usage(action)
+        current = _current_execution(kernel)
+        if original is not None and original.disposition == 'exited' and original.usage_released:
+            return HostInspection(request, original, 'recorded_exit')
+        try:
+            _, record = _bound_record(request, lock)
+            result = self._inspect(request, original, record)
+            if (kernel.host_usage(action) != original or _current_execution(kernel) != current
+                    or result.observation.disposition == 'running'
+                    and current != (request.run_id, request.owner, request.epoch)):
+                return _unavailable(request)
+            return result
+        except (OSError, ValueError, KeyError, TypeError, OverflowError, DomainUnknown):
+            return _unavailable(request)
+
+    def inspect_worker(self, kernel: Kernel, request: HostLaunch, call: AgentCall, lock: Path) -> WorkerInspection:
+        """Read one original Call; a foreign namespace's same-number PID is not it."""
+        def result(disposition: Literal['running', 'exited', 'unknown'],
+                   source: Literal['local', 'recorded_exit', 'host_exit', 'unavailable']) -> WorkerInspection:
+            return WorkerInspection(call.execution, call.invocation_id, call.output_ordinal, disposition, source)
+
+        if request.backend != 'foreground':raise KernelError('host_backend_changed')
+        if call.execution != Execution(request.run_id, request.owner, request.epoch):
+            raise KernelError('worker_host_binding')
+        current = _current_execution(kernel)
+        with kernel.storage.transaction(write=False) as tx:
+            output, host = dict(kernel._invocation(tx, call)), kernel._host(tx, request)
+            host_snapshot = dict(host)
+            if output['dispatch_state'] == 'exited' and type(output['exit_code']) is int:
+                return result('exited', 'recorded_exit')
+            process = None if output['process_identity'] is None else json.loads(tx.get(output['process_identity'], call.subject))
+            if process is None or not kernel._host_contains_process(tx, host, process):
+                return result('unknown', 'unavailable')
+            domain = None if host['domain_id'] is None else json.loads(tx.get(host['domain_id'], host['subject']))
+        observed = self.inspect(kernel, request, lock)
+        disposition: Literal['running', 'exited', 'unknown'] = 'unknown'
+        source: Literal['local', 'recorded_exit', 'host_exit', 'unavailable'] = 'unavailable'
+        try:
+            if observed.observation.disposition == 'exited':
+                disposition, source = 'exited', 'host_exit'
+            elif domain is not None and valid_foreground_domain(domain, request.nonce):
+                anchor = observer_anchor()
+                expected = {'boot_id': process['boot_id'], 'pid_namespace': process['host_namespace'],
+                            'pid1_start': domain['init']['start_token']}
+                if (current == (request.run_id, request.owner, request.epoch)
+                        and anchor == expected and process['pid_namespace'] == anchor['pid_namespace']):
+                    with ExitStack() as stack:
+                        owner = ProcessPin.open(process['host_pid'])
+                        stack.callback(owner.close)
+                        worker = ProcessPin.open(process['pid'])
+                        stack.callback(worker.close)
+                        if ((owner.identity.start_token, owner.identity.boot_id, owner.identity.pid_namespace)
+                                == (process['host_start_token'], anchor['boot_id'], anchor['pid_namespace'])
+                                and (worker.identity.start_token, worker.identity.boot_id, worker.identity.pid_namespace)
+                                == (process['start_token'], anchor['boot_id'], anchor['pid_namespace'])
+                                and owner.observe() == 'running' and observer_anchor() == anchor):
+                            state = worker.observe()
+                            if state in {'running', 'exited'}:
+                                disposition, source = ('running' if state == 'running' else 'exited'), 'local'
+            with kernel.storage.transaction(write=False) as tx:
+                if dict(kernel._invocation(tx, call)) != output or dict(kernel._host(tx, request)) != host_snapshot:
+                    return result('unknown', 'unavailable')
+            if _current_execution(kernel) != current:return result('unknown', 'unavailable')
+            return result(disposition, source)
+        except (OSError, ValueError, KeyError, TypeError, DomainUnknown):
+            return result('unknown', 'unavailable')
+
     def observe(self, kernel: Kernel, request: HostLaunch, lock: Path) -> HostObservation:
         if request.backend != 'foreground':raise KernelError('host_backend_changed')
         original = kernel.host_usage(kernel.host_action(request))
@@ -107,17 +246,8 @@ class ForegroundHost:
             if record.get('domain') is None:
                 raise DomainUnknown('Original namespace identity was not durably established')
             if record['phase'] != 'exited':
-                disposition = recover_init(record['domain'])
-                if (disposition == 'running' and original is not None and original.usage_ready
-                        and record['domain']['executor'] is not None):
-                    pin = ProcessPin.open(record['domain']['executor']['pid'], record['domain']['executor'])
-                    try:
-                        if pin.observe() == 'running' and original.domain == record['domain']:
-                            return _observation(request, record, 'running')
-                    finally:pin.close()
-                if disposition != 'exited':
-                    # Init alive alone does not prove a ready live executor.
-                    return HostObservation('unknown', None, backend='foreground')
+                observed = self._inspect(request, original, record).observation
+                if observed.disposition != 'exited':return observed
                 record.update(phase='exited', ended_at=kernel.clock(), executor_exit_code=None,
                               namespace_exit_code=None, exit_basis='same_observer_init_exit')
                 write_record(path, record)

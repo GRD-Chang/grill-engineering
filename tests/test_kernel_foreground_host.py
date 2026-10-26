@@ -26,6 +26,208 @@ def _domain(nonce):
             'executor': {**common, 'pid': 202, 'parent': 200, 'start_token': '203', 'namespace_pids': [202, 2]}}
 
 
+@pytest.fixture
+def inspection(tmp_path):
+    kernel, ports = task_run(tmp_path, 'inspection')
+    request = kernel.admit_host('launch', kind='run', command=('controlled-executor',),
+        environment_carrier=tmp_path / 'carrier', preflight=lambda: None, backend='foreground')
+    assert kernel.dispatch_host(request)
+    domain = _domain(request.nonce)
+    lock = tmp_path / 'install.lock'
+    with runner_usage_lease(lock):
+        receipt = {'request_digest': _digest(request), 'nonce': request.nonce, 'runner': _runner_witness(lock),
+                   'boot_id': 'test-boot', 'pid_namespace': 'pid:[10]'}
+        running = HostObservation('running', None, boot_id='test-boot', main_pid=202, start_token='203',
+            backend='foreground', domain=domain, usage_ready=True, evidence=_encode(receipt).decode())
+        assert kernel.observe_host(request, running) == 'running'
+        path = physical.record_root(lock, create=True) / (request.nonce + '.json')
+        physical.write_record(path, {'binding': [request.run_id, request.owner, request.epoch, request.nonce],
+            'receipt': receipt, 'phase': 'running', 'domain': domain,
+            'database': str(kernel.storage.path.resolve()), 'action': 'launch'}, create=True)
+    return kernel, ports, request, domain, lock, path
+
+
+def test_readonly_host_inspection_does_not_settle_discovered_exit(inspection, tmp_path, monkeypatch):
+    kernel, _, request, domain, lock, path = inspection
+    monkeypatch.setattr(foreground_host, 'recover_init', lambda value: 'exited' if value == domain else 'unknown')
+    manager = ForegroundHost(environment={})
+    before = durable_snapshot(tmp_path)
+    observed = manager.inspect(kernel, request, lock)
+    assert observed.request == request and observed.source == 'local'
+    assert observed.observation.disposition == 'exited'
+    assert observed.observation.ended_at is None and observed.observation.exit_status is None
+    assert not observed.observation.usage_released
+    assert kernel.active_host_action() == 'launch' and path.exists()
+    assert physical.read_record(path)['phase'] == 'running'
+    assert durable_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize('change,expected', [('none', 'running'), ('init-unknown', 'unknown'),
+    ('executor-exited', 'unknown'), ('pin-failure', 'unknown'), ('domain', 'unknown'), ('receipt', 'unknown')])
+def test_readonly_host_inspection_requires_exact_ready_domain(inspection, tmp_path, monkeypatch, change, expected):
+    from types import SimpleNamespace
+    kernel, _, request, _, lock, path = inspection
+    monkeypatch.setattr(foreground_host, 'recover_init', lambda _: 'unknown' if change == 'init-unknown' else 'running')
+    closed = []
+    def pin(pid, original):
+        if change == 'pin-failure':raise physical.DomainUnknown('controlled FD exhaustion')
+        assert (pid, original['start_token']) == (202, '203')
+        return SimpleNamespace(observe=lambda: 'exited' if change == 'executor-exited' else 'running',
+                               close=lambda: closed.append(pid))
+    monkeypatch.setattr(foreground_host.ProcessPin, 'open', pin)
+    if change in {'domain', 'receipt'}:
+        record = physical.read_record(path)
+        if change == 'domain':record['domain']['executor']['start_token'] = 'foreign'
+        else:record['receipt']['nonce'] = 'foreign'
+        physical.write_record(path, record)
+    before = durable_snapshot(tmp_path)
+    manager = ForegroundHost(environment={})
+    for _ in range(2):
+        reading = manager.inspect(kernel, request, lock)
+        assert reading.observation.disposition == expected
+        assert reading.source == ('local' if expected == 'running' else 'unavailable')
+    assert closed == ([202, 202] if change in {'none', 'executor-exited'} else [])
+    assert durable_snapshot(tmp_path) == before
+
+
+@pytest.fixture
+def inspection_worker(inspection):
+    kernel, ports, request, domain, lock, path = inspection
+    operations = CoreOperations(kernel, Execution(request.run_id, request.owner, request.epoch), lambda _: ports)
+    call = operations.until(lambda step: step.call is not None).call
+    assert call is not None and kernel.dispatch_agent(call)
+    kernel.bind_thread(call, 'inspection-worker')
+    process = {'schema': 'linux-namespace-process-v1', 'pid': 3, 'pgid': 3, 'start_token': 'worker',
+        'host_pid': 2, 'host_start_token': '203', 'boot_id': 'test-boot',
+        'host_namespace': 'pid:[20]', 'pid_namespace': 'pid:[20]'}
+    kernel.agent_started(call, process)
+    return kernel, request, call, process, domain, lock, path
+
+
+@pytest.mark.parametrize('change,expected', [('none', 'running'), ('worker-exited', 'exited'),
+    ('namespace', 'unknown'), ('pid1', 'unknown'), ('worker-reused', 'unknown'),
+    ('owner-reused', 'unknown'), ('owner-exited', 'unknown'), ('worker-pin-failure', 'unknown')])
+def test_readonly_worker_inspection_uses_only_its_exact_observable_namespace(
+    inspection_worker, tmp_path, monkeypatch, change, expected,
+):
+    from types import SimpleNamespace
+    kernel, request, call, _, domain, lock, _ = inspection_worker
+    monkeypatch.setattr(foreground_host, 'recover_init', lambda _: 'unknown')
+    anchor = {'boot_id': 'test-boot', 'pid_namespace': 'pid:[10]' if change == 'namespace' else 'pid:[20]',
+              'pid1_start': 'foreign' if change == 'pid1' else domain['init']['start_token']}
+    monkeypatch.setattr(foreground_host, 'observer_anchor', lambda: anchor)
+    opened, closed = [], []
+    def pin(pid):
+        opened.append(pid)
+        if change == 'worker-pin-failure' and pid == 3:raise physical.DomainUnknown('controlled permission failure')
+        token = ('reused' if change == 'worker-reused' else 'worker') if pid == 3 else ('reused' if change == 'owner-reused' else '203')
+        return SimpleNamespace(identity=SimpleNamespace(start_token=token, boot_id='test-boot', pid_namespace='pid:[20]'),
+            observe=lambda: 'exited' if (pid == 3 and change == 'worker-exited' or pid == 2 and change == 'owner-exited') else 'running',
+            close=lambda: closed.append(pid))
+    monkeypatch.setattr(foreground_host.ProcessPin, 'open', pin)
+    before = durable_snapshot(tmp_path)
+    kernel.clock = lambda: pytest.fail('Readonly inspection must not use a query/settlement clock')
+    reading = ForegroundHost(environment={}).inspect_worker(kernel, request, call, lock)
+    assert reading.execution == call.execution and reading.invocation_id == call.invocation_id
+    assert reading.output_ordinal == call.output_ordinal and reading.disposition == expected
+    assert reading.source == ('local' if expected != 'unknown' else 'unavailable')
+    assert sorted(closed) == sorted(pid for pid in opened if not (change == 'worker-pin-failure' and pid == 3))
+    if change in {'namespace', 'pid1'}:assert opened == []
+    assert durable_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize('mode', ['host-exit', 'recorded-worker-exit', 'raw-only', 'foreign-run', 'foreign-epoch', 'foreign-owner', 'foreign-nonce', 'foreign-context'])
+def test_readonly_worker_exit_and_foreign_binding_are_not_execution_grants(inspection_worker, tmp_path, monkeypatch, mode):
+    kernel, request, call, process, domain, lock, path = inspection_worker
+    if mode == 'recorded-worker-exit':kernel.agent_exited(call, process, 23)
+    if mode == 'raw-only':kernel.receive(call, b'original raw does not prove exit')
+    if mode == 'foreign-run':call = replace(call, execution=replace(call.execution, run_id='foreign'))
+    if mode == 'foreign-epoch':call = replace(call, execution=replace(call.execution, epoch=call.execution.epoch + 1))
+    if mode == 'foreign-owner':call = replace(call, execution=replace(call.execution, owner='foreign'))
+    if mode == 'foreign-nonce':request = replace(request, nonce='foreign')
+    if mode == 'foreign-context':call = replace(call, context={'foreign': True})
+    monkeypatch.setattr(foreground_host, 'recover_init', lambda value: 'exited' if mode != 'raw-only' and value == domain else 'unknown')
+    monkeypatch.setattr(foreground_host, 'observer_anchor', lambda: domain['observer'])
+    def forbidden(*a, **kw):pytest.fail('No process signal, physical launch or settlement is allowed')
+    monkeypatch.setattr(foreground_host.ProcessPin, 'open', forbidden)
+    monkeypatch.setattr(foreground_host, '_settle', forbidden)
+    monkeypatch.setattr(foreground_host, '_remove_record', forbidden)
+    before = durable_snapshot(tmp_path)
+    manager = ForegroundHost(environment={})
+    if mode.startswith('foreign'):
+        with pytest.raises(KernelError):manager.inspect_worker(kernel, request, call, lock)
+    else:
+        reading = manager.inspect_worker(kernel, request, call, lock)
+        assert reading.disposition == ('unknown' if mode == 'raw-only' else 'exited')
+        assert reading.source == ('host_exit' if mode == 'host-exit' else 'unavailable' if mode == 'raw-only' else 'recorded_exit')
+        assert kernel.active_host_action() == 'launch' and path.exists()
+        with kernel.storage.transaction(write=False) as tx:
+            assert tx.one('SELECT count(*) FROM leases')[0] == int(mode != 'recorded-worker-exit')
+    assert durable_snapshot(tmp_path) == before
+
+
+def test_readonly_committed_host_exit_is_recorded_not_a_fresh_process_probe(inspection, tmp_path, monkeypatch):
+    kernel, _, request, _, lock, path = inspection
+    original = kernel.host_usage('launch')
+    exited = replace(original, disposition='exited', ended_at=kernel.clock(), exit_status=None,
+        usage_ready=False, usage_released=True, exit_evidence='same_observer_init_exit')
+    assert kernel.observe_host(request, exited) == 'exited'
+    def forbidden(*a, **kw):pytest.fail('A recorded exact exit needs no process probe or cleanup')
+    monkeypatch.setattr(foreground_host, 'recover_init', forbidden)
+    monkeypatch.setattr(foreground_host, '_remove_record', forbidden)
+    before = durable_snapshot(tmp_path)
+    for _ in range(2):
+        observed = ForegroundHost(environment={}).inspect(kernel, request, lock)
+        assert observed.request == request and observed.source == 'recorded_exit'
+        assert observed.observation == exited and path.exists()
+    assert durable_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize('change', ['raw', 'epoch'])
+def test_readonly_worker_inspection_downgrades_a_racing_original_binding(inspection_worker, monkeypatch, change):
+    from types import SimpleNamespace
+    kernel, request, call, _, domain, lock, _ = inspection_worker
+    monkeypatch.setattr(foreground_host, 'recover_init', lambda _: 'unknown')
+    monkeypatch.setattr(foreground_host, 'observer_anchor', lambda: {
+        'boot_id': 'test-boot', 'pid_namespace': 'pid:[20]', 'pid1_start': domain['init']['start_token']})
+    closed = []
+    def pin(pid):
+        def observe():
+            if pid == 3:
+                if change == 'raw':kernel.receive(call, b'original concurrent callback')
+                else:assert kernel.stop_task('concurrent-stop') == 'applied'
+            return 'running'
+        return SimpleNamespace(identity=SimpleNamespace(start_token='203' if pid == 2 else 'worker',
+            boot_id='test-boot', pid_namespace='pid:[20]'), observe=observe, close=lambda: closed.append(pid))
+    monkeypatch.setattr(foreground_host.ProcessPin, 'open', pin)
+    observed = ForegroundHost(environment={}).inspect_worker(kernel, request, call, lock)
+    assert observed.disposition == 'unknown' and observed.source == 'unavailable'
+    assert sorted(closed) == [2, 3]
+    with kernel.storage.transaction(write=False) as tx:
+        assert tx.one('SELECT count(*) FROM leases')[0] == 1
+        if change == 'epoch':assert tx.one('SELECT stopped FROM runs')[0]
+        else:
+            material = tx.one('SELECT raw_id FROM invocation_outputs WHERE invocation=?', (call.invocation_id,))[0]
+            assert tx.get(material, call.subject) == b'original concurrent callback'
+
+
+def test_readonly_host_inspection_downgrades_epoch_change_during_probe(inspection, monkeypatch):
+    from types import SimpleNamespace
+    kernel, _, request, _, lock, _ = inspection
+    reads = []
+    def init(_):
+        reads.append(True)
+        if len(reads) == 2:assert kernel.stop_task('concurrent-stop') == 'applied'
+        return 'running'
+    monkeypatch.setattr(foreground_host, 'recover_init', init)
+    closed = []
+    monkeypatch.setattr(foreground_host.ProcessPin, 'open', lambda *a: SimpleNamespace(
+        observe=lambda: 'running', close=lambda: closed.append(True)))
+    observed = ForegroundHost(environment={}).inspect(kernel, request, lock)
+    assert observed.observation.disposition == 'unknown' and observed.source == 'unavailable'
+    assert closed == [True]
+
+
 def test_foreground_admission_is_frozen_stop_fences_and_null_exit_does_not_become_zero(tmp_path):
     kernel = task_run(tmp_path, 'foreground')[0]
     args = dict(kind='run', command=('/usr/bin/python3',), environment_carrier=tmp_path / 'carrier',
