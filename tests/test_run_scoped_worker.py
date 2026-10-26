@@ -4,11 +4,8 @@ The test transaction source owns one real SQLite transaction and original
 Transaction accounting. It does not substitute a production Store, implement
 file admission/FIFO/capacity or claim the new public protocol can open yet.
 """
-from contextlib import closing, contextmanager
+from contextlib import closing
 from dataclasses import asdict, replace
-from pathlib import Path
-from threading import RLock
-from types import SimpleNamespace
 import sqlite3
 
 import pytest
@@ -16,42 +13,16 @@ import pytest
 from agent_run.contracts.agent_profiles import resolve_profiles
 from agent_run.core import kernel as core
 from agent_run.core.attempt_continuation import AttemptContinuationBasis, bind_attempt_continuation
-from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.model import AgentPreparation, Execution, Profile, Purpose, Role, wire_json
 from agent_run.storage.run_scope import RunTransaction
 from agent_run.storage.sqlite import Transaction
 from support.repository_scope import connection, insert, seed
+from support.run_scoped_kernel import ScopedKernel
 
 
 SUBJECT = "parent:1"
 
-
-class ScopedKernel(Kernel):
-    """Only transaction injection; every business operation is the real Kernel."""
-
-    def __init__(self, db, run):
-        self.owners = []
-
-        @contextmanager
-        def transaction(*, write=True, ordered=True, cancelled=None):
-            assert cancelled is None and not db.in_transaction
-            db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
-            owner = Transaction(db)
-            self.owners.append(owner)
-            try:
-                yield RunTransaction(owner, run)
-                if owner.failed:
-                    raise KernelError("transaction_aborted")
-                db.commit()
-            except BaseException:
-                db.rollback()
-                raise
-
-        self.storage = SimpleNamespace(transaction=transaction, path=Path("/fixture/kernel.sqlite3"))
-        self.clock = lambda: 100.
-        self._observation = None
-        self._observation_lock = RLock()
 
 
 def _prepare(db, owner, run):

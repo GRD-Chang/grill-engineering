@@ -3738,14 +3738,17 @@ class Kernel:
         """
         if job["kind"] == DeliveryKind.FINAL_RUN:
             return None
-        previous = tx.rows("SELECT a.thread_id AS thread FROM attempts a JOIN threads t ON t.id=a.thread_id WHERE a.subject=? AND a.generation=? "
+        previous = tx.rows(*selected_statement(tx, "SELECT a.thread_id AS thread FROM attempts a JOIN threads t ON t.id=a.thread_id WHERE a.subject=? AND a.generation=? "
                            "AND a.role='publication' AND t.role='publication' AND t.backend_id IS NOT NULL "
-                           "ORDER BY a.ordinal DESC LIMIT 1", (job["id"], job["generation"]))
+                           "ORDER BY a.ordinal DESC LIMIT 1",
+                       "SELECT a.thread_id AS thread FROM attempts a JOIN threads t ON t.run_id=a.run_id AND t.id=a.thread_id WHERE a.subject=? AND a.generation=? AND a.role='publication' AND t.role='publication' AND t.backend_id IS NOT NULL AND a.run_id=? ORDER BY a.ordinal DESC LIMIT 1",
+                       (job["id"], job["generation"]), run_last=True))
         if previous:
             return str(previous[0][0])
         publication = self._profile_document(tx, run["profile_revision"])["profiles"]["publication"]
-        attempts = tx.one("SELECT count(*) FROM attempts WHERE subject=? AND generation=? AND role='publication'",
-                          (job["id"], job["generation"]))[0]
+        attempts = tx.one(*selected_statement(tx, "SELECT count(*) FROM attempts WHERE subject=? AND generation=? AND role='publication'",
+                       "SELECT count(*) FROM attempts WHERE subject=? AND generation=? AND role='publication' AND run_id=?",
+                       (job["id"], job["generation"]), run_last=True))[0]
         # The original selection observes the newly allocated role ordinal.
         if publication["reference"] == "development" and attempts + 1 < 4:
             development_thread = job["development_thread"]
@@ -3785,19 +3788,32 @@ class Kernel:
             return revision
 
     def _inputs(self, tx: Transaction, run: sqlite3.Row) -> dict[str, Any]:
+        selected = transaction_scope(tx)
+        if selected is not None and run["id"] != selected.run_id:
+            raise KernelError("creation_input_binding")
         rows = tx.rows("SELECT * FROM run_inputs WHERE run_id=?", (run["id"],))
         return {} if not rows else dict(json.loads(tx.get(rows[0]["material_id"], rows[0]["subject"])))
 
     def _budget(self, tx: Transaction, job: sqlite3.Row) -> sqlite3.Row:
-        return tx.one("SELECT * FROM budgets WHERE subject=? AND purpose=? AND current=1", (job["id"], job["purpose"]))
+        return tx.one(*selected_statement(tx, "SELECT * FROM budgets WHERE subject=? AND purpose=? AND current=1",
+                   'SELECT * FROM budgets WHERE subject=? AND purpose=? AND current=1 AND run_id=?',
+                   (job["id"], job["purpose"]), run_last=True))
 
     def _ready(self, tx: Transaction, subject: str, table: str) -> None:
         if table not in {"work_queue", "integration_queue"}:
             raise AssertionError(table)
-        if not tx.rows(f"SELECT ready FROM {table} WHERE subject=?", (subject,)):
-            tx.execute("UPDATE runs SET next_ready=next_ready+1")
-            ready = tx.one("SELECT next_ready FROM runs")[0]
-            tx.execute(f"INSERT INTO {table} VALUES (?,?)", (subject, ready))
+        if not tx.rows(*selected_statement(tx, f"SELECT ready FROM {table} WHERE subject=?",
+                   f'SELECT ready FROM {table} WHERE subject=? AND run_id=?',
+                   (subject,), run_last=True)):
+            tx.execute(*selected_statement(tx, "UPDATE runs SET next_ready=next_ready+1",
+                'UPDATE runs SET next_ready=next_ready+1 WHERE id=?',
+                (), run_last=True))
+            ready = tx.one(*selected_statement(tx, "SELECT next_ready FROM runs",
+                        'SELECT next_ready FROM runs WHERE id=?',
+                        (), run_last=True))[0]
+            tx.execute(*selected_statement(tx, f"INSERT INTO {table} VALUES (?,?)",
+                f'INSERT INTO {table}(subject,ready,run_id) VALUES (?,?,?)',
+                (subject, ready), run_last=True))
 
     def _allocate(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, work: Work,
                   world: World, pending: sqlite3.Row | None = None,
@@ -3805,6 +3821,13 @@ class Kernel:
                   output_error: str | None = None, retain_period: bool = False,
                   retain_deadline: bool = False) -> Step | IORequest:
         execution, allow_agent = work.execution, work.allow_agent
+        selected = transaction_scope(tx)
+        if selected is not None:
+            if (run["id"] != selected.run_id or job["run_id"] != selected.run_id
+                    or pending is not None and (pending["run_id"] != selected.run_id
+                                               or pending["subject"] != job["id"])):
+                raise KernelError("allocation_binding")
+            self._executor_owned(tx, run, execution)
         subject = job["id"]
         if self._agent_seats(tx, subject):
             return Step("waiting", subject, "previous_invocation_exit")
@@ -3825,21 +3848,30 @@ class Kernel:
             self._gate(tx, subject, "review_budget_exhausted", purpose=job["purpose"])
             return Step("paused", subject, "review_budget")
         self._ready(tx, subject, "work_queue")
-        first = tx.one("SELECT subject FROM work_queue ORDER BY ready LIMIT 1")[0]
+        first = tx.one(*selected_statement(tx, "SELECT subject FROM work_queue ORDER BY ready LIMIT 1",
+                    'SELECT subject FROM work_queue WHERE run_id=? ORDER BY ready LIMIT 1',
+                    (), run_last=True))[0]
         count = self._agent_seats(tx)
         if first != subject or count >= run["concurrency"]:
             return Step("waiting", subject, "agent_capacity")
         if role == Role.REVIEW and not job["validation_checkout"]:
             return self._prepare_effect(tx, run, job, work, world, "validation_checkout", before=job["workspace_sha"],
                                         payload={"reviewed_commit": job["integrated_sha"] or job["candidate_sha"]})
-        tx.execute("DELETE FROM work_queue WHERE subject=?", (subject,))
+        tx.execute(*selected_statement(tx, "DELETE FROM work_queue WHERE subject=?",
+            'DELETE FROM work_queue WHERE subject=? AND run_id=?',
+            (subject,), run_last=True))
         policy = self._subject_policy(tx, job)
         force_new_thread = False
         bound_feedback: list[str] = []
-        feedback_actions = [] if retain_period else tx.all("SELECT a.* FROM history p JOIN actions a ON a.id=p.identity WHERE p.kind='run_feedback_pending' AND a.run_id=? AND NOT EXISTS (SELECT 1 FROM history b WHERE b.kind IN ('run_feedback_bound','run_feedback_retired') AND b.identity=a.id) ORDER BY p.position", (run["id"],))
-        live_generations = {(row["id"], row["generation"]) for row in tx.all("SELECT id,generation FROM subjects")} if feedback_actions else set()
+        feedback_actions = [] if retain_period else tx.all(*selected_statement(tx, "SELECT a.* FROM history p JOIN actions a ON a.id=p.identity WHERE p.kind='run_feedback_pending' AND a.run_id=? AND NOT EXISTS (SELECT 1 FROM history b WHERE b.kind IN ('run_feedback_bound','run_feedback_retired') AND b.identity=a.id) ORDER BY p.position",
+            "SELECT a.* FROM history p JOIN actions a ON a.run_id=p.run_id AND a.id=p.identity WHERE p.kind='run_feedback_pending' AND a.run_id=? AND NOT EXISTS (SELECT 1 FROM history b WHERE b.run_id=a.run_id AND b.kind IN ('run_feedback_bound','run_feedback_retired') AND b.identity=a.id) AND p.run_id=? ORDER BY p.position", (run["id"],), run_last=True))
+        live_generations = {(row["id"], row["generation"]) for row in tx.all(*selected_statement(tx, "SELECT id,generation FROM subjects",
+                                                                          'SELECT id,generation FROM subjects WHERE run_id=?',
+                                                                          (), run_last=True))} if feedback_actions else set()
         for action in feedback_actions:
-            owner = tx.one("SELECT subject FROM material WHERE id=?", (action["payload_id"],))[0]
+            owner = tx.one(*selected_statement(tx, "SELECT subject FROM material WHERE id=?",
+                        'SELECT subject FROM material WHERE id=? AND run_id=?',
+                        (action["payload_id"],), run_last=True))[0]
             feedback = json.loads(tx.get(action["payload_id"], owner))
             receipt = json.loads(tx.get(action["receipt_id"], owner))
             scope = receipt["feedback_scope"].get(subject)
@@ -3851,8 +3883,12 @@ class Kernel:
                     (pending is not None and pending["id"] == scope["attempt"])
                     or (pending is None and scope["attempt"] is None and scope["role"] == job["phase"])))
                 if pending is not None and force_new_thread:
-                    tx.execute("UPDATE attempts SET new_thread=1 WHERE id=?", (pending["id"],))
-                    pending = tx.one("SELECT * FROM attempts WHERE id=?", (pending["id"],))
+                    tx.execute(*selected_statement(tx, "UPDATE attempts SET new_thread=1 WHERE id=?",
+                        'UPDATE attempts SET new_thread=1 WHERE id=? AND run_id=?',
+                        (pending["id"],), run_last=True))
+                    pending = tx.one(*selected_statement(tx, "SELECT * FROM attempts WHERE id=?",
+                                  'SELECT * FROM attempts WHERE id=? AND run_id=?',
+                                  (pending["id"],), run_last=True))
                 bound_feedback.append(action["id"])
             elif not any((key, value["generation"]) in live_generations for key, value in receipt["feedback_scope"].items()):
                 self._event(tx, owner, "run_feedback_retired", action["id"], action["receipt_id"])
@@ -3879,24 +3915,33 @@ class Kernel:
             thread_id = self._publication_thread(tx, run, job)
         if thread_id is None:
             thread_id = identity()
-            tx.execute("INSERT INTO threads(id,subject,role,profile_revision) VALUES (?,?,?,?)", (thread_id, subject, role.value, run["profile_revision"]))
-        binding = tx.one("SELECT * FROM threads WHERE id=?", (thread_id,))
+            tx.execute(*selected_statement(tx, "INSERT INTO threads(id,subject,role,profile_revision) VALUES (?,?,?,?)",
+                'INSERT INTO threads(id,subject,role,profile_revision,run_id) VALUES (?,?,?,?,?)',
+                (thread_id, subject, role.value, run["profile_revision"]), run_last=True))
+        binding = tx.one(*selected_statement(tx, "SELECT * FROM threads WHERE id=?",
+                      'SELECT * FROM threads WHERE id=? AND run_id=?',
+                      (thread_id,), run_last=True))
         if not self._thread_role_matches(job, role, binding):
             raise KernelError("thread_role_binding")
         profile, reference = self._thread_profile(tx, binding)
         if role == Role.DEVELOPMENT:
-            tx.execute("UPDATE subjects SET development_thread=? WHERE id=?", (thread_id, subject))
+            tx.execute(*selected_statement(tx, "UPDATE subjects SET development_thread=? WHERE id=?",
+                'UPDATE subjects SET development_thread=? WHERE id=? AND run_id=?',
+                (thread_id, subject), run_last=True))
         context = self._context(tx, run, job, world, role) if pending is None else {}
         if pending is None:
-            ordinal = tx.one("SELECT coalesce(max(ordinal),0)+1 FROM attempts WHERE subject=?", (subject,))[0]
+            ordinal = tx.one(*selected_statement(tx, "SELECT coalesce(max(ordinal),0)+1 FROM attempts WHERE subject=?",
+                          'SELECT coalesce(max(ordinal),0)+1 FROM attempts WHERE subject=? AND run_id=?',
+                          (subject,), run_last=True))[0]
             context_id = tx.put(subject, "role_context", wire_json(context))
-            tx.execute("""INSERT INTO attempts(id,subject,generation,ordinal,role,purpose,window,parent_revision,
+            tx.execute(*selected_statement(tx, """INSERT INTO attempts(id,subject,generation,ordinal,role,purpose,window,parent_revision,
                 graph_revision,revision,base_sha,candidate_sha,candidate_tree,expected_tree,completion_revision,
                 context_id,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'allocated')""",
-                       (attempt_id, subject, job["generation"], ordinal, role.value, job["purpose"], budget["window"],
+                "INSERT INTO attempts(id,subject,generation,ordinal,role,purpose,window,parent_revision,graph_revision,revision,base_sha,candidate_sha,candidate_tree,expected_tree,completion_revision,context_id,status,run_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'allocated',?)",
+                (attempt_id, subject, job["generation"], ordinal, role.value, job["purpose"], budget["window"],
                         run["parent_revision"], run["graph_revision"], job["revision"], context["base_sha"],
                         job["candidate_sha"], job["candidate_tree"], job["expected_tree"],
-                        job["completion_revision"], context_id))
+                        job["completion_revision"], context_id), run_last=True))
         else:
             # The Attempt owns its complete input; physical outputs are history.
             assert facts is not None
@@ -3914,12 +3959,16 @@ class Kernel:
         context["semantic_continuation"] = pending is not None
         if not retain_period:
             if pending is None:
-                responses = tx.all("SELECT material_id FROM history WHERE subject=? AND generation=? AND kind='human_response' ORDER BY position", (subject, job["generation"]))
+                responses = tx.all(*selected_statement(tx, "SELECT material_id FROM history WHERE subject=? AND generation=? AND kind='human_response' ORDER BY position",
+                                "SELECT material_id FROM history WHERE subject=? AND generation=? AND kind='human_response' AND run_id=? ORDER BY position",
+                                (subject, job["generation"]), run_last=True))
                 if responses:
                     context["human_responses"] = [tx.get(row[0], subject).decode() for row in responses]
             else:
                 actions = [*bound_feedback, *([] if pending["resume_action"] is None else [pending["resume_action"]])]
-                responses = [row for row in tx.all("SELECT identity,material_id FROM history WHERE subject=? AND generation=? AND kind='human_response' ORDER BY position", (subject, job["generation"])) if row["identity"] in actions]
+                responses = [row for row in tx.all(*selected_statement(tx, "SELECT identity,material_id FROM history WHERE subject=? AND generation=? AND kind='human_response' ORDER BY position",
+                                                "SELECT identity,material_id FROM history WHERE subject=? AND generation=? AND kind='human_response' AND run_id=? ORDER BY position",
+                                                (subject, job["generation"]), run_last=True)) if row["identity"] in actions]
                 if responses:
                     context["human_responses"] = [*context.get("human_responses", []), *[tx.get(row["material_id"], subject).decode() for row in responses]]
         context_id = tx.put(subject, "role_context", wire_json(context))
@@ -3936,8 +3985,9 @@ class Kernel:
         if pending is None:
             bind_attempt_continuation(tx, attempt_id, AttemptContinuationBasis(thread_id, context_id))
         owned_period = bool(retain_period and previous is not None and previous.invocation_id is not None
-                            and tx.rows("SELECT id FROM invocations WHERE id=? AND executor=? AND epoch=? AND thread=?",
-                                        (previous.invocation_id, execution.owner, execution.epoch, thread_id)))
+                            and tx.rows(*selected_statement(tx, "SELECT id FROM invocations WHERE id=? AND executor=? AND epoch=? AND thread=?",
+                                    'SELECT id FROM invocations WHERE id=? AND executor=? AND epoch=? AND thread=? AND run_id=?',
+                                    (previous.invocation_id, execution.owner, execution.epoch, thread_id), run_last=True)))
         started = self.clock()
         deadline = min(started + AGENT_PREPARATION_SECONDS, previous.deadline_at) if inherited and previous is not None else started + AGENT_PREPARATION_SECONDS
         preparation = AgentPreparation(identity(), attempt_id, subject, role, Purpose(job["purpose"]), thread_id,
@@ -3952,9 +4002,12 @@ class Kernel:
                     resume_action=None if pending is None else pending["resume_action"],
                     new_thread=False if pending is None else bool(pending["new_thread"]))
         scope = tx.put(subject, "agent_preparation", wire_json(data))
-        tx.execute("INSERT INTO waits(subject,kind,scope_id,started_at,deadline) VALUES (?,'agent_preparation',?,?,?)",
-                   (subject, scope, started, deadline))
-        tx.execute("UPDATE subjects SET current_attempt=?,version=version+1 WHERE id=?", (attempt_id, subject))
+        tx.execute(*selected_statement(tx, "INSERT INTO waits(subject,kind,scope_id,started_at,deadline) VALUES (?,'agent_preparation',?,?,?)",
+            "INSERT INTO waits(subject,kind,scope_id,started_at,deadline,run_id) VALUES (?,'agent_preparation',?,?,?,?)",
+            (subject, scope, started, deadline), run_last=True))
+        tx.execute(*selected_statement(tx, "UPDATE subjects SET current_attempt=?,version=version+1 WHERE id=?",
+            'UPDATE subjects SET current_attempt=?,version=version+1 WHERE id=? AND run_id=?',
+            (attempt_id, subject), run_last=True))
         for action_id in bound_feedback:
             self._event(tx, subject, "run_feedback_bound", action_id, context_id)
         return Step("preparing", subject, preparation=preparation)
@@ -4120,13 +4173,17 @@ class Kernel:
 
     def _integration_failure(self, tx: Transaction, job: sqlite3.Row) -> tuple[sqlite3.Row, dict[str, Any]] | None:
         """The last actual integration failure, never a later Review/Git check."""
-        rows = tx.rows("SELECT e.* FROM effects e JOIN material m ON m.id=e.receipt_id "
+        rows = tx.rows(*selected_statement(tx, "SELECT e.* FROM effects e JOIN material m ON m.id=e.receipt_id "
                        "WHERE e.subject=? AND e.generation=? AND e.operation='integrate' AND e.status='confirmed' "
                        "AND json_extract(CAST(m.body AS TEXT),'$.disposition')='failure' ORDER BY e.rowid DESC LIMIT 1",
-                       (job["id"], job["generation"]))
+                   "SELECT e.* FROM effects e JOIN material m ON m.run_id=e.run_id AND m.id=e.receipt_id WHERE e.subject=? AND e.generation=? AND e.operation='integrate' AND e.status='confirmed' AND json_extract(CAST(m.body AS TEXT),'$.disposition')='failure' AND e.run_id=? ORDER BY e.rowid DESC LIMIT 1",
+                   (job["id"], job["generation"]), run_last=True))
         return None if not rows else (rows[0], json.loads(tx.get(rows[0]["receipt_id"], job["id"])))
 
     def _context(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, world: World, role: Role) -> dict[str, Any]:
+        selected = transaction_scope(tx)
+        if selected is not None and (run["id"] != selected.run_id or job["run_id"] != selected.run_id):
+            raise KernelError("allocation_binding")
         context: dict[str, Any] = {
             "repository": run["repository"], "parent_issue": run["parent_issue"], "issue": job["issue"],
             "language": run["language"], "repository_root": run["repository_root"],
@@ -4154,8 +4211,9 @@ class Kernel:
             context["work_source"] = "ci"
             if job["ci_failure"]:
                 context["ci_evidence"] = json.loads(tx.get(job["ci_failure"], job["id"]))
-        revisions = tx.rows("SELECT material_id FROM history WHERE subject=? AND generation=? AND kind='revision_requested' ORDER BY position DESC LIMIT 1",
-                            (job["id"], job["generation"]))
+        revisions = tx.rows(*selected_statement(tx, "SELECT material_id FROM history WHERE subject=? AND generation=? AND kind='revision_requested' ORDER BY position DESC LIMIT 1",
+                        "SELECT material_id FROM history WHERE subject=? AND generation=? AND kind='revision_requested' AND run_id=? ORDER BY position DESC LIMIT 1",
+                        (job["id"], job["generation"]), run_last=True))
         if revisions:
             context["human_feedback"] = tx.get(revisions[0][0], job["id"]).decode()
         if role == Role.DEVELOPMENT and job["repair_source"] not in {None, "human_revision"}:
@@ -4177,7 +4235,9 @@ class Kernel:
                 "current_review_attempt": budget["reviews_used"] + 1,
                 "remaining_review_attempts": max(0, budget["review_limit"] - budget["reviews_used"] - int(role == Role.REVIEW)),
             }
-        seed = tx.rows("SELECT id FROM material WHERE subject=? AND purpose='fixture_evidence'", (job["id"],))
+        seed = tx.rows(*selected_statement(tx, "SELECT id FROM material WHERE subject=? AND purpose='fixture_evidence'",
+                   "SELECT id FROM material WHERE subject=? AND purpose='fixture_evidence' AND run_id=?",
+                   (job["id"],), run_last=True))
         if seed and role != Role.DEVELOPMENT:
             context["frozen_fixture_evidence"] = json.loads(tx.get(seed[0][0], job["id"]))
         if run["source_sequence"] is not None:
@@ -4185,21 +4245,29 @@ class Kernel:
             if job["kind"] == DeliveryKind.TICKET:
                 numbers.append((job["issue"], job["revision"], "requirements"))
             if job["kind"] == DeliveryKind.FINAL_RUN:
-                numbers.extend((row["issue"], row["revision"], "completed_ticket") for row in tx.all("SELECT issue,revision FROM subjects WHERE kind='ticket' ORDER BY issue"))
+                numbers.extend((row["issue"], row["revision"], "completed_ticket") for row in tx.all(*selected_statement(tx, "SELECT issue,revision FROM subjects WHERE kind='ticket' ORDER BY issue",
+                                                                                                  "SELECT issue,revision FROM subjects WHERE kind='ticket' AND run_id=? ORDER BY issue",
+                                                                                                  (), run_last=True)))
             context["requirements"] = []
             for number, revision, responsibility in numbers:
                 requirement: dict[str, Any] = {"number": number, "revision": revision, "responsibility": responsibility,
                                                "url": f"https://github.com/{run['repository']}/issues/{number}"}
                 if role != Role.DEVELOPMENT:
-                    value = tx.one("SELECT title,body FROM requirement_versions WHERE issue=? AND revision=?", (number, revision))
+                    value = tx.one(*selected_statement(tx, "SELECT title,body FROM requirement_versions WHERE issue=? AND revision=?",
+                                'SELECT title,body FROM requirement_versions WHERE issue=? AND revision=? AND run_id=?',
+                                (number, revision), run_last=True))
                     requirement.update({"title": value["title"], "body": value["body"]})
                 context["requirements"].append(requirement)
             if job["kind"] == DeliveryKind.FINAL_RUN:
-                barrier = tx.one("SELECT evidence FROM final_barriers WHERE subject=? AND generation=?", (job["id"], job["generation"]))
+                barrier = tx.one(*selected_statement(tx, "SELECT evidence FROM final_barriers WHERE subject=? AND generation=?",
+                              'SELECT evidence FROM final_barriers WHERE subject=? AND generation=? AND run_id=?',
+                              (job["id"], job["generation"]), run_last=True))
                 context["ticket_completions"] = json.loads(tx.get(barrier[0], job["id"]))
         previous_context = previous_artifact = None
         if job["review_attempt"]:
-            previous = tx.one("SELECT * FROM attempts WHERE id=?", (job["review_attempt"],))
+            previous = tx.one(*selected_statement(tx, "SELECT * FROM attempts WHERE id=?",
+                           'SELECT * FROM attempts WHERE id=? AND run_id=?',
+                           (job["review_attempt"],), run_last=True))
             previous_context = json.loads(tx.get(previous["context_id"], job["id"]))
             previous_artifact = artifact(Role.REVIEW, tx.get(previous["result_id"], job["id"]))
         if role == Role.REVIEW:
@@ -4221,9 +4289,10 @@ class Kernel:
                         and (job["purpose"] != Purpose.CI
                              or previous_context.get("ci_evidence", {}).get("head_sha") == review_base)):
                     review_base = previous_context["reviewed_commit"]
-            developments = tx.rows("SELECT id,result_id,purpose FROM attempts WHERE subject=? AND generation=? "
+            developments = tx.rows(*selected_statement(tx, "SELECT id,result_id,purpose FROM attempts WHERE subject=? AND generation=? "
                                    "AND role='development' AND status='consumed' ORDER BY ordinal DESC LIMIT 1",
-                                   (job["id"], job["generation"]))
+                               "SELECT id,result_id,purpose FROM attempts WHERE subject=? AND generation=? AND role='development' AND status='consumed' AND run_id=? ORDER BY ordinal DESC LIMIT 1",
+                               (job["id"], job["generation"]), run_last=True))
             if developments:
                 latest = developments[0]
                 facts.update(development_summary=artifact(Role.DEVELOPMENT, tx.get(latest["result_id"], job["id"]))["summary"],
@@ -4232,9 +4301,10 @@ class Kernel:
             if integration_failure is not None:
                 failure, original = integration_failure
                 development = (developments[0] if developments and developments[0]["purpose"] == Purpose.INTEGRATION
-                               else tx.one("SELECT id,result_id FROM attempts WHERE subject=? AND generation=? "
+                               else tx.one(*selected_statement(tx, "SELECT id,result_id FROM attempts WHERE subject=? AND generation=? "
                                            "AND purpose='integration' AND role='development' AND status='consumed' ORDER BY ordinal DESC LIMIT 1",
-                                           (job["id"], job["generation"])))
+                                        "SELECT id,result_id FROM attempts WHERE subject=? AND generation=? AND purpose='integration' AND role='development' AND status='consumed' AND run_id=? ORDER BY ordinal DESC LIMIT 1",
+                                        (job["id"], job["generation"]), run_last=True)))
                 same_development = facts.get("development_identity", {}).get("attempt_id") == development["id"]
                 summary = (facts.pop("development_summary") if same_development else
                            artifact(Role.DEVELOPMENT, tx.get(development["result_id"], job["id"]))["summary"])
@@ -4249,8 +4319,9 @@ class Kernel:
                     "development_summary": summary,
                 }
             if job["purpose"] == Purpose.CI and job["kind"] != DeliveryKind.TICKET:
-                accepted = tx.rows("SELECT context_id,result_id FROM attempts WHERE subject=? AND generation=? AND role='review' AND outcome='pass' AND purpose!='ci' AND revision=? AND parent_revision=? AND graph_revision=? AND completion_revision=? ORDER BY ordinal DESC LIMIT 1",
-                                   (job["id"], job["generation"], job["revision"], run["parent_revision"], run["graph_revision"], job["completion_revision"]))
+                accepted = tx.rows(*selected_statement(tx, "SELECT context_id,result_id FROM attempts WHERE subject=? AND generation=? AND role='review' AND outcome='pass' AND purpose!='ci' AND revision=? AND parent_revision=? AND graph_revision=? AND completion_revision=? ORDER BY ordinal DESC LIMIT 1",
+                               "SELECT context_id,result_id FROM attempts WHERE subject=? AND generation=? AND role='review' AND outcome='pass' AND purpose!='ci' AND revision=? AND parent_revision=? AND graph_revision=? AND completion_revision=? AND run_id=? ORDER BY ordinal DESC LIMIT 1",
+                               (job["id"], job["generation"], job["revision"], run["parent_revision"], run["graph_revision"], job["completion_revision"]), run_last=True))
                 if accepted:
                     accepted_context = json.loads(tx.get(accepted[0]["context_id"], job["id"]))
                     facts["parent_acceptance_baseline"] = {
@@ -4273,7 +4344,9 @@ class Kernel:
                 context.update(acceptance_artifact=previous_artifact,
                                acceptance_identity=self._review_identity(previous_context))
             elif job["kind"] == DeliveryKind.TICKET and job["gate_mode"] in {"deterministic_fallback", "ci_waiver"}:
-                development = tx.one("SELECT result_id FROM attempts WHERE subject=? AND generation=? AND role='development' AND status='consumed' ORDER BY ordinal DESC LIMIT 1", (job["id"], job["generation"]))
+                development = tx.one(*selected_statement(tx, "SELECT result_id FROM attempts WHERE subject=? AND generation=? AND role='development' AND status='consumed' ORDER BY ordinal DESC LIMIT 1",
+                                  "SELECT result_id FROM attempts WHERE subject=? AND generation=? AND role='development' AND status='consumed' AND run_id=? ORDER BY ordinal DESC LIMIT 1",
+                                  (job["id"], job["generation"]), run_last=True))
                 publication_facts = {
                     "current_candidate_identity": {"base_sha": context["base_sha"], "candidate_sha": job["candidate_sha"],
                                                    "candidate_tree": job["candidate_tree"], "integrated_sha": job["integrated_sha"],
