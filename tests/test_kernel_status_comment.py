@@ -48,6 +48,7 @@ def test_status_projection_and_intent_are_readonly_and_frozen(tmp_path, monkeypa
     assert scenario.kernel.operation_binding().inputs.notifications["enabled"] is False
     assert projection.target.actor == "offline-publisher"
     assert "Agent Run Status" in projection.body
+    assert "Recorded Review: pass" in projection.body
     assert ("Delivery: complete" if kind == DeliveryKind.TICKET else "Delivery: approval") in projection.body
     assert "not_recorded" in projection.body  # This offline producer never launched a formal Host.
     sender = StatusComments(database)
@@ -1293,3 +1294,120 @@ def test_status_displayed_markdown_round_trips_exact_run_argv(tmp_path, monkeypa
     assert received == [["resume", "--repo", scenario.spec.repository, "--", run_id]]
     assert [row[1] for row in api.commands] == ["POST"]
     assert database.read_bytes() == before
+
+
+def test_existing_pr_status_tracks_current_review_failure_repair_and_pass(tmp_path, monkeypatch):
+    scenario = published(tmp_path, monkeypatch)
+    kernel, subject = scenario.kernel, scenario.delivery.key
+    sender = StatusComments(kernel.storage.path)
+    api = CommentsAPI(project_status(kernel.storage.path, subject).target)
+    assert sender.deliver(subject, api=api) == "confirmed"
+    comment_id = api.comments[0]["id"]
+    scenario.reviews = ["pass", "fail", "pass"]
+    original_agent = scenario.agent
+
+    def agent(call):
+        raw = original_agent(call)
+        if call.role == "review":
+            import json
+            value = json.loads(raw)
+            for check in value["checks"].values():
+                check["evidence"] = "private-artifact-<script>\n```" * 1000
+            return json.dumps(value).encode()
+        return raw
+
+    monkeypatch.setattr(scenario, "agent", agent)
+    scenario.port.external_remote_append(scenario.delivery.target_ref,
+        {"new-target.txt": "An independent target change\n"}, "review-status-target")
+    assert kernel.control("approve", "review-status-update", subject=subject, world=scenario.world()) == "updating"
+    assert "Recorded Review: stale" in project_status(kernel.storage.path, subject).body
+    for _ in range(100):
+        scenario.step()
+        with kernel.storage.transaction(write=False) as tx:
+            job = tx.one("SELECT * FROM subjects WHERE id=?", (subject,))
+            review = tx.one("SELECT * FROM attempts WHERE id=?", (job["review_attempt"],)) if job["review_attempt"] else None
+        if review is not None and review["outcome"] == "fail":
+            break
+    else:
+        pytest.fail("An existing PR never reached the real failed Review")
+    assert job["phase"] == "development" and job["pr_number"] == api.target.pr_number
+    before = kernel.storage.path.read_bytes()
+    projection = project_status(kernel.storage.path, subject)
+    assert "Recorded Review: request_changes" in projection.body
+    assert review["candidate_sha"] in projection.body
+    assert kernel.storage.path.read_bytes() == before
+    assert sender.deliver(subject, api=api) == "confirmed"
+    assert api.comments[0]["id"] == comment_id and "Recorded Review: request_changes" in api.comments[0]["body"]
+    # Observe the real next Review before credentials/Invocation admission.
+    from support.core_operations import prepare_scripted_agent
+    for _ in range(100):
+        runner = scenario.runner()
+        step = runner.run_once()
+        if step.preparation is not None and step.preparation.role == "review":
+            break
+        step = prepare_scripted_agent(kernel, step)
+        if step.call is not None:
+            runner.authorize_agent(step.call)
+            kernel.receive(step.call, scenario.agent(step.call))
+    else:
+        pytest.fail("Repair did not prepare a fresh Review")
+    assert step.preparation.context["candidate_sha"] != review["candidate_sha"]
+    pending = project_status(kernel.storage.path, subject)
+    assert "Recorded Review: pending" in pending.body
+    assert "Recorded Review: request_changes" not in pending.body and "Recorded Review: pass" not in pending.body
+    call_step = prepare_scripted_agent(kernel, step)
+    assert call_step.call is not None
+    runner.authorize_agent(call_step.call)
+    kernel.receive(call_step.call, scenario.agent(call_step.call))
+    assert "Recorded Review: pending" in project_status(kernel.storage.path, subject).body
+    assert scenario.run().kind == "approval"
+    current = project_status(kernel.storage.path, subject)
+    assert "Recorded Review: pass" in current.body
+    assert "Recorded Review: request_changes" not in current.body
+    assert len(current.body.encode()) <= 8192 and "private-artifact" not in current.body
+    assert sender.deliver(subject, api=api) == "confirmed"
+    assert len(api.comments) == 1 and api.comments[0]["id"] == comment_id
+    assert [command[1] for command in api.commands] == ["POST", "PATCH", "PATCH"]
+
+
+def test_status_review_rejects_stale_scope_and_unknown_records_without_remote_writes(tmp_path, monkeypatch):
+    """Corrupt only isolated records negatively; normal positive flow is above."""
+    scenario = published(tmp_path, monkeypatch)
+    kernel, subject = scenario.kernel, scenario.delivery.key
+    with kernel.storage.transaction(write=False) as tx:
+        job = tx.one("SELECT * FROM subjects WHERE id=?", (subject,))
+        review = dict(tx.one("SELECT * FROM attempts WHERE id=?", (job["review_attempt"],)))
+    assert "Recorded Review: pass" in project_status(kernel.storage.path, subject).body
+    for key in ("role", "generation", "revision", "parent_revision", "graph_revision", "candidate_sha",
+                "candidate_tree", "base_sha", "expected_tree", "completion_revision"):
+        corrupt = review[key] + 1 if key == "generation" else "foreign-record"
+        with kernel.storage.transaction() as tx:
+            tx.execute(f"UPDATE attempts SET {key}=? WHERE id=?", (corrupt, review["id"]))
+        try:
+            before = kernel.storage.path.read_bytes()
+            body = project_status(kernel.storage.path, subject).body
+            assert "Recorded Review: stale" in body, key
+            assert "Recorded Review: pass" not in body and "Recorded Review: request_changes" not in body, key
+            assert kernel.storage.path.read_bytes() == before
+        finally:
+            with kernel.storage.transaction() as tx:
+                tx.execute(f"UPDATE attempts SET {key}=? WHERE id=?", (review[key], review["id"]))
+    for key, invalid in (("outcome", None), ("outcome", "fail"), ("result_id", None), ("status", "returned")):
+        with kernel.storage.transaction() as tx:
+            tx.execute(f"UPDATE attempts SET {key}=? WHERE id=?", (invalid, review["id"]))
+        try:
+            body = project_status(kernel.storage.path, subject).body
+            assert "Recorded Review: unknown" in body, (key, invalid)
+            assert "Recorded Review: pass" not in body and "Recorded Review: request_changes" not in body
+        finally:
+            with kernel.storage.transaction() as tx:
+                tx.execute(f"UPDATE attempts SET {key}=? WHERE id=?", (review[key], review["id"]))
+    with kernel.storage.transaction() as tx:
+        tx.execute("UPDATE subjects SET review_attempt=NULL WHERE id=?", (subject,))
+    try:
+        assert "Recorded Review: not_recorded" in project_status(kernel.storage.path, subject).body
+    finally:
+        with kernel.storage.transaction() as tx:
+            tx.execute("UPDATE subjects SET review_attempt=? WHERE id=?", (review["id"], subject))
+    assert "Recorded Review: pass" in project_status(kernel.storage.path, subject).body
+    assert not any(write["operation"] == "merge" for write in scenario.writes())

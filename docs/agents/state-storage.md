@@ -74,6 +74,10 @@ Final Run PR 的远端内容仍为 PR Narrative 与单条原地更新的 Agent R
 不再发布完整 `Run Publication Record` JSON 评论，也不把该 JSON 搬入正文或另一评论。
 历史评论保留原样；缺少该评论不影响待批准、准确合并或恢复。
 本地验收、发布、批准、预期合并树和 Required Checks 核验继续有效。
+Status 的 `Recorded Review` 只表达与当前记录的候选、base、generation 及需求范围匹配的
+Review：已消费结论为 `pass` / `request_changes`，尚未消费为 `pending`；
+过期、未知或没有记录分别明确标注，不推测通过，也不发布完整 Artifact。
+这是只读展示，不是实时远端复查或合并授权；评论仍使用原绑定和原 intent 对账更新。
 
 ## 读取与事务
 
