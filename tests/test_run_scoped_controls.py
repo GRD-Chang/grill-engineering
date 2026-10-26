@@ -340,7 +340,7 @@ def approval(db, run, *, result='pass', final=False):
     tx = RunTransaction(Transaction(db), run)
     material = tx.put(SUBJECT, 'required_checks', wire_json(asdict(checks)))
     insert(db, 'checks', {'run_id': run, 'id': 'same-check', 'subject': SUBJECT,
-        'head_sha': BASE.sha, 'pr_number': 11, 'material_id': material})
+        'head_sha': BASE.sha, 'pr_number': 11, 'result': checks.result, 'material_id': material})
     db.execute("UPDATE attempts SET status='returned',outcome='pass' WHERE run_id=?", (run,))
     db.execute("UPDATE subjects SET kind=?,phase='approval',purpose='integration',candidate_sha=?,candidate_tree=?,expected_tree=?,review_attempt='same-attempt',publication_sha=?,publication_tree=?,integration_target=?,pr_number=11,checks_id='same-check' WHERE run_id=?",
         ('final_run' if final else 'parent_only', BASE.sha, BASE.tree, BASE.tree, BASE.sha, BASE.tree, BASE.sha, run))
