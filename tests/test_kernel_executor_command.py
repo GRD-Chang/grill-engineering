@@ -155,7 +155,7 @@ def test_prompt_preparation_failure_durably_releases_only_its_original_allocatio
     from test_kernel_requirements import independent_source
     scenario = GraphScenario(tmp_path / "preparation", independent_source())
     kernel = scenario.kernel
-    operations = CoreOperations(kernel, scenario.execution, scenario.make_ports, credentials_ready=False)
+    operations = CoreOperations(kernel, scenario.execution, scenario.make_ports, prepare_agents=False)
     runner = operations.runner
     call = operations.until(lambda step: step.preparation is not None).preparation
     assert call is not None

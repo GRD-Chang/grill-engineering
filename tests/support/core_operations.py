@@ -20,6 +20,34 @@ if TYPE_CHECKING:
     from support.offline import GraphScenario
 
 
+def prepare_scripted_agent(kernel: Kernel, step: Step | AgentPreparation) -> Step:
+    """Deliver controlled native credentials before admitting a fixture Agent.
+
+    This is the external issuer substitute for Core/SQLite/Git contract tests,
+    not a ready flag or process/exit witness. Native transport tests keep the
+    original preparation and use their actual Codex capture instead.
+    """
+    if isinstance(step, Step) and step.preparation is None:
+        return step
+    import json
+    import tempfile
+    import time
+    from agent_run.adapters.auth.credential_lifecycle import ReadCredential
+    from agent_run.adapters.auth.worker_credentials import NativeCredentialDelivery
+
+    preparation = step if isinstance(step, AgentPreparation) else step.preparation
+    assert preparation is not None
+    with tempfile.TemporaryDirectory(prefix='controlled-credential-') as temporary:
+        directory = Path(temporary) / 'gh'
+        credential = ReadCredential('controlled-native-unit-credential', time.time() + 3600)
+        with NativeCredentialDelivery(lambda: credential, directory) as delivery:
+            delivery.start(guard=lambda: kernel.guard_preparation(preparation),
+                deadline=time.monotonic() + max(0, preparation.preparation_deadline-kernel.clock()))
+            config = json.loads((directory / 'hosts.yml').read_text())
+            assert config['github.com']['oauth_token'] == credential.token
+            return kernel.admit_agent(preparation)
+
+
 def scripted_return(kernel: Kernel, runner: OperationRunner, call: AgentCall,
                     agent: Callable[[AgentCall], bytes]) -> None:
     """A fixture Agent's raw result only; no invented start or exit observation."""
@@ -124,17 +152,15 @@ def final_scenario(root: Path, *, policy: Policy | None = None,
 
 class CoreOperations:
     def __init__(self, kernel: Kernel, execution: Execution,
-                 make_ports: Callable[[OperationBinding], OperationPorts], *, credentials_ready: bool = True) -> None:
-        self.credentials_ready = credentials_ready
+                 make_ports: Callable[[OperationBinding], OperationPorts], *, prepare_agents: bool = True) -> None:
+        self.prepare_agents = prepare_agents
         self.runner = OperationRunner(kernel, execution, make_ports)
         self.steps: list[Step] = []
 
     def once(self, *, agent_capacity: int = 1) -> Step:
         step = self.runner.run_once(agent_capacity=agent_capacity)
-        if self.credentials_ready and step.preparation is not None:
-            # This driver owns explicitly synthetic credential readiness;
-            # native credential tests use the Runner directly until admission.
-            step = self.runner.kernel.admit_agent(step.preparation)
+        if self.prepare_agents:
+            step = prepare_scripted_agent(self.runner.kernel, step)
         self.steps.append(step)
         return step
 

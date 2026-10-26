@@ -11,14 +11,14 @@ from dataclasses import replace
 
 from agent_run.config.resources import builtin_resources, personal_method_directory
 from agent_run.config.defaults import UserDefaultsStore
-from agent_run.model import AgentPreparation, Commit, Delivery, DeliveryKind, Role, RunSpec
+from agent_run.model import AgentPreparation, Step, Commit, Delivery, DeliveryKind, Role, RunSpec
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.runtime.codex import execute_codex
 from agent_run.config.creation import freeze_creation
 from support.offline import Scenario, review_result
 from agent_run.core.prompts.role import render_role_prompt
-from support.core_operations import CoreOperations, native_agent_fixture, observed_call, scripted_return, final_scenario
+from support.core_operations import CoreOperations, native_agent_fixture, observed_call, prepare_scripted_agent, scripted_return, final_scenario
 
 
 def frozen_call(tmp_path: Path) -> tuple[Kernel, AgentPreparation, CoreOperations, UserDefaultsStore]:
@@ -37,7 +37,7 @@ def frozen_call(tmp_path: Path) -> tuple[Kernel, AgentPreparation, CoreOperation
     spec = freeze_creation(RunSpec("prompt-run", "example/repository", 1, "parent-v1", "graph-v1", (delivery,)),
                            defaults, prompt_resources=resources)
     kernel, ports = native_agent_fixture(tmp_path / "state" / "kernel.sqlite3", spec)
-    operations = CoreOperations(kernel, kernel.claim_executor("prompt-owner"), lambda binding: ports, credentials_ready=False)
+    operations = CoreOperations(kernel, kernel.claim_executor("prompt-owner"), lambda binding: ports, prepare_agents=False)
     call = operations.once().preparation
     assert call is not None
     return kernel, call, operations, defaults
@@ -79,7 +79,7 @@ print(json.dumps({{'type': 'thread.started', 'thread_id': 'prompt-thread'}}), fl
     assert "Frozen development method" not in repaired_prompt
     assert "Unrelated acceptance method must not leak" not in repaired_prompt
     assert credential.read_bytes()  # The renderer test explicitly owns this synthetic readiness.
-    actual_repair = kernel.admit_agent(repair).call
+    actual_repair = prepare_scripted_agent(kernel, Step("preparing", repair.subject, preparation=repair)).call
     assert actual_repair is not None
     assert actual_repair.invocation_id == observed_call(kernel, call).invocation_id
     assert actual_repair.deadline_at == observed_call(kernel, call).deadline_at
@@ -90,7 +90,7 @@ def test_call_without_frozen_resources_is_rejected_before_dispatch(tmp_path: Pat
     base = Commit("base", "tree")
     delivery = Delivery("ticket", DeliveryKind.TICKET, 2, "ticket", base, "source", "target")
     kernel, ports = native_agent_fixture(tmp_path / "kernel.sqlite3", RunSpec("run", "example/repository", 1, "parent", "graph", (delivery,)))
-    call = CoreOperations(kernel, kernel.claim_executor("owner"), lambda binding: ports, credentials_ready=False).once().preparation
+    call = CoreOperations(kernel, kernel.claim_executor("owner"), lambda binding: ports, prepare_agents=False).once().preparation
     # Missing resources is a renderer input contract, not authorization to run
     # an unconfigured Core. Exercise it on the immutable call before dispatch.
     assert call is not None
@@ -139,7 +139,7 @@ def test_same_thread_new_development_attempt_keeps_complete_repair_method(tmp_pa
     spec = freeze_creation(scenario.spec, defaults, prompt_resources=resources)
     scenario.kernel = Kernel.create(tmp_path / "state" / "kernel.sqlite3", spec, requirements=scenario.requirements)
     scenario.execution = scenario.kernel.claim_executor("prompt-owner")
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports, credentials_ready=False)
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports, prepare_agents=False)
     first = None
     reviewed = False
     for _ in range(30):
@@ -220,7 +220,7 @@ def test_publication_prompt_consumes_only_the_actual_authorized_evidence(
         scenario.kernel = Kernel.create(tmp_path / "state" / "kernel.sqlite3", spec, requirements=scenario.requirements)
     if kind != DeliveryKind.FINAL_RUN:
         scenario.execution = scenario.kernel.claim_executor("prompt-owner")
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports, credentials_ready=False)
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports, prepare_agents=False)
     for _ in range(80):
         step = operations.once()
         if step.preparation is None:

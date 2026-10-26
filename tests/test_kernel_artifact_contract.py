@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from support.core_operations import CoreOperations, scripted_return
+from support.core_operations import CoreOperations, scripted_return, prepare_scripted_agent
 from agent_run.model import Role
 from agent_run.contracts.artifact import parse_artifact, role_schema
 from agent_run.errors import ArtifactContractError
@@ -48,13 +48,13 @@ def test_publication_message_rejects_a_missing_or_multiline_title(message):
 
 
 def next_call(scenario, role, *, preparation=False):
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports, credentials_ready=not preparation)
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports, prepare_agents=not preparation)
     for _ in range(40):
         step = operations.once()
         if step.preparation is not None:
             if step.preparation.role == role:
                 return step.preparation
-            step = scenario.kernel.admit_agent(step.preparation)
+            step = prepare_scripted_agent(scenario.kernel, step)
         if step.call is not None and step.call.role == role:
             return step.call
         assert step.kind in {"agent", "effect", "progress"}, step
