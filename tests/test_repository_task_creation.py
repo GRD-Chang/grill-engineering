@@ -21,7 +21,7 @@ from agent_run.core.task_creation import (
 from agent_run.errors import KernelError
 from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
 from agent_run.storage.repository_schema import REPOSITORY_TASK_SCHEMA
-from agent_run.storage.run_scope import RunTransaction
+from agent_run.storage.run_scope import RunTransaction, transaction_scope
 from agent_run.storage.save_order import remaining
 from agent_run.storage.sqlite import Transaction
 from agent_run.storage.sqlite import Storage
@@ -116,6 +116,52 @@ def test_idle_task_is_independent_and_has_no_run_or_execution_facts(scenario):
     assert db.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
     for table in ('runs', 'subjects', 'actions', 'invocations', 'invocation_outputs', 'budgets', 'hosts'):
         assert db.execute('SELECT count(*) FROM ' + table).fetchone()[0] == 0
+
+
+def test_metadata_owner_does_not_infer_a_run_or_relax_global_business_scope(scenario):
+    db, _, writer, task = scenario
+    with writer.transaction(ordered=False) as owner:
+        owner.rows_read, owner.bytes_read = 7, 19
+        with pytest.raises(KernelError, match='run_scope_required'):
+            transaction_scope(owner)
+        ensure_idle_task(owner, task)
+        assert owner.rows_read >= 7 and owner.bytes_read >= 19 and not owner.failed
+        assert owner.one('SELECT count(*) FROM runs')[0] == 0
+        before = owner.rows_read, owner.bytes_read
+        with pytest.raises(KernelError, match='run_scope_required'):
+            transaction_scope(owner)
+        assert (owner.rows_read, owner.bytes_read) == before
+    assert db.execute('SELECT current_run FROM tasks').fetchone()[0] is None
+
+
+@pytest.mark.parametrize('invalid', ['outside_transaction', 'run_view', 'poison', 'query_only', 'foreign_keys_off'])
+def test_metadata_seam_rejects_invalid_owner_without_task_writes(scenario, invalid):
+    db, kernel, _, task = scenario
+    if invalid == 'run_view':
+        create(kernel, task)
+    before = snapshot(db)
+    if invalid == 'foreign_keys_off':
+        db.execute('PRAGMA foreign_keys=OFF')
+    if invalid != 'outside_transaction':
+        db.execute('BEGIN IMMEDIATE')
+    owner = Transaction(db)
+    if invalid == 'run_view':
+        owner = RunTransaction(owner, 'A')
+    elif invalid == 'poison':
+        owner.failed = True
+    elif invalid == 'query_only':
+        db.execute('PRAGMA query_only=ON')
+    try:
+        code = 'transaction_aborted' if invalid == 'poison' else 'task_creation_transaction_required'
+        with pytest.raises(KernelError, match=code):
+            ensure_idle_task(owner, task)
+        if invalid == 'poison':
+            assert owner.failed
+    finally:
+        db.rollback()
+        db.execute('PRAGMA query_only=OFF')
+        db.execute('PRAGMA foreign_keys=ON')
+    assert snapshot(db) == before
 
 
 def test_creation_freezes_and_binds_in_one_owner_with_no_locator_or_allocation(scenario):

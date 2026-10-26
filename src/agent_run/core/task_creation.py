@@ -17,7 +17,7 @@ from agent_run.contracts.prompt import validate_resources
 from agent_run.contracts.task import TaskKey
 from agent_run.errors import KernelError
 from agent_run.model import CreationInputs, Requirements, RunSpec
-from agent_run.storage.run_scope import RunTransaction, transaction_scope
+from agent_run.storage.run_scope import RunTransaction
 from agent_run.storage.save_order import WRITE_CONTENTION_SECONDS, remaining
 from agent_run.storage.sqlite import Transaction
 
@@ -34,11 +34,26 @@ class TaskRun:
 
 
 def _writer(owner: Transaction) -> None:
-    # Plain owner for Task metadata; Run views below share this exact owner.
-    if transaction_scope(owner) is not None or not owner.connection.in_transaction:
+    # Task metadata precedes any Run selection. The global transaction_scope
+    # guard correctly refuses a bare owner on the repository layout; it must
+    # not be used to authorize this distinct, bounded metadata seam.
+    if type(owner) is not Transaction or not owner.connection.in_transaction:
         raise KernelError("task_creation_transaction_required")
     if owner.failed:
         raise KernelError("transaction_aborted")
+    if (owner.execute("PRAGMA foreign_keys").fetchone()[0] != 1
+            or owner.execute("PRAGMA query_only").fetchone()[0] != 0):
+        raise KernelError("task_creation_transaction_required")
+    # Inspect only bounded schema metadata; no arbitrary Run is inferred, and
+    # subsequent business reads/writes still require an explicit RunTransaction.
+    columns = owner.execute("PRAGMA table_info(material)").fetchmany(32)
+    primary = [row["name"] for row in sorted(columns, key=lambda row: row["pk"]) if row["pk"]]
+    task_columns = owner.execute("PRAGMA table_info(tasks)").fetchmany(16)
+    link_columns = owner.execute("PRAGMA table_info(task_runs)").fetchmany(16)
+    if (primary != ["run_id", "id"]
+            or [row["name"] for row in task_columns] != ["id", "repository", "repository_root", "parent_issue", "current_run"]
+            or [row["name"] for row in link_columns] != ["task_id", "run_id", "repository", "repository_root", "parent_issue"]):
+        raise KernelError("task_creation_schema_required")
 
 
 def _task_row(owner: Transaction, task: TaskKey) -> sqlite3.Row | None:
