@@ -15,7 +15,7 @@ import pytest
 from agent_run.adapters.foreground import ProcessPin, read_record, subreaper
 from agent_run.core.kernel import Kernel
 from agent_run.runtime.package_lease import default_runner_lock_path, runner_management_lease
-from test_kernel_managed_entry_end_to_end import _CODEX, _control_environment, _git
+from support.systemd_manager import _CODEX, _control_environment, _git
 from agent_run.adapters.workspace import ManagedWorkspace
 
 

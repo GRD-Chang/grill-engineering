@@ -10,7 +10,7 @@ from agent_run.adapters.remote import RemoteEffects
 from agent_run.adapters.source import read_requirements
 from agent_run.core.operation_runner import OperationRunner
 from support.offline import GraphScenario
-from test_kernel_managed_entry_end_to_end import _CODEX, _control_environment, _git
+from support.systemd_manager import _CODEX, _control_environment, _git
 from support.core_operations import Ports, settle_agent
 
 
