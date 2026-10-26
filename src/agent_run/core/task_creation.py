@@ -106,11 +106,14 @@ def _reconcile(kernel: "Kernel", owner: Transaction, task: TaskKey, run_id: str,
                *, created: bool = False) -> TaskRun:
     _writer(owner)
     row = _task_row(owner, task)
-    if row is None or row["current_run"] is None:
-        raise KernelError("task_creation_unknown")
+    links = owner.rows("SELECT task_id FROM task_runs WHERE run_id=?", (run_id,), limit=1)
+    # A recorded foreign owner is a known identity conflict even when the
+    # requested Task is absent or idle. It is not an uncertain commit outcome.
+    if links and links[0]["task_id"] != task.fingerprint:
+        raise KernelError("task_location_identity")
     # A missing proposal is NOT proof that a failed COMMIT rolled back. Refuse
     # rather than create, replace the winner, or adopt an unbound header.
-    if not owner.rows("SELECT run_id FROM task_runs WHERE run_id=?", (run_id,), limit=1):
+    if row is None or row["current_run"] is None or not links:
         raise KernelError("task_creation_unknown")
     _binding(kernel, owner, task, run_id)
     if row["current_run"] != run_id:

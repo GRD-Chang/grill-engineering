@@ -286,6 +286,26 @@ def test_foreign_task_current_run_and_same_id_proposal_are_rejected(scenario):
     assert snapshot(db) == before
 
 
+@pytest.mark.parametrize('registered', [False, True])
+def test_known_foreign_proposal_is_not_unknown_for_an_absent_or_idle_task(scenario, registered):
+    db, kernel, writer, task = scenario
+    create(kernel, task)
+    other = TaskKey(task.workspace, task.repository, 2)
+    if registered:
+        with writer.transaction(ordered=False) as owner:
+            ensure_idle_task(owner, other)
+    before = snapshot(db)
+    with pytest.raises(KernelError, match='task_location_identity'):
+        reconcile_repository_task(kernel, other, 'A')
+    assert snapshot(db) == before
+    with pytest.raises(KernelError, match='task_location_identity'):
+        create(kernel, other, 'A')
+    assert snapshot(db) == before
+    # No membership/loser alias is manufactured for the caller by either path.
+    assert db.execute('SELECT count(*) FROM task_runs').fetchone()[0] == 1
+    assert db.execute('SELECT task_id FROM task_runs').fetchone()[0] == task.fingerprint
+
+
 def test_complete_successor_and_old_proposal_readback_do_not_rebind_current(scenario):
     db, kernel, _, task = scenario
     create(kernel, task)
