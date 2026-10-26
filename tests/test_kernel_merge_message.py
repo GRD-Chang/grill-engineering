@@ -35,14 +35,75 @@ def _merge_record(scenario: Scenario):
             None if row["receipt_id"] is None else json.loads(tx.get(row["receipt_id"], row["subject"])))
 
 
-@pytest.mark.parametrize("message,expected,title,body", [
-    ("feat: no body\r\n", "feat: no body", "feat: no body", ""),
+@pytest.mark.parametrize("repair", [False, True], ids=["first-publication", "updated-after-ci"])
+def test_ticket_squash_uses_the_complete_published_pr_not_the_latest_commit(tmp_path, monkeypatch, repair):
+    scenario = Scenario(tmp_path / "ticket", DeliveryKind.TICKET,
+                        checks=("fail", "pass") if repair else ("pass",))
+    original = scenario.agent
+    publications = []
+
+    def agent(call):
+        raw = original(call)
+        if call.role == Role.PUBLICATION:
+            value = json.loads(raw)
+            number = len(publications) + 1
+            value.update(commit_message=f"fix: narrow patch {number}",
+                         pr_title=f"feat(ticket): 完整交付 {number}",
+                         pr_body_markdown="## What Problem This Solves\r\n完整任务。\r\n\r\n## Evidence\r\nReviewed implementation " + str(number))
+            publications.append(dict(value))
+            return wire_json(value)
+        return raw
+
+    monkeypatch.setattr(scenario, "agent", agent)
+    assert scenario.run().kind == "complete"
+    row, payload, receipt = _merge_record(scenario)
+    publication = publications[-1]
+    expected_body = "Parent Issue: #1\nPrimary Ticket: #2\nDelivery Type: Ticket\n\n" + publication["pr_body_markdown"]
+    expected = publication["pr_title"] + "\n\n" + expected_body
+    assert payload["commit_message"] == expected
+    assert receipt["raw"]["commit_message"] == expected + "\n"
+    assert row["status"] == "confirmed" and row["attempts"] == 1
+    assert scenario.port.git.run("show", "-s", "--format=%B", receipt["commit"]["sha"]).stdout == expected + "\n\n"
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        published = json.loads(tx.get(tx.one("SELECT payload_id FROM effects WHERE operation='publication_commit' ORDER BY rowid DESC LIMIT 1")[0], scenario.delivery.key))
+        assert published["commit_message"] == publication["commit_message"]
+        assert published["title"] == publication["pr_title"]
+    assert len(publications) == (2 if repair else 1)
+    assert scenario.development_count == (2 if repair else 1)
+
+
+def test_foreign_pr_body_cannot_be_adopted_as_the_ticket_squash_intent(tmp_path):
+    scenario = Scenario(tmp_path / "ticket", DeliveryKind.TICKET)
+    for _ in range(80):
+        scenario.step()
+        if scenario.kernel.status(scenario.delivery.key)["phase"] == "merge":
+            break
+    else:
+        raise AssertionError("The real Ticket never reached the merge boundary")
+    status = scenario.kernel.status(scenario.delivery.key)
+    pr_number = status["pr_number"]
+    before = scenario.port.remote_commit(scenario.delivery.target_ref)
+    external = SyntheticGitHub(scenario.port.git, scenario.port.database, "example/project",
+        physical=scenario.port.physical, written=lambda *args: None, read_faults=set(), actor="external-maintainer")
+    assert external.write(f"repos/example/project/pulls/{pr_number}", "PATCH", {"body": "Unapproved external narrative"}).returncode == 0
+    result = scenario.run()
+    assert result.kind == "paused"
+    row, payload, _receipt = _merge_record(scenario)
+    assert "Unapproved external narrative" not in payload["commit_message"]
+    assert "Synthetic scenario with recorded evidence 1." in payload["commit_message"]
+    assert row["attempts"] == 0
+    assert scenario.port.remote_commit(scenario.delivery.target_ref) == before
+    assert not any(write["operation"] in {"merge", "completion_comment", "close"} for write in scenario.port.writes())
+    assert scenario.port.objects.issue(scenario.delivery.issue)["state"] == "open"
+
+
+@pytest.mark.parametrize("message,expected", [
+    ("feat: no body\r\n", "feat: no body"),
     ("feat: CRLF title\r\n\r\nBody\r\nLast line  \r\n\r\n",
-     "feat: CRLF title\n\nBody\r\nLast line  \r\n\r\n",
-     "feat: CRLF title", "Body\r\nLast line  \r\n\r\n"),
+     "feat: CRLF title\n\nBody\r\nLast line  \r\n\r\n"),
 ], ids=["no-body", "crlf-header"])
-def test_publication_freezes_canonical_header_and_sends_exact_title_body(
-    tmp_path, monkeypatch, message, expected, title, body,
+def test_publication_commit_keeps_canonical_message_and_squash_keeps_full_pr(
+    tmp_path, monkeypatch, message, expected,
 ):
     original = SyntheticGitHub.write
     requests = []
@@ -57,16 +118,24 @@ def test_publication_freezes_canonical_header_and_sends_exact_title_body(
     _message_agent(scenario, monkeypatch, message)
     assert scenario.run().kind == "complete"
     row, payload, receipt = _merge_record(scenario)
+    title = "feat: synthetic behavior 1"
+    body = "Parent Issue: #1\nPrimary Ticket: #2\nDelivery Type: Ticket\n\nSynthetic scenario with recorded evidence 1."
+    squash = title + "\n\n" + body
     assert len(requests) == 1
     assert requests[0]["commit_title"] == title and requests[0]["commit_message"] == body
     assert "\n" not in requests[0]["commit_title"] and "\r" not in requests[0]["commit_title"]
-    assert payload["commit_message"] == expected and row["attempts"] == 1
-    assert receipt["raw"]["commit_message"] == (expected if expected.endswith("\n") else expected + "\n")
+    assert payload["commit_message"] == squash and row["attempts"] == 1
+    assert receipt["raw"]["commit_message"] == squash + "\n"
     with scenario.kernel.storage.transaction(write=False) as tx:
         attempt = tx.one("SELECT * FROM attempts WHERE subject=? AND role='publication'", (scenario.delivery.key,))
         output = tx.one("SELECT raw_id FROM invocation_outputs WHERE invocation=?", (attempt["current_invocation"],))
         assert json.loads(tx.get(output[0], scenario.delivery.key))["commit_message"] == message
         assert tx.get(attempt["result_id"], scenario.delivery.key) == tx.get(output[0], scenario.delivery.key)
+        publication = tx.one("SELECT * FROM effects WHERE operation='publication_commit'")
+        assert json.loads(tx.get(publication["payload_id"], scenario.delivery.key))["commit_message"] == expected
+        commit = json.loads(tx.get(publication["receipt_id"], scenario.delivery.key))["commit"]
+    actual = scenario.port.git.run("cat-file", "-p", commit["sha"]).stdout.partition("\n\n")[2]
+    assert actual == (expected if expected.endswith("\n") else expected + "\n")
 
 
 @pytest.mark.parametrize("fault", ["duplicate-body", "extra-blank-line"])
@@ -115,14 +184,20 @@ def test_wrong_squash_message_cannot_complete_or_repeat_the_original_merge(tmp_p
     'feat: preserve body whitespace\n\nTrailing spaces remain here  \n\n  Indented line.',
     'feat: retain body line endings\n\nFirst body line\r\nSecond body line',
 ])
-def test_original_squash_message_survives_real_git_and_complete_receipt(tmp_path, monkeypatch, message):
+def test_original_publication_message_survives_real_git_and_complete_receipt(tmp_path, monkeypatch, message):
     scenario = Scenario(tmp_path / "ticket", DeliveryKind.TICKET)
     _message_agent(scenario, monkeypatch, message)
     assert scenario.run().kind == "complete"
     row, payload, receipt = _merge_record(scenario)
     assert row["status"] == "confirmed" and row["attempts"] == 1 and row["generation"] == 1
-    assert payload["method"] == "squash" and payload["commit_message"] == message
-    assert receipt["raw"]["commit_message"] == message + "\n"
+    expected = "feat: synthetic behavior 1\n\nParent Issue: #1\nPrimary Ticket: #2\nDelivery Type: Ticket\n\nSynthetic scenario with recorded evidence 1."
+    assert payload["method"] == "squash" and payload["commit_message"] == expected
+    assert receipt["raw"]["commit_message"] == expected + "\n"
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        publication = tx.one("SELECT * FROM effects WHERE operation='publication_commit'")
+        assert json.loads(tx.get(publication["payload_id"], scenario.delivery.key))["commit_message"] == message
+        sha = json.loads(tx.get(publication["receipt_id"], scenario.delivery.key))["commit"]["sha"]
+    assert scenario.port.git.run("cat-file", "-p", sha).stdout.partition("\n\n")[2] == message + "\n"
     assert scenario.port.objects.issue(scenario.delivery.issue)["state"] == "closed"
 
 
@@ -199,6 +274,7 @@ def test_ordinary_parent_merge_keeps_its_own_message_policy(tmp_path, monkeypatc
 def test_requeued_generation_uses_its_own_original_publication_message(tmp_path, monkeypatch, old_message):
     scenario = Scenario(tmp_path / "ticket", DeliveryKind.TICKET)
     messages = []
+    narratives = []
     original_agent = scenario.agent
 
     def agent(call):
@@ -206,7 +282,10 @@ def test_requeued_generation_uses_its_own_original_publication_message(tmp_path,
         if call.role == Role.PUBLICATION:
             value = json.loads(raw)
             value["commit_message"] = f'feat: generation {call.context["generation"]}\n\nOriginal reviewed message.'
+            value["pr_title"] = f'feat: complete generation {call.context["generation"]}'
+            value["pr_body_markdown"] = f'Complete reviewed requirement for generation {call.context["generation"]}.'
             messages.append(value["commit_message"])
+            narratives.append(value["pr_title"] + "\n\nParent Issue: #1\nPrimary Ticket: #2\nDelivery Type: Ticket\n\n" + value["pr_body_markdown"])
             return wire_json(value)
         return raw
 
@@ -232,7 +311,7 @@ def test_requeued_generation_uses_its_own_original_publication_message(tmp_path,
 
     def service(self, endpoint, method, body):
         if old_message and endpoint.endswith("/merge"):
-            title, _, details = messages[0].partition("\n\n")
+            title, _, details = narratives[0].partition("\n\n")
             body = {**body, "commit_title": title, "commit_message": details}
         return original_write(self, endpoint, method, body)
 
@@ -245,7 +324,7 @@ def test_requeued_generation_uses_its_own_original_publication_message(tmp_path,
     assert messages == ['feat: generation 1\n\nOriginal reviewed message.',
                         'feat: generation 2\n\nOriginal reviewed message.']
     row, payload, receipt = _merge_record(scenario)
-    assert row["generation"] == 2 and row["attempts"] == 1 and payload["commit_message"] == messages[1]
-    assert receipt["raw"]["commit_message"] == messages[0 if old_message else 1] + "\n"
+    assert row["generation"] == 2 and row["attempts"] == 1 and payload["commit_message"] == narratives[1]
+    assert receipt["raw"]["commit_message"] == narratives[0 if old_message else 1] + "\n"
     assert scenario.port.objects.issue(scenario.delivery.issue)["state"] == ("open" if old_message else "closed")
     assert len([w for w in scenario.port.writes() if w["operation"] == "merge"]) == 1

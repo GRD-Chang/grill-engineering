@@ -536,7 +536,7 @@ _Avoid_: Parent Spec 静默改写、直接修改 Run Branch、无限自动重试
 _Avoid_: 暂停、单 Ticket 阻塞、默认分支回滚、将 `abandon` 默认解释为丢弃未提交成果
 
 **Ticket Squash Merge（Ticket 压缩合并）**:
-Publisher 在 Ticket PR 的 Published-Head Gate 通过后执行的固定合并方式。它使用 `--squash` 与 `--match-head-commit`，将 PR 公开分支上的 Publication 与 repair commits 作为一个新语义 commit 写入 Run Branch；首次推送前已压缩掉的本地 Candidate Commits 不会出现在 PR 页面。合并结果必须继续匹配 Ticket Integration Gate 绑定的 base、Publication tree，以及 Publication Artifact 的完整提交说明（标题与正文）。
+Publisher 在 Ticket PR 的 Published-Head Gate 通过后执行的固定合并方式。它通过正式合并请求指定 `merge_method=squash` 与准确 head `sha`，将 PR 公开分支上的 Publication 与 repair commits 作为一个新语义 commit 写入 Run Branch；首次推送前已压缩掉的本地 Candidate Commits 不会出现在 PR 页面。合并结果必须继续匹配 Ticket Integration Gate 绑定的 base、Publication tree，以及准确 merge intent 的完整提交说明。Ticket squash 使用该次 Publication 的 pr_title 与程序实际发布的完整 PR 正文，包含关联前缀；commit_message 仅用于本次发布提交。写前实际 PR 文案必须仍与冻结的 squash 说明一致，已发送意图和合并回执按原说明严格对账，不改绑新文案。
 _Avoid_: Rebase merge、普通 merge commit、发布前 Candidate 压缩、仅比较提交标题
 
 **Run Merge Commit（运行合并提交）**:

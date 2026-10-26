@@ -200,7 +200,8 @@ def test_original_merge_ack_loss_settles_after_later_target_append(tmp_path, mon
     _effect, pr = _publish_pr(port, push)
     parents = [push.base.sha] + ([] if method == "squash" else [push.after_sha])
     merge = replace(push, effect_id="merge-1", operation="merge", pr_number=pr.number,
-        payload={"method": method, "parents": parents, "commit_message": "Reviewed merge\n\nOriginal body"})
+        payload={"method": method, "parents": parents,
+                 "commit_message": pr.title + "\n\n" + pr.body if method == "squash" else "Reviewed merge\n\nOriginal body"})
     _change(state, lose_operation="merge")
     result = port.execute(merge, WriteAuthority(lambda: lambda: None))
     assert result.disposition == "target" and result.raw["write_returncode"] == 1
@@ -228,6 +229,28 @@ def test_original_merge_ack_loss_settles_after_later_target_append(tmp_path, mon
     assert resumed.raw["commit_message"] == result.raw["commit_message"]
     actual = [json.loads(line) for line in calls.read_text().splitlines()]
     assert sum(c[1].endswith("/merge") and "PUT" in c for c in actual) == 1
+
+
+@pytest.mark.parametrize("changed", ["pr-title", "pr-body", "original-intent"])
+def test_squash_never_rebinds_an_original_intent_to_other_pr_text(tmp_path, monkeypatch, changed):
+    port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
+    _effect, pr = _publish_pr(port, push)
+    original_message = pr.title + "\n\n" + pr.body
+    merge = replace(push, effect_id="original-squash", operation="merge", pr_number=pr.number,
+        payload={"method": "squash", "parents": [push.base.sha], "commit_message": original_message})
+    if changed == "original-intent":
+        # An older frozen intent must not silently adopt the current PR text.
+        merge = replace(merge, payload={**merge.payload, "commit_message": "fix: former local patch"})
+    else:
+        document = json.loads(state.read_text())
+        document["prs"][0]["title" if changed == "pr-title" else "body"] = "External replacement narrative"
+        state.write_text(json.dumps(document))
+    before = dict(merge.payload)
+    result = port.execute(merge, WriteAuthority(lambda: lambda: pytest.fail("other text cannot authorize a squash")))
+    assert result.disposition == "third" and merge.payload == before
+    actual = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert not any(c[1].endswith("/merge") and "PUT" in c for c in actual)
+    assert port.git.run("ls-remote", "origin", push.target_ref).stdout.split()[0] == push.base.sha
 
 
 def test_remote_cas_still_preserves_third_head_appearing_at_dispatch(tmp_path, monkeypatch):
