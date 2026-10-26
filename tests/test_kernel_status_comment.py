@@ -12,14 +12,19 @@ from agent_run.storage import notification_outbox as outbox
 from support.offline import Scenario
 
 
-def published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, notifications=None, kind=DeliveryKind.PARENT_ONLY) -> Scenario:
+def published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, notifications=None, kind=DeliveryKind.PARENT_ONLY, runner_identity=None) -> Scenario:
     # Use the real Task creation API instead of inventing its location pointer.
     original = Kernel.create.__func__
     def create(cls: type[Kernel], path: Path, spec: Any, **kwargs: Any) -> Kernel:
-        if notifications is not None:
+        if notifications is not None or runner_identity is not None:
             from dataclasses import replace
             assert spec.inputs is not None
-            spec = replace(spec, inputs=replace(spec.inputs, notifications=notifications))
+            values = {}
+            if notifications is not None:
+                values["notifications"] = notifications
+            if runner_identity is not None:
+                values["runner_identity"] = runner_identity
+            spec = replace(spec, inputs=replace(spec.inputs, **values))
         with monkeypatch.context() as patch:
             patch.setattr(Kernel, "create", classmethod(original))
             return Kernel.create_task(path, spec, requirements=kwargs["requirements"])
@@ -455,3 +460,84 @@ def test_status_state_change_between_staging_and_claim_fences_original_copy(tmp_
     assert api.commands == []
     assert sender.deliver(subject, api=api) == "confirmed"
     assert len(api.comments) == 1 and "operator_stopped" in api.comments[0]["body"]
+
+
+def test_concurrent_confirmation_is_no_work_before_claim_and_cancel_releases_claim(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    scenario = published(tmp_path, monkeypatch)
+    database, subject = scenario.kernel.storage.path, scenario.delivery.key
+    first, second = StatusComments(database), StatusComments(database)
+    api = CommentsAPI(project_status(database, subject).target)
+    entered, release = Event(), Event()
+    stage = first.stage
+    def staged(owner):
+        value = stage(owner)
+        entered.set()
+        assert release.wait(5)
+        return value
+    before = database.read_bytes()
+    with monkeypatch.context() as patch, ThreadPoolExecutor(max_workers=1) as pool:
+        patch.setattr(first, "stage", staged)
+        future = pool.submit(first.deliver, subject, api=api)
+        try:
+            assert entered.wait(5)
+            assert second.deliver(subject, api=api) == "confirmed"
+        finally:
+            release.set()
+        assert future.result(timeout=10) == "unchanged"
+    assert [command[1] for command in api.commands] == ["POST"]
+    assert database.read_bytes() == before
+    scenario.kernel.control("stop", "cancel-status-after-concurrent-confirmation", subject=subject)
+    assert first.deliver(subject, api=api, cancelled=lambda: True) == "unavailable"
+    document = outbox.read_notifications(database.parent, scenario.spec.run_id)
+    entry, = document["remote_status"]["bindings"].values()
+    assert "claim" not in entry and entry["intent"]["sent"] is False
+    assert second.deliver(subject, api=api) == "confirmed"
+    assert first.deliver(subject, api=api) == "unchanged"
+    assert [command[1] for command in api.commands] == ["POST", "PATCH"]
+
+
+def test_app_identity_403_is_scoped_display_failure_without_dispatch(tmp_path, monkeypatch):
+    from agent_run.adapters.auth.app import GitHubCredentialError
+    identity = {"source": "app", "app_profile": {"app_id": "123", "installation_id": "456",
+                "private_key_path": str(tmp_path / "unread-synthetic-key-reference.pem")},
+                "app_read_only": False, "app_current_repository_only": True}
+    # The existing physical fixture defaults to host. Select the declared App
+    # in that adapter too; keep its real Git/provider objects and authority.
+    from support.offline import OfflinePort
+    from agent_run.adapters.remote import RemoteEffects
+    original_remote = OfflinePort._remote
+    def app_remote(port, *args, **kwargs):
+        original = original_remote(port, *args, **kwargs)
+        return RemoteEffects(original.root, original.repository, runner_identity=identity,
+                             remote=original.remote, api=original.api, git_writes=original.git_writes)
+    with monkeypatch.context() as patch:
+        patch.setattr(OfflinePort, "_remote", app_remote)
+        patch.setattr("agent_run.adapters.auth.app.resolve_app_login", lambda profile: "offline-publisher")
+        scenario = published(tmp_path, monkeypatch, runner_identity=identity)
+    database, subject = scenario.kernel.storage.path, scenario.delivery.key
+    before = database.read_bytes()
+    def denied(profile):
+        assert profile.app_id == "123" and profile.installation_id == "456"
+        raise GitHubCredentialError("synthetic-secret-must-not-be-logged", http_status=403)
+    monkeypatch.setattr("agent_run.adapters.auth.app.resolve_app_login", denied)
+    api = CommentsAPI(project_status(database, subject).target)
+    assert StatusComments(database).deliver(subject, api=api) == "unavailable"
+    document = outbox.read_notifications(database.parent, scenario.spec.run_id)
+    entry, = document["remote_status"]["bindings"].values()
+    assert entry["diagnostic"] == {"code": "github_credential_unavailable", "http_status": 403}
+    assert "claim" not in entry and entry["intent"]["sent"] is False
+    assert api.commands == [] and api.reads == 0
+    assert database.read_bytes() == before
+    assert "synthetic-secret" not in outbox.notification_path(database.parent, scenario.spec.run_id).read_text()
+
+    def unexpected(profile):
+        raise RuntimeError("unexpected program failure")
+    monkeypatch.setattr("agent_run.adapters.auth.app.resolve_app_login", unexpected)
+    with pytest.raises(RuntimeError, match="unexpected program failure"):
+        StatusComments(database).deliver(subject, api=api)
+    document = outbox.read_notifications(database.parent, scenario.spec.run_id)
+    entry, = document["remote_status"]["bindings"].values()
+    assert "claim" not in entry and entry["intent"]["sent"] is False
+    assert database.read_bytes() == before

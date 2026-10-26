@@ -13,6 +13,7 @@ from agent_run.contracts.status_comment import StatusProjection
 from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.core.kernel import Kernel
 from agent_run.adapters.remote import EffectReadError, PhysicalAPI, RemoteEffects
+from agent_run.adapters.auth.app import GitHubCredentialError
 from agent_run.errors import GitHubReadError, KernelError
 from agent_run.runtime.process_identity import _process_binding_status, _process_start_token
 from agent_run.queries.status_comment import project_status
@@ -82,19 +83,25 @@ class StatusComments:
                     return cast(dict[str, Any] | None, deepcopy(entry["intent"]))
                 entry.pop("claim")  # Only a proved-absent sender relinquishes preparation.
 
-            body = entry["marker"] + "\n" + projection.body
-            intent = entry["intent"]
-            if intent is not None and intent["sent"]:
-                return cast(dict[str, Any], deepcopy(intent))  # Never coalesce away an unresolved physical write.
-            if intent is not None and intent["body"] == body:
-                return cast(dict[str, Any], deepcopy(intent))
-            if entry["confirmed_body"] == body:
-                return None
-            # Only undispatched intermediate display states may be discarded.
-            intent = {"id": uuid.uuid4().hex, "comment_id": entry["comment_id"], "before": entry["confirmed_body"],
-                      "body": body, "sent": False}
-            entry["intent"] = intent
+            return deepcopy(self._stage_entry(entry, projection))
+
+    @staticmethod
+    def _stage_entry(entry: dict[str, Any], projection: StatusProjection) -> dict[str, Any] | None:
+        if entry.get("failure") is not None:
+            raise ValueError("Status delivery paused")
+        body = entry["marker"] + "\n" + projection.body
+        intent = entry["intent"]
+        if intent is not None and intent["sent"]:
+            return cast(dict[str, Any], deepcopy(intent))  # Never coalesce away an unresolved physical write.
+        if intent is not None and intent["body"] == body:
             return cast(dict[str, Any], deepcopy(intent))
+        if entry["confirmed_body"] == body:
+            return None
+        # Only undispatched intermediate display states may be discarded.
+        intent = {"id": uuid.uuid4().hex, "comment_id": entry["comment_id"], "before": entry["confirmed_body"],
+                  "body": body, "sent": False}
+        entry["intent"] = intent
+        return cast(dict[str, Any], deepcopy(intent))
 
     def deliver(self, subject: str, *, api: PhysicalAPI | None = None,
                 cancelled: Callable[[], bool] = lambda: False) -> str:
@@ -118,9 +125,16 @@ class StatusComments:
                 owner = entry.get("claim")
                 if owner and _process_binding_status(owner["pid"], owner["token"]) != "absent":
                     return "busy"
+                if entry.get("failure") is not None:
+                    raise ValueError("Status delivery paused")
+                current_intent = entry["intent"]
+                if current_intent is None:
+                    current_intent = self._stage_entry(entry, projection)
+                if current_intent is None:
+                    return "unchanged"
                 claim = {"pid": os.getpid(), "token": _process_start_token(os.getpid()), "id": uuid.uuid4().hex}
                 entry["claim"] = claim
-                intent = deepcopy(entry["intent"])
+                intent = deepcopy(current_intent)
                 marker = entry["marker"]
             binding = Kernel(self.database).operation_binding()
             remote = RemoteEffects(binding.repository_root, binding.repository,
@@ -151,6 +165,7 @@ class StatusComments:
                     entry["write_result"] = {"intent": intent["id"], "returncode": observed["write_returncode"]}
                 if observed["disposition"] == "target":
                     entry.update(comment_id=observed["comment_id"], confirmed_body=intent["body"], intent=None)
+                    entry.pop("diagnostic", None)
                     entry["receipt"] = {"intent": intent["id"], "comment_id": observed["comment_id"],
                                         "write_result": entry.get("write_result") if entry.get("write_result", {}).get("intent") == intent["id"] else None}
                     return "confirmed"
@@ -158,6 +173,15 @@ class StatusComments:
                     entry["failure"] = "foreign_comment_or_publication"
                     return "foreign"
                 return "unknown"
+        except GitHubCredentialError as error:
+            if projection is not None:
+                try:
+                    with outbox.transaction(self.database.parent, projection.target.run_id) as document:
+                        entry = self._entry(document, projection)
+                        entry["diagnostic"] = {"code": "github_credential_unavailable", "http_status": error.http_status}
+                except (OSError, ValueError, KernelError):
+                    pass
+            return "unavailable"
         except (OSError, ValueError, KernelError, GitHubReadError, sqlite3.Error):
             # Preserve any sent intent. Arbitrary remote diagnostics, credentials
             # and response bodies must never enter this projection journal/log.
