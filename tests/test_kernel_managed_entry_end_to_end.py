@@ -6,7 +6,7 @@ user-systemd service; the shared test cgroup cannot prove a released Host epoch.
 from __future__ import annotations
 
 import array
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import json
 import os
 from pathlib import Path
@@ -336,7 +336,7 @@ if '--hostname' in sys.argv:
 
 
 @contextmanager
-def _worker_controls(directory: Path):
+def _worker_controls(directory: Path, *, held_roles: set[tuple[str, str]] | None = None):
     """Hold only external Worker replies; never manufacture a Kernel fact."""
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind("")
@@ -363,7 +363,9 @@ def _worker_controls(directory: Path):
                     assert len(raw) <= 1024 * 1024
                 event = json.loads(raw)
                 name = Path(event["checkout"]).name
-                if event["role"] == "development" and name in {"ticket-2", "ticket-3"} and name not in seen:
+                selected = ((event["role"] == "development" and name in {"ticket-2", "ticket-3"})
+                            if held_roles is None else (event["subject"], event["role"]) in held_roles)
+                if selected and name not in seen:
                     seen.add(name)
                     held.append(channel)
                     arrivals.put((event, channel))
@@ -492,6 +494,599 @@ if os.environ.get('ENTRY_APPROVAL_CONTROL') and sys.argv[1:3] == ['api', 'graphq
     active.parent.mkdir(parents=True)
     active.symlink_to(Path(lifecycle_cli.__file__).resolve().parents[3], target_is_directory=True)
     return dict(os.environ), state
+
+
+@contextmanager
+def _control_process(*arguments, **options):
+    """Own the original CLI before any fallible Host identity observation."""
+    with ExitStack() as handles:
+        child = subprocess.Popen(*arguments, **options)
+        descriptor = -1
+        try:
+            for stream in (child.stdin, child.stdout, child.stderr):
+                if stream is not None:
+                    handles.callback(stream.close)
+            descriptor = os.pidfd_open(child.pid)
+            handles.callback(os.close, descriptor)
+            yield child, descriptor
+        finally:
+            try:
+                if child.poll() is None:
+                    if descriptor >= 0:
+                        _kill_control_process(descriptor)
+                    else:
+                        # Acquisition failed before any wait: this unreaped direct
+                        # child still belongs exclusively to its creating Popen.
+                        child.kill()
+            finally:
+                child.wait(timeout=3)
+    # CLI exit alone is never evidence that its namespace has exited.
+
+
+def _kill_control_process(descriptor):
+    try:
+        signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+    except ProcessLookupError:
+        if not select.select([descriptor], [], [], 0)[0]:
+            raise
+
+
+def _pin_control_host(record, pins):
+    from agent_run.adapters.foreground import ProcessPin
+
+    for witness in (record['domain']['executor'], record['domain']['init'], record['monitor']):
+        # Transfer each handle to cleanup before the next open can fail.
+        pins.append(ProcessPin.open(witness['pid'], witness))
+    return pins[0]
+
+
+def _finish_control_host(child, pins, *, child_fd, stop=None, signal_host=True):
+    """Cleanup exact owned handles; never infer domain exit from CLI exit."""
+    deadline = time.monotonic() + 20
+    errors = []
+    try:
+        try:
+            if stop is not None and child.poll() is None:
+                stop()
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            try:
+                if signal_host and pins and pins[0].observe() != 'exited':
+                    pins[0].kill()
+                elif not pins and child.poll() is None:
+                    _kill_control_process(child_fd)
+            except BaseException as error:
+                errors.append(error)
+            try:
+                if child.poll() is None:
+                    child.communicate(timeout=max(0, deadline - time.monotonic()))
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                try:
+                    # Popen alone reaps its original CLI child.
+                    child.wait(timeout=max(0, deadline - time.monotonic()))
+                except BaseException as error:
+                    errors.append(error)
+    finally:
+        for pin in pins:
+            try:
+                pin.wait_exit(max(0, deadline - time.monotonic()))
+                # Only an adopted child may be reaped through this pidfd.
+                # ECHILD/None never invents a successful business exit.
+                pin.reap()
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                try:
+                    pin.close()
+                except BaseException as error:
+                    errors.append(error)
+        for stream in (child.stdout, child.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except BaseException as error:
+                errors.append(error)
+    if errors:
+        raise BaseExceptionGroup('Owned control Host cleanup failed', errors)
+
+
+@pytest.mark.parametrize('fault', ('pin-executor', 'pin-init', 'pin-monitor', 'stop', 'communicate', 'pin-wait', 'pin-close'))
+def test_control_host_cleanup_preserves_fault_and_closes_every_owned_handle(monkeypatch, fault) -> None:
+    """Mechanical cleanup contract; not a substitute for the public stories."""
+    from agent_run.adapters.foreground import ProcessIdentity, ProcessPin
+
+    with _control_process([sys.executable, '-c', 'import time;time.sleep(30)'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as (child, child_fd):
+        pins, signalled = [], []
+        original_open, original_send = ProcessPin.open, signal.pidfd_send_signal
+        original_wait, original_close = ProcessPin.wait_exit, ProcessPin.close
+        witness = ProcessIdentity.read(child.pid).wire()
+        record = {'domain': {'executor': witness, 'init': witness}, 'monitor': witness}
+        failure = OSError('injected ' + fault)
+        failed_open = {'pin-executor': 0, 'pin-init': 1, 'pin-monitor': 2}.get(fault)
+
+        def open_pin(cls, pid, expected=None):
+            if failed_open is not None and len(pins) == failed_open:
+                raise failure
+            return original_open(pid, expected)
+
+        def send(descriptor, number, *arguments):
+            assert descriptor in {child_fd, *(pin.descriptor for pin in pins)}
+            signalled.append((descriptor, number))
+            original_send(descriptor, number, *arguments)
+
+        def fail(*args, **kwargs):
+            raise failure
+
+        def wait(pin, seconds):
+            if fault == 'pin-wait' and pin is pins[0]:
+                raise failure
+            original_wait(pin, seconds)
+
+        def close(pin):
+            original_close(pin)
+            if fault == 'pin-close' and pin is pins[0]:
+                raise failure
+
+        monkeypatch.setattr(ProcessPin, 'open', classmethod(open_pin))
+        monkeypatch.setattr(signal, 'pidfd_send_signal', send)
+        monkeypatch.setattr(ProcessPin, 'wait_exit', wait)
+        monkeypatch.setattr(ProcessPin, 'close', close)
+        if fault == 'communicate':
+            monkeypatch.setattr(child, 'communicate', fail)
+        if failed_open is not None:
+            with pytest.raises(OSError, match='injected') as opened:
+                _pin_control_host(record, pins)
+            assert opened.value is failure
+            expected_signal = child_fd if not pins else pins[0].descriptor
+            _finish_control_host(child, pins, child_fd=child_fd)
+        else:
+            _pin_control_host(record, pins)
+            expected_signal = pins[0].descriptor
+            with pytest.raises(BaseExceptionGroup) as cleaned:
+                _finish_control_host(child, pins, child_fd=child_fd, stop=fail if fault == 'stop' else None)
+            assert failure in cleaned.value.exceptions
+        assert signalled == [(expected_signal, signal.SIGKILL)]
+        assert child.returncode == -signal.SIGKILL
+        assert all(pin.descriptor == pin.namespace_fd == -1 for pin in pins)
+        assert child.stdout.closed and child.stderr.closed
+        assert select.select([child_fd], [], [], 0)[0] == [child_fd]
+        with pytest.raises(ChildProcessError):
+            os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    with pytest.raises(OSError):
+        os.fstat(child_fd)
+
+
+@pytest.mark.parametrize('original_exit', ('normal-return', 'prior-fault'))
+def test_control_host_cleanup_does_not_repeat_the_original_fault_signal(monkeypatch, original_exit) -> None:
+    from agent_run.adapters.foreground import ProcessPin
+
+    with _control_process([sys.executable, '-c', 'import sys;sys.stdin.read(1)'],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as (child, child_fd):
+        pin = None
+        try:
+            pin = ProcessPin.open(child.pid)
+            signalled = []
+            if original_exit == 'prior-fault':
+                pin.kill()
+            else:
+                child.communicate(input='1', timeout=10)
+            monkeypatch.setattr(ProcessPin, 'kill', lambda target: signalled.append(target.identity.pid))
+            _finish_control_host(child, [pin], child_fd=child_fd, signal_host=original_exit != 'prior-fault')
+            assert signalled == []
+            assert child.returncode == (0 if original_exit == 'normal-return' else -signal.SIGKILL)
+            assert pin.descriptor == pin.namespace_fd == -1
+            assert child.stdout.closed and child.stderr.closed and child.stdin.closed
+        finally:
+            if pin is not None:
+                pin.close()
+
+
+@pytest.mark.parametrize('failure_at', ('identity', 'owner-fd'))
+def test_control_process_owns_child_before_first_identity_observation(monkeypatch, failure_at) -> None:
+    from agent_run.adapters.foreground import ProcessPin
+
+    original_popen, original_open = subprocess.Popen, os.pidfd_open
+    owned = []
+    failure = OSError('first observation failed')
+
+    def popen(*arguments, **options):
+        child = original_popen(*arguments, **options)
+        try:
+            owned.append((child, original_open(child.pid)))
+        except BaseException:
+            child.kill()
+            child.wait(timeout=3)
+            for stream in (child.stdout, child.stderr):
+                stream.close()
+            raise
+        return child
+
+    def fail(*arguments, **options):
+        raise failure
+
+    monkeypatch.setattr(subprocess, 'Popen', popen)
+    monkeypatch.setattr(ProcessPin, 'open', fail)
+    if failure_at == 'owner-fd':
+        monkeypatch.setattr(os, 'pidfd_open', fail)
+    try:
+        with pytest.raises(OSError) as observed:
+            with _control_process([sys.executable, '-c', 'import time;time.sleep(30)'],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as (child, _):
+                ProcessPin.open(child.pid)
+        assert observed.value is failure
+        child, witness = owned[0]
+        assert child.returncode == -signal.SIGKILL
+        assert select.select([witness], [], [], 0)[0] == [witness]
+        assert child.stdout.closed and child.stderr.closed
+    finally:
+        for child, witness in owned:
+            try:
+                if child.poll() is None:
+                    signal.pidfd_send_signal(witness, signal.SIGKILL)
+                    child.wait(timeout=3)
+            finally:
+                os.close(witness)
+
+
+def test_public_parallel_review_and_publication_keep_each_threads_binding(
+    git_repo: Path, tmp_path: Path, monkeypatch,
+) -> None:
+    from agent_run.adapters.foreground import ProcessPin, read_record, record_root, subreaper
+    classification = """schema = json.loads(Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text())
+role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commit_message' in schema['properties'] else 'development'
+"""
+    codex = _CODEX[:_CODEX.index("if prompt.startswith")] + classification + _CODEX[_CODEX.index("thread = "):]
+    codex = codex.replace("'managed-entry-' + role)", "'managed-entry-' + role + '-' + os.urandom(16).hex())")
+    marker = "print(json.dumps({'type': 'thread.started', 'thread_id': thread}), flush=True)"
+    before = r"""control = None
+import re
+issue = int(re.search(r'https://github.com/example/project/issues/(\d+)', prompt).group(1))
+subject = 'ticket-' + str(issue)
+if (subject, role) in {('ticket-2', 'publication'), ('ticket-3', 'review')}:
+    import socket
+    control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    control.settimeout(30)
+    control.connect('\0' + os.environ['ENTRY_WORKER_CONTROL'][1:])
+    control.sendall(json.dumps({'role': role, 'thread': thread, 'checkout': str(Path.cwd()), 'head': head, 'subject': subject}).encode())
+    control.shutdown(socket.SHUT_WR)
+    assert control.recv(1) == b'1'
+"""
+    codex = codex.replace(marker, before + marker)
+    codex = codex.replace("content = 'Implementation", """if control is not None:
+    assert control.recv(1) == b'1'
+    control.close()
+content = 'Implementation""")
+    roles = {('ticket-2', 'publication'), ('ticket-3', 'review')}
+    with _worker_controls(tmp_path, held_roles=roles) as (address, arrivals), subreaper(), ExitStack() as processes:
+        monkeypatch.setenv('ENTRY_WORKER_CONTROL', address)
+        environment, remote_state = _control_environment(git_repo, tmp_path, monkeypatch, codex=codex)
+        child, child_fd = processes.enter_context(_control_process([sys.executable, '-m', 'agent_run', 'run', '1', '--foreground',
+            '--no-notifications', '--repo', 'example/project', '--json'], cwd=git_repo, env=environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+        pins = []
+        snapshots = []
+
+        def public(command):
+            result = subprocess.run([sys.executable, '-m', 'agent_run', command, '--parent', '1',
+                '--repo', 'example/project', '--json'], cwd=git_repo, env=environment,
+                capture_output=True, text=True, timeout=20)
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            return json.loads(result.stdout)
+
+        def invocation(number, role):
+            history = public('history')['history']
+            attempt, = (row for row in history['attempts'] if row['subject'] == f'ticket:{number}' and row['role'] == role)
+            original, = attempt['invocations']
+            return attempt, original
+
+        try:
+            events = [arrivals.get(timeout=30) for _ in range(2)]
+            channels = {event['role']: (event, channel) for event, channel in events}
+            assert set(channels) == {'review', 'publication'}
+            status = public('status')
+            run_id = status['run_id']
+            budgets = {row['subject']: row['budgets'] for row in status['subjects'] if row['kind'] == 'ticket'}
+            lock = default_runner_lock_path(environment)
+            record, = (read_record(path) for path in record_root(lock).glob('*.json'))
+            assert record['binding'][0] == run_id and record['phase'] == 'running'
+            _pin_control_host(record, pins)
+
+            # Force the historical order using real stdout, not bind_thread calls.
+            event_b, channel_b = channels['review']
+            event_a, channel_a = channels['publication']
+            channel_b.sendall(b'1')
+            def bound_b():
+                attempt, row = invocation(3, 'review')
+                return (attempt, row) if row['backend_id'] == event_b['thread'] and any(
+                    item['active'] and item['evidence']['type'] == 'turn.started'
+                    for output in row['outputs'] for item in output['activity']) else None
+            attempt_b, row_b = wait_until(bound_b, timeout=10)
+            snapshot_b = {key: row_b[key] for key in ('id', 'attempt', 'thread', 'backend_id', 'profile_revision', 'model', 'effort')}
+            assert attempt_b['result'] is None
+            channel_a.sendall(b'1')
+            def bound_a():
+                attempt, row = invocation(2, 'publication')
+                return (attempt, row) if row['backend_id'] == event_a['thread'] and any(
+                    item['active'] and item['evidence']['type'] == 'turn.started'
+                    for output in row['outputs'] for item in output['activity']) else None
+            attempt_a, row_a = wait_until(bound_a, timeout=10)
+            assert attempt_b['candidate_sha'] == event_b['head'] and attempt_a['candidate_sha'] == event_a['head']
+            after_b, current_b = invocation(3, 'review')
+            assert {key: current_b[key] for key in snapshot_b} == snapshot_b and after_b['result'] is None
+            assert row_a['thread'] != row_b['thread'] and event_a['thread'] != event_b['thread']
+            assert {row['subject']: row['budgets'] for row in public('status')['subjects'] if row['kind'] == 'ticket'} == budgets
+            snapshots.append({'review_after_publication_callback': current_b, 'publication': row_a})
+
+            channel_b.sendall(b'1')
+            def consumed_b():
+                attempt, _ = invocation(3, 'review')
+                return attempt if attempt['outcome'] is not None else None
+            completed_b = wait_until(consumed_b, timeout=15)
+            assert completed_b['outcome'] == 'pass'
+            still_a, current_a = invocation(2, 'publication')
+            assert current_a['backend_id'] == event_a['thread'] and still_a['result'] is None
+            channel_a.sendall(b'1')
+            output, error = child.communicate(timeout=90)
+            assert child.returncode == 0, (output, error)
+            accepted = json.loads(output)
+            assert accepted['run_id'] == run_id and accepted['host'] == 'exited'
+            final = public('status')
+            tickets = [row for row in final['subjects'] if row['kind'] == 'ticket']
+            assert len(tickets) == 2 and all(row['phase'] == 'complete' and not row['gates'] for row in tickets)
+            assert all(row['delivery_cleanup']['state'] == 'complete' for row in tickets)
+            for ticket in tickets:
+                budget, = (row for row in ticket['budgets'] if row['purpose'] == 'requirements')
+                assert (budget['window'], budget['developments_used'], budget['reviews_used']) == (1, 1, 1)
+            for number, role, original in ((3, 'review', row_b), (2, 'publication', row_a)):
+                attempt, current = invocation(number, role)
+                assert current['id'] == original['id'] and current['backend_id'] == original['backend_id']
+                assert attempt['result'] is not None and all(item['dispatch_state'] == 'exited' for item in current['outputs'])
+                assert sum(event['kind'] == 'role_consumed' and event['identity'] == attempt['id']
+                           for event in public('history')['history']['events']) == 1
+            document = json.loads(remote_state.read_text())
+            assert all(document['source_graph']['issues'][str(number)]['state'] == 'CLOSED' for number in (2, 3))
+            assert all(pin.observe() == 'exited' for pin in pins)
+            assert not list(record_root(lock).glob('*.json'))
+            with runner_management_lease(lock):
+                pass
+        finally:
+            def stop():
+                subprocess.run([sys.executable, '-m', 'agent_run', 'stop', '1', '--repo', 'example/project', '--json'],
+                    cwd=git_repo, env=environment, capture_output=True, timeout=10)
+            try:
+                (tmp_path / 'parallel-callback-snapshots.json').write_text(json.dumps(snapshots))
+            finally:
+                _finish_control_host(child, pins, child_fd=child_fd, stop=stop)
+
+
+def test_public_resume_after_exact_foreground_host_loss_preserves_parallel_work(
+    git_repo: Path, tmp_path: Path, monkeypatch, record_property,
+) -> None:
+    from agent_run.adapters.foreground import ProcessPin, read_record, record_root, subreaper
+    classification = """schema = json.loads(Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text())
+role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commit_message' in schema['properties'] else 'development'
+"""
+    codex = _CODEX[:_CODEX.index("if prompt.startswith")] + classification + _CODEX[_CODEX.index("thread = "):]
+    codex = codex.replace("'managed-entry-' + role)", "'managed-entry-' + role + '-' + os.urandom(16).hex())")
+    held = r"""if role == 'development':
+    import socket
+    Path('managed-delivery.txt').write_text('Implementation from the managed native Worker.\n')
+    Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text(json.dumps(
+        {'result_kind':'development', 'summary':'Old file before Host loss is not an accepted return.', 'human_blockers':None}))
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
+        control.settimeout(30)
+        control.connect('\0' + os.environ['ENTRY_WORKER_CONTROL'][1:])
+        control.sendall(json.dumps({'role':role, 'thread':thread, 'checkout':str(Path.cwd()), 'head':head}).encode())
+        control.shutdown(socket.SHUT_WR)
+        assert control.recv(1) == b'1'
+"""
+    codex = codex.replace("content = 'Implementation", held + "\ncontent = 'Implementation")
+    with _worker_controls(tmp_path) as (_address, arrivals), subreaper(), ExitStack() as processes:
+        monkeypatch.setenv('ENTRY_WORKER_CONTROL', _address)
+        environment, remote_state = _control_environment(git_repo, tmp_path, monkeypatch, codex=codex)
+        child, child_fd = processes.enter_context(_control_process([sys.executable, '-m', 'agent_run', 'run', '1', '--foreground',
+            '--no-notifications', '--repo', 'example/project', '--json'], cwd=git_repo, env=environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+        pins, observations = [], {}
+        host_pin = None
+        sent = False
+
+        def public(*arguments):
+            command = [sys.executable, '-m', 'agent_run', *arguments,
+                       '--repo', 'example/project', '--json']
+            if arguments[0] not in {'resume', 'approve'}:
+                return subprocess.run(command, cwd=git_repo, env=environment,
+                    capture_output=True, text=True, timeout=90)
+            deadline = time.monotonic() + 90
+            with _control_process(command, cwd=git_repo, env=environment,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as (continued, continued_fd):
+                continued_pins = []
+                try:
+                    def launched():
+                        for path in record_root(default_runner_lock_path(environment)).glob('*.json'):
+                            record = read_record(path)
+                            if record['phase'] == 'running':
+                                return (record,)
+                        return (None,) if continued.poll() is not None else None
+                    launch, = wait_until(launched, timeout=min(10, max(0, deadline - time.monotonic())))
+                    if launch is not None:
+                        assert launch['binding'][0] == observations['run']
+                        _pin_control_host(launch, continued_pins)
+                    stdout, stderr = continued.communicate(timeout=max(0, deadline - time.monotonic()))
+                    if continued_pins:
+                        assert all(pin.observe() == 'exited' for pin in continued_pins)
+                    observations.setdefault('continuations', []).append({
+                        'command': arguments[0], 'record': launch,
+                        'pinned': [pin.identity.wire() for pin in continued_pins],
+                        'physical_exit': [pin.observe() for pin in continued_pins],
+                        'returncode': continued.returncode, 'stdout': stdout, 'stderr': stderr})
+                    return subprocess.CompletedProcess(command, continued.returncode, stdout, stderr)
+                finally:
+                    _finish_control_host(continued, continued_pins, child_fd=continued_fd)
+
+        def query(command):
+            result = public(command, '--parent', '1')
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            return json.loads(result.stdout)
+
+        try:
+            ready = [arrivals.get(timeout=30) for _ in range(2)]
+            assert {Path(event['checkout']).name for event, _ in ready} == {'ticket-2', 'ticket-3'}
+            before = query('status')
+            expected_threads = {Path(event['checkout']).name.replace('-', ':'): event['thread'] for event, _ in ready}
+            def bound_attempts():
+                rows = {row['subject']: row for row in query('history')['history']['attempts'] if row['role'] == 'development'}
+                return rows if set(rows) == set(expected_threads) and all(
+                    len(row['invocations']) == 1 and row['invocations'][0]['backend_id'] == expected_threads[subject]
+                    for subject, row in rows.items()) else None
+            attempts = wait_until(bound_attempts, timeout=10)
+            lock = default_runner_lock_path(environment)
+            record, = (read_record(path) for path in record_root(lock).glob('*.json'))
+            assert record['phase'] == 'running' and record['binding'][0] == before['run_id']
+            host_pin = _pin_control_host(record, pins)
+            kernel = Kernel(Path(record['database']))
+            # Physical witness only: observe existing bindings, never repair SQL.
+            with kernel.storage.transaction(write=False) as tx:
+                workers = []
+                for subject, attempt in attempts.items():
+                    invocation, = attempt['invocations']
+                    assert invocation['backend_id'] == next(event['thread'] for event, _ in ready
+                        if Path(event['checkout']).name == subject.replace(':', '-'))
+                    row = tx.one('SELECT process_identity,raw_id FROM invocation_outputs WHERE invocation=?', (invocation['id'],))
+                    assert row['raw_id'] is None and attempt['result'] is None
+                    workers.append(json.loads(tx.get(row['process_identity'], subject)))
+            # Core's authentic Worker receipt binds the process to this exact
+            # Host namespace. Retained namespace-init exit proves that whole
+            # domain is dead; inner PID numbers must not be reopened outside it.
+            assert len({(item['pid'], item['start_token']) for item in workers}) == 2
+            for witness in workers:
+                assert witness['schema'] == 'linux-namespace-process-v1'
+                assert (witness['host_pid'], witness['host_start_token'], witness['boot_id'],
+                        witness['host_namespace'], witness['pid_namespace']) == (
+                    host_pin.identity.namespace_pids[-1], host_pin.identity.start_token,
+                    host_pin.identity.boot_id, host_pin.identity.pid_namespace, host_pin.identity.pid_namespace)
+            assert all(pin.observe() == 'running' for pin in pins)
+            observations.update(run=before['run_id'], original_record=record, before=before,
+                original_attempts=attempts, workers=workers, pinned=[pin.identity.wire() for pin in pins])
+
+            # Only the exact original executor handle receives this fault signal.
+            sent = True
+            host_pin.kill()
+            out, err = child.communicate(timeout=20)
+            for pin in pins:
+                pin.wait_exit(10)
+            observations.update(original_cli={'returncode': child.returncode, 'stdout': out, 'stderr': err},
+                physical_exit=[pin.observe() for pin in pins])
+            after = query('status')
+            history = query('history')['history']
+            assert after['run_id'] == before['run_id']
+            assert {row['subject']: row['budgets'] for row in after['subjects']} == {
+                row['subject']: row['budgets'] for row in before['subjects']}
+            assert not list(record_root(lock).glob('*.json'))
+            with kernel.storage.transaction(write=False) as tx:
+                assert not tx.rows('SELECT id FROM leases')
+                assert tx.one('SELECT status,usage_released FROM hosts WHERE nonce=?', (record['binding'][3],))[:] == ('exited', 1)
+            for subject, original in attempts.items():
+                current, = (row for row in history['attempts'] if row['id'] == original['id'])
+                assert current['result'] is None
+                invocation, = current['invocations']
+                prior, = original['invocations']
+                assert (invocation['id'], invocation['backend_id']) == (prior['id'], prior['backend_id'])
+                assert all(output['dispatch_state'] == 'exited' and output['exit_code'] is None
+                           and output['raw_return'] is None for output in invocation['outputs'])
+                assert any(event['kind'] == 'worker_host_exited' and event['identity'] == invocation['id']
+                           for event in history['events'])
+            observations.update(after_exit=after, history_after_exit=history)
+            original_action = json.loads(out)['action_id']
+            original_request = kernel.host_request(original_action)
+            assert original_request.run_id == before['run_id']
+            resumed = public('resume', before['run_id'], '--foreground')
+            observations['first_resume'] = {'returncode': resumed.returncode, 'stdout': resumed.stdout, 'stderr': resumed.stderr}
+            (tmp_path / 'host-loss-first-resume.json').write_text(json.dumps(observations))
+            assert resumed.returncode == 0, (resumed.stdout, resumed.stderr)
+            receipt = json.loads(resumed.stdout)
+            assert receipt['run_id'] == before['run_id'] and receipt['host'] == 'exited'
+            observations['first_resume_passed'] = True
+            assert kernel.host_request(original_action) == original_request
+            at_approval = query('status')
+            assert at_approval['run_id'] == before['run_id']
+            tickets = [row for row in at_approval['subjects'] if row['kind'] == 'ticket']
+            final, = [row for row in at_approval['subjects'] if row['kind'] == 'final_run']
+            assert {row['subject'] for row in tickets} == set(attempts)
+            assert all(row['phase'] == 'complete' and not row['gates']
+                       and row['delivery_cleanup']['state'] == 'complete' for row in tickets)
+            assert final['phase'] == 'approval' and final['pr_number'] is not None
+            final_budgets = final['budgets']
+            for ticket in tickets:
+                old = next(row for row in before['subjects'] if row['subject'] == ticket['subject'])
+                initial, = [b for b in old['budgets'] if b['purpose'] == 'requirements']
+                completed, = [b for b in ticket['budgets'] if b['purpose'] == 'requirements']
+                assert all(completed[key] == initial[key] for key in (
+                    'window', 'developments_used', 'development_limit', 'review_limit'))
+                assert completed['reviews_used'] == initial['reviews_used'] + 1
+            recovered_history = query('history')['history']
+            for original in attempts.values():
+                current, = [row for row in recovered_history['attempts'] if row['id'] == original['id']]
+                prior, = original['invocations']
+                old, = [row for row in current['invocations'] if row['id'] == prior['id']]
+                renewed, = [row for row in current['invocations'] if row['id'] != prior['id']]
+                assert old['backend_id'] == renewed['backend_id'] == prior['backend_id']
+                assert old['thread'] == renewed['thread'] == prior['thread']
+                assert all(row['raw_return'] is None and row['exit_code'] is None
+                           and row['dispatch_state'] == 'exited' for row in old['outputs'])
+                assert current['result'] is not None and all(row['dispatch_state'] == 'exited'
+                    and row['exit_code'] == 0 and row['raw_return'] is not None for row in renewed['outputs'])
+                assert sum(event['kind'] == 'role_consumed' and event['identity'] == original['id']
+                           for event in recovered_history['events']) == 1
+            observations.update(before_approval=at_approval, recovered_history=recovered_history,
+                                original_action=original_action)
+            (tmp_path / 'host-loss-first-resume.json').write_text(json.dumps(observations))
+            approved = public('approve', before['run_id'], '--foreground')
+            observations['approval'] = {'returncode': approved.returncode,
+                                        'stdout': approved.stdout, 'stderr': approved.stderr}
+            assert approved.returncode == 0, (approved.stdout, approved.stderr)
+            approval = json.loads(approved.stdout)
+            assert approval['run_id'] == before['run_id'] and approval['host'] == 'exited'
+            assert approval['action_id'] not in {original_action, receipt['action_id']}
+            finished = query('status')
+            assert finished['run_id'] == before['run_id'] and finished['status'] == 'completed'
+            assert all(row['phase'] == 'complete' and not row['gates']
+                       and row['delivery_cleanup']['state'] == 'complete' for row in finished['subjects'])
+            completed_final, = [row for row in finished['subjects'] if row['subject'] == final['subject']]
+            assert completed_final['pr_number'] == final['pr_number'] and completed_final['budgets'] == final_budgets
+            assert kernel.host_request(original_action) == original_request
+            with kernel.storage.transaction(write=False) as tx:
+                assert not tx.rows('SELECT id FROM leases')
+                assert not tx.rows("SELECT nonce FROM hosts WHERE status!='exited' OR usage_released!=1")
+                grant = tx.one('SELECT action,pr_number FROM grants WHERE subject=?', (final['subject'],))
+                assert (grant['action'], grant['pr_number']) == (approval['action_id'], final['pr_number'])
+            document = json.loads(remote_state.read_text())
+            assert document['source_graph']['parent']['state'] == 'CLOSED'
+            assert all(document['source_graph']['issues'][str(n)]['state'] == 'CLOSED' for n in (2, 3))
+            assert len(document['prs']) == 3 and all(pr['merged'] for pr in document['prs'])
+            assert _git(tmp_path / 'origin.git', 'show', 'refs/heads/main:managed-delivery.txt') == 'Implementation from the managed native Worker.'
+            for job in finished['subjects']:
+                cleanup = job['delivery_cleanup']
+                absent = subprocess.run(['git', '-C', str(tmp_path / 'origin.git'), 'show-ref',
+                    '--verify', '--quiet', cleanup['source_ref']], capture_output=True, timeout=3)
+                assert absent.returncode == 1
+                assert not Path(cleanup['checkout']).exists()
+            assert not list(record_root(lock).glob('*.json'))
+            assert all(pin.observe() == 'exited' for pin in pins)
+            with runner_management_lease(lock):
+                pass
+            observations.update(completed=finished, remote=document, complete_same_run=True)
+        finally:
+            # No recovery Stop/gate is added, including after a rejected Resume.
+            try:
+                (tmp_path / 'host-loss-first-resume.json').write_text(json.dumps(observations))
+                record_property('host_loss_recovery', json.dumps(observations))
+            finally:
+                _finish_control_host(child, pins, child_fd=child_fd, signal_host=not sent)
 
 
 def test_public_ticket_stop_keeps_late_raw_unconsumed_then_resumes_in_the_original_managed_host(

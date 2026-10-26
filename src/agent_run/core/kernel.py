@@ -2121,6 +2121,8 @@ class Kernel:
             tx.execute("UPDATE hosts SET status=?,observation_id=?,exit_status=?,ended_at=? WHERE run_id=? AND epoch=?",
                        (disposition, material, observation.exit_status if exited else None, observation.ended_at if exited else None, request.run_id, request.epoch))
             if exited:
+                business = tx.one("SELECT stopped,final_action FROM runs")
+                interrupted: set[str] = set()
                 self._host_preparations_exited(tx, Execution(request.run_id, request.owner, request.epoch), {"host_observation": material})
                 for output in tx.all("SELECT o.*,l.subject FROM leases l JOIN invocation_outputs o ON o.lease=l.id WHERE l.executor=? AND l.epoch=?", (request.owner, request.epoch)):
                     process = None if output["process_identity"] is None else json.loads(tx.get(output["process_identity"], output["subject"]))
@@ -2134,6 +2136,26 @@ class Kernel:
                         tx.execute("UPDATE invocations SET status='interrupted' WHERE id=?", (output["invocation"],))
                     tx.execute("DELETE FROM leases WHERE id=?", (output["lease"],))
                     self._event(tx, output["subject"], "worker_host_exited", output["invocation"], proof)
+                    if tx.rows("SELECT s.id FROM subjects s JOIN attempts a ON a.id=s.current_attempt "
+                               "WHERE s.id=? AND a.current_invocation=? AND a.generation=s.generation",
+                               (output["subject"], output["invocation"])):
+                        interrupted.add(output["subject"])
+                if not business["stopped"] and business["final_action"] is None:
+                    interrupted.update(item["id"] for item in tx.rows(
+                        "SELECT s.id FROM subjects s JOIN attempts a ON a.id=s.current_attempt "
+                        "JOIN invocations i ON i.id=a.current_invocation WHERE a.generation=s.generation "
+                        "AND a.status IN ('running','returned','continuing') AND i.executor=? AND i.epoch=? "
+                        "AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.subject=s.id)", (request.owner, request.epoch)))
+                    interrupted.update(item["subject"] for item in tx.rows(
+                        "SELECT DISTINCT e.subject FROM effects e JOIN subjects s ON s.id=e.subject "
+                        "WHERE e.executor=? AND e.epoch=? AND e.generation=s.generation "
+                        "AND e.status IN ('prepared','sent','observed') AND e.operation!='issue_link' "
+                        "AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.subject=s.id)", (request.owner, request.epoch)))
+                for subject in sorted(interrupted):
+                    if (business["final_action"] is None
+                            and not tx.rows("SELECT code FROM gates WHERE subject=? AND code='execution_failed'", (subject,))):
+                        proof = tx.put(subject, "worker_host_exit", wire_json({"host_nonce": request.nonce, "observation": asdict(observation)}))
+                        self._gate(tx, subject, "execution_failed", evidence=proof)
                 tx.execute("INSERT OR IGNORE INTO retired_executors VALUES (?,?,?,'exited')", (request.run_id, request.owner, request.epoch))
                 tx.execute("UPDATE retired_executors SET status='exited' WHERE run_id=? AND owner=? AND epoch=?", (request.run_id, request.owner, request.epoch))
                 tx.execute("UPDATE runs SET executor=NULL,epoch=epoch+1 WHERE id=? AND executor=? AND epoch=?",
@@ -2227,7 +2249,8 @@ class Kernel:
             for waiting in tx.rows("SELECT * FROM waits WHERE kind='agent_preparation'"):
                 preparation, _ = self._preparation(tx, waiting)
                 if preparation.execution == execution and not self._gates(tx, preparation.subject):
-                    self._gate(tx, preparation.subject, "worker_unavailable", evidence=material)
+                    evidence = tx.put(preparation.subject, "executor_failure", tx.get(material, owner))
+                    self._gate(tx, preparation.subject, "worker_unavailable", evidence=evidence)
             # Raw/exit can settle before a failed revocation is retried. The
             # original unconsumed Attempt remains authoritative after its lease.
             for job in tx.rows("SELECT s.id FROM subjects s JOIN attempts a ON a.id=s.current_attempt "
@@ -3054,6 +3077,42 @@ class Kernel:
             if effect.operation == "merge" and not self._merge_authority(tx, run, job, world):
                 raise KernelError("merge_authority_changed")
 
+    def _host_resume_gates(self, tx: Transaction, run: sqlite3.Row) -> list[sqlite3.Row]:
+        """Only exact, physically retired Host failures form a shared boundary."""
+        if (run["executor"] is not None or self._agent_seats(tx)
+                or tx.rows("SELECT owner FROM hosts WHERE status!='exited' OR usage_released=0 LIMIT 1")
+                or tx.rows("SELECT owner FROM retired_executors WHERE status!='exited' LIMIT 1")):
+            return []
+        hosts = tx.rows("SELECT nonce,owner,epoch,observation_id FROM hosts WHERE status='exited' AND usage_released=1")
+        nonces = {host["nonce"] for host in hosts}
+        owners = {(host["owner"], host["epoch"]) for host in hosts}
+        observations = {host["observation_id"] for host in hosts if host["observation_id"] is not None}
+        result = []
+        for gate in tx.rows("SELECT g.*,m.purpose AS evidence_purpose FROM gates g JOIN material m ON m.id=g.evidence AND m.subject=g.subject "
+                            "WHERE g.code IN ('execution_failed','worker_unavailable')"):
+            if gate["evidence_purpose"] not in {"worker_host_exit", "agent_preparation_exit", "executor_failure"}:
+                continue
+            proof = json.loads(tx.get(gate["evidence"], gate["subject"]))
+            if (gate["evidence_purpose"] == "worker_host_exit" and proof.get("host_nonce") in nonces
+                    or gate["evidence_purpose"] == "agent_preparation_exit" and proof.get("evidence", {}).get("host_observation") in observations
+                    or gate["evidence_purpose"] == "executor_failure" and (proof.get("owner"), proof.get("epoch")) in owners):
+                result.append(gate)
+        return result
+
+    def resume_subject(self, *, ticket: int | None = None) -> str | None:
+        """Select a recorded Resume scope; control rechecks it under its write lock."""
+        with self.storage.transaction(write=False) as tx:
+            run = tx.one("SELECT * FROM runs")
+            if ticket is not None:
+                targets = tx.rows("SELECT id FROM subjects WHERE kind='ticket' AND issue=?", (ticket,))
+            elif run["stopped"] or self._host_resume_gates(tx, run):
+                return None
+            else:
+                targets = tx.rows("SELECT DISTINCT s.id FROM subjects s JOIN gates g ON g.subject=s.id ORDER BY s.id")
+            if len(targets) != 1:
+                raise KernelError("control_subject_ambiguous", "Select an exact Ticket or current Parent boundary")
+            return str(targets[0]["id"])
+
     def control(self, kind: str, action_id: str, *, subject: str | None = None,
                 world: World | None = None, message: str | None = None, new_thread: bool = False,
                 policy_overrides: Mapping[str, Any] | None = None, replacement: Delivery | None = None,
@@ -3184,10 +3243,14 @@ class Kernel:
                     raise KernelError("executor_exit_unproven")
                 if self._agent_seats(tx):
                     raise KernelError("worker_exit_unproven")
-                if not run["stopped"] and run["blocked"] != "supervision_timeout":
+                host_gates = self._host_resume_gates(tx, run)
+                if not run["stopped"] and run["blocked"] != "supervision_timeout" and not host_gates:
                     raise KernelError("no_resumable_boundary")
+                for gate in host_gates:
+                    tx.execute("DELETE FROM gates WHERE subject=? AND code=? AND evidence=?",
+                               (gate["subject"], gate["code"], gate["evidence"]))
                 tx.execute("UPDATE runs SET stopped=0 WHERE id=?", (run["id"],))
-                if run["blocked"] == "supervision_timeout":
+                if run["blocked"] == "supervision_timeout" and not host_gates:
                     tx.execute("UPDATE runs SET blocked=NULL WHERE id=?", (run["id"],))
                     tx.execute("DELETE FROM waits WHERE subject IS NULL")
                 tx.execute("UPDATE attempts SET resume_action=? WHERE id IN (SELECT s.current_attempt FROM subjects s WHERE s.run_id=? AND NOT EXISTS (SELECT 1 FROM gates g WHERE g.subject=s.id))",
