@@ -3002,6 +3002,20 @@ class Kernel:
                                  new_thread=new_thread, policy_overrides=policy_overrides, replacement=replacement,
                                   resource_inspections=resource_inspections, discard_worktree=discard_worktree)
 
+    def _checks_timeout_matches(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, evidence: str) -> bool:
+        """Only the original expired checks scope permits a new wait policy."""
+        timeout = json.loads(tx.get(evidence, job["id"]))
+        if not isinstance(timeout, dict) or timeout.get("kind") != "required_checks":
+            return False
+        rows = tx.rows("SELECT * FROM waits WHERE subject=? AND kind='required_checks' AND scope_id=?",
+                       (job["id"], timeout.get("scope_id")))
+        if len(rows) != 1:
+            return False
+        wait = rows[0]
+        return bool(self.clock() >= wait["deadline"]
+                    and (timeout.get("started_at"), timeout.get("deadline")) == (wait["started_at"], wait["deadline"])
+                    and json.loads(tx.get(wait["scope_id"], job["id"])) == self._automatic_scope(tx, run, job["id"], False))
+
     def _control(self, tx: Transaction, kind: str, action_id: str, *, subject: str | None = None,
                  world: World | None = None, message: str | None = None, new_thread: bool = False,
                  policy_overrides: Mapping[str, Any] | None = None, replacement: Delivery | None = None,
@@ -3037,9 +3051,18 @@ class Kernel:
         if message is not None and (not message.strip() or len(message.encode()) > 8192):
             raise KernelError("human_response_boundary")
         if policy_overrides:
-            if (kind != "resume" or job is None or "ticket_development_workers" in policy_overrides
-                    or not any(gate["code"] in {"review_budget_exhausted", "modification_budget_exhausted", "ci_development_budget_exhausted"}
-                               for gate in self._gates(tx, job["id"]))):
+            if kind != "resume" or job is None or "ticket_development_workers" in policy_overrides:
+                raise KernelError("policy_override_boundary")
+            gates = self._gates(tx, job["id"])
+            timeout = next((gate for gate in gates if gate["code"] == "supervision_timeout"), None)
+            if timeout is not None:
+                allowed = (set(policy_overrides) == {"required_checks_wait_seconds"}
+                           and policy_overrides["required_checks_wait_seconds"] is not None
+                           and self._checks_timeout_matches(tx, run, job, timeout["evidence"]))
+            else:
+                allowed = any(gate["code"] in {"review_budget_exhausted", "modification_budget_exhausted", "ci_development_budget_exhausted"}
+                              for gate in gates)
+            if not allowed:
                 raise KernelError("policy_override_boundary")
             policy = checkpoint_policy(self._subject_policy(tx, job), policy_overrides)
             policy_id = tx.put(job["id"], "delivery_policy", wire_json(self._policy_values(policy)))

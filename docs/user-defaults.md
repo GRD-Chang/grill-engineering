@@ -111,7 +111,7 @@ agent-run run 229 --required-checks-wait-seconds 90m
 agent-run settings show --json
 ```
 
-同一字段也可写入个人配置文件的 `policy` 对象；查询统一显示秒。新 Run 按内置默认、个人默认、显式参数的优先级冻结；修改个人默认不热更新已有 Run。旧快照未写此字段时仍采用原来的 45 分钟，不读取未来默认。只有已有预算检查点允许的显式 `resume --required-checks-wait-seconds ...` 覆盖可改变该对象**后续**窗口，普通 Resume 或监督超时 Resume 不开放策略修改；超时后显式 Resume 仍按该 Run 已冻结值建立新窗口。
+同一字段也可写入个人配置文件的 `policy` 对象；查询统一显示秒。新 Run 按内置默认、个人默认、显式参数的优先级冻结；修改个人默认不热更新已有 Run。旧快照未写此字段时仍采用原来的 45 分钟，不读取未来默认。已有预算检查点，或准确 Required Checks 监督超时边界上的显式 `resume --required-checks-wait-seconds ...`，可改变该对象**后续**窗口。CI 超时恢复仅允许覆盖此字段，须匹配原 PR/head/scope 与超时证据，不能附带修改 Agent 额度等其他策略；其他超时和普通运行中不开放此覆盖。省略参数的 Resume 仍按该对象已冻结值建立新窗口。
 
 已开始的窗口持久保存绝对截止。成功读取、网络未知、进程重启和兄弟 Ticket 推进都不续期；不同 PR/head/scope 各自计时。检查明确失败仍进入原 CI 修复流程，未知不视为成功。超时后同一 head 的检查成功，显式 Resume 可继续核验，不重放已经完成的发布或 CI 修复。调整此时长不增加 Agent 额度、Invocation 时限或写入权限；其他 GitHub 异步状态的收敛窗口保持不变。
 

@@ -122,7 +122,7 @@ def test_long_checks_window_survives_unknown_restart_and_late_success(tmp_path, 
     # starts another Agent nor republishes the already completed PR.
     with pytest.raises(KernelError, match="policy_override_boundary"):
         reopened.control("resume", "no-timeout-policy-change", subject=subject,
-                         policy_overrides={"required_checks_wait_seconds": "3h"})
+                         policy_overrides={"required_checks_wait_seconds": "3h", "ticket_ci_development_limit": 9})
     assert reopened.status(subject)["gates"] == ["supervision_timeout"]
     reopened.control("resume", "ci-finished-later", subject=subject)
     scenario.kernel = reopened
@@ -213,3 +213,92 @@ def test_budget_checkpoint_explicit_wait_override_only_changes_future_windows(tm
     window, = read(kernel.storage.path, "status").data["supervision_windows"]
     assert (window["started_at"], window["deadline"]) == (100, 7300)
     assert kernel.status(subject)["budgets"]["requirements"]["window"] == 2
+
+
+def test_expired_checks_resume_changes_only_future_wait_and_serializes_actions(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from test_kernel_query_cli import _snapshot
+
+    scenario = Scenario(tmp_path / "resume-ci", DeliveryKind.TICKET, checks=("pending",),
+                        policy=Policy(required_checks_wait_seconds=3))
+    kernel, subject = scenario.kernel, scenario.delivery.key
+    kernel.clock = lambda: 100
+    assert scenario.run().reason == "required_checks"
+    before = _snapshot(tmp_path)
+    with pytest.raises(KernelError, match="policy_override_boundary"):
+        kernel.control("resume", "not-expired", subject=subject,
+                       policy_overrides={"required_checks_wait_seconds": "2h"})
+    assert _snapshot(tmp_path) == before
+    kernel.clock = lambda: 103
+    assert scenario.step().reason == "supervision_timeout"
+    budget = kernel.status(subject)["budgets"]
+    roles = len(scenario.role_calls)
+    publications = sum(w["operation"] == "pr" for w in scenario.port.writes())
+    with kernel.storage.transaction(write=False) as tx:
+        gate = tx.one("SELECT * FROM gates WHERE subject=? AND code='supervision_timeout'", (subject,))
+        original_timeout_id = gate["evidence"]
+        original_timeout = tx.get(original_timeout_id, subject)
+        old_scope = json.loads(tx.get(json.loads(original_timeout)["scope_id"], subject))
+        frozen_run = tx.one("SELECT policy FROM runs")[0]
+    for invalid in ({"required_checks_wait_seconds": 0}, {"required_checks_wait_seconds": None},
+                    {"required_checks_wait_seconds": "2h", "ticket_ci_development_limit": 9}):
+        before = _snapshot(tmp_path)
+        with pytest.raises((DeliveryPolicyError, KernelError)):
+            kernel.control("resume", "invalid-timeout-change", subject=subject, policy_overrides=invalid)
+        assert _snapshot(tmp_path) == before
+
+    barrier = Barrier(2)
+    overrides = {"required_checks_wait_seconds": "2h"}
+    def resume(action):
+        barrier.wait(timeout=5)
+        try:
+            return action, kernel.control("resume", action, subject=subject, policy_overrides=overrides)
+        except KernelError as error:
+            return action, error.code
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(resume, ["new-ci-window-a", "new-ci-window-b"]))
+    assert sorted(result for _, result in results) == ["applied", "policy_override_boundary"]
+    winner = next(action for action, result in results if result == "applied")
+    before = _snapshot(tmp_path)
+    assert kernel.control("resume", winner, subject=subject, policy_overrides=overrides) == "applied"
+    assert _snapshot(tmp_path) == before
+    with pytest.raises(KernelError, match="action_identity_changed"):
+        kernel.control("resume", winner, subject=subject,
+                       policy_overrides={"required_checks_wait_seconds": "3h"})
+    assert _snapshot(tmp_path) == before
+    with kernel.storage.transaction(write=False) as tx:
+        assert tx.get(original_timeout_id, subject) == original_timeout
+        assert tx.one("SELECT policy FROM runs")[0] == frozen_run
+        assert not tx.rows("SELECT * FROM waits WHERE subject=?", (subject,))
+        assert len(tx.rows("SELECT * FROM actions WHERE id IN ('new-ci-window-a','new-ci-window-b')")) == 1
+    kernel.clock = lambda: 200
+    assert scenario.run().reason == "required_checks"
+    window, = read(kernel.storage.path, "status").data["supervision_windows"]
+    assert (window["started_at"], window["deadline"]) == (200, 7400)
+    with kernel.storage.transaction(write=False) as tx:
+        assert tx.get(original_timeout_id, subject) == original_timeout
+        new_scope = json.loads(tx.get(window["scope_id"], subject))
+    assert new_scope == old_scope
+    assert kernel.status(subject)["budgets"] == budget
+    assert len(scenario.role_calls) == roles
+    assert sum(w["operation"] == "pr" for w in scenario.port.writes()) == publications
+
+
+def test_other_supervision_timeout_cannot_change_checks_policy(tmp_path, monkeypatch):
+    from test_kernel_automatic_supervision import delivery_run, source_operations, unavailable
+    from test_kernel_query_cli import _snapshot
+
+    kernel, source = delivery_run(tmp_path / "run.sqlite3")
+    operations = source_operations(kernel, source, kernel.claim_executor("read-outage"))
+    monkeypatch.setattr(operations.runner.ports, "source", unavailable)
+    kernel.clock = lambda: 100
+    assert operations.once().reason == "github_convergence"
+    kernel.clock = lambda: 700
+    expired = operations.once()
+    assert expired.reason == "supervision_timeout"
+    before = _snapshot(tmp_path)
+    with pytest.raises(KernelError, match="policy_override_boundary"):
+        kernel.control("resume", "unrelated-source-timeout", subject=expired.subject,
+                       policy_overrides={"required_checks_wait_seconds": "2h"})
+    assert _snapshot(tmp_path) == before
