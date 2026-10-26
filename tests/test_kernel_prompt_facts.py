@@ -109,7 +109,11 @@ def test_findings_review_uses_previous_actual_result_and_current_development(tmp
                                       "candidate_sha": review.context["reviewed_commit"]}
     assert frozen["facts"]["development_summary"] == raw["summary"]
     assert frozen["facts"]["development_identity"]["attempt_id"] == development.attempt_id
-    assert raw["summary"] in render_role_prompt(review)
+    actual_prompt = render_role_prompt(review)
+    assert raw["summary"] in actual_prompt
+    assert 'Spec、Standards、E2E 三个独立子 Agent' in actual_prompt
+    assert '最终结构化响应' in actual_prompt and '不得继续调用工具' in actual_prompt
+    assert all(command in actual_prompt for command in ('kill', 'pkill', 'killall'))
     wrong_range = {**frozen, "review_range": {**frozen["review_range"], "candidate_sha": scenario.initial.sha}}
     with pytest.raises(KernelError, match="review_context_identity_unavailable"):
         render_role_prompt(replace(review, context={**review.context, "review_context": wrong_range}))

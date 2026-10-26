@@ -106,7 +106,10 @@ def test_original_integration_receipt_survives_review_continuation_and_findings(
     assert continued.attempt_id == review.attempt_id
     assert (continued.thread_id != review.thread_id) == new_thread
     assert continued.context['review_context']['facts']['integration_record'] == record
-    assert summary in render_role_prompt(continued) and record['receipt_id'] in render_role_prompt(continued)
+    continued_prompt = render_role_prompt(continued)
+    assert summary in continued_prompt and record['receipt_id'] in continued_prompt
+    assert '最终结构化响应' in continued_prompt and '不得继续调用工具' in continued_prompt
+    assert all(command in continued_prompt for command in ('kill', 'pkill', 'killall'))
     runner.authorize_agent(continued)
     scenario.kernel.receive(continued, wire_json(review_result('fail')))
     followup = _next_call(scenario, runner, Role.DEVELOPMENT)

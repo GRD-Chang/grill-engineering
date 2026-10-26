@@ -10,8 +10,10 @@ If full testing fails, first diagnose and fix the failure with targeted checks, 
 
 Use skill:implement.
 
-Review: do not normally organize another independent review. Only when the repair both changes the original approach and introduces a previously uncovered critical risk may you arrange one review targeted at that risk. After addressing the results, finish with self-inspection and retesting; do not repeatedly start general reviews.
+Review: decide by risk whether to organize independent Standards and Spec preflight checks, at most one round. After addressing its findings, finish with self-inspection and retesting; do not repeatedly start general reviews.
 
-The program will submit all workspace changes and new files that are not ignored. Before finishing, inspect all uncommitted content, retain deliverable code, tests, documentation and configuration, and remove temporary, build and test artifacts created during this task. Only long-term reproducible project artifacts that should not be version-controlled belong in .gitignore; do not hide deliverables with ignore rules. Locate and clean up temporary paths created outside the workspace for this task as well; do not perform broad deletion.
+The program will check, automatically stage and commit all workspace changes and new files that are not ignored, then continue the task's existing workflow. Before finishing, inspect all uncommitted content, retain deliverable code, tests, documentation and configuration, and remove temporary, build and test artifacts created during this task. Only long-term reproducible project artifacts that should not be version-controlled belong in .gitignore; do not hide deliverables with ignore rules. Locate and clean up temporary paths created outside the workspace for this task as well; do not perform broad deletion.
+
+Repair the root cause and direct impact. If evidence shows an original Finding is invalid or already resolved, explain why and state any limits without manufacturing unrelated changes.
 
 Completion: resolve the evidence-backed problems for this task, validate their root causes, directly affected related cases and possible regressions from these repairs, and leave a file tree ready for submission. Report only actual development and self-test results; a separate acceptance engineer determines whether the delivery passes review.
