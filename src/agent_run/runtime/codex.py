@@ -172,11 +172,10 @@ class _CodexCapture:
             )
             return self
         except BaseException as error:
-            from agent_run.adapters.auth.credential_lifecycle import safe_http_status
+            from agent_run.adapters.auth.credential_lifecycle import credential_diagnostic
 
-            failure = error if hasattr(error, "retryable") else error.__cause__
             self.diagnostic = {"source": "worker-preparation", "error_type": type(error).__name__,
-                               "http_status": safe_http_status(getattr(failure, "http_status", None))}
+                               **credential_diagnostic(error)}
             try:
                 self._close()
             except BaseException as cleanup_error:

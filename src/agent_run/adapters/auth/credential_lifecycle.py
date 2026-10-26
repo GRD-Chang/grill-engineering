@@ -5,7 +5,7 @@ import math
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, TypeVar
+from typing import Any, Callable, Mapping, TypeVar
 
 from agent_run.contracts.policy import AGENT_PREPARATION_SECONDS
 
@@ -20,16 +20,39 @@ def safe_http_status(value: object) -> int | None:
     return value if type(value) is int and 100 <= value <= 599 else None
 
 
+def credential_diagnostic(error: BaseException) -> dict[str, Any]:
+    """Copy only classified, bounded provider facts; never exception text/output."""
+    failure = error if hasattr(error, "retryable") else error.__cause__
+    stored = getattr(failure, "diagnostic", None)
+    def value(key: str) -> Any:
+        return stored.get(key) if isinstance(stored, Mapping) else getattr(failure, key, None)
+    result: dict[str, Any] = {"http_status": safe_http_status(value("http_status"))}
+    category = value("category")
+    if isinstance(category, str) and category in {"timeout", "network", "rate_limited", "unauthorized", "forbidden", "http_error",
+                    "process_error", "command_failed"}:
+        result["category"] = category
+    for key, lower, upper in (("returncode", -255, 255), ("errno", 1, 4095)):
+        number = value(key)
+        if type(number) is int and lower <= number <= upper:
+            result[key] = number
+    retryable = value("retryable")
+    if type(retryable) is bool:
+        result["retryable"] = retryable
+    return result
+
+
 class WorkerCredentialError(RuntimeError):
     def __init__(
         self, message: str, *, http_status: int | None = None,
         retryable: bool | None = False,
         authorization_failed: bool = False,
+        diagnostic: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.http_status = safe_http_status(http_status)
         self.retryable = retryable
         self.authorization_failed = authorization_failed
+        self.diagnostic = dict(diagnostic) if diagnostic is not None else None
 
 
 class InitialCredentialUnavailable(WorkerCredentialError):
@@ -60,10 +83,12 @@ def prepare_initial_credential(
     until = min(deadline, time.monotonic() + AGENT_PREPARATION_SECONDS)
     delay = 1.0
     last_status: int | None = None
+    last_diagnostic: dict[str, Any] | None = None
     while True:
         guard()
         if time.monotonic() >= until:
-            raise InitialCredentialUnavailable("Initial Worker credential wait expired", retryable=True, http_status=last_status)
+            raise InitialCredentialUnavailable("Initial Worker credential wait expired", retryable=True,
+                http_status=last_status, diagnostic=last_diagnostic)
         try:
             result = prepare()
         except Exception as error:
@@ -72,6 +97,7 @@ def prepare_initial_credential(
             if getattr(failure, "retryable", False) is not True:
                 raise
             last_status = safe_http_status(getattr(failure, "http_status", None))
+            last_diagnostic = credential_diagnostic(error)
             retry_at = min(until, time.monotonic() + delay)
             while time.monotonic() < retry_at:
                 guard()
@@ -146,6 +172,7 @@ class RenewableCredential:
                 http_status=getattr(error, "http_status", None),
                 retryable=getattr(error, "retryable", None),
                 authorization_failed=getattr(error, "authorization_failed", False) is True,
+                diagnostic=credential_diagnostic(error),
             ) from None
         with self._condition:
             if self._closed:
