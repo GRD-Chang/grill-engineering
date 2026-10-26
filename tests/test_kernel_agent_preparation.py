@@ -453,3 +453,29 @@ def test_unknown_or_foreign_host_exit_cannot_free_the_original_preparation(tmp_p
     assert kernel.observe_host(request, replace(foreign, invocation_id='original-host')) == 'exited'
     assert kernel.worker_settled(pending) and runner.state().preparing == ()
     assert counts(kernel) == (1, 0, 0, 0)
+
+
+def test_core_classifies_expired_inherited_execution_deadline_from_its_original_scope(tmp_path: Path) -> None:
+    from support.core_operations import prepare_scripted_agent
+    kernel, runner, _, first, clock = preparation(tmp_path)
+    original = prepare_scripted_agent(kernel, first).call
+    assert original is not None and kernel.dispatch_agent(original)
+    kernel.bind_thread(original, 'original-backend-thread')
+    process = {'pid': 23, 'pgid': 23, 'start_token': 'synthetic-unit-worker',
+               'host_pid': 11, 'host_start_token': 'synthetic-unit-host'}
+    kernel.agent_started(original, process)
+    kernel.agent_source_ready(original)
+    kernel.receive(original, b'{"summary":"incomplete artifact structure"}')
+    kernel.agent_exited(original, process, 0)
+    repair = runner.run_once().preparation
+    assert repair is not None and repair.mode == 'output-repair'
+    assert repair.preparation_deadline == original.deadline_at
+    clock[0] = original.deadline_at
+    with pytest.raises(KernelError, match='invocation_deadline_exceeded'):
+        kernel.guard_preparation(repair)
+    # No preparation resources were opened. The caller reports the common
+    # preparation expiry; Core owns the original inherited execution deadline.
+    kernel.preparation_failed(repair, 'preparation_deadline_exceeded', {'resources_opened': False})
+    assert kernel.status(repair.subject)['gates'] == ['execution_failed']
+    assert kernel.status(repair.subject)['budgets']['requirements']['developments_used'] == 1
+    assert kernel.worker_settled(repair)

@@ -3786,7 +3786,9 @@ class Kernel:
             rows = tx.rows("SELECT * FROM waits WHERE subject=? AND kind='agent_preparation'", (preparation.subject,))
             if not any(self._preparation(tx, row)[0].reservation_id == preparation.reservation_id for row in rows):
                 return
-            row, _ = self._preparation_record(tx, preparation)
+            row, data = self._preparation_record(tx, preparation)
+            if data["retained_deadline"] is not None and self.clock() >= data["retained_deadline"]:
+                code = "invocation_deadline_exceeded"
             self._finish_preparation(tx, preparation, row, code, evidence)
 
     def _finish_preparation(self, tx: Transaction, preparation: AgentPreparation, row: sqlite3.Row,

@@ -416,8 +416,7 @@ def _execute_prepared(
         if call is None and capture.cleanup_complete:
             expired = capture.kernel.clock() >= capture.preparation.preparation_deadline
             capture.kernel.preparation_failed(capture.preparation,
-                ("invocation_deadline_exceeded" if capture.preparation.mode == "output-repair" else
-                 "preparation_deadline_exceeded") if expired else "worker_preparation_failed",
+                "preparation_deadline_exceeded" if expired else "worker_preparation_failed",
                 capture.diagnostic or {"source": "worker-preparation", "error_type": type(error).__name__})
         if call is not None and not capture.cleanup_complete and isinstance(error, Exception):
             raise ProcessExitUnknown("Worker credential resource cleanup remains unproven") from error
