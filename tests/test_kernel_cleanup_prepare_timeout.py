@@ -1,5 +1,6 @@
 """Real cleanup timeout after normal delivery; no database/proof mutations."""
 from __future__ import annotations
+from support.core_operations import prepare_scripted_agent
 
 from contextlib import contextmanager
 import ctypes
@@ -222,7 +223,7 @@ def _exercise(root: Path) -> None:
         try:
             runner = scenario.runner()
             for _ in range(40):
-                step = runner.run_once(agent_capacity=0)
+                step = prepare_scripted_agent(kernel, runner.run_once(agent_capacity=0))
                 assert step.call is None
                 if attempts:
                     break
@@ -260,7 +261,7 @@ def _exercise(root: Path) -> None:
             patch.setattr(cleanup, "_hold_ref", actual_hold)
             runner = scenario.runner()
             for _ in range(40):
-                step = runner.run_once(agent_capacity=0)
+                step = prepare_scripted_agent(kernel, runner.run_once(agent_capacity=0))
                 assert step.call is None
                 if kernel.status(subject)["resource_cleanup"]["state"] == "complete":
                     break

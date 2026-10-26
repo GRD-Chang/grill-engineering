@@ -1,4 +1,5 @@
 """A Ticket fixes its dependency-visible Run head at first workspace intent."""
+from support.core_operations import prepare_scripted_agent
 
 from pathlib import Path
 
@@ -52,7 +53,7 @@ def test_dependent_ticket_first_development_sees_delivered_dependency_code(tmp_p
     assert kernel.status(subject)["source_sha"] == head.sha
     scenario.kernel = Kernel(kernel.storage.path)
     assert workspace_intent(scenario, monkeypatch).effect == prepared
-    assert scenario.runner().run_once().kind == "progress"
+    assert prepare_scripted_agent(kernel, scenario.runner().run_once()).kind == "progress"
     development = first_development(scenario)
     assert development.call.context["base_sha"] == head.sha
     checkout = Path(development.call.context["checkout"])
@@ -78,7 +79,7 @@ def test_workspace_intent_keeps_allocated_base_after_run_branch_moves(tmp_path: 
         # The previously authorized physical call completes after restart.
         result = scenario.make_ports(scenario.runner().binding).execute(original, boundary.authorize)
         assert result.disposition == "target"
-    assert scenario.runner().run_once().kind == "progress"
+    assert prepare_scripted_agent(kernel, scenario.runner().run_once()).kind == "progress"
     development = first_development(scenario)
     assert development.call.context["base_sha"] == allocated.sha
     assert (Path(development.call.context["checkout"]) / "development-1.txt").exists()

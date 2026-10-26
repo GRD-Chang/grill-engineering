@@ -1,4 +1,5 @@
 """Partial native workspace writes retain their intent and resource witnesses."""
+from support.core_operations import prepare_scripted_agent
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -34,7 +35,7 @@ def test_partial_workspace_prior_keeps_original_intent_and_resource_facts(tmp_pa
 
     with monkeypatch.context() as patch:
         patch.setattr(LocalGit, "run", interrupted)
-        first = scenario.runner().run_once()
+        first = prepare_scripted_agent(kernel, scenario.runner().run_once())
     assert first.reason == "original_write_readback_required" and len(intercepted) == 1
     assert not checkout.exists()
     ref = scenario.port.git.run("rev-parse", original.source_ref).stdout.strip()
@@ -55,7 +56,7 @@ def test_partial_workspace_prior_keeps_original_intent_and_resource_facts(tmp_pa
         scenario.requirements = replace(scenario.requirements,
             parent=replace(scenario.requirements.parent, body="A legitimately changed requirement"))
         event = "stale_intent_not_applied"
-    settled = scenario.runner().run_once()
+    settled = prepare_scripted_agent(kernel, scenario.runner().run_once())
     assert settled.kind == "progress"
     with kernel.storage.transaction(write=False) as tx:
         after = dict(tx.one("SELECT * FROM effects WHERE id=?", (original.effect_id,)))
@@ -86,7 +87,7 @@ def test_partial_workspace_prior_keeps_original_intent_and_resource_facts(tmp_pa
     else:
         # With no Attempt, the changed source may be accepted normally. A
         # newly authorized workspace may proceed; the retired intent is kept.
-        next_step = scenario.runner().run_once()
+        next_step = prepare_scripted_agent(kernel, scenario.runner().run_once())
         assert next_step.kind == "progress" and next_step.call is None
     assert resource in kernel.generation_resources()
     assert scenario.port.git.run("rev-parse", original.source_ref).stdout.strip() == ref

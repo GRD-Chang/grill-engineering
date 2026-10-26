@@ -1,4 +1,5 @@
 """Fatal Host shutdown fences admission before awaiting exact Worker settlement."""
+from support.core_operations import prepare_scripted_agent
 from contextlib import contextmanager
 from dataclasses import replace
 import json
@@ -35,7 +36,7 @@ def test_fatal_host_drain_rejects_new_and_repeated_resume_and_preserves_settleme
 
     def allocate():
         for _ in range(60):
-            step = operations.run_once()
+            step = prepare_scripted_agent(kernel, operations.run_once())
             if step.call is not None:
                 return step.call
         pytest.fail("normal producer did not allocate the original work")
@@ -48,7 +49,8 @@ def test_fatal_host_drain_rejects_new_and_repeated_resume_and_preserves_settleme
     continued = allocate()
     assert continued.attempt_id == first.attempt_id and kernel.dispatch_agent(continued)
     kernel.agent_unavailable(continued, "preparation_failed", "Controlled local preparation failure")
-    budget = kernel.status(first.subject)["budgets"]
+    unstarted_budget = kernel.status(first.subject)["budgets"]
+    assert unstarted_budget["requirements"]["developments_used"] == 0
 
     entered, cancelled, release, fault, recovered = [threading.Event() for _ in range(5)]
     resume_entered, resume_finished = threading.Event(), threading.Event()
@@ -72,11 +74,15 @@ def test_fatal_host_drain_rejects_new_and_repeated_resume_and_preserves_settleme
             write_failed = True
             raise OSError("revocation committed but its response was lost")
 
-    def worker(core, call, **kwargs):
+    def worker(core, preparation, **kwargs):
+        call = prepare_scripted_agent(core, preparation).call
+        assert call is not None
         assert core.dispatch_agent(call)
-        kwargs["authorize_source"]()
+        kwargs["authorize_source"](call)
         process = {"pid": 6262, "start_token": "controlled-worker", "pgid": 6262, **witness}
         core.agent_started(call, process)
+        kwargs["authorize_source"](call)
+        core.agent_source_ready(call)
         scenario.select(call.subject)
         raw = scenario.agent(call)
         calls.append(call)
@@ -116,6 +122,11 @@ def test_fatal_host_drain_rejects_new_and_repeated_resume_and_preserves_settleme
     try:
         host_thread.start()
         assert entered.wait(8) and cancelled.wait(8)
+        budget = kernel.status(first.subject)["budgets"]
+        assert budget == unstarted_budget
+        assert calls[0].subject != first.subject
+        assert kernel.status(calls[0].subject)["budgets"]["requirements"]["developments_used"] == 1
+        assert {k:v for k,v in budget.items() if k != "requirements"} == {k:v for k,v in unstarted_budget.items() if k != "requirements"}
         assert host_thread.is_alive() and fault.is_set()
         recovered.set()
         resume_thread.start()
@@ -174,7 +185,7 @@ def test_fatal_host_drain_rejects_new_and_repeated_resume_and_preserves_settleme
     next_execution = Execution(successor.run_id, successor.owner, successor.epoch)
     resumed = OperationRunner(kernel, next_execution, lambda binding: ports)
     for _ in range(30):
-        step = resumed.run_once(agent_capacity=0)
+        step = prepare_scripted_agent(kernel, resumed.run_once(agent_capacity=0))
         assert step.call is None
         if any(event["kind"] == "role_consumed" and event["identity"] == calls[0].attempt_id
                for event in kernel.history(calls[0].subject)):

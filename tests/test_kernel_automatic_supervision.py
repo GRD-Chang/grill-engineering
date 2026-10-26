@@ -1,4 +1,5 @@
 """Real Core operations retain the original bounded supervision contract."""
+from support.core_operations import prepare_scripted_agent
 from agent_run.core.operation_runner import OperationRunner
 from dataclasses import replace
 from pathlib import Path
@@ -109,7 +110,7 @@ def test_read_deadline_survives_successful_reads_diagnostics_siblings_and_restar
     reopened = Kernel(kernel.storage.path)
     reopened.clock = lambda: 700.25
     runner = OperationRunner(reopened, execution, lambda binding: ports)
-    expired = runner.run_once()
+    expired = prepare_scripted_agent(kernel, runner.run_once())
     assert (expired.kind, expired.reason) == ("paused", "supervision_timeout")
     assert reopened.status("ticket:2")["gates"] == ["supervision_timeout"]
     assert reopened.status("ticket:3")["gates"] == []

@@ -1,4 +1,5 @@
 """Recovery facts are checked after slow preparation and before live Core admission."""
+from support.core_operations import prepare_scripted_agent
 from dataclasses import asdict
 import json
 
@@ -104,7 +105,7 @@ def test_real_core_preparation_cannot_write_after_foreign_recovery_transition(tm
     before = scenario.port.writes()
     with pytest.raises(KernelError, match="ticket_recovery_boundary_changed") as refused:
         for _ in range(40):
-            step = runner.run_once()
+            step = prepare_scripted_agent(kernel, runner.run_once())
             assert step.call is None
             if changing:
                 break

@@ -1,4 +1,5 @@
 """Real pending starts its checks window; later uncertainty preserves it."""
+from support.core_operations import prepare_scripted_agent
 from agent_run.core.operation_runner import OperationRunner
 from dataclasses import replace
 
@@ -64,7 +65,7 @@ def test_checks_keep_the_first_absolute_window_across_observation_and_restart(
     observed[0] = later
     now[0] = 105.25
     for _ in range(4):
-        step = scenario.runner().run_once()
+        step = prepare_scripted_agent(kernel, scenario.runner().run_once())
         assert step.call is None
         if step.kind == "waiting":
             break
@@ -86,14 +87,14 @@ def test_checks_keep_the_first_absolute_window_across_observation_and_restart(
     runner = OperationRunner(reopened, scenario.execution, selected)
     if expected_window[1] > 700.25:
         now[0] = 700.25
-        step = runner.run_once()
+        step = prepare_scripted_agent(kernel, runner.run_once())
         assert (step.kind, step.reason, step.call) == ("waiting", "required_checks", None)
         expected_window = (*expected_window[:2], expected_window[2] + 1)
         assert window() == expected_window
         assert reopened.status(subject)["budgets"] == before["budgets"]
         assert reopened.status(subject)["holds_integration"] == before["holds_integration"]
     now[0] = expected_window[1]
-    step = runner.run_once()
+    step = prepare_scripted_agent(kernel, runner.run_once())
     assert (step.kind, step.reason, step.call) == ("paused", "supervision_timeout", None)
     assert window() == expected_window
     assert reopened.status(subject)["budgets"] == before["budgets"]

@@ -1,4 +1,5 @@
 """Historical fault regression; synthetic providers and private local Git only."""
+from support.core_operations import prepare_scripted_agent
 import json
 from pathlib import Path
 
@@ -16,7 +17,7 @@ def test_parent_integration_reviewer_receives_original_conflict_evidence(tmp_pat
     scenario.port.external_append(scenario.delivery.target_ref,{'shared.txt':'External content\n'},'conflict')
     runner=scenario.runner();repair=None
     for _ in range(60):
-        step=runner.run_once()
+        step=prepare_scripted_agent(scenario.kernel, runner.run_once())
         if step.call is None:continue
         call=step.call
         if call.role==Role.DEVELOPMENT:
@@ -40,7 +41,7 @@ def test_parent_integration_reviewer_receives_original_conflict_evidence(tmp_pat
 
 def _next_call(scenario, runner, role):
     for _ in range(80):
-        step = runner.run_once()
+        step = prepare_scripted_agent(scenario.kernel, runner.run_once())
         if step.call is not None:
             if step.call.role == role:
                 return step.call

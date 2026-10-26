@@ -1,4 +1,5 @@
 """An admitted Host gets one finite observation pass, never new write authority."""
+from support.core_operations import prepare_scripted_agent
 from pathlib import Path
 
 import pytest
@@ -134,7 +135,7 @@ def sent_workspaces(tmp_path, *, count=2, execute=True):
 
     runner.ports.execute = uncertain
     for _ in range(16):
-        step = runner.run_once()
+        step = prepare_scripted_agent(scenario.kernel, runner.run_once())
         assert step.call is None
         if len(sent) == count:
             break
@@ -248,7 +249,7 @@ def test_approval_observation_executes_real_currentness_and_resync_checks(tmp_pa
             (Issue(2, "Ticket", "Task", "OPEN", frozenset({"ready-for-agent"})),))
         scenario = admit_scenario(GraphScenario(tmp_path / "graph", source), tmp_path)
         assert scenario.run().kind == "complete"
-        activated = scenario.runner().run_once()
+        activated = prepare_scripted_agent(scenario.kernel, scenario.runner().run_once())
         assert activated.reason == "final_activated"
         scenario.select(activated.subject)
     assert scenario.run().kind == "approval"
@@ -260,7 +261,7 @@ def test_approval_observation_executes_real_currentness_and_resync_checks(tmp_pa
         scenario.requirements = replace(scenario.requirements, parent=replace(scenario.requirements.parent, body="Changed actual source"))
     elif change == "target":
         scenario.port.external_remote_append(scenario.delivery.target_ref, {"target-advance.txt": "new target"}, "external-target")
-    step = runner.run_once()
+    step = prepare_scripted_agent(scenario.kernel, runner.run_once())
     after = scenario.kernel.status(scenario.delivery.key)
     assert step.call is None
     if change == "unchanged":
@@ -319,7 +320,7 @@ def test_reactivation_cannot_capture_an_intent_created_after_the_pass(tmp_path):
 
     runner.ports.execute = uncertain
     for _ in range(8):
-        step = runner.run_once()
+        step = prepare_scripted_agent(scenario.kernel, runner.run_once())
         assert step.call is None
         if sent:
             break
@@ -327,7 +328,7 @@ def test_reactivation_cannot_capture_an_intent_created_after_the_pass(tmp_path):
     runner.ports.reconcile = lambda *a: pytest.fail("activation is a snapshot, not a refill")
     runner.activate_observation()
     assert runner.state().disposition == "quiescent"
-    assert runner.run_once().kind == "quiescent"
+    assert prepare_scripted_agent(scenario.kernel, runner.run_once()).kind == "quiescent"
 
 
 def test_temporary_unknown_host_readiness_does_not_consume_the_pass(tmp_path):

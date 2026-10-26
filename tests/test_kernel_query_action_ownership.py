@@ -1,4 +1,5 @@
 """Action scope is independent of its immutable material owner's subject/order."""
+from support.core_operations import prepare_scripted_agent
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -110,14 +111,14 @@ def test_action_history_keeps_original_generation_after_explicit_requeue(tmp_pat
     kernel.configure_profiles('profiles-g1', preset='economy')
     runner = scenario.runner()
     for _ in range(10):
-        call = runner.run_once().call
+        call = prepare_scripted_agent(kernel, runner.run_once()).call
         if call is not None:
             break
     else:
         raise AssertionError('Original Ticket never reached Development')
     runner.authorize_agent(call)
     kernel.receive(call, scenario.agent(call))
-    assert runner.run_once().kind == 'progress'
+    assert prepare_scripted_agent(kernel, runner.run_once()).kind == 'progress'
     before_revision = kernel.status('ticket:2')['revision']
     scenario.requirements = replace(scenario.requirements, issues=tuple(
         replace(issue, body=issue.body+'\nNew requirement') if issue.number == 2 else issue

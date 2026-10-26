@@ -1,4 +1,5 @@
 """The synthetic physical adapters normalize outages at the real port seam."""
+from support.core_operations import prepare_scripted_agent
 from pathlib import Path
 
 import pytest
@@ -42,7 +43,7 @@ def test_offline_bootstrap_outage_preserves_original_wait_and_unstarted_lease(tm
     now = [100.25]
     scenario.kernel.clock = lambda: now[0]
     for _ in range(12):
-        step = scenario.runner().run_once()
+        step = prepare_scripted_agent(scenario.kernel, scenario.runner().run_once())
         if step.call is not None:
             call = step.call
             break

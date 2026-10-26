@@ -1,4 +1,5 @@
 """Real read/commit interleavings cannot publish mixed source observations."""
+from support.core_operations import prepare_scripted_agent
 from agent_run.core.operation_runner import OperationRunner
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -57,7 +58,7 @@ def test_late_source_read_cannot_reopen_a_newly_observed_external_blocker(tmp_pa
         finally:
             release.set()
     assert kernel.source_status() == fresh
-    assert fresh_runner.run_once().call is None
+    assert prepare_scripted_agent(kernel, fresh_runner.run_once()).call is None
     assert kernel.status("ticket:2")["pending_attempt"] is None
     history = kernel.history("ticket:2")
 

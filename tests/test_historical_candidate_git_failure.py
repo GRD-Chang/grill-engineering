@@ -1,4 +1,5 @@
 """Historical fault regression; synthetic providers and private local Git only."""
+from support.core_operations import prepare_scripted_agent
 import json
 from pathlib import Path
 
@@ -170,7 +171,7 @@ def test_candidate_failure_uses_existing_development_repair_and_budget(tmp_path,
         if (state['phase'] == 'complete' and state['resource_cleanup'] is not None
                 and state['resource_cleanup']['state'] == 'complete'):
             break
-        step = runner.run_once()
+        step = prepare_scripted_agent(scenario.kernel, runner.run_once())
         if step.call is None:
             assert step.kind not in {'paused', 'waiting'}, step
             if step.kind == 'complete':
