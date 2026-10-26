@@ -21,11 +21,7 @@ from agent_run.runtime.executor import _make_ports
 from support.core_operations import CoreOperations
 
 from agent_run.adapters.workspace import ManagedWorkspace, read_git_identity
-
-
-def git(root: Path, *arguments: str) -> str:
-    return subprocess.run(["git", *arguments], cwd=root, check=True, text=True,
-                          capture_output=True).stdout.strip()
+from support.workspace import git
 
 
 def test_native_clone_copies_only_original_identity_and_opens_without_legacy_runtime(

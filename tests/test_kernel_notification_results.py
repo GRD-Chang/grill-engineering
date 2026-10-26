@@ -244,7 +244,7 @@ def test_resume_failure_and_human_result_bind_the_original_gate_without_a_second
 def test_query_rejects_out_of_calendar_recorded_activity_with_public_diagnostic(tmp_path):
     from agent_run.queries.read_facts import QueryError
     from agent_run.queries.run import read
-    from test_kernel_public_v9_facts import _kernel
+    from support.cli_fixtures import _kernel
 
     kernel, ports = _kernel(tmp_path)
     execution = kernel.claim_executor("executor")

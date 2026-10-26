@@ -15,10 +15,10 @@ from agent_run.model import AgentCall, AgentPreparation, Commit, Delivery, Deliv
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.runtime.codex import execute_codex
-from agent_run.runtime.execution import ProcessExit
 from support.offline import fixture_inputs, review_result
 from agent_run.contracts.agent_profiles import resolve_profiles
 from support.core_operations import CoreOperations, ReadOnlyPorts, final_scenario, native_agent_fixture, observed_call
+from support.native_runtime import local_codex
 
 
 RAW = b'{"result_kind":"development","summary":"Implemented by the local CLI process.","human_blockers":null}'
@@ -45,20 +45,6 @@ def allocated_codex(tmp_path: Path) -> tuple[Kernel, AgentPreparation, ReadOnlyP
     call = CoreOperations(kernel, execution, lambda binding: ports, prepare_agents=False).until(lambda step: step.preparation is not None).preparation
     assert call is not None
     return kernel, call, ports
-
-
-def local_codex(kernel: Kernel, call: AgentPreparation, tmp_path: Path, program: str) -> ProcessExit | None:
-    executable = tmp_path / "local-codex"
-    executable.write_text(f"#!{sys.executable}\n" + "import json, os, sys\nfrom pathlib import Path\n" + program)
-    executable.chmod(0o700)
-    credential = tmp_path / "selected-hosts.yml"
-    credential.write_text("github.com:\n  oauth_token: local-fixture-only\n")
-    credential.chmod(0o600)
-    return execute_codex(
-        kernel, call, executable=str(executable), prompt="Continue the allocated task.",
-        environment={"PATH": os.defpath, "HOME": str(tmp_path)}, credential_file=credential,
-        hidden_paths=(), authorize_source=lambda admitted: None, timeout=5,
-    )
 
 
 @pytest.mark.parametrize("raw", [RAW, b'{"result_kind":"development","summary":42}'], ids=["valid", "invalid"])

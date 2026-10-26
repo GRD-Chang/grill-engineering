@@ -12,7 +12,7 @@ import agent_run.runtime.executor as executor
 from support.offline import GraphScenario, Scenario
 from agent_run.core.operation_contract import ReadUnavailable
 from support.requirements_scenarios import independent_source
-from test_kernel_operation_review_host import _NoNotifications
+from support.notification import _NoNotifications
 
 
 def gated_host(tmp_path, monkeypatch):

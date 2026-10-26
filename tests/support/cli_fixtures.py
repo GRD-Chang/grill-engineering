@@ -14,6 +14,9 @@ from agent_run.config.defaults import UserDefaultsStore
 from agent_run.contracts.agent_profiles import resolve_profiles
 from agent_run.core.kernel import Kernel
 from agent_run.model import Blocker, Commit, Delivery, DeliveryKind, Issue, ParentIssue, Policy, Profile, Requirements, RunSpec
+from agent_run.contracts.prompt import RESOURCE_KEYS
+from agent_run.core.operation_contract import DeliveryFacts
+from support.core_operations import ReadOnlyPorts
 
 
 def run_agents(path: Path) -> Path:
@@ -104,3 +107,20 @@ def _published_profile_task(git_repo: Path) -> Kernel:
         (delivery,), repository_root=str(workspace.repository_root)), defaults)
     return Kernel.create_task(workspace.state_root / spec.run_id / 'kernel.sqlite3', spec,
         requirements=Requirements(ParentIssue(1, 'Profile Parent', 'Frozen original requirement'), ()))
+
+
+def _kernel(root: Path) -> tuple[Kernel, ReadOnlyPorts]:
+    defaults = UserDefaultsStore(root / 'defaults.json')
+    defaults.configure(language='en', profile={'development_model': 'frozen-model', 'development_effort': 'high'},
+                       github={'worker_source': 'pat', 'pat': {'env': 'FROZEN_TOKEN'}, 'runner_source': 'host'},
+                       notifications={'enabled': False, 'mode': 'detailed'})
+    base = Commit('base', 'tree')
+    job = Delivery('ticket', DeliveryKind.TICKET, 2, 'ticket-v1', base, 'refs/heads/source', 'refs/heads/target')
+    final = Delivery('final:1', DeliveryKind.FINAL_RUN, 1, 'unread', base, job.target_ref, 'refs/heads/main')
+    source = Requirements(ParentIssue(1, 'Parent', 'Original requirement', (2,)), (
+        Issue(2, 'Ticket', 'Original behavior', 'OPEN', frozenset({'ready-for-agent'})),
+    ))
+    spec = freeze_creation(RunSpec('run', 'example/project', 1, 'parent-v1', 'graph-v1', (job, final),
+        repository_root=str(root)), defaults, prompt_resources={key: 'Original ' + key for key in RESOURCE_KEYS})
+    return (Kernel.create(root / 'kernel.sqlite3', spec, requirements=source),
+            ReadOnlyPorts(source, job.source_ref, job.target_ref, DeliveryFacts(base, None)))

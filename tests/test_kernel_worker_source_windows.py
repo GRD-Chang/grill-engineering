@@ -10,43 +10,12 @@ from threading import Event, Thread, current_thread
 
 import pytest
 
-from agent_run.model import Issue, ParentIssue, Requirements
 from agent_run.errors import KernelError
 from agent_run.core.operation_contract import ReadUnavailable
 from agent_run.runtime.execution import execute
-from agent_run.runtime.executor import _make_ports
-from support.core_operations import CoreOperations
-from support.offline import GraphScenario
 from agent_run.adapters.remote import RemoteEffects
 from agent_run.adapters.source import read_requirements
-from support.remote_effects import _fixture
-
-RAW = b'{"result_kind":"development","summary":"one actual worker","human_blockers":null}'
-
-
-def _allocated_worker(tmp_path, monkeypatch):
-    source = Requirements(ParentIssue(1, "Parent", "Original scope", (2,)),
-                          (Issue(2, "Ticket", "Original task", "OPEN", frozenset({"ready-for-agent"})),))
-    scenario = GraphScenario(tmp_path / "scenario", source)
-    preparation = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
-    call = preparation.until(lambda step: step.call is not None).call
-    assert call is not None
-    transport = tmp_path / "transport"
-    transport.mkdir()
-    _port, _git, _push, state, _calls = _fixture(transport, monkeypatch)
-    scenario.port.git.run("remote", "add", "offline-remote", str(transport / "origin.git"))
-    scenario.port.git.run("push", "--force", "offline-remote",
-                          scenario.initial.sha + ":refs/heads/main",
-                          scenario.initial.sha + ":" + scenario.delivery.target_ref,
-                          scenario.initial.sha + ":" + scenario.delivery.source_ref)
-    state.write_text(json.dumps({"prs": [], "comments": [], "events": [], "issue_state": "open", "source_graph": {
-        "parent": {"number": 1, "title": "Parent", "body": "Original scope", "sub_issues": [2]},
-        "issues": {"2": {"number": 2, "title": "Ticket", "body": "Original task", "state": "OPEN",
-                           "labels": ["ready-for-agent"]}}}}))
-    operations = CoreOperations(scenario.kernel, scenario.execution, _make_ports)
-    operations.runner.observe(scenario.delivery.key)
-    return scenario, operations, state, call
-
+from support.agent_continuation import _allocated_worker, RAW
 
 @pytest.mark.parametrize("window", [1, 2], ids=["before_popen", "before_release"])
 @pytest.mark.parametrize("change", ["labels", "requirement", "upstream"])

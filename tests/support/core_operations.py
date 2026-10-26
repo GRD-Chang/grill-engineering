@@ -17,6 +17,9 @@ from agent_run.contracts.write_authority import WriteAuthority
 
 from support.offline import GraphScenario
 from support.requirements_scenarios import independent_source, native_input
+from agent_run.model import Role
+from agent_run.core.operation_contract import ReadUnavailable
+from support.offline import Scenario, fixture_inputs
 
 
 def prepare_scripted_agent(kernel: Kernel, step: Step | AgentPreparation) -> Step:
@@ -285,3 +288,39 @@ def task_run(root: Path, run_id: str, *, parent: int = 1) -> tuple[Kernel, ReadO
     delivery = Delivery("parent", DeliveryKind.PARENT_ONLY, parent, "v1", base, "refs/heads/task", "refs/heads/main")
     return native_agent_fixture(root / (run_id + ".sqlite3"), RunSpec(run_id, "example/project", parent, "v1", "graph", (delivery,),
                          language="en", repository_root=str(root / "repository")))
+
+
+def delivery_run(path: Path) -> tuple[Kernel, Requirements]:
+    source = Requirements(ParentIssue(1, "Parent", "Requirement", (2, 3)), (
+        Issue(2, "First", "First work", "OPEN", frozenset({"ready-for-agent"})),
+        Issue(3, "Second", "Second work", "OPEN", frozenset({"ready-for-agent"})),
+    ))
+    base = Commit("base", "base-tree")
+    deliveries = tuple(Delivery(f"ticket:{number}", DeliveryKind.TICKET, number, "unread", base,
+                                f"refs/heads/ticket-{number}", "refs/heads/run") for number in (2, 3))
+    final = Delivery("final:1", DeliveryKind.FINAL_RUN, 1, "unread", base, "refs/heads/run", "refs/heads/main")
+    return Kernel.create(path, RunSpec("run", "example/repository", 1, "unread", "unread", (*deliveries, final),
+        Policy(concurrency=2), language="en", repository_root=str(path.parent.resolve()), inputs=fixture_inputs()), requirements=source), source
+
+def source_operations(kernel, source, execution):
+    """Explicit read-only external facts; selection is shared production Core."""
+    deliveries = [kernel.delivery(f"ticket:{issue.number}") for issue in source.issues]
+    facts = {(delivery.source_ref, delivery.target_ref): DeliveryFacts(delivery.base, None) for delivery in deliveries}
+    first = deliveries[0]
+    ports = ReadOnlyPorts(source, first.source_ref, first.target_ref, facts[(first.source_ref, first.target_ref)])
+    ports.delivery = lambda request: facts[(request.source_ref, request.target_ref)]
+    return CoreOperations(kernel, execution, lambda binding: ports)
+
+def unavailable(parent):
+    raise ReadUnavailable("github_read_failed", "Original source outage")
+
+def next_call(scenario: Scenario, role: Role) -> AgentCall:
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+    for _ in range(160):
+        step = operations.once()
+        if step.call is not None and step.call.role == role:
+            return step.call
+        assert step.kind not in {"paused", "waiting", "complete", "approval"}, step
+        if step.call is not None:
+            scripted_return(scenario.kernel, operations.runner, step.call, scenario.agent)
+    raise AssertionError("The requested role never became ready")

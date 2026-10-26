@@ -9,7 +9,7 @@ from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.model import ResourceWitness
 from agent_run.core.operation_contract import DeliveryRead, OperationPorts
 from agent_run.adapters.remote import RemoteEffects
-from test_kernel_local_effects import publication
+from support.remote_effects import publication
 from support.remote_effects import _change, _fixture, _publish_pr
 
 

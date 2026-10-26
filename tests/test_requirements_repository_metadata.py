@@ -81,7 +81,7 @@ def test_initial_creation_still_requires_the_exact_default_commit(git_repo, tmp_
     from agent_run.adapters.workspace import ManagedWorkspace
     from agent_run.cli.lifecycle import prepare_creation
     from agent_run.config.defaults import UserDefaultsStore
-    from test_kernel_managed_creation import git
+    from support.workspace import git
 
     remote = tmp_path / 'origin.git'
     git(git_repo, 'init', '--bare', '--initial-branch=main', str(remote))

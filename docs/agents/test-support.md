@@ -8,19 +8,21 @@
 | 责任 | 当前支撑模块 | 使用边界 |
 | --- | --- | --- |
 | 用户与 Git 环境隔离 | `environment`、`workspace` | 每例独立 HOME/XDG、目录和环境；不可变 Git 模板按 worker 创建，每例复制后独立修改 |
-| 准备、准入与脚本化 Agent 返回 | `core_operations`、`agent_continuation` | `Ports` / `setup` 保留真实 Core 选择和有限依赖场景；驱动准备→准入→Invocation，不跳过凭据准备。`host_kernel` / `task_run` 仅创建有限 Run；`settle_agent` 仅为原单元场景的显式合成进程观察，不是 OS/Host 退出证明 |
+| 准备、准入与脚本化 Agent 返回 | `core_operations`、`agent_continuation` | `Ports` / `setup` 保留真实 Core 选择和有限依赖场景；驱动准备→准入→Invocation，不跳过凭据准备。`host_kernel` / `task_run` / `delivery_run` 仅创建有限 Run，`source_operations` / `next_call` 保留原只读事实和正常角色选择；`settle_agent` 仅为原单元场景的显式合成进程观察，不是 OS/Host 退出证明 |
 | 公共查询、Profile 与 Doctor 前置 | `cli_fixtures`、`environment` | `_create` / `_published` / `_published_profile_task` 保留正常 Core 创建、准确 Task 绑定及冻结配置；`_file_snapshot` 保留原文件字节视图，不与目录级 `durable_snapshot` 混用 |
 | 合成交付世界 | `offline`、`offline_api`、`offline_git` | `Scenario` / `GraphScenario` 使用真实 Kernel、SQLite、私有 Git；Agent 输出和 GitHub 原始对象是合成输入，不是预期结果权威 |
+| 原生 Worker 与续接前置 | `agent_continuation`、`native_runtime` | `_allocated_worker` 保留正常准备、源观察与原 RAW；`local_codex` 准备原本地脚本/fixture credential，再调用唯一 `execute_codex`。文件生成检查不等于 Worker/沙箱执行或退出证明 |
 | 有限需求场景 | `requirements_scenarios` | `native_input` 每次读取新数据；`independent_source` 仅移除声明的依赖，`source_run` 通过真实 Core 创建库，不补造完成状态 |
 | 有限托管控制与观察前置 | `control_scenarios` | `prepared_control` / `managed_approval` 准备准确 PR、合成 manager/HostObservation 及控制观察；`admit_scenario` / `sent_workspaces` 保留原准入和 unknown-intent。`restorable_public_resume` 只准备原隔离损坏输入和已安装 CLI 命令，恢复断言留在用例。调用方拥有控制、读回与退出断言，不把合成事实当 OS 证明 |
-| 资源清理前置与本地 ref 读取 | `cleanup_scenarios` | `_native_scenario`、`_local_head` 保留原种类和准确 ref 语义；`prepared_generation_two_cleanup` 只准备正常 Requeue 与原观察回调，执行和 foreign/退出断言仍由各用例拥有 |
-| 真实 gh 子进程与远端 effect 前置 | `remote_effects` | 唯一 `FAKE_GH` 脚本及 `_fixture`、`_change`、`_pr_effect`、`_publish_pr`、`_source_kernel`、`_reader`；调用方拥有独立仓库、状态、日志及 monkeypatch |
+| Abandon 与 PR 退休前置 | `control_scenarios` | `managed_abandon_scenario`、`_parent_requeue`、`_retirement` 保留各自原控制顺序、原意图和准确回执；不合并不同恢复权限 |
+| 资源清理前置与本地 ref 读取 | `cleanup_scenarios` | `_native_scenario`、`_local_head` 保留原种类和准确 ref 语义；`_intent` / `_checkout` 保留原机械 adapter 场景的准确 REF；`prepared_generation_two_cleanup` 只准备正常 Requeue 与原观察回调，执行和 foreign/退出断言仍由各用例拥有 |
+| 真实 gh 子进程与远端 effect 前置 | `remote_effects` | 唯一 `FAKE_GH` 脚本及 `_fixture`、`_change`、`_pr_effect`、`_publish_pr`、`_source_kernel`、`_reader`、`publication`、`_actual_publication_push`；调用方拥有独立仓库、状态、日志及 monkeypatch |
 | GitHub 读取与文本 fixture | `github_requirements`、`github_checks`、`fixture_text` | 保留编号/仓库/父子关系、分页、检查身份及文本路径语义；错误响应仍由真实 reader 拒绝 |
 | 写前边界与外部观察 | `effect_boundary`、`api_observation` | 在原外部 I/O 窗口注入变化，保留 prepare、物理核验和最终 Core 准入；`workspace_intent` / `advance_to_effect` 只挂起正常选择出的准确 Effect，不缓存已通过的许可 |
 | 受控 manager、托管入口与 Status 端口 | `systemd_manager`、`systemd_exit_manager`、`status_comments` | `_local_manager` 仅替换外部 manager，执行原封存 argv；`_control_environment` / 批准屏障保留原 Git、状态、FD-store 与收尾。manager/sysfs/评论响应的合成输入不冒充真实 OS 或 GitHub 验收 |
-| 通知场景、投影与观察 | `notification`、`observer_errors` | `_kernel` / `_operations` 保留有限的冻结配置与只读端口；`_project` 只读实际 history 并调用产品投影；`_enabled_scenario` 保留正常 Core/Git 前置。每例持有发送器，关闭后独立检查观察异常，不能依赖被后台吞掉的 assert |
+| 通知场景、投影与观察 | `notification`、`observer_errors` | `_kernel` / `_operations` 保留有限的冻结配置与只读端口；`_project` 只读实际 history 并调用产品投影；`_enabled_scenario` 保留正常 Core/Git 前置。`_NoNotifications` 仅用于原明确禁发路径；每例持有发送器，关闭后独立检查观察异常，不能依赖被后台吞掉的 assert |
 | SQLite 故障 | `sqlite_faults`、`sqlite_fault_host` | 仅精确私有 DB/Run/Action；真实事务故障和清理保持，封存前选择的测试 Host 入口不是官方原 argv E2E |
-| 安装及运行库身份 | `installed_runtime`、`offline_install`、`fast_runner_installer`、`native_runtime` | 验证非 editable 安装及源码字节；安装 fixture 使用本地固定依赖，不读取真实账号或在 pytest 内联网准备依赖 |
+| 安装及运行库身份 | `installed_runtime`、`offline_install`、`fast_runner_installer`、`native_runtime` | `offline_install._source_tree` / `_fake_codex` / `_run` 保留原离线准备、显式模拟程序与 shell 调用，不等于真实模型或安装激活验收。验证非 editable 安装及源码字节；安装 fixture 使用本地固定依赖，不读取真实账号或在 pytest 内联网准备依赖 |
 | 进程及同步 | `process_scope`、`readiness`、`worker_process_timing`、`worker_sigint_probe` | 只管理明确归属的进程/句柄；`guardian_timeout_owners` 保留准确 receipt/pidfd 收割与独立子进程的嵌套 finally。先断言真实退出再执行失败兜底；屏障有界且失败时释放 |
 
 ## 有限合法前置与负向输入

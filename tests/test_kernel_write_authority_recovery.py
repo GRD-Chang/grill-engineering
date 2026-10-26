@@ -7,7 +7,7 @@ import pytest
 
 from agent_run.errors import KernelError
 from support.offline_api import SyntheticGitHub
-from test_kernel_abandon import managed_abandon_scenario
+from support.control_scenarios import managed_abandon_scenario
 
 
 def test_write_authority_does_not_cache_permission_before_its_boundary():

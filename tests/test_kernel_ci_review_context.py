@@ -7,7 +7,7 @@ from agent_run.core.prompts.role import render_role_prompt
 from agent_run.model import DeliveryKind, Policy, Role, wire_json
 from support.core_operations import CoreOperations, scripted_return
 from support.offline import Scenario, review_result
-from tests.test_kernel_publication_threads import next_call
+from support.core_operations import next_call
 
 
 FINDING = 'LATEST_CI_REVIEW_FINDING_7e281: repair the newly reviewed CI behavior.'

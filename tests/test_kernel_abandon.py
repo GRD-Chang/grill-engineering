@@ -9,11 +9,12 @@ from pathlib import Path
 import pytest
 
 from agent_run.errors import KernelError
-from agent_run.model import DeliveryKind, Execution, HostLaunch, HostObservation, ResourceInspection
+from agent_run.model import DeliveryKind, Execution, HostObservation, ResourceInspection
 from support.offline import GraphScenario, Scenario
 from support.api_observation import api_writes, lose_api_reply, pr_author_read
 from support.requirements_scenarios import independent_source
 from support.core_operations import CoreOperations, scripted_return
+from support.control_scenarios import managed_abandon_scenario
 
 
 def _merge_response_lost(scenario, monkeypatch: pytest.MonkeyPatch):
@@ -201,26 +202,6 @@ def test_abandon_continuation_settles_the_original_sent_intent_before_fresh_insp
     assert len(retired) == 1 and retired[0]["intent"] == original.effect_id
     assert scenario.port.pr_by_number(prior_pr.number).state == "CLOSED"
     assert kernel.source_status()["abandonment"]["status"] == "complete"
-
-
-def managed_abandon_scenario(tmp_path: Path) -> tuple[GraphScenario, HostLaunch]:
-    # Host observations below are explicit controller-consumer fixture evidence;
-    # this helper never starts a process or claims a physical exit.
-    scenario = GraphScenario(tmp_path / "abandon", independent_source())
-    kernel = scenario.kernel
-    operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
-    operations.until(lambda step: kernel.status(scenario.delivery.key)["phase"] == "development")
-    assert Path(scenario.delivery.checkout).exists()
-    kernel.control("stop", "retire-offline")
-    kernel.confirm_executor_exit(scenario.execution)
-    kernel.control("resume", "prepare-managed")
-    request = kernel.admit_host("start", kind="run", command=("native-host",),
-                                environment_carrier=tmp_path / "carrier", preflight=lambda: None)
-    assert kernel.dispatch_host(request)
-    assert kernel.observe_host(request, HostObservation("running", request.unit_name, "original", "/host", "boot",
-                                                       42, "start", usage_ready=True)) == "running"
-    scenario.execution = Execution(request.run_id, request.owner, request.epoch)
-    return scenario, request
 
 
 def test_abandon_original_cap_ends_before_a_managed_continuation(tmp_path: Path) -> None:

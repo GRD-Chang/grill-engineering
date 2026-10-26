@@ -104,7 +104,7 @@ def test_stderr_marker_across_chunks_keeps_only_bounded_overlap():
 
 
 def test_installer_preserves_safe_probe_category_and_refuses_activation(tmp_path):
-    from test_runner_installer import _source_tree, _fake_codex, _run, _data_root
+    from support.offline_install import _source_tree, _fake_codex, _run, _data_root
 
     source = _source_tree(tmp_path)
     fake_bin, count, _ = _fake_codex(tmp_path, behavior="nonzero")

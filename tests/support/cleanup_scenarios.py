@@ -9,6 +9,8 @@ from agent_run.model import DeliveryKind, Effect
 from support.core_operations import final_scenario
 from support.offline import GraphScenario, Scenario
 from support.requirements_scenarios import independent_source
+from agent_run.model import Execution
+from agent_run.adapters.git_objects import LocalGit
 
 
 def _native_scenario(root: Path, kind: DeliveryKind) -> GraphScenario:
@@ -77,3 +79,24 @@ def prepared_generation_two_cleanup(tmp_path: Path, monkeypatch, foreign_move: b
 
     monkeypatch.setattr(scenario.port, "execute", execute)
     return scenario, original, replacement, original_marker, cleanups
+
+
+REF = "refs/heads/task"
+
+def _intent(git: LocalGit, operation: str, **payload: object) -> Effect:
+    base = git.commit("HEAD")
+    return Effect(
+        "cleanup-original", "ticket:3", operation, "example/repository",
+        REF, "refs/heads/run", base.sha, None, None, base, 1,
+        "offline-publisher", {"branch_ref": REF, "expected_head": base.sha, **payload},
+        Execution("run", "executor", 1),
+    )
+
+def _checkout(git: LocalGit, tmp_path: Path, *, attached: bool = False) -> tuple[Path, Effect]:
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    checkout = owned / "development"
+    git.run("update-ref", REF, git.commit("HEAD").sha)
+    git.run("worktree", "add", *( () if attached else ("--detach",)), str(checkout), REF)
+    common = git.run("rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+    return checkout, _intent(git, "cleanup_worktree", checkout=str(checkout), owned_root=str(owned), common_git_dir=common)

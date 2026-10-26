@@ -15,6 +15,12 @@ from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.model import Effect, Execution
 from support.github_checks import CHECK_ROLLUP_FAKE, LATEST_CHECK_FAKE
 from support.github_requirements import source_issue
+import shutil
+import pytest
+from agent_run.adapters.local_git import LocalEffects
+from agent_run.model import DeliveryKind, EffectResult
+from support.offline import Scenario
+from support.core_operations import prepare_scripted_agent, scripted_return
 
 
 def _fixture(tmp_path, monkeypatch, *, repository="example/project", actor="publisher"):
@@ -347,3 +353,100 @@ else:
     for name in ('GH_TOKEN', 'GITHUB_TOKEN'):
         monkeypatch.delenv(name, raising=False)
     return GhGitHubReader('example/project', working_directory=root, runner_identity={'source': 'host'}), log
+
+
+def publication(git_repo: Path, tmp_path: Path) -> tuple[LocalGit, LocalEffects, Effect]:
+    git = LocalGit(git_repo)
+    git.run("config", "user.name", "Frozen Repository Author")
+    git.run("config", "user.email", "frozen@example.invalid")
+    base = git.commit("HEAD")
+    owned = tmp_path / "work"
+    owned.mkdir()
+    checkout = owned / "delivery"
+    git.run("worktree", "add", "--detach", str(checkout), base.sha)
+    effect = Effect(
+        "publication-original", "ticket:3", "publication_commit", "example/repository",
+        "refs/heads/task", "refs/heads/run", base.sha, None, base, base, None,
+        None, {"checkout": str(checkout), "owned_root": str(owned),
+               "common_git_dir": str(git_repo / ".git"), "integrated_sha": base.sha,
+               "integrated_tree": base.tree, "parents": [base.sha], "reuse_sha": None,
+               "commit_message": "Publish the reviewed change", "intent_token": "publication-original"},
+        Execution("run", "executor", 1),
+    )
+    return git, LocalEffects(git, owned_root=owned), effect
+
+def _actual_publication_push(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                             command_exit: int) -> tuple[Scenario, Effect]:
+    """Use a real Git transport command; its outer exit is not a forged result.
+
+    Adapted from the independent dbfddc8d operation review. All network commands
+    are confined to a local bare repository; gh may only return the fixture actor.
+    """
+    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
+    bare = scenario.port.physical.remote
+    real_git = shutil.which("git")
+    assert real_git is not None
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    trace = tmp_path / "push-command.jsonl"
+    actor = binary / "gh"
+    actor.write_text(f"#!{sys.executable}\nimport json,sys\nassert sys.argv[1:]==['api','user']\n"
+                     "print(json.dumps({'login':'offline-publisher'}))\n")
+    actor.chmod(0o755)
+    command = binary / "git"
+    command.write_text(f"""#!{sys.executable}
+import json,subprocess,sys
+from pathlib import Path
+arguments=sys.argv[1:]
+response=subprocess.run([{real_git!r},*arguments])
+if arguments[:2]==['push',{str(bare)!r}]:
+    actual_exit={command_exit} if response.returncode==0 else response.returncode
+    with Path({str(trace)!r}).open('a') as output:
+        output.write(json.dumps({{'arguments':arguments,'inner_git_returncode':response.returncode,
+                                 'actual_command_returncode':actual_exit}})+'\\n')
+    if actual_exit:
+        print('actual transport command exited nonzero after the local push',file=sys.stderr)
+    raise SystemExit(actual_exit)
+raise SystemExit(response.returncode)
+""")
+    command.chmod(0o755)
+    monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
+    for variable in ("GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(variable, raising=False)
+    native = RemoteEffects(scenario.port.git.root, scenario.spec.repository,
+                           runner_identity={"source": "host"}, remote=str(bare))
+    runner = scenario.runner()
+    execute = runner.ports.execute
+    observed: list[tuple[Effect, EffectResult]] = []
+    grants: list[str] = []
+
+    def execute_original(effect, authorize):
+        if effect.operation != "push":
+            return execute(effect, authorize)
+        def prepare_grant():
+            final_admission = authorize.prepare()
+            def current_grant():
+                final_admission()
+                grants.append(effect.effect_id)
+            return current_grant
+        result = native.execute(effect, WriteAuthority(prepare_grant))
+        observed.append((effect, result))
+        return result
+
+    monkeypatch.setattr(runner.ports, "execute", execute_original)
+    for _ in range(48):
+        step = prepare_scripted_agent(scenario.kernel, runner.run_once())
+        if step.call is not None:
+            scripted_return(scenario.kernel, runner, step.call, scenario.agent)
+        if observed:
+            break
+    else:
+        raise AssertionError("Normal public operations never reached the original push")
+    effect, physical = observed[0]
+    assert grants == [effect.effect_id]
+    commands = [json.loads(line) for line in trace.read_text().splitlines()]
+    assert len(commands) == 1 and commands[0]["inner_git_returncode"] == 0
+    assert commands[0]["actual_command_returncode"] == command_exit
+    assert physical.disposition == "target" and physical.raw["write_returncode"] == command_exit
+    assert scenario.port.git.run("--git-dir", str(bare), "rev-parse", effect.source_ref).stdout.strip() == effect.after_sha
+    return scenario, effect

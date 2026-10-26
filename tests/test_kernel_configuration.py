@@ -1,27 +1,22 @@
 """Creation defaults become native facts; existing Threads never read new defaults."""
-from support.core_operations import prepare_scripted_agent
 
-from agent_run.contracts.write_authority import WriteAuthority
 
 from dataclasses import replace
 import json
-import os
 from pathlib import Path
-import shutil
-import sys
 
 import pytest
 
 from agent_run.contracts.prompt import RESOURCE_KEYS
 from agent_run.config.defaults import UserDefaultsStore
-from agent_run.model import Commit, Delivery, DeliveryKind, Effect, EffectResult, RunSpec
+from agent_run.model import Commit, Delivery, DeliveryKind, RunSpec
 from agent_run.core.kernel import Kernel
 from agent_run.config.creation import freeze_creation
 from agent_run.core.operation_contract import ReadUnavailable
 from support.offline import Scenario
 from agent_run.queries.run import read
-from agent_run.adapters.remote import RemoteEffects
 from support.core_operations import CoreOperations, native_agent_fixture, scripted_return
+from support.remote_effects import _actual_publication_push
 
 
 def test_explicit_frozen_profiles_keep_their_actual_source_without_a_preset(tmp_path: Path) -> None:
@@ -143,83 +138,6 @@ def test_publication_call_retains_its_actual_development_reference_revision(tmp_
     # A later revision cannot mutate the already-authorized Publication call.
     assert scenario.kernel.dispatch_agent(call)
     scenario.kernel.guard_agent(call)
-
-
-def _actual_publication_push(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-                             command_exit: int) -> tuple[Scenario, Effect]:
-    """Use a real Git transport command; its outer exit is not a forged result.
-
-    Adapted from the independent dbfddc8d operation review. All network commands
-    are confined to a local bare repository; gh may only return the fixture actor.
-    """
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
-    bare = scenario.port.physical.remote
-    real_git = shutil.which("git")
-    assert real_git is not None
-    binary = tmp_path / "bin"
-    binary.mkdir()
-    trace = tmp_path / "push-command.jsonl"
-    actor = binary / "gh"
-    actor.write_text(f"#!{sys.executable}\nimport json,sys\nassert sys.argv[1:]==['api','user']\n"
-                     "print(json.dumps({'login':'offline-publisher'}))\n")
-    actor.chmod(0o755)
-    command = binary / "git"
-    command.write_text(f"""#!{sys.executable}
-import json,subprocess,sys
-from pathlib import Path
-arguments=sys.argv[1:]
-response=subprocess.run([{real_git!r},*arguments])
-if arguments[:2]==['push',{str(bare)!r}]:
-    actual_exit={command_exit} if response.returncode==0 else response.returncode
-    with Path({str(trace)!r}).open('a') as output:
-        output.write(json.dumps({{'arguments':arguments,'inner_git_returncode':response.returncode,
-                                 'actual_command_returncode':actual_exit}})+'\\n')
-    if actual_exit:
-        print('actual transport command exited nonzero after the local push',file=sys.stderr)
-    raise SystemExit(actual_exit)
-raise SystemExit(response.returncode)
-""")
-    command.chmod(0o755)
-    monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
-    for variable in ("GH_TOKEN", "GITHUB_TOKEN"):
-        monkeypatch.delenv(variable, raising=False)
-    native = RemoteEffects(scenario.port.git.root, scenario.spec.repository,
-                           runner_identity={"source": "host"}, remote=str(bare))
-    runner = scenario.runner()
-    execute = runner.ports.execute
-    observed: list[tuple[Effect, EffectResult]] = []
-    grants: list[str] = []
-
-    def execute_original(effect, authorize):
-        if effect.operation != "push":
-            return execute(effect, authorize)
-        def prepare_grant():
-            final_admission = authorize.prepare()
-            def current_grant():
-                final_admission()
-                grants.append(effect.effect_id)
-            return current_grant
-        result = native.execute(effect, WriteAuthority(prepare_grant))
-        observed.append((effect, result))
-        return result
-
-    monkeypatch.setattr(runner.ports, "execute", execute_original)
-    for _ in range(48):
-        step = prepare_scripted_agent(scenario.kernel, runner.run_once())
-        if step.call is not None:
-            scripted_return(scenario.kernel, runner, step.call, scenario.agent)
-        if observed:
-            break
-    else:
-        raise AssertionError("Normal public operations never reached the original push")
-    effect, physical = observed[0]
-    assert grants == [effect.effect_id]
-    commands = [json.loads(line) for line in trace.read_text().splitlines()]
-    assert len(commands) == 1 and commands[0]["inner_git_returncode"] == 0
-    assert commands[0]["actual_command_returncode"] == command_exit
-    assert physical.disposition == "target" and physical.raw["write_returncode"] == command_exit
-    assert scenario.port.git.run("--git-dir", str(bare), "rev-parse", effect.source_ref).stdout.strip() == effect.after_sha
-    return scenario, effect
 
 
 @pytest.mark.parametrize("command_exit", [0, 7], ids=["actual-zero", "actual-nonzero"])

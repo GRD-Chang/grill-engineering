@@ -22,6 +22,8 @@ from support.core_operations import CoreOperations, prepare_scripted_agent
 from support.offline import GraphScenario, Scenario
 from support.remote_effects import _fixture
 from support.requirements_scenarios import independent_source
+from agent_run.model import HostLaunch
+from support.offline_api import SyntheticGitHub
 
 
 def prepared_control(tmp_path: Path, monkeypatch, control_kind: str):
@@ -292,3 +294,57 @@ raise SystemExit(main(sys.argv[2:]))
         document=document,
         command=command,
     )
+
+
+def managed_abandon_scenario(tmp_path: Path) -> tuple[GraphScenario, HostLaunch]:
+    # Host observations below are explicit controller-consumer fixture evidence;
+    # this helper never starts a process or claims a physical exit.
+    scenario = GraphScenario(tmp_path / "abandon", independent_source())
+    kernel = scenario.kernel
+    operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
+    operations.until(lambda step: kernel.status(scenario.delivery.key)["phase"] == "development")
+    assert Path(scenario.delivery.checkout).exists()
+    kernel.control("stop", "retire-offline")
+    kernel.confirm_executor_exit(scenario.execution)
+    kernel.control("resume", "prepare-managed")
+    request = kernel.admit_host("start", kind="run", command=("native-host",),
+                                environment_carrier=tmp_path / "carrier", preflight=lambda: None)
+    assert kernel.dispatch_host(request)
+    assert kernel.observe_host(request, HostObservation("running", request.unit_name, "original", "/host", "boot",
+                                                       42, "start", usage_ready=True)) == "running"
+    scenario.execution = Execution(request.run_id, request.owner, request.epoch)
+    return scenario, request
+
+def _parent_requeue(tmp_path, monkeypatch):
+    scenario = Scenario(tmp_path / 'scenario', DeliveryKind.PARENT_ONLY)
+    assert scenario.run().kind == 'approval'
+    old = scenario.world()
+    assert old.pr is not None and old.target is not None
+    target = scenario.port.external_append(scenario.delivery.target_ref,
+        {'target.txt': 'A real target append before explicit requeue.\n'}, 'target-before-retirement')
+    read = SyntheticGitHub.object
+
+    def stale(api, endpoint):
+        value = read(api, endpoint)
+        if (endpoint.startswith(f'repos/{scenario.spec.repository}/pulls/')
+                and value.get('number') == old.pr.number and not value.get('merged')):
+            return {**value, 'base': {**value['base'], 'sha': old.target.sha}}
+        return value
+
+    monkeypatch.setattr(SyntheticGitHub, 'object', stale)
+    scenario.requirements = replace(scenario.requirements,
+        parent=replace(scenario.requirements.parent, body=scenario.requirements.parent.body + '\nExplicit revised scope.'))
+    world = scenario.world()
+    original = scenario.kernel.delivery(scenario.delivery.key)
+    replacement = replace(original, source_ref=original.source_ref + '-g2', base=target,
+        checkout=str(tmp_path / 'scenario' / 'work' / 'parent-1-g2'))
+    assert world.pr is not None and world.pr.base == old.target and world.target == target
+    return scenario, old, replacement, world
+
+def _retirement(scenario):
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        rows = tx.rows("SELECT * FROM effects WHERE subject=? AND operation='retire_pr'",
+                       (scenario.delivery.key,))
+        assert len(rows) == 1
+        row = dict(rows[0])
+        return row, json.loads(tx.get(row['payload_id'], scenario.delivery.key)), json.loads(tx.get(row['receipt_id'], scenario.delivery.key))

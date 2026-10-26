@@ -14,7 +14,7 @@ from support.core_operations import CoreOperations
 from agent_run.errors import KernelError
 from agent_run.model import ReadWait, Step
 from support.remote_effects import _fixture, _publish_pr, _source_kernel
-from test_kernel_worker_source_windows import _allocated_worker, RAW
+from support.agent_continuation import _allocated_worker, RAW
 
 
 def test_executor_waits_for_real_pr_and_remote_ref_observations_to_converge(tmp_path, monkeypatch):

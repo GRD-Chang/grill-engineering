@@ -208,3 +208,14 @@ def _enabled_scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: Del
         else:
             scenario = GraphScenario(tmp_path, source, reviews=reviews if kind == DeliveryKind.PARENT_ONLY else ("pass",))
     return scenario
+
+
+class _NoNotifications:
+    def __init__(self, *_arguments):
+        pass
+
+    def observe_committed(self):
+        pass
+
+    def close(self, **_arguments):
+        pass
