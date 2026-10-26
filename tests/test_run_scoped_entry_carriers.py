@@ -98,6 +98,22 @@ def test_current_public_stop_keeps_durable_fence_and_exact_selected_run_without_
         assert run_is_current(tx, database)
 
 
+def test_current_producer_nonempty_notification_page_retains_the_original_history_layout(tmp_path):
+    spec, source = proposal(tmp_path / 'repository', 'current-page', 99)
+    kernel = Kernel.create_task(tmp_path / 'current' / 'kernel.sqlite3', spec, requirements=source)
+    assert kernel.stop_task('page-stop') == 'applied'
+    observer = NativeNotifications.__new__(NativeNotifications)
+    observer.database, observer.storage = kernel.storage.path, kernel.storage
+    with kernel.storage.transaction(write=False) as tx:
+        columns = tx.execute('PRAGMA table_info(history)').fetchall()
+        assert 'run_id' not in [column['name'] for column in columns]
+        assert tx.one('SELECT count(*) FROM history')[0] > 0
+        observer.run_id, observer.binding, observer.config, observer.state = observer._run(tx)
+        highwater = tx.one('SELECT max(position) FROM history')[0]
+    events, more, cursor = observer._page(0)
+    assert events == [] and not more and cursor == highwater
+
+
 @pytest.mark.parametrize('operation', ['run', 'resume', 'approve', 'stop', 'revise', 'requeue', 'abandon'])
 def test_internal_public_route_stays_closed_before_lease_io_or_control(repository, monkeypatch, operation):
     assert routing.REPOSITORY_PUBLIC_READY is False
