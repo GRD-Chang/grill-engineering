@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import sqlite3
 import threading
@@ -18,6 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from agent_run.contracts.repository import normalize_repository
 from agent_run.storage import notification_outbox as outbox
 from agent_run.errors import bounded_error, KernelError
 from agent_run.notifications.cards import card
@@ -39,6 +41,16 @@ from agent_run.storage.sqlite import Storage, Transaction
 
 CLOSE_TIMEOUT_SECONDS = 60.0
 Send = Callable[..., Mapping[str, Any]]
+
+
+def _pull_request_identity(url: object) -> tuple[str, int] | None:
+    match = re.fullmatch(r"https://github[.]com/([^/]+/[^/]+)/pull/([1-9][0-9]*)", url) if isinstance(url, str) else None
+    if match is None:
+        return None
+    try:
+        return normalize_repository(match[1]), int(match[2])
+    except ValueError:
+        return None
 
 
 class NativeNotifications:
@@ -329,17 +341,21 @@ class NativeNotifications:
 
     @staticmethod
     def _coalesce_final_pr(document: dict[str, Any]) -> None:
-        # Only an already-enqueued current approval card with the exact PR URL
+        # Only an already-enqueued current approval card with the exact PR identity
         # replaces an unsent creation card. Sending/unknown payloads keep their
         # original identity and delivery budget.
-        approvals = {(item["event"]["work_subject"], item["event"]["generation"], item["event"]["url"])
+        approvals = {(item["event"]["work_subject"], item["event"]["generation"], identity)
                      for item in document["pending"] if item["event"]["kind"] == "boundary" and item["event"].get("current")
-                     and type(item["event"].get("approval_pr")) is int and item["event"]["approval_pr"] > 0
+                     and type(item["event"].get("approval_pr")) is int
+                     and (identity := _pull_request_identity(item["event"].get("url"))) is not None
+                     and identity[1] == item["event"]["approval_pr"]
                      and not item.get("cancelled") and not item.get("exhausted")}
         for item in list(document["pending"]):
             event = item["event"]
+            identity = _pull_request_identity(event.get("url"))
             if (event["kind"] == "pr_created" and item["attempts"] == 0 and item["outcome"] == "pending"
-                    and (event.get("work_subject"), event.get("generation"), event.get("url")) in approvals):
+                    and identity is not None
+                    and (event.get("work_subject"), event.get("generation"), identity) in approvals):
                 outbox.cancel_item(document, item, "included in current Final PR approval")
 
     def observe_committed(self) -> None:

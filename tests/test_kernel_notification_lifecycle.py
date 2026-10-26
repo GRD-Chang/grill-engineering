@@ -154,11 +154,28 @@ def test_observed_run_branch_write_does_not_promote_a_superseded_acceptance(
     scenario.port.git.run("merge-base", "--is-ancestor", foreign.sha, target.sha)
 
 
-@pytest.mark.parametrize("mode,approval", [("detailed", True), ("detailed", False), ("concise", True)],
-                         ids=["detailed-approval", "detailed-checks-pending", "concise-approval"])
+@pytest.mark.parametrize("mode,approval,uppercase_repository", [
+    ("detailed", True, False), ("detailed", False, False), ("concise", True, False),
+    ("detailed", True, True), ("detailed", False, True)],
+    ids=["detailed-approval", "detailed-checks-pending", "concise-approval",
+         "canonical-case-approval", "canonical-case-checks-pending"])
 def test_healthy_final_pr_and_approval_in_one_observation_share_only_the_approval_card(
-    tmp_path, monkeypatch, mode, approval,
+    tmp_path, monkeypatch, mode, approval, uppercase_repository,
 ):
+    from support.offline_api import SyntheticGitHub
+
+    if uppercase_repository:
+        original_pr = SyntheticGitHub._pr
+
+        def canonical_pr(api, number):
+            # A normal HTTP-shaped provider read returns GitHub's canonical
+            # spelling; all Core/Remote identity checks and receipts stay real.
+            response = original_pr(api, number)
+            for field in ("head", "base"):
+                response[field]["repo"]["full_name"] = response[field]["repo"]["full_name"].upper()
+            return response
+
+        monkeypatch.setattr(SyntheticGitHub, "_pr", canonical_pr)
     scenario = _enabled_scenario(tmp_path, monkeypatch, DeliveryKind.PARENT_ONLY, mode=mode)
     if approval:
         assert scenario.run().kind == "approval"
@@ -175,6 +192,7 @@ def test_healthy_final_pr_and_approval_in_one_observation_share_only_the_approva
             raise AssertionError("Normal producer did not consume its Final PR creation")
     pr = scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref)
     assert pr is not None
+    assert pr.repository == ("EXAMPLE/PROJECT" if uppercase_repository else "example/project")
     from agent_run.queries.run import read
     # Discard mutable notification files from the read-only product comparison.
     database_before = scenario.kernel.storage.path.read_bytes()
@@ -237,7 +255,9 @@ def test_notification_degradation_uses_frozen_language_and_original_technical_re
 
 
 @pytest.mark.parametrize("change", ["none", "subject", "generation", "url", "missing-pr", "not-current",
-                                     "exhausted", "unknown", "sending", "already-attempted", "wrong-kind", "invalid-pr"], ids=str)
+                                     "exhausted", "unknown", "sending", "already-attempted", "wrong-kind", "invalid-pr", "repo-case", "foreign-host",
+                                     "credentials", "query", "fragment", "bad-repository", "wrong-route",
+                                     "noncanonical-number", "wrong-scheme", "number-coherence"], ids=str)
 def test_final_pr_coalescing_requires_an_exact_current_approval_and_an_unsent_creation(change):
     from copy import deepcopy
     from agent_run.notifications.envelope import event_envelope
@@ -261,6 +281,20 @@ def test_final_pr_coalescing_requires_an_exact_current_approval_and_an_unsent_cr
         approval["kind"] = "stage_end"
     elif change == "invalid-pr":
         approval["approval_pr"] = "2"
+    if change == "repo-case":
+        creation["url"] = "https://github.com/EXAMPLE/PROJECT/pull/2"
+    elif change == "foreign-host":
+        creation["url"] = "https://other.example/example/project/pull/2"
+    elif change in {"credentials", "query", "fragment", "bad-repository", "wrong-route",
+                    "noncanonical-number", "wrong-scheme"}:
+        altered = {"credentials": "https://user@github.com/example/project/pull/2", "query": url + "?x=1",
+                   "fragment": url + "#issuecomment-1", "bad-repository": "https://github.com/../project/pull/2",
+                   "wrong-route": "https://github.com/example/project/issues/2",
+                   "noncanonical-number": "https://github.com/example/project/pull/02",
+                   "wrong-scheme": "http://github.com/example/project/pull/2"}[change]
+        creation["url"] = approval["url"] = altered
+    elif change == "number-coherence":
+        approval["approval_pr"] = 99
     document = {"pending": [], "records": []}
     outbox.enqueue(document, creation, 100.25)
     outbox.enqueue(document, approval, 100.25)
@@ -273,7 +307,7 @@ def test_final_pr_coalescing_requires_an_exact_current_approval_and_an_unsent_cr
         first["attempt_history"] = [{"number": 1, "outcome": first["outcome"], "started_at": 100.5}]
     before = deepcopy(document)
     NativeNotifications._coalesce_final_pr(document)
-    if change == "none":
+    if change in {"none", "repo-case"}:
         assert document["pending"] == [before["pending"][1]]
         record, = document["records"]
         assert (record["id"], record["attempts"], record["outcome"]) == (creation["id"], 0, "cancelled")
