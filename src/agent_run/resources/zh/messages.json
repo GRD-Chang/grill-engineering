@@ -1106,6 +1106,7 @@
   "cli.doctor_online_help": "显式验证所选 GitHub 身份，不调用模型",
   "cli.doctor_mode_help": "检查后台或前台 Host 所需能力（默认后台）",
   "cli.doctor_run_help": "检查此 Run 的冻结身份，而非新任务默认",
+  "cli.receipt.completed": "{command}: 交付已完成；本次未执行新动作。",
   "cli.receipt.accepted": "{command}: 请求已受理",
   "cli.receipt.attached": "{command}: 已附着既有请求；本次新操作未应用",
   "cli.receipt.status": "已记录请求状态: {status}",

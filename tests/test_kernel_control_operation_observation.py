@@ -81,7 +81,7 @@ def test_control_read_failure_is_a_cli_error_without_a_work_wait_or_claim(tmp_pa
         assert not tx.rows("SELECT subject FROM waits")
 
 
-def managed_approval(tmp_path, monkeypatch, *, tickets):
+def managed_approval(tmp_path, monkeypatch, *, tickets, language="en"):
     transport = tmp_path / "transport"
     transport.mkdir()
     port, git, push, state, calls = _fixture(transport, monkeypatch)
@@ -92,7 +92,7 @@ def managed_approval(tmp_path, monkeypatch, *, tickets):
                                     "labels": ["ready-for-agent"]} for n in tickets}}
     state.write_text(json.dumps({"prs": [], "comments": [], "events": [], "issue_state": "open", "source_graph": graph}))
     defaults = UserDefaultsStore()
-    defaults.configure(language="en", profile={"preset": "economy"})
+    defaults.configure(language=language, profile={"preset": "economy"})
     database, spec, source = lifecycle_cli.prepare_creation(1, "example/project", source_directory=git.root,
         defaults=defaults, remote_url=str(transport / "origin.git"))
     kernel = Kernel.create_task(database, spec, requirements=source)

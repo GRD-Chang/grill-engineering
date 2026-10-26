@@ -1106,6 +1106,7 @@
   "cli.doctor_online_help": "Explicitly verify selected GitHub identities without calling a model",
   "cli.doctor_mode_help": "Check background or foreground Host capabilities (default: background)",
   "cli.doctor_run_help": "Check this Run's frozen identities instead of new-Run defaults",
+  "cli.receipt.completed": "{command}: Delivery already completed; no new action was performed.",
   "cli.receipt.accepted": "{command}: Request accepted",
   "cli.receipt.attached": "{command}: Attached to the existing request; new action not applied",
   "cli.receipt.status": "Stored request state: {status}",

@@ -115,11 +115,15 @@ def _print_receipt(parsed: argparse.Namespace, output: Mapping[str, Any], langua
     def copy(key: str, **values: object) -> str:
         return text("cli.receipt." + key, language=language, **values)
 
-    print(safe_text(copy("attached" if output["result"] == "attached" else "accepted", command=parsed.command)))
-    status = {"action_pending": "pending", "action_applied": "applied", "action_complete": "complete",
-              "action_updating": "updating", "action_superseded": "superseded",
-              "action_failed": "failed"}.get(output["status"], "unknown")
-    print(copy("status", status=copy(status)))
+    completed = (parsed.command == "stop" and output.get("action") == "stop"
+                 and output["result"] == output["status"] == "completed"
+                 and output.get("action_id") is None and output["host"] == "exited")
+    print(safe_text(copy("completed" if completed else "attached" if output["result"] == "attached" else "accepted", command=parsed.command)))
+    if not completed:
+        status = {"action_pending": "pending", "action_applied": "applied", "action_complete": "complete",
+                  "action_updating": "updating", "action_superseded": "superseded",
+                  "action_failed": "failed"}.get(output["status"], "unknown")
+        print(copy("status", status=copy(status)))
     host = output["host"] if output["host"] in {"running", "exited"} else "unknown"
     print(copy("host_" + host))
     parent = getattr(parsed, "parent", None)
@@ -140,7 +144,8 @@ def _print_receipt(parsed: argparse.Namespace, output: Mapping[str, Any], langua
         command.append("--help")
     if parent is not None:
         command.extend(("--parent", str(parent)))
-    print(copy("boundary"))
+    if not completed:
+        print(copy("boundary"))
     print(safe_text(copy("next", command=shlex.join(command))))
 
 
