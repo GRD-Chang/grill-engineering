@@ -11,8 +11,7 @@ from agent_run.core.kernel import Kernel
 from agent_run.model import DeliveryKind, Policy
 from support.offline import Scenario
 from support.core_operations import prepare_scripted_agent
-from test_kernel_attempt_continuation import _native_boundary, _read_operations
-from test_kernel_agent_preparation import preparation
+from support.agent_continuation import _native_boundary, _read_operations, preparation
 
 
 INCOMPLETE = wire_json({"result_kind": "incomplete", "summary": "Implementation is unfinished; continue the current task.", "human_blockers": None})
@@ -46,7 +45,7 @@ def test_incomplete_uses_same_attempt_thread_and_deadline_with_new_invocation(tm
         assert tx.get(tx.one("SELECT raw_id FROM invocation_outputs WHERE invocation=?", (original.invocation_id,))[0], original.subject) == INCOMPLETE
 
 
-def finish(kernel, call, body, *, failure_kind="ordinary"):
+def finish(kernel, call, body, *, failure_kind="ordinary", returncode=None):
     assert kernel.dispatch_agent(call)
     kernel.bind_thread(call, call.reported_thread or "retained-backend")
     process = {"pid": 77, "start_token": call.invocation_id, "pgid": 77,
@@ -55,7 +54,7 @@ def finish(kernel, call, body, *, failure_kind="ordinary"):
     kernel.agent_source_ready(call)
     if body is not None:
         kernel.receive(call, body)
-    kernel.agent_exited(call, process, 0 if body is not None else 1, failure_kind=failure_kind)
+    kernel.agent_exited(call, process, (0 if body is not None else 1) if returncode is None else returncode, failure_kind=failure_kind)
 
 
 def test_second_incomplete_pauses_and_reopen_does_not_reset_the_one_successor(tmp_path):
@@ -125,6 +124,36 @@ def test_automatic_failure_recovery_cannot_extend_semantic_time_or_reset_counts(
         facts = load_continuation(tx, attempt)
         assert facts.semantic_used == 1 and facts.semantic_deadline == 107.0
         assert (facts.ordinary_used, facts.capacity_count) == ((1, 0) if kind == "ordinary" else (0, 0))
+
+
+@pytest.mark.parametrize("observed_at", [107.0, 108.0])
+def test_malformed_semantic_raw_capacity_wait_expires_at_the_original_deadline(tmp_path, observed_at):
+    kernel, _, operations, attempt, original = _native_boundary(tmp_path, return_body=INCOMPLETE)
+    kernel.clock = lambda: 103.0
+    resumed = operations.once().call
+    assert resumed is not None
+    kernel.clock = lambda: 104.0
+    malformed = b'{"summary":'
+    finish(kernel, resumed, malformed, failure_kind="capacity", returncode=1)
+    assert operations.once().call is None
+    assert operations.runner.state().wake_at == original.deadline_at == 107.0
+    kernel.clock = lambda: 106.0
+    assert operations.once().call is None
+    assert operations.runner.state().wake_at == 107.0
+    kernel.clock = lambda: observed_at
+    expired = operations.once()
+    assert expired.kind == "paused" and expired.reason == "invocation_deadline_exceeded"
+    assert expired.call is None and expired.preparation is None
+    assert operations.once().call is None
+    with kernel.storage.transaction(write=False) as tx:
+        facts = load_continuation(tx, attempt)
+        assert facts.semantic_deadline == 107.0 and facts.semantic_used == 1
+        assert facts.prior.recovery_ready_at == 134.0
+        assert facts.ordinary_used == facts.capacity_count == facts.output_ordinal == 0
+        assert tx.get(facts.prior.raw_id, original.subject) == malformed
+        assert tx.one("SELECT count(*) FROM invocations")[0] == 2
+        assert not tx.rows("SELECT scope_id FROM waits WHERE kind='agent_preparation'")
+        assert not tx.rows("SELECT id FROM effects")
 
 
 def test_stop_revokes_semantic_preparation_and_late_raw_is_only_history(tmp_path):

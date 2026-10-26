@@ -4108,6 +4108,10 @@ class Kernel:
         if previous is None:
             return Step("paused", subject, "continuation_exit_missing")
         backend = tx.one("SELECT backend_id FROM threads WHERE id=?", (facts.thread_id,))[0]
+        if (facts.semantic_deadline is not None and self.clock() >= facts.semantic_deadline
+                and attempt["resume_action"] is None):
+            self._gate(tx, subject, "execution_failed", evidence=previous.start_evidence)
+            return Step("paused", subject, "invocation_deadline_exceeded")
         if previous.failure_kind == "capacity" and previous.recovery_ready_at is not None and self.clock() < previous.recovery_ready_at:
             return Step("waiting", subject, "capacity_recovery_wait")
         if attempt["resume_action"] is not None and previous.failure_kind is not None:
