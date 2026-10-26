@@ -100,6 +100,7 @@ class _CodexCapture:
         self.kernel, self.preparation, self.executable = kernel, preparation, executable
         self.call: AgentCall | None = None
         self.cleanup_complete = False
+        self.dispatch_claimed = False
         # Local launch knowledge only. Cleared before Popen can create anything;
         # absence of a stored PID or a completed Future is never this proof.
         self.unstarted_failure: tuple[str, dict[str, Any] | str] | None = (
@@ -424,7 +425,8 @@ def _execute_prepared(
                 capture.diagnostic or {"source": "worker-preparation", "error_type": type(error).__name__})
         if call is not None and capture.cleanup_complete and capture.unstarted_failure is not None:
             try:
-                capture.kernel.agent_unavailable(call, *capture.unstarted_failure)
+                capture.kernel.agent_unavailable(call, *capture.unstarted_failure,
+                    before_dispatch=not capture.dispatch_claimed)
             except BaseException as settlement_error:
                 raise error from settlement_error
         if call is not None and not capture.cleanup_complete and isinstance(error, Exception):
@@ -434,7 +436,8 @@ def _execute_prepared(
         raise
     if capture.cleanup_complete and capture.unstarted_failure is not None:
         assert call is not None
-        capture.kernel.agent_unavailable(call, *capture.unstarted_failure)
+        capture.kernel.agent_unavailable(call, *capture.unstarted_failure,
+            before_dispatch=not capture.dispatch_claimed)
     return result
 
 

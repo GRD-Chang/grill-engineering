@@ -2909,11 +2909,16 @@ class Kernel:
                     and not self._gates(tx, call.subject)):
                 self._gate(tx, call.subject, "worker_start_unknown", evidence=material)
 
-    def agent_unavailable(self, call: AgentCall, code: str, evidence: dict[str, Any] | str) -> None:
-        """Caller proves no spawn and completed cleanup; missing PID is no proof."""
+    def agent_unavailable(self, call: AgentCall, code: str, evidence: dict[str, Any] | str, *,
+                          before_dispatch: bool = False) -> None:
+        """Settle owned unspawned work; an unacknowledged claim is allocated-only."""
         with self.storage.transaction() as tx:
             invocation = self._invocation(tx, call)
-            if invocation["process_identity"] is not None or invocation["dispatch_state"] not in {"allocated", "sent", "unavailable"}:
+            if invocation["process_identity"] is not None:
+                raise KernelError("worker_exit_unproven")
+            if invocation["dispatch_state"] == "unavailable":
+                return  # Preserve the original exact cleanup receipt on repeated settlement.
+            if invocation["dispatch_state"] != ("allocated" if before_dispatch else "sent"):
                 raise KernelError("worker_exit_unproven")
             material = tx.put(call.subject, "worker_unavailable", wire_json({"code": code, "evidence": evidence}))
             tx.execute("UPDATE invocation_outputs SET dispatch_state='unavailable',start_evidence=? WHERE invocation=? AND ordinal=?",

@@ -220,12 +220,18 @@ def _execute(
         claimed = kernel.dispatch_agent(call)
     except BaseException as error:
         if capture is None:
-            _unavailable(kernel, call, "worker_preparation_failed", {"error_type": type(error).__name__}, None)
+            try:
+                kernel.agent_unavailable(call, "worker_preparation_failed",
+                    {"error_type": type(error).__name__}, before_dispatch=True)
+            except BaseException as settlement_error:
+                raise error from settlement_error
         raise
     if not claimed:
         if capture is not None:
             capture.unstarted_failure = None  # Another launch claim is not ours to settle.
         return None
+    if capture is not None:
+        capture.dispatch_claimed = True  # Only an acknowledged True claim belongs to this launch.
     configured = call.deadline_at - kernel.clock()
     supplied = call.deadline_seconds if timeout is None else timeout
     try:

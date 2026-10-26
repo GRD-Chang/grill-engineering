@@ -11,26 +11,7 @@ from agent_run.core.operation_runner import OperationRunner
 from agent_run.errors import KernelError
 from agent_run.model import Commit, Delivery, DeliveryKind, Policy, RunSpec
 from agent_run.runtime.execution import execute
-from support.core_operations import native_agent_fixture
-
-
-def preparation(tmp_path: Path, *, concurrency: int = 1):
-    base = Commit('base', 'tree')
-    spec = RunSpec('preparation', 'example/repository', 1, 'parent', 'graph', (
-        Delivery('ticket:2', DeliveryKind.TICKET, 2, 'original', base,
-                 'refs/heads/ticket', 'refs/heads/run', checkout=str(tmp_path)),
-    ), Policy(ticket_rounds=1, development_deadline_seconds=120, concurrency=concurrency))
-    (tmp_path / 'state').mkdir()
-    kernel, ports = native_agent_fixture(tmp_path / 'state' / 'kernel.sqlite3', spec)
-    clock = [1000.0]
-    kernel.clock = lambda: clock[0]
-    owner = kernel.claim_executor('preparation-owner')
-    runner = OperationRunner(kernel, owner, lambda _: ports)
-    for _ in range(6):
-        step = runner.run_once()
-        if step.call is not None or getattr(step, 'preparation', None) is not None:
-            return kernel, runner, ports, step, clock
-    raise AssertionError('Core did not reserve Agent work')
+from support.core_operations import native_agent_fixture, agent_preparation_fixture as preparation
 
 
 def counts(kernel):
