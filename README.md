@@ -127,6 +127,12 @@ The current backend is Codex CLI with GitHub, running on Linux. Your agent can f
 install and configure it. Runs use your Codex account quota; models and repair limits can be adjusted
 through [user settings](docs/user-defaults.md).
 
+Windows users can evaluate a WSL2 Linux Guest; macOS users can evaluate a Linux VM Guest.
+Install and run the whole toolchain inside that Guest, including project files, sockets and
+credential references. Native Windows/macOS Workers are unsupported; Guest startup and recovery
+are not yet platform-validated. Follow the [support tiers and read-only diagnostics](docs/productization/support.md#linux-guest-路径与只读诊断)
+before installation. Docker is not the default compatibility path.
+
 For Matt's workflow, see the [upstream guide](https://www.aihero.dev/skills).
 
 ## Acknowledgments

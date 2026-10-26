@@ -14,6 +14,9 @@ host/PAT/App 身份、后台运行、人工批准或恢复合同。
 需要认证和仓库读取时再显式 `doctor --online --repo OWNER/REPO`，见[准备说明](../preparation.md)。
 这些材料的静态检查、示例测试和记录检查器不代表真实发行验收完成。
 只有 [支持矩阵](support.md) 中有同版实际证据的条目才能标为已验证。
+Windows 的 WSL2 与 macOS 的 Linux VM 是待逐机验证的 Linux Guest 路径，
+不是原生后端；先按[Guest 布局与诊断步骤](support.md#linux-guest-路径与只读诊断)核对，
+不把 Docker 内工具存在、`uname` 或 doctor 就绪报告当作跨平台启动验收。
 无 systemd 的前台候选已接入显式入口，仍待物理 Host 与真实交付验收；
 能力预检不代表业务通过，见[运行模式](../agent-run.md#运行模式与前台候选验收)。
 
