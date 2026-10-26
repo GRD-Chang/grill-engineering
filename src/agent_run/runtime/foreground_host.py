@@ -130,9 +130,17 @@ class ForegroundHost:
         """Finish only an already committed exit whose final unlink was lost."""
         try:root = record_root(lock)
         except FileNotFoundError:return
+        run_id = kernel.run_paths().run_id
         for path in root.glob('*.json'):
             record = read_record(path)
             if record.get('database') != str(kernel.storage.path.resolve()):continue
+            binding = record.get('binding')
+            if (not isinstance(binding, list) or len(binding) != 4
+                    or not isinstance(binding[0], str) or not binding[0]):
+                raise DomainUnknown('Foreground protection has no exact Run binding')
+            # A shared database is not a Run identity. Preserve sibling records
+            # for their own closure and the existing global management barrier.
+            if binding[0] != run_id:continue
             action = record['action']
             original = kernel.host_usage(action)
             if original is not None and original.disposition == 'exited' and original.usage_released:
