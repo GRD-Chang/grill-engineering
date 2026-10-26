@@ -211,6 +211,8 @@ def test_latest_resume_distinguishes_application_from_the_target_start_and_ignor
     sibling_process = {"pid": 23, "pgid": 23, "start_token": "query-sibling",
                        "host_pid": 10, "host_start_token": "query-host"}
     kernel.agent_started(sibling, sibling_process)
+    kernel.observe_worker_activity(sibling, "sibling-turn", active=True, observed_at=101.0,
+                                   evidence={"type": "turn.started"})
     before = _snapshot(tmp_path)
     assert main(_arguments(kernel, "status", "--json")) == 0
     document = json.loads(capsys.readouterr().out)
@@ -232,6 +234,9 @@ def test_latest_resume_distinguishes_application_from_the_target_start_and_ignor
     assert target is not None and kernel.dispatch_agent(target)
     target_process = {**sibling_process, "pid": 22, "pgid": 22, "start_token": "query-target"}
     kernel.agent_started(target, target_process)
+    assert query.read(kernel.storage.path, "status").data["latest_resume"]["resume"]["progress"] is None
+    kernel.observe_worker_activity(target, "target-turn", active=True, observed_at=102.0,
+                                   evidence={"type": "turn.started"})
     before = _snapshot(tmp_path)
     latest = query.read(kernel.storage.path, "status").data["latest_resume"]
     assert latest["status"] == "applied"

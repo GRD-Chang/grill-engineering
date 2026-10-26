@@ -12,7 +12,7 @@ from typing import Any, Literal, Mapping, Sequence
 from agent_run.contracts.task import TaskKey
 from agent_run.storage.notification_outbox import read_notifications
 
-from agent_run.queries.execution import activity, recorded_profile
+from agent_run.queries.execution import activity, recorded_profile, worker_activity_start
 from agent_run.queries.resume_facts import resume_facts
 from agent_run.queries.model import HistoryPage, RunStatus
 from agent_run.errors import KernelError
@@ -285,8 +285,6 @@ def _resume_progress(tx: Transaction, control: list[dict[str, Any]]) -> None:
         if action["kind"] != "resume":
             continue
         successors = _all(tx, "SELECT id FROM invocations WHERE action_id=? ORDER BY rowid", (action["id"],))
-        started = tx.one("SELECT min(o.started_at) FROM invocation_outputs o JOIN invocations i "
-                         "ON i.id=o.invocation WHERE i.action_id=?", (action["id"],))[0]
         receipt = action["receipt"]
         application = tx.rows("SELECT position,generation FROM history WHERE kind='control_applied' "
                               "AND identity=? AND material_id=? ORDER BY position LIMIT 1",
@@ -295,7 +293,7 @@ def _resume_progress(tx: Transaction, control: list[dict[str, Any]]) -> None:
             applications.append(application[0])
         action["resume"] = {"applied": isinstance(receipt, Mapping) and receipt.get("applied") is True,
                             "successor_invocations": [row["id"] for row in successors],
-                            "started_at": _timestamp(started), "progress": None}
+                            "started_at": None, "progress": None}
         resumes.append(action)
     if not resumes or not applications:
         return
@@ -303,8 +301,8 @@ def _resume_progress(tx: Transaction, control: list[dict[str, Any]]) -> None:
     # This is a candidate read, not a second Resume interpretation. Only the
     # shared reader decides whether a proof belongs to the original Action.
     # Archived status bodies/phase copy are never needed by that reader.
-    sql = ("SELECT position,kind,identity,subject,generation,material_id FROM history WHERE position>? "
-           "AND kind IN ('worker_started','effect_consumed','checks_observed','role_consumed','paused')")
+    sql = ("SELECT position,kind,identity,subject,generation,material_id,created_at FROM history WHERE position>? "
+           "AND kind IN ('worker_started','worker_active','effect_consumed','checks_observed','role_consumed','paused')")
     values: tuple[Any, ...] = (min(row["position"] for row in applications),)
     if len(resumes) == 1 and resumes[0]["subject"] is not None:
         sql += " AND subject=? AND generation=?"
@@ -313,6 +311,9 @@ def _resume_progress(tx: Transaction, control: list[dict[str, Any]]) -> None:
         facts = resume_facts(tx, dict(row))
         if facts and facts["action_id"] in by_action:
             by_action[facts["action_id"]]["progress"] = facts
+            started = worker_activity_start(tx, row["subject"], position=row["position"])
+            if started is not None:
+                by_action[facts["action_id"]]["started_at"] = _timestamp(started["started_at"])
 
 
 def _resume_waits(run: Mapping[str, Any], subjects: list[dict[str, Any]],
@@ -393,6 +394,7 @@ def _native_history(tx: Transaction, subjects: list[dict[str, Any]], *,
         event["created_at"] = _timestamp(event.get("created_at"))
         event["status"] = json.loads(event["status"]) if event["status"] is not None else None
         event["evidence"] = _material(tx, event["material_id"], event["subject"])
+    identities.extend(event["identity"].rsplit(":", 1)[0] for event in events if event["kind"] == "worker_active")
     next_after = events[-1]["position"] if events else after
     has_more = bool(tx.rows("SELECT position FROM history WHERE position>? LIMIT 1", (next_after,)))
     attempt_ids = {row[0] for identity in identities for row in tx.rows(

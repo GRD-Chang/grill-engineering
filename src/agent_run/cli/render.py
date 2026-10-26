@@ -266,7 +266,7 @@ def _history_lines(document: QueryDocument, details: bool) -> Iterator[str]:
     milestones = {"final_activated", "paused", "human_response", "control_applied", "checks_observed", "ci_failed",
                   "effect_consumed", "generation_requeued", "budget_renewed", "resource_retired", "cleanup_pending",
                   "boundary_update", "acceptance_promoted"}
-    round_events = {"agent_allocated", "agent_dispatched", "worker_started", "worker_exited", "raw_returned",
+    round_events = {"agent_allocated", "agent_dispatched", "worker_started", "worker_active", "worker_exited", "raw_returned",
                     "role_consumed", "output_repair_allocated"}
     for event in history["events"]:
         attempt = attempts.get(event["identity"]) or identities.get(event["identity"])

@@ -43,7 +43,7 @@ def parallel_state(reason: str = "agent_requires_human", mode: str = "concise") 
 
 def recorded_agents(scenario: GraphScenario, monkeypatch: pytest.MonkeyPatch,
                      result: Callable[[AgentCall], bytes] | None = None,
-                     started: Callable[[AgentCall], None] | None = None) -> None:
+                     started: Callable[[AgentCall], None] | None = None, *, activity: bool = True) -> None:
     original_agent = scenario.agent
     original_receive = scenario.kernel.receive
     completed: dict[tuple[str, int], tuple[dict[str, Any], bytes]] = {}
@@ -56,9 +56,16 @@ def recorded_agents(scenario: GraphScenario, monkeypatch: pytest.MonkeyPatch,
         assert scenario.kernel.dispatch_agent(call)
         scenario.runner().authorize_agent(call)
         scenario.kernel.agent_started(call, process)
+        if activity:
+            scenario.kernel.agent_source_ready(call)
+            scenario.kernel.observe_worker_activity(call, "fixture-start", active=True,
+                observed_at=scenario.kernel.clock(), evidence={"type": "turn.started", "source": "synthetic-agent"})
         if started is not None:
             started(call)
         raw = (result or original_agent)(call)
+        if activity:
+            scenario.kernel.observe_worker_activity(call, "fixture-end", active=False,
+                observed_at=scenario.kernel.clock(), evidence={"type": "turn.completed", "source": "synthetic-agent"})
         # A throwing/interrupted callback supplies no known exit. Only this
         # exact synchronously returned output may settle its synthetic process.
         completed[(call.invocation_id, call.output_ordinal)] = (process, raw)
@@ -107,7 +114,7 @@ def continued_round(tmp_path: Path, monkeypatch, request):
                               "human_blockers": ["Keep the original decision / 保留原文"]})
         return original_agent(call)
 
-    recorded_agents(scenario, monkeypatch, agent, started)
+    recorded_agents(scenario, monkeypatch, agent, started, activity=False)
     assert scenario.run().kind == "paused"
     scenario.kernel.configure_profiles("new-profile", overrides={
         "development_model": "new-model", "development_effort": "high"})

@@ -91,6 +91,11 @@ Status/History 只读展示当前额度和续期历史，不补造旧内外层�
 
 ## 通知与验证入口
 
+Worker 的进程绑定先于最终来源核验和 GO 放行，`worker_started` 只证明 bootstrap 已被准确持有。
+首次启动及人工 Resume 的启动进展采用 `worker_activity` 中首次实际 backend active 观察；
+`worker_active` 历史项只引用准确 Invocation/output 的该原记录，供既有通知和只读查询关联，
+不建立另一份开始状态。Stop、旧代次或已过期调用的迟到活动仍保留原执行证据，但不生成当前启动里程碑。
+
 通知的 concise/detailed 选择、occurrence/dedupe、outbox、Ledger 和 transport
 由通知模块负责；`NativeNotifications` 消费已提交事件与 `read_boundaries`，
 不调用 Kernel 推进业务，也不从渲染后的 Status 文案推断新业务事实。

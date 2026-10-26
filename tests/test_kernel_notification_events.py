@@ -7,10 +7,225 @@ import pytest
 
 from agent_run.model import AgentCall, DeliveryKind, Issue, ParentIssue, Requirements, Role, Step
 from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
 from agent_run.model import wire_json
 from agent_run.notifications.event_projection import project_event
 from support.offline import GraphScenario, Scenario
 from support.notification import recorded_agents as _recorded_agents
+
+
+@pytest.mark.parametrize("kind", [DeliveryKind.TICKET, DeliveryKind.PARENT_ONLY])
+def test_bootstrap_binding_is_not_an_actual_start_and_first_activity_is_unique(tmp_path, kind):
+    from support.core_operations import CoreOperations
+
+    scenario = Scenario(tmp_path, kind)
+    kernel = scenario.kernel
+    operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
+    step = operations.until(lambda step: step.call is not None)
+    call = step.call
+    assert call is not None and kernel.dispatch_agent(call)
+    operations.runner.authorize_agent(call)
+    process = {"pid": 21, "pgid": 21, "start_token": "bootstrap-only",
+               "host_pid": 10, "host_start_token": "synthetic-host"}
+    kernel.agent_started(call, process)  # Safety binding before source/GO, not backend execution.
+    for mode in ("concise", "detailed"):
+        assert _project(kernel, mode) == []
+    kernel.observe_worker_activity(call, "inactive", active=False, observed_at=100.0,
+                                   evidence={"type": "turn.completed"})
+    assert _project(kernel, "concise") == []
+    kernel.agent_source_ready(call)
+    kernel.observe_worker_activity(call, "active", active=True, observed_at=101.0,
+                                   evidence={"type": "turn.started"})
+    first = _project(kernel, "concise")
+    assert [event["kind"] for event in first] == [
+        "ticket_started" if kind == DeliveryKind.TICKET else "parent_started"]
+    assert first[0]["attempt_id"] == call.attempt_id
+    assert first[0]["started_at"] == "1970-01-01T00:01:41+00:00"
+    kernel.observe_worker_activity(call, "active", active=True, observed_at=101.0,
+                                   evidence={"type": "turn.started"})
+    kernel.observe_worker_activity(call, "another-turn", active=True, observed_at=102.0,
+                                   evidence={"type": "turn.started"})
+    assert _project(kernel, "concise") == first
+    with pytest.raises(KernelError, match="conflicting_activity_observation"):
+        kernel.observe_worker_activity(call, "active", active=False, observed_at=101.0,
+                                       evidence={"type": "turn.started"})
+    assert _project(kernel, "concise") == first
+    kernel.agent_exited(call, process, 1, failure="Controlled fixture finished", failure_kind="fatal")
+    assert kernel.worker_settled(call)
+
+
+def test_pre_go_source_rejection_reaps_its_real_bootstrap_without_start_notification(tmp_path):
+    import os
+    import sys
+    from agent_run.runtime.execution import execute
+    from support.core_operations import CoreOperations
+
+    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
+    kernel = scenario.kernel
+    operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
+    step = operations.until(lambda step: step.call is not None)
+    call = step.call
+    assert call is not None
+    canary = tmp_path / "argv-was-executed"
+    reads = 0
+
+    def authorize():
+        nonlocal reads
+        reads += 1
+        operations.runner.authorize_agent(call)
+        if reads == 2:
+            raise KernelError("controlled_second_source_rejection")
+
+    with pytest.raises(KernelError, match="controlled_second_source_rejection"):
+        execute(kernel, call, arguments=(sys.executable, "-c",
+            "from pathlib import Path; import sys; Path(sys.argv[1]).write_text('executed')", str(canary)),
+            cwd=Path(call.context["checkout"]), prompt="", environment=os.environ, timeout=5,
+            authorize_source=authorize)
+    assert reads == 2 and not canary.exists()
+    assert kernel.worker_settled(call)
+    assert not any(event["kind"] in {"parent_started", "stage_start", "resume"}
+                   for event in _project(kernel, "detailed"))
+    assert all(budget["developments_used"] == 0 for budget in kernel.status(call.subject)["budgets"].values())
+
+
+@pytest.mark.parametrize("whole_run", [False, True])
+@pytest.mark.parametrize("old_observer", [False, True])
+def test_late_stopped_activity_does_not_take_the_first_start_or_resume_milestone(tmp_path, monkeypatch, whole_run, old_observer):
+    from agent_run.queries.run import read
+    from support.core_operations import CoreOperations
+
+    scenario = Scenario(tmp_path, DeliveryKind.PARENT_ONLY)
+    kernel = scenario.kernel
+    now = [100.0]
+    kernel.clock = lambda: now[0]
+    if old_observer:
+        record = kernel._event
+
+        def without_observer_trigger(tx, subject, kind, identity, material=None, **kwargs):
+            if kind != "worker_active":
+                record(tx, subject, kind, identity, material, **kwargs)
+
+        monkeypatch.setattr(kernel, "_event", without_observer_trigger)
+    operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
+    first = operations.until(lambda step: step.call is not None).call
+    assert first is not None and kernel.dispatch_agent(first)
+    operations.runner.authorize_agent(first)
+    kernel.bind_thread(first, "original-backend")
+    process = {"pid": 21, "pgid": 21, "start_token": "original-bootstrap",
+               "host_pid": 10, "host_start_token": "synthetic-host"}
+    kernel.agent_started(first, process)
+    kernel.agent_source_ready(first)
+    scope = None if whole_run else first.subject
+    now[0] = 101.0
+    assert kernel.control("stop", "stop-before-activity", subject=scope) == "applied"
+    kernel.observe_worker_activity(first, "late", active=True, observed_at=101.0,
+                                   evidence={"type": "turn.started", "source": "late-backend"})
+    assert not any(event["kind"] == "parent_started" for event in _project(kernel, "concise"))
+    kernel.agent_exited(first, process, 1, failure="Controlled stopped process", failure_kind="fatal")
+    if whole_run:
+        kernel.confirm_executor_exit(scenario.execution)
+    now[0] = 102.0
+    assert kernel.control("resume", "resume-original", subject=scope, world=scenario.world()) == "applied"
+    if whole_run:
+        scenario.execution = kernel.claim_executor("recovered-owner")
+    operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
+    resumed = operations.until(lambda step: step.call is not None).call
+    assert resumed is not None and resumed.attempt_id == first.attempt_id
+    assert resumed.invocation_id != first.invocation_id and kernel.dispatch_agent(resumed)
+    operations.runner.authorize_agent(resumed)
+    replacement = dict(process, start_token="resumed-bootstrap")
+    kernel.agent_started(resumed, replacement)
+    assert not any(event.get("resume_id") == "resume-original" for event in _project(kernel, "concise"))
+    waiting = read(kernel.storage.path, "status").data["latest_resume"]["resume"]
+    assert waiting["progress"] is None and waiting["started_at"] is None
+    kernel.agent_source_ready(resumed)
+    kernel.observe_worker_activity(resumed, "actual", active=True, observed_at=102.0,
+                                   evidence={"type": "turn.started"})
+    events = [event for event in _project(kernel, "concise") if event["kind"] == "parent_started"]
+    assert len(events) == 1 and events[0]["resume_id"] == "resume-original"
+    assert events[0]["invocation_id"] == resumed.invocation_id
+    progress = read(kernel.storage.path, "status").data["latest_resume"]["resume"]["progress"]
+    assert progress["evidence"] == ("worker_started" if old_observer else "worker_active")
+    assert progress["invocation_id"] == resumed.invocation_id
+    # An old owner's newly arriving turn cannot replace the current milestone.
+    kernel.observe_worker_activity(first, "later-old-turn", active=True, observed_at=103.0,
+                                   evidence={"type": "turn.started", "source": "late-backend"})
+    assert [event for event in _project(kernel, "concise") if event["kind"] == "parent_started"] == events
+    kernel.agent_exited(resumed, replacement, 1, failure="Controlled fixture finished", failure_kind="fatal")
+    assert kernel.worker_settled(first) and kernel.worker_settled(resumed)
+
+
+def test_stopped_repair_activity_is_not_presented_as_still_active(tmp_path, monkeypatch):
+    scenario = Scenario(tmp_path, DeliveryKind.FINAL_RUN, reviews=("fail", "pass"))
+    stopped = []
+
+    def started(call):
+        if call.role != Role.DEVELOPMENT:
+            return
+        current = [event for event in _project(scenario.kernel, "concise") if event["kind"] == "acceptance_repair"][-1]
+        assert current["live"] is True
+        assert scenario.kernel.control("stop", "stop-current-repair", subject=call.subject) == "applied"
+        waiting = [event for event in _project(scenario.kernel, "concise") if event["kind"] == "acceptance_repair"][-1]
+        assert waiting["id"] == current["id"] and waiting["live"] is False
+        stopped.append(call.attempt_id)
+
+    _recorded_agents(scenario, monkeypatch, started=started)
+    assert scenario.run().kind == "paused"
+    assert len(stopped) == 1
+
+
+def test_same_protocol_activity_without_observer_trigger_keeps_real_start_and_resume(tmp_path, monkeypatch):
+    from agent_run.queries.run import read
+    from support.core_operations import CoreOperations
+
+    scenario = Scenario(tmp_path, DeliveryKind.PARENT_ONLY)
+    kernel = scenario.kernel
+    now = [100.0]
+    kernel.clock = lambda: now[0]
+    record = kernel._event
+
+    def old_observer(tx, subject, kind, identity, material=None, **kwargs):
+        # Reproduce the old v21 observer representation only: Core still owns
+        # every business transition and the real worker_activity producer.
+        if kind != "worker_active":
+            record(tx, subject, kind, identity, material, **kwargs)
+
+    monkeypatch.setattr(kernel, "_event", old_observer)
+    operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
+    first = operations.until(lambda step: step.call is not None).call
+    assert first is not None and kernel.dispatch_agent(first)
+    operations.runner.authorize_agent(first)
+    kernel.bind_thread(first, "old-v21-backend")
+    process = {"pid": 21, "pgid": 21, "start_token": "old-output",
+               "host_pid": 10, "host_start_token": "synthetic-host"}
+    kernel.agent_started(first, process)
+    assert _project(kernel, "concise") == []
+    kernel.agent_source_ready(first)
+    now[0] = 101.0
+    kernel.observe_worker_activity(first, "old-turn", active=True, observed_at=now[0], evidence={"type": "turn.started"})
+    started, = _project(kernel, "concise")
+    assert started["kind"] == "parent_started" and started["started_at"] == "1970-01-01T00:01:41+00:00"
+    now[0] = 102.0
+    assert kernel.control("stop", "old-stop", subject=first.subject) == "applied"
+    kernel.agent_exited(first, process, 1, failure="Controlled old output exit", failure_kind="fatal")
+    now[0] = 103.0
+    assert kernel.control("resume", "old-resume", subject=first.subject, world=scenario.world()) == "applied"
+    resumed = operations.until(lambda step: step.call is not None).call
+    assert resumed is not None and kernel.dispatch_agent(resumed)
+    operations.runner.authorize_agent(resumed)
+    replacement = dict(process, start_token="old-resumed-output")
+    kernel.agent_started(resumed, replacement)
+    assert read(kernel.storage.path, "status").data["latest_resume"]["resume"]["progress"] is None
+    kernel.agent_source_ready(resumed)
+    now[0] = 104.0
+    kernel.observe_worker_activity(resumed, "old-resumed-turn", active=True, observed_at=now[0], evidence={"type": "turn.started"})
+    projected = _project(kernel, "concise")
+    assert sum(event["kind"] == "parent_started" for event in projected) == 1
+    resumed_event, = [event for event in projected if event.get("resume_id") == "old-resume"]
+    assert resumed_event["invocation_id"] == resumed.invocation_id
+    view = read(kernel.storage.path, "status").data["latest_resume"]["resume"]
+    assert view["started_at"] == 104.0 and view["progress"]["resume_outcome"] == "started"
+    kernel.agent_exited(resumed, replacement, 1, failure="Controlled fixture finished", failure_kind="fatal")
 
 
 def _project(kernel: Kernel, mode: str) -> list[dict[str, Any]]:
