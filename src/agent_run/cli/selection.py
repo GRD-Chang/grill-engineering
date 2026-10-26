@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import subprocess
 from typing import Any
+from collections.abc import Sequence
 
 from agent_run.errors import GitError
 from agent_run.adapters.workspace import ManagedWorkspace, normalize_repository
@@ -16,6 +17,7 @@ from agent_run.contracts.task import TaskKey
 from agent_run.queries.read_facts import QueryError
 from agent_run.queries.run import discover, task_binding, task_published
 from agent_run.storage.tasks import read_task_bindings
+from agent_run.storage.routing import RepositoryRoute, RunLocation
 
 
 def _repository(value: str) -> str:
@@ -187,4 +189,81 @@ def _select(parsed: argparse.Namespace, candidates: list[dict[str, Any]]) -> lis
         raise QueryError("run_locator_missing", "No matching Run; use runs to inspect candidates")
     if len(matches) != 1:
         raise QueryError("run_locator_conflict", "Multiple Runs or clones match; provide an exact Run ID and state directory", candidates=matches)
+    return matches
+
+
+def repository_candidates(parsed: argparse.Namespace, routes: Sequence[RepositoryRoute]) -> list[RunLocation]:
+    """Canonical metadata discovery for the inactive repository dispatcher.
+
+    Routes come from trusted workspace assembly, never a directory-named Run
+    or a JSON publication. Missing/unreadable storage propagates; this reader
+    cannot initialize, create or reconcile a proposal. Public default dispatch
+    still uses the current protocol until the coordinated one-way switch.
+    """
+    repository = _repository(parsed.repo) if parsed.repo else None
+    exact = getattr(parsed, "run_id", None)
+    parent = getattr(parsed, "parent", None)
+    if (exact is not None and (type(exact) is not str or not exact)
+            or parent is not None and (type(parent) is not int or parent < 1)
+            or exact is not None and parent is not None):
+        raise QueryError("run_locator_invalid", "Choose a positive Parent or one exact Run ID")
+    state = getattr(parsed, "state_dir", None)
+    data = getattr(parsed, "data_root", None)
+    if len(routes) > 4096:
+        raise QueryError("query_limit", "Too many repository routes")
+    found: dict[tuple[Path, str], RunLocation] = {}
+    seen: set[Path] = set()
+    for route in routes:
+        if repository is not None and route.repository != repository:
+            continue
+        if state is not None and route.database.parent.resolve() != state.resolve():
+            continue
+        if data is not None and not route.database.resolve().is_relative_to(data.resolve()):
+            continue
+        database = route.database.resolve()
+        if database in seen:
+            # Do not silently select between contradictory namespace claims.
+            raise QueryError("run_locator_conflict", "Duplicate repository database route")
+        seen.add(database)
+        after = ""
+        while True:
+            page = route.discover(after=after, limit=128, run_id=exact, parent=parent)
+            for item in page.items:
+                if (exact is not None and item.run_id != exact
+                        or parent is not None and item.task.parent_number != parent):
+                    continue
+                found[(database, item.run_id)] = item
+                if len(found) > 256:
+                    raise QueryError("query_limit", "Too many Runs; select an exact repository, Parent or Run")
+            if not page.has_more:
+                break
+            if page.next_after is None or page.next_after <= after:
+                raise QueryError("run_locator_conflict", "Repository discovery did not advance")
+            after = page.next_after
+    return list(found.values())
+
+
+def select_repository(parsed: argparse.Namespace, candidates: Sequence[RunLocation]) -> list[RunLocation]:
+    """Select typed metadata; every later mutation rechecks currentness in SQL."""
+    exact = getattr(parsed, "run_id", None)
+    parent = getattr(parsed, "parent", None)
+    repository = _repository(parsed.repo) if parsed.repo else None
+    if (exact is not None and (type(exact) is not str or not exact)
+            or parent is not None and (type(parent) is not int or parent < 1)
+            or exact is not None and parent is not None):
+        raise QueryError("run_locator_invalid", "Choose a positive Parent or one exact Run ID")
+    if parsed.command != "runs" and exact is None and parent is None:
+        raise QueryError("run_locator_invalid", "Select an exact Run ID or Parent")
+    matches = [item for item in candidates
+               if (exact is None or item.run_id == exact)
+               and (repository is None or item.task.repository == repository)
+               and (parent is None or item.task.parent_number == parent)]
+    if parsed.command == "runs":
+        return sorted(matches, key=lambda item: (item.task.repository, item.task.parent_number, item.run_id))
+    if exact is None:
+        matches = [item for item in matches if item.current]
+    if not matches:
+        raise QueryError("run_locator_missing", "No matching published Run")
+    if len(matches) != 1:
+        raise QueryError("run_locator_conflict", "Multiple repository Runs match; select an exact repository and Run")
     return matches

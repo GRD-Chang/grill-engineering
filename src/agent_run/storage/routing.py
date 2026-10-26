@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import sqlite3
 from pathlib import Path
 from typing import Final, Literal, TYPE_CHECKING
 
@@ -195,12 +196,24 @@ class RepositoryRoute:
         return reconcile_repository_task(Kernel._from_storage(self.metadata()), task,
             proposal_run_id, deadline=deadline)
 
-    def discover(self, *, after: str = "", limit: int = 128) -> RunPage:
-        if type(after) is not str or type(limit) is not int or not 1 <= limit <= 128:
+    def discover(self, *, after: str = "", limit: int = 128,
+                 run_id: str | None = None, parent: int | None = None) -> RunPage:
+        if (type(after) is not str or type(limit) is not int or not 1 <= limit <= 128
+                or run_id is not None and (type(run_id) is not str or not run_id)
+                or parent is not None and (type(parent) is not int or parent < 1)
+                or run_id is not None and parent is not None):
             raise KernelError("query_limit")
+        task = TaskKey(self.repository_root, self.repository, parent) if parent is not None else None
         with self.metadata().transaction(write=False) as owner:
-            rows = owner.rows("SELECT id FROM runs WHERE id>? ORDER BY id LIMIT ?", (after, limit), limit=limit)
+            def page(cursor: str, size: int) -> list[sqlite3.Row]:
+                if run_id is not None:
+                    return owner.rows("SELECT id FROM runs WHERE id=? AND id>? ORDER BY id LIMIT ?",
+                        (run_id, cursor, size), limit=size)
+                if task is not None:
+                    return owner.rows("SELECT run_id AS id FROM task_runs WHERE task_id=? AND run_id>? ORDER BY run_id LIMIT ?",
+                        (task.fingerprint, cursor, size), limit=size)
+                return owner.rows("SELECT id FROM runs WHERE id>? ORDER BY id LIMIT ?", (cursor, size), limit=size)
+            rows = page(after, limit)
             items = tuple(self._location(owner, row["id"]) for row in rows)
-            more = bool(items and owner.rows("SELECT id FROM runs WHERE id>? ORDER BY id LIMIT 1",
-                (items[-1].run_id,), limit=1))
+            more = bool(items and page(items[-1].run_id, 1))
             return RunPage(items, more, items[-1].run_id if more else None)

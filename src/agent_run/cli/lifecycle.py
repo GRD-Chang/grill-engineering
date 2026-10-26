@@ -325,14 +325,13 @@ def execute(parsed: argparse.Namespace, *, language: str,
     from uuid import uuid4
     from agent_run.adapters.workspace import ManagedWorkspace, workspace_for_root
     from agent_run.contracts.repository import normalize_repository
-    from agent_run.contracts.task import TaskKey
     from agent_run.storage.routing import RepositoryRoute
     from agent_run.storage import routing
     from agent_run.runtime.package_lease import default_runner_lock_path, runner_usage_lease
     from agent_run.adapters.systemd import SystemdHost, HostUnavailable
     from agent_run.core.kernel import Kernel
     from agent_run.errors import KernelError
-    from agent_run.cli.selection import _candidates, _select
+    from agent_run.cli.selection import _candidates, _select, repository_candidates, select_repository
     from agent_run.adapters.remote import RemoteEffects
 
     if parsed.command not in {"run", "resume", "approve", "stop", "revise", "requeue", "abandon"}:
@@ -367,16 +366,9 @@ def execute(parsed: argparse.Namespace, *, language: str,
                     or parsed.repo is not None and normalize_repository(parsed.repo) != repository_route.repository
                     or parsed.state_dir is not None and parsed.state_dir.resolve() != workspace.state_root.resolve()):
                 raise KernelError("managed_state_identity")
-            run_id = selection.run_id
-            if run_id is None:
-                if selection.parent is None:
-                    raise KernelError("control_subject_ambiguous", "Select an exact Run or Parent")
-                location = repository_route.task(TaskKey(workspace.repository_root, workspace.repository, selection.parent))
-                if location is None or location.current_run is None:
-                    raise KernelError("task_run_unpublished")
-                run_id = location.current_run
-            database = repository_route.database
-            kernel = repository_route.kernel(run_id)
+            location = select_repository(selection, repository_candidates(selection, (repository_route,)))[0]
+            database = location.database
+            kernel = repository_route.kernel(location.run_id)
         with kernel.storage.transaction(write=False) as tx:
             run = tx.one(*selected_statement(tx, 'SELECT * FROM runs',
                       'SELECT * FROM runs WHERE id=?', ()))

@@ -40,7 +40,7 @@ from agent_run.core.attempt_continuation import (AttemptContinuationBasis, Conti
                                    bind_attempt_continuation, load_continuation)
 from agent_run.contracts.policy_values import checkpoint_policy
 from agent_run.contracts.policy import AGENT_PREPARATION_SECONDS
-from agent_run.storage.tasks import bind_task, read_task, task_lock, task_path
+from agent_run.storage.tasks import bind_task, read_task, task_lock, task_path, run_is_current
 from agent_run.storage.admission import locked_admission
 from agent_run.core.operation_contract import (OperationBinding, OperationState, ReadUnavailable, ReadFence,
                                  RequirementsRead, LocalCleanupRead, LocalCleanupObservation, DeliveryObservation, DeliveryRead, DeliveryFacts,
@@ -2180,6 +2180,31 @@ class Kernel:
             raise KernelError("task_workspace_unknown")
         return TaskKey(Path(run["repository_root"]), run["repository"], run["parent_issue"])
 
+    @staticmethod
+    @contextmanager
+    def _task_admission(task: TaskKey, *, repository: bool, wait: bool = True) -> Iterator[Path | None]:
+        """Reuse the one Task mutex, never a second publication/index lock.
+
+        The staged database has already been admitted by Storage. Its canonical
+        Task/current pointer is checked in the original writer below; the mutex
+        also retains the existing unrecorded-revocation barrier. Current public
+        v21 keeps its old admission/refusal and locator behavior until cutover.
+        """
+        if repository:
+            with task_lock(task, wait=wait):
+                yield None
+        else:
+            with locked_admission(task, wait=wait) as location:
+                yield location
+
+    def _require_current_task(self, tx: Transaction, task: TaskKey, run_id: str) -> None:
+        """Canonical publication check inside the exact mutation snapshot."""
+        scope = transaction_scope(tx)
+        if (scope is None or scope.run_id != run_id
+                or TaskKey(Path(scope.repository_root), scope.repository, scope.parent_issue) != task
+                or not run_is_current(tx, self.storage.path.resolve())):
+            raise KernelError("task_location_identity")
+
     def _replaceable(self, task: TaskKey, run_id: str) -> bool:
         with self.storage.transaction(write=False) as tx:
             return self._replaceable_in(tx, task, run_id)
@@ -2276,15 +2301,19 @@ class Kernel:
             elif continuation_of is not None:
                 raise KernelError("abandon_continuation_boundary")
             run_id, task = run["id"], self._task(run)
-        with locked_admission(task) as location:
-            prior = read_task(location)
-            if prior is not None and prior != (run_id, self.storage.path.resolve()):
-                if not Kernel(prior[1])._replaceable(task, prior[0]):
-                    raise KernelError("task_run_busy")
-            if prior != (run_id, self.storage.path.resolve()):
-                bind_task(location, run_id, self.storage.path)
+            repository = transaction_scope(tx) is not None
+        with self._task_admission(task, repository=repository) as location:
+            if location is not None:
+                prior = read_task(location)
+                if prior is not None and prior != (run_id, self.storage.path.resolve()):
+                    if not Kernel(prior[1])._replaceable(task, prior[0]):
+                        raise KernelError("task_run_busy")
+                if prior != (run_id, self.storage.path.resolve()):
+                    bind_task(location, run_id, self.storage.path)
             # A crash here preserves the bound, fully created Run even without a PID.
             with self.storage.transaction(ordered=False) as tx:
+                if location is None:
+                    self._require_current_task(tx, task, run_id)
                 old = tx.rows(*selected_statement(tx, "SELECT * FROM hosts WHERE action_id=?",
                           'SELECT * FROM hosts WHERE action_id=? AND run_id=?',
                           (action_id,), run_last=True))
@@ -2406,10 +2435,13 @@ class Kernel:
                       'SELECT * FROM runs WHERE id=?',
                       (), run_last=True))
             run_id, task = run["id"], self._task(run)
-        with locked_admission(task, wait=False) as location:
-            if read_task(location) != (run_id, self.storage.path.resolve()):
+            repository = transaction_scope(tx) is not None
+        with self._task_admission(task, repository=repository, wait=False) as location:
+            if location is not None and read_task(location) != (run_id, self.storage.path.resolve()):
                 raise KernelError("task_location_identity")
             with self.storage.transaction(ordered=False) as tx:
+                if location is None:
+                    self._require_current_task(tx, task, run_id)
                 self._host(tx, request)
                 run = tx.one(*selected_statement(tx, "SELECT * FROM runs",
                           'SELECT * FROM runs WHERE id=?',
@@ -2436,10 +2468,13 @@ class Kernel:
                       'SELECT * FROM runs WHERE id=?',
                       (), run_last=True))
             run_id, task = run["id"], self._task(run)
-        with locked_admission(task) as location:
-            if read_task(location) != (run_id, self.storage.path.resolve()):
+            repository = transaction_scope(tx) is not None
+        with self._task_admission(task, repository=repository) as location:
+            if location is not None and read_task(location) != (run_id, self.storage.path.resolve()):
                 raise KernelError("task_location_identity")
             with self.storage.transaction(write=False) as tx:
+                if location is None:
+                    self._require_current_task(tx, task, run_id)
                 terminal = (tx.one(*selected_statement(tx, "SELECT final_action FROM runs",
                                 'SELECT final_action FROM runs WHERE id=?',
                                 (), run_last=True))[0] is None
@@ -2452,6 +2487,8 @@ class Kernel:
             if terminal and self._replaceable(task, run_id):
                 return "complete"
             with self.storage.transaction(ordered=False) as tx:
+                if location is None:
+                    self._require_current_task(tx, task, run_id)
                 return self._control(tx, "stop", action_id, subject=subject)
 
     def abandon_task(self, action_id: str, *, resource_inspections: tuple[ResourceInspection, ...],
@@ -2462,10 +2499,13 @@ class Kernel:
                       'SELECT * FROM runs WHERE id=?',
                       (), run_last=True))
             run_id, task = run["id"], self._task(run)
-        with locked_admission(task) as location:
-            if read_task(location) != (run_id, self.storage.path.resolve()):
+            repository = transaction_scope(tx) is not None
+        with self._task_admission(task, repository=repository) as location:
+            if location is not None and read_task(location) != (run_id, self.storage.path.resolve()):
                 raise KernelError("task_location_identity")
             with self.storage.transaction(ordered=False) as tx:
+                if location is None:
+                    self._require_current_task(tx, task, run_id)
                 return self._control(tx, "abandon", action_id, resource_inspections=resource_inspections,
                                      discard_worktree=discard_worktree)
 
@@ -2732,6 +2772,7 @@ class Kernel:
                       (), run_last=True))
             self._executor_owned(tx, run, execution)
             task = self._task(run)
+            repository = transaction_scope(tx) is not None
         failure: BaseException | None = None
         retain_lock: Callable[[], None] | None = None
         revoked = False
@@ -2742,7 +2783,12 @@ class Kernel:
                 try:
                     if retain_lock is None:
                         retain_lock = held.enter_context(task_lock(task))
-                    if read_task(task_path(task)) != (execution.run_id, self.storage.path.resolve()):
+                    if repository:
+                        with self.storage.transaction(write=False) as tx:
+                            current = run_is_current(tx, self.storage.path.resolve())
+                    else:
+                        current = read_task(task_path(task)) == (execution.run_id, self.storage.path.resolve())
+                    if not current:
                         revoked = True  # The original Task binding no longer admits this Run.
                         held.close()
                         retain_lock = None
@@ -4546,39 +4592,48 @@ class Kernel:
                       'SELECT * FROM runs WHERE id=?',
                       (), run_last=True))
             run_id, task = run["id"], self._task(run)
-        with locked_admission(task) as location:
-            if read_task(location) != (run_id, self.storage.path.resolve()):
+            repository = transaction_scope(tx) is not None
+        with self._task_admission(task, repository=repository) as location:
+            if location is not None and read_task(location) != (run_id, self.storage.path.resolve()):
                 raise KernelError("task_location_identity")
-            return self.configure_profiles(action_id, preset=preset, overrides=overrides)
+            if location is not None:
+                return self.configure_profiles(action_id, preset=preset, overrides=overrides)
+            with self.storage.transaction(ordered=False) as tx:
+                self._require_current_task(tx, task, run_id)
+                return self._configure_profiles_in(tx, action_id, preset=preset, overrides=overrides)
 
     def configure_profiles(self, action_id: str, *, preset: str | None = None, overrides: ProfileOverrides | None = None) -> int:
         """An explicit immutable revision applies only when a new Thread is allocated."""
         with self.storage.transaction(ordered=False) as tx:
-            run = tx.one(*selected_statement(tx, "SELECT * FROM runs",
-                      'SELECT * FROM runs WHERE id=?',
-                      (), run_last=True))
-            owner = tx.one(*selected_statement(tx, "SELECT subject FROM profile_revisions WHERE id=?",
-                        'SELECT subject FROM profile_revisions WHERE id=? AND run_id=?',
-                        (run["profile_revision"],), run_last=True))[0]
-            payload = wire_json({"kind": "configure_profiles", "preset": preset, "overrides": dict(overrides or {})})
-            existing = tx.rows(*selected_statement(tx, "SELECT * FROM actions WHERE id=?",
-                           'SELECT * FROM actions WHERE id=? AND run_id=?',
-                           (action_id,), run_last=True))
-            if existing:
-                if tx.get(existing[0]["payload_id"], owner) != payload:
-                    raise KernelError("action_identity_changed")
-                return int(json.loads(tx.get(existing[0]["receipt_id"], owner))["profile_revision"])
-            profiles = resolve_profiles(preset=preset, current=self._profile_document(tx, run["profile_revision"]), overrides=overrides)
-            revision = self._store_profiles(tx, owner, profiles, {"operation": "configure", "action": action_id})
-            material = tx.put(owner, "control_intent", payload)
-            receipt = tx.put(owner, "control_receipt", wire_json({"profile_revision": revision}))
-            tx.execute("INSERT INTO actions(id,run_id,kind,payload_id,status,receipt_id) VALUES (?,?,'configure_profiles',?,'applied',?)",
-                       (action_id, run["id"], material, receipt))
-            tx.execute(*selected_statement(tx, "UPDATE runs SET profile_revision=?",
-                'UPDATE runs SET profile_revision=? WHERE id=?',
-                (revision,), run_last=True))
-            self._event(tx, owner, "profiles_configured", action_id, receipt)
-            return revision
+            return self._configure_profiles_in(tx, action_id, preset=preset, overrides=overrides)
+
+    def _configure_profiles_in(self, tx: Transaction, action_id: str, *, preset: str | None = None,
+                               overrides: ProfileOverrides | None = None) -> int:
+        run = tx.one(*selected_statement(tx, "SELECT * FROM runs",
+                  'SELECT * FROM runs WHERE id=?',
+                  (), run_last=True))
+        owner = tx.one(*selected_statement(tx, "SELECT subject FROM profile_revisions WHERE id=?",
+                    'SELECT subject FROM profile_revisions WHERE id=? AND run_id=?',
+                    (run["profile_revision"],), run_last=True))[0]
+        payload = wire_json({"kind": "configure_profiles", "preset": preset, "overrides": dict(overrides or {})})
+        existing = tx.rows(*selected_statement(tx, "SELECT * FROM actions WHERE id=?",
+                       'SELECT * FROM actions WHERE id=? AND run_id=?',
+                       (action_id,), run_last=True))
+        if existing:
+            if tx.get(existing[0]["payload_id"], owner) != payload:
+                raise KernelError("action_identity_changed")
+            return int(json.loads(tx.get(existing[0]["receipt_id"], owner))["profile_revision"])
+        profiles = resolve_profiles(preset=preset, current=self._profile_document(tx, run["profile_revision"]), overrides=overrides)
+        revision = self._store_profiles(tx, owner, profiles, {"operation": "configure", "action": action_id})
+        material = tx.put(owner, "control_intent", payload)
+        receipt = tx.put(owner, "control_receipt", wire_json({"profile_revision": revision}))
+        tx.execute("INSERT INTO actions(id,run_id,kind,payload_id,status,receipt_id) VALUES (?,?,'configure_profiles',?,'applied',?)",
+                   (action_id, run["id"], material, receipt))
+        tx.execute(*selected_statement(tx, "UPDATE runs SET profile_revision=?",
+            'UPDATE runs SET profile_revision=? WHERE id=?',
+            (revision,), run_last=True))
+        self._event(tx, owner, "profiles_configured", action_id, receipt)
+        return revision
 
     def _inputs(self, tx: Transaction, run: sqlite3.Row) -> dict[str, Any]:
         selected = transaction_scope(tx)
