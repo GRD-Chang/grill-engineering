@@ -655,11 +655,14 @@ def test_parent_ci_target_append_changes_current_work_to_integration_and_retains
     assert "ci_failure" not in call.context
     budgets = scenario.kernel.status(scenario.delivery.key)["budgets"]
     assert budgets["ci"] == original_ci
-    assert budgets["integration"]["developments_used"] == 1
+    assert budgets["integration"]["developments_used"] == 0
     assert [event for event in scenario.kernel.history(scenario.delivery.key) if event["kind"] == "ci_failed"] == original_ci_events
 
 
     scripted_return(scenario.kernel, operations.runner, call, scenario.agent)
+    budgets = scenario.kernel.status(scenario.delivery.key)["budgets"]
+    assert budgets["integration"]["developments_used"] == 1
+    assert budgets["ci"] == original_ci
     for _ in range(30):
         step = operations.once()
         if step.call is not None:

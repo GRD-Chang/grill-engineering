@@ -208,7 +208,8 @@ def test_merge_rechecks_the_original_target_after_slow_prepare(tmp_path, monkeyp
     port, git, push, _state, calls = _fixture(tmp_path, monkeypatch)
     _original, pr = _publish_pr(port, push)
     merge = replace(push, effect_id='original-merge', operation='merge', pr_number=pr.number,
-        payload={'method': 'squash', 'parents': [push.base.sha], 'commit_message': 'Exact reviewed merge'})
+        payload={'method': 'squash', 'parents': [push.base.sha], 'commit_message': pr.title + '\n\n' + pr.body})
+    assert port.reconcile(merge).disposition == 'prior'
     later = git.make_commit(push.base.tree, (push.base.sha,), 'Target changed during preparation')
     admissions = []
 
@@ -218,6 +219,7 @@ def test_merge_rechecks_the_original_target_after_slow_prepare(tmp_path, monkeyp
 
     with pytest.raises(KernelError, match='operation_boundary_changed'):
         port.execute(merge, WriteAuthority(prepare))
+    assert git.run('ls-remote', 'origin', push.target_ref).stdout.strip() == later.sha + '\t' + push.target_ref
     assert admissions == []
     writes = [json.loads(line) for line in calls.read_text().splitlines() if '--method' in json.loads(line)]
     assert len(writes) == 1 and not any(call[1].endswith('/merge') for call in writes)
