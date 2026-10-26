@@ -14,7 +14,7 @@ import subprocess
 DEPENDENCIES = {
     "Set up Python", "Set up Python for private checks", "Install system dependencies",
     "Prepare verified SQLite runtime", "Install product and development tools",
-    "Install E2E test dependency",
+    "Install E2E test dependency", "Prepare product package test dependencies",
 }
 CHECKS = {
     "Detect changes", "Select checks", "Verify selection", "Test CI selection rules",
@@ -22,7 +22,7 @@ CHECKS = {
     "Run E2E harness tests", "Run type checks", "Verify independent checks",
     "Test private-only CI selection rules", "Run private-only sync tests",
     "Run private-only E2E harness tests", "Verify private-only checks",
-    "Record complete test shard",
+    "Record complete test shard", "Run product package tests", "Run private-only product package tests",
 }
 
 
