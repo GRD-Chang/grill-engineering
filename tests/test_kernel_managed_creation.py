@@ -1,14 +1,22 @@
 """Real clone/path seam used by the native public lifecycle entry."""
 from __future__ import annotations
 
+import json
+import select
+import sqlite3
 import subprocess
 import sys
+import threading
+import time
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from agent_run.core.kernel import Kernel
+from agent_run.errors import KernelError
+from agent_run.cli.main import main
 from agent_run.runtime.executor import _make_ports
 from support.core_operations import CoreOperations
 
@@ -749,3 +757,169 @@ def test_public_idle_abandon_records_the_exact_initial_or_continuation_host_inte
             assert tx.one("SELECT count(*) FROM invocations")[0] == 0
         assert kernel.source_status()["abandonment"]["status"] == "pending"
         assert kernel.host_request(result["action_id"]) == request
+
+
+@contextmanager
+def _sqlite_writer_lock(path):
+    program = """import select,sqlite3,sys
+db = sqlite3.connect(sys.argv[1], isolation_level=None)
+try:
+    db.execute('BEGIN IMMEDIATE')
+    print('locked', flush=True)
+    command = sys.stdin.readline().strip()
+    if command == 'short':
+        # A controlled 50ms physical conflict, not a larger product timeout.
+        select.select([sys.stdin], [], [], .05)
+    db.rollback()
+    print('released', flush=True)
+finally:
+    db.close()
+"""
+    process = subprocess.Popen([sys.executable, '-I', '-c', program, str(path)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        assert select.select([process.stdout], [], [], 5)[0], 'writer never acquired SQLite'
+        assert process.stdout.readline() == 'locked\n'
+        yield process
+    finally:
+        output, error = process.communicate('release\n', timeout=5)
+        assert process.returncode == 0 and output == 'released\n', (output, error)
+
+
+def _queued_sqlite_begin(monkeypatch, name, entered, proceed):
+    """Observe the actual BEGIN; all connections, SQL and timeout stay native."""
+    connect = sqlite3.connect
+    def traced(*args, **kwargs):
+        connection = connect(*args, **kwargs)
+        if threading.current_thread().name == name:
+            def trace(sql):
+                if sql == 'BEGIN IMMEDIATE':
+                    entered.set()
+                    assert proceed.wait(5), 'BEGIN barrier was not released'
+            connection.set_trace_callback(trace)
+        return connection
+    monkeypatch.setattr(sqlite3, 'connect', traced)
+
+
+@contextmanager
+def _sqlite_two_calls(tmp_path, monkeypatch):
+    from agent_run.model import Issue, ParentIssue, Policy, Requirements
+    from support.offline import GraphScenario
+    source = Requirements(ParentIssue(1, 'Parent', 'Original requirement', (2, 3)), tuple(
+        Issue(number, 'Ticket', 'Original work', 'OPEN', frozenset({'ready-for-agent'}))
+        for number in (2, 3)))
+    scenario = GraphScenario(tmp_path / 'scenario', source, policy=Policy(concurrency=2))
+    kernel = scenario.kernel
+    kernel.control('stop', 'retire-fixture')
+    kernel.confirm_executor_exit(scenario.execution)
+    kernel.control('resume', 'prepare-managed')
+    with _ready_public_host(kernel, tmp_path, monkeypatch) as (request, execution, _):
+        scenario.execution = execution
+        operations = CoreOperations(kernel, execution, scenario.make_ports)
+        calls = [operations.until(lambda step: step.call is not None).call for _ in range(2)]
+        assert {call.subject for call in calls} == {'ticket:2', 'ticket:3'}
+        yield scenario, calls
+
+
+def test_short_sqlite_writer_contention_applies_one_control_without_touching_sibling(
+    tmp_path, monkeypatch,
+):
+    with _sqlite_two_calls(tmp_path, monkeypatch) as (scenario, (first, sibling)):
+        kernel, entered, proceed = scenario.kernel, threading.Event(), threading.Event()
+        before = {call.subject: kernel.status(call.subject) for call in (first, sibling)}
+        usage = kernel.host_usage('original')
+        result, errors = [], []
+        _queued_sqlite_begin(monkeypatch, 'short-control', entered, proceed)
+        def control():
+            try:
+                result.append(kernel.control_host(kernel.host_request('original'), 'stop', 'stop-one', subject=first.subject))
+            except BaseException as error:
+                errors.append(error)
+        thread = threading.Thread(target=control, name='short-control')
+        with _sqlite_writer_lock(kernel.storage.path) as writer:
+            try:
+                thread.start()
+                assert entered.wait(5)
+                proceed.set()
+                writer.stdin.write('short\n')
+                writer.stdin.flush()
+                thread.join(5)
+                assert not thread.is_alive() and errors == [] and result == ['applied']
+            finally:
+                proceed.set()
+                thread.join(5)
+        assert kernel.control_host(kernel.host_request('original'), 'stop', 'stop-one', subject=first.subject) == 'applied'
+        assert kernel.status(first.subject)['gates'] == ['operator_stopped']
+        assert kernel.status(sibling.subject) == before[sibling.subject]
+        assert kernel.host_usage('original') == usage and kernel.active_host_action() == 'original'
+        assert set(kernel.operation_state().active) == {first.lease_id, sibling.lease_id}
+        for call in (first, sibling):
+            assert kernel.status(call.subject)['budgets'] == before[call.subject]['budgets']
+        assert sum(event['kind'] == 'control_applied' and event['identity'] == 'stop-one'
+                   for event in kernel.history(first.subject)) == 1
+        with pytest.raises(KernelError, match='agent_authority_changed'):
+            kernel.dispatch_agent(first)
+        assert kernel.dispatch_agent(sibling)
+
+
+def test_exhausted_sqlite_writer_reports_public_stop_failure_without_accepting_action(
+    git_repo, tmp_path, monkeypatch, capsys,
+):
+    with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, _, _, _):
+        before = kernel.source_status(), kernel.history('parent:1'), kernel.status('parent:1')
+        usage = kernel.host_usage('original')
+        with _sqlite_writer_lock(kernel.storage.path):
+            started = time.monotonic()
+            failed = subprocess.run([sys.executable, '-m', 'agent_run', 'stop', 'public-controls',
+                '--state-dir', str(kernel.storage.path), '--json'], capture_output=True, text=True, timeout=5)
+            elapsed = time.monotonic() - started
+            assert elapsed < 5  # Failure bound only; the production busy limit is unchanged.
+        assert (kernel.source_status(), kernel.history('parent:1'), kernel.status('parent:1')) == before
+        assert kernel.host_request('original') == request and kernel.host_usage('original') == usage
+        assert main(['stop', 'public-controls', '--state-dir', str(kernel.storage.path), '--json']) == 0
+        assert json.loads(capsys.readouterr().out)['status'] == 'action_applied'
+        assert failed.returncode == 2, failed.stderr
+        output = json.loads(failed.stdout)
+        assert output['result'] == 'error' and output['status'] == 'command_failed'
+        assert 'action_id' not in output and output['diagnostics'][0]['code'] == 'storage_busy'
+
+
+def test_sqlite_waiting_worker_claim_rechecks_a_committed_stop_without_new_budget(
+    tmp_path, monkeypatch,
+):
+    with _sqlite_two_calls(tmp_path, monkeypatch) as (scenario, calls):
+        kernel, entered, proceed = scenario.kernel, threading.Event(), threading.Event()
+        before = {call.subject: kernel.status(call.subject)['budgets'] for call in calls}
+        usage, result, errors = kernel.host_usage('original'), [], []
+        _queued_sqlite_begin(monkeypatch, 'waiting-dispatch', entered, proceed)
+        def dispatch():
+            try:
+                result.append(kernel.dispatch_agent(calls[0]))
+            except BaseException as error:
+                errors.append(error)
+        thread = threading.Thread(target=dispatch, name='waiting-dispatch')
+        try:
+            thread.start()
+            assert entered.wait(5)
+            assert Kernel(kernel.storage.path).stop_task('stop-before-claim') == 'applied'
+            with _sqlite_writer_lock(kernel.storage.path) as writer:
+                proceed.set()
+                writer.stdin.write('short\n')
+                writer.stdin.flush()
+                thread.join(5)
+                assert not thread.is_alive()
+        finally:
+            proceed.set()
+            thread.join(5)
+        assert result == [] and len(errors) == 1
+        assert isinstance(errors[0], KernelError) and errors[0].code == 'executor_fenced'
+        assert kernel.source_status()['stopped'] is True
+        assert set(kernel.operation_state().active) == {call.lease_id for call in calls}
+        assert kernel.host_usage('original') == usage and kernel.active_host_action() == 'original'
+        for call in calls:
+            assert kernel.status(call.subject)['budgets'] == before[call.subject]
+            assert not any(event['kind'] == 'agent_dispatched' and event['identity'] == call.invocation_id
+                           for event in kernel.history(call.subject))
+        with pytest.raises(KernelError, match='executor_exit_unproven'):
+            kernel.admit_host('too-early', kind='resume', command=('native-host',),
+                environment_carrier=tmp_path / 'next-carrier', preflight=lambda: None)
