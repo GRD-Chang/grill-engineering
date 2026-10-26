@@ -105,7 +105,7 @@ def test_public_run_profile_revision_changes_only_future_threads(git_repo, comma
 def test_public_run_profile_rejects_invalid_changes_and_unpublished_snapshots_without_saving(
     git_repo, tmp_path, capsys, case,
 ):
-    from tests.test_kernel_query_cli import _snapshot
+    from support.environment import durable_snapshot as _snapshot
     from agent_run.contracts.task import TaskKey
     from agent_run.storage.tasks import task_path
     import shutil

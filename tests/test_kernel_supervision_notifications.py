@@ -9,7 +9,7 @@ from agent_run.notifications.sender import NativeNotifications
 from agent_run.core.operation_contract import ReadUnavailable
 from support.core_operations import CoreOperations
 from test_kernel_notification_lifecycle import _enabled_scenario
-from test_kernel_query_cli import _snapshot
+from support.environment import durable_snapshot as _snapshot
 
 
 def test_before_final_timeout_uses_one_original_global_notification_and_resume(tmp_path, monkeypatch):

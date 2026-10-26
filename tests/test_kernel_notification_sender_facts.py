@@ -14,7 +14,7 @@ from agent_run.model import DeliveryKind, Role
 from agent_run.core.kernel import Kernel
 from agent_run.model import wire_json
 from agent_run.notifications.sender import NativeNotifications
-from test_kernel_notification_events import _recorded_agents
+from support.notification import recorded_agents as _recorded_agents
 from test_kernel_notification_lifecycle import _enabled_scenario
 from test_kernel_notifications import _kernel, _operations
 

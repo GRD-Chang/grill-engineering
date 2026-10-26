@@ -218,7 +218,7 @@ def test_budget_checkpoint_explicit_wait_override_only_changes_future_windows(tm
 def test_expired_checks_resume_changes_only_future_wait_and_serializes_actions(tmp_path):
     from concurrent.futures import ThreadPoolExecutor
     from threading import Barrier
-    from test_kernel_query_cli import _snapshot
+    from support.environment import durable_snapshot as _snapshot
 
     scenario = Scenario(tmp_path / "resume-ci", DeliveryKind.TICKET, checks=("pending",),
                         policy=Policy(required_checks_wait_seconds=3))
@@ -287,7 +287,7 @@ def test_expired_checks_resume_changes_only_future_wait_and_serializes_actions(t
 
 def test_other_supervision_timeout_cannot_change_checks_policy(tmp_path, monkeypatch):
     from test_kernel_automatic_supervision import delivery_run, source_operations, unavailable
-    from test_kernel_query_cli import _snapshot
+    from support.environment import durable_snapshot as _snapshot
 
     kernel, source = delivery_run(tmp_path / "run.sqlite3")
     operations = source_operations(kernel, source, kernel.claim_executor("read-outage"))

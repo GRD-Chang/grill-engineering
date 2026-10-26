@@ -14,7 +14,7 @@ from agent_run.model import Blocker, Issue, ParentIssue, Policy, Requirements
 from agent_run.queries.run import read
 from agent_run.queries.read_facts import QueryError
 from support.offline import GraphScenario
-from test_kernel_query_cli import _snapshot
+from support.environment import durable_snapshot as _snapshot
 
 
 def _graph(root):

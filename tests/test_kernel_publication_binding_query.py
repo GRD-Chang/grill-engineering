@@ -9,8 +9,9 @@ import agent_run.queries.run as query
 from agent_run.model import Role
 from support.offline import GraphScenario
 from agent_run.cli.render import render
-from tests.test_kernel_notification_events import _project, _recorded_agents
-from tests.test_kernel_query_cli import _snapshot
+from tests.test_kernel_notification_events import _project
+from support.notification import recorded_agents as _recorded_agents
+from support.environment import durable_snapshot as _snapshot
 
 
 @pytest.mark.parametrize("kind", ["ticket", "parent_only"])

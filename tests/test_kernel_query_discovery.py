@@ -13,7 +13,8 @@ from agent_run.core.kernel import Kernel
 from support.offline import OfflinePort, Scenario
 from agent_run.cli.main import main
 from agent_run.storage.tasks import bind_task, locked_task, task_path
-from tests.test_kernel_query_cli import _create, _snapshot
+from tests.test_kernel_query_cli import _create
+from support.environment import durable_snapshot as _snapshot
 
 
 def _published(root: Path, run_id: str = "run-query", *, repository: str = "example/project",
