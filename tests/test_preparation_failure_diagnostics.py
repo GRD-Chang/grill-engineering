@@ -33,8 +33,10 @@ def test_native_preparation_retains_safe_auth_diagnostic_without_invocation(
     tools = tmp_path / 'tools'
     tools.mkdir()
     gh = tools / 'gh'
+    calls = tmp_path / 'auth-calls'
     header = f'HTTP/2.0 {status} Synthetic\r\n\r\n' if status is not None else ''
     gh.write_text(f'#!{sys.executable}\nimport sys\n'
+        f"from pathlib import Path\nwith Path({str(calls)!r}).open('a') as log:log.write('call\\n')\n"
         "assert sys.argv[1:]==['api','--hostname','github.com','user','--include','--silent']\n"
         f'sys.stdout.write({header!r})\nsys.stderr.write({(stderr + " Authorization: Bearer secret-fixture-value")!r})\n'
         'raise SystemExit(23)\n')
@@ -64,6 +66,15 @@ def test_native_preparation_retains_safe_auth_diagnostic_without_invocation(
     assert evidence['retryable'] is retryable
     assert evidence['http_status'] == status
     assert evidence['source'] == 'worker-preparation'
+    if stderr not in {'process-error', 'timeout'}:
+        attempts = len(calls.read_text().splitlines())
+        assert evidence['credential_attempts'] == attempts
+        assert evidence['credential_retries'] == attempts - 1
+    assert evidence['credential_stage'] == 'initial'
+    assert evidence['credential_valid_at_last_failure'] is False
+    assert evidence['credential_remaining_seconds_at_last_failure'] is None
+    assert action['evidence']['failure_evidence']['deadline'] == request.preparation_deadline
+    assert action['evidence']['failure_evidence']['started_at'] == 1000.0
     serialized = json.dumps(document)
     assert 'secret-fixture-value' not in serialized and 'arbitrary private text' not in serialized
     assert len(json.dumps(evidence).encode()) < 512
@@ -81,3 +92,16 @@ def test_credential_diagnostic_rejects_arbitrary_provider_metadata():
         'category': ['private category'], 'returncode': True, 'errno': -1,
         'http_status': '401 secret', 'retryable': 'private', 'stderr': 'private stderr'})
     assert credential_diagnostic(error) == {'http_status': None}
+
+
+@pytest.mark.parametrize('remaining', [float('nan'), float('inf'), -1, True, 10**1000, 'private expiry'])
+def test_credential_diagnostic_rejects_unproved_duration_and_counter(remaining):
+    from agent_run.adapters.auth.credential_lifecycle import WorkerCredentialError, credential_diagnostic
+    error = WorkerCredentialError('private provider details', diagnostic={'credential_stage': 'renewal',
+        'credential_attempts': True, 'credential_retries': -1,
+        'credential_remaining_seconds_at_last_failure': remaining})
+    result = credential_diagnostic(error)
+    assert 'credential_attempts' not in result and 'credential_retries' not in result
+    assert 'credential_remaining_seconds_at_last_failure' not in result
+    assert result['credential_failure_observed'] is None and result['credential_valid_at_last_failure'] is None
+    assert 'private' not in json.dumps(result, allow_nan=False)
