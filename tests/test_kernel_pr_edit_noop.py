@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from agent_run.errors import KernelError
-from test_kernel_remote_effects import _fixture, _publish_pr
+from support.remote_effects import _fixture, _publish_pr
 
 
 @pytest.mark.parametrize("mode", ["current", "stopped", "changed_head", "changed_base", "foreign", "stale_base"])

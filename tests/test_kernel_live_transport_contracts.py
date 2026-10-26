@@ -125,7 +125,7 @@ def test_remote_merge_readback_returns_integrated_sha(
 ) -> None:
     from dataclasses import replace
     from agent_run.adapters.git_objects import LocalGit
-    from test_kernel_remote_effects import _fixture, _publish_pr
+    from support.remote_effects import _fixture, _publish_pr
 
     port, git, push, _state, calls = _fixture(tmp_path, monkeypatch)
     source_ref = "refs/heads/agent-run-repair/run-1"

@@ -87,7 +87,7 @@ def test_bootstrap_source_outage_keeps_original_call_and_bounded_read_wait(tmp_p
     import pytest
     from agent_run.model import ReadWait
     from support.core_operations import CoreOperations
-    from test_kernel_remote_effects import _change, _fixture, _source_kernel
+    from support.remote_effects import _change, _fixture, _source_kernel
     port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
     kernel = _source_kernel(tmp_path, port, push)
     execution = kernel.claim_executor("real-port-bootstrap")

@@ -106,7 +106,7 @@ def test_prepare_creation_uses_original_defaults_real_remote_and_independent_clo
 ) -> None:
     import json
     import os
-    from tests.test_kernel_remote_effects import FAKE_GH
+    from support.remote_effects import FAKE_GH
     from agent_run.config.defaults import UserDefaultsStore
     from agent_run.cli.lifecycle import prepare_creation
     from agent_run.model import DeliveryKind
@@ -320,7 +320,7 @@ def _running_public_parent(git_repo: Path, tmp_path: Path, monkeypatch, *, admit
     from agent_run.model import Commit, Delivery, DeliveryKind, Issue, ParentIssue, Requirements, RunSpec
     from agent_run.core.kernel import Kernel
     from agent_run.config.creation import freeze_creation
-    from tests.test_kernel_remote_effects import FAKE_GH
+    from support.remote_effects import FAKE_GH
     binary = tmp_path / "source-bin"
     binary.mkdir()
     executable = binary / "gh"

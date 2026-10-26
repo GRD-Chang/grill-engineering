@@ -19,7 +19,7 @@ from support.core_operations import CoreOperations
 from support.offline import GraphScenario
 from agent_run.adapters.remote import RemoteEffects
 from agent_run.adapters.source import read_requirements
-from test_kernel_remote_effects import _fixture
+from support.remote_effects import _fixture
 
 RAW = b'{"result_kind":"development","summary":"one actual worker","human_blockers":null}'
 

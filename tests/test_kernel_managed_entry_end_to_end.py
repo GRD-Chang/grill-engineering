@@ -26,7 +26,7 @@ from agent_run.runtime.package_lease import RunnerLeaseBusy, default_runner_lock
 from agent_run.config.defaults import UserDefaultsStore
 from agent_run.core.kernel import Kernel
 from support.systemd_manager import controlled_manager
-from tests.test_kernel_remote_effects import FAKE_GH
+from support.remote_effects import FAKE_GH
 from support.worker_process_timing import wait_until
 
 

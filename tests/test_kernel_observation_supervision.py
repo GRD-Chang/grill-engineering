@@ -13,7 +13,7 @@ from agent_run.runtime.executor import _make_ports
 from support.core_operations import CoreOperations
 from agent_run.errors import KernelError
 from agent_run.model import ReadWait, Step
-from test_kernel_remote_effects import _fixture, _publish_pr, _source_kernel
+from support.remote_effects import _fixture, _publish_pr, _source_kernel
 from test_kernel_worker_source_windows import _allocated_worker, RAW
 
 

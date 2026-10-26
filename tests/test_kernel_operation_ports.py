@@ -10,7 +10,7 @@ from agent_run.model import ResourceWitness
 from agent_run.core.operation_contract import DeliveryRead, OperationPorts
 from agent_run.adapters.remote import RemoteEffects
 from test_kernel_local_effects import publication
-from test_kernel_remote_effects import _change, _fixture, _publish_pr
+from support.remote_effects import _change, _fixture, _publish_pr
 
 
 def test_source_and_delivery_facts_need_no_core_or_database(tmp_path, monkeypatch):

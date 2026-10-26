@@ -21,7 +21,7 @@ from agent_run.adapters.remote import RemoteEffects
 from support.systemd_manager import controlled_manager
 from support.ticket_process import isolated_ticket_test
 from test_kernel_operation_runner import setup
-from test_kernel_remote_effects import _fixture
+from support.remote_effects import _fixture
 
 
 def test_control_observation_never_claims_executor_or_allocates_work(tmp_path, monkeypatch):

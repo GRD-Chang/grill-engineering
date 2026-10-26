@@ -220,7 +220,7 @@ def test_real_core_original_write_rechecks_its_prior_after_preparation(tmp_path,
 def test_pr_noop_foreign_readback_does_not_dispatch_a_new_admission(tmp_path, monkeypatch):
     from agent_run.contracts.write_authority import WriteAuthority
     from dataclasses import replace
-    from test_kernel_remote_effects import _fixture, _pr_effect
+    from support.remote_effects import _fixture, _pr_effect
 
     port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
     fixture_authority = WriteAuthority(lambda: lambda: None)

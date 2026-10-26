@@ -10,7 +10,7 @@ from agent_run.runtime.executor import _make_ports
 from support.core_operations import CoreOperations
 from agent_run.model import Execution, HostObservation
 from support.offline import GraphScenario
-from test_kernel_remote_effects import _fixture
+from support.remote_effects import _fixture
 from test_kernel_requirements import independent_source
 
 
