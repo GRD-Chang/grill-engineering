@@ -14,7 +14,7 @@ from agent_run.core.operation_runner import OperationRunner
 from agent_run.core.operation_contract import ReadUnavailable
 from agent_run.cli.main import main
 from agent_run.queries.read_facts import read_boundaries
-from tests.test_kernel_query_cli import _snapshot
+from support.environment import durable_snapshot as _snapshot
 
 
 @pytest.mark.parametrize('initial,later,wait_kind,budget,status', [

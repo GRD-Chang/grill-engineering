@@ -13,7 +13,7 @@ from agent_run.core.operation_contract import ReadUnavailable
 from support.core_operations import CoreOperations
 from agent_run.cli.render import render
 from test_kernel_automatic_supervision import delivery_run, source_operations
-from test_kernel_query_cli import _snapshot
+from support.environment import durable_snapshot as _snapshot
 
 
 def source_run(tmp_path, monkeypatch, language="en"):

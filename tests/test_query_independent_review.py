@@ -6,7 +6,7 @@ from agent_run.config.paths import app_data_root
 from agent_run.contracts.task import TaskKey
 from agent_run.queries.run import task_binding
 from agent_run.cli.main import main
-from test_kernel_query_cli import _snapshot as _bytes
+from support.environment import durable_snapshot as _bytes
 from test_kernel_query_discovery import _published
 
 

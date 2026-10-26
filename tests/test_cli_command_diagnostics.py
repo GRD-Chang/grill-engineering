@@ -190,7 +190,8 @@ def test_stop_receipt_uses_frozen_language_and_keeps_internal_identity_only_in_j
 
 def test_ambiguous_run_error_keeps_locations_and_machine_identity_without_repeating_private_ids(tmp_path: Path, capsys) -> None:
     from agent_run.cli.main import main
-    from test_kernel_query_cli import _create, _snapshot
+    from test_kernel_query_cli import _create
+    from support.environment import durable_snapshot as _snapshot
 
     kernels = [_create(tmp_path, identity) for identity in ("private-one", "private-two")]
     before = _snapshot(tmp_path)
@@ -230,7 +231,7 @@ def test_ambiguous_databases_in_the_same_directory_have_distinct_copyable_locati
     from agent_run.core.kernel import Kernel
     from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
     from support.offline import fixture_inputs
-    from test_kernel_query_cli import _snapshot
+    from support.environment import durable_snapshot as _snapshot
 
     delivery = Delivery("parent:1", DeliveryKind.PARENT_ONLY, 1, "original", Commit("base", "tree"),
                         "refs/heads/task", "refs/heads/main")
