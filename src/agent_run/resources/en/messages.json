@@ -1099,5 +1099,8 @@
   "cli.usage_prefix": "usage: ",
   "cli.help_option": "show this help message and exit",
   "cli.invalid_choice": "argument {argument}: invalid choice: {value} (choose from {choices})",
-  "cli.error.run_locator_missing": "No matching Run was found. First inspect existing Runs with agent-run runs --repo OWNER/NAME; if this Parent has no Runner workspace yet, start it with agent-run run PARENT --repo OWNER/NAME."
+  "cli.error.run_locator_missing": "No matching Run was found. First inspect existing Runs with agent-run runs --repo OWNER/NAME; if this Parent has no Runner workspace yet, start it with agent-run run PARENT --repo OWNER/NAME.",
+  "cli.settings.field.required_checks_wait_seconds": "Required Checks wait (seconds)",
+  "cli.required_checks_wait_help": "Required Checks wait per PR/head: positive seconds or s/m/h/d, at most 7d (default 45m; frozen when creating a Run)",
+  "policy.error.checks_wait_range": "required_checks_wait_seconds must be positive and at most 7 days"
 }

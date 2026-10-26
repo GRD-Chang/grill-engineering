@@ -65,6 +65,8 @@ def _policy_options(parser: argparse.ArgumentParser, language: str, *, allow_thr
                         help=text("cli.integration_resync_limit_help", language=language))
     parser.add_argument("--ticket-ci-review", action=argparse.BooleanOptionalAction, default=None,
                         help=text("cli.ticket_ci_review_help", language=language))
+    parser.add_argument("--required-checks-wait-seconds", type=partial(_duration, language=language),
+                        help=text("cli.required_checks_wait_help", language=language))
     for role, label in (("development", "Development"), ("review", "Review"), ("publication", "Publication")):
         parser.add_argument(f"--{role}-deadline", f"--{role}-duration", f"--{role}-timeout", dest=f"{role}_deadline",
                             type=partial(_duration, language=language), help=text("cli.deadline_help", language=language, role=label))
@@ -109,7 +111,7 @@ def add_parsers(commands: Any, language: str) -> None:
 
 
 def _policy_values(parsed: argparse.Namespace) -> dict[str, Any]:
-    keys = tuple(item[0] for item in _POSITIVE_POLICY) + ("development_thread_policy", "integration_resync_limit", "ticket_ci_review")
+    keys = tuple(item[0] for item in _POSITIVE_POLICY) + ("development_thread_policy", "integration_resync_limit", "ticket_ci_review", "required_checks_wait_seconds")
     result = {key: getattr(parsed, key) for key in keys if getattr(parsed, key, None) is not None}
     deadlines = {role: getattr(parsed, role + "_deadline") for role in ("development", "review", "publication")
                  if getattr(parsed, role + "_deadline", None) is not None}

@@ -1099,5 +1099,8 @@
   "cli.usage_prefix": "用法: ",
   "cli.help_option": "显示帮助并退出",
   "cli.invalid_choice": "参数 {argument} 的无效选项：{value}（可选：{choices}）",
-  "cli.error.run_locator_missing": "找不到匹配的 Run。请先用 agent-run runs --repo OWNER/NAME 核对已有 Run；若尚未创建此 Parent 的 Runner 工作区，请用 agent-run run PARENT --repo OWNER/NAME 启动。"
+  "cli.error.run_locator_missing": "找不到匹配的 Run。请先用 agent-run runs --repo OWNER/NAME 核对已有 Run；若尚未创建此 Parent 的 Runner 工作区，请用 agent-run run PARENT --repo OWNER/NAME 启动。",
+  "cli.settings.field.required_checks_wait_seconds": "Required Checks 等待时长（秒）",
+  "cli.required_checks_wait_help": "每个 PR/head 的 Required Checks 等待时长：正数秒或 s/m/h/d，最多 7d（默认 45m，创建 Run 时冻结）",
+  "policy.error.checks_wait_range": "required_checks_wait_seconds 必须大于零且不超过 7 天"
 }

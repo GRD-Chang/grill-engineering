@@ -97,6 +97,7 @@ def normalize_policy_overrides(
         "ticket_ci_development_limit": "ticket_ci_development_limit",
         "ticket_ci_review": "ticket_ci_review",
         "parent_ci_development_limit": "parent_ci_development_limit",
+        "required_checks_wait_seconds": "required_checks_wait_seconds",
     }
     flat_deadline_aliases = {
         role: {
@@ -143,6 +144,8 @@ def normalize_policy_overrides(
 def _policy_changes(values: Mapping[str, Any]) -> dict[str, Any]:
     """Convert explicit, normalized options to native Policy fields."""
     changes = {field: values[key] for key, field in POLICY_VALUE_FIELDS.items() if key in values}
+    if "required_checks_wait_seconds" in changes:
+        changes["required_checks_wait_seconds"] = _positive_duration(changes["required_checks_wait_seconds"], "required_checks_wait_seconds")
     if "development_thread_policy" in values:
         changes["new_thread_per_development"] = _new_thread_per_development(values["development_thread_policy"])
     deadlines = values.get("invocation_deadlines", {})

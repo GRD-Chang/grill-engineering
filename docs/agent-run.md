@@ -8,7 +8,7 @@
 - 为每轮首次候选验收创建全新的 Fresh Acceptance Thread 和一次性 Validation Checkout；同一 Reviewer 因 `execution_failed` 或 Human Blocker 继续当前对象时复用原 Thread 并重新准备 checkout；
 - 以 [Acceptance Artifact Schema](acceptance-artifact-schema.md) 约束 Ticket 与 Run Reviewer 共用的三条验收 lane 输出；
 - `run` 与 `resume` 都通过同一 Task Control 和独立 Executor 连续推进；恢复失败 Invocation 或 Human Blocker 后形成的 Candidate、PR 与 Required Checks 由同一 Executor 监督到下一真实边界，后台模式下发起终端退出或 Ctrl-C 只离开观察；前台候选的区别见下节；
-- Required Checks 的 pending 等待当前默认2700秒（45分钟），到期进入可恢复的监督超时暂停；其他 GitHub 异步状态、未知读取或对账按各自有界窗口监督。远端检查在超时后成功不会自动重启或续期；按 `status` 指引显式 `resume` 开始对应的新窗口，不另启 watcher，不以重复 `run` 清除超时或其他人工门禁；
+- Required Checks 的 pending 等待默认2700秒（45分钟），可通过 `--required-checks-wait-seconds 2h` 或同名个人 Policy 字段配置并在新 Run 冻结（详见 [个人默认](user-defaults.md#required-checks-等待时长)）；到期进入可恢复的监督超时暂停；其他 GitHub 异步状态、未知读取或对账按各自有界窗口监督。远端检查在超时后成功不会自动重启或续期；按 `status` 指引显式 `resume` 开始对应的新窗口，不另启 watcher，不以重复 `run` 清除超时或其他人工门禁；
 - 通过 Required Checks 与 Published-Head Gate 后，将 Ticket PR squash merge
   到 Run Branch，并显式关闭唯一 Primary Ticket；
 - 每张 Ticket 完成后重新读取 GitHub，继续推进其他可执行分支；
