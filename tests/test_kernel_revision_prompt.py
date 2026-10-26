@@ -67,6 +67,10 @@ def test_managed_revision_feedback_reaches_real_development_review_and_publicati
             assert call.context["review_context"]["facts"]["human_feedback"] == feedback
         prompt = render_role_prompt(call)
         assert prompt.count(feedback) == 1, (call.role, prompt)
+        if call.role == 'review':
+            assert 'three independent subagents for Spec, Standards and E2E' in prompt
+            assert 'final structured response' in prompt and 'do not call tools afterwards' in prompt
+            assert all(command in prompt for command in ('kill', 'pkill', 'killall'))
         if call.role == "publication":
             assert "current work only" in prompt
             assert "not proof of resolution or approval" in prompt

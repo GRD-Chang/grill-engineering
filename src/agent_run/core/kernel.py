@@ -126,7 +126,7 @@ class Kernel:
                     review = tx.one("SELECT context_id FROM attempts WHERE id=?", (job["review_attempt"],))
                     context = json.loads(tx.get(review[0], fence.subject))
                     if "review_context" in context:
-                        anchors.add(context["review_context"]["full_range"]["candidate_sha"])
+                        anchors.add(context["reviewed_commit"])
             query = DeliveryRead(job["source_ref"], job["target_ref"], job["pr_number"] if fence.subject is not None else None,
                                  tuple(sorted(anchors)), job["source_sha"] if fence.subject is not None and job["phase"] == "checks" else None,
                                  fence.subject is not None)
@@ -3831,33 +3831,45 @@ class Kernel:
                 "requirements", "ticket_completions", "work_source", "ci_evidence", "human_feedback",
             ) if key in context}
             facts["current_review_identity"] = self._review_identity(context)
-            full = {"base_sha": context["base_sha"], "candidate_sha": context["reviewed_commit"]}
-            focus, complete = full, False
+            review_base = (context["ci_evidence"]["head_sha"] if job["purpose"] == Purpose.CI
+                           else context["base_sha"])
             if previous_context is not None and previous_artifact is not None:
                 facts.update(previous_review_identity=self._review_identity(previous_context),
                              previous_acceptance_artifact=previous_artifact)
-                saved = previous_context.get("review_context")
-                if isinstance(saved, dict):
-                    prior_candidate = saved["full_range"]["candidate_sha"]
-                    complete = (saved["full_range"]["base_sha"] == full["base_sha"]
-                                and all(previous_context.get(key) == context[key] for key in (
-                                    "scope", "revision", "parent_revision", "graph_revision", "completion_revision"))
-                                and not any(lane["status"] == "blocked" for lane in previous_artifact["checks"].values())
-                                and (prior_candidate == full["candidate_sha"] or (prior_candidate, full["candidate_sha"]) in world.ancestry))
-                    if complete:
-                        focus = {"base_sha": prior_candidate, "candidate_sha": full["candidate_sha"]}
+                # Findings define the next comparison, not a complete-baseline
+                # heuristic. A new failed CI head starts a new repair scope.
+                if (review_outcome(previous_artifact) == "fail"
+                        and previous_context["purpose"] == job["purpose"]
+                        and previous_context["generation"] == job["generation"]
+                        and (job["purpose"] != Purpose.CI
+                             or previous_context.get("ci_evidence", {}).get("head_sha") == review_base)):
+                    review_base = previous_context["reviewed_commit"]
+            developments = tx.rows("SELECT id,result_id,purpose FROM attempts WHERE subject=? AND generation=? "
+                                   "AND role='development' AND status='consumed' ORDER BY ordinal DESC LIMIT 1",
+                                   (job["id"], job["generation"]))
+            if developments:
+                latest = developments[0]
+                facts.update(development_summary=artifact(Role.DEVELOPMENT, tx.get(latest["result_id"], job["id"]))["summary"],
+                             development_identity={"attempt_id": latest["id"], "result_id": latest["result_id"],
+                                                   "purpose": latest["purpose"]})
             if integration_failure is not None:
                 failure, original = integration_failure
-                development = tx.one("SELECT id,result_id FROM attempts WHERE subject=? AND generation=? "
-                                     "AND purpose='integration' AND role='development' AND status='consumed' ORDER BY ordinal DESC LIMIT 1",
-                                     (job["id"], job["generation"]))
+                development = (developments[0] if developments and developments[0]["purpose"] == Purpose.INTEGRATION
+                               else tx.one("SELECT id,result_id FROM attempts WHERE subject=? AND generation=? "
+                                           "AND purpose='integration' AND role='development' AND status='consumed' ORDER BY ordinal DESC LIMIT 1",
+                                           (job["id"], job["generation"])))
+                same_development = facts.get("development_identity", {}).get("attempt_id") == development["id"]
+                summary = (facts.pop("development_summary") if same_development else
+                           artifact(Role.DEVELOPMENT, tx.get(development["result_id"], job["id"]))["summary"])
+                if same_development:
+                    facts.pop("development_identity")
                 facts["integration_record"] = {
                     "effect_id": failure["id"], "receipt_id": failure["receipt_id"], "subject": job["id"],
                     "generation": job["generation"], "source_ref": failure["source_ref"],
                     "target_ref": failure["target_ref"], "candidate_sha": failure["candidate_sha"],
                     "target_sha": failure["base_sha"], "receipt": original,
                     "development_attempt": development["id"], "development_result": development["result_id"],
-                    "development_summary": artifact(Role.DEVELOPMENT, tx.get(development["result_id"], job["id"]))["summary"],
+                    "development_summary": summary,
                 }
             if job["purpose"] == Purpose.CI and job["kind"] != DeliveryKind.TICKET:
                 accepted = tx.rows("SELECT context_id,result_id FROM attempts WHERE subject=? AND generation=? AND role='review' AND outcome='pass' AND purpose!='ci' AND revision=? AND parent_revision=? AND graph_revision=? AND completion_revision=? ORDER BY ordinal DESC LIMIT 1",
@@ -3868,8 +3880,8 @@ class Kernel:
                         **self._review_identity(accepted_context),
                         "artifact": artifact(Role.REVIEW, tx.get(accepted[0]["result_id"], job["id"])),
                     }
-            context["review_context"] = {"facts": facts, "full_range": full, "focus_range": focus,
-                                         "has_complete_baseline": complete}
+            context["review_context"] = {"facts": facts, "review_range": {
+                "base_sha": review_base, "candidate_sha": context["reviewed_commit"]}}
         elif role == Role.PUBLICATION:
             if job["gate_mode"] == "review" and previous_context is not None and previous_artifact is not None:
                 if review_outcome(previous_artifact) != "pass":

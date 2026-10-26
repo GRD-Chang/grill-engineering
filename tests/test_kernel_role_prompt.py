@@ -14,6 +14,7 @@ from agent_run.config.defaults import UserDefaultsStore
 from agent_run.model import AgentCall, Commit, Delivery, DeliveryKind, Role, RunSpec
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
+from agent_run.contracts.artifact import role_schema
 from agent_run.runtime.codex import execute_codex
 from agent_run.config.creation import freeze_creation
 from support.offline import Scenario, review_result
@@ -61,7 +62,9 @@ def test_frozen_development_body_reaches_cli_and_repair_selects_only_its_contrac
     executable = tmp_path / "local-codex"
     executable.write_text(f"#!{sys.executable}\n" + f"""\
 import json, sys
+from pathlib import Path
 assert sys.stdin.read() == {prompt!r}
+assert json.loads(Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text()) == {role_schema(call.role.value)!r}
 print(json.dumps({{'type': 'thread.started', 'thread_id': 'prompt-thread'}}), flush=True)
 """)
     executable.chmod(0o700)
@@ -106,6 +109,7 @@ def run_prompt_call(kernel: Kernel, call: AgentCall, tmp_path: Path, raw: bytes,
 import json, sys
 from pathlib import Path
 assert sys.stdin.read() == {prompt!r}
+assert json.loads(Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text()) == {role_schema(call.role.value)!r}
 if {call.reported_thread!r} is not None:
     assert sys.argv[1:4] == ['exec', 'resume', '--json']
     assert sys.argv[5] == {call.reported_thread!r}
@@ -148,7 +152,7 @@ def test_same_thread_new_development_attempt_keeps_complete_repair_method(tmp_pa
             assert first is not None and not reviewed
             prompt = run_prompt_call(scenario.kernel, call, tmp_path, json.dumps(review_result("fail")).encode())
             context = call.context["review_context"]
-            assert context["full_range"]["candidate_sha"] in prompt
+            assert context["review_range"]["candidate_sha"] in prompt
             reviewed = True
         elif call.role == Role.DEVELOPMENT:
             raw = b'{"result_kind":"development","summary":"Implemented the allocated task.","human_blockers":null}'

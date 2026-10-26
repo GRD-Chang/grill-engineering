@@ -10,6 +10,7 @@ import sys
 import pytest
 
 import agent_run.config.resources as prompt_resources
+from agent_run.contracts.artifact import role_schema
 from agent_run.core.prompts.development import development_prompt
 
 
@@ -56,6 +57,7 @@ def test_preview_uses_execution_assembler_and_frozen_resources(tmp_path: Path) -
     preview = cli("preview", "--request", str(request_file), "--role", "development", "--json")
     assert preview.returncode == 0, preview.stdout + preview.stderr
     assert json.loads(preview.stdout)["prompt"] == development_prompt(request)
+    assert json.loads(preview.stdout)["schema"] == role_schema("development")
     assert "个人共用标记" in preview.stdout
     request["_prompt_resources"] = prompt_resources.resolve_resources()
     request_file.write_text(json.dumps(request))
@@ -84,20 +86,26 @@ def test_unreadable_override_reports_error(tmp_path: Path, language: str) -> Non
     assert ("普通 Markdown 文件" if language == "zh" else "regular Markdown file") in human.stdout
 
 
+@pytest.mark.parametrize("output_name,role", [
+    ("Development result", "development"), ("Acceptance Artifact", "review"),
+    ("Publication Artifact", "publication"),
+])
 def test_output_repair_preview_is_read_only_and_snapshot_is_required_when_supplied(
-    tmp_path: Path, capsys,
+    tmp_path: Path, capsys, output_name: str, role: str,
 ) -> None:
     from agent_run.cli.main import main
     from agent_run.core.prompts.context import structured_output_repair_prompt
 
-    request = {"output_name": "Development result", "contract_error": "字段缺失"}
+    request = {"output_name": output_name, "contract_error": "字段缺失"}
     request_file = tmp_path / "request.json"
     request_file.write_text(json.dumps(request))
     arguments = ["prompts", "preview", "--request", str(request_file),
                  "--role", "output-repair", "--json"]
     assert main(arguments) == 0
-    prompt = json.loads(capsys.readouterr().out)["prompt"]
-    assert prompt == structured_output_repair_prompt("Development result", "字段缺失")
+    result = json.loads(capsys.readouterr().out)
+    prompt = result["prompt"]
+    assert result["schema"] == role_schema(role)
+    assert prompt == structured_output_repair_prompt(output_name, "字段缺失")
     assert "字段缺失" in prompt
     assert not prompt_resources.personal_method_directory().exists()
     request["_prompt_resources"] = {}

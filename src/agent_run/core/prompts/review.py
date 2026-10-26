@@ -9,7 +9,6 @@ from agent_run.config.resources import bind_resources, resource
 from agent_run.core.prompts.context import (
     human_continuation,
     pretty,
-    prompt_context,
     review_budget,
     task_brief,
     uses_short_role_prompt,
@@ -61,14 +60,6 @@ def _review_object(request: dict[str, Any]) -> str:
         description = resource(request, "review/run-ci-object" if request.get("acceptance_scope") == "run" else "review/ci-object")
     elif request.get("acceptance_scope") != "run":
         description = resource(request, "review/commit-object")
-    elif request.get("repair_scope") == "run_repair":
-        description = (
-            resource(request, "review/run-repair-object")
-        )
-    elif request.get("candidate_acceptance") is True:
-        description = (
-            resource(request, "review/candidate-object")
-        )
     else:
         description = (
             resource(request, "review/run-object")
@@ -90,15 +81,9 @@ def _ci_repair_evidence(request: dict[str, Any]) -> str:
 
 def _identity_lines(identity: dict[str, Any], request: dict[str, Any]) -> list[str]:
     labels = (
-        (resource(request, "review/identity-run-base"), "run_base_sha"),
-        (resource(request, "review/identity-repair-candidate"), "repair_candidate_sha"),
-        (resource(request, "review/identity-default-base"), "default_base_sha"),
-        (resource(request, "review/identity-run-head"), "run_head_sha"),
-        (resource(request, "review/identity-candidate"), "candidate_sha"),
         (resource(request, "review/identity-reviewed-base"), "reviewed_base_sha"),
         (resource(request, "review/identity-reviewed-candidate"), "reviewed_candidate_sha"),
         (resource(request, "review/identity-reviewed-tree"), "reviewed_candidate_tree"),
-        (resource(request, "review/identity-expected-tree"), "expected_merge_tree"),
     )
     return [
         f"{label}（{key}）：{identity[key]}"
@@ -130,17 +115,7 @@ def _integration_evidence(request: dict[str, Any]) -> str:
     if isinstance(request.get("integration_record"), dict):
         key = "review/parent-integration" if request.get("acceptance_scope") == "parent_only" else "review/integration-evidence"
         return resource(request, key).format(pretty(request["integration_record"]))
-    if request.get("acceptance_scope") != "run":
-        return ""
-    evidence = prompt_context(
-        request, "fallback_ticket_records", "ticket_integration_records",
-        "ci_repair_ticket_records", "run_integration_record", "run_review_facts",
-    )
-    if not evidence:
-        return ""
-    return (
-        resource(request, "review/integration-evidence").format(pretty(evidence))
-    )
+    return ""
 
 
 def _run_review_scope(request: dict[str, Any]) -> str:
@@ -159,8 +134,7 @@ def _review_ranges(request: dict[str, Any]) -> str:
         key: value for key, value in facts.items()
         if key not in {
             "current_review_identity", "previous_review_identity", "previous_acceptance_artifact",
-            "ci_evidence", "integration_record", "run_integration_record", "run_review_facts",
-            "fallback_ticket_records", "ticket_integration_records", "ci_repair_ticket_records",
+            "ci_evidence", "integration_record",
             "prior_human_blockers",
         }
     }
@@ -173,6 +147,10 @@ def _review_ranges(request: dict[str, Any]) -> str:
         }
     displayed = {
         "facts": displayed_facts,
-        **{key: context[key] for key in ("full_range", "focus_range", "has_complete_baseline")},
+        "review_range": context["review_range"],
     }
-    return resource(request, "review/context-ranges").format(pretty(displayed))
+    background = {key: request[key] for key in ("base_sha", "candidate_sha", "candidate_tree", "expected_tree")
+                  if key in request}
+    if background:
+        displayed["delivery_identity_background"] = background
+    return resource(request, "review/fixed-range").format(pretty(displayed))

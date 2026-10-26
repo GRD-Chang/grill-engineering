@@ -2,25 +2,25 @@
 
 
 TEXTS: dict[str, dict[str, str]] = {
-    'review/context-ranges': {
+    'review/fixed-range': {
         'zh': """本次固定审核快照的需求与范围事实（原始证据在下方用途段落给出，均取自同一快照）：
 {0}
 
-full_range 是交付基线至当前候选的完整范围；focus_range 是本轮优先核验的变化，不能代替完整交付责任。has_complete_baseline 为 false 时先建立完整基线。facts 保留有效需求、原始 Findings、失败证据及当前组合；Ticket 的 parent 仅提供背景，不扩大具体任务范围。集成改变基线时按新基线核验最终组合，并检查原始集成变化。CI Review 聚焦原失败、修复与直接回归；两种 Parent 仍对当前整体形成结论。你自主决定检查深度，按具体风险扩大核验范围。""",
+review_range 是本次唯一固定比较范围，从 base_sha 到 candidate_sha；当前工作区的 HEAD 对应其结束提交。围绕该范围、原问题和直接回归独立验证，不以完整需求、历史基线或 Parent 背景扩大本轮审查范围，也不因旧验证缺失退回首次全量。首次审核按已固定范围完成应有的完整核验；后续使用适用原始证据形成当前结论，缺失或无法确认的证据如实说明，不能冒充通过。facts 中的开发说明只解释实际修改，不能替代独立证据。Ticket 的 parent 只提供背景。""",
         'en': """Requirements and ranges from the fixed review snapshot (original evidence appears in the purpose-specific sections below, from the same snapshot):
 {0}
 
-full_range covers the delivery base through the current candidate; focus_range identifies priority changes and does not replace full delivery responsibility. Establish a complete baseline when has_complete_baseline is false. facts retain effective requirements, original Findings, failure evidence and the current combination; a Ticket's parent is background only and does not expand its task. When integration changes the base, check the final combination against the new base and inspect the original integration changes. CI Review focuses on the original failure, repairs and direct regressions; both Parent types still conclude on the entire current result. Decide inspection depth independently and expand validation for concrete risks.""",
+review_range is the only fixed comparison for this review, from base_sha to candidate_sha; the checkout HEAD matches its ending commit. Independently validate that range, the original problems and direct regressions. Complete requirements, historical baselines and Parent background do not expand this review's scope, and missing prior validation does not restart an initial full review. Complete the necessary initial validation within the fixed first-review range. Later conclusions use applicable original evidence; state missing or unverified evidence honestly rather than claiming a pass. Development explanations in facts describe actual changes but do not replace independent evidence. A Ticket's parent is background only.""",
     },
     'review/run-ci-object': {
         'zh': """本次验收对象：
-当前工作区是 CI 修复与默认分支合并后的未提交整体预览，HEAD 留在默认分支基准是正常情况；检查工作树中的当前整体结果。CI 修复提交差异从失败证据绑定的版本到下方 repair_candidate_sha 比较；该提交差异用于定向核验，不替代整体预览。整体开发基准与实际合并基准可能不同，实际合并基准从当前工作区的只读 Git 取得。""",
+当前工作区是 CI 修复与默认分支组合后的固定已提交成果，HEAD 必须对应 reviewed_candidate_sha。只使用 review_range 规定的本轮比较范围；原 CI 失败版本和完整 Parent 成果提供背景，不另行生成第二个比较范围。""",
         'en': """Current acceptance review object:
-The workspace is an uncommitted preview of the CI repair merged with the default branch. HEAD remaining at the default-branch base is normal; inspect the entire current result in the working tree. Compare the CI repair commit delta from the revision bound by the failure evidence to repair_candidate_sha below; this delta supports targeted verification and does not replace the integrated preview. The overall development base and actual merge base may differ. Obtain the actual merge base using read-only Git in the workspace.""",
+The checkout is the fixed committed result combining the CI repair with the default branch. HEAD must match reviewed_candidate_sha. Use only the current comparison defined by review_range; the original CI failure and complete Parent result provide background, not another comparison range.""",
     },
     'review/ci-object': {
-        'zh': """当前工作区包含待审核的 CI 修复提交。下列身份用于准确绑定成果；审查差异以 CI 失败证据中的 head_sha 到当前 reviewed_candidate_sha 为准，原开发基线只提供需求与历史约束，不要求重复审查其全部累计改动。""",
-        'en': """The checkout contains the CI repair commit under review. The identities below bind the exact result; review the delta from head_sha in the CI failure evidence to the current reviewed_candidate_sha. The original development base provides requirement and historical constraints, without requiring a repeated review of all cumulative changes.""",
+        'zh': """当前工作区包含固定已提交的 CI 修复成果，HEAD 对应 reviewed_candidate_sha。审查范围只取 review_range；首次从失败 head 开始，Findings 后从紧邻实际审核提交开始，原开发基线和 CI 证据只提供适用背景。""",
+        'en': """The checkout contains the fixed committed CI repair result, with HEAD at reviewed_candidate_sha. Use only review_range: the failed head for the first repair review, and the immediately previous actual review commit after Findings. The development base and original CI evidence provide applicable background.""",
     },
     'review/ci-initial-baseline': {
         'zh': """本次 CI 修复尚无上轮 CI Review 结果。依据准确失败证据、当前修复差异及直接回归，独立建立本次 CI 修复的审查结论。""",
@@ -45,20 +45,20 @@ CI failure (complete original evidence):
 Reuse prior validation evidence from this baseline; independently verify current changes and conclude on the entire current result. The old result cannot authorize a new result directly.""",
     },
     'review/parent-ci-repair': {
-        'zh': """你负责当前完整 Parent 成果的 CI 修复审核。围绕准确失败版本、失败检查、原始日志和直接回归定向核验；原需求约束本次修复，不重新开发已完成 Ticket。已有适用完整 Parent 验收基线时，复用其验证证据并增量核验变化，但必须对当前完整 Parent 需求及整体成果形成结论；没有适用完整基线时建立完整基线，具体风险需要时扩大验证。不得削弱有效检查伪造通过。Review Findings、人工回复和新会话仍保留原始 CI 证据及当前整体责任。
+        'zh': """你负责当前 Parent 成果的 CI 修复审核。按唯一 review_range，结合准确失败检查、原始日志和直接回归定向核验；原需求约束本次修复，不重新开发或重新审核全部已完成 Ticket。结合适用的完整 Parent 证据形成当前整体成果结论，不以局部修复通过代替整体完成；证据不适用或缺失时如实说明，不将本次范围改为首次全量。不得削弱有效检查伪造通过。Review Findings、人工回复和新会话仍保留原始 CI 证据。
 
 CI 失败（完整原始证据）：
 {}""",
-        'en': """You are responsible for CI repair review of the complete current Parent result. Verify the exact failed revision, failed checks, original logs and direct regressions. Original requirements constrain this repair; do not redevelop completed Tickets. With an applicable complete Parent acceptance baseline, reuse its validation evidence and verify changes incrementally, while concluding on the complete current Parent requirements and result. Without an applicable complete baseline, establish one; expand validation when concrete risks require it. Do not weaken valid checks to manufacture a pass. Review Findings, human replies and new sessions retain the original CI evidence and overall responsibility.
+        'en': """You are responsible for CI repair review of the current Parent result. Follow only review_range, using the exact failed checks, original logs and direct regressions. Original requirements constrain the repair; do not redevelop or re-review every completed Ticket. Use applicable complete Parent evidence to conclude on the current overall result; a passing local repair does not prove overall completion. State missing or inapplicable evidence honestly without changing this range into an initial full review. Do not weaken valid checks to manufacture a pass. Findings, human replies and new sessions retain the original CI evidence.
 
 CI failure (complete original evidence):
 {}""",
     },
     'review/parent-integration': {
-        'zh': """你负责当前完整 Parent 成果的集成验收。下面是准确源版本、目标版本、本地候选、最终组合及冲突路径。核验双方应交付成果、新组合风险和直接回归，对当前整体需求形成完整结论。已有适用完整基线时可以复用其证据并增量核验；没有适用基线时建立完整基线。相同 tree 不能代替范围、需求版本、基线和成果身份核验。
+        'zh': """你负责当前 Parent 成果的集成验收。下面是准确源版本、目标版本、本地候选、最终组合及冲突路径。按唯一 review_range 核验本次组合、原冲突处理和直接回归；结合适用整体证据形成当前成果结论，不扩大为另一套完整比较。相同 tree 不能代替范围、需求版本、基线和成果身份核验。
 准确集成事实：
 {0}""",
-        'en': """You are responsible for integration acceptance of the complete current Parent result. The following records exact source, target, local candidate, final combination and conflict paths. Verify deliverable contributions, combination risks and direct regressions, and form a complete conclusion for the current requirements. With an applicable complete baseline, reuse its evidence and verify changes incrementally; otherwise establish a complete baseline. An identical tree does not replace scope, requirement revision, baseline and result identity checks.
+        'en': """You are responsible for integration acceptance of the current Parent result. The following records exact source, target, local candidate, final combination and conflict paths. Use only review_range to verify this combination, the original conflict resolution and direct regressions. Use applicable overall evidence to conclude on the current result without adding another full comparison. An identical tree does not replace scope, requirement revision, baseline and result identity checks.
 Exact integration facts:
 {0}""",
     },
@@ -69,26 +69,32 @@ Exact integration facts:
 副本应对应当前工作区的实际待验收内容，包括未提交修改和未跟踪的交付文件，不能只复制 HEAD 的提交内容。
 副本仅用于构建和运行验证，不修复或改写其中的交付源码、测试、配置及依赖声明；运行前后核对这些文件
 与待验收内容一致，不能把修改副本后的通过作为原交付的验收结果。
-结束前关闭本轮启动的服务和浏览器，清理临时副本及其他本轮临时产物。不得提交、推送、合并或修改 GitHub。""",
+结束前清理明确属于本轮的临时路径，优先通过正常关闭接口关闭服务和浏览器。
+对于本轮自建子进程，仅允许通过本轮持有的准确句柄，或先核验其进程身份未变化后，定向发出 SIGTERM 并有界等待退出。
+禁止按名称或宽泛 PID 扫描清理，禁止 pkill、killall；不得向自身、祖先进程、所属进程组、程序管理的 Worker 及其管理域发送信号。不得对未知或身份不符的目标使用 kill 或按 PID 清理；Worker 由程序回收。
+不得提交、推送、合并或修改 GitHub。""",
         'en': """Keep the entire workspace read-only. You may start services, operate browsers and create test data; place writable build caches, runtime data, logs and browser artifacts in identifiable temporary paths outside the workspace dedicated to this task.
 Prefer external cache and runtime directories supported by the project. If running in a read-only directory is genuinely impossible, you may create a temporary runtime copy outside the workspace.
 The copy must match the actual content under review in the current workspace, including uncommitted changes and untracked deliverables, rather than only the committed HEAD.
 Use the copy only to build and run validation. Do not fix or rewrite its deliverable source, tests, configuration or dependency declarations. Verify before and after execution that these files match the content under review; a pass after modifying the copy is not acceptance evidence for the original delivery.
-Before finishing, stop services and browsers started during this task and remove the temporary copy and other task-specific temporary artifacts. Do not commit, push, merge or modify GitHub.""",
+Before finishing, remove only known task-specific temporary paths and prefer normal shutdown interfaces for services and browsers.
+For child processes created by this task, you may use exact handles held by this task or verify their unchanged process identity to send targeted SIGTERM and wait for exit within a bound.
+Do not use broad name/PID scans, pkill or killall, or signal yourself, ancestors, your process group, program-managed Workers or their management domain. Do not use kill or clean up by PID for unknown or identity-mismatched targets; the program reclaims Workers.
+Do not commit, push, merge or modify GitHub.""",
     },
     'review/integration-evidence': {
-        'zh': """已有子任务的原始审查、后续修改与集成证据：
+        'zh': """本次集成的原始现场和实际处理说明：
 {}
 
 这些记录帮助定位风险，不替代当前整体结果的独立验收。""",
-        'en': """Original review, subsequent change and integration evidence for existing subtasks:
+        'en': """Original integration failure and actual repair explanation:
 {}
 
 These records help locate risks; they do not replace independent acceptance review of the current integrated result.""",
     },
     'review/run-complete-scope': {
-        'zh': """本轮对完整 Parent 需求、全部 Ticket 集合与实际完成事实、累计变化和当前准确预期合并结果形成整体结论；Ticket 的跳过记录不是 Parent 验收豁免。首次审查必须建立完整验收基线。后续有基线时可复用旧验证证据，增量核验变更、组合及直接回归，但仍对当前完整成果负责；无适用基线时重新建立完整基线。""",
-        'en': """Conclude on the full Parent requirements, all Tickets and actual completion facts, accumulated changes and the current exact expected merge result. Skipped Ticket reviews do not exempt Parent acceptance. The first review must establish a complete acceptance baseline. Later reviews with an applicable baseline may reuse prior validation evidence and incrementally verify changes, combinations and direct regressions, while still concluding on the entire current result; without an applicable baseline, establish a complete baseline.""",
+        'zh': """完整 Parent 需求、Ticket 集合与完成事实用于判断当前整体成果，Ticket 的跳过记录不是 Parent 验收豁免。首次按固定的首次范围完成整体验收；后续仅审核 review_range 中本次变化、原问题和直接回归，结合仍适用的完整证据形成结论。背景不扩大本轮范围，证据不足不能冒充整体通过。""",
+        'en': """Use the full Parent requirements, Ticket set and completion facts to judge the current overall result; skipped Ticket reviews do not exempt Parent acceptance. Complete the initial overall review within its fixed initial range. Later review only the current changes, original problems and direct regressions in review_range, using still-applicable complete evidence to form a conclusion. Background does not expand this round's scope, and insufficient evidence cannot prove overall acceptance.""",
     },
     'review/initial-baseline': {
         'zh': """按当前需求和代码检查本次完整范围，独立建立验收结论。""",
@@ -107,12 +113,14 @@ Use these counts only to organize this round reasonably. They do not change acce
 pass 与 blocked 的 findings 为空。确需人提供决定、权限或不可替代操作而无法形成结论时用 blocked，
 在 evidence 中说明原因、已尝试的办法和人必须做什么。
 e2e 的 evidence 说明实际操作及结果，standards 说明审查范围或基准，spec 说明验收条件及覆盖情况。
-只有三个维度均 pass 才通过；不输出额外报告或问题处理对照表。""",
+只有三个维度均 pass 才通过；不输出额外报告或问题处理对照表。
+必须以最终结构化响应返回，返回后立即结束，不得继续调用工具；commentary 中的 JSON 不能代替最终返回。""",
         'en': """This overrides code-review's default Markdown report step. Output only review JSON conforming to the supplied output schema, with e2e, standards and spec checks.
 
 Each status must be pass, fail or blocked. Use fail with nonempty findings for problems that must be fixed. For pass and blocked, findings must be empty. Use blocked only when a human decision, permission or irreplaceable action is genuinely required before a conclusion can be reached; explain the reason, attempted approaches and necessary human action in evidence.
 The e2e evidence describes actual operations and results; standards describes review scope or baseline; spec describes acceptance criteria and their coverage.
-Acceptance passes only when all three dimensions pass. Do not output an additional report or an issue-disposition table.""",
+Acceptance passes only when all three dimensions pass. Do not output an additional report or an issue-disposition table.
+Return the final structured response and end immediately; do not call tools afterwards. JSON in commentary cannot replace the final response.""",
     },
     'review/output-repair': {
         'zh': """你已完成本次独立验收。现在只负责根据已经完成的真实工作，重新输出符合要求的审查结果 JSON。
@@ -127,54 +135,30 @@ Correct only the result format. Do not restart development, review or validation
     'review/resume': {
         'zh': """你是负责本次交付的独立验收工程师。继续完成你负责的独立验收。以当前工作区和下列准确对象为准，完成尚未结束的核验。
 
-最后只返回本次审查结果 JSON，保留 checks 中 e2e、standards、spec 三个维度的 status、evidence 和 findings。""",
+保留 Spec、Standards、E2E 的独立审查责任和本轮固定范围。清理仅限本轮已知临时路径，优先使用正常关闭接口。对于本轮自建子进程，仅允许通过本轮持有的准确句柄，或先核验其进程身份未变化后，定向发出 SIGTERM 并有界等待退出。
+禁止按名称或宽泛 PID 扫描清理，禁止 pkill、killall；不得向自身、祖先进程、所属进程组、程序管理的 Worker 及其管理域发送信号。不得对未知或身份不符的目标使用 kill 或按 PID 清理；Worker 由程序回收。
+以最终结构化响应返回本次审查结果 JSON，保留 checks 中 e2e、standards、spec 三个维度的 status、evidence 和 findings；返回后立即结束，不得继续调用工具，commentary JSON 不能代替最终返回。""",
         'en': """You are the independent acceptance engineer responsible for this delivery. Continue your independent acceptance work. Use the current workspace and the exact objects below to finish outstanding validation.
 
-Return only the current review result JSON, retaining status, evidence and findings for the e2e, standards and spec dimensions in checks.""",
-    },
-    'review/candidate-object': {
-        'zh': """本次验收对象：
-当前工作区是待验收修复与默认分支合并后的未提交预览；HEAD 留在默认分支基准是正常情况。按下面的实际默认分支基准和待合并提交检查工作树中的整体结果，不能只证明局部修复通过。""",
-        'en': """Current acceptance review object:
-The current workspace is an uncommitted preview of the repair under review merged with the default branch. HEAD remaining at the default-branch base is normal. Use the actual default-branch base and commit to merge below to inspect the complete result in the working tree; proving only the local repair passes is insufficient.""",
+Keep the independent Spec, Standards and E2E duties and this review's fixed range. Clean only known task-specific temporary paths and prefer normal shutdown interfaces. For child processes created by this task, you may use exact handles held by this task or verify their unchanged process identity to send targeted SIGTERM and wait for exit within a bound.
+Do not use broad name/PID scans, pkill or killall, or signal yourself, ancestors, your process group, program-managed Workers or their management domain. Do not use kill or clean up by PID for unknown or identity-mismatched targets; the program reclaims Workers.
+Return the current review result JSON as the final structured response, retaining status, evidence and findings for e2e, standards and spec in checks. End immediately; do not call tools afterwards. JSON in commentary cannot replace the final response.""",
     },
     'review/commit-object': {
         'zh': """本次验收对象：
-当前工作区对应待验收提交，检查比较基准到该提交的完整改动。""",
+当前工作区的 HEAD 对应固定待验收提交。只按 review_range 核验本轮比较；交付身份基准用于背景，不是另一个审核起点。""",
         'en': """Current acceptance review object:
-The current workspace corresponds to the commit under acceptance review. Inspect the complete changes from the comparison base to that commit.""",
+The checkout HEAD is the fixed commit under review. Inspect only the comparison in review_range; delivery identity bases provide background, not another review starting point.""",
     },
     'review/run-object': {
         'zh': """本次验收对象：
-当前工作区是默认分支与本次全部交付合并后的未提交预览。HEAD 保留在基准提交是正常情况；检查工作树中的整体结果。""",
+当前工作区是默认分支与本次全部交付组合后的固定已提交成果，HEAD 必须对应 reviewed_candidate_sha。按唯一 review_range 核验实际成果；完整需求和完成事实是上下文，不另行改变本轮比较范围。""",
         'en': """Current acceptance review object:
-The current workspace is an uncommitted preview of the default branch merged with the entire delivery. HEAD remaining at the base commit is normal; inspect the integrated result in the working tree.""",
-    },
-    'review/run-repair-object': {
-        'zh': """本次验收对象：
-当前工作区是本次修复与默认分支合并后的未提交预览；HEAD 留在默认分支基准是正常情况，检查修复进入整体后的结果。整体开发基准与实际合并基准可能不同，不把二者混为一谈。实际合并基准从当前工作区的只读 Git 取得。""",
-        'en': """Current acceptance review object:
-The current workspace is an uncommitted preview of this repair merged with the default branch. HEAD remaining at the default-branch base is normal; inspect the repair as part of the integrated result. The overall development base and actual merge base may differ; do not conflate them. Obtain the actual merge base using read-only Git in the current workspace.""",
-    },
-    'review/identity-candidate': {
-        'zh': """待合并提交""",
-        'en': """Commit to merge""",
-    },
-    'review/identity-default-base': {
-        'zh': """默认分支合并基准""",
-        'en': """Default-branch merge base""",
-    },
-    'review/identity-expected-tree': {
-        'zh': """预期合并文件树""",
-        'en': """Expected merged file tree""",
-    },
-    'review/identity-repair-candidate': {
-        'zh': """待合并的修复提交""",
-        'en': """Repair commit to merge""",
+The checkout is the fixed committed result combining the default branch with the entire delivery. HEAD must match reviewed_candidate_sha. Verify the actual result using only review_range; complete requirements and completion facts provide context without changing this round's comparison.""",
     },
     'review/identity-reviewed-base': {
-        'zh': """比较基准""",
-        'en': """Comparison base""",
+        'zh': """交付身份基准（背景，不是本轮比较起点）""",
+        'en': """Delivery identity base (background, not this review's comparison start)""",
     },
     'review/identity-reviewed-candidate': {
         'zh': """待验收提交""",
@@ -183,14 +167,6 @@ The current workspace is an uncommitted preview of this repair merged with the d
     'review/identity-reviewed-tree': {
         'zh': """待验收文件树""",
         'en': """File tree under acceptance review""",
-    },
-    'review/identity-run-base': {
-        'zh': """整体开发基准""",
-        'en': """Overall development base""",
-    },
-    'review/identity-run-head': {
-        'zh': """本次全部交付的提交""",
-        'en': """Commit containing the complete delivery""",
     },
     'review/previous-result': {
         'zh': """上一次验收对象：
