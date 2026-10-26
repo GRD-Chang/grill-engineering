@@ -1,5 +1,6 @@
 """Ordinary native workspace allocation does not require an import certificate."""
-from test_kernel_workspace_allocation import dependent_ticket, workspace_intent
+from support.core_operations import dependent_ticket
+from support.effect_boundary import workspace_intent
 
 
 def test_no_applicable_binding_preserves_the_ordinary_workspace_payload(tmp_path, monkeypatch):

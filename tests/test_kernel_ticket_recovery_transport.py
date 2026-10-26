@@ -12,7 +12,7 @@ from agent_run.model import Effect, Execution
 from agent_run.core.operation_contract import ReadUnavailable
 from agent_run.adapters.remote import RemoteEffects
 from support.managed_abandon_transport import install_currentness
-from test_kernel_managed_entry_end_to_end import _CODEX, _control_environment
+from support.systemd_manager import _CODEX, _control_environment
 
 
 def _closed_ticket(git_repo, tmp_path, monkeypatch):

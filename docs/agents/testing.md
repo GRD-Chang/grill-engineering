@@ -53,7 +53,7 @@ CI 对没有文件变更，或仅修改根目录 Markdown、`docs/` 下 Markdown
 
 新增重型测试、修改共享 fixture 或执行策略后，在最终验证中记录修改前后的全量耗时及资源变化，可复用同条件下有效的基线证据，无需每次编辑都跑全量。超过预算或余量明显缩小时，定位最慢用例及 setup/teardown，优先调整验证层级、准备与等待方式；保留有效断言和真实边界保障，明确报告仍未解决的耗时及原因。该预算是审查和验收要求，当前没有自动耗时门禁。
 
-修改测试执行策略、共享 fixture 或重型测试时，遵循本页的五分钟预算、环境隔离、有效覆盖和最终验证要求。涉及 Locator 时，无关失效记录不能阻塞查询；多个匹配候选必须明确消歧，查询不得改写状态。历史讨论为 相关设计记录 和 相关设计记录（私有开发记录，执行本指南不需要访问）。
+修改测试执行策略、共享 fixture 或重型测试时，遵循本页的五分钟预算、环境隔离、有效覆盖和最终验证要求。涉及 Locator 时，无关失效记录不能阻塞查询；多个匹配候选必须明确消歧，查询不得改写状态。当前持久化和展示合同见[状态存储](state-storage.md)与[展示事实](display-facts.md)。
 
 ## 集成测试保留范围
 
@@ -62,9 +62,9 @@ CI 对没有文件变更，或仅修改根目录 Markdown、`docs/` 下 Markdown
 
 | 核心风险 | 必须保留的真实边界与代表测试 |
 | --- | --- |
-| 命令入口、暂停与恢复 | `test_cli_mvp.py`、`test_cli_run_supervision.py`、`test_cli_run_repair_supervision.py` 中的真实 run/resume/approve 与进程重新启动 |
-| 持久化、授权与版本漂移 | StateStore、Locator、`test_ticket_191_*.py`、`test_git_dispatch_fence.py` 的真实文件、锁、Git 与前后状态断言 |
-| Worker 隔离、取消与凭据回收 | `test_codex_backend.py` 的真实子进程、bubblewrap、信号验证，以及 App 凭据测试中的文件更新和清理验证 |
+| 命令入口、暂停与恢复 | `test_kernel_managed_entry_end_to_end.py`、`test_kernel_host_exit_resume.py` 中的真实公开控制、同 Run 恢复、批准及进程退出；`test_kernel_query_cli.py` 保留独立 CLI 查询进程 |
+| 持久化、授权与版本漂移 | `test_kernel_task_admission.py`、`test_kernel_local_effects.py`、`test_kernel_sqlite_faults.py` 的真实 Core/SQLite、锁、Git、版本拒绝及回滚前后事实 |
+| Worker 隔离、取消与凭据回收 | `test_kernel_execution.py`、`test_git_process_ownership.py`、`test_worker_credential_shutdown.py` 保留真实子进程、信号与准确回收；`test_runner_app_credentials.py` 保留合成 App 响应下的凭据文件与清理边界 |
 | 安装与离线构建 | 安装器真实构建、激活、回滚及中断恢复；依赖在测试前准备 |
 
 同一流程中的辅助结果查询可以调用进程内公开 CLI；CLI 启动、环境继承、跨目录选择与信号测试仍需真实子进程。

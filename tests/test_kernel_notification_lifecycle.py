@@ -1,54 +1,15 @@
 """Notify actual formal promotion, rather than any passing Reviewer result."""
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 import agent_run.storage.notification_outbox as outbox
-from agent_run.contracts.prompt import RESOURCE_KEYS
-from agent_run.config.defaults import UserDefaultsStore
-from agent_run.model import DeliveryKind, RunSpec
-from agent_run.core.kernel import Kernel
-from agent_run.config.creation import freeze_creation
+from agent_run.model import DeliveryKind
 from agent_run.notifications.sender import NativeNotifications
-from support.offline import GraphScenario, Scenario
-from test_kernel_requirements import independent_source
-
-
-def _enabled_scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: DeliveryKind,
-                      *, reviews: tuple[str, ...] = ("pass",), mode: str = "concise", language: str = "en") -> Scenario:
-    defaults = UserDefaultsStore(tmp_path / "defaults.json")
-    defaults.configure(language=language, notifications={"enabled": False, "mode": mode})
-    original_create = Kernel.create
-
-    def create(_cls: type[Kernel], path: Path, spec: RunSpec, **kwargs: Any) -> Kernel:
-        spec = freeze_creation(spec, defaults,
-                               prompt_resources={key: "Frozen " + key for key in RESOURCE_KEYS})
-        assert spec.inputs is not None
-        inputs = replace(spec.inputs, notifications={"enabled": True, "mode": mode,
-                         "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
-        return original_create(path, replace(spec, language=language, inputs=inputs), **kwargs)
-
-    source = independent_source()
-    if kind == DeliveryKind.PARENT_ONLY:
-        source = replace(source, parent=replace(source.parent, sub_issue_numbers=()), issues=())
-    else:
-        first = source.issues[0]
-        source = replace(source, parent=replace(source.parent, sub_issue_numbers=(first.number,)), issues=(first,))
-    # Freeze only input configuration. Workspace and local marker ownership are
-    # produced by the real Core/effect path, never by a synthetic receipt.
-    with monkeypatch.context() as patch:
-        patch.setattr(Kernel, "create", classmethod(create))
-        if kind == DeliveryKind.FINAL_RUN:
-            # d847 builds and retains actual historical Ticket Completion.
-            scenario = Scenario(tmp_path, kind, reviews=reviews)
-            assert len(scenario.kernel.source_status()["completions"]) == 1
-        else:
-            scenario = GraphScenario(tmp_path, source, reviews=reviews if kind == DeliveryKind.PARENT_ONLY else ("pass",))
-    return scenario
+from support.notification import _enabled_scenario
 
 
 @pytest.mark.parametrize("kind", [DeliveryKind.PARENT_ONLY, DeliveryKind.FINAL_RUN])

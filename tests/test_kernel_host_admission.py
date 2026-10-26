@@ -1,4 +1,5 @@
 """Task-wide admission uses real databases and durable launch identities."""
+from support.core_operations import task_run
 
 from pathlib import Path
 from contextlib import contextmanager
@@ -10,20 +11,13 @@ from typing import Iterator
 
 import pytest
 
-from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
+from agent_run.model import ParentIssue, Requirements
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.model import Execution, HostObservation
-from support.core_operations import CoreOperations, ReadOnlyPorts, native_agent_fixture
+from support.core_operations import CoreOperations
 from support.offline import GraphScenario, Scenario
 from agent_run.storage.sqlite import Transaction
-
-
-def task_run(root: Path, run_id: str, *, parent: int = 1) -> tuple[Kernel, ReadOnlyPorts]:
-    base = Commit("base", "tree")
-    delivery = Delivery("parent", DeliveryKind.PARENT_ONLY, parent, "v1", base, "refs/heads/task", "refs/heads/main")
-    return native_agent_fixture(root / (run_id + ".sqlite3"), RunSpec(run_id, "example/project", parent, "v1", "graph", (delivery,),
-                         language="en", repository_root=str(root / "repository")))
 
 
 def test_host_preflight_rejects_before_action_or_task_binding(tmp_path: Path) -> None:

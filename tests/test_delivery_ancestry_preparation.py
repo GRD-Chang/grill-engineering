@@ -8,7 +8,7 @@ import pytest
 from agent_run.adapters.git_objects import LocalGit
 from agent_run.core.operation_contract import DeliveryRead, ReadUnavailable
 from agent_run.errors import GitHubReadError, KernelError
-from test_kernel_remote_effects import _fixture
+from support.remote_effects import _fixture
 
 
 def query(effect, anchors):

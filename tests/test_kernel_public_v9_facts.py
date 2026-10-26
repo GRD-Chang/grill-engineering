@@ -5,33 +5,13 @@ from pathlib import Path
 import pytest
 
 from agent_run.contracts.prompt import RESOURCE_KEYS
-from agent_run.config.defaults import UserDefaultsStore
-from agent_run.model import Commit, Delivery, DeliveryKind, Policy, RunSpec, Issue, ParentIssue, Requirements
-from agent_run.core.kernel import Kernel
-from agent_run.config.creation import freeze_creation
+from agent_run.model import DeliveryKind, Policy
 from support.offline import Scenario
 from agent_run.queries.run import read
 from agent_run.cli.main import main
-from agent_run.core.operation_contract import DeliveryFacts
-from support.core_operations import CoreOperations, ReadOnlyPorts
-from test_kernel_configuration import _actual_publication_push
-
-
-def _kernel(root: Path) -> tuple[Kernel, ReadOnlyPorts]:
-    defaults = UserDefaultsStore(root / 'defaults.json')
-    defaults.configure(language='en', profile={'development_model': 'frozen-model', 'development_effort': 'high'},
-                       github={'worker_source': 'pat', 'pat': {'env': 'FROZEN_TOKEN'}, 'runner_source': 'host'},
-                       notifications={'enabled': False, 'mode': 'detailed'})
-    base = Commit('base', 'tree')
-    job = Delivery('ticket', DeliveryKind.TICKET, 2, 'ticket-v1', base, 'refs/heads/source', 'refs/heads/target')
-    final = Delivery('final:1', DeliveryKind.FINAL_RUN, 1, 'unread', base, job.target_ref, 'refs/heads/main')
-    source = Requirements(ParentIssue(1, 'Parent', 'Original requirement', (2,)), (
-        Issue(2, 'Ticket', 'Original behavior', 'OPEN', frozenset({'ready-for-agent'})),
-    ))
-    spec = freeze_creation(RunSpec('run', 'example/project', 1, 'parent-v1', 'graph-v1', (job, final),
-        repository_root=str(root)), defaults, prompt_resources={key: 'Original ' + key for key in RESOURCE_KEYS})
-    return (Kernel.create(root / 'kernel.sqlite3', spec, requirements=source),
-            ReadOnlyPorts(source, job.source_ref, job.target_ref, DeliveryFacts(base, None)))
+from support.core_operations import CoreOperations
+from support.remote_effects import _actual_publication_push
+from support.cli_fixtures import _kernel
 
 
 def _durable(root: Path) -> dict[str, bytes]:

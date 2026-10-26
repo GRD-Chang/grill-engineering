@@ -19,7 +19,7 @@ from agent_run.queries.host_exit import host_exit_notice
 from agent_run.model import HostObservation
 from agent_run.runtime.handoff import prepare_handoff
 from agent_run.notifications.sender import NativeNotifications
-from test_kernel_notifications import _kernel
+from support.notification import _kernel
 
 
 @contextmanager

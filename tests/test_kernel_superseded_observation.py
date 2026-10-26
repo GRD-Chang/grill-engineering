@@ -11,7 +11,7 @@ from agent_run.errors import KernelError
 from agent_run.model import Step
 from agent_run.adapters.source import read_requirements
 from support.core_operations import CoreOperations
-from test_kernel_remote_effects import _change, _fixture, _source_kernel
+from support.remote_effects import _change, _fixture, _source_kernel
 
 
 def source_operations(tmp_path, port, push, monkeypatch):

@@ -286,7 +286,7 @@ def test_expired_checks_resume_changes_only_future_wait_and_serializes_actions(t
 
 
 def test_other_supervision_timeout_cannot_change_checks_policy(tmp_path, monkeypatch):
-    from test_kernel_automatic_supervision import delivery_run, source_operations, unavailable
+    from support.core_operations import delivery_run, source_operations, unavailable
     from support.environment import durable_snapshot as _snapshot
 
     kernel, source = delivery_run(tmp_path / "run.sqlite3")

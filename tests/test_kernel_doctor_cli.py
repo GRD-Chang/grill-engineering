@@ -9,11 +9,7 @@ import pytest
 
 from agent_run.install.installer import _runtime_identity
 from support.environment import _user_environment as _isolated_environment
-
-
-def _file_snapshot(root: Path) -> dict[str, bytes]:
-    return {str(path.relative_to(root)): path.read_bytes()
-            for path in root.rglob("*") if path.is_file()}
+from support.environment import _file_snapshot
 
 
 @pytest.mark.parametrize(

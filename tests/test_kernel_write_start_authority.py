@@ -13,8 +13,8 @@ from agent_run.adapters.auth import runner_transport
 from agent_run.errors import KernelError
 from agent_run.model import DeliveryKind, ReadWait
 from support.offline import Scenario
-from test_kernel_exploration import advance_to_effect
-from test_kernel_remote_effects import FAKE_GH
+from support.effect_boundary import advance_to_effect
+from support.remote_effects import FAKE_GH
 
 
 @pytest.mark.parametrize('operation', ['pr_write', 'push'])

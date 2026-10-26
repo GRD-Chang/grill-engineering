@@ -14,7 +14,7 @@ from agent_run.runtime.foreground_host import ForegroundHost
 import agent_run.runtime.foreground_host as foreground_host
 from agent_run.cli.lifecycle import attach
 from agent_run.runtime.handoff import _digest, _encode, _runner_witness
-from test_kernel_host_admission import task_run
+from support.core_operations import task_run
 
 
 def _domain(nonce):

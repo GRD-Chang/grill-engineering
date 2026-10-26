@@ -10,8 +10,8 @@ from agent_run.errors import KernelError
 from agent_run.model import Commit, DeliveryKind, PullRequest
 from support.offline import Scenario
 from support.offline_api import SyntheticGitHub
-from test_kernel_pr_base_retirement import _parent_requeue, _retirement
-from test_kernel_notification_events import _project
+from support.control_scenarios import _parent_requeue, _retirement
+from support.notification import _project
 
 
 @pytest.fixture

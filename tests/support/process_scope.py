@@ -1,10 +1,12 @@
 """只回收已证明属于本次调用的 PID/start token，不扫描其他任务。"""
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
 import time
+from contextlib import contextmanager
 from collections.abc import Mapping
 from typing import Any
 
@@ -53,3 +55,46 @@ def cleanup_owned_process(
         if pending:
             time.sleep(0.01)
     assert process.poll() is not None and not pending, f"Owned processes survived cleanup: {pending}"
+
+
+@contextmanager
+def guardian_timeout_owners(tmp_path):
+    import ctypes
+    import select
+    import signal
+    import subprocess
+    import sys
+    from agent_run.runtime.process_cleanup import child_subreaper
+    from agent_run.runtime.process_identity import _process_start_token
+
+    receipt = tmp_path / "guardian-owner.json"
+    unrelated = subprocess.Popen([sys.executable, "-I", "-c", "import signal; signal.pause()"], start_new_session=True)
+    try:
+        unrelated_token = _process_start_token(unrelated.pid)
+        with child_subreaper():
+            try:
+                active = ctypes.c_int()
+                assert ctypes.CDLL(None).prctl(37, ctypes.byref(active), 0, 0, 0) == 0 and active.value == 1
+                yield receipt, unrelated, unrelated_token
+            finally:
+                # A failed regression still owns its exact orphan. No global PID
+                # sweep or unrelated process group is used as the safety net.
+                if receipt.exists():
+                    guardian = json.loads(receipt.read_text())["guardian"]
+                    pid, token = guardian["pid"], guardian["start_token"]
+                    if _process_start_token(pid) == token:
+                        fd = os.pidfd_open(pid)
+                        try:
+                            assert _process_start_token(pid) == token
+                            if not select.select([fd], [], [], 3)[0]:
+                                signal.pidfd_send_signal(fd, signal.SIGKILL)
+                            os.waitpid(pid, 0)
+                        finally:
+                            os.close(fd)
+    finally:
+        # Guardian cleanup failure must not skip this independently owned child.
+        try:
+            if unrelated.poll() is None:
+                unrelated.terminate()
+        finally:
+            unrelated.wait(timeout=3)

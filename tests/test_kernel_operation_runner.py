@@ -1,5 +1,5 @@
 """Public Core operation seam: selection, bounded I/O and durable settlement."""
-from support.core_operations import prepare_scripted_agent
+from support.core_operations import prepare_scripted_agent, Ports, settle_agent, setup
 from agent_run.core.operation_runner import OperationRunner, observe_control
 from agent_run.contracts.write_authority import WriteAuthority
 from pathlib import Path
@@ -14,45 +14,7 @@ from agent_run.errors import KernelError
 from support.offline import GraphScenario
 from agent_run.core.operation_contract import ReadUnavailable
 from agent_run.queries.run import read
-from test_kernel_requirements import independent_source, native_input
-
-
-class Ports:
-    def __init__(self, scenario):
-        self.scenario = scenario
-        self.reads = 0
-
-    def source(self, parent_number):
-        self.reads += 1
-        s = self.scenario
-        assert parent_number == s.requirements.parent.number
-        return s.port.source(s.requirements, parent_number)
-
-    def delivery(self, request):
-        s = self.scenario
-        return s.port.delivery(request, ('none',), [], publisher_identity=s.spec.inputs.runner_identity)
-
-    def inspect(self, resources):
-        return self.scenario.port.inspect_resources(resources)
-
-    def execute(self, effect, authorize):
-        return self.scenario.port.execute(effect, authorize)
-
-    def reconcile(self, effect):
-        return self.scenario.port.reconcile(effect)
-
-    def prepare_publication(self, effect):
-        return self.scenario.port.local.prepare_publication(effect)
-
-    def prepare_retirement(self, effect):
-        return self.scenario.port.prepare_retirement(effect)
-
-
-def setup(tmp_path, *, concurrency=1, dependent=False):
-    source = Requirements.from_wire(native_input()["initial_requirements"]) if dependent else independent_source()
-    s = GraphScenario(tmp_path / "graph", source, policy=Policy(concurrency=concurrency))
-    ports = Ports(s)
-    return s, ports, OperationRunner(s.kernel, s.execution, lambda binding: ports)
+from support.requirements_scenarios import independent_source
 
 
 @pytest.mark.parametrize("ready", [True, False])
@@ -115,19 +77,6 @@ def test_allocated_agent_returns_immediately_without_post_allocation_read(tmp_pa
             assert not runner.worker_settled(step.preparation)
             return
     raise AssertionError("Core did not return the reserved AgentPreparation")
-
-
-def settle_agent(s, runner, call):
-    assert s.kernel.dispatch_agent(call)
-    runner.authorize_agent(call)
-    process = {"pid": 4242, "start_token": "synthetic", "pgid": 4242,
-               "host_pid": 4241, "host_start_token": "synthetic-host"}
-    s.kernel.agent_started(call, process)
-    s.select(call.subject)  # Observe the returned call; never choose runnable work.
-    s.kernel.receive(call, s.agent(call))
-    assert not runner.worker_settled(call)
-    s.kernel.agent_exited(call, process, 0)
-    assert runner.worker_settled(call)
 
 
 def test_one_operation_returns_committed_publication_final_and_cleanup_boundaries(tmp_path):

@@ -9,7 +9,7 @@ from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.errors import KernelError
 from agent_run.model import ReadWait
 from agent_run.model import DeliveryKind
-from test_kernel_cleanup_lifecycle import _native_scenario
+from support.cleanup_scenarios import _native_scenario
 
 
 def test_local_cleanup_does_not_read_delivery_inside_write_authority(tmp_path, monkeypatch):
@@ -76,7 +76,7 @@ def pending_cleanup(tmp_path, monkeypatch, operation="cleanup_worktree", *, sibl
     """Stop at a real committed intent; never seed or edit persisted state."""
     if sibling:
         from support.offline import GraphScenario
-        from test_kernel_requirements import independent_source
+        from support.requirements_scenarios import independent_source
         s = GraphScenario(tmp_path / "scenario", independent_source())
     else:
         s = _native_scenario(tmp_path / "scenario", DeliveryKind.TICKET)
@@ -322,7 +322,7 @@ def test_sibling_requirement_refresh_keeps_existing_gate_rules(tmp_path, monkeyp
 def test_unreadable_worktree_registry_remains_unknown_without_authorization(git_repo, tmp_path, monkeypatch):
     from agent_run.adapters.cleanup import cleanup_worktree
     from agent_run.adapters.git_objects import LocalGit
-    from test_kernel_cleanup_adapter import _checkout
+    from support.cleanup_scenarios import _checkout
 
     git = LocalGit(git_repo)
     checkout, effect = _checkout(git, tmp_path)

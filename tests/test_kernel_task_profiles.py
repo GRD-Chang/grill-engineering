@@ -9,7 +9,7 @@ from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from support.offline import GraphScenario
 from agent_run.storage.tasks import bind_task, locked_task
-from test_kernel_requirements import independent_source
+from support.requirements_scenarios import independent_source
 from support.core_operations import CoreOperations
 
 

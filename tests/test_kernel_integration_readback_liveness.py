@@ -1,6 +1,6 @@
 """A queued integration waiter cannot starve its owner's original readback."""
 from support.offline import GraphScenario
-from test_kernel_requirements import independent_source
+from support.requirements_scenarios import independent_source
 
 
 def _pending_merge_with_waiter(tmp_path):

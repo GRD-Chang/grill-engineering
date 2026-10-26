@@ -1,5 +1,5 @@
 """Manual managed controls share Core observation without an Executor claim."""
-from support.core_operations import prepare_scripted_agent
+from support.control_scenarios import managed_approval, restorable_public_resume
 from agent_run.core.operation_runner import OperationRunner, observe_control
 from dataclasses import replace
 import json
@@ -8,20 +8,16 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.config.defaults import UserDefaultsStore
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 import agent_run.cli.lifecycle as lifecycle_cli
-from agent_run.model import DeliveryKind, Execution
+from agent_run.model import Execution
 from agent_run.errors import ObservationSuperseded
-from support.offline import Scenario
 from agent_run.core.operation_contract import ReadUnavailable
 from agent_run.cli.main import _parser
-from agent_run.adapters.remote import RemoteEffects
-from support.systemd_manager import controlled_manager
 from support.ticket_process import isolated_ticket_test
-from test_kernel_operation_runner import setup
-from test_kernel_remote_effects import _fixture
+from support.process_scope import guardian_timeout_owners
+from support.core_operations import setup
 
 
 def test_control_observation_never_claims_executor_or_allocates_work(tmp_path, monkeypatch):
@@ -81,82 +77,6 @@ def test_control_read_failure_is_a_cli_error_without_a_work_wait_or_claim(tmp_pa
         assert not tx.rows("SELECT id FROM attempts")
         assert not tx.rows("SELECT id FROM leases")
         assert not tx.rows("SELECT subject FROM waits")
-
-
-def managed_approval(tmp_path, monkeypatch, *, tickets, language="en", interrupt_development=False, save_development=False):
-    transport = tmp_path / "transport"
-    transport.mkdir()
-    port, git, push, state, calls = _fixture(transport, monkeypatch)
-    fake = transport / "bin" / "gh"
-    fake.write_text(fake.read_text().replace("'number':17,", "'number':17+len(d['prs']),"))
-    graph = {"parent": {"number": 1, "title": "Parent", "body": "Original requirement", "sub_issues": list(tickets)},
-             "issues": {str(n): {"number": n, "title": "Ticket", "body": "Ticket requirement", "state": "OPEN",
-                                    "labels": ["ready-for-agent"]} for n in tickets}}
-    state.write_text(json.dumps({"prs": [], "comments": [], "events": [], "issue_state": "open", "source_graph": graph}))
-    defaults = UserDefaultsStore()
-    defaults.configure(language=language, profile={"preset": "economy"})
-    database, spec, source = lifecycle_cli.prepare_creation(1, "example/project", source_directory=git.root,
-        defaults=defaults, remote_url=str(transport / "origin.git"))
-    kernel = Kernel.create_task(database, spec, requirements=source)
-    manager_root = tmp_path / "manager"
-    manager_root.mkdir()
-    manager, _, response, manager_calls = controlled_manager(manager_root)
-    request = kernel.admit_host("original-host", kind="run", command=("fixture-native-host",),
-        environment_carrier=manager_root / "original-carrier", preflight=manager.preflight)
-    assert kernel.dispatch_host(request)
-    sealed = ""
-    if interrupt_development:
-        from agent_run.runtime.handoff import prepare_handoff
-        from agent_run.runtime.package_lease import default_runner_lock_path, runner_usage_lease
-        from agent_run.model import HostObservation
-        manager_root.chmod(0o700)
-        lock = default_runner_lock_path(dict(os.environ))
-        with runner_usage_lease(lock) as terminal:
-            handoff = prepare_handoff(request, {}, runner_lock=lock, terminal_lease=terminal, ttl_seconds=.5)
-            try:
-                sealed = json.dumps(handoff.receipt, sort_keys=True, separators=(",", ":"))
-                assert kernel.observe_host(request, HostObservation("unknown", request.unit_name,
-                    usage_pending=True, evidence=sealed)) == "unknown"
-            finally:
-                handoff.process.wait(timeout=3)
-        assert not Path(f"/proc/{handoff.process.pid}").exists()
-    document = json.loads(response.read_text())
-    group = next(line[3:] for line in Path(f"/proc/{os.getpid()}/cgroup").read_text().splitlines() if line.startswith("0::"))
-    document["fields"].update(Id=request.unit_name, Description=request.description,
-        ActiveState="active", SubState="running", MainPID=str(os.getpid()), ControlGroup=group)
-    response.write_text(json.dumps(document))
-    observed = manager.observe(request)
-    assert observed.disposition == "running"
-    assert kernel.observe_host(request, replace(observed, usage_ready=True, evidence=sealed)) == "running"
-    execution = Execution(request.run_id, request.owner, request.epoch)
-    physical = RemoteEffects(Path(spec.repository_root), spec.repository, runner_identity=spec.inputs.runner_identity)
-    runner = OperationRunner(kernel, execution, lambda binding: physical)
-    # This existing fake Agent only makes files/raw bytes. All source, Git, PR,
-    # Completion and operation decisions above/below remain production paths.
-    agents = Scenario(tmp_path / "agents", DeliveryKind.PARENT_ONLY)
-    agents.kernel, agents.port.git = kernel, physical.git
-    subject = "final:1" if tickets else "parent:1"
-    for _ in range(180):
-        step = prepare_scripted_agent(kernel, runner.run_once())
-        if step.call is not None:
-            if interrupt_development:
-                if save_development:
-                    runner.authorize_agent(step.call)
-                    kernel.receive(step.call, agents.agent(step.call))
-                break
-            runner.authorize_agent(step.call)
-            kernel.receive(step.call, agents.agent(step.call))
-        if kernel.source_status()["final_subject"] == subject or not tickets:
-            status = kernel.status(subject)
-            assert not status["gates"], (step, status["gates"])
-            if status["phase"] == "approval":
-                break
-    else:
-        raise AssertionError("The managed Run never reached its real approval")
-    monkeypatch.setattr(lifecycle_cli, "_active_runner", lambda: True)
-    import agent_run.adapters.systemd as adapter
-    monkeypatch.setattr(adapter, "SystemdHost", lambda **kwargs: manager)
-    return kernel, runner, physical, state, calls, request, subject, source
 
 
 @pytest.mark.parametrize("command", ["approve", "revise", "requeue"])
@@ -272,64 +192,26 @@ def test_first_public_resume_applies_after_exact_systemd_exit(tmp_path, monkeypa
 def test_public_resume_after_trusted_material_or_checkout_restoration(tmp_path, monkeypatch, missing):
     """Corrupt only isolated fixture bytes; restore the exact original backup."""
     import subprocess
-    import sys
-    from agent_run.config.paths import app_data_root
-    kernel, _runner, physical, _state, calls, request, subject, _source = managed_approval(
-        tmp_path, monkeypatch, tickets=(), interrupt_development=True)
-    database = kernel.storage.path
-    before = kernel.status(subject)
-    with kernel.storage.transaction(write=False) as tx:
-        inputs = tx.one("SELECT subject,material_id FROM run_inputs")
-        frozen = tx.get(inputs["material_id"], inputs["subject"])
-        attempt = tx.one("SELECT current_attempt FROM subjects WHERE id=?", (subject,))[0]
-        count = tx.one("SELECT count(*) FROM actions")[0]
-    backup = database.read_bytes()
-    checkout = physical.git.root
-    saved_checkout = tmp_path / "trusted-checkout"
-    if missing == "frozen-material":
-        # Physical corruption, not a fabricated business row or a new digest.
-        # SQLite still reads the record; original immutable hash must reject it.
-        prefix = frozen[:128]
-        assert backup.count(prefix) >= 1
-        database.write_bytes(backup.replace(prefix, b"[" + prefix[1:]))
-    else:
-        checkout.rename(saved_checkout)
-    damaged = database.read_bytes()
-    active = app_data_root() / "active" / "current"
-    active.parent.mkdir(parents=True, exist_ok=True)
-    active.symlink_to(Path(lifecycle_cli.__file__).resolve().parents[3], target_is_directory=True)
-    manager_root = tmp_path / "manager"
-    environment = dict(os.environ, PATH=str(manager_root) + os.pathsep + os.environ["PATH"])
-    response = manager_root / "manager-response.json"
-    document = json.loads(response.read_text())
-    document["fields"].update(ActiveState="inactive", SubState="dead", MainPID="0", ControlPID="0", NFileDescriptorStore="0")
-    response.write_text(json.dumps(document))
-    group = manager_root / "cgroups" / document["fields"]["ControlGroup"].lstrip("/")
-    group.mkdir(exist_ok=True, parents=True)
-    (group / "cgroup.events").write_text("populated 0\n")
-    # Separate interpreter, installed public main; only the external systemd
-    # adapter's sysfs root and unused synthetic launch startup are controlled.
-    bootstrap = tmp_path / "resume.py"
-    bootstrap.write_text("""from contextlib import contextmanager
-import sys
-from pathlib import Path
-import agent_run.adapters.systemd as adapter
-import agent_run.runtime.handoff as native
-from agent_run.cli.main import main
-original = adapter.SystemdHost
-adapter.SystemdHost = lambda **kw: original(**kw, cgroup_root=Path(sys.argv[1]))
-@contextmanager
-def handoff(*args, **kwargs):
-    proof = native.prepare_handoff(*args, **kwargs, ttl_seconds=.5)
-    try:
-        yield proof
-    finally:
-        proof.process.wait(timeout=3)
-native.handoff_scope = handoff
-raise SystemExit(main(sys.argv[2:]))
-""")
-    command = [sys.executable, str(bootstrap), str(manager_root / "cgroups"), "resume", request.run_id,
-               "--repo", physical.repository, "--state-dir", str(database), "--json"]
+    prepared = restorable_public_resume(tmp_path, monkeypatch, missing)
+    kernel = prepared.kernel
+    physical = prepared.physical
+    request = prepared.request
+    subject = prepared.subject
+    database = prepared.database
+    before = prepared.before
+    inputs = prepared.inputs
+    frozen = prepared.frozen
+    attempt = prepared.attempt
+    count = prepared.count
+    backup = prepared.backup
+    checkout = prepared.checkout
+    saved_checkout = prepared.saved_checkout
+    damaged = prepared.damaged
+    manager_root = prepared.manager_root
+    environment = prepared.environment
+    response = prepared.response
+    document = prepared.document
+    command = prepared.command
     failed = subprocess.run(command, env=environment, cwd=tmp_path, text=True, capture_output=True, timeout=15)
     assert failed.returncode == 2, (failed.stdout, failed.stderr)
     error = json.loads(failed.stdout)
@@ -533,60 +415,28 @@ def _delayed_public_recovery_case(tmp_path, monkeypatch):
                 + "        signal.pause()\n        yield proof")
         return original_write(path, text, *args, **kwargs)
     monkeypatch.setattr(Path, "write_text", delayed)
-    target = getattr(test_public_resume_after_trusted_material_or_checkout_restoration,
-                     "__wrapped__", test_public_resume_after_trusted_material_or_checkout_restoration)
-    target(tmp_path, monkeypatch, "managed-checkout")
+    import subprocess
+    prepared = restorable_public_resume(tmp_path, monkeypatch, "managed-checkout")
+    subprocess.run(prepared.command, env=prepared.environment, cwd=tmp_path,
+                   text=True, capture_output=True, timeout=15)
+    pytest.fail("Delayed recovery returned before the expected guardian timeout")
 
 
 def test_public_resume_timeout_reaps_exact_guardian_without_touching_unrelated_child(tmp_path, monkeypatch):
-    import ctypes
-    import select
-    import signal
     import subprocess
-    import sys
-    from agent_run.runtime.process_cleanup import child_subreaper
     from agent_run.runtime.process_identity import _process_start_token
 
-    receipt = tmp_path / "guardian-owner.json"
-    unrelated = subprocess.Popen([sys.executable, "-I", "-c", "import signal; signal.pause()"], start_new_session=True)
-    try:
-        unrelated_token = _process_start_token(unrelated.pid)
-        with child_subreaper():
-            try:
-                active = ctypes.c_int()
-                assert ctypes.CDLL(None).prctl(37, ctypes.byref(active), 0, 0, 0) == 0 and active.value == 1
-                with pytest.raises((subprocess.TimeoutExpired, pytest.fail.Exception)) as failed:
-                    _delayed_public_recovery_case(tmp_path, monkeypatch)
-                assert "timed out after 15 seconds" in str(failed.value)
-                assert not getattr(failed.value, "__notes__", ()), "Owned cleanup must not fail behind the expected timeout"
-                recorded = json.loads(receipt.read_text())
-                guardian = recorded["guardian"]
-                assert type(guardian["pid"]) is int and guardian["start_token"]
-                assert _process_start_token(recorded["cli"]) is None
-                assert _process_start_token(guardian["pid"]) != guardian["start_token"], "Original guardian was orphaned after CLI timeout"
-                assert unrelated.poll() is None and _process_start_token(unrelated.pid) == unrelated_token
-            finally:
-                # A failed regression still owns its exact orphan. No global PID
-                # sweep or unrelated process group is used as the safety net.
-                if receipt.exists():
-                    guardian = json.loads(receipt.read_text())["guardian"]
-                    pid, token = guardian["pid"], guardian["start_token"]
-                    if _process_start_token(pid) == token:
-                        fd = os.pidfd_open(pid)
-                        try:
-                            assert _process_start_token(pid) == token
-                            if not select.select([fd], [], [], 3)[0]:
-                                signal.pidfd_send_signal(fd, signal.SIGKILL)
-                            os.waitpid(pid, 0)
-                        finally:
-                            os.close(fd)
-    finally:
-        # Guardian cleanup failure must not skip this independently owned child.
-        try:
-            if unrelated.poll() is None:
-                unrelated.terminate()
-        finally:
-            unrelated.wait(timeout=3)
+    with guardian_timeout_owners(tmp_path) as (receipt, unrelated, unrelated_token):
+        with pytest.raises((subprocess.TimeoutExpired, pytest.fail.Exception)) as failed:
+            _delayed_public_recovery_case(tmp_path, monkeypatch)
+        assert "timed out after 15 seconds" in str(failed.value)
+        assert not getattr(failed.value, "__notes__", ()), "Owned cleanup must not fail behind the expected timeout"
+        recorded = json.loads(receipt.read_text())
+        guardian = recorded["guardian"]
+        assert type(guardian["pid"]) is int and guardian["start_token"]
+        assert _process_start_token(recorded["cli"]) is None
+        assert _process_start_token(guardian["pid"]) != guardian["start_token"], "Original guardian was orphaned after CLI timeout"
+        assert unrelated.poll() is None and _process_start_token(unrelated.pid) == unrelated_token
 
 
 @pytest.mark.parametrize("failure", ["subreaper-capability", "guardian-cleanup"])
@@ -632,7 +482,8 @@ def test_public_resume_timeout_owner_cleans_unrelated_child_on_early_failure(tmp
     try:
         expected = AssertionError if failure == "subreaper-capability" else OSError
         with pytest.raises(expected) as failed:
-            test_public_resume_timeout_reaps_exact_guardian_without_touching_unrelated_child(tmp_path, monkeypatch)
+            with guardian_timeout_owners(tmp_path):
+                _delayed_public_recovery_case(tmp_path, monkeypatch)
         if failure == "guardian-cleanup":
             assert "guardian cleanup interrupted" in str(failed.value)
         assert reached_delay == ([] if failure == "subreaper-capability" else [True])
@@ -649,3 +500,69 @@ def test_public_resume_timeout_owner_cleans_unrelated_child_on_early_failure(tmp
                     process.kill()
             finally:
                 process.wait(timeout=3)
+
+
+@pytest.mark.parametrize("failure", [None, ValueError, KeyboardInterrupt, SystemExit], ids=["return", "value-error", "keyboard-interrupt", "system-exit"])
+def test_guardian_timeout_scope_preserves_result_or_body_exception_and_reaps_owned_child(tmp_path, failure):
+    from agent_run.runtime.process_identity import _process_start_token
+
+    error = None if failure is None else failure("owned body interrupted")
+    owned = []
+
+    def invoke():
+        with guardian_timeout_owners(tmp_path) as (receipt, process, token):
+            owned.append((process, token))
+            assert not receipt.exists() and process.poll() is None
+            assert _process_start_token(process.pid) == token
+            if error is not None:
+                raise error
+            return "original result"
+
+    if error is None:
+        assert invoke() == "original result"
+    else:
+        with pytest.raises(failure) as failed:
+            invoke()
+        assert failed.value is error
+    process, token = owned[0]
+    assert process.poll() is not None and _process_start_token(process.pid) != token
+
+
+@pytest.mark.parametrize("matching", [True, False], ids=["exact-exited-owner", "foreign-token"])
+def test_guardian_timeout_scope_reaps_only_its_exact_receipted_child(tmp_path, matching):
+    import select
+    import subprocess
+    import sys
+    from agent_run.runtime.process_identity import _process_start_token
+
+    guardian = None
+    try:
+        with guardian_timeout_owners(tmp_path) as (receipt, unrelated, _unrelated_token):
+            guardian = subprocess.Popen([sys.executable, "-I", "-c", "import signal; signal.pause()"], start_new_session=True)
+            token = _process_start_token(guardian.pid)
+            assert token is not None
+            receipt.write_text(json.dumps({"guardian": {"pid": guardian.pid,
+                "start_token": token if matching else token + "-foreign"}}))
+            if matching:
+                # Observe true exit without reaping; the scope owns the reap.
+                descriptor = os.pidfd_open(guardian.pid)
+                try:
+                    guardian.terminate()
+                    assert select.select([descriptor], [], [], 3)[0] == [descriptor]
+                finally:
+                    os.close(descriptor)
+        assert unrelated.poll() is not None
+        if matching:
+            assert _process_start_token(guardian.pid) != token
+            with pytest.raises(ChildProcessError):
+                os.waitpid(guardian.pid, os.WNOHANG)
+        else:
+            assert guardian.poll() is None and _process_start_token(guardian.pid) == token
+    finally:
+        # Only this test's independently created child, after the verdict.
+        if guardian is not None:
+            try:
+                if guardian.poll() is None:
+                    guardian.terminate()
+            finally:
+                guardian.wait(timeout=3)

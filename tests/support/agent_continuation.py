@@ -4,6 +4,7 @@ All boundaries are reached through real Core allocation and process events;
 ReadOnlyPorts cannot execute physical effects.
 """
 from pathlib import Path
+import json
 from dataclasses import replace
 
 from agent_run.model import Commit, Delivery, DeliveryKind, Policy, RunSpec, Issue, ParentIssue, Requirements
@@ -11,6 +12,9 @@ from agent_run.core.kernel import Kernel
 from agent_run.core.operation_contract import DeliveryFacts
 from support.core_operations import CoreOperations, ReadOnlyPorts
 from support.offline import fixture_inputs
+from agent_run.runtime.executor import _make_ports
+from support.offline import GraphScenario
+from support.remote_effects import _fixture
 
 def ticket_spec() -> RunSpec:
     base = Commit("base", "base-tree")
@@ -68,3 +72,29 @@ def _native_boundary(tmp_path: Path, *, ordinary_used: bool = False, malformed: 
             call = source_operations.once().call
             assert call is not None
     return source, owner, source_operations, call.attempt_id, call
+
+
+RAW = b'{"result_kind":"development","summary":"one actual worker","human_blockers":null}'
+
+def _allocated_worker(tmp_path, monkeypatch):
+    source = Requirements(ParentIssue(1, "Parent", "Original scope", (2,)),
+                          (Issue(2, "Ticket", "Original task", "OPEN", frozenset({"ready-for-agent"})),))
+    scenario = GraphScenario(tmp_path / "scenario", source)
+    preparation = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+    call = preparation.until(lambda step: step.call is not None).call
+    assert call is not None
+    transport = tmp_path / "transport"
+    transport.mkdir()
+    _port, _git, _push, state, _calls = _fixture(transport, monkeypatch)
+    scenario.port.git.run("remote", "add", "offline-remote", str(transport / "origin.git"))
+    scenario.port.git.run("push", "--force", "offline-remote",
+                          scenario.initial.sha + ":refs/heads/main",
+                          scenario.initial.sha + ":" + scenario.delivery.target_ref,
+                          scenario.initial.sha + ":" + scenario.delivery.source_ref)
+    state.write_text(json.dumps({"prs": [], "comments": [], "events": [], "issue_state": "open", "source_graph": {
+        "parent": {"number": 1, "title": "Parent", "body": "Original scope", "sub_issues": [2]},
+        "issues": {"2": {"number": 2, "title": "Ticket", "body": "Original task", "state": "OPEN",
+                           "labels": ["ready-for-agent"]}}}}))
+    operations = CoreOperations(scenario.kernel, scenario.execution, _make_ports)
+    operations.runner.observe(scenario.delivery.key)
+    return scenario, operations, state, call

@@ -12,32 +12,12 @@ import time
 
 import pytest
 
-from agent_run.model import Effect, Execution
+from agent_run.model import Effect
 from agent_run.errors import KernelError
 from agent_run.adapters.git_objects import LocalGit
 from agent_run.adapters.local_git import LocalEffects
 from agent_run.contracts.write_authority import WriteAuthority
-
-
-def publication(git_repo: Path, tmp_path: Path) -> tuple[LocalGit, LocalEffects, Effect]:
-    git = LocalGit(git_repo)
-    git.run("config", "user.name", "Frozen Repository Author")
-    git.run("config", "user.email", "frozen@example.invalid")
-    base = git.commit("HEAD")
-    owned = tmp_path / "work"
-    owned.mkdir()
-    checkout = owned / "delivery"
-    git.run("worktree", "add", "--detach", str(checkout), base.sha)
-    effect = Effect(
-        "publication-original", "ticket:3", "publication_commit", "example/repository",
-        "refs/heads/task", "refs/heads/run", base.sha, None, base, base, None,
-        None, {"checkout": str(checkout), "owned_root": str(owned),
-               "common_git_dir": str(git_repo / ".git"), "integrated_sha": base.sha,
-               "integrated_tree": base.tree, "parents": [base.sha], "reuse_sha": None,
-               "commit_message": "Publish the reviewed change", "intent_token": "publication-original"},
-        Execution("run", "executor", 1),
-    )
-    return git, LocalEffects(git, owned_root=owned), effect
+from support.remote_effects import publication
 
 
 @pytest.mark.parametrize("crash_boundary", ["prepared", "object_written", "checkout_reset"])

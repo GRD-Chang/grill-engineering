@@ -1,5 +1,5 @@
 """A Ticket fixes its dependency-visible Run head at first workspace intent."""
-from support.core_operations import prepare_scripted_agent
+from support.core_operations import prepare_scripted_agent, dependent_ticket
 
 from pathlib import Path
 
@@ -7,33 +7,11 @@ import pytest
 
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
-from agent_run.model import Requirements
 from agent_run.adapters.git_objects import LocalGit
 from agent_run.contracts.write_authority import FinalAdmission, WriteAuthority
 from agent_run.model import Role
-from support.offline import GraphScenario
-from test_kernel_requirements import native_input
-from support.effect_boundary import EffectBoundary, effect_boundary
 from support.core_operations import CoreOperations, scripted_return
-
-
-def dependent_ticket(tmp_path: Path):
-    scenario = GraphScenario(tmp_path / "dependencies", Requirements.from_wire(native_input()["initial_requirements"]))
-    assert scenario.kernel.source_status()["remaining"]["ticket:4"] == "blocked_by_incomplete_tickets"
-    assert scenario.run().kind == "complete"
-    head = scenario.port.remote_commit("refs/heads/run")
-    assert head is not None and head != scenario.initial
-    scenario.select("ticket:4")
-    assert not Path(scenario.delivery.checkout).exists()
-    assert not scenario.port.git.run("for-each-ref", "--format=%(refname)", scenario.delivery.source_ref).stdout
-    return scenario, head
-
-
-def workspace_intent(scenario, monkeypatch, *, sent=False):
-    with effect_boundary(scenario, monkeypatch, "workspace", sent=sent):
-        with pytest.raises(EffectBoundary) as boundary:
-            CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports).until(lambda step: False, limit=16)
-    return boundary.value
+from support.effect_boundary import workspace_intent
 
 
 def first_development(scenario):
