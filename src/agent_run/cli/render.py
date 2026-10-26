@@ -227,7 +227,7 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
                 if invocation["outputs"][-1]["started_at"] is not None:
                     yield f"  {copy['started']}"
                 yield f"  {copy['duration']}: {invocation['elapsed_seconds'] if invocation['elapsed_seconds'] is not None else copy['incomplete']}"
-        for budget in job["budgets"] if job["phase"] not in {"complete", "abandoned"} else []:
+        for budget in job["budgets"] if document.kind != "status" or job["phase"] not in {"complete", "abandoned"} else []:
             review_limit = budget["review_limit"] if budget["review_limit"] is not None else copy["unknown"]
             yield (f"  {copy['budget']}: {terms.get(budget['purpose'], budget['purpose'])} W{budget['window']} "
                    f"D {budget['developments_used']}/{budget['development_limit']} R {budget['reviews_used']}/{review_limit}")
