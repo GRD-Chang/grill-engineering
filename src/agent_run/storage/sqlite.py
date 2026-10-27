@@ -505,7 +505,8 @@ class Storage:
             request.require()
             try:
                 with self._transaction(write=True, identity=identity, deadline=request.deadline,
-                        cancelled=cancelled, select_run=False, commit=commit, retry_admission=True) as tx:
+                        cancelled=cancelled, select_run=False, commit=commit, retry_admission=True,
+                        clock=request.clock) as tx:
                     if operation == 'register':
                         request.register(tx)
                     elif operation == 'reconcile':
@@ -595,7 +596,8 @@ class Storage:
     @contextmanager
     def _transaction(self, *, write: bool, identity: tuple[int, int] | None, deadline: float,
                      cancelled: Event | None, select_run: bool = True, request: RepositorySave | None = None,
-                     commit: SaveCommit | None = None, retry_admission: bool = False) -> Iterator[Transaction]:
+                     commit: SaveCommit | None = None, retry_admission: bool = False,
+                     clock: SaveClock | None = None) -> Iterator[Transaction]:
         if write and self._repository_mode:
             assert identity is not None
             self._verify_save_database(identity, deadline)
@@ -626,6 +628,9 @@ class Storage:
                     require_supported_connection(connection, self.path)
                 self._capacity(connection)
                 self._require_namespace(transaction)
+                if ((request is not None or clock is not None)
+                        and connection.execute('PRAGMA journal_mode').fetchone()[0] != 'wal'):
+                    raise KernelError('storage_clock_domain', 'Native save recovery requires the local WAL deployment contract')
                 if request is not None:
                     request.admit(transaction)
                 exposed = transaction
@@ -652,6 +657,12 @@ class Storage:
                     if request is not None:
                         request.finish(transaction)
                 self._capacity(connection, committing=write)
+                if request is not None:
+                    request.require()  # Recheck source evidence before business COMMIT, not its deadline.
+                elif clock is not None:
+                    clock.require()
+                    check_cancelled(cancelled)
+                    remaining(deadline)  # Metadata never receives a fresh contention allowance.
                 if commit is not None:
                     commit.attempted = True
                 connection.commit()
