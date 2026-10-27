@@ -3570,7 +3570,8 @@ class Kernel:
         if message is not None and (not message.strip() or len(message.encode()) > 8192):
             raise KernelError("human_response_boundary")
         if policy_overrides:
-            if kind != "resume" or job is None or "ticket_development_workers" in policy_overrides:
+            if (kind != "resume" or job is None or "ticket_development_workers" in policy_overrides
+                    or "development_thread_policy" in policy_overrides):
                 raise KernelError("policy_override_boundary")
             gates = self._gates(tx, job["id"])
             timeout = next((gate for gate in gates if gate["code"] == "supervision_timeout"), None)

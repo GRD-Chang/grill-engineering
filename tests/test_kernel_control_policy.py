@@ -1,6 +1,7 @@
 """Explicit checkpoint policy and stopped-Run feedback keep their real owners."""
 
 from pathlib import Path
+import json
 
 import pytest
 
@@ -21,12 +22,13 @@ def managed(kernel: Kernel, root: Path) -> tuple[HostLaunch, Execution]:
     return request, Execution(request.run_id, request.owner, request.epoch)
 
 
-def tickets(root: Path) -> tuple[Kernel, ReadOnlyPorts]:
+def tickets(root: Path, *, new_thread_per_development: bool = False) -> tuple[Kernel, ReadOnlyPorts]:
     base = Commit("base", "tree")
     jobs = tuple(Delivery(f"ticket:{number}", DeliveryKind.TICKET, number, "v1", base,
                           f"refs/heads/ticket-{number}", "refs/heads/run") for number in (2, 3))
     kernel, ports = native_agent_fixture(root / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", jobs,
-                           Policy(ticket_rounds=1, concurrency=2, development_deadline_seconds=7.0),
+                           Policy(ticket_rounds=1, concurrency=2, development_deadline_seconds=7.0,
+                                  new_thread_per_development=new_thread_per_development),
                            language="en", repository_root=str(root / "repository")))
     class TicketPorts(ReadOnlyPorts):
         def delivery(self, request):
@@ -79,7 +81,8 @@ def test_parent_checkpoint_freezes_new_limits_without_rewriting_old_invocations(
 
 
 def test_ticket_policy_window_does_not_change_a_sibling_call_or_its_allowances(tmp_path: Path) -> None:
-    kernel, ports = tickets(tmp_path)
+    # #229 freezes rotation at creation; Resume changes only the legal window.
+    kernel, ports = tickets(tmp_path, new_thread_per_development=True)
     request, execution = managed(kernel, tmp_path)
     operations = CoreOperations(kernel, execution, lambda binding: ports)
     previous = None
@@ -93,7 +96,7 @@ def test_ticket_policy_window_does_not_change_a_sibling_call_or_its_allowances(t
             else:
                 assert step.call.subject == "ticket:2"
                 previous = step.call
-                kernel.bind_thread(previous, previous.reported_thread or "ticket-two-thread")
+                kernel.bind_thread(previous, previous.reported_thread or "ticket-two-thread-" + previous.thread_id)
                 kernel.receive(previous, b'{"result_kind":"development","summary":"Investigated candidate integrity","human_blockers":null}')
         if "modification_budget_exhausted" in kernel.status("ticket:2")["gates"]:
             break
@@ -107,7 +110,7 @@ def test_ticket_policy_window_does_not_change_a_sibling_call_or_its_allowances(t
     with kernel.storage.transaction(write=False) as tx:
         original_policy = tx.one("SELECT policy FROM runs")[0]
     assert kernel.control_host(request, "resume", "ticket-window", subject="ticket:2", policy_overrides={
-        "ticket_review_rounds": 3, "development_deadline": "13s", "development_thread_policy": "new-per-attempt",
+        "ticket_review_rounds": 3, "development_deadline": "13s",
     }) == "applied"
     resumed = operations.once().call
     assert resumed is not None and resumed.deadline_seconds == 13.0
@@ -297,3 +300,104 @@ def test_two_accepted_whole_run_responses_reach_the_original_work_in_order(tmp_p
     assert kernel.status("ticket:2")["budgets"]["requirements"]["developments_used"] == 1
     responses = [item["identity"] for item in kernel.history("ticket:2") if item["kind"] == "human_response"]
     assert responses == ["resume-1", "resume-2"]
+
+
+@pytest.mark.parametrize('initial,forbidden', [(False, 'new-per-attempt'), (True, 'reuse')])
+@pytest.mark.parametrize('entry', ['control', 'control_host'])
+def test_checkpoint_thread_policy_is_creation_frozen_and_legal_exceptions_stay_independent(
+    tmp_path: Path, initial: bool, forbidden: str, entry: str,
+) -> None:
+    """Real Core/SQLite producers; no Worker, Host, Git or clock substitute."""
+    kernel, ports = tickets(tmp_path, new_thread_per_development=initial)
+    request, execution = managed(kernel, tmp_path)
+    operations = CoreOperations(kernel, execution, lambda binding: ports)
+    previous = sibling = None
+    for _ in range(30):
+        step = operations.once()
+        if step.call is not None:
+            if step.call.subject == 'ticket:3':
+                assert sibling is None
+                sibling = step.call  # Keep the sibling's original idle lease.
+            else:
+                assert step.call.subject == 'ticket:2'
+                previous = step.call
+                kernel.bind_thread(previous, previous.reported_thread or 'checkpoint-ticket-two-' + previous.thread_id)
+                kernel.receive(previous, wire_json({'result_kind': 'development',
+                    'summary': 'Investigated candidate integrity', 'human_blockers': None}))
+        if 'modification_budget_exhausted' in kernel.status('ticket:2')['gates']:
+            break
+    else:
+        raise AssertionError('Normal candidate failures did not reach the original checkpoint')
+    assert previous is not None
+    assert 'modification_budget_exhausted' in kernel.status('ticket:2')['gates']
+    if sibling is None:
+        sibling = operations.once().call
+    assert sibling is not None and sibling.subject == 'ticket:3'
+    sibling_budget = kernel.status('ticket:3')['budgets']
+    original_policy = kernel.status('ticket:2')['policy']
+    assert original_policy['new_thread_per_development'] is initial
+    with kernel.storage.transaction(write=False) as tx:
+        original_run_policy = tx.one('SELECT policy FROM runs WHERE id=?', (execution.run_id,))[0]
+        original_threads = [dict(row) for row in tx.all('SELECT * FROM threads WHERE run_id=? ORDER BY id', (execution.run_id,))]
+        before = tuple(tx.connection.iterdump())
+
+    def resume(action, **options):
+        if entry == 'control_host':
+            return kernel.control_host(request, 'resume', action, subject='ticket:2', **options)
+        return kernel.control('resume', action, subject='ticket:2', **options)
+
+    # Presence itself is invalid, including a same-value or unset override.
+    # Mixing a legal budget/new-thread/message cannot apply any partial intent.
+    frozen = 'new-per-attempt' if initial else 'reuse'
+    for name, value in (('flip', forbidden), ('same', frozen), ('unset', None)):
+        for _ in range(2):
+            with pytest.raises(KernelError, match='policy_override_boundary'):
+                resume('rejected-' + name, policy_overrides={'ticket_review_rounds': 3,
+                    'development_deadline': '13s', 'development_thread_policy': value},
+                    message='Do not persist rejected feedback', new_thread=True)
+            with kernel.storage.transaction(write=False) as tx:
+                assert tuple(tx.connection.iterdump()) == before
+                assert not tx.rows('SELECT id FROM actions WHERE run_id=? AND id=?',
+                    (execution.run_id, 'rejected-' + name))
+
+    # Profile Revision is a distinct valid boundary; old Threads remain frozen.
+    revision = kernel.configure_task_profiles('valid-profile', overrides={
+        'development_model': 'checkpoint-development-model'})
+    assert revision == 2
+    with kernel.storage.transaction(write=False) as tx:
+        assert [dict(row) for row in tx.all('SELECT * FROM threads WHERE run_id=? ORDER BY id', (execution.run_id,))] == original_threads
+    overrides = {'ticket_review_rounds': 3, 'development_deadline': '13s'}
+    assert resume('rejected-flip', policy_overrides=overrides) == 'applied'
+    assert resume('rejected-flip', policy_overrides=overrides) == 'applied'
+    renewed = kernel.status('ticket:2')['budgets']['requirements']
+    assert (renewed['window'], renewed['development_limit'], renewed['review_limit']) == (2, 4, 3)
+    resumed = operations.once().call
+    assert resumed is not None and resumed.subject == 'ticket:2'
+    assert resumed.attempt_id != previous.attempt_id and resumed.deadline_seconds == 13.0
+    assert (resumed.thread_id != previous.thread_id) is initial
+    assert resumed.profile_revision == (2 if initial else previous.profile_revision)
+    if initial:
+        assert resumed.profile.model == 'checkpoint-development-model'
+    assert kernel.status('ticket:3')['budgets'] == sibling_budget
+    assert kernel.status('ticket:2')['policy']['new_thread_per_development'] is initial
+
+    # A one-off new Thread resumes this same Attempt and uses the current Profile
+    # without changing the creation-frozen rotation policy or sibling budget.
+    assert kernel.dispatch_agent(resumed)
+    kernel.bind_thread(resumed, resumed.reported_thread or 'resumed-checkpoint-thread')
+    kernel.agent_unavailable(resumed, 'worker_preparation_failed', 'Controlled pre-process failure')
+    assert resume('one-off-thread', new_thread=True) == 'applied'
+    successor = operations.once().call
+    assert successor is not None and successor.attempt_id == resumed.attempt_id
+    assert successor.thread_id != resumed.thread_id and successor.deadline_seconds == 13.0
+    assert successor.profile_revision == revision and successor.profile.model == 'checkpoint-development-model'
+    assert kernel.status('ticket:2')['policy']['new_thread_per_development'] is initial
+    assert kernel.status('ticket:3')['budgets'] == sibling_budget
+    with kernel.storage.transaction(write=False) as tx:
+        assert tx.one('SELECT policy FROM runs WHERE id=?', (execution.run_id,))[0] == original_run_policy
+        job = tx.one('SELECT policy_id FROM subjects WHERE run_id=? AND id=?', (execution.run_id, 'ticket:2'))
+        assert json.loads(tx.get(job['policy_id'], 'ticket:2'))['new_thread_per_development'] is initial
+        assert tx.one('SELECT new_thread FROM attempts WHERE run_id=? AND id=?',
+            (execution.run_id, successor.attempt_id))[0] == 0
+        assert tx.one('SELECT count(*) FROM actions WHERE run_id=? AND id=?',
+            (execution.run_id, 'rejected-flip'))[0] == 1
