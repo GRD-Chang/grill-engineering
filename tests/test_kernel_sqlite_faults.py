@@ -1,6 +1,4 @@
 """Real bounded SQLite faults, not fabricated database/business records."""
-from contextlib import closing
-from pathlib import Path
 import json
 import os
 import sqlite3
@@ -18,17 +16,7 @@ from agent_run.runtime.execution import execute
 from support.core_operations import CoreOperations, native_agent_fixture
 from support.offline import fixture_inputs
 from support.workspace import prepare_workspace
-from support.sqlite_faults import sqlite_fault
-
-
-
-
-def logical_state(database: Path):
-    with closing(sqlite3.connect(database)) as connection:
-        assert connection.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
-        assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
-        return tuple(connection.iterdump())
-
+from support.sqlite_faults import assert_save_rollback, logical_state, sqlite_fault
 
 def allocated_work(tmp_path):
     base = Commit('base', 'tree')
@@ -146,20 +134,11 @@ def test_unclassified_sqlite_errors_and_interruptions_keep_their_original_identi
     kernel, _, _, original = allocated_work(tmp_path)
     for error in (sqlite3.OperationalError('unclassified failure'), KeyboardInterrupt(), SystemExit(7)):
         before = logical_state(kernel.storage.path)
-        with closing(sqlite3.connect(kernel.storage.path)) as connection:
-            sequence = connection.execute("SELECT seq FROM sqlite_sequence WHERE name='save_admissions'").fetchone()
-            original_sequence = sequence[0] if sequence is not None else 0
         with pytest.raises(type(error)) as caught:
             with kernel.storage.transaction():
                 raise error
         assert caught.value is error
-        after = logical_state(kernel.storage.path)
-        technical = 'INSERT INTO "sqlite_sequence" VALUES(\'save_admissions\','
-        assert tuple(row for row in after if not row.startswith(technical)) == tuple(
-            row for row in before if not row.startswith(technical))
-        with closing(sqlite3.connect(kernel.storage.path)) as connection:
-            assert connection.execute("SELECT seq FROM sqlite_sequence WHERE name='save_admissions'").fetchone()[0] == original_sequence + 1
-            assert connection.execute('SELECT count(*) FROM save_admissions').fetchone()[0] == 0
+        assert_save_rollback(kernel.storage.path, before, registrations=1)
 
 
 def test_public_stop_reports_real_commit_interruption_without_partial_action(

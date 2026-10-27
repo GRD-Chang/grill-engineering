@@ -1,4 +1,5 @@
 """Private test capability validation; these cases never activate a fault."""
+from contextlib import closing
 from dataclasses import replace
 import hashlib
 import json
@@ -12,7 +13,63 @@ import pytest
 
 from agent_run.model import Commit, Delivery, DeliveryKind, RunSpec
 from support.core_operations import native_agent_fixture
-from support.sqlite_faults import FaultScope, sqlite_fault
+from support.sqlite_faults import FaultScope, assert_save_rollback, logical_state, sqlite_fault
+
+
+@pytest.fixture
+def rollback_snapshot_database(tmp_path):
+    """A snapshot-helper leaf, not a Core/FIFO execution or fault substitute."""
+    database = tmp_path / 'snapshot.sqlite3'
+    with closing(sqlite3.connect(database)) as connection:
+        connection.executescript('''
+            CREATE TABLE business(body TEXT);
+            CREATE TABLE budgets(used INTEGER);
+            CREATE TABLE save_admissions(position INTEGER PRIMARY KEY AUTOINCREMENT);
+            CREATE TABLE other_sequence(id INTEGER PRIMARY KEY AUTOINCREMENT);
+            INSERT INTO business VALUES ('Original evidence');
+            INSERT INTO budgets VALUES (3);
+        ''')
+        connection.commit()
+    return database
+
+
+@pytest.mark.parametrize('registration_committed', [False, True])
+def test_rollback_snapshot_counts_only_committed_registration(rollback_snapshot_database, registration_committed):
+    database = rollback_snapshot_database
+    before = logical_state(database)
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute('INSERT INTO save_admissions DEFAULT VALUES')
+        if registration_committed:
+            connection.commit()
+        else:
+            connection.rollback()
+        connection.execute("INSERT INTO business VALUES ('Uncommitted evidence')")
+        connection.execute('UPDATE budgets SET used=4')
+        connection.rollback()
+        connection.execute('DELETE FROM save_admissions')
+        connection.commit()
+    assert_save_rollback(database, before, registrations=int(registration_committed))
+
+
+@pytest.mark.parametrize('corruption', ['business', 'budget', 'queue', 'other-sequence', 'registration-count'])
+def test_rollback_snapshot_rejects_any_other_change(rollback_snapshot_database, corruption):
+    database = rollback_snapshot_database
+    before = logical_state(database)
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute('INSERT INTO save_admissions DEFAULT VALUES')
+        connection.commit()
+        if corruption != 'queue':
+            connection.execute('DELETE FROM save_admissions')
+        if corruption == 'business':
+            connection.execute("UPDATE business SET body='Unexpected replacement'")
+        elif corruption == 'budget':
+            connection.execute('UPDATE budgets SET used=4')
+        elif corruption == 'other-sequence':
+            connection.execute('INSERT INTO other_sequence DEFAULT VALUES')
+            connection.execute('DELETE FROM other_sequence')
+        connection.commit()
+    with pytest.raises(AssertionError):
+        assert_save_rollback(database, before, registrations=0 if corruption == 'registration-count' else 1)
 
 
 def _created_kernel(directory: Path):

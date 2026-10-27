@@ -12,19 +12,13 @@ from agent_run.errors import KernelError
 from agent_run.queries.read_facts import QueryError
 from agent_run.queries.run import QueryDocument
 from support.core_operations import agent_preparation_fixture
+from support.sqlite_faults import assert_save_rollback, logical_state
 
 
 def native_work(root):
     kernel, _, _, step, _ = agent_preparation_fixture(root)
     assert step.preparation is not None
     return kernel, step.preparation
-
-
-def logical_state(path):
-    with closing(sqlite3.connect(path)) as connection:
-        assert connection.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
-        assert not connection.execute('PRAGMA foreign_key_check').fetchall()
-        return tuple(connection.iterdump())
 
 
 @pytest.mark.parametrize('size', [0, storage.MATERIAL_LIMIT])
@@ -42,22 +36,11 @@ def test_material_accepts_empty_and_exact_four_mib_without_truncation(tmp_path, 
 def test_oversize_material_rolls_back_earlier_writes_and_preserves_budget(tmp_path):
     kernel, preparation = native_work(tmp_path)
     before = logical_state(kernel.storage.path)
-    with closing(sqlite3.connect(kernel.storage.path)) as connection:
-        sequence = connection.execute("SELECT seq FROM sqlite_sequence WHERE name='save_admissions'").fetchone()
-        original_sequence = sequence[0] if sequence is not None else 0
     with pytest.raises(KernelError, match='^material_limit'):
         with kernel.storage.transaction() as tx:
             tx.put(preparation.subject, 'earlier-uncommitted-material', b'Keep this exact original evidence.')
             tx.put(preparation.subject, 'too-large', b'x' * (storage.MATERIAL_LIMIT + 1))
-    after = logical_state(kernel.storage.path)
-    # The separate committed FIFO registration consumes exactly one technical
-    # sequence number. It is not a partial business material/budget commit.
-    technical = 'INSERT INTO "sqlite_sequence" VALUES(\'save_admissions\','
-    assert tuple(row for row in after if not row.startswith(technical)) == tuple(
-        row for row in before if not row.startswith(technical))
-    with closing(sqlite3.connect(kernel.storage.path)) as connection:
-        assert connection.execute("SELECT seq FROM sqlite_sequence WHERE name='save_admissions'").fetchone()[0] == original_sequence + 1
-        assert connection.execute('SELECT count(*) FROM save_admissions').fetchone()[0] == 0
+    assert_save_rollback(kernel.storage.path, before, registrations=1)
 
 
 @pytest.mark.parametrize('limit', [-1, 0, 129])
@@ -118,7 +101,7 @@ def test_query_budget_rejection_rolls_back_the_entire_write_scope(tmp_path, monk
             # generating 32 MiB of unrelated records or changing any policy.
             bounds.setattr(storage, 'QUERY_LIMIT', tx.bytes_read)
             tx.rows("SELECT CAST('x' AS BLOB)")
-    assert logical_state(kernel.storage.path) == before
+    assert_save_rollback(kernel.storage.path, before, registrations=1)
 
 
 def test_current_record_guard_accepts_exact_calibrated_size_and_rejects_one_less(tmp_path, monkeypatch):
@@ -143,14 +126,17 @@ def test_database_page_limit_rejects_growth_and_rolls_back_all_material(tmp_path
     with kernel.storage.transaction(write=False) as tx:
         size = tx.connection.execute('PRAGMA page_count').fetchone()[0] * tx.connection.execute('PRAGMA page_size').fetchone()[0]
     before = logical_state(kernel.storage.path)
+    body_entered = False
     with monkeypatch.context() as bounds:
         bounds.setattr(storage, 'DATABASE_LIMIT', size)
         with kernel.storage.transaction(write=False):
             pass
         with pytest.raises(KernelError, match='^storage_limit'):
             with kernel.storage.transaction() as tx:
+                body_entered = True
                 tx.put(preparation.subject, 'page-growth', b'x' * 65536)
-    assert logical_state(kernel.storage.path) == before
+    assert body_entered  # Registration committed; the business growth was rejected.
+    assert_save_rollback(kernel.storage.path, before, registrations=1)
 
 
 def test_existing_physical_over_limit_refuses_before_the_body_and_preserves_state(tmp_path, monkeypatch):

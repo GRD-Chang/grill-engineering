@@ -1,10 +1,11 @@
 """One SQLite fault factory; native test scopes are explicit private capabilities."""
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import sqlite3
 import stat
@@ -12,6 +13,33 @@ import stat
 import pytest
 
 from agent_run.runtime.process_identity import _process_start_token
+
+
+def logical_state(database: Path):
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+        assert connection.execute('PRAGMA foreign_key_check').fetchall() == []
+        return tuple(connection.iterdump())
+
+
+def assert_save_rollback(database: Path, before: tuple[str, ...], *, registrations: int):
+    """Keep all business/queue facts; account only committed FIFO registrations."""
+    assert type(registrations) is int and registrations >= 0
+    after = logical_state(database)
+    prefix = 'INSERT INTO "sqlite_sequence" VALUES(\'save_admissions\','
+    def sequence(rows):
+        entries = [row for row in rows if row.startswith(prefix)]
+        assert len(entries) <= 1
+        if not entries:
+            return 0
+        match = re.fullmatch(r'INSERT INTO "sqlite_sequence" VALUES\(\'save_admissions\',([0-9]+)\);', entries[0])
+        assert match is not None
+        return int(match[1])
+    assert sequence(after) == sequence(before) + registrations
+    assert tuple(row for row in after if not row.startswith(prefix)) == tuple(
+        row for row in before if not row.startswith(prefix))
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute('SELECT count(*) FROM save_admissions').fetchone()[0] == 0
 
 
 def _private_read(path: Path) -> bytes:
