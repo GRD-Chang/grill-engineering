@@ -3,7 +3,7 @@
 Clock substitutes exercise decisions, not actual kernel clock comparability.
 True separate-process/clock/crash/WAL-cost acceptance remains explicitly pending.
 """
-from contextlib import closing
+from contextlib import closing, contextmanager
 import io
 import json
 import sqlite3
@@ -23,9 +23,15 @@ from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Require
 from support.offline import fixture_inputs
 
 
+@contextmanager
+def identical_offsets_for_parser_test(descriptor):
+    # Parser-only fixtures do not claim real namespace binding evidence.
+    yield lambda: None
+
+
 class DecisionClock(SaveClock):
     def __init__(self, domain='decision-clock'):
-        self.domain = json.dumps(['native-linux-local-wal-save/1',
+        self.domain = json.dumps(['native-linux-local-wal-save/2',
             '12345678-1234-1234-1234-123456789abc', 'clock_gettime(CLOCK_MONOTONIC)',
             1, 2, 0 if domain == 'decision-clock' else 1, 0], separators=(',', ':'))
         self.closed = False
@@ -167,6 +173,7 @@ def test_inherited_request_owner_cannot_claim_or_remove_parent_ticket(queue, mon
 def test_clock_capture_refuses_unproved_current_monotonic_domain(monkeypatch, fault):
     from agent_run.adapters import foreground
     monkeypatch.setattr(foreground, 'require_proc_view', lambda: None)
+    monkeypatch.setattr(save_order, '_offset_namespace', identical_offsets_for_parser_test)
     monkeypatch.setattr(save_order, '_filesystem_type', lambda fd: save_order._NSFS_MAGIC)
     monkeypatch.setattr(save_order, '_source_identity', lambda path: (3, 4))
     monkeypatch.setattr(save_order, 'get_clock_info', lambda name: SimpleNamespace(
@@ -609,7 +616,7 @@ def test_connection_close_failure_cannot_be_hidden_in_internal_wait_retry(waitin
 
 def native_domain(*, boot='12345678-1234-1234-1234-123456789abc', namespace=2,
                   offset=0, provider='clock_gettime(CLOCK_MONOTONIC)'):
-    return json.dumps(['native-linux-local-wal-save/1', boot, provider, 1, namespace, offset, 0],
+    return json.dumps(['native-linux-local-wal-save/2', boot, provider, 1, namespace, offset, 0],
         separators=(',', ':'))
 
 
@@ -642,7 +649,7 @@ def test_original_uuid_cannot_adopt_an_equivalent_clock_with_different_domain_by
 
 
 @pytest.mark.parametrize('invalid', ['old-format', 'bad-json', 'old-boot-unknown-provider',
-    'same-boot-offset', 'wrong-version', 'noncanonical'])
+    'same-boot-offset', 'wrong-version', 'old-source-binding', 'noncanonical'])
 def test_classify_every_row_before_mutating_any_previous_boot_ticket(queue, invalid):
     old = request()
     old.clock.domain = native_domain(boot='22345678-1234-1234-1234-123456789abc')
@@ -652,7 +659,8 @@ def test_classify_every_row_before_mutating_any_previous_boot_ticket(queue, inva
         '{broken' if invalid == 'bad-json' else
         native_domain(boot='22345678-1234-1234-1234-123456789abc', provider='unknown') if invalid == 'old-boot-unknown-provider' else
         native_domain(offset=1) if invalid == 'same-boot-offset' else
-        native_domain().replace('/1', '/0') if invalid == 'wrong-version' else
+        native_domain().replace('/2', '/0') if invalid == 'wrong-version' else
+        native_domain().replace('/2', '/1') if invalid == 'old-source-binding' else
         json.dumps(json.loads(native_domain())))
     queue.execute('INSERT INTO save_admissions(request,clock_domain,deadline) VALUES (?,?,?)',
         ('f' * 32, bad, save_order.monotonic() + 100))
@@ -790,6 +798,7 @@ def test_current_time_namespace_descriptor_must_be_nsfs(monkeypatch):
 def test_native_offsets_require_complete_canonical_records(monkeypatch, offsets):
     from agent_run.adapters import foreground
     monkeypatch.setattr(foreground, 'require_proc_view', lambda: None)
+    monkeypatch.setattr(save_order, '_offset_namespace', identical_offsets_for_parser_test)
     monkeypatch.setattr(save_order, 'get_clock_info', lambda name: SimpleNamespace(
         implementation='clock_gettime(CLOCK_MONOTONIC)', monotonic=True, adjustable=False))
     monkeypatch.setattr(save_order, '_filesystem_type', lambda fd: save_order._NSFS_MAGIC)
@@ -841,9 +850,9 @@ def test_native_source_racing_final_symlink_is_refused_by_original_open_flags(tm
     assert retained.read_text() == 'original' and target.read_text() == 'other target' and path.is_symlink()
 
 
-@pytest.mark.parametrize('malformed', ['x' * 513, json.dumps(['native-linux-local-wal-save/1',
+@pytest.mark.parametrize('malformed', ['x' * 513, json.dumps(['native-linux-local-wal-save/2',
     '12345678-1234-1234-1234-123456789abc', 'clock_gettime(CLOCK_MONOTONIC)', 1, 1 << 64, 0, 0]),
-    json.dumps(['native-linux-local-wal-save/1', '12345678-1234-1234-1234-123456789abc',
+    json.dumps(['native-linux-local-wal-save/2', '12345678-1234-1234-1234-123456789abc',
         'clock_gettime(CLOCK_MONOTONIC)', 1, 2, False, 0])])
 def test_invalid_clock_domain_metadata_has_no_legal_native_producer(malformed):
     with pytest.raises(KernelError) as refused:
@@ -889,3 +898,250 @@ def test_old_boot_retirement_and_original_uuid_survive_unknown_registration_comm
     assert scalar(repository, 'SELECT count(*) FROM save_admissions') == (0 if after_commit else 1)
     if not after_commit:
         assert scalar(repository, 'SELECT request FROM save_admissions') == old.request
+
+
+@pytest.fixture
+def native_task_observation(monkeypatch):
+    """Controlled syscall observations, never setns/unshare or real namespace proof."""
+    from agent_run.adapters import foreground
+    current_path = '/proc/thread-self/ns/time'
+    children_path = '/proc/thread-self/ns/time_for_children'
+    boot_path = '/proc/sys/kernel/random/boot_id'
+    offsets_path = '/proc/thread-self/timens_offsets'
+    current_fd, children_fd = 100001, 100002
+    observed = SimpleNamespace(
+        pins={current_fd: 2, children_fd: 2},
+        paths={current_path: 2, children_path: 2},
+        filesystems={current_fd: save_order._NSFS_MAGIC, children_fd: save_order._NSFS_MAGIC},
+        opened=[], closed=[], reads=[], on_read=lambda phase: None,
+        children_open_error=None, children_close_error=None, offsets_error=None,
+        offsets='monotonic 0 0\nboottime 0 0')
+    original_open, original_close = save_order.os.open, save_order.os.close
+    original_stat, original_fstat = save_order.os.stat, save_order.os.fstat
+    original_fs, original_source = save_order._filesystem_type, save_order._source_identity
+    original_text = save_order._bounded_text
+    def opened(path, *args, **kwargs):
+        if str(path) in {current_path, children_path}:
+            if str(path) == children_path and observed.children_open_error is not None:
+                raise observed.children_open_error
+            descriptor = current_fd if str(path) == current_path else children_fd
+            observed.opened.append(descriptor)
+            return descriptor
+        return original_open(path, *args, **kwargs)
+    def closed(descriptor):
+        if descriptor in observed.pins:
+            observed.closed.append(descriptor)
+            if descriptor == children_fd and observed.children_close_error is not None:
+                raise observed.children_close_error
+            return None
+        return original_close(descriptor)
+    def stat_path(path, *args, **kwargs):
+        if str(path) in observed.paths:
+            return SimpleNamespace(st_dev=1, st_ino=observed.paths[str(path)])
+        return original_stat(path, *args, **kwargs)
+    def stat_fd(descriptor):
+        if descriptor in observed.pins:
+            return SimpleNamespace(st_dev=1, st_ino=observed.pins[descriptor])
+        return original_fstat(descriptor)
+    def text(path, limit):
+        if str(path) in {boot_path, offsets_path}:
+            phase = 'boot' if str(path) == boot_path else 'offsets'
+            observed.reads.append(phase)
+            observed.on_read(phase)
+            if phase == 'offsets' and observed.offsets_error is not None:
+                raise observed.offsets_error
+            return ('12345678-1234-1234-1234-123456789abc'
+                    if phase == 'boot' else observed.offsets)
+        return original_text(path, limit)
+    monkeypatch.setattr(foreground, 'require_proc_view', lambda: None)
+    monkeypatch.setattr(save_order, 'get_clock_info', lambda name: SimpleNamespace(
+        implementation='clock_gettime(CLOCK_MONOTONIC)', monotonic=True, adjustable=False))
+    monkeypatch.setattr(save_order.os, 'open', opened)
+    monkeypatch.setattr(save_order.os, 'close', closed)
+    monkeypatch.setattr(save_order.os, 'stat', stat_path)
+    monkeypatch.setattr(save_order.os, 'fstat', stat_fd)
+    monkeypatch.setattr(save_order, '_filesystem_type', lambda fd:
+        observed.filesystems[fd] if fd in observed.pins else original_fs(fd))
+    monkeypatch.setattr(save_order, '_source_identity', lambda path:
+        (3, 4 if str(path) == boot_path else 5) if str(path) in {boot_path, offsets_path}
+        else original_source(path))
+    monkeypatch.setattr(save_order, '_bounded_text', text)
+    return observed
+
+
+def test_same_calling_task_current_and_children_sources_remain_pinned(native_task_observation):
+    observed = native_task_observation
+    clock = SaveClock()
+    try:
+        clock.require()
+        assert clock.domain == native_domain()
+        assert observed.reads == ['boot', 'offsets'] * 3
+        assert observed.closed == [100002] * 3
+    finally:
+        clock.close()
+    assert observed.opened.count(100001) == observed.closed.count(100001) == 1
+    assert observed.opened.count(100002) == observed.closed.count(100002) == 3
+
+
+@pytest.mark.parametrize('path', ['/proc/thread-self/ns/time', '/proc/thread-self/ns/time_for_children'])
+@pytest.mark.parametrize('phase', ['boot', 'offsets'])
+def test_namespace_path_change_before_or_after_offset_read_is_refused_and_unpinned(
+        native_task_observation, path, phase):
+    observed = native_task_observation
+    def change(selected):
+        if selected == phase:
+            observed.paths[path] = 3  # Retained descriptors stay fixed at namespace 2.
+    observed.on_read = change
+    with pytest.raises(ValueError):
+        SaveClock()
+    assert observed.reads == (['boot'] if phase == 'boot' else ['boot', 'offsets'])
+    assert observed.closed == [100002, 100001]
+
+
+@pytest.mark.parametrize('fault', ['different-children', 'wrong-children-filesystem', 'open-failure'])
+def test_children_binding_failure_cannot_consume_offsets_and_closes_owned_fds(native_task_observation, fault):
+    observed = native_task_observation
+    if fault == 'different-children':
+        observed.pins[100002] = observed.paths['/proc/thread-self/ns/time_for_children'] = 3
+    elif fault == 'wrong-children-filesystem':
+        observed.filesystems[100002] = save_order._PROCFS_MAGIC
+    else:
+        observed.children_open_error = OSError('controlled children pin unavailable')
+    with pytest.raises((ValueError, OSError)):
+        SaveClock()
+    assert observed.reads == []
+    assert observed.closed == ([100001] if fault == 'open-failure' else [100002, 100001])
+
+
+def test_retained_fd_does_not_authorize_a_changed_task_namespace(native_task_observation):
+    observed = native_task_observation
+    clock = SaveClock()
+    try:
+        observed.paths['/proc/thread-self/ns/time'] = 3
+        observed.paths['/proc/thread-self/ns/time_for_children'] = 3
+        observed.pins[100002] = 3
+        with pytest.raises(KernelError) as refused:
+            clock.require()
+        assert refused.value.code == 'storage_clock_domain'
+        assert observed.reads == ['boot', 'offsets'] * 2
+    finally:
+        clock.close()
+    # A fresh request can sample the new task domain, never rebind the old request.
+    observed.pins[100001] = 3
+    newer = SaveClock()
+    try:
+        assert newer.domain == native_domain(namespace=3)
+    finally:
+        newer.close()
+    assert observed.opened.count(100001) == observed.closed.count(100001) == 2
+    assert observed.opened.count(100002) == observed.closed.count(100002)
+
+
+def test_offset_read_error_is_not_replaced_by_children_close_error(native_task_observation):
+    observed = native_task_observation
+    failure = OSError('controlled offset observation failed')
+    observed.offsets_error = failure
+    observed.children_close_error = OSError('controlled children close failed')
+    with pytest.raises(OSError) as refused:
+        SaveClock()
+    assert refused.value is failure
+    assert observed.closed == [100002, 100001]
+    assert refused.value.__notes__ == ['Time namespace cleanup unavailable: OSError']
+
+
+def test_children_offsets_cannot_expire_a_live_ticket_of_another_current_clock(
+        repository, native_task_observation, monkeypatch):
+    # A: current/children clock 100, original deadline 101. Real SQLite ticket.
+    monkeypatch.setattr(save_order, 'monotonic', lambda: 100.)
+    monkeypatch.setattr(storage_module, 'monotonic', lambda: 100.)
+    original = request(deadline=101.)
+    with repository.metadata().transaction(ordered=False) as tx:
+        original.register(tx)
+    with repository.metadata().transaction(write=False) as tx:
+        before = [tuple(row) for row in tx.all('SELECT * FROM save_admissions')]
+    before_bytes = repository.database.read_bytes()
+    # B's current clock is 1000, but its children offsets match A. Source
+    # binding must reject before treating A's live deadline as expired.
+    observed = native_task_observation
+    observed.pins[100001] = observed.paths['/proc/thread-self/ns/time'] = 3
+    monkeypatch.setattr(save_order, 'monotonic', lambda: 1000.)
+    monkeypatch.setattr(storage_module, 'monotonic', lambda: 1000.)
+    monkeypatch.setattr(storage_module, 'SaveClock', SaveClock)
+    entered = []
+    with pytest.raises(KernelError) as refused:
+        with repository.at_run('B').transaction():
+            entered.append(True)
+    assert refused.value.code == 'storage_clock_domain' and entered == []
+    with repository.metadata().transaction(write=False) as tx:
+        assert [tuple(row) for row in tx.all('SELECT * FROM save_admissions')] == before
+    assert repository.database.read_bytes() == before_bytes
+    assert original.deadline == 101. and original.position == before[0][0]
+    assert observed.reads == [] and observed.closed == [100002, 100001]
+
+
+
+def test_namespace_change_after_row_observation_cannot_delete_any_ticket(queue, native_task_observation, monkeypatch):
+    old = request()
+    old.clock.domain = native_domain(boot='22345678-1234-1234-1234-123456789abc')
+    old.register(queue)
+    before = [tuple(row) for row in queue.all('SELECT * FROM save_admissions')]
+    clock = SaveClock()
+    try:
+        ticket = RepositorySave(clock, None, save_order.monotonic() + 100)
+        original_rows = queue.rows
+        def changed_after_rows(sql, parameters=(), *, limit=128):
+            result = original_rows(sql, parameters, limit=limit)
+            if sql.startswith('SELECT position,request,run_id,clock_domain,deadline'):
+                native_task_observation.paths['/proc/thread-self/ns/time_for_children'] = 3
+            return result
+        with monkeypatch.context() as patch:
+            patch.setattr(queue, 'rows', changed_after_rows)
+            with pytest.raises(KernelError) as refused:
+                ticket.register(queue)
+        assert refused.value.code == 'storage_clock_domain'
+        assert [tuple(row) for row in queue.all('SELECT * FROM save_admissions')] == before
+        assert ticket.position is None
+    finally:
+        clock.close()
+    assert native_task_observation.opened.count(100002) == native_task_observation.closed.count(100002)
+
+
+def test_namespace_change_after_admission_never_enters_business_body(repository, native_task_observation, monkeypatch):
+    monkeypatch.setattr(save_order, 'monotonic', lambda: 100.)
+    monkeypatch.setattr(storage_module, 'monotonic', lambda: 100.)
+    monkeypatch.setattr(storage_module, 'SaveClock', SaveClock)
+    admitted, entered = [], []
+    original_admit = RepositorySave.admit
+    def changed_after_admit(ticket, tx):
+        original_admit(ticket, tx)
+        admitted.append((ticket.request, ticket.clock.domain,
+                         ticket.deadline, ticket.position))
+        native_task_observation.paths['/proc/thread-self/ns/time_for_children'] = 3
+    monkeypatch.setattr(RepositorySave, 'admit', changed_after_admit)
+    with pytest.raises(KernelError) as refused:
+        with repository.at_run('A').transaction():
+            entered.append(True)
+    assert refused.value.code == 'storage_clock_domain' and entered == []
+    assert len(admitted) == 1 and admitted[0][2] == 101.
+    with repository.metadata().transaction(write=False) as tx:
+        row = tx.one('SELECT request,clock_domain,deadline,position FROM save_admissions')
+        assert tuple(row) == admitted[0]
+        assert tx.one('SELECT stopped FROM runs WHERE id=?', ('A',))[0] == 0
+        assert tx.one('SELECT stopped FROM runs WHERE id=?', ('B',))[0] == 0
+    assert native_task_observation.opened.count(100001) == native_task_observation.closed.count(100001) == 1
+    assert native_task_observation.opened.count(100002) == native_task_observation.closed.count(100002)
+
+
+
+def test_children_close_failure_is_not_silenced_by_an_already_handled_outer_error(native_task_observation):
+    observed = native_task_observation
+    failure = OSError('controlled children close failed after successful observation')
+    observed.children_close_error = failure
+    try:
+        raise ValueError('Already handled outside clock observation')
+    except ValueError as previous:
+        with pytest.raises(OSError) as refused:
+            SaveClock()
+        assert refused.value is failure
+        assert not getattr(previous, '__notes__', ())
+    assert observed.closed == [100002, 100001]

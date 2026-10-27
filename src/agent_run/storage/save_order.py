@@ -15,7 +15,7 @@ from pathlib import Path
 import stat
 from threading import Condition, Event, Lock, get_ident
 from time import get_clock_info, monotonic
-from typing import Any, Iterator, Literal, TYPE_CHECKING
+from typing import Any, Callable, Iterator, Literal, TYPE_CHECKING
 from uuid import UUID, uuid4
 
 if TYPE_CHECKING:
@@ -121,7 +121,8 @@ class SaveNotHead(RuntimeError):
 
 _PROCFS_MAGIC = 0x9fa0
 _NSFS_MAGIC = 0x6e736673
-_SAVE_CLOCK_PROTOCOL = 'native-linux-local-wal-save/1'
+# v1 did not prove offsets belonged to the current task; never adopt its tickets.
+_SAVE_CLOCK_PROTOCOL = 'native-linux-local-wal-save/2'
 _MONOTONIC_PROVIDER = 'clock_gettime(CLOCK_MONOTONIC)'
 
 
@@ -173,6 +174,34 @@ def _bounded_text(path: Path, limit: int) -> str:
         os.close(descriptor)
 
 
+@contextmanager
+def _offset_namespace(descriptor: int) -> Iterator[Callable[[], None]]:
+    """timens_offsets describes time_for_children: accept only current==children."""
+    children = os.open('/proc/thread-self/ns/time_for_children', os.O_RDONLY | os.O_CLOEXEC)
+    original: BaseException | None = None
+    try:
+        def same_namespace() -> None:
+            observed = (os.fstat(descriptor), os.fstat(children), os.stat('/proc/thread-self/ns/time'),
+                        os.stat('/proc/thread-self/ns/time_for_children'))
+            identities = {(item.st_dev, item.st_ino) for item in observed}
+            if (len(identities) != 1 or _filesystem_type(descriptor) != _NSFS_MAGIC
+                    or _filesystem_type(children) != _NSFS_MAGIC):
+                raise ValueError('Clock offsets are not bound to the current time namespace')
+        same_namespace()
+        yield same_namespace
+        same_namespace()
+    except BaseException as error:
+        original = error
+        raise
+    finally:
+        try:
+            os.close(children)
+        except OSError as cleanup:
+            if original is None:
+                raise
+            original.add_note('Time namespace cleanup unavailable: ' + type(cleanup).__name__)
+
+
 def _clock_fields(descriptor: int) -> tuple[str, str, int, int, int, int,
                                            tuple[int, int], tuple[int, int], tuple[int, int]]:
     from agent_run.adapters.foreground import require_proc_view
@@ -181,34 +210,38 @@ def _clock_fields(descriptor: int) -> tuple[str, str, int, int, int, int,
     if (info.implementation != _MONOTONIC_PROVIDER or not info.monotonic or info.adjustable
             or _filesystem_type(descriptor) != _NSFS_MAGIC):
         raise ValueError('Comparable native monotonic provider is unavailable')
-    before = os.stat('/proc/self/ns/time')
+    before = os.stat('/proc/thread-self/ns/time')
     pinned = os.fstat(descriptor)
     if (before.st_dev, before.st_ino) != (pinned.st_dev, pinned.st_ino):
         raise ValueError('Current time namespace changed')
-    boot_path, offsets_path = Path('/proc/sys/kernel/random/boot_id'), Path('/proc/self/timens_offsets')
-    boot_source, offsets_source = _source_identity(boot_path), _source_identity(offsets_path)
-    boot = _bounded_text(boot_path, 64)
-    if str(UUID(boot)) != boot:
-        raise ValueError('Kernel boot identity is unavailable')
-    offsets: dict[str, tuple[int, int]] = {}
-    for line in _bounded_text(offsets_path, 256).splitlines():
-        fields = line.split()
-        if len(fields) != 3 or fields[0] not in {'monotonic', 'boottime'} or fields[0] in offsets:
-            raise ValueError('Clock offsets are ambiguous')
-        seconds, nanos = int(fields[1]), int(fields[2])
-        if (str(seconds) != fields[1] or str(nanos) != fields[2]
-                or not -(1 << 63) <= seconds < (1 << 63) or not 0 <= nanos <= 999999999):
-            raise ValueError('Clock offsets are invalid')
-        offsets[fields[0]] = (seconds, nanos)
-    if set(offsets) != {'monotonic', 'boottime'}:
-        raise ValueError('Clock offsets are incomplete')
-    after = os.stat('/proc/self/ns/time')
-    if ((after.st_dev, after.st_ino) != (pinned.st_dev, pinned.st_ino)
-            or _filesystem_type(descriptor) != _NSFS_MAGIC
-            or _source_identity(boot_path) != boot_source or _source_identity(offsets_path) != offsets_source):
-        raise ValueError('Current clock source changed')
-    return (boot, info.implementation, pinned.st_dev, pinned.st_ino, *offsets['monotonic'],
-            offsets['boottime'], boot_source, offsets_source)
+    with _offset_namespace(descriptor) as same_namespace:
+        boot_path, offsets_path = Path('/proc/sys/kernel/random/boot_id'), Path('/proc/thread-self/timens_offsets')
+        boot_source, offsets_source = _source_identity(boot_path), _source_identity(offsets_path)
+        boot = _bounded_text(boot_path, 64)
+        if str(UUID(boot)) != boot:
+            raise ValueError('Kernel boot identity is unavailable')
+        offsets: dict[str, tuple[int, int]] = {}
+        same_namespace()  # proc offsets uses this same task's children namespace.
+        text = _bounded_text(offsets_path, 256)
+        same_namespace()
+        for line in text.splitlines():
+            fields = line.split()
+            if len(fields) != 3 or fields[0] not in {'monotonic', 'boottime'} or fields[0] in offsets:
+                raise ValueError('Clock offsets are ambiguous')
+            seconds, nanos = int(fields[1]), int(fields[2])
+            if (str(seconds) != fields[1] or str(nanos) != fields[2]
+                    or not -(1 << 63) <= seconds < (1 << 63) or not 0 <= nanos <= 999999999):
+                raise ValueError('Clock offsets are invalid')
+            offsets[fields[0]] = (seconds, nanos)
+        if set(offsets) != {'monotonic', 'boottime'}:
+            raise ValueError('Clock offsets are incomplete')
+        after = os.stat('/proc/thread-self/ns/time')
+        if ((after.st_dev, after.st_ino) != (pinned.st_dev, pinned.st_ino)
+                or _filesystem_type(descriptor) != _NSFS_MAGIC
+                or _source_identity(boot_path) != boot_source or _source_identity(offsets_path) != offsets_source):
+            raise ValueError('Current clock source changed')
+        return (boot, info.implementation, pinned.st_dev, pinned.st_ino, *offsets['monotonic'],
+                offsets['boottime'], boot_source, offsets_source)
 
 
 def _domain_fields(value: str) -> list[Any]:
@@ -242,9 +275,13 @@ def _domain_kind(current: str, recorded: str) -> Literal['same_clock', 'previous
 
 
 class SaveClock:
-    """A pinned current time namespace, not time_for_children or an exit proof."""
+    """Pinned calling-task clock, never an exit proof.
+
+    Trusted owner code, including signal callbacks, must not mutate namespaces
+    during a request. Endpoint observations cannot prove absence of an ABA.
+    """
     def __init__(self) -> None:
-        self.descriptor = os.open('/proc/self/ns/time', os.O_RDONLY | os.O_CLOEXEC)
+        self.descriptor = os.open('/proc/thread-self/ns/time', os.O_RDONLY | os.O_CLOEXEC)
         try:
             self.fields = _clock_fields(self.descriptor)
             self.domain = json.dumps([_SAVE_CLOCK_PROTOCOL, *self.fields[:6]], separators=(',', ':'))
@@ -297,6 +334,7 @@ class RepositorySave:
         self.require()
         rows = tx.rows('SELECT position,request,run_id,clock_domain,deadline FROM save_admissions ORDER BY position',
                        limit=MAX_PENDING_WRITES)
+        self.require()  # Revalidate the calling task after the bounded row observation.
         # Classify the complete set before any mutation: an invalid later row
         # must not leave an earlier previous-boot deletion behind.
         for row in rows:

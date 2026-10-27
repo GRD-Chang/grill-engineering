@@ -641,6 +641,8 @@ class Storage:
                     if transaction.one("SELECT id FROM runs")[0] != self._run_id:
                         raise KernelError("run_scope_changed")
                 if write:
+                    if request is not None:
+                        request.require()  # Final body admission uses the same current-task clock evidence.
                     check_cancelled(cancelled)
                     remaining(deadline)
                 yield exposed
