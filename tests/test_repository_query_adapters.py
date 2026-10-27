@@ -1,9 +1,11 @@
-"""Inactive CLI query/profile assembly and write-before-refusal boundaries.
+"""Final CLI query/profile assembly and write-before-refusal boundaries.
 
 Only real files, SQLite and in-process CLI parsing are used. No child, Host,
 notification thread, login, model probe, service or protocol activation is run.
 All new nodes are supplied UNRUN by the author for independent execution.
 """
+
+from support.repository_fixture import create_kernel
 from contextlib import closing
 from pathlib import Path
 import json
@@ -65,7 +67,8 @@ def test_existing_reader_projects_exact_selected_run_without_fallback_or_write(r
     assert document.kind == kind and document.data['run_id'] == 'A'
     info = header(repository.database, storage=storage)
     assert info['run_id'] == 'A' and info['parent'] == 1
-    assert info['state_dir'] == str(repository.kernel('A').run_paths().artifacts)
+    assert info['state_dir'] == str(repository.database.parent)
+    assert info['artifacts_dir'] == str(repository.kernel('A').run_paths().artifacts)
     assert dump(repository.database) == before
     with pytest.raises(QueryError) as wrong:
         read(repository.database, kind, storage=storage, expected_run='B')
@@ -83,7 +86,7 @@ def test_internal_query_adapter_uses_typed_targets_for_parent_and_historical_que
     assert [(item['run_id'], item['parent']) for item in listing.data['runs']] == [('A', 1), ('B', 2)]
     assert all(item['database'] == str(repository.database) for item in listing.data['runs'])
     # Metadata selection and projection do not arm a public lifecycle.
-    assert routing.REPOSITORY_PUBLIC_READY is False
+    assert not hasattr(routing, 'REPOSITORY_PUBLIC_READY')
 
 
 def test_explicit_state_route_uses_database_namespace_instead_of_directory_name(repository, monkeypatch):
@@ -174,23 +177,25 @@ def test_default_personal_settings_still_read_defaults_without_opening_repositor
 def test_public_repository_adapters_remain_closed_before_any_query_profile_or_probe(repository, monkeypatch, capsys, arguments):
     before = dump(repository.database)
     def no_repository(*args, **kwargs):
-        raise AssertionError('Unactivated public route reached repository work')
+        raise QueryError('fixture_selection_boundary', 'Selected canonical route reached its controlled boundary')
+    from agent_run.runtime import package_lease
+    monkeypatch.setattr(package_lease, 'runner_usage_lease', no_repository)
     monkeypatch.setattr(selection, 'repository_target', no_repository)
     monkeypatch.setattr(selection, 'repository_candidates', no_repository)
     monkeypatch.setattr(RepositoryRoute, 'metadata', no_repository)
     assert cli_main.main(arguments, repository_routes=(repository,)) == 2
-    assert json.loads(capsys.readouterr().out)['diagnostics'][0]['code'] == 'repository_activation_incomplete'
+    assert json.loads(capsys.readouterr().out)['diagnostics'][0]['code'] == 'fixture_selection_boundary'
     assert dump(repository.database) == before
 
 
 def test_direct_profile_adapter_is_also_closed_before_selection(repository, monkeypatch):
     request = parsed(['configure', 'A', '--repo', repository.repository, '--development-effort', 'low'])
     def no_selection(*args):
-        raise AssertionError('Unactivated profile selected a Run')
+        raise QueryError('fixture_selection_boundary', 'Canonical selection reached')
     monkeypatch.setattr(selection, 'repository_target', no_selection)
     with pytest.raises(KernelError) as refused:
         profile_cli.execute(request, repository_routes=(repository,))
-    assert refused.value.code == 'repository_activation_incomplete'
+    assert refused.value.code == 'fixture_selection_boundary'
 
 
 def test_current_profile_entry_keeps_original_frozen_authority_and_default_query_behavior(tmp_path, monkeypatch, capsys):
@@ -198,11 +203,9 @@ def test_current_profile_entry_keeps_original_frozen_authority_and_default_query
     root = tmp_path / 'repository'
     spec, source = proposal(root, 'current-profile')
     database = tmp_path / 'current' / 'kernel.sqlite3'
-    kernel = Kernel.create_task(database, spec, requirements=source)
+    kernel = create_kernel(database, spec, requirements=source)
     before = read(database, 'settings', expected_run=spec.run_id).data
-    monkeypatch.setattr(selection, '_candidates', lambda request: [{
-        'database': str(database), 'run_id': spec.run_id, 'repository': spec.repository,
-        'parent': 1, 'repository_root': str(root), 'is_terminal': False}])
+    monkeypatch.setattr(selection, 'managed_repository_routes', lambda request: (RepositoryRoute(database, root, spec.repository),))
     monkeypatch.setattr(profile_cli, 'workspace_for_root', lambda path:
         SimpleNamespace(state_root=database.parent, repository_root=root))
     request = parsed(['configure', spec.run_id, '--repo', spec.repository,
@@ -254,7 +257,7 @@ def test_real_current_database_uncheckpointed_wal_materials_and_budget_survive_n
     root = tmp_path / 'repository'
     spec, source = proposal(root, 'old-current')
     database = state / spec.run_id / 'kernel.sqlite3'
-    old = Kernel.create_task(database, spec, requirements=source)
+    old = create_kernel(database, spec, requirements=source)
     raw = database.parent / 'raw.bin'
     raw.write_bytes(b'Exact old raw bytes\0\xff')
     with closing(sqlite3.connect(database, isolation_level=None)) as keeper:
@@ -283,7 +286,7 @@ def test_real_current_database_uncheckpointed_wal_materials_and_budget_survive_n
         assert not route.database.exists()
 
 
-@pytest.mark.parametrize('protocol', ['sqlite-work-records-v6', 'independent-delivery-kernel-v20', 'independent-delivery-kernel-v21', 'unknown-format'])
+@pytest.mark.parametrize('protocol', ['sqlite-work-records-v6', 'independent-delivery-kernel-v20', 'independent-delivery-kernel-v21', 'independent-delivery-repository-unactivated', 'unknown-format'])
 def test_existing_canonical_old_protocol_is_refused_readonly_without_interpreting_or_replacing_its_data(tmp_path, protocol):
     state = tmp_path / 'state'
     state.mkdir()

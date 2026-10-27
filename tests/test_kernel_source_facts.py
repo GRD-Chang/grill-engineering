@@ -41,7 +41,7 @@ def test_refresh_receipt_preserves_observed_issue_and_completion_identities(tmp_
         {"subject": "ticket:2", "generation": 1, "completion_revision": "no-tickets"},
         {"subject": "ticket:3", "generation": 1, "completion_revision": "no-tickets"},
     ]
-    assert Kernel(kernel.storage.path).source_status() == receipt
+    assert Kernel(kernel.storage.path, run_id=kernel.storage.run_id).source_status() == receipt
     assert kernel.status(second.subject) == sibling
 
 

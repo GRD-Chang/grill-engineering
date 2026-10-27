@@ -3,6 +3,8 @@
 Callers supply physical OperationPorts. This helper never supplies a subject,
 constructs a World, executes an Agent, or manufactures process-exit evidence.
 """
+
+from support.repository_fixture import create_kernel
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -112,7 +114,7 @@ def native_agent_fixture(path: Path, spec: RunSpec) -> tuple[Kernel, ReadOnlyPor
     inputs = spec.inputs if spec.inputs is not None else fixture_inputs()
     spec = replace(spec, repository_root=spec.repository_root or str(path.parent.resolve()),
                    language=spec.language or 'zh', inputs=inputs, deliveries=deliveries)
-    return (Kernel.create(path, spec, requirements=source),
+    return (create_kernel(path, spec, requirements=source),
             ReadOnlyPorts(source, first.source_ref, first.target_ref, DeliveryFacts(first.base, None)))
 
 
@@ -134,7 +136,7 @@ def final_scenario(root: Path, *, policy: Policy | None = None,
         # Configure the fresh creation before any business operation, never
         # recreate a progressed Run and lose its real Completion history.
         scenario.spec = replace(scenario.spec, inputs=inputs, language=language)
-        scenario.kernel = Kernel.create(root / 'configured.sqlite3', scenario.spec, requirements=source)
+        scenario.kernel = create_kernel(root / 'configured.sqlite3', scenario.spec, requirements=source)
         scenario.execution = scenario.kernel.claim_executor('configured-fixture')
     operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
     for _ in range(100):

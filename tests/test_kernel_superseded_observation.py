@@ -17,11 +17,12 @@ from test_kernel_remote_effects import _change, _fixture, _source_kernel
 def source_operations(tmp_path, port, push, monkeypatch):
     # Freeze the exact local fixture remote at fresh creation. This neither
     # changes the shared fixture nor fills a missing progressed Run input.
-    create = Kernel.create
+    import test_kernel_remote_effects as fixtures
+    create = fixtures.create_kernel
     def bound(path, spec, **kwargs):
         return create(path, replace(spec, inputs=replace(spec.inputs, repository_remote="origin")), **kwargs)
     with monkeypatch.context() as patch:
-        patch.setattr(Kernel, "create", staticmethod(bound))
+        patch.setattr(fixtures, "create_kernel", bound)
         kernel = _source_kernel(tmp_path, port, push)
     execution = kernel.claim_executor("native-reader")
     return CoreOperations(kernel, execution, lambda binding: port)

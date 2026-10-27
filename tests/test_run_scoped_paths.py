@@ -1,4 +1,6 @@
 """Explicit Run paths and the existing carrier digest, without a Host/process."""
+
+from support.repository_fixture import create_kernel
 from contextlib import closing
 from dataclasses import replace
 import hashlib
@@ -68,10 +70,11 @@ def test_current_layout_keeps_paths_but_reads_identity_from_header_not_directory
     spec = RunSpec('recorded-run', 'example/project', 1, 'r', 'g', (delivery,),
         language='zh', repository_root=str(tmp_path / 'checkout'), inputs=fixture_inputs())
     path = tmp_path / 'directory-is-not-the-run-id' / 'kernel.sqlite3'
-    kernel = Kernel.create(path, spec, requirements=Requirements(ParentIssue(1, 'Parent', 'Requirement'), ()))
+    kernel = create_kernel(path, spec, requirements=Requirements(ParentIssue(1, 'Parent', 'Requirement'), ()))
     result = kernel.run_paths(expected_run='recorded-run')
-    assert result.run_id == 'recorded-run' and result.host_partition is None
-    assert result.artifacts == result.journal_root == path.parent
+    assert result.run_id == 'recorded-run' and result.host_partition == hashlib.sha256(b'recorded-run').hexdigest()
+    assert result.artifacts == path.parent / 'runs' / result.host_partition
+    assert result.journal_root == path.parent
     with pytest.raises(KernelError, match='run_path_binding'):
         kernel.run_paths(expected_run=path.parent.name)
 

@@ -1,51 +1,50 @@
-"""One locked Task -> Run location; all replacement decisions stay in Kernel."""
+"""Canonical Task relations and the existing physical admission mutex."""
 
 
 from contextlib import contextmanager
 import fcntl
-import json
 import os
 import sqlite3
 from pathlib import Path
-import tempfile
 from typing import TYPE_CHECKING, Callable, Iterator
 
 from agent_run.config.paths import app_data_root
 from agent_run.contracts.task import TaskKey
 
 from agent_run.errors import KernelError
-from agent_run.model import wire_json
 
 if TYPE_CHECKING:
     from agent_run.storage.sqlite import Transaction
 
 
 def read_repository_task(owner: "Transaction", task: TaskKey) -> sqlite3.Row | None:
-    """Canonical staged Task metadata, without JSON publication or Run inference."""
-    rows = owner.rows("SELECT * FROM tasks WHERE id=?", (task.fingerprint,), limit=1)
+    """Canonical Task metadata, without JSON publication or Run inference."""
+    try:
+        rows = owner.rows("SELECT * FROM tasks WHERE id=?", (task.fingerprint,), limit=1)
+    except (OSError, sqlite3.Error) as error:
+        raise KernelError("task_location_unavailable", "Canonical Task observation is unavailable") from error
     if not rows:
         return None
     row = rows[0]
     if (row["repository"], row["repository_root"], row["parent_issue"]) != (
             task.repository, str(task.workspace), task.parent_number):
         raise KernelError("task_location_identity")
+    if row["current_run"] is None and owner.rows(
+            "SELECT run_id FROM task_runs WHERE task_id=? LIMIT 1", (task.fingerprint,), limit=1):
+        raise KernelError("task_location_identity", "An existing Run cannot become an idle Task")
     return row
 
 
-def run_is_current(owner: "Transaction", database: Path) -> bool:
+def run_is_current(owner: "Transaction") -> bool:
     """Recheck publication from facts in the original selected snapshot.
 
-    The current protocol's existing locator is unchanged until the one-way
-    switch. Repository mode uses only its canonical Task and Run relations;
-    displayed status, directory names and external notices never choose a Run.
+    Only canonical Task and Run relations choose the current binding. Display
+    bodies, directory names and external notices never select or authorize it.
     """
-    from agent_run.storage.run_scope import selected_statement, transaction_scope
+    from agent_run.storage.run_scope import run_statement, transaction_scope
     selected = transaction_scope(owner)
-    run = owner.one(*selected_statement(owner, "SELECT id,repository,repository_root,parent_issue FROM runs",
-        "SELECT id,repository,repository_root,parent_issue FROM runs WHERE id=?"))
+    run = owner.one(*run_statement(owner, "SELECT id,repository,repository_root,parent_issue FROM runs WHERE id=?"))
     task = TaskKey(Path(run["repository_root"]), run["repository"], run["parent_issue"])
-    if selected is None:
-        return read_task(task_path(task)) == (run["id"], database)
     row = read_repository_task(owner, task)
     links = owner.rows("SELECT task_id,repository,repository_root,parent_issue FROM task_runs WHERE run_id=?",
         (selected.run_id,), limit=1)
@@ -56,14 +55,23 @@ def run_is_current(owner: "Transaction", database: Path) -> bool:
 
 
 def task_path(task: TaskKey) -> Path:
-    """Name the existing identity pointer without creating any directory."""
+    """Name retired-publication residue; never create or decode a pointer."""
     return app_data_root() / "native-task-locations" / (task.fingerprint + ".json")
+
+
+def refuse_retired_task(task: TaskKey) -> None:
+    """Retired publication can only refuse admission; its contents select nothing."""
+    path = task_path(task)
+    if path.exists() or path.is_symlink():
+        from agent_run.storage.preflight import UnsupportedState
+        raise UnsupportedState(path, "retired_task_publication")
 
 
 @contextmanager
 def task_lock(task: TaskKey, *, wait: bool = True) -> Iterator[Callable[[], None]]:
     """Own the Task lock; the yielded callback transfers it to process lifetime."""
     path = task_path(task)
+    refuse_retired_task(task)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     descriptor = os.open(path.with_suffix(".lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     process_owned = False
@@ -79,69 +87,3 @@ def task_lock(task: TaskKey, *, wait: bool = True) -> Iterator[Callable[[], None
     finally:
         if not process_owned:
             os.close(descriptor)
-
-
-@contextmanager
-def locked_task(task: TaskKey, *, wait: bool = True) -> Iterator[Path]:
-    with task_lock(task, wait=wait):
-        yield task_path(task)
-
-
-def read_task(path: Path) -> tuple[str, Path] | None:
-    try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    except FileNotFoundError:
-        return None
-    with os.fdopen(descriptor, "rb") as source:
-        body = source.read(8193)
-    if len(body) > 8192:
-        raise KernelError("task_location_invalid")
-    try:
-        value = json.loads(body)
-    except (ValueError, UnicodeError) as error:
-        raise KernelError("task_location_invalid") from error
-    if (not isinstance(value, dict) or set(value) != {"run_id", "database"}
-            or not isinstance(value["run_id"], str) or not value["run_id"]
-            or not isinstance(value["database"], str) or not Path(value["database"]).is_absolute()):
-        raise KernelError("task_location_invalid")
-    return value["run_id"], Path(value["database"])
-
-
-def read_task_bindings() -> Iterator[tuple[str, Path]]:
-    """Enumerate valid pointers without letting unrelated damaged files block reads.
-
-    A valid pointer to a damaged database is still yielded for caller diagnosis.
-    Exact Task admission uses read_task directly and continues to fail closed.
-    """
-    try:
-        with os.scandir(app_data_root() / "native-task-locations") as entries:
-            for entry in entries:
-                if entry.name.endswith(".json"):
-                    try:
-                        binding = read_task(Path(entry.path))
-                    except (KernelError, OSError):
-                        continue
-                    if binding is not None:
-                        yield binding
-    except FileNotFoundError:
-        return
-
-
-def bind_task(path: Path, run_id: str, database: Path) -> None:
-    body = wire_json({"run_id": run_id, "database": str(database.resolve())})
-    if len(body) > 8192:
-        raise KernelError("task_location_invalid")
-    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as target:
-        temporary = Path(target.name)
-        try:
-            target.write(body)
-            target.flush()
-            os.fsync(target.fileno())
-            os.replace(temporary, path)
-            descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-        finally:
-            temporary.unlink(missing_ok=True)

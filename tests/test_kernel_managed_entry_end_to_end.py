@@ -281,7 +281,7 @@ if '--hostname' in sys.argv:
         command = commands[0]
         assert command[command.index("-m") + 1] == 'agent_run.runtime.executor'
         database = Path(command[command.index("--database") + 1])
-        kernel = Kernel(database)
+        kernel = Kernel(database, run_id=accepted['run_id'])
         assert kernel.status("ticket:2")["phase"] == "complete"
         assert kernel.status("ticket:3")["phase"] != "complete"
         assert kernel.operation_state().active == ()
@@ -967,7 +967,7 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
             record, = (read_record(path) for path in record_root(lock).glob('*.json'))
             assert record['phase'] == 'running' and record['binding'][0] == before['run_id']
             host_pin = _pin_control_host(record, pins)
-            kernel = Kernel(Path(record['database']))
+            kernel = Kernel(Path(record['database']), run_id=record['binding'][0])
             # Physical witness only: observe existing bindings, never repair SQL.
             with kernel.storage.transaction(write=False) as tx:
                 workers = []
@@ -1150,7 +1150,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
             initial = [arrivals.get(timeout=min(15, remaining())) for _ in range(2)]
             assert {Path(event["checkout"]).name for event, _channel in initial} == {"ticket-2", "ticket-3"}
             command = commands[0]
-            kernel = Kernel(Path(command[command.index("--database") + 1]))
+            kernel = Kernel(Path(command[command.index('--database') + 1]), run_id=next((item.partition('=')[2] for item in command if item.startswith('--run-id='))))
             request = kernel.host_request(accepted["action_id"])
             before = kernel.status("ticket:2")
             attempt = before["pending_attempt"]
@@ -1369,7 +1369,7 @@ if role == 'development':
                 code, accepted = public("run", "1", "--no-notifications")
                 assert code == 0, accepted
                 command = commands[0]
-                kernel = Kernel(Path(command[command.index("--database") + 1]))
+                kernel = Kernel(Path(command[command.index('--database') + 1]), run_id=next((item.partition('=')[2] for item in command if item.startswith('--run-id='))))
                 databases.append(kernel)
                 # Only the original Host's external reads use the barrier.
                 # This terminal's new Revise still reads the actual fresh world.
@@ -1494,7 +1494,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                 code, accepted = public("run", "1", "--no-notifications")
                 assert code == 0, accepted
                 command = commands[0]
-                kernel = Kernel(Path(command[command.index("--database") + 1]))
+                kernel = Kernel(Path(command[command.index('--database') + 1]), run_id=next((item.partition('=')[2] for item in command if item.startswith('--run-id='))))
                 databases.append(kernel)
                 environment.pop("ENTRY_APPROVAL_CONTROL")
                 original_event, channel = arrivals.get(timeout=min(20, remaining()))
@@ -1799,7 +1799,7 @@ issue = int(re.search(r'https://github.com/example/project/issues/(\\d+)', promp
             record, = (read_record(path) for path in record_root(lock).glob('*.json'))
             assert record['binding'][0] == before['run_id'] and record['phase'] == 'running'
             _pin_control_host(record, pins)
-            kernel = Kernel(Path(record['database']))
+            kernel = Kernel(Path(record['database']), run_id=record['binding'][0])
             # There is no mutable observer selection in the new architecture.
             # Selecting completed A for a read cannot own B's later failure.
             selected_a = kernel.status('ticket:2')
@@ -1896,7 +1896,7 @@ issue = int(re.search(r'https://github.com/example/project/issues/(\\d+)', promp
                     and row['kind'] in {'role_consumed', 'effect_consumed', 'worker_exited'}] == completed_history_a
             assert not any(row['kind'] == 'role_consumed' and row['identity'] == attempt_b['id']
                            for row in fresh_history['events'])
-            reopened = Kernel(Path(record['database']))
+            reopened = Kernel(Path(record['database']), run_id=record['binding'][0])
             assert reopened.status('ticket:3')['gates'] == ['execution_failed']
             assert next(row for row in reopened.source_status()['completions'] if row['subject'] == 'ticket:2') == completion_a
             assert all(completed['ticket:2'][key] == jobs['ticket:2'][key] for key in (
@@ -1955,8 +1955,8 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
     action = uuid4().hex
     lock = default_runner_lock_path(environment)
     scope, digest = FaultScope.create(tmp_path / 'fault-scope', database, spec.run_id, action)
-    selected = command(database, action, lock, environment, scope.manifest, digest)
-    assert selected != executor.command(database, action, lock, environment)
+    selected = command(database, action, lock, environment, scope.manifest, digest, run_id=spec.run_id)
+    assert selected != executor.command(database, action, lock, environment, run_id=spec.run_id)
     with subreaper(), sqlite_fault(monkeypatch, database, 'commit-interrupt', scope=scope) as failures:
         result = submit(kernel, 'run', action_id=action, command=selected,
             manager=ForegroundHost(environment=environment), environment=environment, runner_lock=lock)
@@ -2048,11 +2048,11 @@ require_current_installation()
 database, manifest, lock = map(Path, sys.argv[2:5])
 run, action, digest = sys.argv[5:8]
 scope = FaultScope.load(manifest, digest, database, run, action)
-selected = command(database, action, lock, os.environ, manifest, digest)
+selected = command(database, action, lock, os.environ, manifest, digest, run_id=run)
 try:
     with pytest.MonkeyPatch.context() as patch:
         with sqlite_fault(patch, database, 'commit-interrupt', scope=scope):
-            result = submit(Kernel(database), 'run', action_id=action, command=selected,
+            result = submit(Kernel(database, run_id=run), 'run', action_id=action, command=selected,
                 manager=ForegroundHost(environment=os.environ), environment=os.environ, runner_lock=lock)
 except Exception as error:
     print(json.dumps({'error_type': type(error).__name__, 'code': getattr(error, 'code', None),
@@ -2071,7 +2071,7 @@ else:
         action = uuid4().hex
         lock = default_runner_lock_path(environment)
         scope, digest = FaultScope.create(tmp_path / 'fault-scope', database, spec.run_id, action)
-        selected = command(database, action, lock, environment, scope.manifest, digest)
+        selected = command(database, action, lock, environment, scope.manifest, digest, run_id=spec.run_id)
         unrelated, unrelated_fd = processes.enter_context(_control_process(
             [sys.executable, '-I', '-c', 'import time; time.sleep(180)'],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))

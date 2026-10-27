@@ -1,6 +1,6 @@
-"""Actual-file inactive repository routing, no Host/Worker or child process.
+"""Actual-file repository routing, no Host/Worker or child process.
 
-The public marker stays unsupported. Tests call explicit internal factories;
+The one public protocol requires explicit Run selection. Tests use typed routes;
 metadata, SQL/WAL, original owner and frozen creation are the exercised seams.
 """
 from dataclasses import replace
@@ -15,7 +15,7 @@ from agent_run.errors import KernelError
 from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
 from agent_run.storage import routing
 from agent_run.storage.preflight import UnsupportedState, require_supported_state
-from agent_run.storage.repository_schema import STAGED_REPOSITORY_PROTOCOL
+from agent_run.storage.repository_schema import PROTOCOL
 from agent_run.storage.routing import RepositoryRoute
 from agent_run.storage.run_scope import RunTransaction, transaction_scope
 from agent_run.storage.sqlite import Storage, Transaction
@@ -57,26 +57,23 @@ def dump(route):
 
 
 def test_staged_public_gate_is_closed_and_idle_task_is_not_a_run(route, monkeypatch):
-    assert routing.REPOSITORY_PUBLIC_READY is False
+    # Historical node retained: the final protocol admits metadata, never an idle Run.
     route.idle(task(route))
     assert route.task(task(route)).current_run is None
     with route.metadata().transaction(write=False) as owner:
         assert type(owner) is Transaction
-        assert owner.one('SELECT protocol FROM meta')[0] == STAGED_REPOSITORY_PROTOCOL
+        assert owner.one('SELECT protocol FROM meta')[0] == PROTOCOL
         for table in ('runs', 'attempts', 'invocations', 'invocation_outputs', 'budgets', 'hosts'):
             assert owner.one('SELECT count(*) FROM ' + table)[0] == 0
         with pytest.raises(KernelError, match='run_scope_required'):
             transaction_scope(owner)
     before = dump(route)
-    for opening in (lambda: Storage(route.database), lambda: Kernel(route.database),
-                    lambda: routing.open_run(route.database, run_id='A'),
-                    lambda: require_supported_state(route.database)):
-        with pytest.raises(UnsupportedState, match='unknown_protocol'):
-            opening()
-    assert dump(route) == before
-    monkeypatch.setattr(routing, 'REPOSITORY_PUBLIC_READY', True)
-    with pytest.raises(KernelError, match='repository_activation_incomplete'):
+    assert require_supported_state(route.database) == PROTOCOL
+    with pytest.raises(KernelError, match='run_scope_required'):
+        routing.open_run(route.database)
+    with pytest.raises(KernelError, match='run_scope_missing'):
         routing.open_run(route.database, run_id='A')
+    assert not hasattr(routing, 'REPOSITORY_PUBLIC_READY')
     assert dump(route) == before
 
 
@@ -250,7 +247,10 @@ def test_read_failure_or_missing_database_never_implicitly_initializes_or_create
 
 def test_existing_current_protocol_is_refused_by_staged_route_without_migration_or_deletion(tmp_path):
     database = tmp_path / 'kernel.sqlite3'
-    Storage.create(database)
+    # A bounded retired protocol fixture, never an old producer or migration.
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute('CREATE TABLE meta(protocol TEXT NOT NULL)')
+        connection.execute('INSERT INTO meta VALUES (?)', ('independent-delivery-kernel-v21',))
     route = RepositoryRoute(database, tmp_path / 'repository', 'example/project')
     before = database.read_bytes()
     with pytest.raises(UnsupportedState, match='unknown_protocol'):

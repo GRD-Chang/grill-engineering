@@ -74,7 +74,7 @@ if role == 'development':
                 accepted = public("run", "1", "--parent-only-paired-round", "1", "--no-notifications")
                 assert accepted["result"] == "accepted"
                 command = commands[0]
-                kernel = Kernel(Path(command[command.index("--database") + 1]))
+                kernel = Kernel(Path(command[command.index('--database') + 1]), run_id=next((item.partition('=')[2] for item in command if item.startswith('--run-id='))))
                 databases.append(kernel)
                 ready.touch()
                 assert reached.wait(min(75, max(0, deadline - time.monotonic()))), (output, errors)

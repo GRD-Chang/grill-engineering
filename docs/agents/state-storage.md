@@ -6,17 +6,19 @@
 ## 路径与唯一支持的协议
 
 数据主目录默认为 `~/.local/share/agent-run/`，或 `$XDG_DATA_HOME/agent-run/`。
-每个新 Run 的控制、Host 与业务关系保存在
-`repositories/<owner>/<repo>/state/<run_id>/kernel.sqlite3`；
-数据库的 `meta.protocol` 必须为 **`independent-delivery-kernel-v21`**。
-`native-task-locations/<task-fingerprint>.json` 只保存该 Task 的 Run ID 和数据库路径，
-不复制生命周期状态；替换与占用判断仍由 Core 决定。
+本开发候选按受管仓库共用 `repositories/<owner>/<repo>/state/kernel.sqlite3`，
+`meta.protocol` 唯一值为 **`independent-delivery-repository-v22`**。
+该源码候选仍待同版独立验收，不代表用户环境已经切换或真实进程验收通过。
+`tasks` 保存准确Task身份和可空的 `current_run`；`task_runs` 绑定历史Run。
+独立idle Task不产生空壳Run、Invocation、预算或执行权。完整冻结Run及必要关系/材料
+与Task绑定在同一短事务中提交；COMMIT未知仅对账原proposal，不重新创建或套用新默认值。
 
-[`storage.preflight`](../../src/agent_run/storage/preflight.py) 以只读连接检查现有数据库。
-旧 JSON/v6、早期 native v17/v18/v19/v20、来源封印及导入状态明确拒绝，
-保留原文件、Candidate、工作区和成果，不升级、不转换、不双写，也不直接续接。
-[`storage.admission`](../../src/agent_run/storage/admission.py) 只检查旧 Task 占用及拒绝条件，
-不解释或转移旧工作。拒绝不授权清除旧 Task、封印或历史数据。
+[`storage.preflight`](../../src/agent_run/storage/preflight.py) 只读检查原数据库。
+旧JSON/v6、native v17–v21、早期仓库实验marker、封印和导入状态均拒绝，
+保留原SQLite/WAL、raw、材料、预算和工作区，不升级、不转换、不双写。
+旧的每Run库目录残留不能被当作空仓库重新初始化。
+Task锁仍使用 `native-task-locations/<task-fingerprint>.lock` 的原inode；
+该目录不再发布JSON绑定，残留JSON只能拒绝控制准入，不能授权、定位或覆盖新事实。
 
 `Storage.create` 排他创建新文件，拒绝接管已有数据库或遗留 sidecar。
 写事务在打开写连接前、取得写锁后及提交前复核支持边界；查询同样只接受当前 native 状态。
@@ -24,10 +26,11 @@
 
 ## 事实的唯一归属
 
-[`storage.sqlite`](../../src/agent_run/storage/sqlite.py) 的 `SCHEMA` 是表和列的实现依据：
+[`storage.repository_schema`](../../src/agent_run/storage/repository_schema.py) 是唯一schema定义，`storage.sqlite.SCHEMA` 直接组合该定义：
 
 | 事实 | 当前关系 |
 | --- | --- |
+| Task和仓库身份 | `repository_binding`、`tasks`、`task_runs` |
 | Run、交付对象及代次 | `runs`、`subjects`、`retired_generations` |
 | 固定输入与需求观测 | `run_inputs`、`requirement_versions`、`source_observations`、`profile_revisions` |
 | 语义工作与真实调用 | `attempts`、`invocations`、`invocation_outputs`、`threads`、`worker_activity` |
@@ -43,7 +46,7 @@
 预算保留用途、窗口、累计用量及原证据，显式续期或同次中断续接不能重复记账。
 
 Attempt、Invocation 和 Thread 各有独立 `id`，通过明确外键关联。
-物理输出以 `(invocation, ordinal)` 标识；原始返回、进程身份与活动事实属于准确输出，
+域内关系以准确Run复合键关联，物理输出以 `(run_id, invocation, ordinal)` 标识；原始返回、进程身份与活动事实属于准确输出，
 不从后来的当前对象重建早先调用或审核依据。Attempt 的 `thread_id` 和 `opening_id`
 由 continuation 入口绑定，分别引用 Thread 和不可变 Opening 材料。
 
@@ -55,8 +58,8 @@ Attempt、Invocation 和 Thread 各有独立 `id`，通过明确外键关联。
 放行准入或实际返回工作证据处仅记账一次。准备取消只有准确资源清理完成或原 Host
 退出证明才能释放席位；Future 完成及未知 Host 均不是清理证明。
 
-v20 的分配时扣费且 `accounted=0` 不能解释为 v21 延迟扣费。当前 Runner 在写前、
-锁内与读取时明确拒绝 v20；不迁移、不补偿退款、不改写其用量。保留原数据及匹配
+旧协议的分配时扣费及未收口用量不重新解释。当前协议保留已审的准备→执行单一生命周期语义，
+读取、写前及锁内均拒绝旧协议；不迁移、不补偿退款、不改写旧用量。保留原数据及匹配
 Runner Snapshot，以原版本恢复；安装新 Runner 不意味着能够继续旧 Run。
 
 需求/图版本、候选、预期合并树与 Ticket 完成事实保留准确关联，
@@ -68,7 +71,8 @@ Runner Snapshot，以原版本恢复；安装新 Runner 不意味着能够继续
 结果消费和适用预算变化由 Core 在同一业务事务收口，重复返回不能再次执行或记账。
 原始返回尚未落盘的中断仍属于未知结果，不能假定成功。
 
-`Transaction.put/get` 按拥有者、用途、SHA-256 和实际字节数保存及核验材料。
+`RunTransaction.put/get` 按准确Run、拥有者、用途、SHA-256和实际字节数保存及核验材料。
+裸 `Transaction` 只用于显式仓库元数据，不隐含Run选择；各Run view共享原owner的累计读预算和poison。
 材料不借用其他对象的证据，不以截断正文、删除历史或重置预算处理缺损和超限。
 Final Run PR 的远端内容仍为 PR Narrative 与单条原地更新的 Agent Run Status；
 不再发布完整 `Run Publication Record` JSON 评论，也不把该 JSON 搬入正文或另一评论。
@@ -136,32 +140,30 @@ OperationRunner 将读回证据交给 Core 核验和消费，数据库提交不�
 Stop/Abandon、冲突拒绝、不可取消批准及集成单席合同不变。
 作用域只选择入口，不能替代准确授权。
 
-业务保存通过 `Storage.transaction` 的进程内 FIFO 取得资格。顺序的线性化点是
-同一普通数据库文件身份（device/inode）的 ticket 登记；同库不同 `Storage` 实例及
-允许的目录别名共用入口，不承诺调用尚未登记时的墙钟顺序，也不承诺跨进程 FIFO。
-Worker 的 Thread/活动/原始返回/退出记录，以及 Core 的工作分配、观察消费、
-正式写意图与读回保存使用这一入口；完整业务操作仍可能包含若干独立短事务。
-ticket 不保存业务正文、权限或待重放闭包，原调用线程取得资格后才打开写连接，
-沿原逻辑重读身份、代次、Stop 栅栏、协议和资源界限，事务体只执行一次。
+业务保存通过同一主SQLite的 `save_admissions` 排序。只承诺**有效登记提交后的顺序**，
+不承诺调用先后或登记前公平；队列只保存不可变UUID、准确Run、clock域、截止与序号，
+不保存业务正文、闭包或执行权。只读查询不登记、不清票。Core工作/集成FIFO职责不变。
+同库不同Storage实例共用这一关系；进程内仅保留重入/after-fork所有权检查，没有第二deque。
 
-生命周期 Action 的 `requeue`、`admit_host`、`control_host`、`stop_task`、
-`abandon_task`、`control`、`configure_profiles`，以及排他初始化 `create` 和
-共享故障撤权 `_retire_failed_executor` 显式使用 `ordered=False`。这些控制入口
-不等待业务 ticket，因此不会在持有 Task/admission 锁时等待业务保存资格；
-它们仍受原 SQLite 写锁、全部校验及原子提交约束，不保证瞬时抢占已开启的事务。
-只读查询不排队。工作/集成 FIFO、控制 Action 和保存 ticket 各有既有职责。
+原资格等待、preflight、登记、轮询和取得writer锁共用原 **1秒**竞争预算，
+业务体至多执行一次；最终进入体前仍检查原截止与取消，这不是事务体或Agent运行时限。
+至少有一次登记COMMIT和一次业务COMMIT，另有只读轮询及必要清票；WAL长读、争锁和
+额外提交的成本仍须实测，不能以单元耗时推导真实跨进程性能。
+全库活动与遗留票合计最多128。控制/Host/撤权和明确Task元数据入口使用原
+`ordered=False`旁路，仍受同一SQLite锁、身份、容量、poison及提交约束，不能抢占已入体事务。
 
-资格等待、preflight 和取得 writer lock 共用从写入口开始的 **1 秒**竞争预算，
-SQLite 连接只接收剩余时间，不在排队后重新增加一秒；这不是事务体、Agent 或
-业务等待窗口的运行期限。每库最多保留 128 个业务 ticket（含当前头部），满额
-或到期在事务体执行前返回 `storage_busy`，不自动重放 Agent、SQL 事务或外部动作。
-该元数据额度不改变材料、查询、数据库或冻结业务 Policy 的容量限制。
+登记COMMIT未知只核原UUID；票缺或不可读不等于未提交，不重新登记或重放业务。
+取消清票仅用原剩余预算，拿不到writer保留主异常与遗留票；已确认业务COMMIT成功
+不能被finally清理或截止改成失败。未知业务写继续沿原intent/receipt恢复。
 
-`cancelled` Event 仅撤销尚未进入事务体的保存等待；Stop 不会笼统丢弃应保留的
-原始返回和退出收口，它们继续由 Core 分别授权。异常、取消、超时均撤销准确 ticket，
-提交/回滚且连接关闭后才释放资格，空闲 registry 项立即移除；fork 子进程重置
-进程内协调对象。同线程嵌套写以 `storage_busy` 拒绝，不复用另一笔事务或改变
-SQL 错误 poison/rollback 合同。等待期间文件身份改变仍拒绝，不接管替换数据库。
+clock来源要求可信原生Linux、本地WAL、同一物理DB同时单kernel及未伪造的proc/队列表。
+每次采样固定 `/proc/thread-self/ns/time` 与 `time_for_children`，两者须相同；
+offsets新开原生procfs有界文件，读取前后重复核验两路径与原pin。
+支持的owner线程及signal回调在请求期间不得变更namespace；端点观察不证明敌对ABA不存在。
+同boot/provider/monotonic offset可比较；可信不同boot的合法 `/2`票只能在原登记事务内
+整体分类后清理。未知域、同boot混offset和未证明绑定的 `/1`票拒绝保留，不猜过期。
+容器重启不等于kernel boot变化。不支持网络WAL、多kernel并写或VM快照回滚。
+**真实namespace、多进程FIFO、重启恢复和成本仍未验收，最终部署/验收仍阻断。**
 
 正常推进与在途结果、取消、真实退出收口分别核验。Stop 已生效、租约已释放或
 旧 Executor 被替换后，原 Invocation 仍可在准确身份、代次、Thread 与 Attempt

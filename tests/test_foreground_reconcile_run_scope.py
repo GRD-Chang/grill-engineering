@@ -3,6 +3,8 @@
 No Host, Worker, namespace, signal, child or external notification is run.
 The observations below are an adapter substitute, not physical exit proof.
 """
+
+from support.repository_fixture import create_kernel
 from contextlib import closing
 from dataclasses import replace
 import sqlite3
@@ -29,7 +31,7 @@ def create_run(path, root, name, parent, *, route=None):
         repository_root=str(root), inputs=fixture_inputs())
     source = Requirements(ParentIssue(parent, 'Parent', 'Frozen requirements'), ())
     if route is None:
-        return Kernel.create_task(path, spec, requirements=source)
+        return create_kernel(path, spec, requirements=source)
     assert route.create(TaskKey(root, route.repository, parent), spec, source).created
     return route.kernel(name)
 
@@ -159,7 +161,7 @@ def test_current_single_run_committed_exit_still_closes_only_original_record(tmp
     with runner_usage_lease(lock):
         _, path = protection(kernel, lock, 'original-action', closed=True)
         before = snapshot(kernel.storage.path)
-        ForegroundHost(environment={}).reconcile_closed(Kernel(kernel.storage.path), lock)
+        ForegroundHost(environment={}).reconcile_closed(Kernel(kernel.storage.path, run_id=kernel.storage.run_id), lock)
         assert not path.exists() and snapshot(kernel.storage.path) == before
     with runner_management_lease(lock):
         pass

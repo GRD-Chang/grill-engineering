@@ -1,4 +1,6 @@
 """Detailed History retains real global facts before the first Attempt."""
+
+from support.repository_fixture import create_kernel
 from dataclasses import replace
 from io import StringIO
 import json
@@ -15,7 +17,7 @@ from support.offline import OfflinePort
 def test_history_details_keep_failure_before_any_attempt_and_original_stop(tmp_path):
     port = OfflinePort.create(tmp_path / "physical")
     spec, _ = port.prepare(DeliveryKind.PARENT_ONLY)
-    kernel = Kernel.create_task(tmp_path / "state" / "kernel.sqlite3", spec,
+    kernel = create_kernel(tmp_path / "state" / "kernel.sqlite3", spec,
                                requirements=Requirements(ParentIssue(1, "Parent", "Scope"), ()))
     execution = kernel.claim_executor("original-history-owner")
     original = OSError("ORIGINAL-GLOBAL-FAILURE before first Attempt")
@@ -25,7 +27,7 @@ def test_history_details_keep_failure_before_any_attempt_and_original_stop(tmp_p
             raise original
     assert raised.value is original
     assert kernel.control("stop", "original-stop") == "applied"
-    document = read(kernel.storage.path, "history")
+    document = read(kernel.storage.path, 'history', storage=kernel.storage)
     assert document.data["history"]["attempts"] == []
     failed, = [event for event in document.data["history"]["events"] if event["kind"] == "executor_failed"]
     assert failed["evidence"]["message"] == str(original)
@@ -36,7 +38,7 @@ def test_history_details_keep_failure_before_any_attempt_and_original_stop(tmp_p
             render(replace(document, language=language), style=style, details=True, stream=output)
             assert str(original) in output.getvalue()
             assert "OSError" in output.getvalue() and "original-stop" in output.getvalue()
-    page = read(kernel.storage.path, "history", after=failed["position"] - 1, limit=1)
+    page = read(kernel.storage.path, 'history', after=failed['position'] - 1, limit=1, storage=kernel.storage)
     assert page.data["history"]["attempts"] == []
     output = StringIO()
     render(page, style="plain", details=True, stream=output)

@@ -64,15 +64,19 @@ OperationRunner 以冻结的 `OperationBinding` 组合真实端口，将观察�
 
 ## 状态与证据
 
-当前唯一支持的状态协议是 **`independent-delivery-kernel-v21`**。
-新 Run 使用受管目录 `repositories/<owner>/<repo>/state/<run_id>/kernel.sqlite3`；
-Task 位置记录位于数据主目录的 `native-task-locations/`，只绑定 Run ID 与数据库路径。
+本开发候选的唯一状态协议是 **`independent-delivery-repository-v22`**；
+尚待同版独立验收，不表示已经部署或验证真实 Host。
+每个受管仓库使用 `repositories/<owner>/<repo>/state/kernel.sqlite3`。
+Task 可先独立持久化为 idle；完整冻结的 Run、必要关系/材料及 `Task.current_run`
+在同一短事务中提交。该数据库是唯一发布与发现权威，不再发布或读取 JSON locator。
 具体事务和读取范围见[状态存储](agents/state-storage.md)，显示归属见[展示事实](agents/display-facts.md)。
 
-旧 JSON/v6、早期 native v17/v18/v19/v20、来源封印和导入状态不升级、不转换、不兼容推进。
-[`storage.preflight`](../src/agent_run/storage/preflight.py) 在读取、写前和写锁内检查支持边界；
-[`storage.admission`](../src/agent_run/storage/admission.py) 只核对旧 Task 占用与拒绝条件。
-这些拒绝检查不提供迁移入口，也不授权删除旧数据库、Candidate 或工作区。
+旧 JSON/v6、native v17–v21、来源封印、导入状态和未激活的仓库实验协议明确拒绝，
+不升级、不转换、不兼容推进。
+[`storage.preflight`](../src/agent_run/storage/preflight.py) 在读取、写前及写锁内核验唯一协议和完整schema；
+[`storage.tasks`](../src/agent_run/storage/tasks.py) 保留原 Task mutex inode 与撤权FD，
+旧JSON位置记录只能阻止新的执行准入，内容不再选择或授权Run。
+这些拒绝检查不提供迁移入口，也不授权删除旧数据库、Candidate、材料或工作区。
 
 原始 Agent 返回落盘与业务消费分别提交。Attempt、Invocation、物理输出、Thread 绑定、
 预算窗口、effects intent/receipt 和历史证据保留准确归属；恢复优先消费已存返回。

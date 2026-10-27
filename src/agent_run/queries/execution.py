@@ -7,7 +7,7 @@ from typing import Any
 
 from agent_run.storage.sqlite import Transaction
 from agent_run.storage.attempts import AttemptRecords
-from agent_run.storage.run_scope import selected_statement, transaction_scope
+from agent_run.storage.run_scope import run_statement, transaction_scope
 
 
 def worker_activity_start(tx: Transaction, subject: str | None, *, position: int | None = None,
@@ -20,26 +20,7 @@ def worker_activity_start(tx: Transaction, subject: str | None, *, position: int
     facts remain unknown. The optional observer trigger is never authority.
     Activity at or after its original Invocation deadline is not a start.
     """
-    sql = (
-        "SELECT a.*,i.id AS invocation_id,i.action_id,o.ordinal AS output_ordinal,o.dispatch_state,o.exit_code,"
-        "w.observed_at AS started_at,w.rowid AS activity_position,w.evidence AS activity_evidence,h.position AS source_position "
-        "FROM invocation_outputs o JOIN invocations i ON i.id=o.invocation "
-        "JOIN attempts a ON a.id=i.attempt JOIN threads t ON t.id=i.thread AND t.subject=a.subject "
-        "JOIN worker_activity w ON w.invocation=o.invocation AND w.ordinal=o.ordinal "
-        "JOIN history h ON h.subject=a.subject AND h.generation=a.generation "
-        "WHERE o.process_identity IS NOT NULL AND o.started_at IS NOT NULL AND w.active=1 "
-        "AND w.observed_at<i.deadline_at "
-        "AND w.rowid=(SELECT min(rowid) FROM worker_activity WHERE invocation=o.invocation AND ordinal=o.ordinal AND active=1) "
-        "AND ((h.kind='worker_active' AND h.identity=o.invocation || ':' || o.ordinal AND h.material_id=w.evidence) "
-        "OR (h.kind='worker_started' AND h.identity=i.id AND h.material_id=o.process_identity "
-        "AND json_extract(h.status,'$.stopped')=0 AND json_extract(h.status,'$.blocked') IS NULL "
-        "AND json_array_length(json_extract(h.status,'$.gates'))=0 AND w.observed_at>=h.created_at "
-        "AND NOT EXISTS (SELECT 1 FROM history n WHERE n.kind='worker_active' AND n.identity=o.invocation || ':' || o.ordinal) "
-        "AND NOT EXISTS (SELECT 1 FROM history c JOIN actions act ON act.id=c.identity "
-        "WHERE c.kind='control_applied' AND c.position>h.position AND c.created_at<=w.observed_at "
-        "AND (act.subject IS NULL OR act.subject=a.subject))))")
-    sql, parameters = selected_statement(tx, sql,
-        "SELECT a.*,i.id AS invocation_id,i.action_id,o.ordinal AS output_ordinal,o.dispatch_state,o.exit_code,"
+    sql, parameters = run_statement(tx, "SELECT a.*,i.id AS invocation_id,i.action_id,o.ordinal AS output_ordinal,o.dispatch_state,o.exit_code,"
         "w.observed_at AS started_at,w.rowid AS activity_position,w.evidence AS activity_evidence,h.position AS source_position "
         "FROM invocation_outputs o JOIN invocations i ON i.run_id=o.run_id AND i.id=o.invocation "
         "JOIN attempts a ON a.run_id=i.run_id AND a.id=i.attempt "
@@ -73,9 +54,7 @@ def worker_activity_start(tx: Transaction, subject: str | None, *, position: int
 
 def activity(tx: Transaction, invocation: str, ordinal: int, subject: str,
              *, until: float | None = None) -> dict[str, Any]:
-    sql = "SELECT * FROM worker_activity WHERE invocation=? AND ordinal=?"
-    sql, parameters = selected_statement(tx, sql,
-        "SELECT * FROM worker_activity WHERE run_id=? AND invocation=? AND ordinal=?", (invocation, ordinal))
+    sql, parameters = run_statement(tx, "SELECT * FROM worker_activity WHERE run_id=? AND invocation=? AND ordinal=?", (invocation, ordinal))
     values = tuple(parameters)
     if until is not None:
         sql += " AND observed_at<=?"
@@ -146,13 +125,9 @@ def execution_facts(tx: Transaction, row: Mapping[str, Any], *, attempt_id: str 
                     whole_run: bool = False) -> dict[str, Any]:
     """Aggregate original allocations through this history record, never process lifetime."""
     scope = transaction_scope(tx)
-    if scope is not None and row.get("run_id") != scope.run_id:
+    if row.get('run_id') != scope.run_id:
         raise ValueError("History belongs to a different Run")
-    sql = ("SELECT i.id,i.attempt,a.subject,a.role,t.role AS binding_role,t.profile_revision,t.subject AS thread_subject "
-           "FROM invocations i JOIN attempts a ON a.id=i.attempt LEFT JOIN threads t ON t.id=i.thread "
-           "WHERE EXISTS (SELECT 1 FROM history h WHERE h.kind='agent_allocated' AND h.identity=i.id AND h.position<=?)")
-    sql, parameters = selected_statement(tx, sql,
-        "SELECT i.id,i.attempt,a.subject,a.role,t.role AS binding_role,t.profile_revision,t.subject AS thread_subject "
+    sql, parameters = run_statement(tx, "SELECT i.id,i.attempt,a.subject,a.role,t.role AS binding_role,t.profile_revision,t.subject AS thread_subject "
         "FROM invocations i JOIN attempts a ON a.run_id=i.run_id AND a.id=i.attempt "
         "LEFT JOIN threads t ON t.run_id=i.run_id AND t.id=i.thread "
         "WHERE i.run_id=? AND EXISTS (SELECT 1 FROM history h WHERE h.run_id=i.run_id "
@@ -168,20 +143,16 @@ def execution_facts(tx: Transaction, row: Mapping[str, Any], *, attempt_id: str 
     for invocation in tx.all(sql + " ORDER BY i.rowid", values):
         profile = (recorded_profile(tx, invocation["profile_revision"])["profiles"].get(invocation["binding_role"], {})
                    if invocation["thread_subject"] == invocation["subject"] else {})
-        outputs = tx.all(*selected_statement(tx, "SELECT * FROM invocation_outputs WHERE invocation=? ORDER BY ordinal",
-            "SELECT * FROM invocation_outputs WHERE run_id=? AND invocation=? ORDER BY ordinal", (invocation["id"],)))
+        outputs = tx.all(*run_statement(tx, "SELECT * FROM invocation_outputs WHERE run_id=? AND invocation=? ORDER BY ordinal", (invocation["id"],)))
         for output in outputs:
-            if output["ordinal"] != outputs[0]["ordinal"] and not tx.rows(*selected_statement(tx,
-                "SELECT position FROM history WHERE kind='output_repair_allocated' AND identity=? AND position<=?",
+            if output["ordinal"] != outputs[0]["ordinal"] and not tx.rows(*run_statement(tx,
                 "SELECT position FROM history WHERE run_id=? AND kind='output_repair_allocated' AND identity=? AND position<=?",
                 (f'{invocation["id"]}:{output["ordinal"]}', row["position"]))):
                 continue
             measured = activity(tx, invocation["id"], output["ordinal"], invocation["subject"], until=row["created_at"])
             if output["exited_at"] is None or output["exited_at"] > row["created_at"]:
                 measured["elapsed_seconds"] = None
-            if (output["dispatch_state"] == "unavailable" and output["started_at"] is None and tx.rows(*selected_statement(tx,
-                "SELECT position FROM history WHERE subject=? AND kind='paused' AND identity='worker_unavailable' "
-                "AND material_id=? AND position<=? LIMIT 1",
+            if (output["dispatch_state"] == "unavailable" and output["started_at"] is None and tx.rows(*run_statement(tx,
                 "SELECT position FROM history WHERE run_id=? AND subject=? AND kind='paused' AND identity='worker_unavailable' "
                 "AND material_id=? AND position<=? LIMIT 1",
                 (invocation["subject"], output["start_evidence"], row["position"])))):

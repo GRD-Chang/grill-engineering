@@ -82,7 +82,7 @@ def test_long_checks_window_survives_unknown_restart_and_late_success(tmp_path, 
     kernel, subject = scenario.kernel, scenario.delivery.key
     kernel.clock = lambda: 100.25
     assert scenario.run().reason == "required_checks"
-    original = read(kernel.storage.path, "status").data["supervision_windows"][0]
+    original = read(kernel.storage.path, 'status', storage=kernel.storage).data["supervision_windows"][0]
     assert (original["started_at"], original["deadline"]) == (100.25, 7300.25)
     before = kernel.status(subject)
     role_count = len(scenario.role_calls)
@@ -98,13 +98,13 @@ def test_long_checks_window_survives_unknown_restart_and_late_success(tmp_path, 
     UserDefaultsStore().configure(policy={"required_checks_wait_seconds": "3h"})
     kernel.clock = lambda: 2801.25  # Beyond the old fixed 45 minutes.
     assert operations.once().kind == "waiting"
-    retained = read(kernel.storage.path, "status").data["supervision_windows"][0]
+    retained = read(kernel.storage.path, 'status', storage=kernel.storage).data["supervision_windows"][0]
     assert (retained["scope_id"], retained["deadline"]) == (original["scope_id"], 7300.25)
-    reopened = Kernel(kernel.storage.path)
+    reopened = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     reopened.clock = lambda: 7300.25
     operations = CoreOperations(reopened, scenario.execution, lambda binding: ports)
     assert operations.once().reason == "supervision_timeout"
-    timeout = read(kernel.storage.path, "status").data["supervision_windows"][0]["timeout"]
+    timeout = read(kernel.storage.path, 'status', storage=kernel.storage).data["supervision_windows"][0]["timeout"]
     assert timeout["budget_seconds"] == 7200
     assert reopened.status(subject)["budgets"] == before["budgets"]
     assert scenario.port.writes() == writes
@@ -142,7 +142,7 @@ def test_sibling_progress_does_not_renew_wait_and_stop_cannot_start_repair(tmp_p
     scenario.checks[:] = ["pending"]
     scenario.kernel.clock = lambda: 100
     assert scenario.run().reason == "required_checks"
-    first = read(scenario.kernel.storage.path, "status").data["supervision_windows"][0]
+    first = read(scenario.kernel.storage.path, 'status', storage=scenario.kernel.storage).data["supervision_windows"][0]
     scenario.kernel.clock = lambda: 110
     for _ in range(60):
         scenario.step()
@@ -150,7 +150,7 @@ def test_sibling_progress_does_not_renew_wait_and_stop_cannot_start_repair(tmp_p
             break
     else:
         raise AssertionError("Sibling did not finish independent development and review")
-    windows = read(scenario.kernel.storage.path, "status").data["supervision_windows"]
+    windows = read(scenario.kernel.storage.path, 'status', storage=scenario.kernel.storage).data["supervision_windows"]
     assert len(windows) == 1  # The first Ticket correctly owns the single integration seat.
     assert (windows[0]["scope_id"], windows[0]["deadline"]) == (first["scope_id"], 220)
     assert scenario.kernel.status("ticket:2")["holds_integration"]
@@ -173,7 +173,7 @@ def test_sibling_progress_does_not_renew_wait_and_stop_cannot_start_repair(tmp_p
     scenario.kernel.clock = lambda: 120
     for _ in range(100):
         scenario.step()
-        windows = read(scenario.kernel.storage.path, "status").data["supervision_windows"]
+        windows = read(scenario.kernel.storage.path, 'status', storage=scenario.kernel.storage).data["supervision_windows"]
         if any(w["subject"] == "ticket:3" and w["kind"] == "required_checks" for w in windows):
             break
     else:
@@ -210,7 +210,7 @@ def test_budget_checkpoint_explicit_wait_override_only_changes_future_windows(tm
     scenario.reviews[:] = ["pass"]
     kernel.clock = lambda: 100
     assert scenario.run().reason == "required_checks"
-    window, = read(kernel.storage.path, "status").data["supervision_windows"]
+    window, = read(kernel.storage.path, 'status', storage=kernel.storage).data["supervision_windows"]
     assert (window["started_at"], window["deadline"]) == (100, 7300)
     assert kernel.status(subject)["budgets"]["requirements"]["window"] == 2
 
@@ -274,7 +274,7 @@ def test_expired_checks_resume_changes_only_future_wait_and_serializes_actions(t
         assert len(tx.rows("SELECT * FROM actions WHERE id IN ('new-ci-window-a','new-ci-window-b')")) == 1
     kernel.clock = lambda: 200
     assert scenario.run().reason == "required_checks"
-    window, = read(kernel.storage.path, "status").data["supervision_windows"]
+    window, = read(kernel.storage.path, 'status', storage=kernel.storage).data["supervision_windows"]
     assert (window["started_at"], window["deadline"]) == (200, 7400)
     with kernel.storage.transaction(write=False) as tx:
         assert tx.get(original_timeout_id, subject) == original_timeout

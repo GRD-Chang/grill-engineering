@@ -1,9 +1,8 @@
-"""Explicit opening and repository metadata routing on the one Storage owner.
+"""Canonical repository metadata routing on the one Storage owner.
 
-Public switching is CLOSED. No environment/CLI option changes this constant.
-The staged route accepts only the unactivated marker and exact owned schema;
-public Storage/Kernel/queries continue refusing that marker. Final activation
-requires the complete caller map, explicit Host argv, FIFO and refusal proofs.
+The sole public protocol always selects an exact Run. Metadata access is a
+separate explicit role, never an alternate schema or implicit Run inference.
+No migration, fallback initialization or JSON publication is provided.
 """
 from __future__ import annotations
 
@@ -13,7 +12,7 @@ import sqlite3
 import os
 import stat
 from pathlib import Path
-from typing import Final, Literal, TYPE_CHECKING
+from typing import Literal, TYPE_CHECKING
 
 from agent_run.contracts.repository import normalize_repository
 from agent_run.contracts.task import TaskKey
@@ -30,24 +29,17 @@ if TYPE_CHECKING:
     from agent_run.queries.run import QueryDocument
 
 
-REPOSITORY_PUBLIC_READY: Final = False
-
 
 def open_run(database: Path, *, run_id: str | None = None, storage: Storage | None = None) -> Storage:
-    """Open publicly, or carry an explicit existing internal selection unchanged.
-
-    Supplying an owned handle is not protocol discovery or an activation flag.
-    It must name this exact database/Run; callers never substitute a root handle
-    after failure. A staged handle is supplied only by RepositoryRoute.at_run.
-    """
+    """One public protocol with an exact Run or an already-selected owner."""
     if storage is not None:
-        if storage.path.absolute() != database.absolute() or run_id is not None and storage.run_id != run_id:
+        if (storage.path.absolute() != database.absolute() or storage.run_id is None
+                or run_id is not None and storage.run_id != run_id):
             raise KernelError("run_scope_changed")
         return storage
-    if REPOSITORY_PUBLIC_READY:
-        # Flipping a boolean alone must not activate half the consumer chain.
-        raise KernelError("repository_activation_incomplete")
-    return Storage(database, run_id=run_id) if run_id is not None else Storage(database)
+    if type(run_id) is not str or not run_id:
+        raise KernelError("run_scope_required")
+    return Storage(database, run_id=run_id)
 
 
 @dataclass(frozen=True)
@@ -75,7 +67,7 @@ class RunPage:
 
 @dataclass(frozen=True)
 class RepositoryRoute:
-    """INTERNAL staged route from an already validated managed workspace.
+    """Repository route from an validated managed workspace.
 
     Caller supplies workspace.state_root/'kernel.sqlite3', repository_root and
     repository from that workspace's trusted metadata, outside any transaction.
@@ -102,7 +94,7 @@ class RepositoryRoute:
         database = database.absolute()
         if not database.exists() and not database.is_symlink():
             cls._require_vacant_root(database)
-        with Storage._repository(database).transaction(write=False) as owner:
+        with Storage.metadata(database).transaction(write=False) as owner:
             row = owner.one("SELECT repository,repository_root FROM repository_binding WHERE singleton=1")
             route = cls(database, Path(row["repository_root"]), row["repository"])
             if (row["repository"], row["repository_root"]) != (route.repository, str(route.repository_root)):
@@ -118,7 +110,8 @@ class RepositoryRoute:
     def metadata(self) -> Storage:
         if not self.database.exists() and not self.database.is_symlink():
             self._require_vacant_root(self.database)
-        return Storage._repository(self.database,
+            raise UnsupportedState(self.database, "unreadable_state")
+        return Storage.metadata(self.database,
             namespace=(self.repository, str(self.repository_root)))
 
     @staticmethod
@@ -148,8 +141,7 @@ class RepositoryRoute:
     def initialize(self) -> Storage:
         """Explicit exclusive initialization only, never a read-error repair."""
         self._require_vacant_root(self.database)
-        Storage.create(self.database, _repository=True,
-            _namespace=(self.repository, str(self.repository_root)))
+        Storage.create(self.database, namespace=(self.repository, str(self.repository_root)))
         return self.metadata()
 
     def _task(self, task: TaskKey) -> None:
@@ -203,6 +195,9 @@ class RepositoryRoute:
         from agent_run.core.kernel import Kernel
         from agent_run.storage.run_scope import RunTransaction
         self._task(task)
+        if not self.database.exists() and not self.database.is_symlink():
+            self._require_vacant_root(self.database)
+            return None
         metadata = self.metadata()
         with metadata.transaction(write=False) as owner:
             row = read_repository_task(owner, task)

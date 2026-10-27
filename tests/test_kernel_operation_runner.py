@@ -1,4 +1,6 @@
 """Public Core operation seam: selection, bounded I/O and durable settlement."""
+
+from support.repository_fixture import create_kernel
 from support.core_operations import prepare_scripted_agent
 from agent_run.core.operation_runner import OperationRunner, observe_control
 from agent_run.contracts.write_authority import WriteAuthority
@@ -66,7 +68,7 @@ def test_readonly_selection_pages_130_tickets_without_allocating(tmp_path: Path,
                                  f"refs/heads/ticket-{n}", "refs/heads/run") for n in numbers)
     deliveries += (Delivery("final:1", DeliveryKind.FINAL_RUN, 1, "untrusted", base,
                             "refs/heads/run", "refs/heads/main"),)
-    kernel = Kernel.create(tmp_path / "kernel.sqlite3", RunSpec("large-run", "example/project", 1,
+    kernel = create_kernel(tmp_path / "kernel.sqlite3", RunSpec("large-run", "example/project", 1,
         "untrusted", "untrusted", deliveries, Policy(concurrency=1)), requirements=source)
     before = kernel.history("ticket:2")
     state = kernel.operation_state()
@@ -224,7 +226,7 @@ def test_read_outage_poll_and_restart_keep_original_deadline(tmp_path):
     ports.source = unavailable
     assert runner.run_once().retry_at == 105.25
     assert runner.state().disposition == "waiting"
-    s.kernel = Kernel(s.kernel.storage.path)
+    s.kernel = Kernel(s.kernel.storage.path, run_id=s.kernel.storage.run_id)
     s.kernel.clock = lambda: now[0]
     runner = OperationRunner(s.kernel, s.execution, lambda binding: ports)
     now[0] = 700.25
@@ -318,7 +320,7 @@ def test_ready_fifo_is_preserved_while_host_has_no_new_agent_slot(tmp_path):
         raise AssertionError("ready Ticket never retained its FIFO position")
     assert s.kernel.status("ticket:4")["budgets"] == before
     settle_agent(s, runner, first.call)
-    s.kernel = Kernel(s.kernel.storage.path)
+    s.kernel = Kernel(s.kernel.storage.path, run_id=s.kernel.storage.run_id)
     runner = OperationRunner(s.kernel, s.execution, lambda binding: ports)
     second = drive_until(s, runner, lambda step: step.call is not None)
     assert second.call.subject == "ticket:4"
@@ -337,7 +339,7 @@ def test_explicit_approval_poll_observes_target_append_without_background_pollin
     budgets = s.kernel.status("parent:1")["budgets"]
     s.port.external_remote_append(s.delivery.target_ref, {"external.txt": "Original external work"}, "append")
     assert runner.run_once().kind == "paused"
-    data = read(s.kernel.storage.path, "status").data
+    data = read(s.kernel.storage.path, 'status', storage=s.kernel.storage).data
     assert data["subjects"][0]["integration_resync"]["limit"] == 0 and data["subjects"][0]["integration_resync"]["used"] == 0
     assert data["subjects"][0]["integration_resync"]["window"] == 1 and data["subjects"][0]["integration_resync"]["open"] is False
     action = next(item for item in data["operator_actions"] if item["reason"] == "integration_resync_exhausted")
@@ -345,7 +347,7 @@ def test_explicit_approval_poll_observes_target_append_without_background_pollin
     assert s.kernel.status("parent:1")["budgets"] == budgets
     s.kernel.control("resume", "explicit-zero-resync-resume", subject="parent:1")
     assert runner.run_once().kind == "paused"
-    resumed = read(s.kernel.storage.path, "status").data["subjects"][0]["integration_resync"]
+    resumed = read(s.kernel.storage.path, 'status', storage=s.kernel.storage).data["subjects"][0]["integration_resync"]
     assert resumed["limit"] == 0 and resumed["used"] == 0
     assert resumed["window"] == 1 and resumed["open"] is False
     assert s.kernel.status("parent:1")["budgets"] == budgets

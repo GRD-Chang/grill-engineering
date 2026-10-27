@@ -169,7 +169,7 @@ def test_wrong_squash_message_cannot_complete_or_repeat_the_original_merge(tmp_p
         assert receipt["raw"]["commit_message"] == payload["commit_message"] + "\n\n"
     assert receipt["commit"]["sha"] == scenario.port.remote_commit(scenario.delivery.target_ref).sha
     before = scenario.port.writes()
-    scenario.kernel = Kernel(scenario.kernel.storage.path)
+    scenario.kernel = Kernel(scenario.kernel.storage.path, run_id=scenario.kernel.storage.run_id)
     with pytest.raises(KernelError, match="foreign_merge_receipt"):
         scenario.step()
     assert scenario.kernel.status(scenario.delivery.key)["pending_write"] == pending
@@ -223,7 +223,7 @@ def test_missing_full_message_stays_unknown_until_resume_reads_original_merge(tm
     assert len([w for w in scenario.port.writes() if w["operation"] == "merge"]) == 1
     assert scenario.port.objects.issue(scenario.delivery.issue)["state"] == "open"
     missing[0] = False
-    scenario.kernel = Kernel(scenario.kernel.storage.path)
+    scenario.kernel = Kernel(scenario.kernel.storage.path, run_id=scenario.kernel.storage.run_id)
     scenario.kernel.clock = lambda: now[0]
     assert scenario.kernel.control("resume", "read-original-merge", subject=scenario.delivery.key) == "applied"
     assert scenario.run().kind == "complete"

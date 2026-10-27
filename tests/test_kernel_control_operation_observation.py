@@ -439,7 +439,7 @@ output=io.StringIO()
 with redirect_stdout(output):code=main(sys.argv[2:])
 control=json.loads(output.getvalue())
 if code:print(json.dumps({'control':control}));raise SystemExit(code)
-kernel=Kernel(Path(sys.argv[sys.argv.index('--state-dir')+1]))
+kernel=Kernel(Path(sys.argv[sys.argv.index('--state-dir')+1]),run_id=control['run_id'])
 request=kernel.host_request(control['action_id'])
 response=manager_root/'manager-response.json';state=json.loads(response.read_text())
 state['fields'].update(Id=request.unit_name,Description=request.description,InvocationID=request.nonce,

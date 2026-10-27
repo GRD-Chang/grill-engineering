@@ -49,7 +49,7 @@ def test_foreground_admission_is_frozen_stop_fences_and_null_exit_does_not_becom
     exited = replace(running, disposition='exited', exit_status=None, ended_at=kernel.clock(),
                      usage_ready=False, usage_released=True, exit_evidence='same_observer_init_exit')
     assert kernel.observe_host(request, exited) == 'exited'
-    assert Kernel(kernel.storage.path).host_usage('launch').exit_status is None
+    assert Kernel(kernel.storage.path, run_id=kernel.storage.run_id).host_usage('launch').exit_status is None
     resumed = kernel.admit_host('resume', **{**args, 'kind': 'resume'})
     assert resumed.owner != request.owner and resumed.epoch > request.epoch
     with kernel.storage.transaction(write=False) as tx:
@@ -119,12 +119,12 @@ def test_fresh_observer_consumes_persisted_exact_exit_without_reopening_reaped_p
         assert manager.observe(kernel, request, lock).disposition == 'unknown'
         assert kernel.active_host_action() is None and path.exists()
         monkeypatch.setattr(foreground_host, '_remove_record', remove)
-        manager.reconcile_closed(Kernel(kernel.storage.path), lock)
+        manager.reconcile_closed(Kernel(kernel.storage.path, run_id=kernel.storage.run_id), lock)
         observed = manager.observe(kernel, request, lock)
         assert observed.disposition == 'exited' and observed.exit_status == 7 and observed.usage_released
         assert observed.namespace_exit_status == -9 and observed.exit_evidence == 'retained_namespace_pidfd'
         assert not path.exists()
-        assert manager.observe(Kernel(kernel.storage.path), request, lock) == observed
+        assert manager.observe(Kernel(kernel.storage.path, run_id=kernel.storage.run_id), request, lock) == observed
     with runner_management_lease(lock):pass
 
 

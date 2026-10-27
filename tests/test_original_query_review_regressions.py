@@ -10,5 +10,5 @@ def test_native_page_control_records_keep_the_recorded_order(tmp_path):
     for kind, identity in zip(['stop', 'resume', 'stop', 'resume'], actions):
         kernel.control(kind, identity, subject='ticket:2')
     before = _bytes(tmp_path)
-    assert [row['id'] for row in read(kernel.storage.path, 'history').data['history']['actions']] == actions
+    assert [row['id'] for row in read(kernel.storage.path, 'history', storage=kernel.storage).data['history']['actions']] == actions
     assert _bytes(tmp_path) == before

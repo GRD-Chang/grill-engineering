@@ -1,4 +1,6 @@
 """Remote effects through real bare Git and an isolated stateful gh executable."""
+
+from support.repository_fixture import create_kernel
 from support.core_operations import prepare_scripted_agent
 
 from agent_run.contracts.write_authority import WriteAuthority
@@ -417,7 +419,7 @@ def test_real_issue_ack_stays_optional_and_once_across_kernel_reopen(tmp_path, m
                 settle_agent(scenario, runner, step.call)
         raise AssertionError("original Ticket did not complete with mandatory cleanup")
     finish_ticket()
-    durable = Kernel(scenario.kernel.storage.path)
+    durable = Kernel(scenario.kernel.storage.path, run_id=scenario.kernel.storage.run_id)
     assert durable.status("ticket:2")["phase"] == "complete"
     assert durable.status("ticket:2")["issue_link"]["state"] == {"ack-lost": "indeterminate", "acknowledged": "linked", "unavailable": "unavailable"}[mode]
     before_roles = list(scenario.role_calls)
@@ -486,7 +488,7 @@ def _source_kernel(tmp_path, port, push):
                             {"source": "host"}, {"source": "host"}, {"enabled": False}, {"source": "explicit-test"})
     spec = RunSpec("source-run", port.repository, 1, "not-parent", "not-graph", (job,),
                    language="en", repository_root=str(port.root.resolve()), inputs=inputs)
-    return Kernel.create(tmp_path / "source.sqlite3", spec, requirements=source)
+    return create_kernel(tmp_path / "source.sqlite3", spec, requirements=source)
 
 
 def test_observe_uses_real_requirements_remote_commits_and_required_ci_facts(tmp_path, monkeypatch):

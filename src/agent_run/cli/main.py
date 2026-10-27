@@ -184,37 +184,26 @@ def main(arguments: Sequence[str] | None = None, *, repository_routes: Sequence[
     except SystemExit as error:
         return int(error.code) if isinstance(error.code, int) else 2
     try:
-        if repository_routes is not None:
-            from agent_run.storage import routing
-            selected_settings = parsed.command == "settings" and parsed.settings_command == "show" and (
-                parsed.run_id is not None or parsed.parent is not None)
-            uses_repository = parsed.command in {"configure", "config", "profile", "run", "resume", "approve",
-                "requeue", "revise", "stop", "abandon", "runs", "status", "history"} or selected_settings or (
-                parsed.command == "doctor" and parsed.run_id is not None)
-            if uses_repository and not routing.REPOSITORY_PUBLIC_READY:
-                raise KernelError("repository_activation_incomplete")
         if parsed.command in {"configure", "config", "profile"}:
             from agent_run.cli import profiles as run_profile_cli
-            options: dict[str, Any] = {} if repository_routes is None else {"repository_routes": repository_routes}
-            return run_profile_cli.execute(parsed, **options)
+            return run_profile_cli.execute(parsed, repository_routes=repository_routes)
         if parsed.command == "prompts":
             from agent_run.cli import prompts as prompt_cli
             return prompt_cli.execute(parsed)
         if parsed.command in {"run", "resume", "approve", "requeue", "revise", "stop", "abandon"}:
             from agent_run.cli.lifecycle import execute
-            if repository_routes is None:
-                output = execute(parsed, language=language)
-            else:
+            route = None
+            if repository_routes is not None:
                 if parsed.command == "run":
                     repository = cli_selection._repository(parsed.repo) if parsed.repo else cli_selection._cwd_repository()
-                    matches = [route for route in repository_routes if route.repository == repository]
+                    matches = [item for item in repository_routes if item.repository == repository]
                     if len(matches) != 1:
                         raise QueryError("run_locator_conflict", "Select one exact managed repository")
-                    selected_route = matches[0]
+                    route = matches[0]
                 else:
                     selection = cli_selection.control_selection(parsed, language=language)
-                    selected_route, _ = cli_selection.repository_target(selection, repository_routes)
-                output = execute(parsed, language=language, repository_route=selected_route)
+                    route, _ = cli_selection.repository_target(selection, repository_routes)
+            output = execute(parsed, language=language, repository_route=route)
             language = output.pop("language", language)
             if parsed.as_json:
                 print(json.dumps(output, ensure_ascii=False, sort_keys=True))
@@ -228,48 +217,23 @@ def main(arguments: Sequence[str] | None = None, *, repository_routes: Sequence[
             frozen = None
             if parsed.run_id is not None:
                 parsed.parent = None
-                if repository_routes is None:
-                    candidate = cli_selection._select(parsed, cli_selection._candidates(parsed))[0]
-                    frozen = read(Path(candidate["database"]), "settings", expected_run=candidate["run_id"],
-                                  expected_repository=candidate["repository"].lower()).data
-                    parsed.repo = candidate["repository"]
-                else:
-                    route, location = cli_selection.repository_target(parsed, repository_routes)
-                    frozen = read(location.database, "settings", expected_run=location.run_id,
-                        expected_repository=location.task.repository, storage=route.at_run(location.run_id)).data
-                    parsed.repo = location.task.repository
+                routes = repository_routes if repository_routes is not None else cli_selection.managed_repository_routes(parsed)
+                route, location = cli_selection.repository_target(parsed, routes)
+                frozen = route.read(location.run_id, "settings").data
+                parsed.repo = location.task.repository
             return diagnose(as_json=parsed.as_json, local=parsed.local, online=parsed.online,
                             mode=parsed.mode, repository=parsed.repo, frozen=frozen)
         if parsed.command == "settings":
             if parsed.settings_command == "show" and (parsed.run_id is not None or parsed.parent is not None):
-                if repository_routes is None:
-                    candidate = cli_selection._select(parsed, cli_selection._candidates(parsed))[0]
-                    if candidate.get("language") in {"zh", "en"}:
-                        language = candidate["language"]
-                    document = read(Path(candidate["database"]), "settings", expected_run=candidate["run_id"],
-                                    expected_repository=candidate["repository"].lower())
-                else:
-                    document = _repository_query(parsed, repository_routes, language)
-                settings = dict(document.data)
-                language = document.language
+                routes = repository_routes if repository_routes is not None else cli_selection.managed_repository_routes(parsed)
+                document = _repository_query(parsed, routes, language)
+                settings, language = dict(document.data), document.language
             else:
                 settings = personal_settings.execute(parsed)
             render_settings(settings, as_json=parsed.as_json, stream=sys.stdout)
             return 0
-        if repository_routes is not None:
-            document = _repository_query(parsed, repository_routes, language)
-        elif parsed.command == "runs":
-            selected = cli_selection._select(parsed, cli_selection._candidates(parsed))
-            document = QueryDocument("runs", language, {"result": "runs", "runs": selected})
-        else:
-            selected = cli_selection._select(parsed, cli_selection._candidates(parsed))
-            candidate = selected[0]
-            if candidate.get("language") in {"zh", "en"}:
-                language = candidate["language"]
-            kind: Literal["history", "status"] = "history" if parsed.command == "history" else "status"
-            document = read(Path(candidate["database"]), kind,
-                            after=getattr(parsed, "after", 0), limit=getattr(parsed, "limit", None),
-                            expected_run=candidate["run_id"], expected_repository=candidate["repository"].lower())
+        routes = repository_routes if repository_routes is not None else cli_selection.managed_repository_routes(parsed)
+        document = _repository_query(parsed, routes, language)
         style: Literal["json", "rich", "plain"] = "json" if parsed.as_json else "rich" if (not getattr(parsed, "plain", False)
                 and "NO_COLOR" not in os.environ and os.environ.get("TERM", "").lower() != "dumb"
                 and sys.stdout.isatty()) else "plain"

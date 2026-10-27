@@ -4,7 +4,6 @@ Only business writes queue. Explicit control writes share SQLite's existing
 arbitration. Tickets contain no business facts; the original caller executes
 the original transaction once, revalidating authority after its turn arrives.
 """
-from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 import json
@@ -13,7 +12,7 @@ import math
 import os
 from pathlib import Path
 import stat
-from threading import Condition, Event, Lock, get_ident
+from threading import Event, Lock, get_ident
 from time import get_clock_info, monotonic
 from typing import Any, Callable, Iterator, Literal, TYPE_CHECKING
 from uuid import UUID, uuid4
@@ -29,25 +28,13 @@ WRITE_CONTENTION_SECONDS = 1.0
 MAX_PENDING_WRITES = 128  # Includes the active business save, never its payload.
 
 
-class _Ticket:
-    def __init__(self) -> None:
-        self.owner = get_ident()
-        self.active = False
-
-
-class _Gate:
-    def __init__(self) -> None:
-        self.queue: deque[_Ticket] = deque()
-        self.requests: set[_Ticket] = set()
-
-
-_condition = Condition(Lock())
-_gates: dict[tuple[int, int], _Gate] = {}
+_owner_lock = Lock()
+_owners: dict[tuple[int, int], set[int]] = {}
 
 
 def _after_fork() -> None:
-    global _condition, _gates
-    _condition, _gates = Condition(Lock()), {}
+    global _owner_lock, _owners
+    _owner_lock, _owners = Lock(), {}
 
 
 os.register_at_fork(after_in_child=_after_fork)
@@ -77,42 +64,26 @@ def check_cancelled(cancelled: Event | None) -> None:
 
 
 @contextmanager
-def save_turn(path: Path, *, ordered: bool, deadline: float,
-              cancelled: Event | None) -> Iterator[tuple[int, int]]:
-    identity, ticket = database_identity(path), _Ticket()
-    gate: _Gate | None = None
+def write_owner(path: Path, *, deadline: float, cancelled: Event | None) -> Iterator[tuple[int, int]]:
+    """Local reentry/after-fork guard only; SQLite owns save ordering and capacity."""
+    identity, owner, process = database_identity(path), get_ident(), os.getpid()
+    registered: set[int] | None = None
     try:
-        with _condition:
-            gate = _gates.get(identity)
-            if gate is None:
-                gate = _Gate()
-                _gates[identity] = gate
-            if any(item.owner == ticket.owner and item.active for item in gate.requests):
+        with _owner_lock:
+            check_cancelled(cancelled)
+            remaining(deadline)
+            if owner in _owners.get(identity, ()):
                 raise KernelError("storage_busy", "Nested writes to the same database are not supported")
-            if ordered and len(gate.queue) >= MAX_PENDING_WRITES:
-                raise KernelError("storage_busy", "SQLite save admission is full; retry the command")
-            gate.requests.add(ticket)
-            if ordered:
-                gate.queue.append(ticket)
-            while True:
-                check_cancelled(cancelled)
-                seconds = remaining(deadline)
-                if not ordered or gate.queue[0] is ticket:
-                    ticket.active = True
-                    break
-                _condition.wait(min(seconds, 0.05) if cancelled is not None else seconds)
+            registered = _owners.setdefault(identity, set())
+            registered.add(owner)
         yield identity
     finally:
-        if gate is not None:
-            with _condition:
-                gate.requests.discard(ticket)
-                try:
-                    gate.queue.remove(ticket)
-                except ValueError:
-                    pass
-                if not gate.requests and _gates.get(identity) is gate:
-                    del _gates[identity]
-                _condition.notify_all()
+        if registered is not None and os.getpid() == process:
+            with _owner_lock:
+                if _owners.get(identity) is registered:
+                    registered.remove(owner)
+                    if not registered:
+                        del _owners[identity]
 
 
 class SaveNotHead(RuntimeError):

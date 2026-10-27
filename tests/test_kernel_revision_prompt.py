@@ -1,4 +1,6 @@
 """A real managed revision reaches each allocated role's rendered instructions."""
+
+from support.repository_fixture import create_kernel
 from pathlib import Path
 
 import pytest
@@ -27,7 +29,7 @@ def test_managed_revision_feedback_reaches_real_development_review_and_publicati
     spec = freeze_creation(scenario.spec, defaults, prompt_resources=builtin_resources("en"))
     # Freeze creation before any operation; preserve the real Ticket history
     # and Completion when the same admitted Host later reaches Final.
-    scenario.kernel = Kernel.create(tmp_path / "state" / "kernel.sqlite3", spec, requirements=source)
+    scenario.kernel = create_kernel(tmp_path / "state" / "kernel.sqlite3", spec, requirements=source)
     kernel = scenario.kernel
     request = kernel.admit_host("start", kind="run", command=("native-host",),
                                 environment_carrier=tmp_path / "carrier", preflight=lambda: None)

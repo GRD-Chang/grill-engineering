@@ -1,15 +1,6 @@
-"""Staged Run-owned relations for the repository database transition.
+"""One Run-owned relational schema per managed repository, no migration reader."""
 
-Not selected by public Storage admission, protocol discovery, CLI or Host launch. The
-current protocol remains untouched until all Run consumers, Task publication
-and per-Run artifacts have moved together. This definition will replace the
-existing schema at that single activation point, never run beside it as a
-second writable authority or serve as an old-protocol migration path.
-"""
-
-# Development-only admission marker, never accepted by the public protocol.
-# Final protocol selection waits all producers/consumers and refusal gates.
-STAGED_REPOSITORY_PROTOCOL = "independent-delivery-repository-unactivated"
+PROTOCOL = "independent-delivery-repository-v22"
 
 REPOSITORY_RUN_SCHEMA = """
 CREATE TABLE meta (protocol TEXT NOT NULL);
@@ -655,7 +646,7 @@ CREATE INDEX source_observation_run_page ON source_observations(run_id,sequence)
 CREATE INDEX history_run_page ON history(run_id,position);
 """
 
-# Additive Task layer of the SAME inactive repository database. Earlier
+# Additive Task layer of the SAME repository database. Earlier
 # Run-domain fixtures intentionally use the Run-only foundation above; neither
 # definition is selected by public Storage/CLI/Host until activation is complete.
 REPOSITORY_TASK_SCHEMA = """
@@ -728,7 +719,7 @@ BEGIN SELECT RAISE(ABORT,'repository namespace mismatch'); END;
 
 
 def repository_schema_objects() -> dict[tuple[str, str], str]:
-    """Exact owned DDL for staged admission; parse only, never execute a model."""
+    """Exact owned DDL for protocol admission; parse only, never execute a model."""
     import re
     import sqlite3
     result: dict[tuple[str, str], str] = {}
@@ -740,9 +731,9 @@ def repository_schema_objects() -> dict[tuple[str, str], str]:
         sql = statement.strip().removesuffix(";").strip()
         match = re.fullmatch(r"CREATE (?:UNIQUE )?(TABLE|INDEX|TRIGGER) (\w+)[\s\S]*", sql)
         if match is None:
-            raise RuntimeError("Unrecognized staged schema declaration")
+            raise RuntimeError("Unrecognized schema declaration")
         result[(match[1].lower(), match[2])] = sql
         statement = ""
     if statement.strip():
-        raise RuntimeError("Incomplete staged schema declaration")
+        raise RuntimeError("Incomplete schema declaration")
     return result

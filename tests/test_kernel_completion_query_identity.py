@@ -21,7 +21,7 @@ def _create_task(workspace, identity, parent, language="zh"):
         Commit("base", "tree"), "refs/heads/source", "refs/heads/main")
     spec = RunSpec(identity, workspace.repository, parent, "parent", "graph", (delivery,),
                    repository_root=str(workspace.repository_root), language=language, inputs=fixture_inputs())
-    return Kernel.create_task(workspace.state_root / str(parent) / "kernel.sqlite3", spec,
+    return Kernel.create_task(workspace.state_root / "kernel.sqlite3", spec,
                               requirements=Requirements(ParentIssue(parent, "Parent", "Scope"), ()))
 
 

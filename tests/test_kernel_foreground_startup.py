@@ -21,7 +21,7 @@ def test_real_namespace_startup_failure_retires_original_admission(tmp_path, mon
     lock = tmp_path / 'install.lock'
     environment = dict(os.environ)
     arguments = ((sys.executable, '-I', '-c', 'raise SystemExit(23)') if boundary == 'before-hello'
-                 else command(kernel.storage.path, 'launch', lock, environment))
+                 else command(kernel.storage.path, 'launch', lock, environment, run_id=kernel.run_paths().run_id))
     manager = ForegroundHost(environment=environment)
     request = kernel.admit_host('launch', kind='run', command=arguments,
         environment_carrier=tmp_path / 'carrier', preflight=manager.preflight, backend='foreground')

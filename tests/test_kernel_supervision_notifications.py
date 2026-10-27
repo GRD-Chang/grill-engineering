@@ -38,7 +38,7 @@ def test_before_final_timeout_uses_one_original_global_notification_and_resume(t
         return {"outcome": "success", "reason": None}
 
     def observe():
-        observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport)
+        observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
         observer.close()
         assert observer.failure_reason is None
         return outbox.read_notifications(tmp_path, scenario.spec.run_id)

@@ -20,7 +20,7 @@ from agent_run.errors import KernelError
     )
 ] + [(sqlite3.ProgrammingError, sqlite3.SQLITE_BUSY)])
 def test_transaction_classifies_only_supported_native_busy_codes(tmp_path, monkeypatch, exception, code):
-    native = Storage.create(tmp_path / 'state.sqlite3')
+    native = Storage.create(tmp_path / 'state.sqlite3', namespace=('example/project', str(tmp_path.resolve())))
     error = exception('database is locked' if code not in {5, 261, 517, 773} else 'opaque native detail')
     if code is not None:
         error.sqlite_errorcode = code
@@ -52,7 +52,7 @@ def test_transaction_classifies_only_supported_native_busy_codes(tmp_path, monke
     monkeypatch.setattr(sqlite3, 'connect', open_connection)
     busy = exception is sqlite3.OperationalError and code in {5, 261, 517, 773}
     with pytest.raises(KernelError if busy else exception) as failed:
-        with native.transaction():
+        with native.transaction(ordered=False):
             pytest.fail('A rejected BEGIN must not execute its business body')
     if busy:
         assert failed.value.code == 'storage_busy' and failed.value.__cause__ is error
@@ -70,7 +70,7 @@ def _durable_bytes(path: Path) -> dict[str, bytes]:
 
 
 def test_latest_producer_state_and_wal_are_not_modified_by_preflight(tmp_path: Path) -> None:
-    native = Storage.create(tmp_path / 'latest' / 'kernel.sqlite3')
+    native = Storage.create(tmp_path / 'latest' / 'kernel.sqlite3', namespace=('example/project', str(tmp_path.resolve())))
     with native.transaction(write=False):
         # Normal SQLite maintenance while a reader holds its earlier snapshot
         # leaves the latest producer's actual schema/data in a committed WAL.
@@ -92,7 +92,7 @@ def test_missing_state_and_orphaned_sidecars_are_not_new_storage(tmp_path: Path)
     orphan = tmp_path / 'kernel.sqlite3-shm'
     orphan.touch()
     with pytest.raises(UnsupportedState, match='uncertain_state'):
-        Storage.create(tmp_path / 'kernel.sqlite3')
+        Storage.create(tmp_path / 'kernel.sqlite3', namespace=('example/project', str(tmp_path.resolve())))
     assert orphan.read_bytes() == b''
     assert not (tmp_path / 'kernel.sqlite3').exists()
 
@@ -101,7 +101,7 @@ def test_missing_state_and_orphaned_sidecars_are_not_new_storage(tmp_path: Path)
 def test_last_sqlite_close_during_sidecar_observation_preserves_committed_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str,
 ) -> None:
-    native = Storage.create(tmp_path / 'kernel.sqlite3')
+    native = Storage.create(tmp_path / 'kernel.sqlite3', namespace=('example/project', str(tmp_path.resolve())))
     writer = sqlite3.connect(native.path)
     writer.execute('PRAGMA user_version=7')
     writer.commit()
@@ -134,7 +134,7 @@ def test_last_sqlite_close_during_sidecar_observation_preserves_committed_state(
 def test_missing_sidecar_at_metadata_read_is_not_missing_database(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    native = Storage.create(tmp_path / 'kernel.sqlite3')
+    native = Storage.create(tmp_path / 'kernel.sqlite3', namespace=('example/project', str(tmp_path.resolve())))
     writer = sqlite3.connect(native.path)
     writer.execute('PRAGMA user_version=7')
     writer.commit()
@@ -163,7 +163,7 @@ def test_missing_sidecar_at_metadata_read_is_not_missing_database(
 def test_sidecar_permission_failure_is_not_absence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str,
 ) -> None:
-    native = Storage.create(tmp_path / 'kernel.sqlite3')
+    native = Storage.create(tmp_path / 'kernel.sqlite3', namespace=('example/project', str(tmp_path.resolve())))
     target = Path(str(native.path) + suffix)
     original_stat = Path.stat
 
@@ -180,7 +180,7 @@ def test_sidecar_permission_failure_is_not_absence(
 
 @pytest.mark.parametrize('kind', ['symlink', 'directory', 'hardlink', 'nonempty_journal'])
 def test_unsafe_sidecar_still_refuses_reading_current_state(tmp_path: Path, kind: str) -> None:
-    native = Storage.create(tmp_path / 'kernel.sqlite3')
+    native = Storage.create(tmp_path / 'kernel.sqlite3', namespace=('example/project', str(tmp_path.resolve())))
     # Let SQLite normally clean up sidecars left by the read-only preflight.
     with closing(sqlite3.connect(native.path)) as maintenance:
         maintenance.execute('SELECT 1')

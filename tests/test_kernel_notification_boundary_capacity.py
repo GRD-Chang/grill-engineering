@@ -10,7 +10,7 @@ def test_current_ticket_boundaries_do_not_compete_for_ordinary_capacity(tmp_path
     for number in range(count):
         assert kernel.control("stop", f"original-{number}", subject=f"native-ticket-{number}") == "applied"
     monkeypatch.setattr(NativeNotifications, "_work", lambda _self: None)
-    observer = NativeNotifications(kernel.storage.path, tmp_path)
+    observer = NativeNotifications(kernel.storage.path, tmp_path, storage=kernel.storage)
     observer.close(drain=False)
     assert observer.failure_reason is None
     document = outbox.read_notifications(tmp_path, "run-native")

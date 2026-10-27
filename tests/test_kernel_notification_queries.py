@@ -1,4 +1,6 @@
 """Public delivery audits consume recorded outbox facts without sending or repair."""
+
+from support.repository_fixture import create_kernel
 from pathlib import Path
 import io
 import json
@@ -34,7 +36,12 @@ def _run(root: Path, *, enabled: bool = True, run_id: str = "notification-query"
                    language=language, repository_root=str(root / "checkout"))
     if frozen:
         spec = freeze_creation(spec, defaults)
-    return Kernel.create(root / spec.run_id / "kernel.sqlite3", spec)
+    kernel = create_kernel(root / "kernel.sqlite3", spec)
+    if not frozen:
+        # A damaged required input is explicit negative reader evidence.
+        with kernel.storage.transaction() as tx:
+            tx.execute("DELETE FROM run_inputs WHERE run_id=?", (spec.run_id,))
+    return kernel
 
 
 def _journal(kernel: Kernel, run_id: str = "notification-query") -> None:
@@ -80,7 +87,7 @@ def test_notification_boundary_reader_keeps_ticket_completion_distinct_from_the_
         ParentIssue(1, "Full Parent", "Original requirements", (2,)),
         (Issue(2, "Ticket", "Original task", "OPEN", labels=("ready-for-agent",)),)))
     assert scenario.run().kind == "complete"
-    assert query.read(scenario.kernel.storage.path, "status").data["status"] == "run_acceptance_pending"
+    assert query.read(scenario.kernel.storage.path, "status", storage=scenario.kernel.storage).data["status"] == "run_acceptance_pending"
     monkeypatch.setattr(query, "read_notifications", lambda *_a, **_kw: pytest.fail("Boundary facts must not read a journal"))
     with scenario.kernel.storage.transaction(write=False) as tx:
         ticket_only = read_boundaries(tx, time.time())

@@ -30,7 +30,7 @@ def test_healthy_observation_recovers_the_original_sender(tmp_path: Path, monkey
         return {"outcome": "success", "reason": None}
 
     monkeypatch.setattr(notifications, "read_boundaries", unavailable)
-    observer = notifications.NativeNotifications(kernel.storage.path, tmp_path, transport=transport)
+    observer = notifications.NativeNotifications(kernel.storage.path, tmp_path, transport=transport, storage=kernel.storage)
     try:
         assert observer.failure_reason is not None
         assert sent == []
@@ -76,7 +76,7 @@ def test_returned_result_survives_journal_failure_with_original_end_time(tmp_pat
         return {"outcome": outcome, "reason": "original physical result"}
 
     monkeypatch.setattr(outbox, "transaction", interrupted)
-    observer = notifications.NativeNotifications(kernel.storage.path, tmp_path, transport=transport)
+    observer = notifications.NativeNotifications(kernel.storage.path, tmp_path, transport=transport, storage=kernel.storage)
     try:
         assert failed.wait(3)
         with observer.condition:
@@ -130,7 +130,7 @@ def test_claim_commit_tail_failure_is_known_unsent_and_does_not_block_sender(tmp
         return {"outcome": "success", "reason": None}
 
     monkeypatch.setattr(outbox, "transaction", commit_tail)
-    observer = notifications.NativeNotifications(kernel.storage.path, tmp_path, transport=transport)
+    observer = notifications.NativeNotifications(kernel.storage.path, tmp_path, transport=transport, storage=kernel.storage)
     try:
         assert failed.wait(3)
         with observer.condition:
@@ -179,7 +179,7 @@ def test_inflight_cancel_finishes_before_the_requested_recovery(tmp_path: Path, 
         assert returned.is_set(), "new transport overlapped the unfinished original call"
         return {"outcome": "success", "reason": None}
 
-    observer = notifications.NativeNotifications(kernel.storage.path, tmp_path, transport=transport)
+    observer = notifications.NativeNotifications(kernel.storage.path, tmp_path, transport=transport, storage=kernel.storage)
     try:
         assert started.wait(3)
         kernel.control("stop", "current-local-gate", subject="native-ticket")
@@ -224,7 +224,7 @@ def test_fatal_close_wins_over_a_late_healthy_recovery_read(tmp_path: Path, monk
         return {"outcome": "success", "reason": None}
 
     monkeypatch.setattr(notifications, "read_boundaries", unavailable)
-    observer = notifications.NativeNotifications(kernel.storage.path, tmp_path, transport=transport)
+    observer = notifications.NativeNotifications(kernel.storage.path, tmp_path, transport=transport, storage=kernel.storage)
     try:
         assert observer.failure_reason is not None
         monkeypatch.setattr(notifications, "read_boundaries", healthy_but_delayed)

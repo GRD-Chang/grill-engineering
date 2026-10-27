@@ -51,7 +51,7 @@ def test_dependent_ticket_first_development_sees_delivered_dependency_code(tmp_p
     assert prepared.before_sha == head.sha and prepared.base == head
     assert kernel.delivery(subject).base == head
     assert kernel.status(subject)["source_sha"] == head.sha
-    scenario.kernel = Kernel(kernel.storage.path)
+    scenario.kernel = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     assert workspace_intent(scenario, monkeypatch).effect == prepared
     assert prepare_scripted_agent(kernel, scenario.runner().run_once()).kind == "progress"
     development = first_development(scenario)
@@ -71,7 +71,7 @@ def test_workspace_intent_keeps_allocated_base_after_run_branch_moves(tmp_path: 
     assert original.operation == "workspace"
     later = scenario.port.external_remote_append(scenario.delivery.target_ref, {"later-run.txt": "Later Run work\n"}, "after-allocation")
     assert later != allocated
-    scenario.kernel = kernel = Kernel(kernel.storage.path)
+    scenario.kernel = kernel = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     repeated = workspace_intent(scenario, monkeypatch)
     assert repeated.phase == ("reconcile" if dispatched else "execute")
     assert repeated.effect == original and kernel.delivery(subject).base == allocated
@@ -159,7 +159,7 @@ def test_new_workspace_never_resets_a_foreign_preexisting_ticket_ref(tmp_path: P
     # physical preflight. The formal old Host never did: it retained prepared/0.
     # No sent uncertainty exists to reconcile; the global runner is quiescent
     # while the subject remains manually paused on its original conflict.
-    scenario.kernel = kernel = Kernel(kernel.storage.path)
+    scenario.kernel = kernel = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     for _ in range(3):
         assert kernel.operation_state().disposition == "quiescent"
         assert scenario.runner().run_once().kind == "quiescent"

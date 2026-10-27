@@ -43,9 +43,9 @@ def test_publication_query_keeps_semantic_role_and_original_development_profile(
             assert call.thread_id == development.thread_id and call.mode == "resume"
             assert call.profile_revision == development.profile_revision
             before = _snapshot(tmp_path)
-            status = query.read(scenario.kernel.storage.path, "status")
-            history = query.read(scenario.kernel.storage.path, "history").data
-            settings = query.read(scenario.kernel.storage.path, "settings").data
+            status = query.read(scenario.kernel.storage.path, "status", storage=scenario.kernel.storage)
+            history = query.read(scenario.kernel.storage.path, "history", storage=scenario.kernel.storage).data
+            settings = query.read(scenario.kernel.storage.path, "settings", storage=scenario.kernel.storage).data
             invocation = next(row for attempt in history["history"]["attempts"] for row in attempt["invocations"] if row["id"] == call.invocation_id)
             assert invocation["role"] == "publication" and invocation["binding_role"] == "development"
             assert invocation["thread"] == development.thread_id
@@ -80,7 +80,7 @@ def test_publication_query_keeps_semantic_role_and_original_development_profile(
     assert [call.role for call in calls] == [Role.DEVELOPMENT, Role.REVIEW, Role.PUBLICATION]
     assert len(observations) == 1
     before = _snapshot(tmp_path)
-    history = query.read(scenario.kernel.storage.path, "history").data
+    history = query.read(scenario.kernel.storage.path, "history", storage=scenario.kernel.storage).data
     assert history["history"]["rounds"] == {
         ("ticket" if kind == "ticket" else "parent") + "_" + role: 1
         for role in ("development", "review", "publication")}

@@ -23,7 +23,7 @@ from agent_run.storage.sqlite_runtime import require_wal_runtime
 from agent_run.errors import KernelError
 from agent_run.storage.preflight import PROTOCOL, UnsupportedState, read_state, require_supported_connection, require_supported_state
 from agent_run.storage.save_order import (WRITE_CONTENTION_SECONDS, MAX_PENDING_WRITES, RepositorySave, SaveClock, SaveCommit,
-    SaveNotHead, check_cancelled, database_identity, remaining, save_turn)
+    SaveNotHead, check_cancelled, database_identity, remaining, write_owner)
 
 MATERIAL_LIMIT = 4 * 1024 * 1024
 CURRENT_LIMIT = 256 * 1024
@@ -31,240 +31,9 @@ DATABASE_LIMIT = 256 * 1024 * 1024
 PHYSICAL_LIMIT = 1024 * 1024 * 1024
 QUERY_LIMIT = 32 * 1024 * 1024
 
-SCHEMA = """
-CREATE TABLE meta (protocol TEXT NOT NULL);
-CREATE TABLE runs (
- id TEXT PRIMARY KEY, repository TEXT NOT NULL, parent_issue INTEGER NOT NULL,
- parent_revision TEXT NOT NULL, graph_revision TEXT NOT NULL, accepted_parent_revision TEXT NOT NULL,
- concurrency INTEGER NOT NULL CHECK(concurrency>0), policy BLOB NOT NULL,
- executor TEXT, epoch INTEGER NOT NULL DEFAULT 0, stopped INTEGER NOT NULL DEFAULT 0,
- final_action TEXT, integration_holder TEXT, next_ready INTEGER NOT NULL DEFAULT 0, blocked TEXT,
- source_sequence INTEGER, observed_parent_revision TEXT, observed_graph_revision TEXT,
- language TEXT CHECK(language IN ('zh','en')), repository_root TEXT, created_at REAL NOT NULL,
- profile_revision INTEGER NOT NULL DEFAULT 1 REFERENCES profile_revisions(id) DEFERRABLE INITIALLY DEFERRED
-);
-CREATE TABLE subjects (
- id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), kind TEXT NOT NULL,
- issue INTEGER NOT NULL, revision TEXT NOT NULL, generation INTEGER NOT NULL DEFAULT 1,
- version INTEGER NOT NULL DEFAULT 1, phase TEXT NOT NULL, purpose TEXT NOT NULL,
- source_ref TEXT NOT NULL, target_ref TEXT NOT NULL,
- base_sha TEXT NOT NULL, base_tree TEXT NOT NULL, source_sha TEXT NOT NULL,
- candidate_sha TEXT, candidate_tree TEXT, integrated_sha TEXT, integrated_tree TEXT,
- expected_tree TEXT, integration_target TEXT, completion_revision TEXT NOT NULL,
- current_attempt TEXT, review_attempt TEXT, publication_attempt TEXT,
- publication_sha TEXT, publication_tree TEXT, pr_number INTEGER,
- checks_id TEXT, grant_id TEXT, merge_sha TEXT, gate_mode TEXT,
- development_thread TEXT, ci_failure TEXT, last_failure TEXT
- ,checkout TEXT NOT NULL DEFAULT '', workspace_sha TEXT, resume_purpose TEXT, repair_source TEXT,
- validation_checkout TEXT, validation_cleanup TEXT, owned_root TEXT NOT NULL DEFAULT '', common_git_dir TEXT NOT NULL DEFAULT '',
- refresh_revision TEXT, policy_id TEXT REFERENCES material(id)
-);
-CREATE TABLE dependencies (
- subject TEXT NOT NULL REFERENCES subjects(id), predecessor TEXT NOT NULL REFERENCES subjects(id),
- PRIMARY KEY(subject,predecessor)
-);
-CREATE TABLE requirement_versions (
- issue INTEGER NOT NULL, revision TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
- PRIMARY KEY(issue,revision)
-);
-CREATE TABLE issue_facts (
- issue INTEGER PRIMARY KEY, revision TEXT NOT NULL, state TEXT NOT NULL, labels BLOB NOT NULL,
- position INTEGER NOT NULL
-);
-CREATE TABLE dependency_facts (
- issue INTEGER NOT NULL, blocker INTEGER NOT NULL, state TEXT NOT NULL,
- PRIMARY KEY(issue,blocker)
-);
-CREATE TABLE source_observations (
- sequence INTEGER PRIMARY KEY AUTOINCREMENT, parent_revision TEXT NOT NULL,
- graph_revision TEXT NOT NULL, body BLOB NOT NULL
-);
-CREATE TABLE final_target (
- id TEXT PRIMARY KEY, source_ref TEXT NOT NULL, target_ref TEXT NOT NULL, checkout TEXT NOT NULL,
- owned_root TEXT NOT NULL, common_git_dir TEXT NOT NULL
-);
-CREATE TABLE completions (
- subject TEXT NOT NULL REFERENCES subjects(id), generation INTEGER NOT NULL,
- revision TEXT NOT NULL, parent_revision TEXT NOT NULL, graph_revision TEXT NOT NULL,
- source_sha TEXT NOT NULL, merge_sha TEXT NOT NULL, tree TEXT NOT NULL,
- pr_number INTEGER NOT NULL, gate_mode TEXT NOT NULL, review_attempt TEXT, development_attempt TEXT,
- comment_effect TEXT NOT NULL REFERENCES effects(id), close_effect TEXT NOT NULL REFERENCES effects(id),
- PRIMARY KEY(subject,generation)
-);
-CREATE TABLE final_barriers (
- subject TEXT NOT NULL REFERENCES subjects(id), generation INTEGER NOT NULL,
- completion_revision TEXT NOT NULL, run_sha TEXT NOT NULL, default_sha TEXT NOT NULL,
- evidence TEXT NOT NULL REFERENCES material(id), PRIMARY KEY(subject,generation)
-);
-CREATE TABLE retired_generations (
- subject TEXT NOT NULL REFERENCES subjects(id), generation INTEGER NOT NULL, revision TEXT NOT NULL,
- source_ref TEXT NOT NULL, checkout TEXT NOT NULL, source_sha TEXT NOT NULL,
- candidate_sha TEXT, publication_sha TEXT, pr_number INTEGER, reason TEXT NOT NULL,
- validation_checkout TEXT, validation_cleanup TEXT, workspace_sha TEXT NOT NULL, owned_root TEXT NOT NULL, common_git_dir TEXT NOT NULL,
- PRIMARY KEY(subject,generation)
-);
-CREATE TABLE resource_cleanup (
- subject TEXT NOT NULL REFERENCES subjects(id), generation INTEGER NOT NULL,
- source_ref TEXT NOT NULL, source_sha TEXT NOT NULL, checkout TEXT NOT NULL, workspace_sha TEXT NOT NULL,
- owned_root TEXT NOT NULL, common_git_dir TEXT NOT NULL, stage INTEGER NOT NULL DEFAULT 0,
- state TEXT NOT NULL DEFAULT 'pending', effect_id TEXT REFERENCES effects(id), outcome TEXT,
- PRIMARY KEY(subject,generation)
-);
-CREATE TABLE issue_links (
- subject TEXT PRIMARY KEY REFERENCES subjects(id), generation INTEGER NOT NULL,
- source_ref TEXT NOT NULL, source_sha TEXT NOT NULL, issue INTEGER NOT NULL,
- state TEXT NOT NULL DEFAULT 'pending', effect_id TEXT NOT NULL REFERENCES effects(id)
-);
-CREATE TABLE budgets (
- subject TEXT NOT NULL REFERENCES subjects(id), purpose TEXT NOT NULL,
- window INTEGER NOT NULL, developments_used INTEGER NOT NULL DEFAULT 0,
- reviews_used INTEGER NOT NULL DEFAULT 0, development_limit INTEGER NOT NULL,
- review_limit INTEGER, review_required INTEGER NOT NULL, current INTEGER NOT NULL DEFAULT 1,
- PRIMARY KEY(subject,purpose,window)
-);
-CREATE UNIQUE INDEX current_budget ON budgets(subject,purpose) WHERE current=1;
-CREATE TABLE resync_allowances (
- subject TEXT NOT NULL REFERENCES subjects(id), generation INTEGER NOT NULL,
- used INTEGER NOT NULL DEFAULT 0, allowance INTEGER NOT NULL CHECK(allowance>=0),
- current INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(subject,generation)
-);
-CREATE UNIQUE INDEX current_resync ON resync_allowances(subject) WHERE current=1;
-CREATE TABLE integration_snapshots (
- subject TEXT NOT NULL REFERENCES subjects(id), window INTEGER NOT NULL,
- allowance_generation INTEGER NOT NULL, source_ref TEXT NOT NULL, target_ref TEXT NOT NULL,
- source_sha TEXT NOT NULL, target_sha TEXT NOT NULL, open INTEGER NOT NULL,
- PRIMARY KEY(subject,window), FOREIGN KEY(subject,allowance_generation) REFERENCES resync_allowances(subject,generation)
-);
-CREATE TABLE material (
- id TEXT PRIMARY KEY, subject TEXT NOT NULL REFERENCES subjects(id), purpose TEXT NOT NULL,
- digest TEXT NOT NULL, size INTEGER NOT NULL, body BLOB NOT NULL,
- UNIQUE(subject,purpose,digest)
-);
-CREATE TABLE threads (
- id TEXT PRIMARY KEY, subject TEXT NOT NULL REFERENCES subjects(id), role TEXT NOT NULL,
- profile_revision INTEGER NOT NULL REFERENCES profile_revisions(id), backend_id TEXT UNIQUE
-);
-CREATE TABLE profile_revisions (
- id INTEGER PRIMARY KEY, subject TEXT NOT NULL REFERENCES subjects(id),
- material_id TEXT NOT NULL REFERENCES material(id), created_at REAL NOT NULL
-);
-CREATE TABLE run_inputs (
- run_id TEXT PRIMARY KEY REFERENCES runs(id), subject TEXT NOT NULL REFERENCES subjects(id),
- material_id TEXT NOT NULL REFERENCES material(id)
-);
-CREATE TABLE attempts (
- id TEXT PRIMARY KEY, subject TEXT NOT NULL REFERENCES subjects(id), generation INTEGER NOT NULL,
- ordinal INTEGER NOT NULL, role TEXT NOT NULL, purpose TEXT NOT NULL, window INTEGER NOT NULL,
- parent_revision TEXT NOT NULL, graph_revision TEXT NOT NULL, revision TEXT NOT NULL,
- base_sha TEXT NOT NULL, candidate_sha TEXT, candidate_tree TEXT, expected_tree TEXT,
- completion_revision TEXT NOT NULL, context_id TEXT NOT NULL REFERENCES material(id),
- current_invocation TEXT, result_id TEXT REFERENCES material(id), status TEXT NOT NULL,
- accounted INTEGER NOT NULL DEFAULT 0, outcome TEXT, new_thread INTEGER NOT NULL DEFAULT 0,
- resume_action TEXT REFERENCES actions(id),
- thread_id TEXT REFERENCES threads(id), opening_id TEXT REFERENCES material(id), UNIQUE(subject,ordinal)
-);
-CREATE TABLE invocations (
- id TEXT PRIMARY KEY, attempt TEXT NOT NULL REFERENCES attempts(id), thread TEXT NOT NULL REFERENCES threads(id),
- executor TEXT NOT NULL, epoch INTEGER NOT NULL, status TEXT NOT NULL, allocated_at REAL NOT NULL,
- deadline_seconds REAL NOT NULL, deadline_at REAL NOT NULL,
- predecessor TEXT REFERENCES invocations(id), recovery_kind TEXT CHECK(recovery_kind IN ('ordinary','capacity','explicit','semantic')),
- action_id TEXT REFERENCES actions(id)
-);
-CREATE TABLE invocation_outputs (
- invocation TEXT NOT NULL REFERENCES invocations(id), ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 2),
- context_id TEXT NOT NULL REFERENCES material(id), lease TEXT NOT NULL UNIQUE,
- raw_id TEXT REFERENCES material(id),
- dispatch_state TEXT NOT NULL DEFAULT 'allocated', process_identity TEXT REFERENCES material(id),
- exit_code INTEGER, start_evidence TEXT REFERENCES material(id), allocated_at REAL NOT NULL,
- dispatched_at REAL, started_at REAL, returned_at REAL, exited_at REAL,
- mode TEXT NOT NULL, requested_thread TEXT,
- failure_kind TEXT CHECK(failure_kind IN ('ordinary','capacity','fatal')), recovery_ready_at REAL,
- PRIMARY KEY(invocation,ordinal)
-);
-CREATE TABLE worker_activity (
- invocation TEXT NOT NULL, ordinal INTEGER NOT NULL, identity TEXT NOT NULL,
- active INTEGER NOT NULL, observed_at REAL NOT NULL, evidence TEXT NOT NULL REFERENCES material(id),
- PRIMARY KEY(invocation,ordinal,identity), FOREIGN KEY(invocation,ordinal) REFERENCES invocation_outputs(invocation,ordinal)
-);
-CREATE TABLE work_queue (
- subject TEXT PRIMARY KEY REFERENCES subjects(id), ready INTEGER NOT NULL UNIQUE
-);
-CREATE TABLE integration_queue (
- subject TEXT PRIMARY KEY REFERENCES subjects(id), ready INTEGER NOT NULL UNIQUE
-);
-CREATE TABLE leases (
- id TEXT PRIMARY KEY, subject TEXT NOT NULL UNIQUE REFERENCES subjects(id),
- invocation TEXT NOT NULL UNIQUE REFERENCES invocations(id), executor TEXT NOT NULL, epoch INTEGER NOT NULL
-);
-CREATE TABLE retired_executors (
- run_id TEXT NOT NULL REFERENCES runs(id), owner TEXT NOT NULL, epoch INTEGER NOT NULL,
- status TEXT NOT NULL, PRIMARY KEY(run_id,owner,epoch)
-);
-CREATE TABLE hosts (
- run_id TEXT NOT NULL REFERENCES runs(id), epoch INTEGER NOT NULL, owner TEXT NOT NULL,
- nonce TEXT NOT NULL UNIQUE, action_id TEXT NOT NULL UNIQUE REFERENCES actions(id),
- subject TEXT NOT NULL REFERENCES subjects(id), request_id TEXT NOT NULL REFERENCES material(id),
- unit_name TEXT UNIQUE, backend TEXT NOT NULL CHECK(backend IN ('systemd','foreground')),
- domain_id TEXT REFERENCES material(id), allocated_at REAL NOT NULL, dispatched_at REAL,
- status TEXT NOT NULL CHECK(status IN ('allocated','dispatched','running','unknown','exited')),
- invocation_id TEXT, cgroup TEXT, boot_id TEXT, main_pid INTEGER, start_token TEXT,
- exit_status INTEGER, ended_at REAL, observation_id TEXT REFERENCES material(id),
- usage_ready INTEGER NOT NULL DEFAULT 0, usage_released INTEGER NOT NULL DEFAULT 0,
- PRIMARY KEY(run_id,epoch), UNIQUE(run_id,owner)
-);
-CREATE TABLE waits (
- subject TEXT REFERENCES subjects(id), kind TEXT NOT NULL,
- scope_id TEXT NOT NULL REFERENCES material(id),
- started_at REAL NOT NULL, deadline REAL NOT NULL,
- retry_count INTEGER NOT NULL DEFAULT 0, next_retry_at REAL,
- evidence TEXT REFERENCES material(id),
- PRIMARY KEY(scope_id,kind)
-);
-CREATE TABLE gates (
- subject TEXT NOT NULL REFERENCES subjects(id), code TEXT NOT NULL,
- purpose TEXT, evidence TEXT REFERENCES material(id), PRIMARY KEY(subject,code)
-);
-CREATE TABLE effects (
- id TEXT PRIMARY KEY, subject TEXT NOT NULL REFERENCES subjects(id), operation TEXT NOT NULL,
- status TEXT NOT NULL, executor TEXT, epoch INTEGER,
- parent_revision TEXT NOT NULL, graph_revision TEXT NOT NULL, revision TEXT NOT NULL,
- generation INTEGER NOT NULL, source_ref TEXT NOT NULL, target_ref TEXT NOT NULL,
- before_sha TEXT NOT NULL, after_sha TEXT, candidate_sha TEXT, candidate_tree TEXT,
- base_sha TEXT NOT NULL, base_tree TEXT NOT NULL, pr_number INTEGER, actor TEXT CHECK(actor IS NULL OR length(trim(actor))>0),
- payload_id TEXT NOT NULL REFERENCES material(id), receipt_id TEXT REFERENCES material(id),
- attempts INTEGER NOT NULL DEFAULT 0, retry_baseline INTEGER NOT NULL DEFAULT 0, control_action TEXT REFERENCES actions(id),
- CHECK((executor IS NOT NULL AND epoch IS NOT NULL) OR (status='confirmed' AND executor IS NULL AND epoch IS NULL)),
- CHECK(actor IS NOT NULL OR status='confirmed' OR operation NOT IN ('push','run_branch','pr_write','merge','completion_comment','close','issue_link','cleanup_remote_ref','retire_pr','reopen_ticket'))
-);
-CREATE INDEX control_effects ON effects(control_action);
-CREATE TABLE effect_failures (
- effect TEXT NOT NULL REFERENCES effects(id), dispatch_serial INTEGER NOT NULL,
- evidence TEXT NOT NULL REFERENCES material(id), observed_at REAL NOT NULL,
- PRIMARY KEY(effect,dispatch_serial)
-);
-CREATE UNIQUE INDEX pending_effect ON effects(subject) WHERE status IN ('prepared','sent','observed') AND operation NOT IN ('cleanup_worktree','cleanup_local_ref','cleanup_remote_ref','issue_link');
-CREATE TABLE checks (
- id TEXT PRIMARY KEY, subject TEXT NOT NULL REFERENCES subjects(id), pr_number INTEGER NOT NULL,
- head_sha TEXT NOT NULL, result TEXT NOT NULL, material_id TEXT NOT NULL REFERENCES material(id)
-);
-CREATE TABLE grants (
- id TEXT PRIMARY KEY, subject TEXT NOT NULL REFERENCES subjects(id), action TEXT NOT NULL,
- pr_number INTEGER NOT NULL, head_sha TEXT NOT NULL, base_sha TEXT NOT NULL,
- review_attempt TEXT NOT NULL, checks_id TEXT NOT NULL, revision TEXT NOT NULL,
- parent_revision TEXT NOT NULL, graph_revision TEXT NOT NULL, completion_revision TEXT NOT NULL
-);
-CREATE TABLE actions (
- id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id), kind TEXT NOT NULL,
- subject TEXT REFERENCES subjects(id), payload_id TEXT REFERENCES material(id), status TEXT NOT NULL,
- receipt_id TEXT REFERENCES material(id)
-);
-CREATE TABLE history (
- position INTEGER PRIMARY KEY AUTOINCREMENT, subject TEXT NOT NULL REFERENCES subjects(id),
- kind TEXT NOT NULL, identity TEXT NOT NULL, material_id TEXT REFERENCES material(id),
- generation INTEGER NOT NULL, created_at REAL NOT NULL, phase TEXT, purpose TEXT, status TEXT
-);
-CREATE INDEX history_action_facts ON history(kind,identity);
-"""
+# The schema has one definition; early experimental layouts are refused.
+from agent_run.storage.repository_schema import REPOSITORY_RUN_SCHEMA, REPOSITORY_TASK_SCHEMA, REPOSITORY_ROUTING_SCHEMA
+SCHEMA = REPOSITORY_RUN_SCHEMA + REPOSITORY_TASK_SCHEMA + REPOSITORY_ROUTING_SCHEMA
 
 
 class _SaveAdmissionBusy(RuntimeError):
@@ -347,58 +116,32 @@ class Transaction:
                 return result
 
     def put(self, subject: str, purpose: str, body: bytes) -> str:
-        if len(body) > MATERIAL_LIMIT:
-            raise KernelError("material_limit")
-        digest = hashlib.sha256(body).hexdigest()
-        identity = hashlib.sha256(f"{subject}\0{purpose}\0{digest}".encode()).hexdigest()
-        self.execute("INSERT OR IGNORE INTO material VALUES (?,?,?,?,?,?)",
-                     (identity, subject, purpose, digest, len(body), body))
-        # An existing digest never licenses trusting damaged or foreign bytes.
-        if self.get(identity, subject) != body:
-            raise KernelError("material_corrupt")
-        return identity
+        raise KernelError("run_scope_required", "Material requires an explicit Run transaction")
 
     def get(self, identity: str, subject: str) -> bytes:
-        header = self.one("SELECT subject,digest,size,typeof(body),length(body) FROM material WHERE id=?", (identity,))
-        if (header[0] != subject or header[3] != "blob" or header[2] != header[4]
-                or not 0 <= header[4] <= MATERIAL_LIMIT):
-            raise KernelError("material_corrupt", identity)
-        if self.bytes_read + header[4] > QUERY_LIMIT:
-            raise KernelError("query_limit")
-        body = self.one("SELECT body FROM material WHERE id=?", (identity,))[0]
-        if hashlib.sha256(body).hexdigest() != header[1]:
-            raise KernelError("material_corrupt", identity)
-        return bytes(body)
+        raise KernelError("run_scope_required", "Material requires an explicit Run transaction")
 
 
 class Storage:
-    def __init__(self, path: Path, *, run_id: str | None = None, _repository: bool = False,
+    def __init__(self, path: Path, *, run_id: str | None = None, _metadata: bool = False,
                  _namespace: tuple[str, str] | None = None) -> None:
         require_wal_runtime()
-        if run_id is not None and (type(run_id) is not str or not run_id):
-            raise KernelError("run_scope_invalid")
-        self.path = path
-        self._run_id = run_id
-        self._repository_mode = _repository
-        if _namespace is not None and not _repository:
-            raise KernelError("repository_namespace_required")
-        self._namespace = _namespace
+        if _metadata and run_id is not None or not _metadata and (type(run_id) is not str or not run_id):
+            raise KernelError("run_scope_required")
+        self.path, self._run_id, self._namespace = path, run_id, _namespace
         if not path.is_file():
             raise KernelError("missing_database", str(path))
         with self.transaction(write=False):
             pass
 
     @classmethod
-    def create(cls, path: Path, *, _repository: bool = False,
-               _namespace: tuple[str, str] | None = None) -> Storage:
+    def create(cls, path: Path, *, namespace: tuple[str, str]) -> Storage:
+        """Exclusively initialize an explicitly vacant repository, never adopt state."""
         require_wal_runtime()
-        if (_repository and _namespace is None) or (_namespace is not None and not _repository):
-            raise KernelError("repository_namespace_required")
         if any(Path(str(path) + suffix).exists() or Path(str(path) + suffix).is_symlink()
                for suffix in ("-wal", "-shm", "-journal")):
             raise UnsupportedState(path, "uncertain_state")
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Exclusive creation refuses to adopt or upgrade any existing database.
         with path.open("xb"):
             pass
         connection = sqlite3.connect(path, isolation_level=None)
@@ -406,32 +149,21 @@ class Storage:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=FULL")
             connection.execute("PRAGMA foreign_keys=ON")
-            if _repository:
-                from agent_run.storage.repository_schema import (
-                    REPOSITORY_RUN_SCHEMA, REPOSITORY_TASK_SCHEMA, REPOSITORY_ROUTING_SCHEMA, STAGED_REPOSITORY_PROTOCOL,
-                )
-                schema = REPOSITORY_RUN_SCHEMA + REPOSITORY_TASK_SCHEMA + REPOSITORY_ROUTING_SCHEMA
-                protocol = STAGED_REPOSITORY_PROTOCOL
-            else:
-                schema, protocol = SCHEMA, PROTOCOL
-            connection.executescript("BEGIN IMMEDIATE;\n" + schema)
-            connection.execute("INSERT INTO meta VALUES (?)", (protocol,))
-            if _repository:
-                assert _namespace is not None
-                connection.execute("INSERT INTO repository_binding VALUES (1,?,?)", _namespace)
+            connection.executescript("BEGIN IMMEDIATE;\n" + SCHEMA)
+            connection.execute("INSERT INTO meta VALUES (?)", (PROTOCOL,))
+            connection.execute("INSERT INTO repository_binding VALUES (1,?,?)", namespace)
             connection.commit()
         except BaseException:
             connection.rollback()
             raise
         finally:
             connection.close()
-        return cls(path, _repository=True, _namespace=_namespace) if _repository else cls(path)
+        return cls.metadata(path, namespace=namespace)
 
     @classmethod
-    def _repository(cls, path: Path, *, run_id: str | None = None,
-                    namespace: tuple[str, str] | None = None) -> Storage:
-        """Internal staged opening only; public admission still rejects its marker."""
-        return cls(path, run_id=run_id, _repository=True, _namespace=namespace)
+    def metadata(cls, path: Path, *, namespace: tuple[str, str] | None = None) -> Storage:
+        """Explicit repository metadata owner; never an implicit Run opening."""
+        return cls(path, _metadata=True, _namespace=namespace)
 
     @property
     def run_id(self) -> str | None:
@@ -439,11 +171,9 @@ class Storage:
 
     def at_run(self, run_id: str) -> Storage:
         """Select explicitly without mutating this handle or guessing current work."""
-        return type(self)(self.path, run_id=run_id, _repository=self._repository_mode, _namespace=self._namespace)
+        return type(self)(self.path, run_id=run_id, _namespace=self._namespace)
 
     def _require_namespace(self, owner: Transaction) -> None:
-        if not self._repository_mode:
-            return
         # One immutable file namespace, not work state, a locator or a scan of
         # every historical Run. Canonical SQL constraints enforce row ownership.
         row = owner.one("SELECT singleton,repository,repository_root FROM repository_binding")
@@ -460,15 +190,14 @@ class Storage:
         with ExitStack() as scopes:
             identity = None
             if write:
-                # Staged repository writes use only the durable queue below.
-                # The old deque remains solely for the still-active v21 layout;
-                # ordered=False retains its shared nested-owner/afterfork guard.
-                identity = scopes.enter_context(save_turn(self.path, ordered=ordered and not self._repository_mode,
+                # One durable queue; this local guard only rejects reentry and
+                # clears inherited ownership after fork. Control bypass remains explicit.
+                identity = scopes.enter_context(write_owner(self.path,
                     deadline=deadline, cancelled=cancelled))
-                require_supported_state(self.path, timeout=remaining(deadline), **({'_repository': True} if self._repository_mode else {}))
+                require_supported_state(self.path, timeout=remaining(deadline))
                 if database_identity(self.path) != identity:
                     raise UnsupportedState(self.path, "uncertain_state")
-            if write and ordered and self._repository_mode:
+            if write and ordered:
                 assert identity is not None
                 with self._repository_save(identity, deadline, cancelled) as tx:
                     yield tx
@@ -481,7 +210,7 @@ class Storage:
             raise UnsupportedState(self.path, "uncertain_state")
         with read_state(self.path, timeout=remaining(deadline)) as connection:
             connection.row_factory = sqlite3.Row
-            require_supported_connection(connection, self.path, _repository=True)
+            require_supported_connection(connection, self.path)
             self._require_namespace(Transaction(connection))
         if database_identity(self.path) != identity:
             raise UnsupportedState(self.path, "uncertain_state")
@@ -598,7 +327,7 @@ class Storage:
                      cancelled: Event | None, select_run: bool = True, request: RepositorySave | None = None,
                      commit: SaveCommit | None = None, retry_admission: bool = False,
                      clock: SaveClock | None = None) -> Iterator[Transaction]:
-        if write and self._repository_mode:
+        if write:
             assert identity is not None
             self._verify_save_database(identity, deadline)
         with ExitStack() as scopes:
@@ -622,10 +351,7 @@ class Storage:
                     beginning = False
                     if database_identity(self.path) != identity:
                         raise UnsupportedState(self.path, "uncertain_state")
-                if self._repository_mode:
-                    require_supported_connection(connection, self.path, _repository=True)
-                else:
-                    require_supported_connection(connection, self.path)
+                require_supported_connection(connection, self.path)
                 self._capacity(connection)
                 self._require_namespace(transaction)
                 if ((request is not None or clock is not None)
@@ -634,12 +360,9 @@ class Storage:
                 if request is not None:
                     request.admit(transaction)
                 exposed = transaction
-                if self._repository_mode and self._run_id is not None and select_run:
+                if self._run_id is not None and select_run:
                     from agent_run.storage.run_scope import RunTransaction
                     exposed = RunTransaction(transaction, self._run_id)
-                elif not self._repository_mode and self._run_id is not None:
-                    if transaction.one("SELECT id FROM runs")[0] != self._run_id:
-                        raise KernelError("run_scope_changed")
                 if write:
                     if request is not None:
                         request.require()  # Final body admission uses the same current-task clock evidence.
@@ -651,10 +374,7 @@ class Storage:
                 if write:
                     if database_identity(self.path) != identity:
                         raise UnsupportedState(self.path, "uncertain_state")
-                    if self._repository_mode:
-                        require_supported_connection(connection, self.path, _repository=True)
-                    else:
-                        require_supported_connection(connection, self.path)
+                    require_supported_connection(connection, self.path)
                     self._require_namespace(transaction)
                     if request is not None:
                         request.finish(transaction)
@@ -716,9 +436,8 @@ class Storage:
             # its possible database growth within the existing database cap.
             physical += (wal_size - sizes[1] + max(0, shm_size - sizes[2])
                          + max(0, DATABASE_LIMIT - sizes[0]))
-        if self._repository_mode:
-            tickets = connection.execute("SELECT count(*) FROM save_admissions").fetchone()[0]
-            if tickets > MAX_PENDING_WRITES:
-                raise KernelError("storage_limit")
+        tickets = connection.execute("SELECT count(*) FROM save_admissions").fetchone()[0]
+        if tickets > MAX_PENDING_WRITES:
+            raise KernelError("storage_limit")
         if database_size > DATABASE_LIMIT or physical > PHYSICAL_LIMIT:
             raise KernelError("storage_limit")

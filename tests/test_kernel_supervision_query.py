@@ -17,18 +17,12 @@ from support.environment import durable_snapshot as _snapshot
 
 
 def source_run(tmp_path, monkeypatch, language="en"):
-    original_create = Kernel.create
-
-    def create(path, spec, **kwargs):
-        return original_create(path, replace(spec, language=language), **kwargs)
-
-    monkeypatch.setattr(Kernel, "create", staticmethod(create))
-    return delivery_run(tmp_path / "kernel.sqlite3")[0]
+    return delivery_run(tmp_path / "kernel.sqlite3", language=language)[0]
 
 
 def read_only(kernel, tmp_path, kind="status"):
     before = _snapshot(tmp_path)
-    document = query.read(kernel.storage.path, kind)
+    document = query.read(kernel.storage.path, kind, storage=kernel.storage)
     assert _snapshot(tmp_path) == before
     return document
 

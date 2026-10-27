@@ -1,5 +1,7 @@
 """Frozen policy controls real domain allocation and continuation authority."""
 
+from support.repository_fixture import create_kernel
+
 from dataclasses import replace
 from pathlib import Path
 
@@ -17,7 +19,7 @@ def test_ci_allowance_uses_the_actual_ticket_or_parent_owner(tmp_path: Path, kin
     base = Commit("base", "tree")
     delivery = Delivery("delivery", kind, 1, "requirements", base, "refs/heads/source", "refs/heads/target")
     policy = Policy(ticket_ci_developments=1, parent_ci_developments=2)
-    kernel = Kernel.create(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,), policy))
+    kernel = create_kernel(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,), policy))
     assert kernel.status(delivery.key)["budgets"]["ci"]["development_limit"] == expected
 
 
@@ -56,7 +58,7 @@ def test_created_language_is_consumed_by_the_actual_agent_call(tmp_path: Path) -
 def test_ci_review_requirement_is_not_inferred_from_an_unlimited_review_budget(tmp_path: Path, kind: DeliveryKind, review: bool) -> None:
     base = Commit("base", "tree")
     delivery = Delivery("delivery", kind, 1, "parent", base, "refs/heads/source", "refs/heads/target")
-    kernel = Kernel.create(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,)))
+    kernel = create_kernel(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,)))
     ci = kernel.status(delivery.key)["budgets"]["ci"]
     assert ci["review_limit"] is None
     assert ci.get("review_required") is review

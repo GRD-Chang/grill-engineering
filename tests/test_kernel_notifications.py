@@ -1,6 +1,8 @@
 """Native notifications consume committed facts and retain the old outbox budget."""
 from __future__ import annotations
 
+from support.repository_fixture import create_kernel
+
 from dataclasses import replace
 from pathlib import Path
 import subprocess
@@ -53,7 +55,7 @@ def _kernel(root: Path, count: int = 1) -> Kernel:
                                                  "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
     final = Delivery("notification-final", DeliveryKind.FINAL_RUN, 1, "unread", base,
                      delivery.target_ref, "refs/heads/main")
-    return Kernel.create(root / "kernel.sqlite3", replace(spec, inputs=inputs, deliveries=(*deliveries, final)),
+    return create_kernel(root / "kernel.sqlite3", replace(spec, inputs=inputs, deliveries=(*deliveries, final)),
                          requirements=_source(count))
 
 
@@ -66,12 +68,12 @@ def test_native_run_start_is_sent_once_from_the_frozen_run_and_query_does_not_se
         return {"outcome": "success", "reason": None}
 
     from agent_run.queries.run import read
-    assert read(kernel.storage.path, "status").data["run_id"] == "run-native"
+    assert read(kernel.storage.path, 'status', storage=kernel.storage).data["run_id"] == "run-native"
     assert sent == [] and not (tmp_path / "notifications").exists()
-    NativeNotifications(kernel.storage.path, tmp_path, transport=fake).close()
+    NativeNotifications(kernel.storage.path, tmp_path, transport=fake, storage=kernel.storage).close()
     first = list(sent)
     assert len(first) == 1
-    NativeNotifications(kernel.storage.path, tmp_path, transport=fake).close()
+    NativeNotifications(kernel.storage.path, tmp_path, transport=fake, storage=kernel.storage).close()
     assert sent == first
     document = outbox.read_notifications(tmp_path, "run-native")
     assert document["pending"] == []
@@ -106,7 +108,7 @@ def test_native_reopens_dead_sender_claim_as_unknown_with_original_budget(tmp_pa
         calls.append(identity)
         return {"outcome": "success", "reason": None}
 
-    NativeNotifications(kernel.storage.path, tmp_path, transport=fake).close()
+    NativeNotifications(kernel.storage.path, tmp_path, transport=fake, storage=kernel.storage).close()
     document = outbox.read_notifications(tmp_path, "run-native")
     record = next(item for item in document["records"] if item["id"] == event["id"])
     assert len(calls) == 1 and record["attempts"] == 2
@@ -124,8 +126,8 @@ def test_native_unknown_ack_is_not_sent_again_after_reopen(tmp_path: Path) -> No
         calls.append(identity)
         return {"outcome": "unknown", "reason": "ACK not observed"}
 
-    NativeNotifications(kernel.storage.path, tmp_path, transport=uncertain).close()
-    NativeNotifications(kernel.storage.path, tmp_path, transport=uncertain).close()
+    NativeNotifications(kernel.storage.path, tmp_path, transport=uncertain, storage=kernel.storage).close()
+    NativeNotifications(kernel.storage.path, tmp_path, transport=uncertain, storage=kernel.storage).close()
     record = outbox.read_notifications(tmp_path, "run-native")["records"][0]
     assert len(calls) == 1 and record["outcome"] == "unknown" and record["attempts"] == 1
 
@@ -171,7 +173,7 @@ def test_native_pr_creation_requires_consumed_receipt_and_does_not_repeat_for_ed
         return {"outcome": "success", "reason": None}
 
     def observe() -> list[dict[str, Any]]:
-        observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport)
+        observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
         observer.close()
         assert observer.failure_reason is None
         return outbox.read_notifications(tmp_path, scenario.spec.run_id)["records"]
@@ -244,7 +246,7 @@ def test_native_does_not_adopt_an_unmigrated_existing_journal(tmp_path: Path) ->
         calls.append("sent")
         return {"outcome": "success", "reason": None}
 
-    sender = NativeNotifications(kernel.storage.path, tmp_path, transport=fake)
+    sender = NativeNotifications(kernel.storage.path, tmp_path, transport=fake, storage=kernel.storage)
     assert sender.failure_reason == "existing notification journal has no native receipt"
     sender.close()
     assert calls == [] and outbox.read_notifications(tmp_path, "run-native") == before
@@ -265,14 +267,14 @@ def test_native_first_worker_event_uses_committed_start_once(tmp_path: Path) -> 
         sent.append(rendered["header"]["title"]["content"])
         return {"outcome": "success", "reason": None}
 
-    NativeNotifications(kernel.storage.path, tmp_path, transport=fake).close()
+    NativeNotifications(kernel.storage.path, tmp_path, transport=fake, storage=kernel.storage).close()
     records = outbox.read_notifications(tmp_path, "run-native")["records"]
     assert {record["kind"] for record in records} == {"run_start", "ticket_started"}
     from agent_run.notifications.envelope import _identity
     assert next(record for record in records if record["kind"] == "ticket_started")["id"] == (
         _identity("run-native", "ticket_started", "ticket:2"))
     assert len(sent) == 2
-    NativeNotifications(kernel.storage.path, tmp_path, transport=fake).close()
+    NativeNotifications(kernel.storage.path, tmp_path, transport=fake, storage=kernel.storage).close()
     assert len(sent) == 2
 
 
@@ -291,7 +293,7 @@ def test_native_observer_consumes_multiple_committed_history_pages(tmp_path: Pat
         sent.append(rendered["header"]["title"]["content"])
         return {"outcome": "success", "reason": None}
 
-    sender = NativeNotifications(kernel.storage.path, tmp_path, transport=fake)
+    sender = NativeNotifications(kernel.storage.path, tmp_path, transport=fake, storage=kernel.storage)
     sender.close()
     assert sender.failure_reason is None
     document = outbox.read_notifications(tmp_path, "run-native")
@@ -311,14 +313,14 @@ def test_parent_requirement_refresh_keeps_notification_delivery_available(tmp_pa
     assert spec.inputs is not None
     inputs = replace(spec.inputs, notifications={"enabled": True, "mode": "detailed",
                                                  "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
-    kernel = Kernel.create(tmp_path / "kernel.sqlite3", replace(spec, inputs=inputs), requirements=source)
+    kernel = create_kernel(tmp_path / "kernel.sqlite3", replace(spec, inputs=inputs), requirements=source)
     delivered = Event()
 
     def fake(_config: Any, _rendered: Any, _identity: str, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
         delivered.set()
         return {"outcome": "success", "reason": None}
 
-    sender = NativeNotifications(kernel.storage.path, tmp_path, transport=fake)
+    sender = NativeNotifications(kernel.storage.path, tmp_path, transport=fake, storage=kernel.storage)
     try:
         assert delivered.wait(3)
         changed = replace(source, parent=replace(source.parent, title="Revised Parent"))
@@ -361,7 +363,7 @@ def test_fatal_close_cancels_real_local_send_child_without_drain(tmp_path: Path)
             child.terminate()
             child.wait(timeout=5)
 
-    sender = NativeNotifications(kernel.storage.path, tmp_path, transport=fake)
+    sender = NativeNotifications(kernel.storage.path, tmp_path, transport=fake, storage=kernel.storage)
     try:
         assert started.wait(3)
         before = time.monotonic()
@@ -389,7 +391,7 @@ def test_native_gate_leave_reentry_between_observations_is_a_new_occurrence(tmp_
         return {"outcome": "success", "reason": None}
 
     def boundaries() -> list[dict[str, Any]]:
-        observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport)
+        observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport, storage=kernel.storage)
         observer.close()
         assert observer.failure_reason is None
         return [row for row in outbox.read_notifications(tmp_path, "run-native")["records"]
@@ -423,7 +425,7 @@ def test_leaving_a_gate_cancels_its_unsent_card_without_claiming_delivery(tmp_pa
         delivered.append(identity)
         return {"outcome": "success", "reason": None}
 
-    observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport)
+    observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport, storage=kernel.storage)
     try:
         assert started.wait(3)
         kernel.control("stop", "first-stop", subject="native-ticket")
@@ -455,7 +457,7 @@ def test_gate_batch_wakes_a_parked_sender_without_close(tmp_path: Path) -> None:
         started.set()
         return {"outcome": "success", "reason": None}
 
-    observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport)
+    observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport, storage=kernel.storage)
     try:
         assert started.wait(3)
         deadline = time.monotonic() + 3
@@ -487,7 +489,7 @@ def test_accumulated_gate_history_continues_within_each_read_budget(tmp_path: Pa
         sent.append(rendered["header"]["title"]["content"])
         return {"outcome": "success", "reason": None}
 
-    observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport)
+    observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport, storage=kernel.storage)
     observer.close()
     assert observer.failure_reason is None
     document = outbox.read_notifications(tmp_path, "run-native")
@@ -506,7 +508,7 @@ def test_gate_reentry_during_paged_catchup_never_claims_the_old_card(tmp_path: P
         delivered.append(rendered["header"]["title"]["content"])
         return {"outcome": "success", "reason": None}
 
-    observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport)
+    observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport, storage=kernel.storage)
     try:
         assert started.wait(3)
         kernel.control("stop", "original-stop", subject="native-ticket")
@@ -550,7 +552,7 @@ def test_gate_retry_rereads_committed_subject_without_a_callback(tmp_path: Path)
             return {"outcome": "failed", "reason": "definitive rejected send"}
         return {"outcome": "success", "reason": None}
 
-    observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport)
+    observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport, storage=kernel.storage)
     try:
         assert attempted.wait(3)
         observer.close()

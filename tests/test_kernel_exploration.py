@@ -35,7 +35,7 @@ def test_return_is_durable_before_consumption_and_resume_does_not_charge_twice(t
     operations.runner.authorize_agent(first.call)
     kernel.receive(first.call, b'{"result_kind":"development","summary":"changed","human_blockers":null}')
 
-    reopened = Kernel(path)
+    reopened = Kernel(path, run_id=kernel.storage.run_id)
     observed = reopened.status("ticket:2")
     assert observed["pending_return"] is True
     assert observed["budgets"]["requirements"]["developments_used"] == 1
@@ -124,8 +124,8 @@ def test_stop_late_raw_is_settlement_only_and_independent_process_can_read_it(tm
         operations.runner.authorize_agent(step.call)
     environment = dict(os.environ, PYTHONPATH=os.pathsep.join((
         str(Path(__file__).resolve().parents[1] / "src"), str(Path(__file__).resolve().parent))))
-    command = "from pathlib import Path; from agent_run.core.kernel import Kernel; import json,sys; print(json.dumps(Kernel(Path(sys.argv[1])).status('ticket:2')))"
-    process = subprocess.run([sys.executable, "-c", command, str(path)], env=environment,
+    command = "from pathlib import Path; from agent_run.core.kernel import Kernel; import json,sys; print(json.dumps(Kernel(Path(sys.argv[1]),run_id=sys.argv[2]).status('ticket:2')))"
+    process = subprocess.run([sys.executable, "-c", command, str(path), kernel.storage.run_id], env=environment,
                              text=True, capture_output=True, check=True, timeout=15)
     observed = json.loads(process.stdout)
     assert observed["stopped"] is True
@@ -143,7 +143,7 @@ from agent_run.model import Execution, Commit, Requirements, ParentIssue, Issue
 from agent_run.core.operation_contract import DeliveryFacts
 from support.core_operations import CoreOperations, ReadOnlyPorts
 import json, sys
-k = Kernel(Path(sys.argv[1]))
+k = Kernel(Path(sys.argv[1]),run_id=sys.argv[5])
 wire = json.loads(sys.argv[4])
 parent = wire['parent']; parent['sub_issue_numbers'] = tuple(parent['sub_issue_numbers'])
 source = Requirements(ParentIssue(**parent), tuple(Issue(**dict(item, labels=frozenset(item['labels']), blocked_by=())) for item in wire['issues']))
@@ -152,7 +152,7 @@ step = CoreOperations(k, Execution('offline-run',sys.argv[2],int(sys.argv[3])), 
 print(json.dumps({'step':step.kind,'status':k.status('ticket:2')}))
 """
     resumed = subprocess.run([sys.executable, "-c", consume_command, str(path), replacement.owner, str(replacement.epoch),
-                              json.dumps(asdict(ports.requirements), default=list)],
+                              json.dumps(asdict(ports.requirements), default=list), kernel.storage.run_id],
                              env=environment, text=True, capture_output=True, check=True, timeout=15)
     assert json.loads(resumed.stdout)["step"] == "progress"
     assert json.loads(resumed.stdout)["status"]["phase"] == "candidate"

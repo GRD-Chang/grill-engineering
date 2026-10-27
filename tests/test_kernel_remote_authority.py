@@ -92,7 +92,7 @@ def test_original_merge_readback_distinguishes_server_commit_from_partial_local_
         with pytest.raises(ReadUnavailable) as unavailable:
             scenario.port.reconcile(effect)
         assert unavailable.value.code == "remote_read_failed" and unavailable.value.write_returncode is None
-    scenario.kernel = Kernel(scenario.kernel.storage.path)
+    scenario.kernel = Kernel(scenario.kernel.storage.path, run_id=scenario.kernel.storage.run_id)
     scenario.kernel.clock = lambda: now[0]
     waiting = scenario.runner().run_once()
     if server_committed:
@@ -127,7 +127,7 @@ def test_parent_closeout_recovers_after_merged_source_ref_is_deleted(tmp_path, m
     assert effect.source_ref not in scenario.port.remote_refs()
     roles, budgets = list(scenario.role_calls), scenario.kernel.status(effect.subject)["budgets"]
     assert scenario.kernel.status(effect.subject)["pending_write"]["status"] == "sent"
-    scenario.kernel = Kernel(scenario.kernel.storage.path)
+    scenario.kernel = Kernel(scenario.kernel.storage.path, run_id=scenario.kernel.storage.run_id)
     assert scenario.run(approve=True).kind == "complete"
     status = scenario.kernel.status(effect.subject)
     assert status["phase"] == "complete" and status["budgets"] == budgets

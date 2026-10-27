@@ -43,7 +43,7 @@ def test_consumed_review_keeps_each_original_format_return(tmp_path, monkeypatch
     assert len(calls) == 3
     assert len({call.attempt_id for call in calls}) == len({call.invocation_id for call in calls}) == 1
     before = _snapshot(tmp_path)
-    document = read(scenario.kernel.storage.path, "history")
+    document = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage)
     payload = json.dumps(document.data, ensure_ascii=False, sort_keys=True)
     review, = [attempt for attempt in document.data["history"]["attempts"] if attempt["role"] == "review"]
     assert review["status"] == "consumed" and review["outcome"] == "pass"
@@ -74,7 +74,7 @@ def test_consumed_review_keeps_each_original_format_return(tmp_path, monkeypatch
               if event["kind"] == "raw_returned" and event["identity"] == calls[0].invocation_id]
     assert len(events) == 3
     for event in events:
-        page = read(scenario.kernel.storage.path, "history", after=event["position"] - 1, limit=1)
+        page = read(scenario.kernel.storage.path, 'history', after=event['position'] - 1, limit=1, storage=scenario.kernel.storage)
         assert page.data["history"]["attempts"] == [review]
         human = StringIO()
         render(replace(page, language="en"), style="plain", details=True, stream=human)
@@ -89,7 +89,7 @@ def test_consumed_review_keeps_each_original_format_return(tmp_path, monkeypatch
 @pytest.mark.parametrize("continued_round", ["complete"], indirect=True)
 def test_original_returns_remain_under_their_exact_invocation_after_new_thread_resume(continued_round, tmp_path):
     scenario, calls, _ = continued_round
-    document = read(scenario.kernel.storage.path, "history")
+    document = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage)
     attempt, = document.data["history"]["attempts"]
     assert attempt["id"] == calls[0].attempt_id == calls[1].attempt_id
     assert len(attempt["invocations"]) == 2

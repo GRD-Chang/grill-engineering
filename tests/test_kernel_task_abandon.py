@@ -1,4 +1,6 @@
 """Permanent Task revocation does not reclaim an unknown Host or Worker."""
+
+from support.repository_fixture import create_kernel
 from dataclasses import replace
 from pathlib import Path
 
@@ -9,7 +11,8 @@ from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.model import Execution, HostObservation
 from support.offline import GraphScenario
-from agent_run.storage.tasks import bind_task, locked_task
+from support.repository_fixture import foreign_task_run
+import sqlite3
 from test_kernel_requirements import independent_source
 from support.core_operations import CoreOperations
 
@@ -17,7 +20,7 @@ from support.core_operations import CoreOperations
 @pytest.mark.parametrize("host_state", ["unlaunched", "unknown", "rebound"])
 def test_task_abandon_fences_the_exact_task_without_reclaiming_its_host(tmp_path: Path, host_state: str) -> None:
     scenario = GraphScenario(tmp_path / "source", independent_source())
-    kernel = Kernel.create_task(tmp_path / "published.sqlite3", scenario.spec, requirements=scenario.requirements)
+    kernel = create_kernel(tmp_path / "published.sqlite3", scenario.spec, requirements=scenario.requirements)
     scenario.kernel = kernel
     task = TaskKey(Path(scenario.spec.repository_root), scenario.spec.repository, scenario.spec.parent_issue)
     request = None
@@ -45,11 +48,13 @@ def test_task_abandon_fences_the_exact_task_without_reclaiming_its_host(tmp_path
         assert kernel.observe_host(request, HostObservation("unknown", request.unit_name)) == "unknown"
     inspections = scenario.port.inspect_resources(kernel.generation_resources())
     if host_state == "rebound":
-        other = Kernel.create(tmp_path / "other.sqlite3", replace(scenario.spec, run_id="other-run"), requirements=scenario.requirements)
-        with locked_task(task) as location:
-            bind_task(location, "other-run", other.storage.path)
-        with pytest.raises(KernelError, match="task_location_identity"):
-            kernel.abandon_task("abandon-original-task", resource_inspections=inspections)
+        other = foreign_task_run(kernel, scenario.spec, scenario.requirements)
+        # The final schema rejects the old JSON-rebinding scenario at its
+        # canonical composite FK, before any control or cross-Run mutation.
+        from agent_run.storage.routing import RepositoryRoute
+        with pytest.raises(sqlite3.IntegrityError):
+            with RepositoryRoute.from_database(kernel.storage.path).metadata().transaction(ordered=False) as tx:
+                tx.execute("UPDATE tasks SET current_run=? WHERE id=?", ('other-run', task.fingerprint))
         assert kernel.source_status()["abandonment"] is None
         assert other.source_status()["abandonment"] is None
         return

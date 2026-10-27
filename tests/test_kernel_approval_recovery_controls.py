@@ -81,7 +81,7 @@ def test_idle_public_approve_starts_existing_recovery_without_a_merge_grant(tmp_
     request, = requests
     # A lost caller response reopens the same durable request; it neither
     # reapplies the control nor allocates another execution identity.
-    assert Kernel(kernel.storage.path).host_request(result["action_id"]) == request
+    assert Kernel(kernel.storage.path, run_id=kernel.storage.run_id).host_request(result["action_id"]) == request
     assert kernel.dispatch_host(request) and not kernel.dispatch_host(request)
     running = replace(observed, unit_name=request.unit_name, invocation_id="recovery-" + request.nonce)
     assert kernel.observe_host(request, running) == "running"

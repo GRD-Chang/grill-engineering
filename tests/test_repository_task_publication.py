@@ -49,7 +49,7 @@ def repository(tmp_path, monkeypatch):
         raise AssertionError('Canonical repository operation touched legacy publication/admission')
     for module, names in ((core, ('read_task', 'bind_task', 'locked_admission')), (tasks, ('read_task', 'bind_task'))):
         for name in names:
-            monkeypatch.setattr(module, name, no_locator)
+            assert not hasattr(module, name)
     return route
 
 
@@ -228,7 +228,7 @@ def test_first_resume_selector_finds_current_run_without_a_json_publication_or_e
     assert selected[0].task == TaskKey(repository.repository_root, repository.repository, 1)
     assert repository.kernel(selected[0].run_id).storage.path == repository.database
     # No CLI/Host is enabled or run by a successful metadata selection.
-    assert routing.REPOSITORY_PUBLIC_READY is False
+    assert not hasattr(routing, 'REPOSITORY_PUBLIC_READY')
     with repository.at_run('A').transaction(write=False) as tx:
         assert tx.one('SELECT count(*) FROM hosts')[0] == 0
         assert tx.one('SELECT count(*) FROM invocations')[0] == 0

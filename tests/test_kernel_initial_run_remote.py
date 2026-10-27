@@ -1,5 +1,7 @@
 """Actual source observation feeds the original first Run-ref empty CAS."""
 
+from support.repository_fixture import create_kernel
+
 from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.core.operation_runner import observe_control
 from pathlib import Path
@@ -34,7 +36,7 @@ def test_real_empty_run_ref_is_observed_and_created_before_a_ticket_workspace(tm
     resources = creation_resources("new-run", source, seed.base, "refs/heads/main", port.root.resolve())
     spec = RunSpec("new-run", port.repository, 1, "not-authority", "not-authority", resources,
                    language="en", repository_root=str(port.root.resolve()), inputs=inputs)
-    kernel = Kernel.create(tmp_path / "new-run/kernel.sqlite3", spec, requirements=source)
+    kernel = create_kernel(tmp_path / "new-run/kernel.sqlite3", spec, requirements=source)
     execution = kernel.claim_executor("creator")
     operations = CoreOperations(kernel, execution, lambda binding: port)
     world = operations.runner.observe("ticket:2")
@@ -66,7 +68,7 @@ def test_real_empty_run_ref_is_observed_and_created_before_a_ticket_workspace(tm
     assert effect.payload["expected_remote_sha"] is None and effect.after_sha == seed.base.sha
     assert authorized == [effect.effect_id]
     assert git.run("ls-remote", "--refs", "origin", effect.source_ref).stdout.split()[0] == seed.base.sha
-    reopened = Kernel(kernel.storage.path)
+    reopened = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     original_read = port.reconcile
     readbacks = []
 

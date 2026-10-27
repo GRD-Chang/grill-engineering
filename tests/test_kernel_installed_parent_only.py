@@ -58,7 +58,7 @@ def test_installed_public_parent_only_reaches_approval_close_cleanup_and_normal_
                 assert accepted["result"] == "accepted"
                 command = commands[0]
                 assert command[command.index("-m") + 1] == 'agent_run.runtime.executor'
-                kernel = Kernel(Path(command[command.index("--database") + 1]))
+                kernel = Kernel(Path(command[command.index('--database') + 1]), run_id=next((item.partition('=')[2] for item in command if item.startswith('--run-id='))))
                 databases.append(kernel)
                 # Only the original Host's actual external reads wait here.
                 # The public approval reads the fresh world without this delay.

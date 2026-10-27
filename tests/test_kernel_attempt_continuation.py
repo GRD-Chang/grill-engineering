@@ -1,4 +1,6 @@
 """A semantic continuation owns its input and binding before native execution."""
+
+from support.repository_fixture import create_kernel
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -52,7 +54,7 @@ def test_human_resume_uses_attempt_input_and_binding_without_charging_again(tmp_
     assert second is not None and second.attempt_id == first.attempt_id
     assert bound == [first.attempt_id]
     with kernel.storage.transaction(write=False) as tx:
-        assert tx.one("SELECT protocol FROM meta")[0] == PROTOCOL == "independent-delivery-kernel-v21"
+        assert tx.one("SELECT protocol FROM meta")[0] == PROTOCOL == "independent-delivery-repository-v22"
         references = {row["from"]: (row["table"], row["to"])
                       for row in tx.execute("PRAGMA foreign_key_list(attempts)")}
         assert references["thread_id"] == ("threads", "id")
@@ -155,7 +157,7 @@ def test_format_period_crossing_executor_exit_uses_a_real_new_invocation(tmp_pat
 def test_local_resume_new_thread_keeps_format_period_and_old_invocation_binding(tmp_path: Path) -> None:
     spec, requirements = _native_spec(tmp_path)
     spec = replace(spec, policy=replace(spec.policy, development_deadline_seconds=7))
-    kernel = Kernel.create(tmp_path / 'native.sqlite3', spec, requirements=requirements)
+    kernel = create_kernel(tmp_path / 'native.sqlite3', spec, requirements=requirements)
     now = [100.0]
     kernel.clock = lambda: now[0]
     execution = kernel.claim_executor('executor')

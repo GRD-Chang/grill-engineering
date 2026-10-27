@@ -78,7 +78,7 @@ def test_installed_foreground_parent_only_public_lifecycle(git_repo, tmp_path, m
             # The CLI is the source of the selected Task; the DB is opened only
             # to inspect committed binding/raw/lease facts, never edited.
             workspace = ManagedWorkspace.for_repository('example/project')
-            kernel = Kernel(workspace.state_root / original['run_id'] / 'kernel.sqlite3')
+            kernel = Kernel(workspace.state_root / 'kernel.sqlite3', run_id=original['run_id'])
             assert kernel.host_request(original['action_id']).run_id == original['run_id']
             before = kernel.status('parent:1')
             assert before['phase'] == 'approval'

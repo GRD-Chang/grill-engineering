@@ -45,7 +45,7 @@ def test_settings_sparse_overrides_freeze_native_policy_and_renew_from_frozen(tm
     assert main(["settings", "configure", "--ticket-review-rounds", "9",
                  "--development-deadline", "2h", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["policy"]["ticket_review_rounds"] == 9
-    reopened = Kernel(kernel.storage.path)
+    reopened = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     execution = reopened.claim_executor("settings-owner")
     call = CoreOperations(reopened, execution, lambda binding: ports).once().call
     assert call is not None and call.deadline_seconds == 7

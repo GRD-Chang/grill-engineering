@@ -19,7 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from agent_run.storage.run_scope import selected_statement
+from agent_run.storage.run_scope import run_statement
 from agent_run.contracts.repository import normalize_repository
 from agent_run.storage import notification_outbox as outbox
 from agent_run.errors import bounded_error, KernelError
@@ -60,7 +60,7 @@ class NativeNotifications:
 
     def __init__(self, database: Path, state_root: Path, *, transport: Send = send,
                  exit_notice: Mapping[str, Any] | None = None, status_api: PhysicalAPI | None = None,
-                 storage: Storage | None = None) -> None:
+                 storage: Storage) -> None:
         if (database.is_symlink() or state_root.is_symlink()
                 or not database.is_file() or not state_root.is_dir()
                 or database.parent.resolve() != state_root.resolve()):
@@ -71,7 +71,7 @@ class NativeNotifications:
         self.exit_notice = dict(exit_notice) if exit_notice is not None else None
         self.exit_event_id: str | None = None
         self.storage = open_run(database, storage=storage)
-        self._storage_options: dict[str, Any] = {} if storage is None else {"storage": self.storage}
+        self._storage_options: dict[str, Any] = {"storage": self.storage}
         with self.storage.transaction(write=False) as tx:
             self.run_id, self.binding, self.config, self.state = self._run(tx)
         self.feishu_enabled = self.config.get("enabled") is True
@@ -132,8 +132,7 @@ class NativeNotifications:
             run_id, binding, config, state = self._run(tx)
             if not self._same_binding(run_id, binding, config, state):
                 raise ValueError("notification Run or recipient binding changed")
-            history = tx.rows(*selected_statement(tx, 'SELECT position,subject,kind,identity,generation,created_at,material_id,phase,purpose FROM history WHERE position>? ORDER BY position LIMIT 16',
-                          'SELECT run_id,position,subject,kind,identity,generation,created_at,material_id,phase,purpose FROM history WHERE run_id=? AND position>? ORDER BY position LIMIT 16', (after,)), limit=16)
+            history = tx.rows(*run_statement(tx, 'SELECT run_id,position,subject,kind,identity,generation,created_at,material_id,phase,purpose FROM history WHERE run_id=? AND position>? ORDER BY position LIMIT 16', (after,)), limit=16)
             events: list[dict[str, Any]] = []
             for row in history:
                 events.extend(projected.content for projected in project_event(
@@ -209,15 +208,13 @@ class NativeNotifications:
             terminal = self._terminal_event(tx, view)
             if terminal is not None and view["status"] == "completed":
                 closure = view["closures"][0]
-                original = tx.one(*selected_statement(tx, "SELECT * FROM history WHERE kind='effect_consumed' AND identity=? AND material_id=?",
-                               "SELECT * FROM history WHERE run_id=? AND kind='effect_consumed' AND identity=? AND material_id=?", (closure["effect_id"], closure["receipt_id"])))
+                original = tx.one(*run_statement(tx, "SELECT * FROM history WHERE run_id=? AND kind='effect_consumed' AND identity=? AND material_id=?", (closure["effect_id"], closure["receipt_id"])))
                 timing = execution_facts(tx, dict(original), whole_run=True)
                 total = timing.pop("execution_seconds", None)
                 terminal.update(timing, total_seconds=total)
             highwater = view["highwater"]
             if cursor < highwater:
-                rows = tx.rows(*selected_statement(tx, 'SELECT position,subject,generation,phase,status FROM history WHERE position>? AND position<=? ORDER BY position LIMIT 128',
-                           'SELECT position,subject,generation,phase,status FROM history WHERE run_id=? AND position>? AND position<=? ORDER BY position LIMIT 128', (cursor, highwater)), limit=128)
+                rows = tx.rows(*run_statement(tx, 'SELECT position,subject,generation,phase,status FROM history WHERE run_id=? AND position>? AND position<=? ORDER BY position LIMIT 128', (cursor, highwater)), limit=128)
                 if not rows:
                     raise ValueError("notification history cursor has no committed continuation")
                 for row in rows:
@@ -238,8 +235,7 @@ class NativeNotifications:
             for key, action in actions.items():
                 if action["subject"] is None:
                     continue
-                gate_history = tx.rows(*selected_statement(tx, "SELECT h.* FROM history h JOIN gates g ON g.subject=h.subject AND g.code=h.identity AND g.evidence IS h.material_id WHERE h.kind='paused' AND h.subject=? AND h.generation=? AND h.identity=? ORDER BY h.position DESC LIMIT 1",
-                                   "SELECT h.* FROM history h JOIN gates g ON g.run_id=h.run_id AND g.subject=h.subject AND g.code=h.identity AND g.evidence IS h.material_id WHERE h.run_id=? AND h.kind='paused' AND h.subject=? AND h.generation=? AND h.identity=? ORDER BY h.position DESC LIMIT 1", (action["subject"], action.get("generation"), action["reason"])))
+                gate_history = tx.rows(*run_statement(tx, "SELECT h.* FROM history h JOIN gates g ON g.run_id=h.run_id AND g.subject=h.subject AND g.code=h.identity AND g.evidence IS h.material_id WHERE h.run_id=? AND h.kind='paused' AND h.subject=? AND h.generation=? AND h.identity=? ORDER BY h.position DESC LIMIT 1", (action["subject"], action.get("generation"), action["reason"])))
                 if gate_history:
                     resumes[key] = resume_facts(tx, dict(gate_history[0]))
             caught_up = cursor == highwater
@@ -776,10 +772,10 @@ class NativeNotifications:
             print("Notification sender cleanup unproven", file=sys.stderr)
 
 
-def notify_committed(database: Path, *, timeout_seconds: float = 1.0, storage: Storage | None = None) -> None:
+def notify_committed(database: Path, *, timeout_seconds: float = 1.0, storage: Storage) -> None:
     """One finite post-commit opportunity through the existing sender."""
     observer: NativeNotifications | None = None
-    options: dict[str, Any] = {} if storage is None else {"storage": storage}
+    options: dict[str, Any] = {"storage": storage}
     try:
         observer = NativeNotifications(database, database.parent, **options)
         observer.close(timeout_seconds=timeout_seconds)
@@ -790,8 +786,8 @@ def notify_committed(database: Path, *, timeout_seconds: float = 1.0, storage: S
             observer.close(drain=False)
 
 
-def deliver_host_exit_notice(database: Path, state_root: Path, notice: Mapping[str, Any], *, storage: Storage | None = None) -> None:
+def deliver_host_exit_notice(database: Path, state_root: Path, notice: Mapping[str, Any], *, storage: Storage) -> None:
     """Drain one exact Host-exit receipt through the existing bounded sender."""
-    options: dict[str, Any] = {} if storage is None else {"storage": storage}
+    options: dict[str, Any] = {"storage": storage}
     observer = NativeNotifications(database, state_root, exit_notice=notice, **options)
     observer.close()

@@ -1,8 +1,7 @@
-"""Staged Run selection and immutable material access on one transaction.
+"""Explicit Run selection and immutable material access on one transaction.
 
 This module neither opens a database nor grants execution. Storage's protocol,
 file-identity, transaction and capacity checks remain the caller's responsibility.
-It is not wired into a public producer until all repository consumers are scoped.
 There is no SQL rewriting, cached business state or second writable store here.
 """
 from dataclasses import dataclass
@@ -27,9 +26,8 @@ class RunScope:
 class RunTransaction(Transaction):
     """One explicit selection; consumers must still scope their domain SQL.
 
-    Only the material interface is migrated in this first bounded slice. The
-    inherited query interface deliberately does not guess or rewrite SQL.
-    Current Core, CLI, Host and protocol selection do not construct this class.
+    All consumers explicitly scope their SQL. The inherited query interface
+    deliberately does not guess or rewrite SQL.
     """
 
     def __init__(self, transaction: Transaction, run_id: str) -> None:
@@ -140,35 +138,15 @@ class RunTransaction(Transaction):
         return bytes(body)
 
 
-def transaction_scope(transaction: Transaction) -> RunScope | None:
-    """Select an explicit layout, never infer a Run from arbitrary record data.
-
-    The None branch belongs only to the still-active current producer. It is
-    removed at one-way protocol activation, not an old-protocol reader.
-    """
-    if isinstance(transaction, RunTransaction):
-        return transaction.require_scope()
-    if type(transaction) is not Transaction:
+def transaction_scope(transaction: Transaction) -> RunScope:
+    """Require one explicit Run view; metadata owners never imply a selection."""
+    if not isinstance(transaction, RunTransaction):
         raise KernelError("run_scope_required")
-    columns = transaction.execute("PRAGMA table_info(material)").fetchmany(32)
-    primary = [row["name"] for row in sorted(columns, key=lambda row: row["pk"]) if row["pk"]]
-    if primary != ["id"]:
-        raise KernelError("run_scope_required")
-    return None
+    return transaction.require_scope()
 
 
-def selected_statement(transaction: Transaction, current: str, scoped: str | None,
-                       values: Sequence[Any] = (), *, run_last: bool = False) -> tuple[str, Sequence[Any]]:
-    """Choose complete caller-owned SQL; do not generate or rewrite predicates.
-
-    Run-bound statements explicitly put the selected Run parameter first, or
-    last when run_last is specified (for SET/VALUES before the Run predicate). A
-    consumer not yet migrated must refuse the staged layout rather than issue
-    its current-layout statement there. Query budgets still belong to Transaction.
-    """
+def run_statement(transaction: Transaction, statement: str,
+                  values: Sequence[Any] = (), *, run_last: bool = False) -> tuple[str, Sequence[Any]]:
+    """Bind the explicit Run to complete caller-owned SQL, never rewrite SQL."""
     scope = transaction_scope(transaction)
-    if scope is None:
-        return current, values
-    if scoped is None:
-        raise KernelError("run_scope_required")
-    return scoped, (*values, scope.run_id) if run_last else (scope.run_id, *values)
+    return statement, (*values, scope.run_id) if run_last else (scope.run_id, *values)

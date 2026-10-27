@@ -15,7 +15,7 @@ from agent_run.storage.sqlite import Storage
 
 @pytest.mark.parametrize('suffix', ['-wal', '-shm'])
 def test_unlinked_sidecar_requires_one_absence_check_before_connect(tmp_path, monkeypatch, suffix):
-    native = Storage.create(tmp_path / 'kernel.sqlite3')
+    native = Storage.create(tmp_path / 'kernel.sqlite3', namespace=('example/project', str(tmp_path.resolve())))
     writer = sqlite3.connect(native.path)
     writer.execute('PRAGMA user_version=7')
     writer.commit()
@@ -61,7 +61,7 @@ def test_unlinked_sidecar_requires_one_absence_check_before_connect(tmp_path, mo
 @pytest.mark.parametrize('suffix', ['-wal', '-shm'])
 @pytest.mark.parametrize('outcome', ['same', 'new', 'zero', 'EACCES', 'EIO', 'ENOTDIR', 'false_ENOENT'])
 def test_zero_link_sidecar_recheck_cannot_adopt_existing_or_unreadable_object(tmp_path, monkeypatch, suffix, outcome):
-    native = Storage.create(tmp_path / 'kernel.sqlite3')
+    native = Storage.create(tmp_path / 'kernel.sqlite3', namespace=('example/project', str(tmp_path.resolve())))
     target = Path(str(native.path) + suffix)
     original = Path.stat
     calls = []
@@ -91,7 +91,7 @@ def test_zero_link_sidecar_recheck_cannot_adopt_existing_or_unreadable_object(tm
 @pytest.mark.parametrize('target', ['database', 'directory'])
 @pytest.mark.parametrize('fault', ['missing', 'replacement', 'nonregular', 'hardlink'])
 def test_identity_is_rechecked_after_real_snapshot_before_yield(tmp_path, monkeypatch, target, fault):
-    native = Storage.create(tmp_path / 'kernel.sqlite3')
+    native = Storage.create(tmp_path / 'kernel.sqlite3', namespace=('example/project', str(tmp_path.resolve())))
     watched = native.path if target == 'database' else native.path.parent
     original_stat, original_connect = Path.stat, sqlite3.connect
     snapshot = []
@@ -143,7 +143,7 @@ def test_identity_is_rechecked_after_real_snapshot_before_yield(tmp_path, monkey
 
 
 def test_real_snapshot_precedes_yield_and_keeps_uncheckpointed_wal_visible(tmp_path):
-    native = Storage.create(tmp_path / 'kernel.sqlite3')
+    native = Storage.create(tmp_path / 'kernel.sqlite3', namespace=('example/project', str(tmp_path.resolve())))
     with closing(sqlite3.connect(native.path)) as writer:
         writer.execute('PRAGMA user_version=7')
         writer.commit()
@@ -176,7 +176,7 @@ def test_real_snapshot_precedes_yield_and_keeps_uncheckpointed_wal_visible(tmp_p
     ('-shm', stat.S_IFLNK | 0o777, 0, 0),
 ])
 def test_unsafe_objects_never_enter_the_disappearance_exception(tmp_path, monkeypatch, suffix, mode, links, size):
-    native = Storage.create(tmp_path / 'kernel.sqlite3')
+    native = Storage.create(tmp_path / 'kernel.sqlite3', namespace=('example/project', str(tmp_path.resolve())))
     target = Path(str(native.path) + suffix)
     original = Path.stat
     calls = []

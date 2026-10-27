@@ -44,7 +44,7 @@ before/after hello 真实 namespace 合成2P、unknown 负例1P；这些不同�
 真实 Codex 与父助手原云交付仍未验收。
 不能把合成通过、上述合同或 doctor 的能力预检作为完整交付证明。环境实测边界统一见[支持矩阵](productization/support.md)。
 
-本候选仅接受 v20；v19 及更旧 Run 保留原数据但拒绝续接，无迁移，见[状态存储](agents/state-storage.md)。
+本候选仅接受 repository v22；v21及更旧Run、早期未激活仓库候选保留原数据但拒绝续接，无迁移，见[状态存储](agents/state-storage.md)。
 
 ## 一条命令推进 Ticket 交付
 
@@ -303,7 +303,7 @@ evidence；任一可重建输入变化都先回到 fresh Run Acceptance 判断 R
 | `stop --ticket` | 未终止 Run 中尚未完成的指定 Ticket，最终批准期间除外 | 持久记录停止意图，立即中断准确归属该票的 Agent，取消未启动的工作排队；确认进程退出后释放名额，其他 Ticket 与 CI 监督继续 | 保留工作区、Attempt、适用 Thread 与独立预算门禁；在途写入先对账，状态展示等待收口原因；用 `resume --ticket` 显式继续 |
 | `abandon` | 未完成 Run（包括人工边界） | 先检查所有 Managed Development Checkout；干净时写入 durable abandonment，再执行受限的 PR 关闭、Ticket reopen 与本地清理恢复 | 不回滚默认分支；dirty checkout 默认不删且不执行 GitHub mutation，只有显式 `--discard-worktree` 才强制丢弃 |
 
-控制 Action、Host、Executor 与业务事实同在 v20 数据库中，不能依靠删除一个控制文件恢复准入。
+控制 Action、Host、Executor 与业务事实同在该仓库的唯一v22数据库中，不能依靠删除一个控制文件恢复准入。
 生命周期命令先核验准确 Task 绑定、原 Host 和 Runner 使用租约，再决定附着或交接。
 附着回执不表示本次新请求已应用；须核对 requested action 与实际应用结果。
 Run 已到人工边界、PID 消失或原命令参数相同，都不能代替准确 Host/Worker 的退出证明。
@@ -374,9 +374,9 @@ Ticket 和两种 Parent 共用开发循环，由 Development 定向调查失败�
 同一 Parent 的修复工作、最终 PR、后继提交和目标追加共用累计 CI 开发额度，默认 3 次；
 耗尽后显式 resume 仅续期该额度并保留历史，修复后的当前成果须重新通过准确 CI 和人工批准。
 
-新 Run 在 `native-task-locations/` 发布 Task → Run ID / 数据库路径的准确绑定，
-业务身份从 v20 数据库核验。`runs` 可以按当前仓库或显式 `--repo` 发现候选；
-`status`、`history` 可以按当前仓库唯一未终止 Run、`--parent`，或任意目录的
+新Run与Task/current绑定同事务保存在该仓库唯一SQLite中，不再发布JSON位置记录。
+业务身份只从准确Run的数据库关系核验。`runs` 可以按当前仓库或显式 `--repo` 发现候选；
+`status`、`history` 可以按当前仓库唯一current Run、`--parent`，或任意目录的
 `--repo + --parent` 选择。同一用户的不同启动目录和用户 clone 共用同一 Repository/Parent 的未完成任务。
 候选不唯一或身份冲突时停止，不按最近时间猜测，不全盘搜索，不补写状态。
 准确定位与有界发现规则见[Run 选择与定位](agents/run-selection.md)。
@@ -620,15 +620,16 @@ Worker host/PAT/App 来源通过 `settings show/configure` 管理，详情见[�
 | 位置（相对于数据主目录） | 内容 |
 | --- | --- |
 | `repositories/<owner>/<repo>/repository/` | 从远端独立克隆的 Git 仓库；owner/repo 统一小写 |
-| `repositories/<owner>/<repo>/state/<run_id>/kernel.sqlite3` | v20 Run、控制、Host、Profile、预算与历史关系 |
+| `repositories/<owner>/<repo>/state/kernel.sqlite3` | 仓库内Task/Run、控制、Host、Profile、预算与历史关系 |
 | `repositories/<owner>/<repo>/worktrees/<run_id>/` | 准确属于该 Run 的开发、集成与发布工作区 |
-| `native-task-locations/<task-fingerprint>.json` | Task → Run ID 与数据库位置，不复制业务状态 |
-| `repositories/<owner>/<repo>/state/<run_id>/notifications/` | 独立通知投递记录，与业务数据库和只读查询分工 |
+| `native-task-locations/<task-fingerprint>.lock` | 原Task mutex与撤权FD；不发布或清理JSON绑定 |
+| `repositories/<owner>/<repo>/state/notifications/` | 独立通知投递记录，与业务数据库和只读查询分工 |
+| `repositories/<owner>/<repo>/state/runs/<Run SHA-256>/` | 准确Run的raw产物，Host临时carrier另按Run哈希分区 |
 | `snapshots/`、`generations/` 等安装目录 | 安装快照和当前版本选择，与任务数据分别管理 |
 
 配置继续位于 `$XDG_CONFIG_HOME/agent-run/`（默认 `~/.config/agent-run/`），临时环境交接文件使用运行时目录。卸载仅清理安装内容，保留任务数据。用户仓库的文件、索引、引用和 Git 元数据均由用户自行管理。
 
-当前唯一状态协议是 **`independent-delivery-kernel-v20`**，详见[状态存储](agents/state-storage.md)。
+本开发候选唯一状态协议是 **`independent-delivery-repository-v22`**（尚待同版独立验收，非已部署声明），详见[状态存储](agents/state-storage.md)。
 旧 JSON/v6、native v17/v18、来源封印及导入状态不升级、不转换，不提供兼容查询或恢复；
 原数据、Candidate 和工作区保留，拒绝继续不授予清理权限。
 稳定 Development Checkout 在 Required Checks pending 或 Worker/Publisher 普通失败、超时、

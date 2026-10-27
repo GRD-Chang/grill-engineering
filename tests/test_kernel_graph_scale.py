@@ -1,4 +1,6 @@
 """Legal source graphs exceed one physical SQLite read page."""
+
+from support.repository_fixture import create_kernel
 from pathlib import Path
 
 import pytest
@@ -24,7 +26,7 @@ def test_130_ticket_source_graph_dependencies_fifo_and_stop_cross_read_pages(tmp
     final = Delivery("final:1", DeliveryKind.FINAL_RUN, 1, "unaccepted", base, "refs/heads/run", "refs/heads/main")
     spec = RunSpec("wide-run", "example/project", 1, "unaccepted", "unaccepted", (*deliveries, final),
                    Policy(concurrency=1), language="en", repository_root=str(tmp_path.resolve()), inputs=fixture_inputs())
-    kernel = Kernel.create(tmp_path / "run.sqlite3", spec, requirements=source)
+    kernel = create_kernel(tmp_path / "run.sqlite3", spec, requirements=source)
     ports = ReadOnlyPorts(source, deliveries[0].source_ref, deliveries[0].target_ref, DeliveryFacts(base, None))
     facts = {(delivery.source_ref, delivery.target_ref): DeliveryFacts(base, None) for delivery in deliveries}
     monkeypatch.setattr(ports, "delivery", lambda request: facts[(request.source_ref, request.target_ref)])
@@ -38,7 +40,7 @@ def test_130_ticket_source_graph_dependencies_fifo_and_stop_cross_read_pages(tmp
     assert allocated is not None and allocated.subject == "ticket:2"
     for _ in range(128):
         assert operations.once(agent_capacity=0).call is None
-    assert len(read(kernel.storage.path, "status").data["scheduling"]["work_fifo"]) == 128
+    assert len(read(kernel.storage.path, 'status', storage=kernel.storage).data["scheduling"]["work_fifo"]) == 128
     assert kernel.status(f"ticket:{numbers[-1]}")["pending_attempt"] is None
     kernel.control("stop", "stop-whole-wide-run")
     assert all(kernel.status(f"ticket:{number}")["stopped"] for number in numbers)

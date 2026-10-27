@@ -1,4 +1,6 @@
 """A managed profile change belongs to the exact published Task."""
+
+from support.repository_fixture import create_kernel
 from dataclasses import replace
 from pathlib import Path
 
@@ -8,7 +10,9 @@ from agent_run.contracts.task import TaskKey
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from support.offline import GraphScenario
-from agent_run.storage.tasks import bind_task, locked_task
+from support.repository_fixture import foreign_task_run
+from agent_run.storage.routing import RepositoryRoute
+import sqlite3
 from test_kernel_requirements import independent_source
 from support.core_operations import CoreOperations
 
@@ -22,21 +26,28 @@ def test_task_profile_revision_requires_exact_binding_and_only_changes_new_threa
     source = replace(source, parent=replace(source.parent, sub_issue_numbers=(3,)),
                      issues=tuple(issue for issue in source.issues if issue.number == 3))
     scenario = GraphScenario(tmp_path / 'source', source)
-    create = Kernel.create if binding == 'unbound' else Kernel.create_task
-    kernel = create(tmp_path / 'profile.sqlite3', scenario.spec, requirements=scenario.requirements)
     task = TaskKey(Path(scenario.spec.repository_root), scenario.spec.repository, scenario.spec.parent_issue)
+    if binding == 'unbound':
+        route = RepositoryRoute(tmp_path / 'idle' / 'kernel.sqlite3', task.workspace, task.repository)
+        route.initialize()
+        route.idle(task)
+        with pytest.raises(KernelError, match='run_scope_missing'):
+            route.kernel(scenario.spec.run_id)
+        with route.metadata().transaction(write=False) as tx:
+            for table in ('runs', 'invocations', 'actions', 'profile_revisions'):
+                assert tx.one('SELECT count(*) FROM ' + table)[0] == 0
+        return
+    kernel = create_kernel(tmp_path / 'profile.sqlite3', scenario.spec, requirements=scenario.requirements)
     if binding == 'foreign':
-        other = Kernel.create(tmp_path / 'other.sqlite3', replace(scenario.spec, run_id='other-run'),
-                              requirements=scenario.requirements)
-        with locked_task(task) as location:
-            bind_task(location, 'other-run', other.storage.path)
-    if binding != 'current':
-        with pytest.raises(KernelError, match='task_location_identity'):
-            kernel.configure_task_profiles('choose-new-model', overrides={'development_model': 'next-thread-model'})
+        other = foreign_task_run(kernel, scenario.spec, scenario.requirements)
+        with pytest.raises(sqlite3.IntegrityError):
+            with RepositoryRoute.from_database(kernel.storage.path).metadata().transaction(ordered=False) as tx:
+                tx.execute('UPDATE tasks SET current_run=? WHERE id=?', ('other-run', task.fingerprint))
         with kernel.storage.transaction(write=False) as tx:
-            assert tx.one('SELECT profile_revision FROM runs')[0] == 1
-            assert tx.one('SELECT count(*) FROM actions')[0] == 0
-            assert tx.one('SELECT count(*) FROM profile_revisions')[0] == 1
+            assert tx.one('SELECT profile_revision FROM runs WHERE id=?', (kernel.storage.run_id,))[0] == 1
+            assert tx.one('SELECT count(*) FROM actions WHERE run_id=?', (kernel.storage.run_id,))[0] == 0
+            assert tx.one('SELECT count(*) FROM profile_revisions WHERE run_id=?', (kernel.storage.run_id,))[0] == 1
+        assert other.storage.run_id != kernel.storage.run_id
         return
     scenario.kernel = kernel
     scenario.execution = kernel.claim_executor('profile-executor')

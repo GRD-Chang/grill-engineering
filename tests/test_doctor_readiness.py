@@ -232,7 +232,7 @@ def test_doctor_preserves_current_settings_profile_and_task(
     from agent_run.adapters.workspace import ManagedWorkspace
     from agent_run.contracts.task import TaskKey
     from agent_run.cli.main import main
-    from agent_run.storage.tasks import read_task, task_path
+    from support.repository_fixture import read_binding
     from test_kernel_profile_prompt_cli import _published_profile_task
 
     # The existing native fixture uses freeze_creation and Kernel.create_task,
@@ -250,7 +250,7 @@ def test_doctor_preserves_current_settings_profile_and_task(
     assert configured["profiles"]["development"]["model"] == "current-run-model"
     workspace = ManagedWorkspace.for_repository("example/project")
     task = TaskKey(workspace.repository_root, workspace.repository, 1)
-    binding = read_task(task_path(task))
+    binding = read_binding(task, kernel.storage.path)
     assert binding == ("profile-public", kernel.storage.path.resolve())
 
     # No real credentials, service, namespace or dependency probe can run.
@@ -271,7 +271,7 @@ def test_doctor_preserves_current_settings_profile_and_task(
     else:
         assert "agent-run doctor" in output and "pat" in output
     assert _file_snapshot(tmp_path) == before
-    assert read_task(task_path(task)) == binding
+    assert read_binding(task, kernel.storage.path) == binding
 
 
 @pytest.mark.parametrize("module", ["agent_run", 'agent_run'])

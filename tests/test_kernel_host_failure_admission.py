@@ -60,7 +60,7 @@ def test_fatal_host_drain_rejects_new_and_repeated_resume_and_preserves_settleme
     original_error = OSError("original shared storage read failure")
 
     @contextmanager
-    def transaction(*, write=True):
+    def transaction(*, write=True, **options):
         nonlocal write_failed
         if threading.current_thread().name == "failing-host" and entered.is_set() and not fault.is_set():
             fault.set()
@@ -68,7 +68,7 @@ def test_fatal_host_drain_rejects_new_and_repeated_resume_and_preserves_settleme
         if write and fault.is_set() and storage_failure == "write_unavailable" and not recovered.is_set():
             write_failed = True
             raise OSError("shutdown storage remains unavailable")
-        with actual_transaction(write=write) as tx:
+        with actual_transaction(write=write, **options) as tx:
             yield tx
         if write and fault.is_set() and storage_failure == "committed_reply_loss" and not write_failed:
             write_failed = True
@@ -215,7 +215,7 @@ from agent_run.contracts.task import TaskKey
 from agent_run.storage.tasks import task_path
 print('ready',flush=True)
 assert sys.stdin.readline()=='enter\\n'
-kernel=Kernel(Path(sys.argv[1]))
+kernel=Kernel(Path(sys.argv[1]),run_id=sys.argv[2])
 execution=Execution(sys.argv[2],sys.argv[3],int(sys.argv[4]))
 actual=kernel.storage.transaction
 error=OSError('original Host failure')
@@ -235,9 +235,9 @@ def held_descriptors():
     return held
 with kernel.executor_scope(execution) as close_admission:
     @contextmanager
-    def unavailable(*,write=True):
+    def unavailable(*,write=True, **options):
         if write: raise OSError('all shutdown commits fail')
-        with actual(write=False) as tx: yield tx
+        with actual(write=False, **options) as tx: yield tx
     kernel.storage.transaction=unavailable
     close_admission(error)
     original_descriptors=held_descriptors()

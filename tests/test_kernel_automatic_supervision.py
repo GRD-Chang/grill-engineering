@@ -1,4 +1,6 @@
 """Real Core operations retain the original bounded supervision contract."""
+
+from support.repository_fixture import create_kernel
 from support.core_operations import prepare_scripted_agent
 from agent_run.core.operation_runner import OperationRunner
 from dataclasses import replace
@@ -16,7 +18,7 @@ from agent_run.queries.run import read
 from support.core_operations import CoreOperations, ReadOnlyPorts, scripted_return
 
 
-def delivery_run(path: Path) -> tuple[Kernel, Requirements]:
+def delivery_run(path: Path, *, language: str = "en") -> tuple[Kernel, Requirements]:
     source = Requirements(ParentIssue(1, "Parent", "Requirement", (2, 3)), (
         Issue(2, "First", "First work", "OPEN", frozenset({"ready-for-agent"})),
         Issue(3, "Second", "Second work", "OPEN", frozenset({"ready-for-agent"})),
@@ -25,8 +27,8 @@ def delivery_run(path: Path) -> tuple[Kernel, Requirements]:
     deliveries = tuple(Delivery(f"ticket:{number}", DeliveryKind.TICKET, number, "unread", base,
                                 f"refs/heads/ticket-{number}", "refs/heads/run") for number in (2, 3))
     final = Delivery("final:1", DeliveryKind.FINAL_RUN, 1, "unread", base, "refs/heads/run", "refs/heads/main")
-    return Kernel.create(path, RunSpec("run", "example/repository", 1, "unread", "unread", (*deliveries, final),
-        Policy(concurrency=2), language="en", repository_root=str(path.parent.resolve()), inputs=fixture_inputs()), requirements=source), source
+    return create_kernel(path, RunSpec("run", "example/repository", 1, "unread", "unread", (*deliveries, final),
+        Policy(concurrency=2), language=language, repository_root=str(path.parent.resolve()), inputs=fixture_inputs()), requirements=source), source
 
 
 def source_operations(kernel, source, execution):
@@ -66,7 +68,7 @@ def test_whole_operation_progress_requires_its_own_business_change(tmp_path: Pat
     kernel.clock = lambda: 700.25
     expired = operations.once()
     assert (expired.kind, expired.reason, expired.subject) == ("paused", "supervision_timeout", "ticket:2")
-    reopened = Kernel(kernel.storage.path)
+    reopened = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     assert reopened.status("ticket:2")["gates"] == ["supervision_timeout"]
     assert reopened.status("ticket:3")["gates"] == []
 
@@ -105,9 +107,9 @@ def test_read_deadline_survives_successful_reads_diagnostics_siblings_and_restar
         raise ReadUnavailable("remote_refs_unavailable", "Different later diagnostic")
     monkeypatch.setattr(ports, "delivery", failed_delivery)
     assert operations.once().kind == "waiting"
-    window = read(kernel.storage.path, "status").data["supervision_windows"][0]
+    window = read(kernel.storage.path, 'status', storage=kernel.storage).data["supervision_windows"][0]
     assert window["started_at"] == 100.25 and window["deadline"] == 700.25
-    reopened = Kernel(kernel.storage.path)
+    reopened = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     reopened.clock = lambda: 700.25
     runner = OperationRunner(reopened, execution, lambda binding: ports)
     expired = prepare_scripted_agent(kernel, runner.run_once())
@@ -131,11 +133,11 @@ def test_completed_business_operation_retires_read_wait(tmp_path: Path, monkeypa
     scripted_return(kernel, operations.runner, allocation.call,
         lambda call: b'{"result_kind":"development","summary":"changed","human_blockers":null}')
     assert operations.once(agent_capacity=0).kind == "progress"
-    assert read(kernel.storage.path, "status").data["supervision_windows"] == []
+    assert read(kernel.storage.path, 'status', storage=kernel.storage).data["supervision_windows"] == []
     kernel.clock = lambda: 800
     monkeypatch.setattr(ports, "source", unavailable)
     assert operations.once().retry_at == 805
-    fresh = read(kernel.storage.path, "status").data["supervision_windows"][0]
+    fresh = read(kernel.storage.path, 'status', storage=kernel.storage).data["supervision_windows"][0]
     assert fresh["started_at"] == 800 and fresh["deadline"] == 1400
 
 
@@ -192,9 +194,9 @@ def test_checks_read_error_reuses_the_original_45_minute_window(tmp_path: Path, 
     monkeypatch.setattr(operations.runner.ports, "source", unavailable)
     scenario.kernel.clock = lambda: 701
     assert operations.once().kind == "waiting"
-    window = read(scenario.kernel.storage.path, "status").data["supervision_windows"][0]
+    window = read(scenario.kernel.storage.path, 'status', storage=scenario.kernel.storage).data["supervision_windows"][0]
     assert window["started_at"] == 100 and window["deadline"] == 2800
-    reopened = Kernel(scenario.kernel.storage.path)
+    reopened = Kernel(scenario.kernel.storage.path, run_id=scenario.kernel.storage.run_id)
     reopened.clock = lambda: 2800
     runner = OperationRunner(reopened, scenario.execution, lambda binding: operations.runner.ports)
     assert runner.run_once().reason == "supervision_timeout"
@@ -223,7 +225,7 @@ def test_timed_out_sent_write_quiesces_until_resume_then_only_reads_back(tmp_pat
     monkeypatch.setattr(operations.runner.ports, "reconcile", failed_readback)
     kernel.clock = lambda: 105
     assert operations.once().retry_at == 115
-    window = read(kernel.storage.path, "status").data["supervision_windows"][0]
+    window = read(kernel.storage.path, 'status', storage=kernel.storage).data["supervision_windows"][0]
     assert window["started_at"] == 100 and window["deadline"] == 700
     kernel.clock = lambda: 700
     assert operations.once().reason == "supervision_timeout"

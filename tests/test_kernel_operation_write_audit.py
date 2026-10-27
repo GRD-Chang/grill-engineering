@@ -1,4 +1,6 @@
 """A nonzero physical write remains audited when exact readback succeeds."""
+
+from support.repository_fixture import create_kernel
 from support.core_operations import prepare_scripted_agent
 from agent_run.core.operation_runner import OperationRunner
 import json
@@ -32,7 +34,7 @@ def test_actual_nonzero_push_is_audited_once_despite_target_readback(tmp_path, m
     source = Requirements(ParentIssue(1, "Parent", "Whole requirement"), ())
     spec = RunSpec("physical-audit", port.repository, 1, "untrusted", "untrusted", (job,),
         language="en", repository_root=str(git.root), inputs=fixture_inputs())
-    kernel = Kernel.create(tmp_path / "kernel.sqlite3", spec, requirements=source)
+    kernel = create_kernel(tmp_path / "kernel.sqlite3", spec, requirements=source)
     execution = kernel.claim_executor("physical-owner")
     runner = OperationRunner(kernel, execution, lambda binding: port)
     agents = Scenario(tmp_path / "agents", DeliveryKind.PARENT_ONLY)
@@ -77,7 +79,7 @@ def test_publication_unknown_response_diagnostic_remains_public_after_successful
     assert runner.run_once().kind == "waiting"
     now[0] = 105.25
     assert scenario.run().kind == "approval"
-    public = read(scenario.kernel.storage.path, "history").data
+    public = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage).data
     events = [event for event in public["history"]["events"] if event.get("evidence") == {
         "code": "write_response_unavailable", "message": "pr_write took effect; response lost"}]
     assert len(events) == 1

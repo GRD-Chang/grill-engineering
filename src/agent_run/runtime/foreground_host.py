@@ -57,7 +57,7 @@ def _settle(kernel: Kernel, request: HostLaunch, path: Path, record: dict[str, A
     # A durable exact exit receipt precedes Core retirement. Failure leaves the
     # management barrier intact; a later observer may retry this same settlement.
     observation = _observation(request, record, 'exited', released=True)
-    options: dict[str, Any] = {"storage": kernel.storage} if getattr(kernel.storage, "run_id", None) is not None else {}
+    options: dict[str, Any] = {"storage": kernel.storage}
     if not record.get('notice_settled'):
         from agent_run.queries.host_exit import foreground_exit_notice
         from agent_run.notifications.sender import deliver_host_exit_notice

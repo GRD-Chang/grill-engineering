@@ -1,8 +1,7 @@
-"""Inactive repository Task creation on the existing Storage transaction owner.
+"""Atomic repository Task creation on the existing Storage transaction owner.
 
 No file creation, locator publication, credentials or Host dispatch. The caller
-must already own a validated repository Storage once that protocol is enabled.
-Until then only staged transaction tests call this seam. An uncertain request
+must already own a validated repository metadata Storage. An uncertain request
 is recovered by reconcile_repository_task with its ORIGINAL proposal Run ID;
 reconciliation never allocates. There is no creation retry loop or second log.
 """
@@ -157,7 +156,7 @@ def create_repository_task(kernel: "Kernel", task: TaskKey, spec: RunSpec,
                 result = TaskRun(row["current_run"], row["current_run"], False)
             else:
                 kernel._create_run(owner, spec, profiles, requirements=requirements,
-                    scoped=True, policy_values=policy_values)
+                    policy_values=policy_values)
                 owner.execute("INSERT INTO task_runs VALUES (?,?,?,?,?)",
                     (task.fingerprint, spec.run_id, task.repository, str(task.workspace), task.parent_number))
                 changed = owner.execute("UPDATE tasks SET current_run=? WHERE id=? AND current_run IS ?",

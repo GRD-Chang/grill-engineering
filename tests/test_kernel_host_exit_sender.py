@@ -51,9 +51,7 @@ def _killed_host(tmp_path: Path):
                 start_token=token, evidence=encoded, usage_ready=True))
             child.kill()
             assert child.wait(timeout=3) == -9
-            notice = host_exit_notice(kernel.storage.path, "original", handoff.receipt,
-                                      service_result="signal", exit_code="killed", exit_status="KILL",
-                                      invocation_id="1" * 32)
+            notice = host_exit_notice(kernel.storage.path, 'original', handoff.receipt, service_result='signal', exit_code='killed', exit_status='KILL', invocation_id='1' * 32, storage=kernel.storage)
             assert notice is not None
             yield kernel, notice
     finally:
@@ -75,7 +73,7 @@ def test_exit_sender_keeps_first_evidence_budget_and_does_not_observe_business_h
             calls.append(identity)
             return {"outcome": "unknown" if len(calls) == 1 else "success", "reason": None}
         before = kernel.storage.path.read_bytes()
-        first = NativeNotifications(kernel.storage.path, tmp_path, exit_notice=notice, transport=transport)
+        first = NativeNotifications(kernel.storage.path, tmp_path, exit_notice=notice, transport=transport, storage=kernel.storage)
         first.close()
         assert first.failure_reason is None
         document = outbox.read_notifications(tmp_path, "run-native")
@@ -86,8 +84,7 @@ def test_exit_sender_keeps_first_evidence_budget_and_does_not_observe_business_h
         assert record["attempt_history"][0]["outcome"] == "unknown"
         assert len(calls) == 2 and len(set(calls)) == 1
         assert "native_cursor" not in document and not document.get("native_run_start")
-        second = NativeNotifications(kernel.storage.path, tmp_path,
-                                     exit_notice={**notice, "observed_at": "later observation"}, transport=transport)
+        second = NativeNotifications(kernel.storage.path, tmp_path, exit_notice={**notice, 'observed_at': 'later observation'}, transport=transport, storage=kernel.storage)
         second.close()
         assert second.failure_reason is None
         assert outbox.read_notifications(tmp_path, "run-native")["records"] == [record]
@@ -107,7 +104,7 @@ def test_exit_sender_rechecks_after_transport_identity_before_physical_send(
                 "appId": "app_fixture", "profile": "fixture", "identity": "bot", "available": True,
             }).encode())
         monkeypatch.setattr(notification_transport, "_run", run)
-        observer = NativeNotifications(kernel.storage.path, tmp_path, exit_notice=notice)
+        observer = NativeNotifications(kernel.storage.path, tmp_path, exit_notice=notice, storage=kernel.storage)
         observer.close()
         assert observer.failure_reason is None and len(commands) == 1
         document = outbox.read_notifications(tmp_path, "run-native")
@@ -115,7 +112,7 @@ def test_exit_sender_rechecks_after_transport_identity_before_physical_send(
         record = document["records"][0]
         assert record["outcome"] == "failed" and record["attempts"] == 1 and record["cancelled"]
         assert record["attempt_history"][0]["outcome"] == "failed"
-        NativeNotifications(kernel.storage.path, tmp_path, exit_notice=notice).close()
+        NativeNotifications(kernel.storage.path, tmp_path, exit_notice=notice, storage=kernel.storage).close()
         assert outbox.read_notifications(tmp_path, "run-native")["records"] == [record]
         assert len(commands) == 1
 
@@ -129,7 +126,7 @@ def test_full_exit_journal_records_first_unsent_failure_without_renewing_budget(
                 outbox.enqueue(document, {"id": f"existing-{number}", "kind": "stage_start"}, time.time())
         def forbidden(*_args, **_kwargs):
             raise AssertionError("capacity failure must not start a physical transport")
-        observer = NativeNotifications(kernel.storage.path, tmp_path, exit_notice=notice, transport=forbidden)
+        observer = NativeNotifications(kernel.storage.path, tmp_path, exit_notice=notice, transport=forbidden, storage=kernel.storage)
         observer.close()
         assert observer.failure_reason is None
         document = outbox.read_notifications(tmp_path, "run-native")
@@ -139,8 +136,7 @@ def test_full_exit_journal_records_first_unsent_failure_without_renewing_budget(
         assert original["kind"] == "executor_exit" and original["exit_evidence"] == notice
         assert original["outcome"] == "failed" and original["attempts"] == 0
         assert original["exhaustion_reason"] == "pending_capacity"
-        NativeNotifications(kernel.storage.path, tmp_path,
-                            exit_notice={**notice, "observed_at": "later"}, transport=forbidden).close()
+        NativeNotifications(kernel.storage.path, tmp_path, exit_notice={**notice, 'observed_at': 'later'}, transport=forbidden, storage=kernel.storage).close()
         assert outbox.read_notifications(tmp_path, "run-native")["records"] == [original]
 
 
@@ -159,7 +155,7 @@ def test_exit_invalidated_after_claim_is_recorded_unsent_not_unknown(tmp_path: P
         monkeypatch.setattr(facts, "host_exit_current", current)
         def forbidden(*_args, **_kwargs):
             raise AssertionError("the known obsolete claim must never enter transport")
-        observer = NativeNotifications(kernel.storage.path, tmp_path, exit_notice=notice, transport=forbidden)
+        observer = NativeNotifications(kernel.storage.path, tmp_path, exit_notice=notice, transport=forbidden, storage=kernel.storage)
         observer.close()
         assert stopped and observer.failure_reason is None
         document = outbox.read_notifications(tmp_path, "run-native")
@@ -187,7 +183,7 @@ def test_temporary_unsent_claim_does_not_label_later_success_unsent(tmp_path: Pa
             assert kwargs["is_current"]()
             calls.append(identity)
             return {"outcome": "success", "reason": None}
-        observer = NativeNotifications(kernel.storage.path, tmp_path, exit_notice=notice, transport=transport)
+        observer = NativeNotifications(kernel.storage.path, tmp_path, exit_notice=notice, transport=transport, storage=kernel.storage)
         observer.close()
         assert interrupted and observer.failure_reason is None and len(calls) == 1
         document = outbox.read_notifications(tmp_path, "run-native")
@@ -226,7 +222,7 @@ def test_exit_identity_read_fault_before_submit_keeps_original_unsent_attempt(tm
             return notification_transport._CommandResult(0, b'{"data":{"message_id":"local-only-proof"}}')
         monkeypatch.setattr(facts, "host_exit_current", current)
         monkeypatch.setattr(notification_transport, "_run", run)
-        observer = NativeNotifications(kernel.storage.path, tmp_path, exit_notice=notice)
+        observer = NativeNotifications(kernel.storage.path, tmp_path, exit_notice=notice, storage=kernel.storage)
         observer.close()
         assert observer.failure_reason is None and interrupted
         assert sum("whoami" in command for command in commands) == 2
@@ -247,7 +243,7 @@ def test_late_exit_observation_does_not_downgrade_latest_exit_receipt(tmp_path, 
         # A real sender must independently revalidate before claiming the old
         # event; this probe neither creates nor authorizes a successor Host.
         monkeypatch.setattr(NativeNotifications, "_work", lambda _self: None)
-        observer = NativeNotifications(kernel.storage.path, tmp_path, exit_notice=notice)
+        observer = NativeNotifications(kernel.storage.path, tmp_path, exit_notice=notice, storage=kernel.storage)
         observer.close(drain=False)
         assert observer.failure_reason is None
         assert outbox.read_notifications(tmp_path, "run-native")["executor_exit"] == later

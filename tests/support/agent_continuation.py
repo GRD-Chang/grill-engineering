@@ -3,6 +3,8 @@
 All boundaries are reached through real Core allocation and process events;
 ReadOnlyPorts cannot execute physical effects.
 """
+
+from support.repository_fixture import create_kernel
 from pathlib import Path
 from dataclasses import replace
 
@@ -46,7 +48,7 @@ def _native_boundary(tmp_path: Path, *, ordinary_used: bool = False, malformed: 
     """Reach the boundary through native allocation/return/exit in one Run."""
     spec, requirements = _native_spec(tmp_path)
     spec = replace(spec, policy=replace(spec.policy, development_deadline_seconds=7))
-    source = Kernel.create(tmp_path / "source.sqlite3", spec, requirements=requirements)
+    source = create_kernel(tmp_path / "source.sqlite3", spec, requirements=requirements)
     source.clock = lambda: 100.0
     owner = source.claim_executor("source-executor")
     source_operations = _read_operations(source, owner, requirements)

@@ -1,4 +1,6 @@
 """Publication freezes two output ranges without changing the Review boundary."""
+
+from support.repository_fixture import create_kernel
 from copy import deepcopy
 from dataclasses import asdict, replace
 import json
@@ -26,7 +28,7 @@ def test_publication_ranges_reach_runtime_and_public_preview_from_real_work(tmp_
     else:
         scenario = Scenario(tmp_path / "delivery", kind, checks=("fail", "fail", "none") if kind == DeliveryKind.TICKET else ("fail", "none"))
         spec = replace(scenario.spec, inputs=inputs, language=language)
-        scenario.kernel = Kernel.create(tmp_path / "configured.sqlite3", spec, requirements=scenario.requirements)
+        scenario.kernel = create_kernel(tmp_path / "configured.sqlite3", spec, requirements=scenario.requirements)
         scenario.execution = scenario.kernel.claim_executor("publication-scope-owner")
     original = scenario.agent
     publications = []

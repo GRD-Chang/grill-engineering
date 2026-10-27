@@ -72,7 +72,7 @@ raise SystemExit(7)
     assert result is not None and result.returncode == 7 and result.raw == raw
     with pytest.raises(ChildProcessError):
         os.waitpid(int(result.identity["pid"]), os.WNOHANG)
-    reopened = Kernel(kernel.storage.path)
+    reopened = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     before = reopened.status(call.subject)
     assert before["pending_return"] is True and before["gates"] == []
     assert before["phase"] == "development" and before["pending_attempt"] == call.attempt_id
@@ -108,7 +108,7 @@ print(json.dumps({'type': 'thread.started', 'thread_id': 'original-thread'}), fl
 raise SystemExit(1)
 """)
     assert failed is not None and failed.returncode == 1 and failed.raw == b""
-    reopened = Kernel(kernel.storage.path)
+    reopened = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     assert reopened.status(first.subject)["gates"] == []
     assert reopened.operation_state().active == ()
     resumed = CoreOperations(reopened, first.execution, lambda binding: ports, prepare_agents=False).until(lambda step: step.preparation is not None).preparation
@@ -133,7 +133,7 @@ for thread in {events!r}:
         with pytest.raises(ValueError, match="different Thread ID"):
             local_codex(reopened, resumed, tmp_path, program)
     assert observed_call(kernel, resumed).invocation_id != observed_call(kernel, first).invocation_id
-    after = Kernel(kernel.storage.path)
+    after = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     status = after.status(first.subject)
     assert status["pending_return"] is (events == ("original-thread",))
     assert status["gates"] == ([] if events == ("original-thread",) else ["execution_failed"])
@@ -161,7 +161,7 @@ if {replacement!r} == 'symlink':
     target.write_bytes({RAW!r})
     output.symlink_to(target)
 """)
-    reopened = Kernel(kernel.storage.path)
+    reopened = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     status = reopened.status(call.subject)
     assert status["pending_return"] is False and status["gates"] == ["execution_failed"]
     assert status["pending_attempt"] == call.attempt_id and status["candidate"] is None
@@ -171,7 +171,7 @@ if {replacement!r} == 'symlink':
                for event in reopened.history(call.subject))
     assert not any(event["kind"] == "raw_returned" for event in reopened.history(call.subject))
     from agent_run.queries.run import read
-    document = read(kernel.storage.path, 'status').data
+    document = read(kernel.storage.path, 'status', storage=kernel.storage).data
     action = next(item for item in document['operator_actions'] if item['status_code'] == 'execution_failed')
     proof = action['evidence']['failure_evidence']
     assert proof['returncode'] == 0
@@ -317,7 +317,7 @@ output.write_bytes({RAW!r})
         assert not started.exists()
 
     result = execute_codex(
-        ObserveDurableThread(path), call, executable=str(executable),
+        ObserveDurableThread(path, run_id=call.execution.run_id), call, executable=str(executable),
         prompt="Perform this one allocated development task.",
         environment={"PATH": os.defpath, "HOME": str(tmp_path), "CODEX_HOME": str(home),
                      "GH_TOKEN": "Wrong-inherited-identity", "GITHUB_TOKEN": "Wrong-fallback",
@@ -327,7 +327,7 @@ output.write_bytes({RAW!r})
     )
     assert result is not None and result.returncode == 0 and result.raw == RAW
     assert checks == 2 and int(started.read_text()) != os.getpid()
-    reopened = Kernel(path)
+    reopened = Kernel(path, run_id=call.execution.run_id)
     assert reopened.status(call.subject)["pending_return"] is True
     assert reopened.status(call.subject)["budgets"]["requirements"]["developments_used"] == 1
     assert reopened.operation_state().active == ()
@@ -500,7 +500,7 @@ def test_real_capacity_event_cannot_authorize_recovery_after_corrupt_capture(tmp
             if not active:
                 observed.write_text("The terminal event reached the Kernel")
 
-    kernel = ObserveTerminal(kernel.storage.path)
+    kernel = ObserveTerminal(kernel.storage.path, run_id=call.execution.run_id)
     with pytest.raises(UnicodeDecodeError):
         local_codex(kernel, call, tmp_path, f"""\
 import time

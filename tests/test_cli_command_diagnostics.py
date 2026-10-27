@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from support.repository_fixture import create_kernel
+
 import json
 import os
 import subprocess
@@ -41,7 +43,7 @@ def test_current_command_help_uses_personal_language_without_starting_work(
     def forbidden(*_args, **_kwargs):
         pytest.fail("Help must not create a Run or start a process")
 
-    monkeypatch.setattr(Kernel, "create", forbidden)
+    monkeypatch.setattr(Kernel, "create_task", forbidden)
     monkeypatch.setattr(subprocess, "run", forbidden)
     assert main([*arguments, "--help"]) == 0
     captured = capsys.readouterr()
@@ -158,7 +160,7 @@ def test_stop_receipt_uses_frozen_language_and_keeps_internal_identity_only_in_j
                         "refs/heads/task", "refs/heads/main")
     spec = freeze_creation(RunSpec("private-run-identity", workspace.repository, 12, "parent", "graph", (delivery,),
                                    repository_root=str(root)), store)
-    kernel = Kernel.create_task(workspace.state_root / spec.run_id / "kernel.sqlite3", spec,
+    kernel = Kernel.create_task(workspace.state_root / "kernel.sqlite3", spec,
                                requirements=Requirements(ParentIssue(12, "Original Parent", "Original requirement"), ()))
     store.configure(language="en" if language == "zh" else "zh")
     assert main(["stop", spec.run_id if exact else "12", "--repo", workspace.repository,
@@ -237,7 +239,7 @@ def test_ambiguous_databases_in_the_same_directory_have_distinct_copyable_locati
                         "refs/heads/task", "refs/heads/main")
     source = Requirements(ParentIssue(1, "Parent", "Original requirement"), ())
     for name, identity in (("kernel.sqlite3", "first-private-id"), ("state.sqlite3", "second-private-id")):
-        Kernel.create(tmp_path / name, RunSpec(identity, "example/project", 1, "parent", "graph", (delivery,),
+        create_kernel(tmp_path / name, RunSpec(identity, "example/project", 1, "parent", "graph", (delivery,),
                       language="en", repository_root=str(tmp_path / "checkout"), inputs=fixture_inputs()), requirements=source)
     before = _snapshot(tmp_path)
     arguments = ["status", "--repo", "example/project", "--parent", "1", "--state-dir", str(tmp_path)]

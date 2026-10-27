@@ -22,9 +22,10 @@ def _enabled_scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: Del
                       *, reviews: tuple[str, ...] = ("pass",), mode: str = "concise", language: str = "en") -> Scenario:
     defaults = UserDefaultsStore(tmp_path / "defaults.json")
     defaults.configure(language=language, notifications={"enabled": False, "mode": mode})
-    original_create = Kernel.create
+    from support import offline
+    original_create = offline.create_kernel
 
-    def create(_cls: type[Kernel], path: Path, spec: RunSpec, **kwargs: Any) -> Kernel:
+    def create(path: Path, spec: RunSpec, **kwargs: Any) -> Kernel:
         spec = freeze_creation(spec, defaults,
                                prompt_resources={key: "Frozen " + key for key in RESOURCE_KEYS})
         assert spec.inputs is not None
@@ -41,7 +42,7 @@ def _enabled_scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: Del
     # Freeze only input configuration. Workspace and local marker ownership are
     # produced by the real Core/effect path, never by a synthetic receipt.
     with monkeypatch.context() as patch:
-        patch.setattr(Kernel, "create", classmethod(create))
+        patch.setattr(offline, "create_kernel", create)
         if kind == DeliveryKind.FINAL_RUN:
             # d847 builds and retains actual historical Ticket Completion.
             scenario = Scenario(tmp_path, kind, reviews=reviews)
@@ -63,7 +64,7 @@ def test_formal_acceptance_notification_waits_for_real_promotion(
         return {"outcome": "success", "reason": None}
 
     def observed_acceptances() -> list[dict[str, Any]]:
-        observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport)
+        observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
         observer.close()
         assert observer.failure_reason is None
         return [row for row in outbox.read_notifications(tmp_path, scenario.spec.run_id)["records"]
@@ -135,14 +136,14 @@ def test_observed_run_branch_write_does_not_promote_a_superseded_acceptance(
     def transport(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         return {"outcome": "success", "reason": None}
 
-    observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport)
+    observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
     observer.close()
     assert observer.failure_reason is None
     assert not [row for row in outbox.read_notifications(tmp_path, scenario.spec.run_id)["records"]
                 if row["kind"] == "acceptance_passed"]
     assert scenario.run(approve=True).kind == "complete"
     assert scenario.review_count > original_reviews
-    observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport)
+    observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
     observer.close()
     assert observer.failure_reason is None
     accepted = [row for row in outbox.read_notifications(tmp_path, scenario.spec.run_id)["records"]
@@ -202,7 +203,7 @@ def test_healthy_final_pr_and_approval_in_one_observation_share_only_the_approva
         sent.append(rendered)
         return {"outcome": "success", "reason": None}
 
-    observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport)
+    observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
     try:
         observer.close()
         assert observer.failure_reason is None
@@ -223,7 +224,7 @@ def test_healthy_final_pr_and_approval_in_one_observation_share_only_the_approva
     if approval:
         assert any(f"https://github.com/example/project/pull/{pr.number}" in str(item) for item in approval_cards)
     assert scenario.kernel.storage.path.read_bytes() == database_before
-    assert read(scenario.kernel.storage.path, "status").data["subjects"][0]["phase"] == ("approval" if approval else "checks")
+    assert read(scenario.kernel.storage.path, 'status', storage=scenario.kernel.storage).data["subjects"][0]["phase"] == ("approval" if approval else "checks")
 
 
 @pytest.mark.parametrize("language,prefix", [("en", "Feishu notifications unavailable; development continues"),
@@ -242,8 +243,7 @@ def test_notification_degradation_uses_frozen_language_and_original_technical_re
         raise OSError(reason)
 
     monkeypatch.setattr(sender, "read_boundaries", unavailable)
-    observer = NativeNotifications(scenario.kernel.storage.path, tmp_path,
-                                   transport=lambda *_a, **_kw: {"outcome": "success", "reason": None})
+    observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=lambda *_a, **_kw: {'outcome': 'success', 'reason': None}, storage=scenario.kernel.storage)
     try:
         assert observer.failure_reason == reason
         error = capsys.readouterr().err
@@ -327,7 +327,7 @@ def test_healthy_multi_page_observation_does_not_repeat_pr_creation_after_approv
         sent.append(rendered)
         return {"outcome": "success", "reason": None}
 
-    observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport)
+    observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
     try:
         assert scenario.run().kind == "approval"
         wake = observer._wake_pending

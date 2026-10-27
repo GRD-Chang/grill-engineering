@@ -419,12 +419,12 @@ def test_nested_same_database_control_is_rejected_without_deadlock_or_body_repla
 
 
 def test_afterfork_reset_retains_no_parent_local_wait_owner(monkeypatch):
-    condition, gates = save_order._condition, save_order._gates
+    condition, gates = save_order._owner_lock, save_order._owners
     with monkeypatch.context() as patch:
-        patch.setattr(save_order, '_condition', condition)
-        patch.setattr(save_order, '_gates', {(1, 2): object()})
+        patch.setattr(save_order, '_owner_lock', condition)
+        patch.setattr(save_order, '_owners', {(1, 2): object()})
         save_order._after_fork()
-        assert save_order._gates == {} and save_order._condition is not condition
+        assert save_order._owners == {} and save_order._owner_lock is not condition
 
 
 @pytest.mark.parametrize('error_code,expected', [(sqlite3.SQLITE_FULL, 'storage_limit'),
@@ -1145,3 +1145,18 @@ def test_children_close_failure_is_not_silenced_by_an_already_handled_outer_erro
         assert refused.value is failure
         assert not getattr(previous, '__notes__', ())
     assert observed.closed == [100002, 100001]
+
+
+
+def test_local_reentry_cleanup_does_not_reuse_an_afterfork_owner_registry(tmp_path):
+    path = tmp_path / 'identity.sqlite3'
+    path.write_bytes(b'')
+    with save_order.write_owner(path, deadline=save_order.monotonic() + 1, cancelled=None):
+        inherited = save_order._owners
+        assert len(inherited) == 1
+        save_order._after_fork()  # Pure state boundary; no child or SQLite execution.
+        assert save_order._owners == {} and save_order._owners is not inherited
+    assert save_order._owners == {}
+    with save_order.write_owner(path, deadline=save_order.monotonic() + 1, cancelled=None):
+        assert len(save_order._owners) == 1
+    assert save_order._owners == {}

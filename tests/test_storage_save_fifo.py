@@ -18,9 +18,9 @@ from support.core_operations import agent_preparation_fixture
 
 @pytest.fixture(autouse=True)
 def empty_save_registry():
-    assert not save_order._gates
+    assert not save_order._owners
     yield
-    assert not save_order._gates
+    assert not save_order._owners
 
 
 @contextmanager
@@ -32,7 +32,7 @@ def paused_head(storage, subject):
     errors = []
     def run():
         def trace(frame, event, arg):
-            if frame.f_code is code and event == 'line' and frame.f_lineno == line:
+            if frame.f_code is code and event == 'line' and frame.f_lineno == line and frame.f_locals.get('request') is not None:
                 ready.set()
                 assert release.wait(2)
             return trace
@@ -56,14 +56,13 @@ def paused_head(storage, subject):
 
 
 def wait_for_queue(path, count):
-    identity = save_order.database_identity(path)
     deadline = time.monotonic() + 0.5
     while True:
-        with save_order._condition:
-            gate = save_order._gates.get(identity)
-            if gate is not None and len(gate.queue) == count:
-                return
-        assert time.monotonic() < deadline, 'save did not reach its actual queue slot'
+        with closing(sqlite3.connect(path.absolute().as_uri() + '?mode=ro', uri=True)) as connection:
+            queued = connection.execute('SELECT count(*) FROM save_admissions').fetchone()[0]
+        if queued == count:
+            return
+        assert time.monotonic() < deadline, 'save did not reach its committed registration'
         threading.Event().wait(0.002)
 
 
@@ -73,11 +72,11 @@ def test_earlier_save_cannot_be_overtaken_after_preflight(tmp_path, client):
     subject = step.preparation.subject
     other = kernel.storage
     if client == 'separate':
-        other = Storage(kernel.storage.path)
+        other = Storage(kernel.storage.path, run_id=kernel.storage.run_id)
     elif client == 'directory-alias':
         alias = tmp_path / 'state-alias'
         alias.symlink_to(kernel.storage.path.parent, target_is_directory=True)
-        other = Storage(alias / kernel.storage.path.name)
+        other = Storage(alias / kernel.storage.path.name, run_id=kernel.storage.run_id)
     code = Storage._transaction.__wrapped__.__code__
     lines, start = inspect.getsourcelines(Storage._transaction.__wrapped__)
     before_begin = start + next(i for i, line in enumerate(lines) if 'connection.execute("BEGIN IMMEDIATE")' in line)
@@ -87,7 +86,7 @@ def test_earlier_save_cannot_be_overtaken_after_preflight(tmp_path, client):
         def trace(frame, event, arg):
             if frame.f_code is Storage.transaction.__wrapped__.__code__ and label == 'B' and event == 'call':
                 second_entered.set()
-            if frame.f_code is code and label == 'A' and event == 'line' and frame.f_lineno == before_begin:
+            if frame.f_code is code and label == 'A' and event == 'line' and frame.f_lineno == before_begin and frame.f_locals.get('request') is not None:
                 first_ready.set()
                 assert release.wait(2), 'first save barrier was not released'
             return trace
@@ -115,7 +114,7 @@ def test_earlier_save_cannot_be_overtaken_after_preflight(tmp_path, client):
             if thread.ident is not None:
                 thread.join(3)
     assert not first.is_alive() and not second.is_alive() and not failures
-    with Storage(kernel.storage.path).transaction(write=False) as tx:
+    with Storage(kernel.storage.path, run_id=kernel.storage.run_id).transaction(write=False) as tx:
         assert [row['body'] for row in tx.rows(
             "SELECT body FROM material WHERE subject=? AND purpose='fifo-test' ORDER BY rowid", (subject,))] == [b'A', b'B']
 
@@ -127,7 +126,7 @@ def test_queued_cancel_removes_only_its_ticket_and_next_save_progresses(tmp_path
     errors, ran = [], []
     def waiting():
         try:
-            with Storage(kernel.storage.path).transaction(cancelled=cancel):
+            with Storage(kernel.storage.path, run_id=kernel.storage.run_id).transaction(cancelled=cancel):
                 ran.append(True)
         except BaseException as error:
             errors.append(error)
@@ -166,7 +165,7 @@ def test_full_queue_keeps_stop_and_read_only_access_available(tmp_path, monkeypa
             waiter.start()
             wait_for_queue(kernel.storage.path, 2)
             with pytest.raises(KernelError, match='storage_busy'):
-                with Storage(kernel.storage.path).transaction():
+                with Storage(kernel.storage.path, run_id=kernel.storage.run_id).transaction():
                     pytest.fail('full queue executed a transaction')
             with kernel.storage.transaction(write=False) as tx:
                 assert tx.one('SELECT 1')[0] == 1
@@ -183,7 +182,7 @@ def test_full_queue_keeps_stop_and_read_only_access_available(tmp_path, monkeypa
 def test_nested_write_fails_without_poisoning_outer_transaction(tmp_path, ordered):
     kernel, _, _, step, _ = agent_preparation_fixture(tmp_path)
     subject = step.preparation.subject
-    other = Storage(kernel.storage.path)
+    other = Storage(kernel.storage.path, run_id=kernel.storage.run_id)
     with kernel.storage.transaction() as tx:
         tx.put(subject, 'outer-before', b'before')
         with pytest.raises(KernelError, match='storage_busy'):
@@ -211,7 +210,7 @@ def test_transaction_exception_releases_turn_and_rolls_back_all_writes(tmp_path,
 
 def test_queue_wait_and_sqlite_busy_share_one_second(tmp_path, monkeypatch):
     kernel, _, _, step, _ = agent_preparation_fixture(tmp_path)
-    clients = [Storage(kernel.storage.path), Storage(kernel.storage.path)]
+    clients = [Storage(kernel.storage.path, run_id=kernel.storage.run_id), Storage(kernel.storage.path, run_id=kernel.storage.run_id)]
     entered = [threading.Event(), threading.Event()]
     results, ran = {}, []
     original = sqlite3.connect
@@ -299,7 +298,7 @@ def test_unsafe_database_alias_refuses_without_admission_leak(tmp_path, alias):
         os.link(kernel.storage.path, path)
     try:
         with pytest.raises(UnsupportedState, match='uncertain_state'):
-            with save_order.save_turn(path, ordered=True, deadline=time.monotonic() + 1, cancelled=None):
+            with save_order.write_owner(path, deadline=time.monotonic() + 1, cancelled=None):
                 pytest.fail('unsafe alias obtained save admission')
     finally:
         path.unlink()
@@ -331,7 +330,7 @@ def test_pre_cancelled_head_executes_no_body_and_leaves_no_ticket(tmp_path):
 def test_same_database_replacement_while_waiting_is_not_adopted(tmp_path, monkeypatch):
     import agent_run.storage.sqlite as storage_module
     kernel, _, _, _, _ = agent_preparation_fixture(tmp_path)
-    replacement = Storage.create(tmp_path / 'replacement.sqlite3')
+    replacement = Storage.create(tmp_path / 'replacement.sqlite3', namespace=('example/project', str(tmp_path.resolve())))
     original = storage_module.require_supported_state
     before = replacement.path.read_bytes()
     def replace_before_preflight(path, **kwargs):
@@ -355,7 +354,7 @@ def test_control_revokes_a_waiting_admission_without_creating_an_invocation(tmp_
     failures = []
     def admit():
         def trace(frame, event, arg):
-            if frame.f_code is code and event == 'line' and frame.f_lineno == line:
+            if frame.f_code is code and event == 'line' and frame.f_lineno == line and frame.f_locals.get('request') is not None:
                 ready.set()
                 assert release.wait(2)
             return trace
@@ -397,9 +396,9 @@ def test_shared_revocation_record_does_not_wait_on_business_save_queue(tmp_path)
 def test_completed_requests_do_not_keep_registry_or_storage_instances(tmp_path):
     kernel, _, _, _, _ = agent_preparation_fixture(tmp_path)
     for _ in range(10):
-        with Storage(kernel.storage.path).transaction() as tx:
+        with Storage(kernel.storage.path, run_id=kernel.storage.run_id).transaction() as tx:
             assert tx.one('SELECT 1')[0] == 1
-        assert not save_order._gates
+        assert not save_order._owners
 
 
 def test_cancel_while_sqlite_waits_never_enters_business_body(tmp_path, monkeypatch):
@@ -492,7 +491,7 @@ def test_writer_lock_acquired_after_original_deadline_cannot_enter_body(tmp_path
     assert len(acquired) == 1 and acquired[0] >= deadlines[0]
     assert not ran and len(failures) == 1
     assert isinstance(failures[0], KernelError) and failures[0].code == 'storage_busy'
-    assert not save_order._gates
-    with Storage(kernel.storage.path).transaction() as tx:
+    assert not save_order._owners
+    with Storage(kernel.storage.path, run_id=kernel.storage.run_id).transaction() as tx:
         assert tx.one("SELECT count(*) FROM material WHERE purpose='expired-save'")[0] == 0
         tx.put(step.preparation.subject, 'after-expired-save', b'next save remains usable')

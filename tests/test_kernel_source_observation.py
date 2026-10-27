@@ -83,8 +83,8 @@ def test_refresh_returns_its_own_receipt_when_another_read_commits_after_it(tmp_
     transaction = kernel.storage.transaction
 
     @contextmanager
-    def after_commit(*, write=True):
-        with transaction(write=write) as tx:
+    def after_commit(*, write=True, **options):
+        with transaction(write=write, **options) as tx:
             yield tx
         if write and kernel.source_status()["observation"] > 1:
             committed.set()
@@ -95,19 +95,19 @@ def test_refresh_returns_its_own_receipt_when_another_read_commits_after_it(tmp_
         first = workers.submit(original.observe, "ticket:2")
         try:
             assert committed.wait(10), "original source observation never committed"
-            first_receipt = Kernel(kernel.storage.path).source_status()
+            first_receipt = Kernel(kernel.storage.path, run_id=kernel.storage.run_id).source_status()
             assert first_receipt["frontier"] == ["ticket:2"] and first_receipt["remaining"] == {}
             scenario.requirements = new
-            other = OperationRunner(Kernel(kernel.storage.path), scenario.execution, scenario.make_ports)
+            other = OperationRunner(Kernel(kernel.storage.path, run_id=kernel.storage.run_id), scenario.execution, scenario.make_ports)
             other.observe("ticket:2")
-            newer = Kernel(kernel.storage.path).source_status()
+            newer = Kernel(kernel.storage.path, run_id=kernel.storage.run_id).source_status()
             release.set()
             error = first.exception(timeout=10)
             assert isinstance(error, KernelError) and error.code == "automatic_step_superseded"
         finally:
             release.set()
     assert first_receipt["observation"] < newer["observation"]
-    assert Kernel(kernel.storage.path).source_status() == newer
+    assert Kernel(kernel.storage.path, run_id=kernel.storage.run_id).source_status() == newer
 
 
 def test_graph_world_keeps_the_receipt_from_its_own_source_read(tmp_path: Path, monkeypatch) -> None:

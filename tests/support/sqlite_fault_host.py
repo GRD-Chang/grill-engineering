@@ -19,8 +19,8 @@ from support.sqlite_faults import FaultScope, sqlite_fault
 
 
 def command(database: Path, action: str, runner_lock: Path,
-            environment: Mapping[str, str], manifest: Path, digest: str) -> tuple[str, ...]:
-    original = executor.command(database, action, runner_lock, environment)
+            environment: Mapping[str, str], manifest: Path, digest: str, *, run_id: str) -> tuple[str, ...]:
+    original = executor.command(database, action, runner_lock, environment, run_id=run_id)
     index = original.index('-m')
     if original[index + 1] != 'agent_run.runtime.executor':
         raise ValueError('Unknown native Host command')
@@ -33,24 +33,24 @@ def main(arguments=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--database', type=Path, required=True)
     parser.add_argument('--action', required=True)
+    parser.add_argument('--run-id', required=True)
     parser.add_argument('--runner-lock', type=Path, required=True)
     parser.add_argument('--fault-scope', type=Path, required=True)
     parser.add_argument('--fault-digest', required=True)
     parsed = parser.parse_args(arguments)
-    kernel = Kernel(parsed.database)
+    kernel = Kernel(parsed.database, run_id=parsed.run_id)
     request = kernel.host_request(parsed.action)
     scope = FaultScope.load(parsed.fault_scope, parsed.fault_digest,
                             parsed.database, request.run_id, parsed.action)
     import os
     if (request.backend != 'foreground' or request.command != command(
             parsed.database, parsed.action, parsed.runner_lock, os.environ,
-            parsed.fault_scope, parsed.fault_digest)):
+            parsed.fault_scope, parsed.fault_digest, run_id=parsed.run_id)):
         raise ValueError('Test Host command does not match the sealed admission')
     with pytest.MonkeyPatch.context() as patch:
         with sqlite_fault(patch, parsed.database, 'commit-interrupt', scope=scope):
             scope.record('factory_loaded')
-            result = executor.main(['--database', str(parsed.database), '--action', parsed.action,
-                                    '--runner-lock', str(parsed.runner_lock)])
+            result = executor.main(['--database', str(parsed.database), '--action', parsed.action, '--runner-lock', str(parsed.runner_lock), '--run-id=' + parsed.run_id])
         scope.record('factory_closed')
         return result
 

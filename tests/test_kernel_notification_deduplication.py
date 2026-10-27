@@ -25,7 +25,7 @@ def test_one_repair_milestone_updates_only_an_unsent_card_and_keeps_its_original
     # observations of one committed milestone, not two domain transitions.
     monkeypatch.setattr(NativeNotifications, '_page', lambda _self, _after: next(pages))
     monkeypatch.setattr(NativeNotifications, '_work', lambda _self: None)
-    sender = NativeNotifications(kernel.storage.path, tmp_path)
+    sender = NativeNotifications(kernel.storage.path, tmp_path, storage=kernel.storage)
     try:
         with outbox.transaction(tmp_path, 'run-native') as document:
             item = next(row for row in document['pending'] if row['event']['id'] == planned['id'])

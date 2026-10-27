@@ -73,7 +73,7 @@ def test_completed_delivery_retires_only_its_recorded_resources(
     def execute(effect: Effect, authorize: WriteAuthority) -> EffectResult | None:
         if effect.operation in CLEANUP_OPERATIONS:
             # Cleanup cannot be used as a substitute for durable business closeout.
-            fresh = Kernel(scenario.port.root / "kernel.sqlite3")
+            fresh = Kernel(scenario.port.root / 'kernel.sqlite3', run_id=scenario.spec.run_id)
             assert fresh.status(scenario.delivery.key)["phase"] == "complete"
             retired.append(effect)
             if effect.operation == "cleanup_worktree":
@@ -120,7 +120,7 @@ def test_completed_delivery_retires_only_its_recorded_resources(
         assert scenario.port.reconcile(effect).disposition == "target"
     calls_before = list(scenario.role_calls)
     writes_before = scenario.port.writes()
-    scenario.kernel = Kernel(scenario.port.root / "kernel.sqlite3")
+    scenario.kernel = Kernel(scenario.port.root / 'kernel.sqlite3', run_id=scenario.spec.run_id)
     assert scenario.run(approve=True).kind == "complete"
     assert scenario.role_calls == calls_before
     assert scenario.port.writes() == writes_before
@@ -161,7 +161,7 @@ def test_foreign_remote_head_keeps_completed_delivery_and_original_cleanup_inten
     assert boundary.kind == "waiting" and boundary.reason == "cleanup_pending", boundary
     assert len(attempts) == len(foreign_heads) == 1
     original = attempts[0]
-    durable = Kernel(scenario.port.root / "kernel.sqlite3").status(scenario.delivery.key)
+    durable = Kernel(scenario.port.root / 'kernel.sqlite3', run_id=scenario.spec.run_id).status(scenario.delivery.key)
     assert durable["phase"] == "complete"
     cleanup = durable["resource_cleanup"]
     assert cleanup["state"] == "pending" and cleanup["stage"] == 2
@@ -175,7 +175,7 @@ def test_foreign_remote_head_keeps_completed_delivery_and_original_cleanup_inten
     assert scenario.port.remote_commit(scenario.delivery.target_ref) == pr.merged
     assert scenario.port.git.run("show", f"{foreign_heads[0]}:foreign.txt").stdout == "another actor's retained work\n"
     calls_before, writes_before = list(scenario.role_calls), scenario.port.writes()
-    scenario.kernel = Kernel(scenario.port.root / "kernel.sqlite3")
+    scenario.kernel = Kernel(scenario.port.root / 'kernel.sqlite3', run_id=scenario.spec.run_id)
     scenario.port = OfflinePort(scenario.port.root)
     assert scenario.port.remote_refs()[original.source_ref] == foreign_heads[0]
     # Re-entry may admit Final, but must neither replay the original cleanup
@@ -215,7 +215,7 @@ def test_dirty_checkout_keeps_completed_delivery_and_blocks_later_resource_delet
     boundary = scenario.cleanup(max_steps=200)
     assert boundary.kind == "waiting" and boundary.reason == "cleanup_pending", boundary
     assert len(attempts) == 1
-    durable = Kernel(scenario.port.root / "kernel.sqlite3").status(scenario.delivery.key)
+    durable = Kernel(scenario.port.root / 'kernel.sqlite3', run_id=scenario.spec.run_id).status(scenario.delivery.key)
     assert durable["phase"] == "complete"
     cleanup = durable["resource_cleanup"]
     assert cleanup["state"] == "pending" and cleanup["stage"] == 0
@@ -231,7 +231,7 @@ def test_dirty_checkout_keeps_completed_delivery_and_blocks_later_resource_delet
     assert scenario.port.git.run("rev-parse", "HEAD", cwd=checkout).stdout.strip() == attempts[0].payload["expected_head"]
     assert f"worktree {checkout}" in scenario.port.git.run("worktree", "list", "--porcelain", "-z").stdout.split("\0")
     calls_before, writes_before = list(scenario.role_calls), scenario.port.writes()
-    scenario.kernel = Kernel(scenario.port.root / "kernel.sqlite3")
+    scenario.kernel = Kernel(scenario.port.root / 'kernel.sqlite3', run_id=scenario.spec.run_id)
     scenario.port = OfflinePort(scenario.port.root)
     reentry = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports).once(agent_capacity=0)
     assert reentry.call is None and reentry.reason == "final_activated"
@@ -268,7 +268,7 @@ def test_optional_issue_link_lost_ack_is_not_replayed_or_promoted_by_readback(
                 final_admission = original_authorize.prepare()
                 def dispatched() -> None:
                     final_admission()
-                    before = Kernel(scenario.port.root / "kernel.sqlite3").status(scenario.delivery.key)
+                    before = Kernel(scenario.port.root / 'kernel.sqlite3', run_id=scenario.spec.run_id).status(scenario.delivery.key)
                     assert before["issue_link"]["state"] == "indeterminate"
                 return dispatched
 
@@ -299,7 +299,7 @@ def test_optional_issue_link_lost_ack_is_not_replayed_or_promoted_by_readback(
     assert boundary.kind == "complete", boundary
     assert len(attempts) == 1
     original = attempts[0]
-    durable = Kernel(scenario.port.root / "kernel.sqlite3").status(scenario.delivery.key)
+    durable = Kernel(scenario.port.root / 'kernel.sqlite3', run_id=scenario.spec.run_id).status(scenario.delivery.key)
     assert durable["phase"] == "complete"
     assert durable["issue_link"]["state"] == "indeterminate"
     assert durable["issue_link"]["source_sha"] == original.payload["source_head"]
@@ -307,7 +307,7 @@ def test_optional_issue_link_lost_ack_is_not_replayed_or_promoted_by_readback(
     assert scenario.role_calls == calls_at_loss
     calls_before, writes_before = list(scenario.role_calls), scenario.port.writes()
     assert sum(write["operation"] == "issue_link" for write in writes_before) == 1
-    scenario.kernel = Kernel(scenario.port.root / "kernel.sqlite3")
+    scenario.kernel = Kernel(scenario.port.root / 'kernel.sqlite3', run_id=scenario.spec.run_id)
     scenario.port = OfflinePort(scenario.port.root)
     # Real durable external link exists; observing it cannot manufacture the
     # missing original acknowledgement or authorize a second optional mutation.

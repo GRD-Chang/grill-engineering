@@ -22,7 +22,7 @@ def test_history_timing_distinguishes_complete_partial_and_unknown_without_count
 
     scenario, calls, timing = continued_round
     before = _snapshot(tmp_path)
-    document = read(scenario.kernel.storage.path, "history")
+    document = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage)
     attempt, = document.data["history"]["attempts"]
     assert attempt["id"] == calls[0].attempt_id
     assert [(item["model"], item["effort"]) for item in attempt["invocations"]] == [
@@ -61,7 +61,7 @@ def test_closed_activity_without_worker_exit_does_not_prove_complete_execution(t
     kernel.observe_worker_activity(call, "start", active=True, observed_at=101.0, evidence={"type": "turn.started"})
     kernel.observe_worker_activity(call, "end", active=False, observed_at=103.0, evidence={"type": "turn.completed"})
     before = _snapshot(tmp_path)
-    attempt, = read(kernel.storage.path, "history").data["history"]["attempts"]
+    attempt, = read(kernel.storage.path, 'history', storage=kernel.storage).data["history"]["attempts"]
     assert invocation_timing(attempt["invocations"]) == {
         "execution_timing_complete": False, "recorded_execution_seconds": 2}
     assert _snapshot(tmp_path) == before
@@ -72,7 +72,7 @@ def test_history_renders_one_round_with_original_configurations_and_true_timing(
     from agent_run.cli.render import render
 
     scenario, calls, timing = continued_round
-    document = read(scenario.kernel.storage.path, "history")
+    document = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage)
     original = json.dumps(document.data, ensure_ascii=False, sort_keys=True)
     before = _snapshot(tmp_path)
     for language, role, elapsed, recorded in (("en", "Development Agent", "Round execution time", "Recorded execution time"),
@@ -124,7 +124,7 @@ def test_history_keeps_unconsumed_malformed_review_as_raw_evidence_without_a_ver
     else:
         raise AssertionError("The normal pipeline did not reach Review")
     before = _snapshot(tmp_path)
-    document = read(scenario.kernel.storage.path, "history")
+    document = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage)
     review = next(row for row in document.data["history"]["attempts"] if row["role"] == "review")
     assert review["status"] == "returned" and review["outcome"] is None
     for details in (False, True):
@@ -136,7 +136,7 @@ def test_history_keeps_unconsumed_malformed_review_as_raw_evidence_without_a_ver
     assert _snapshot(tmp_path) == before
     repair = scenario.step()
     assert repair.call is not None and repair.call.output_ordinal == 1
-    full_document = read(scenario.kernel.storage.path, "history")
+    full_document = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage)
     full = full_document.data["history"]
     output = StringIO()
     render(replace(full_document, language="en"), style="plain", details=True, stream=output)
@@ -144,7 +144,7 @@ def test_history_keeps_unconsumed_malformed_review_as_raw_evidence_without_a_ver
     assert "Output continuations: 1, included in this round" in output.getvalue()
     event = next(item for item in full["events"] if item["kind"] == "output_repair_allocated")
     before = _snapshot(tmp_path)
-    page = read(scenario.kernel.storage.path, "history", after=event["position"] - 1, limit=1)
+    page = read(scenario.kernel.storage.path, 'history', after=event['position'] - 1, limit=1, storage=scenario.kernel.storage)
     assert len(page.data["history"]["events"]) == 1 and page.data["history"]["attempts"] == []
     output = StringIO()
     render(replace(page, language="en"), style="plain", details=True, stream=output)
@@ -183,7 +183,7 @@ def test_history_binds_each_review_findings_and_evidence_to_its_original_candida
     assert reviews[0].context["candidate_sha"] != reviews[1].context["candidate_sha"]
     assert scenario.run().kind == "approval"
     before = _snapshot(tmp_path)
-    document = read(scenario.kernel.storage.path, "history")
+    document = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage)
     attempts = {item["id"]: item for item in document.data["history"]["attempts"]}
     first, second = (attempts[call.attempt_id] for call in reviews)
     publication, = (item for item in attempts.values() if item["role"] == "publication")
@@ -241,7 +241,7 @@ def test_default_history_bounds_human_text_without_changing_details_or_audit(tmp
                                    message=reply) == "applied"
     assert scenario.step().call is not None
     before = _snapshot(tmp_path)
-    document = read(scenario.kernel.storage.path, "history")
+    document = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage)
     audit = json.dumps(document.data, ensure_ascii=False, sort_keys=True)
     for language, marker in (("en", "truncated; --details retains the original"),
                              ("zh", "已截断；--details 保留原文")):

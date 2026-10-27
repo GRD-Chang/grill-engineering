@@ -45,7 +45,7 @@ def test_bootstrap_read_outage_retains_original_wait_and_lease(tmp_path):
     with pytest.raises(ReadWait) as second:
         runner.authorize_agent(call)
     assert second.value.retry_at == first.value.retry_at
-    s.kernel = Kernel(s.kernel.storage.path)
+    s.kernel = Kernel(s.kernel.storage.path, run_id=s.kernel.storage.run_id)
     s.kernel.clock = lambda: now[0]
     runner = OperationRunner(s.kernel, s.execution, lambda binding: ports)
     now[0] = 700.25

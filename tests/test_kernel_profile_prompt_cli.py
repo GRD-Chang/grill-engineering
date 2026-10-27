@@ -31,7 +31,7 @@ def _published_profile_task(git_repo: Path) -> Kernel:
                         'refs/heads/parent', 'refs/heads/main')
     spec = freeze_creation(RunSpec('profile-public', workspace.repository, 1, 'parent-v1', 'graph-v1',
         (delivery,), repository_root=str(workspace.repository_root)), defaults)
-    return Kernel.create_task(workspace.state_root / spec.run_id / 'kernel.sqlite3', spec,
+    return Kernel.create_task(workspace.state_root / 'kernel.sqlite3', spec,
         requirements=Requirements(ParentIssue(1, 'Profile Parent', 'Frozen original requirement'), ()))
 
 
@@ -66,7 +66,7 @@ def test_public_run_profile_revision_changes_only_future_threads(git_repo, comma
     monkeypatch.setattr(Kernel, 'admit_host', forbidden)
     monkeypatch.setattr(Kernel, 'control_host', forbidden)
     selector = '1' if command == 'configure' else 'profile-public'
-    location = ['--state-dir', str(kernel.storage.path.parent.parent)] if command == 'profile' else []
+    location = ['--state-dir', str(kernel.storage.path.parent)] if command == 'profile' else []
     assert main([command, selector, '--repo', 'example/project', *location,
                  '--dev-model', 'future-development', '--dev-effort', 'high', '--json']) == 0
     configured = json.loads(capsys.readouterr().out)
@@ -101,7 +101,7 @@ def test_public_run_profile_revision_changes_only_future_threads(git_repo, comma
     assert changed.attempt_id == original.attempt_id
 
 
-@pytest.mark.parametrize('case', ['empty', 'conflict', 'invalid-effort', 'unbound', 'wrong-repository', 'custom-state', 'zero-parent'])
+@pytest.mark.parametrize('case', ['empty', 'conflict', 'invalid-effort', 'unbound', 'wrong-repository', 'custom-state', 'nested-copy', 'zero-parent'])
 def test_public_run_profile_rejects_invalid_changes_and_unpublished_snapshots_without_saving(
     git_repo, tmp_path, capsys, case,
 ):
@@ -112,12 +112,17 @@ def test_public_run_profile_rejects_invalid_changes_and_unpublished_snapshots_wi
 
     kernel = _published_profile_task(git_repo)
     repository = 'wrong/project' if case == 'wrong-repository' else 'example/project'
-    state = kernel.storage.path.parent.parent
+    state = kernel.storage.path.parent
     if case == 'unbound':
         workspace = ManagedWorkspace.for_repository('example/project')
-        task_path(TaskKey(workspace.repository_root, 'example/project', 1)).unlink()
-    elif case == 'custom-state':
-        state = tmp_path / 'diagnostic-copy'
+        # Corrupted canonical binding, never removal of a JSON authority.
+        from agent_run.storage.sqlite import Storage
+        with Storage.metadata(kernel.storage.path).transaction(ordered=False) as owner:
+            owner.execute('UPDATE tasks SET current_run=NULL WHERE id=?',
+                (TaskKey(workspace.repository_root, 'example/project', 1).fingerprint,))
+    elif case in {'custom-state', 'nested-copy'}:
+        state = ((tmp_path / 'diagnostic-copy') if case == 'custom-state' else
+                 kernel.storage.path.parent / 'diagnostic-copy')
         state.mkdir()
         shutil.copy2(kernel.storage.path, state / 'kernel.sqlite3')
     options = {'empty': [], 'conflict': ['--publication-model', 'independent', '--publication-from-development'],

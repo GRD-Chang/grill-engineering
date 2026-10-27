@@ -1,5 +1,7 @@
 """Current publisher witnesses and original comment receipts bind remote writes."""
 
+from support.repository_fixture import create_kernel
+
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -25,7 +27,7 @@ def publisher_scenario(path: Path, monkeypatch: pytest.MonkeyPatch) -> Scenario:
     remote = scenario.spec.inputs.repository_remote
     frozen = freeze_creation(scenario.spec, UserDefaultsStore(path / "personal.json"))
     scenario.spec = replace(frozen, inputs=replace(frozen.inputs, repository_remote=remote))
-    scenario.kernel = Kernel.create(path / "frozen.sqlite3", scenario.spec, requirements=scenario.requirements)
+    scenario.kernel = create_kernel(path / "frozen.sqlite3", scenario.spec, requirements=scenario.requirements)
     scenario.execution = scenario.kernel.claim_executor("publisher-owner")
     scenario.publisher = {"actor": "actual-runner", "identity": {"source": "host"}}
     make_ports = scenario.make_ports
@@ -74,8 +76,6 @@ def close_intent(effect: Effect) -> dict:
 
 def test_unconfigured_run_cannot_publish_with_two_missing_identity_selections(tmp_path: Path) -> None:
     scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
-    scenario.spec = replace(scenario.spec, inputs=None)
-    scenario.kernel = Kernel.create(tmp_path / "unconfigured.sqlite3", scenario.spec)
     scenario.execution = scenario.kernel.claim_executor("unconfigured-owner")
     # A deliberately unconfigured input is a publisher-validation unit, not
     # a managed native Run. The runner rejects its missing creation binding.
@@ -171,7 +171,7 @@ def test_close_inherits_only_the_confirmed_original_comment_receipt(
         assert scenario.kernel.status(scenario.delivery.key)["phase"] == "completion_comment"
         return
     assert scenario.runner().run_once().kind == "progress"
-    scenario.kernel = Kernel(scenario.kernel.storage.path)
+    scenario.kernel = Kernel(scenario.kernel.storage.path, run_id=scenario.kernel.storage.run_id)
     close = capture_effect(scenario, monkeypatch, "close").effect
     assert close.operation == "close"
     assert close.payload.get("close_intent") == intent

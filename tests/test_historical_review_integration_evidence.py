@@ -101,7 +101,7 @@ def test_original_integration_receipt_survives_review_continuation_and_findings(
     scenario.kernel.control('resume', 'reviewer-answer', subject=review.subject,
                             message='Use the recorded original conflict.', new_thread=new_thread)
     # The saved Attempt, rather than a new live Git read, owns continuation facts.
-    scenario.kernel = Kernel(scenario.kernel.storage.path)
+    scenario.kernel = Kernel(scenario.kernel.storage.path, run_id=scenario.kernel.storage.run_id)
     runner = scenario.runner()
     continued = _next_call(scenario, runner, Role.REVIEW)
     assert continued.attempt_id == review.attempt_id

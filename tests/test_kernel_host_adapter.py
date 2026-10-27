@@ -1,5 +1,7 @@
 """Real local CLI boundaries; controlled manager replies are not a live unit."""
 
+from support.repository_fixture import create_kernel
+
 import errno
 import json
 import os
@@ -147,7 +149,7 @@ def test_real_unavailable_manager_refuses_host_readiness(tmp_path: Path, record_
 def host_kernel(tmp_path: Path) -> Kernel:
     base = Commit("base", "tree")
     delivery = Delivery("parent", DeliveryKind.PARENT_ONLY, 1, "requirements", base, "source", "target")
-    return Kernel.create(tmp_path / "state" / "kernel.sqlite3", RunSpec(
+    return create_kernel(tmp_path / "state" / "kernel.sqlite3", RunSpec(
         "host-run", "example/repository", 1, "requirements", "graph", (delivery,),
         language="en", repository_root=str(tmp_path / "repository"),
     ))
@@ -155,11 +157,11 @@ def host_kernel(tmp_path: Path) -> Kernel:
 
 def _assert_unavailable_manager_precedes_admission(tmp_path: Path, host: SystemdHost, capability: str) -> None:
     from agent_run.contracts.task import TaskKey
-    from agent_run.storage.tasks import read_task, task_path
+    from support.repository_fixture import read_binding
     kernel = host_kernel(tmp_path)
     carrier = tmp_path / "carrier"
     task = TaskKey(tmp_path / "repository", "example/repository", 1)
-    assert read_task(task_path(task)) is None and not carrier.exists()
+    assert read_binding(task, kernel.storage.path) == (kernel.storage.run_id, kernel.storage.path.resolve()) and not carrier.exists()
     with pytest.raises(HostUnavailable, match="user systemd") as rejected:
         kernel.admit_host("start", kind="run", command=(sys.executable, "-c", "pass"),
                           environment_carrier=carrier, preflight=host.preflight)
@@ -173,7 +175,7 @@ def _assert_unavailable_manager_precedes_admission(tmp_path: Path, host: Systemd
         assert tx.one("SELECT count(*) FROM actions")[0] == 0
         assert tx.one("SELECT count(*) FROM hosts")[0] == 0
         assert tx.one("SELECT executor FROM runs")[0] is None
-    assert read_task(task_path(task)) is None and not carrier.exists()
+    assert read_binding(task, kernel.storage.path) == (kernel.storage.run_id, kernel.storage.path.resolve()) and not carrier.exists()
 
 
 def test_real_unavailable_manager_rejects_kernel_admission_before_action(tmp_path: Path, record_property) -> None:
@@ -201,7 +203,7 @@ def test_real_manager_boundary_reports_unknown_and_reconciles_original_kernel_gr
     observed = host.launch(launch, dispatch=lambda: kernel.dispatch_host(launch))
     assert observed is not None and observed.disposition == "unknown"
     assert kernel.observe_host(launch, observed) == "unknown"
-    reopened = Kernel(kernel.storage.path)
+    reopened = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     before = calls.read_bytes()
     assert host.launch(launch, dispatch=lambda: reopened.dispatch_host(launch)) is None
     assert calls.read_bytes() == before

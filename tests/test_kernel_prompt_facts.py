@@ -154,7 +154,7 @@ def test_findings_review_uses_previous_actual_result_and_current_development(tmp
     repaired["summary"] = "Current repair explanation with directly affected regression evidence."
     scenario.kernel.receive(repair, wire_json(repaired))
     # New allocation after reopening must use the saved actual Review, not live HEAD.
-    scenario.kernel = Kernel(scenario.kernel.storage.path)
+    scenario.kernel = Kernel(scenario.kernel.storage.path, run_id=scenario.kernel.storage.run_id)
     rereview = next_call(scenario, Role.REVIEW)
     facts = rereview.context["review_context"]["facts"]
     assert rereview.thread_id != review.thread_id

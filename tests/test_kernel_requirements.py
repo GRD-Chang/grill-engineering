@@ -1,4 +1,6 @@
 """Native Issue inputs through the shared Core operation runner."""
+
+from support.repository_fixture import create_kernel
 from support.core_operations import prepare_scripted_agent
 
 from dataclasses import replace
@@ -27,7 +29,7 @@ def source_run(path: Path, requirements: Requirements | None = None) -> tuple[Ke
                                 f"refs/heads/ticket-{number}", "refs/heads/run") for number in source.parent.sub_issue_numbers)
     final = Delivery("final:1", DeliveryKind.FINAL_RUN, 1, "reader-untrusted-revision", base, "refs/heads/run", "refs/heads/main")
     spec = RunSpec("native-run", "example/project", 1, "untrusted-parent", "untrusted-graph", (*deliveries, final), Policy(concurrency=2))
-    return Kernel.create(path, spec, requirements=source), source
+    return create_kernel(path, spec, requirements=source), source
 
 
 def test_closed_local_dependency_without_completion_never_unblocks_or_creates_final(tmp_path: Path) -> None:
@@ -42,7 +44,7 @@ def test_closed_local_dependency_without_completion_never_unblocks_or_creates_fi
         replace(issue, blocked_by=tuple(replace(blocker, state="CLOSED") for blocker in issue.blocked_by))
         for issue in source.issues))
     scenario.refresh()
-    state = Kernel(kernel.storage.path).source_status()
+    state = Kernel(kernel.storage.path, run_id=kernel.storage.run_id).source_status()
     assert state["frontier"] == []
     assert state["remaining"] == {"ticket:3": "ticket_closed", "ticket:4": "blocked_by_incomplete_tickets"}
     assert state["final_subject"] is None
@@ -81,7 +83,7 @@ def test_real_ticket_close_receipts_create_completion_before_dependency_and_fina
     scenario.refresh()
     assert scenario.kernel.source_status()["completions"] == original_completions
     assert scenario.kernel.source_status()["blocked"] is None
-    scenario.kernel = Kernel(scenario.kernel.storage.path)
+    scenario.kernel = Kernel(scenario.kernel.storage.path, run_id=scenario.kernel.storage.run_id)
     operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
     activation = operations.until(lambda step: step.reason == "final_activated")
     final = activation.subject
@@ -524,7 +526,7 @@ def test_original_final_merge_keeps_closeout_after_uncertain_read_and_parent_dri
     assert scenario.kernel.status(effect.subject)["pending_write"]["id"] == effect.effect_id
     assert not [write for write in scenario.port.writes() if write["subject"] == effect.subject and write["operation"] == "close"]
     restore_read()
-    scenario.kernel = Kernel(scenario.kernel.storage.path)
+    scenario.kernel = Kernel(scenario.kernel.storage.path, run_id=scenario.kernel.storage.run_id)
     scenario.requirements = replace(scenario.requirements, parent=replace(scenario.requirements.parent, body="Changed after uncertain original merge readback."))
     # Original sent intent readback precedes any source refresh, even across restart.
     assert scenario.runner().run_once().kind == "progress"

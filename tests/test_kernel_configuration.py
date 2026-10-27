@@ -268,7 +268,7 @@ def test_publication_unknown_response_retains_the_original_intent_without_invent
     assert pending is not None and pending["operation"] == "pr_write" and pending["status"] == "sent"
     assert exceptions == [(pending["id"], 1, None)]
     diagnostic = {"code": "write_response_unavailable", "message": "pr_write took effect; response lost"}
-    assert read(scenario.kernel.storage.path, "status").data["supervision_windows"][0]["latest_observation"] == diagnostic
+    assert read(scenario.kernel.storage.path, 'status', storage=scenario.kernel.storage).data["supervision_windows"][0]["latest_observation"] == diagnostic
     assert unresolved.retry_at is not None
     now[0] = unresolved.retry_at
     assert scenario.run().kind == "approval"

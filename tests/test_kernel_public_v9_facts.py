@@ -1,4 +1,6 @@
 """Public consumers read actual native producer facts, not a legacy Run view."""
+
+from support.repository_fixture import create_kernel
 import json
 from pathlib import Path
 
@@ -30,7 +32,7 @@ def _kernel(root: Path) -> tuple[Kernel, ReadOnlyPorts]:
     ))
     spec = freeze_creation(RunSpec('run', 'example/project', 1, 'parent-v1', 'graph-v1', (job, final),
         repository_root=str(root)), defaults, prompt_resources={key: 'Original ' + key for key in RESOURCE_KEYS})
-    return (Kernel.create(root / 'kernel.sqlite3', spec, requirements=source),
+    return (create_kernel(root / 'kernel.sqlite3', spec, requirements=source),
             ReadOnlyPorts(source, job.source_ref, job.target_ref, DeliveryFacts(base, None)))
 
 
@@ -59,7 +61,7 @@ def test_frozen_settings_and_old_thread_binding_survive_personal_and_run_profile
     assert settings['github']['worker'] == {'source': 'pat', 'pat': {'env': 'FROZEN_TOKEN'}}
     assert settings['notifications']['mode'] == 'detailed'
     assert settings['prompt_resources'] == {key: 'Original ' + key for key in RESOURCE_KEYS}
-    invocation = read(kernel.storage.path, 'status').data['subjects'][0]['pending_attempt']['invocations'][0]
+    invocation = read(kernel.storage.path, 'status', storage=kernel.storage).data['subjects'][0]['pending_attempt']['invocations'][0]
     assert invocation['model'] == 'frozen-model' and invocation['profile_revision'] == first.profile_revision
     assert invocation['profile_revision'] != revision
     assert _durable(tmp_path) == before
@@ -90,7 +92,7 @@ def test_query_retains_physical_output_raw_and_actual_activity_without_recountin
     kernel.agent_exited(repair, next_process, 0)
     assert operations.once().kind == 'progress'
     before = _durable(tmp_path)
-    data = read(kernel.storage.path, 'history').data
+    data = read(kernel.storage.path, 'history', storage=kernel.storage).data
     invocation = data['history']['attempts'][0]['invocations'][0]
     assert invocation['id'] == first.invocation_id
     outputs = invocation['outputs']
@@ -115,7 +117,7 @@ def test_publication_actual_failure_is_not_dispatch_count_or_erased_by_successfu
 ) -> None:
     scenario, effect = _actual_publication_push(tmp_path, monkeypatch, 7)
     before = _durable(tmp_path)
-    data = read(scenario.kernel.storage.path, 'history').data
+    data = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage).data
     failures = data['history']['effect_failures']
     assert len(failures) == 1 and failures[0]['operation'] == 'push'
     assert failures[0]['effect'] == effect.effect_id and failures[0]['dispatch_serial'] == 1
@@ -136,12 +138,12 @@ def test_publication_unknown_response_diagnostic_remains_public_after_successful
     pending = scenario.kernel.status(scenario.delivery.key)["pending_write"]
     assert pending is not None and pending["operation"] == "pr_write" and pending["status"] == "sent"
     diagnostic = {"code": "write_response_unavailable", "message": "pr_write took effect; response lost"}
-    assert read(scenario.kernel.storage.path, 'history').data['supervision_windows'][0]['latest_observation'] == diagnostic
+    assert read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage).data['supervision_windows'][0]['latest_observation'] == diagnostic
     assert unresolved.retry_at is not None
     now[0] = unresolved.retry_at
     assert scenario.run().kind == 'approval'
     before = _durable(tmp_path)
-    data = read(scenario.kernel.storage.path, 'history').data
+    data = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage).data
     failures = data['history']['effect_failures']
     assert failures == []  # Unknown response is not a proved nonzero command exit.
     assert sum(operation['attempts'] for operation in data['history']['effects']) > len(failures)
@@ -164,7 +166,7 @@ def test_zero_resync_gate_exposes_actual_window_and_explicit_resume_without_rene
     scenario.port.external_remote_append(scenario.delivery.target_ref, {'external.txt': 'Original external work'}, 'append')
     assert scenario.run().kind == 'paused'
     before = _durable(tmp_path)
-    data = read(scenario.kernel.storage.path, 'status').data
+    data = read(scenario.kernel.storage.path, 'status', storage=scenario.kernel.storage).data
     assert data['subjects'][0]['integration_resync']['limit'] == 0 and data['subjects'][0]['integration_resync']['used'] == 0
     assert data['subjects'][0]['integration_resync']['window'] == 1 and data['subjects'][0]['integration_resync']['open'] is False
     action = next(item for item in data['operator_actions'] if item['reason'] == 'integration_resync_exhausted')
@@ -182,7 +184,7 @@ def test_resume_application_receipt_does_not_claim_start_before_the_bound_succes
     kernel.receive(first, b'{"result_kind":"human_blocker","summary":null,"human_blockers":["Need original decision"]}')
     assert operations.once().kind == 'paused'
     assert kernel.control('resume', 'exact-response', subject='ticket', message='Original response') == 'applied'
-    before_start = next(action for action in read(kernel.storage.path, 'history').data['history']['actions'] if action['kind'] == 'resume')
+    before_start = next(action for action in read(kernel.storage.path, 'history', storage=kernel.storage).data['history']['actions'] if action['kind'] == 'resume')
     assert before_start['status'] == 'applied' and before_start['resume']['started_at'] is None
     assert before_start['resume']['successor_invocations'] == []
     successor = operations.once().call
@@ -190,7 +192,7 @@ def test_resume_application_receipt_does_not_claim_start_before_the_bound_succes
     kernel.bind_thread(successor, 'real-resumed-thread')
     process = {'pid': 21, 'pgid': 21, 'start_token': 'successor', 'host_pid': 10, 'host_start_token': 'host'}
     kernel.agent_started(successor, process)
-    bound_only = next(action for action in read(kernel.storage.path, 'history').data['history']['actions']
+    bound_only = next(action for action in read(kernel.storage.path, 'history', storage=kernel.storage).data['history']['actions']
                       if action['kind'] == 'resume')
     assert bound_only['resume']['started_at'] is None
     # Synthetic backend activity is distinct from the original process binding.
@@ -199,7 +201,7 @@ def test_resume_application_receipt_does_not_claim_start_before_the_bound_succes
     kernel.observe_worker_activity(successor, 'original-turn-start', active=True,
         observed_at=100.0, evidence={'type': 'turn.started', 'source': 'synthetic-query-fixture'})
     before = _durable(tmp_path)
-    data = read(kernel.storage.path, 'history').data
+    data = read(kernel.storage.path, 'history', storage=kernel.storage).data
     resumed = next(action for action in data['history']['actions'] if action['kind'] == 'resume')
     assert resumed['resume']['successor_invocations'] == [successor.invocation_id]
     assert resumed['resume']['started_at'] == 100.0 and resumed['payload']['message'] == 'Original response'

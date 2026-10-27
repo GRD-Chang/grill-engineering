@@ -43,7 +43,7 @@ def test_status_reads_ordinary_recovery_preparation_without_a_supervision_window
     budget = kernel.status(pending.subject)["budgets"]
 
     before = _durable(kernel)
-    document = read(kernel.storage.path, "status")
+    document = read(kernel.storage.path, 'status', storage=kernel.storage)
     assert document.data["supervision_windows"] == []
     assert pending.subject in {job["subject"] for job in document.data["subjects"]}
     arguments = ["status", "preparation", "--repo", "example/repository",
@@ -66,7 +66,7 @@ def test_status_reads_ordinary_recovery_preparation_without_a_supervision_window
         authorize_source=lambda: runner.authorize_agent(recovered))
     assert completed is not None and completed.returncode == 0 and kernel.worker_settled(pending)
     assert kernel.status(pending.subject)["budgets"] == budget
-    assert read(kernel.storage.path, "status").data["supervision_windows"] == []
+    assert read(kernel.storage.path, 'status', storage=kernel.storage).data["supervision_windows"] == []
 
 
 def test_initial_preparation_is_not_an_external_supervision_timeout(tmp_path):
@@ -75,7 +75,7 @@ def test_initial_preparation_is_not_an_external_supervision_timeout(tmp_path):
     assert request is not None
     clock[0] = request.preparation_deadline + 1
     before = _durable(kernel)
-    status = read(kernel.storage.path, "status").data
+    status = read(kernel.storage.path, 'status', storage=kernel.storage).data
     assert status["supervision_windows"] == [] and status["operator_actions"] == []
     assert runner.state().preparing == (request.reservation_id,)
     assert not kernel.worker_settled(request)
@@ -95,7 +95,7 @@ def test_sibling_required_checks_still_has_its_original_window_during_preparatio
         step = runner.run_once(agent_capacity=1)
         if step.preparation is not None:
             observed_roles.add(step.preparation.role)
-            assert read(kernel.storage.path, "status").data["supervision_windows"] == []
+            assert read(kernel.storage.path, 'status', storage=kernel.storage).data["supervision_windows"] == []
             if step.subject == "ticket:3":
                 held = step.preparation
             else:
@@ -119,7 +119,7 @@ def test_sibling_required_checks_still_has_its_original_window_during_preparatio
     with kernel.storage.transaction(write=False) as tx:
         original = dict(tx.one("SELECT * FROM waits WHERE kind='required_checks'"))
     before = _durable(kernel)
-    windows = read(kernel.storage.path, "status").data["supervision_windows"]
+    windows = read(kernel.storage.path, 'status', storage=kernel.storage).data["supervision_windows"]
     assert len(windows) == 1
     assert (windows[0]["subject"], windows[0]["kind"], windows[0]["scope_id"]) == (
         "ticket:2", "required_checks", original["scope_id"])
@@ -157,13 +157,13 @@ def test_query_rejects_invalid_typed_wait_reads_without_mutating_records(tmp_pat
         assert runner.run_once().kind == "waiting"
     with kernel.storage.transaction(write=False) as tx:
         scope_id = tx.one("SELECT scope_id FROM waits")[0]
-    read(kernel.storage.path, "status")  # The actual stored producer is valid.
+    read(kernel.storage.path, 'status', storage=kernel.storage)  # The actual stored producer is valid.
     before = _durable(kernel)
     original_rows, original_material = read_facts.all_rows, read_facts.material
     observed = []
 
-    def rows(tx, sql, values=(), *, scoped_sql=None):
-        result = original_rows(tx, sql, values, scoped_sql=scoped_sql)
+    def rows(tx, sql, values=()):
+        result = original_rows(tx, sql, values)
         if sql.startswith("SELECT w.*,m.subject"):
             row, = result
             observed.append(row["scope_id"])
@@ -197,7 +197,7 @@ def test_query_rejects_invalid_typed_wait_reads_without_mutating_records(tmp_pat
     monkeypatch.setattr(read_facts, "all_rows", rows)
     monkeypatch.setattr(read_facts, "material", material)
     with pytest.raises(QueryError) as rejected:
-        read(kernel.storage.path, "status")
+        read(kernel.storage.path, 'status', storage=kernel.storage)
     assert rejected.value.code == "incompatible_run_state"
     assert observed == [scope_id]
     assert _durable(kernel) == before
@@ -213,7 +213,7 @@ def test_recorded_preparation_remains_readable_after_its_execution_epoch_is_revo
     with pytest.raises(KernelError):
         kernel.guard_preparation(request)
     before = _durable(kernel)
-    document = read(kernel.storage.path, "status")
+    document = read(kernel.storage.path, 'status', storage=kernel.storage)
     assert document.data["supervision_windows"] == []
     assert runner.state().preparing == (request.reservation_id,)
     assert not kernel.worker_settled(request)
@@ -243,7 +243,7 @@ def test_status_preserves_pending_continuation_bindings(tmp_path, repair):
     if repair == "output-repair":
         assert pending.mode == repair and pending.output_ordinal == 1
     before = _durable(kernel)
-    assert read(kernel.storage.path, "status").data["supervision_windows"] == []
+    assert read(kernel.storage.path, 'status', storage=kernel.storage).data["supervision_windows"] == []
     assert runner.state().preparing == (pending.reservation_id,)
     assert kernel.status(pending.subject)["budgets"]["requirements"]["developments_used"] == 1
     assert _durable(kernel) == before
@@ -258,7 +258,7 @@ def test_public_status_rejects_malformed_preparation_values_read_only(tmp_path, 
     kernel, _, _, step, _ = agent_preparation_fixture(tmp_path)
     request = step.preparation
     assert request is not None
-    read(kernel.storage.path, "status")
+    read(kernel.storage.path, 'status', storage=kernel.storage)
     before = _durable(kernel)
     original_material, original_profile = read_facts.material, read_facts.recorded_profile
     durations = {"huge": 10**400, "nan": float("nan"), "inf": float("inf"),
@@ -293,6 +293,6 @@ def test_public_status_rejects_malformed_preparation_values_read_only(tmp_path, 
     assert main([*arguments, "--plain"]) == 2
     assert "incompatible_run_state" in capsys.readouterr().out
     with pytest.raises(QueryError) as rejected:
-        read(kernel.storage.path, "status")
+        read(kernel.storage.path, 'status', storage=kernel.storage)
     assert rejected.value.code == "incompatible_run_state"
     assert _durable(kernel) == before

@@ -1,4 +1,6 @@
 """Default discovery follows managed state roots, never source checkout contents."""
+
+from support.repository_fixture import create_kernel
 from pathlib import Path
 from dataclasses import replace
 import json
@@ -12,7 +14,8 @@ from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Require
 from agent_run.core.kernel import Kernel
 from support.offline import OfflinePort, Scenario
 from agent_run.cli.main import main
-from agent_run.storage.tasks import bind_task, locked_task, task_path
+from agent_run.storage.tasks import task_path
+from agent_run.storage.routing import RepositoryRoute
 from tests.test_kernel_query_cli import _create
 from support.environment import durable_snapshot as _snapshot
 
@@ -22,8 +25,11 @@ def _published(root: Path, run_id: str = "run-query", *, repository: str = "exam
     delivery = Delivery(f"parent:{parent}", DeliveryKind.PARENT_ONLY, parent, "requirement", Commit("base", "tree"),
                         "refs/heads/parent", "refs/heads/main")
     spec = RunSpec(run_id, repository, parent, "parent", "graph", (delivery,), language="en",
-                   repository_root=str(repository_root or root.parent / "repository"))
-    return Kernel.create_task(root / run_id / "kernel.sqlite3", spec,
+                   repository_root=str(repository_root or (ManagedWorkspace.for_repository(repository).repository_root
+                       if root == ManagedWorkspace.for_repository(repository).state_root else root.parent / "repository")))
+    from support.offline import fixture_inputs
+    spec = replace(spec, inputs=fixture_inputs())
+    return create_kernel(root / "kernel.sqlite3", spec,
                               requirements=Requirements(ParentIssue(parent, "Parent", "Requirement"), ()))
 
 
@@ -55,7 +61,7 @@ def test_default_discovery_ignores_nonmanaged_database_but_explicit_scope_can_re
     assert main(["status", "same", "--repo", "example/project", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["repository_root"] == str(ManagedWorkspace.for_repository("example/project").repository_root)
     assert main(["status", "same", "--state-dir", str(snapshot.storage.path), "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["repository_root"] == str(snapshot.storage.path.parent.parent / "checkout")
+    assert json.loads(capsys.readouterr().out)["repository_root"] == str(snapshot.storage.path.parent / "checkout")
     assert _snapshot(data) == before
 
 
@@ -88,52 +94,58 @@ def test_default_discovery_accepts_the_existing_dot_github_repository_contract(
     assert _snapshot(workspace.root) == before
 
 
-def test_default_discovery_ignores_unpublished_creation_but_exact_snapshot_stays_read_only(
-    tmp_path: Path, monkeypatch, capsys,
-) -> None:
+def test_default_discovery_ignores_unpublished_creation_but_exact_snapshot_stays_read_only(tmp_path, monkeypatch, capsys):
     data = tmp_path / "data"
     monkeypatch.setenv("XDG_DATA_HOME", str(data))
-    root = ManagedWorkspace.for_repository("example/project").state_root
-    published = _published(root, "published")
-    orphan = _create(root, "unpublished")
-    shell = root / "failed-creation" / "kernel.sqlite3"
+    workspace = ManagedWorkspace.for_repository("example/project")
+    published = _published(workspace.state_root, "published")
+    # A competing proposal for the same active Task reuses the original complete Run.
+    from support.offline import fixture_inputs
+    delivery = Delivery('other-subject', DeliveryKind.PARENT_ONLY, 1, 'unread', Commit('base', 'tree'), 'source', 'target')
+    proposed = RunSpec('unpublished', workspace.repository, 1, 'new', 'new', (delivery,), language='zh',
+        repository_root=str(workspace.repository_root), inputs=fixture_inputs())
+    winner = create_kernel(published.storage.path, proposed, requirements=Requirements(ParentIssue(1, 'Changed', 'Changed'), ()))
+    assert winner.storage.run_id == 'published' and winner.storage.path == published.storage.path
+    shell = workspace.state_root / 'failed-creation' / 'kernel.sqlite3'
     shell.parent.mkdir()
     shell.touch()
     before = _snapshot(data)
-    assert main(["status", "--repo", "example/project", "--parent", "1", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["run_id"] == "published"
-    assert main(["runs", "--repo", "example/project", "--json"]) == 0
-    assert [item["run_id"] for item in json.loads(capsys.readouterr().out)["runs"]] == ["published"]
-    assert main(["status", "unpublished", "--state-dir", str(orphan.storage.path), "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["run_id"] == "unpublished"
-    assert main(["status", "--state-dir", str(shell), "--json"]) == 2
-    diagnostic = json.loads(capsys.readouterr().out)["diagnostics"][0]
-    assert diagnostic["code"] == "unsupported_state"
-    assert diagnostic["path"] == str(shell) and diagnostic["reason"] == "uncertain_state"
+    assert main(['status', '--repo', workspace.repository, '--parent', '1', '--json']) == 0
+    assert json.loads(capsys.readouterr().out)['run_id'] == 'published'
+    assert main(['runs', '--repo', workspace.repository, '--json']) == 0
+    assert [item['run_id'] for item in json.loads(capsys.readouterr().out)['runs']] == ['published']
+    assert main(['status', 'unpublished', '--state-dir', str(winner.storage.path), '--json']) == 2
+    assert json.loads(capsys.readouterr().out)['diagnostics'][0]['code'] == 'run_locator_missing'
+    assert main(['status', 'unpublished', '--state-dir', str(shell), '--json']) == 2
+    diagnostic = json.loads(capsys.readouterr().out)['diagnostics'][0]
+    assert diagnostic['code'] == 'unsupported_state' and diagnostic['path'] == str(shell)
     assert published.storage.path.exists() and _snapshot(data) == before
 
 
 @pytest.mark.parametrize("missing", ["database", "state-directory"])
-def test_default_discovery_diagnoses_a_missing_published_database_without_repair(
-    tmp_path: Path, monkeypatch, capsys, missing: str,
-) -> None:
-    data = tmp_path / "data"
-    monkeypatch.setenv("XDG_DATA_HOME", str(data))
-    root = ManagedWorkspace.for_repository("example/project").state_root
-    published = _published(root, "published")
-    if missing == "database":
+def test_default_discovery_diagnoses_a_missing_published_database_without_repair(tmp_path, monkeypatch, capsys, missing):
+    data = tmp_path / 'data'
+    monkeypatch.setenv('XDG_DATA_HOME', str(data))
+    root = ManagedWorkspace.for_repository('example/project').state_root
+    published = _published(root, 'published')
+    if missing == 'database':
         published.storage.path.unlink()
     else:
         shutil.rmtree(root)
     before = _snapshot(data)
-    assert main(["status", "--repo", "example/project", "--parent", "1", "--json"]) == 2
+    assert main(['status', '--repo', 'example/project', '--parent', '1', '--json']) == 2
     output = json.loads(capsys.readouterr().out)
-    diagnostic = output["diagnostics"][0]
-    assert diagnostic["code"] == "unsupported_state"
-    assert diagnostic["path"] == str(published.storage.path)
-    assert diagnostic["reason"] == "unreadable_state" and diagnostic["recovery_hint"]
-    assert output["selection"] == {"repo": "example/project", "parent": 1}
-    assert output["candidates"][0]["run_id"] == "published"
+    diagnostic = output['diagnostics'][0]
+    if missing == 'database':
+        assert diagnostic['code'] == 'unsupported_state'
+        assert diagnostic['path'] == str(published.storage.path)
+        assert diagnostic['reason'] == 'unreadable_state' and diagnostic['recovery_hint']
+        assert output['selection'] == {'repo': 'example/project', 'parent': 1}
+    else:
+        # Removing the entire sole authority erases its identity. No retired JSON
+        # is decoded into a fictitious current Run, and no replacement is created.
+        assert diagnostic['code'] == 'run_locator_missing'
+    assert 'candidates' not in output
     assert not published.storage.path.exists() and _snapshot(data) == before
 
 
@@ -150,10 +162,11 @@ def test_default_discovery_isolates_an_unrelated_invalid_task_pointer(
     other = ManagedWorkspace.for_repository(other_repository)
     _published(other.state_root, "other", repository=other_repository, parent=other_parent)
     pointer = task_path(TaskKey(other.repository_root, other_repository, other_parent))
+    pointer.parent.mkdir(parents=True, exist_ok=True)
     if fault == "malformed":
         pointer.write_bytes(b"{")
     else:
-        pointer.unlink()
+        pointer.unlink(missing_ok=True)
         replacement = tmp_path / "unrelated-pointer.json"
         replacement.write_bytes(b"{}")
         pointer.symlink_to(replacement)
@@ -173,18 +186,19 @@ def test_default_discovery_diagnoses_its_exact_task_pointer_without_repair(
     monkeypatch.setenv("XDG_DATA_HOME", str(data))
     root = ManagedWorkspace.for_repository("example/project").state_root
     _published(root, "published")
-    pointer = task_path(TaskKey(root.parent / "repository", "example/project", 1))
+    pointer = task_path(TaskKey(ManagedWorkspace.for_repository("example/project").repository_root, "example/project", 1))
+    pointer.parent.mkdir(parents=True, exist_ok=True)
     if fault == "malformed":
         pointer.write_bytes(b"{")
     else:
-        pointer.unlink()
+        pointer.unlink(missing_ok=True)
         replacement = tmp_path / "invalid-pointer.json"
         replacement.write_bytes(b"{}")
         pointer.symlink_to(replacement)
     before = _snapshot(data)
-    assert main(["status", "--repo", "example/project", "--parent", "1", "--json"]) == 2
+    assert main(["status", "--repo", "example/project", "--parent", "1", "--json"]) == 0
     output = json.loads(capsys.readouterr().out)
-    assert output["diagnostics"][0]["code"] in {"task_location_invalid", "run_locator_invalid"}
+    assert output["run_id"] == "published" and output["parent"]["number"] == 1
     assert _snapshot(data) == before
 
 
@@ -205,108 +219,54 @@ def test_unpublished_shells_do_not_consume_the_default_run_candidate_limit(
     assert _snapshot(data) == before
 
 
-def test_default_parent_selects_the_exact_published_run_and_retains_terminal_history(
-    tmp_path: Path, monkeypatch, capsys,
-) -> None:
-    data = tmp_path / "data"
-    monkeypatch.setenv("XDG_DATA_HOME", str(data))
-    workspace = ManagedWorkspace.for_repository("example/repository")
-    root = workspace.state_root
-    original_create = OfflinePort.create
-
-    def managed_port(path, *args, **kwargs):
-        from copy import copy
-        import support.offline as offline
-
-        port = original_create(path, *args, **kwargs)
-        physical = port.physical
-        # Place the fresh physical Git before prepare freezes its identities.
-        port.git.root.rename(workspace.repository_root)
-        port.git.root = workspace.repository_root
-        # Keep this test's real remote provider bound to the relocated private
-        # repository. Every operation still performs OfflineGit's ownership
-        # checks; other Scenarios retain the normal authority/remote layout.
-        physical.repository = workspace.repository_root
-        physical.root = workspace.root
-        original_physical = offline.OfflineGit
-
-        def relocated_physical(root, *, environment, written=None):
-            if root != port.root:
-                return original_physical(root, environment=environment, written=written)
-            # The read and audited-write providers use the same real paths;
-            # each retains its own callback and the original ownership checks.
-            provider = copy(physical)
-            provider.written = written
-            provider._owned()
-            return provider
-
-        monkeypatch.setattr(offline, "OfflineGit", relocated_physical)
-        return port
-
-    with monkeypatch.context() as creation:
-        creation.setattr(OfflinePort, "create", staticmethod(managed_port))
-        scenario = Scenario(root / "historical", DeliveryKind.PARENT_ONLY)
-    assert Path(scenario.spec.repository_root) == scenario.port.git.root == workspace.repository_root
-    assert scenario.run(approve=True).kind == "complete"
-    active = _published(root, "published", repository="example/repository")
-    before = _snapshot(data)
-    assert main(["status", "--repo", "example/repository", "--parent", "1", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["run_id"] == "published"
-    assert main(["runs", "--repo", "example/repository", "--json"]) == 0
-    output = json.loads(capsys.readouterr().out)
-    assert {item["run_id"]: item["is_terminal"] for item in output["runs"]} == {
-        "offline-run": True, "published": False}
-    assert main(["history", "offline-run", "--repo", "example/repository", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["run_id"] == "offline-run"
-    assert main(["status", "--repo", "example/repository", "--parent", "1",
-                 "--data-root", str(root), "--json"]) == 2
-    assert json.loads(capsys.readouterr().out)["diagnostics"][0]["code"] == "run_locator_conflict"
-    assert active.storage.path.exists() and _snapshot(data) == before
-    task = TaskKey(workspace.repository_root, "example/repository", 1)
-    duplicate = root / "history-copy" / "kernel.sqlite3"
-    duplicate.parent.mkdir()
-    shutil.copyfile(scenario.kernel.storage.path, duplicate)
-    # A completed Run's original publication remains an exact fact even when
-    # a copied historical database has the same Run ID. Use the formal writer.
-    with locked_task(task) as pointer:
-        bind_task(pointer, scenario.spec.run_id, scenario.kernel.storage.path)
-    before = _snapshot(data)
-    assert main(["status", "--repo", "example/repository", "--parent", "1", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["run_id"] == "offline-run"
-    assert _snapshot(data) == before
-    pointer.unlink()
-    before = _snapshot(data)
-    assert main(["status", "--repo", "example/repository", "--parent", "1", "--json"]) == 2
-    assert json.loads(capsys.readouterr().out)["diagnostics"][0]["code"] == "run_locator_conflict"
-    assert _snapshot(data) == before
+def test_default_parent_selects_the_exact_published_run_and_retains_terminal_history(tmp_path, monkeypatch, capsys):
+    from agent_run.model import DeliveryKind
+    scenario = Scenario(tmp_path / 'history', DeliveryKind.PARENT_ONLY)
+    assert scenario.run(approve=True).kind == 'complete'
+    scenario.kernel.confirm_executor_exit(scenario.execution)
+    original = scenario.kernel
+    successor_spec = replace(scenario.spec, run_id='published')
+    successor = create_kernel(original.storage.path, successor_spec, requirements=scenario.requirements)
+    assert original.storage.path == successor.storage.path and successor.storage.run_id == 'published'
+    before = _snapshot(tmp_path)
+    args = ['--repo', scenario.spec.repository, '--state-dir', str(original.storage.path), '--json']
+    assert main(['status', '--parent', str(scenario.spec.parent_issue), *args]) == 0
+    assert json.loads(capsys.readouterr().out)['run_id'] == 'published'
+    assert main(['runs', *args]) == 0
+    runs = json.loads(capsys.readouterr().out)['runs']
+    assert {item['run_id']: item['is_terminal'] for item in runs} == {'offline-run': True, 'published': False}
+    assert main(['history', 'offline-run', *args]) == 0
+    assert json.loads(capsys.readouterr().out)['run_id'] == 'offline-run'
+    assert _snapshot(tmp_path) == before
 
 
 @pytest.mark.parametrize("fault", ["damaged", "missing"])
 @pytest.mark.parametrize("selector", ["parent", "exact"])
-def test_exact_default_query_isolates_another_parents_bound_database_failure(
-    tmp_path: Path, monkeypatch, capsys, fault: str, selector: str,
-) -> None:
-    data = tmp_path / "data"
-    monkeypatch.setenv("XDG_DATA_HOME", str(data))
-    root = ManagedWorkspace.for_repository("example/project").state_root
-    _published(root, "published")
-    other = _published(root, "other", parent=9)
-    if fault == "damaged":
-        other.storage.path.write_bytes(b"not a SQLite database")
+def test_exact_default_query_isolates_another_parents_bound_database_failure(tmp_path, monkeypatch, capsys, fault, selector):
+    data = tmp_path / 'data'
+    monkeypatch.setenv('XDG_DATA_HOME', str(data))
+    root = ManagedWorkspace.for_repository('example/project').state_root
+    selected = _published(root, 'published')
+    other = _published(root, 'other', parent=9)
+    assert selected.storage.path == other.storage.path
+    if fault == 'damaged':
+        other.storage.path.write_bytes(b'not a SQLite database')
     else:
         other.storage.path.unlink()
     before = _snapshot(data)
-    arguments = ["--parent", "1"] if selector == "parent" else ["published"]
-    assert main(["status", *arguments, "--repo", "example/project", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)["run_id"] == "published"
-    assert main(["status", "--parent", "9", "--repo", "example/project", "--json"]) == 2
+    arguments = ['--parent', '1'] if selector == 'parent' else ['published']
+    # Physical loss of the sole repository authority affects both Tasks. A
+    # reader must refuse, never synthesize facts from the retired JSON pointer.
+    assert main(['status', *arguments, '--repo', 'example/project', '--json']) == 2
     output = json.loads(capsys.readouterr().out)
-    diagnostic = output["diagnostics"][0]
-    assert diagnostic["code"] == "unsupported_state"
-    assert diagnostic["path"] == str(other.storage.path)
-    assert diagnostic["reason"] == ("uncertain_state" if fault == "damaged" else "unreadable_state")
-    assert diagnostic["recovery_hint"] and output["selection"] == {"repo": "example/project", "parent": 9}
-    assert output["candidates"][0]["run_id"] == "other"
-    assert main(["runs", "--repo", "example/project", "--json"]) == 2
-    assert json.loads(capsys.readouterr().out)["diagnostics"][0]["path"] == str(other.storage.path)
+    diagnostic = output['diagnostics'][0]
+    assert diagnostic['code'] == 'unsupported_state'
+    assert diagnostic['path'] == str(other.storage.path)
+    assert diagnostic['reason'] == ('uncertain_state' if fault == 'damaged' else 'unreadable_state')
+    assert diagnostic['recovery_hint']
+    assert 'candidates' not in output
+    assert main(['status', '--parent', '9', '--repo', 'example/project', '--json']) == 2
+    assert json.loads(capsys.readouterr().out)['diagnostics'][0]['path'] == str(other.storage.path)
+    assert main(['runs', '--repo', 'example/project', '--json']) == 2
+    assert json.loads(capsys.readouterr().out)['diagnostics'][0]['path'] == str(other.storage.path)
     assert _snapshot(data) == before

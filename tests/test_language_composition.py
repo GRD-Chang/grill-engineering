@@ -61,7 +61,7 @@ def test_run_language_remains_frozen_and_missing_values_never_use_personal_defau
     def forbidden(*args, **kwargs):
         raise AssertionError('A frozen Run consulted current personal language')
     monkeypatch.setattr(UserDefaultsStore, 'language', forbidden)
-    document = read(kernel.storage.path, 'status')
+    document = read(kernel.storage.path, 'status', storage=kernel.storage)
     assert document.language == selected_language({'language': document.language}) == 'en'
     for state in ({}, {'language': None}, {'language': 'invalid'}):
         with pytest.raises(ValueError, match='must be zh or en'):

@@ -53,7 +53,7 @@ def test_native_preparation_retains_safe_auth_diagnostic_without_invocation(
         execute_selected_codex(kernel, request, identity={'source': 'host'},
             environment={'PATH': str(tools), 'HOME': str(tmp_path)}, prompt='Never execute',
             executable='never-started-codex', hidden_paths=(), authorize_source=runner.authorize_agent)
-    document = read(kernel.storage.path, 'status').data
+    document = read(kernel.storage.path, 'status', storage=kernel.storage).data
     action = next(item for item in document['operator_actions'] if item['status_code'] == 'worker_unavailable')
     evidence = action['evidence']['failure_evidence']['evidence']
     assert evidence['category'] == category

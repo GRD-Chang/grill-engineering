@@ -1,6 +1,8 @@
 """Real clone/path seam used by the native public lifecycle entry."""
 from __future__ import annotations
 
+from support.repository_fixture import create_kernel
+
 import json
 import select
 import sqlite3
@@ -87,7 +89,7 @@ def test_host_preflight_failure_never_accepts_action_or_creates_environment(tmp_
     from agent_run.config.paths import app_runtime_root
     delivery = Delivery("parent:1", DeliveryKind.PARENT_ONLY, 1, "revision", Commit("base", "tree"),
                         "refs/heads/parent", "refs/heads/main")
-    kernel = Kernel.create(tmp_path / "state.sqlite3", RunSpec("run-1", "example/project", 1,
+    kernel = create_kernel(tmp_path / "state.sqlite3", RunSpec("run-1", "example/project", 1,
                            "parent", "graph", (delivery,), repository_root=str(tmp_path)))
     manager = SystemdHost(systemctl=str(tmp_path / "missing-systemctl"),
                           systemd_run=str(tmp_path / "missing-systemd-run"), environment=dict(os.environ))
@@ -143,7 +145,7 @@ def test_prepare_creation_uses_original_defaults_real_remote_and_independent_clo
     assert read_git_identity(root) == original_identity
     assert not (root / "unpublished.txt").exists()
     assert database.name == "kernel.sqlite3"
-    assert not database.exists() and database.parent.parent == root.parent / "state"
+    assert not database.exists() and database.parent == root.parent / "state"
     assert git(root, "for-each-ref", "--format=%(refname)", "refs/heads/agent-run") == ""
     assert git(root, "ls-remote", "--heads", "origin").splitlines() == [initial + "\trefs/heads/main"]
     assert not any(Path(job.checkout).exists() for job in spec.deliveries)
@@ -198,7 +200,7 @@ def test_existing_run_error_uses_frozen_language_after_personal_language_changes
     spec = freeze_creation(RunSpec("run-1", "example/project", 1, "parent", "graph", (delivery,),
                                    repository_root=str(root)), defaults)
     from agent_run.model import ParentIssue, Requirements
-    kernel = Kernel.create_task(workspace.state_root / "run-1" / "kernel.sqlite3", spec,
+    kernel = Kernel.create_task(workspace.state_root / "kernel.sqlite3", spec,
         requirements=Requirements(ParentIssue(1, "Parent", "Frozen requirement"), ()))
     defaults.configure(language="zh")
     # This is a language/selection test, not a real user-bus release claim.
@@ -214,7 +216,7 @@ def test_existing_run_error_uses_frozen_language_after_personal_language_changes
     output = capsys.readouterr().out
     assert output.startswith("Command not applied:")
     assert "control_subject_ambiguous" in output
-    assert Kernel(kernel.storage.path).source_status() == before
+    assert Kernel(kernel.storage.path, run_id=kernel.storage.run_id).source_status() == before
     with kernel.storage.transaction(write=False) as tx:
         assert tx.one("SELECT count(*) FROM actions")[0] == 0
         assert tx.one("SELECT count(*) FROM hosts")[0] == 0
@@ -351,7 +353,7 @@ def _running_public_parent(git_repo: Path, tmp_path: Path, monkeypatch, *, admit
                            policy_overrides={"parent_only_paired_rounds": 1, "development_deadline": "7s"})
     assert spec.inputs is not None
     spec = replace(spec, inputs=replace(spec.inputs, repository_remote="origin"))
-    kernel = Kernel.create_task(workspace.state_root / spec.run_id / "kernel.sqlite3", spec,
+    kernel = Kernel.create_task(workspace.state_root / "kernel.sqlite3", spec,
         requirements=Requirements(ParentIssue(1, "Parent", "Frozen requirement", tickets), tuple(
             Issue(number, f"Ticket {number}", "Frozen Ticket requirement", "OPEN", labels=frozenset({"ready-for-agent"}))
             for number in tickets)))
@@ -903,7 +905,7 @@ def test_sqlite_waiting_worker_claim_rechecks_a_committed_stop_without_new_budge
         try:
             thread.start()
             assert entered.wait(5)
-            assert Kernel(kernel.storage.path).stop_task('stop-before-claim') == 'applied'
+            assert Kernel(kernel.storage.path, run_id=kernel.storage.run_id).stop_task('stop-before-claim') == 'applied'
             with _sqlite_writer_lock(kernel.storage.path) as writer:
                 proceed.set()
                 writer.stdin.write('short\n')

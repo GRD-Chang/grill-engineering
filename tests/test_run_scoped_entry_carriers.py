@@ -1,14 +1,17 @@
-"""Inactive entry assembly and explicit carriers, using only SQLite/argv.
+"""Final-protocol entry assembly and explicit carriers, using only SQLite/argv.
 
 No Host, Worker, child, notification thread or real remote is started here.
-Default public admission remains v21. Synthetic exit entry tests stop at the
+The source defaults to one repository protocol. Synthetic exit entry tests stop at the
 opening seam; they are not a systemd/foreground execution or receipt proof.
 """
-from contextlib import contextmanager
+
+from support.repository_fixture import create_kernel
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 import sys
+import sqlite3
 
 import pytest
 
@@ -73,7 +76,7 @@ def test_current_public_stop_keeps_durable_fence_and_exact_selected_run_without_
     database = tmp_path / 'legacy' / 'kernel.sqlite3'
     root = tmp_path / 'repository'
     spec, source = proposal(root, 'legacy-A', 99)
-    original = Kernel.create_task(database, spec, requirements=source)
+    original = create_kernel(database, spec, requirements=source)
     selected, notices = [], []
     @contextmanager
     def lease(path):
@@ -83,9 +86,10 @@ def test_current_public_stop_keeps_durable_fence_and_exact_selected_run_without_
     monkeypatch.setattr(package_lease, 'default_runner_lock_path', lambda env: tmp_path / 'runner.lock')
     monkeypatch.setattr(workspace_module, 'workspace_for_root', lambda path:
         SimpleNamespace(repository_root=root, repository='example/project', state_root=database.parent))
-    monkeypatch.setattr(selection, '_candidates', lambda parsed: [{
-        'run_id': spec.run_id, 'repository': spec.repository, 'parent': spec.parent_issue,
-        'database': str(database), 'repository_root': str(root), 'is_terminal': False}])
+    from agent_run.adapters.workspace import ManagedWorkspace
+    canonical = SimpleNamespace(repository_root=root, repository='example/project', state_root=database.parent)
+    monkeypatch.setattr(ManagedWorkspace, 'for_repository', staticmethod(lambda repository: canonical))
+    monkeypatch.setattr(selection, 'managed_repository_routes', lambda request: (RepositoryRoute(database, root, spec.repository),))
     monkeypatch.setattr(sender, 'notify_committed', lambda path, **kw: notices.append((path, kw['storage'].run_id)))
     parsed = _parser('en').parse_args(['stop', spec.run_id, '--repo', spec.repository, '--json'])
     result = lifecycle.execute(parsed, language='en')
@@ -95,18 +99,18 @@ def test_current_public_stop_keeps_durable_fence_and_exact_selected_run_without_
     with original.storage.transaction(write=False) as tx:
         assert tx.one('SELECT count(*) FROM hosts')[0] == 0
         assert tx.one('SELECT count(*) FROM invocations')[0] == 0
-        assert run_is_current(tx, database)
+        assert run_is_current(tx)
 
 
 def test_current_producer_nonempty_notification_page_retains_the_original_history_layout(tmp_path):
     spec, source = proposal(tmp_path / 'repository', 'current-page', 99)
-    kernel = Kernel.create_task(tmp_path / 'current' / 'kernel.sqlite3', spec, requirements=source)
+    kernel = create_kernel(tmp_path / 'current' / 'kernel.sqlite3', spec, requirements=source)
     assert kernel.stop_task('page-stop') == 'applied'
     observer = NativeNotifications.__new__(NativeNotifications)
     observer.database, observer.storage = kernel.storage.path, kernel.storage
     with kernel.storage.transaction(write=False) as tx:
         columns = tx.execute('PRAGMA table_info(history)').fetchall()
-        assert 'run_id' not in [column['name'] for column in columns]
+        assert 'run_id' in [column['name'] for column in columns]
         assert tx.one('SELECT count(*) FROM history')[0] > 0
         observer.run_id, observer.binding, observer.config, observer.state = observer._run(tx)
         highwater = tx.one('SELECT max(position) FROM history')[0]
@@ -116,23 +120,27 @@ def test_current_producer_nonempty_notification_page_retains_the_original_histor
 
 @pytest.mark.parametrize('operation', ['run', 'resume', 'approve', 'stop', 'revise', 'requeue', 'abandon'])
 def test_internal_public_route_stays_closed_before_lease_io_or_control(repository, monkeypatch, operation):
-    assert routing.REPOSITORY_PUBLIC_READY is False
+    assert not hasattr(routing, 'REPOSITORY_PUBLIC_READY')
     from agent_run.runtime import package_lease
     def forbidden(*args, **kwargs):
-        raise AssertionError('Inactive public route reached an external/admission step')
+        raise KernelError('fixture_lease_boundary', 'Canonical route reached its required usage lease')
     monkeypatch.setattr(package_lease, 'runner_usage_lease', forbidden)
     arguments = [operation, '1' if operation == 'run' else 'A', '--repo', 'example/project']
     if operation == 'revise':
         arguments += ['--message', 'Accurate retained request']
     parsed = _parser('en').parse_args(arguments)
-    with pytest.raises(KernelError, match='repository_activation_incomplete'):
+    with pytest.raises(KernelError, match='fixture_lease_boundary'):
         lifecycle.execute(parsed, language='en', repository_route=repository)
     assert repository.task(TaskKey(repository.repository_root, repository.repository, 1)).current_run == 'A'
 
 
-def test_direct_creation_assembly_is_also_closed_before_preparation(repository):
-    with pytest.raises(KernelError, match='repository_activation_incomplete'):
-        lifecycle._run(SimpleNamespace(), manager=None, environment={}, runner_lock=Path('/not-opened'),
+def test_direct_creation_assembly_is_also_closed_before_preparation(repository, monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Foreign repository route reached creation preparation')
+    monkeypatch.setattr(lifecycle, 'prepare_creation', forbidden)
+    parsed = _parser('en').parse_args(['run', '1', '--repo', 'example/project'])
+    with pytest.raises(KernelError, match='managed_state_identity'):
+        lifecycle._run(parsed, manager=None, environment={}, runner_lock=Path('/not-opened'),
             repository_route=repository)
 
 
@@ -148,19 +156,19 @@ def test_canonical_workspace_route_has_one_database_and_does_not_create_it(tmp_p
 def test_task_observation_uses_canonical_sql_and_original_replaceability_without_json(repository, monkeypatch):
     def forbidden(*args):
         raise AssertionError('Repository mode consulted a JSON Task publication')
-    monkeypatch.setattr(tasks, 'read_task', forbidden)
+    assert not hasattr(tasks, 'read_task')
     task = TaskKey(repository.repository_root, repository.repository, 1)
     current = repository.open_task(task)
     assert current is not None and current.storage.run_id == 'A'
     with current.storage.transaction(write=False) as tx:
-        assert run_is_current(tx, repository.database)
+        assert run_is_current(tx)
     with current.storage.transaction() as tx:
         tx.execute("UPDATE subjects SET phase='complete' WHERE run_id='A'")
     assert repository.open_task(task) is None
     spec, source = proposal(repository.repository_root, 'successor', 1)
     assert repository.create(task, spec, source).created
     with current.storage.transaction(write=False) as tx:
-        assert not run_is_current(tx, repository.database)
+        assert not run_is_current(tx)
     assert repository.open_task(task).storage.run_id == 'successor'
     assert status_subjects(repository.database, storage=repository.at_run('B')) == []
 
@@ -168,9 +176,10 @@ def test_task_observation_uses_canonical_sql_and_original_replaceability_without
 @pytest.mark.parametrize('run_id', ['A', '-a`b`c % quoted value'])
 def test_host_argv_seals_explicit_selector_as_one_item_and_keeps_original_default(tmp_path, run_id):
     database, lock = tmp_path / 'kernel.sqlite3', tmp_path / 'runner.lock'
-    old = executor.command(database, 'action', lock, {})
-    assert old == (sys.executable, '-m', 'agent_run.runtime.executor', '--database', str(database),
+    old = (sys.executable, '-m', 'agent_run.runtime.executor', '--database', str(database),
         '--action', 'action', '--runner-lock', str(lock))
+    with pytest.raises(TypeError):
+        executor.command(database, 'action', lock, {})  # No implicit Run selector.
     selected = executor.command(database, 'action', lock, {}, run_id=run_id)
     assert selected == (*old, '--run-id=' + run_id)
     assert executor.command(database, 'action', lock, {'LD_LIBRARY_PATH': '/controlled/library'}, run_id=run_id) == (
@@ -195,20 +204,32 @@ def test_entry_parsers_propagate_exact_run_before_any_managed_execution(tmp_path
         '--runner-lock', str(tmp_path / 'runner.lock')]
     if run_id is not None:
         arguments.append('--run-id=' + run_id)
-    assert module.main(arguments) == 1
-    assert captured == [(tmp_path / 'state.sqlite3', {} if run_id is None else {'run_id': run_id})]
+    if run_id is None:
+        with pytest.raises(SystemExit) as refused:
+            module.main(arguments)
+        assert refused.value.code == 2 and captured == []
+    else:
+        assert module.main(arguments) == 1
+        assert captured == [(tmp_path / 'state.sqlite3', {'run_id': run_id})]
 
 
 @pytest.mark.parametrize('entry', ['executor', 'exit-hook'])
-def test_staged_marker_is_rejected_by_real_entry_opening_before_a_host_or_credential_read(repository, monkeypatch, entry):
+def test_staged_marker_is_rejected_by_real_entry_opening_before_a_host_or_credential_read(repository, monkeypatch, entry, tmp_path):
     module = executor if entry == 'executor' else host_exit
     monkeypatch.setenv('CREDENTIALS_DIRECTORY', '/unread-credential')
     monkeypatch.setenv('NOTIFY_SOCKET', 'unopened-socket')
     monkeypatch.setenv('SERVICE_RESULT', 'exit-code')
     monkeypatch.setenv('EXIT_CODE', 'exited')
     monkeypatch.setenv('EXIT_STATUS', '23')
-    assert module.main(['--database', str(repository.database), '--action', 'no-host',
+    import shutil
+    retired = tmp_path / 'retired.sqlite3'
+    shutil.copyfile(repository.database, retired)
+    with closing(sqlite3.connect(retired)) as connection:
+        connection.execute('UPDATE meta SET protocol=?', ('independent-delivery-repository-unactivated',))
+    original_bytes = retired.read_bytes()
+    assert module.main(['--database', str(retired), '--action', 'no-host',
         '--runner-lock', '/unopened-runner.lock', '--run-id=A']) == 1
+    assert retired.read_bytes() == original_bytes
     with repository.at_run('A').transaction(write=False) as tx:
         assert tx.one('SELECT count(*) FROM hosts WHERE run_id=?', ('A',))[0] == 0
 

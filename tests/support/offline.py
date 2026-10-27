@@ -5,6 +5,8 @@ Its scripts control external outcomes, never internal kernel transitions.
 """
 
 from __future__ import annotations
+
+from support.repository_fixture import create_kernel
 from agent_run.core.operation_runner import observe_control
 
 from dataclasses import asdict, replace
@@ -414,7 +416,7 @@ class Scenario:
         if kind == DeliveryKind.FINAL_RUN:
             producer = self._completed_source(root, policy, neutral_script)
             self.port, self.initial, self.spec = producer.port, producer.initial, producer.spec
-            self.kernel = Kernel(producer.kernel.storage.path)
+            self.kernel = Kernel(producer.kernel.storage.path, run_id=producer.kernel.storage.run_id)
             self.requirements = producer.requirements
             self.historical_trace = producer.trace()
             self.historical_trace['completion'] = next(row for row in self.kernel.source_status()['completions']
@@ -447,7 +449,7 @@ class Scenario:
                     self.delivery.target_ref, "refs/heads/main", checkout=str(self.port.root / "work" / "final-1"),
                     owned_root=self.delivery.owned_root, common_git_dir=self.delivery.common_git_dir)
                 self.spec = replace(self.spec, deliveries=(*self.spec.deliveries, final))
-            self.kernel = Kernel.create(root / "kernel.sqlite3", self.spec, requirements=self.requirements)
+            self.kernel = create_kernel(root / "kernel.sqlite3", self.spec, requirements=self.requirements)
             self.delivery = self.kernel.delivery(self.delivery.key)
             self.execution = self.kernel.claim_executor("offline-executor")
         self.reviews = list(reviews)
@@ -818,7 +820,7 @@ class GraphScenario(Scenario):
                               "refs/heads/parent", "refs/heads/main", checkout=str(work / "parent-1"), owned_root=str(work), common_git_dir=common))
         self.spec = RunSpec("offline-run", "example/project", requirements.parent.number, "untrusted", "untrusted", tuple(deliveries), policy or Policy(),
                            language="zh", repository_root=str(self.port.git.root.resolve()), inputs=fixture_inputs())
-        self.kernel = Kernel.create(root / "kernel.sqlite3", self.spec, requirements=requirements)
+        self.kernel = create_kernel(root / "kernel.sqlite3", self.spec, requirements=requirements)
         self.execution = self.kernel.claim_executor("offline-executor")
         self.delivery = self.kernel.delivery(deliveries[0].key)
         self.reviews, self.checks = list(reviews), ["none"]

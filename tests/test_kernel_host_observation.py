@@ -75,8 +75,8 @@ def test_managed_activation_reads_the_original_sent_target_once(tmp_path, monkey
     assert runner.state().disposition == "quiescent"
     runner.activate_observation()
     assert runner.state().disposition == "quiescent"
-    read(kernel.storage.path, "history")
-    read(kernel.storage.path, "status")
+    read(kernel.storage.path, 'history', storage=kernel.storage)
+    read(kernel.storage.path, 'status', storage=kernel.storage)
     assert len(reads) == 1
     with kernel.storage.transaction(write=False) as tx:
         assert tuple(tx.one("SELECT status,attempts FROM effects WHERE id=?", (pending["id"],))) == ("observed", 1)

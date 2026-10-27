@@ -64,7 +64,7 @@ def test_sqlite_fault_rolls_back_the_whole_resume_and_first_reopen_preserves_wor
         assert refused.value.__cause__ in failures
         assert refused.value.__cause__.sqlite_errorcode == sqlite_code
     assert logical_state(kernel.storage.path) == before
-    reopened = Kernel(kernel.storage.path)
+    reopened = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     assert reopened.status(original.subject)['budgets'] == budget
     assert reopened.control('resume', 'faulted-resume', **arguments) == 'applied'
     assert reopened.control('resume', 'faulted-resume', **arguments) == 'applied'
@@ -113,7 +113,7 @@ def test_real_worker_raw_save_fault_reaps_the_process_and_reopen_resumes_origina
         with pytest.raises(ChildProcessError):
             os.waitpid(pid, os.WNOHANG)
         assert unrelated.poll() is None
-        reopened = Kernel(kernel.storage.path)
+        reopened = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
         status = reopened.status(original.subject)
         assert status['pending_attempt'] == original.attempt_id and not status['pending_return']
         assert status['phase'] == 'development' and status['gates'] == ['execution_failed']
@@ -161,7 +161,7 @@ def test_public_stop_reports_real_commit_interruption_without_partial_action(
     source = Requirements(ParentIssue(1, 'Parent', 'Preserve this original requirement', ()), ())
     delivery = Delivery('parent:1', DeliveryKind.PARENT_ONLY, 1, 'unobserved', base,
         'refs/heads/fault-delivery', 'refs/heads/main', checkout=str(workspace.repository_root))
-    kernel = Kernel.create_task(workspace.state_root / 'sqlite-fault-run' / 'kernel.sqlite3',
+    kernel = Kernel.create_task(workspace.state_root / 'kernel.sqlite3',
         RunSpec('sqlite-fault-run', 'example/project', 1, 'unobserved', 'graph', (delivery,),
             inputs=fixture_inputs(), language='en', repository_root=str(workspace.repository_root)), requirements=source)
     before = logical_state(kernel.storage.path)

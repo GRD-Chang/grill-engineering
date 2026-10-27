@@ -86,7 +86,7 @@ def test_requeue_read_outage_keeps_its_original_deadline_across_restart(
     with kernel.storage.transaction(write=False) as tx:
         wait = tx.one("SELECT started_at,deadline FROM waits WHERE subject='ticket:2'")
         assert tuple(wait) == (100.25, 700.25)
-    scenario.kernel = Kernel(kernel.storage.path)
+    scenario.kernel = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     scenario.kernel.clock = lambda: 700.25
     restarted = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
     monkeypatch.setattr(restarted.runner.ports, "source", read_outage)

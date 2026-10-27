@@ -1,5 +1,7 @@
 """Frozen request rendering reaches a real CLI without rereading personal input."""
 
+from support.repository_fixture import create_kernel
+
 import json
 import os
 from pathlib import Path
@@ -141,7 +143,7 @@ def test_same_thread_new_development_attempt_keeps_complete_repair_method(tmp_pa
     resources = builtin_resources("en")
     resources["methods/repair"] = "Frozen full repair method\n" + resources["methods/repair"]
     spec = freeze_creation(scenario.spec, defaults, prompt_resources=resources)
-    scenario.kernel = Kernel.create(tmp_path / "state" / "kernel.sqlite3", spec, requirements=scenario.requirements)
+    scenario.kernel = create_kernel(tmp_path / "state" / "kernel.sqlite3", spec, requirements=scenario.requirements)
     scenario.execution = scenario.kernel.claim_executor("prompt-owner")
     operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports, prepare_agents=False)
     first = None
@@ -221,7 +223,7 @@ def test_publication_prompt_consumes_only_the_actual_authorized_evidence(
     if kind == DeliveryKind.FINAL_RUN:
         scenario = final_scenario(tmp_path / 'configured-final', inputs=spec.inputs, language=spec.language)
     else:
-        scenario.kernel = Kernel.create(tmp_path / "state" / "kernel.sqlite3", spec, requirements=scenario.requirements)
+        scenario.kernel = create_kernel(tmp_path / "state" / "kernel.sqlite3", spec, requirements=scenario.requirements)
     if kind != DeliveryKind.FINAL_RUN:
         scenario.execution = scenario.kernel.claim_executor("prompt-owner")
     operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports, prepare_agents=False)

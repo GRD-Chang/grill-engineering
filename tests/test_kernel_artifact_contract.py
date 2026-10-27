@@ -1,5 +1,7 @@
 """Native Requirements consume synthetic returns through the actual attempt lifecycle."""
 
+from support.repository_fixture import create_kernel
+
 import json
 import os
 from pathlib import Path
@@ -192,7 +194,7 @@ def test_frozen_run_accepts_complete_artifacts_in_the_other_language(tmp_path, l
     resources = resolve_resources(language)
     scenario.spec = replace(scenario.spec, language=language,
                             inputs=replace(scenario.spec.inputs, prompt_resources=resources))
-    scenario.kernel = Kernel.create(tmp_path / "configured.sqlite3", scenario.spec, requirements=scenario.requirements)
+    scenario.kernel = create_kernel(tmp_path / "configured.sqlite3", scenario.spec, requirements=scenario.requirements)
     scenario.execution = scenario.kernel.claim_executor("configured-language")
     call = next_call(scenario, role)
     assert call.context["language"] == language and call.context["_prompt_resources"] == resources

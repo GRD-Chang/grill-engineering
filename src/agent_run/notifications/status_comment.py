@@ -23,16 +23,15 @@ from agent_run.storage.sqlite import Storage
 
 
 class StatusComments:
-    def __init__(self, database: Path, *, storage: Storage | None = None) -> None:
+    def __init__(self, database: Path, *, storage: Storage) -> None:
         self.database = database.absolute()
-        self._storage = open_run(self.database, storage=storage) if storage is not None else None
+        self._storage = open_run(self.database, storage=storage)
 
     def _projection(self, subject: str) -> StatusProjection:
-        return (project_status(self.database, subject) if self._storage is None else
-                project_status(self.database, subject, storage=self._storage))
+        return project_status(self.database, subject, storage=self._storage)
 
     def _kernel(self) -> Kernel:
-        return Kernel(self.database) if self._storage is None else Kernel._from_storage(self._storage)
+        return Kernel._from_storage(self._storage)
 
     @staticmethod
     def _entry(document: dict[str, Any], projection: StatusProjection) -> dict[str, Any]:

@@ -40,7 +40,7 @@ def _observe(scenario, root, captured):
         captured.append(event)
         return {"outcome": "success", "reason": None}
 
-    observer = NativeNotifications(scenario.kernel.storage.path, root, transport=transport)
+    observer = NativeNotifications(scenario.kernel.storage.path, root, transport=transport, storage=scenario.kernel.storage)
     observer.close()
     assert observer.failure_reason is None
 
@@ -128,15 +128,16 @@ def test_sender_terminal_uses_original_close_whole_effort_and_keeps_unknown_publ
 
 
 def test_sender_compresses_real_development_to_review_and_preserves_gate_budget_and_return_order(tmp_path, monkeypatch):
-    original_create = Kernel.create
+    from support import offline
+    original_create = offline.create_kernel
 
-    def detailed(_cls, path, spec, **kwargs):
+    def detailed(path, spec, **kwargs):
         assert spec.inputs is not None
         inputs = replace(spec.inputs, notifications={**spec.inputs.notifications, "mode": "detailed"})
         return original_create(path, replace(spec, inputs=inputs), **kwargs)
 
     with monkeypatch.context() as patch:
-        patch.setattr(Kernel, "create", classmethod(detailed))
+        patch.setattr(offline, "create_kernel", detailed)
         scenario = _enabled_scenario(tmp_path, monkeypatch, DeliveryKind.PARENT_ONLY)
     entered, release = Event(), Event()
     sent = []
@@ -153,7 +154,7 @@ def test_sender_compresses_real_development_to_review_and_preserves_gate_budget_
             sent.append(event)
         return {"outcome": "success", "reason": None}
 
-    observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport)
+    observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
     observed = []
 
     def started(call):
@@ -232,7 +233,7 @@ def test_sender_one_poll_replaces_failed_live_start_with_the_newer_real_sibling_
 
     second = [None]
     second_call = None
-    observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport)
+    observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport, storage=kernel.storage)
     try:
         assert returned.wait(5)
         until = time.monotonic() + 5

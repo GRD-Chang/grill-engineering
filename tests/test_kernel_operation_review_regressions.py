@@ -41,7 +41,7 @@ def _window(scenario: Scenario) -> dict[str, float]:
 
 
 def _failures(scenario: Scenario) -> list[dict]:
-    return read(scenario.kernel.storage.path, "history").data["history"]["effect_failures"]
+    return read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage).data["history"]["effect_failures"]
 
 
 def test_stop_resume_preserves_the_original_source_wait_deadline(tmp_path: Path) -> None:

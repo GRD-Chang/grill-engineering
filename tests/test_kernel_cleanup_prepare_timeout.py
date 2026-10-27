@@ -235,7 +235,7 @@ def _exercise(root: Path) -> None:
             assert 5 <= timeouts[0]["seconds"] < 30
             original = attempts[0]
             checkout = Path(original.payload["checkout"])
-            durable = Kernel(kernel.storage.path).status(subject)
+            durable = Kernel(kernel.storage.path, run_id=kernel.storage.run_id).status(subject)
             assert durable["phase"] == "complete" and durable["budgets"] == before["budgets"]
             assert durable["resource_cleanup"]["state"] == "pending"
             assert durable["resource_cleanup"]["effect_id"] == original.effect_id

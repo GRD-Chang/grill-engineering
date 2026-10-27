@@ -65,7 +65,7 @@ def test_second_incomplete_pauses_and_reopen_does_not_reset_the_one_successor(tm
     finish(kernel, resumed, INCOMPLETE)
     stopped = operations.once()
     assert stopped.kind == "paused" and stopped.reason == "semantic_incomplete_limit"
-    reopened = Kernel(kernel.storage.path)
+    reopened = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     reopened.clock = kernel.clock
     continued = _read_operations(reopened, owner, operations.runner.ports.requirements)
     assert continued.once().call is None

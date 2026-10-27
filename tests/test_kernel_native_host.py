@@ -150,7 +150,7 @@ if sys.argv[7] == 'managed':
     state_path.write_text(json.dumps(state))
     manager = SystemdHost(systemctl=sys.argv[9], systemd_run=sys.argv[10], environment={'PATH': os.defpath},
                           cgroup_root=Path(sys.argv[11]))
-    selected = managed_host_environment(Kernel(Path(sys.argv[12])), 'handoff', manager,
+    selected = managed_host_environment(Kernel(Path(sys.argv[12]),run_id=value['run_id']), 'handoff', manager,
                                        runner_lock=Path(sys.argv[2]), credential=Path(sys.argv[3]), notify_socket=sys.argv[4])
 else:
     selected = host_environment(HostLaunch(**value), runner_lock=Path(sys.argv[2]),
@@ -171,7 +171,7 @@ with selected as inherited:
         signal = os.read(ready_read, 1)
         assert signal == b"1", child.communicate(timeout=3) if not signal else signal
         if managed:
-            reopened = Kernel(kernel.storage.path)
+            reopened = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
             usage = reopened.host_usage("handoff")
             assert usage is not None and usage.usage_ready and not usage.usage_released
             assert usage.main_pid == child.pid and json.loads(usage.evidence) == handoff.receipt
@@ -202,7 +202,7 @@ with selected as inherited:
                 raise AssertionError("management crossed the manager's retained FD")
         if managed:
             from agent_run.runtime.handoff import reconcile_handoff
-            reopened = Kernel(kernel.storage.path)
+            reopened = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
             state = json.loads(response.read_text())
             group = state["fields"]["ControlGroup"]
             group_path = manager.cgroup_root / group.lstrip("/")
@@ -247,7 +247,7 @@ with selected as inherited:
             response.write_text(json.dumps(state))
             released = reconcile_handoff(reopened, "handoff", manager)
             assert released.disposition == "exited" and released.usage_released
-            receipt = Kernel(kernel.storage.path).host_usage("handoff")
+            receipt = Kernel(kernel.storage.path, run_id=kernel.storage.run_id).host_usage("handoff")
             assert receipt == released and "SYNTHETIC_SECRET" not in receipt.evidence
             before = calls.read_bytes()
             assert reconcile_handoff(reopened, "handoff", manager) == released
@@ -319,7 +319,7 @@ with host_environment(HostLaunch(**value), runner_lock=Path(sys.argv[2]),
                                capture_output=True, timeout=2)
         assert child.returncode != 0 and not canary.exists()
         assert b"fixture-private-value" not in child.stdout + child.stderr
-        reopened = Kernel(kernel.storage.path)
+        reopened = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
         assert reopened.host_request("handoff") == launch
         usage = reopened.host_usage("handoff")
         assert usage is not None and usage.usage_pending and not usage.usage_ready

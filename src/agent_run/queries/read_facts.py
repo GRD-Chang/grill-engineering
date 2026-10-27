@@ -20,7 +20,7 @@ from agent_run.errors import AgentProfileError
 from agent_run.model import AgentPreparation, Execution, Purpose, Role, artifact, review_outcome
 from agent_run.queries.execution import recorded_profile
 from agent_run.storage.sqlite import Transaction
-from agent_run.storage.run_scope import RunTransaction, selected_statement, transaction_scope
+from agent_run.storage.run_scope import RunTransaction, run_statement, transaction_scope
 from agent_run.storage.run_paths import RunPaths
 from agent_run.contracts.copy import text
 
@@ -28,22 +28,18 @@ from agent_run.contracts.copy import text
 def recorded_review(tx: Transaction, run: Mapping[str, Any], job: Mapping[str, Any]) -> str:
     """Describe recorded applicability, never claim a fresh remote observation."""
     scope = transaction_scope(tx)
-    if scope is not None and (run["id"] != scope.run_id or job.get("run_id") != scope.run_id):
+    if run['id'] != scope.run_id or job.get('run_id') != scope.run_id:
         raise QueryError("incompatible_run_state", "Review belongs to a different Run")
-    current = (_one(tx, "SELECT * FROM attempts WHERE id=? AND subject=?", (job["current_attempt"], job["id"]),
-                    scoped_sql="SELECT * FROM attempts WHERE run_id=? AND id=? AND subject=?")
+    current = (_one(tx, 'SELECT * FROM attempts WHERE run_id=? AND id=? AND subject=?', (job['current_attempt'], job['id']))
                if job["current_attempt"] else None)
     active = current is not None and current["role"] == "review"
-    review = current if active else (_one(tx, "SELECT * FROM attempts WHERE id=? AND subject=?",
-        (job["review_attempt"], job["id"]), scoped_sql="SELECT * FROM attempts WHERE run_id=? AND id=? AND subject=?")
+    review = current if active else (_one(tx, 'SELECT * FROM attempts WHERE run_id=? AND id=? AND subject=?', (job['review_attempt'], job['id']))
         if job["review_attempt"] else None)
     if review is None:
         return "not_recorded"
-    snapshots = _rows(tx, "SELECT target_sha FROM integration_snapshots WHERE subject=? ORDER BY window DESC LIMIT 1", (job["id"],),
-        scoped_sql="SELECT target_sha FROM integration_snapshots WHERE run_id=? AND subject=? ORDER BY window DESC LIMIT 1")
+    snapshots = _rows(tx, 'SELECT target_sha FROM integration_snapshots WHERE run_id=? AND subject=? ORDER BY window DESC LIMIT 1', (job['id'],))
     base = snapshots[0][0] if snapshots else job["integration_target"] or job["base_sha"]
-    revision = (_one(tx, "SELECT revision FROM issue_facts WHERE issue=?", (job["issue"],),
-                     scoped_sql="SELECT revision FROM issue_facts WHERE run_id=? AND issue=?")[0]
+    revision = (_one(tx, 'SELECT revision FROM issue_facts WHERE run_id=? AND issue=?', (job['issue'],))[0]
                 if job["kind"] == "ticket" else run["observed_parent_revision"])
     if (review["role"] != "review" or review["generation"] != job["generation"]
             or review["revision"] != job["revision"] or review["revision"] != revision
@@ -98,21 +94,18 @@ def action_guidance(operation: str, *, run_id: str, repository: str,
     return shlex.join([*argv, "--", run_id])
 
 
-def _one(tx: Transaction, sql: str, values: Sequence[Any] = (), *, scoped_sql: str) -> sqlite3.Row:
-    return tx.one(*selected_statement(tx, sql, scoped_sql, values))
+def _one(tx: Transaction, sql: str, values: Sequence[Any] = ()) -> sqlite3.Row:
+    return tx.one(*run_statement(tx, sql, values))
 
 
-def _rows(tx: Transaction, sql: str, values: Sequence[Any] = (), *,
-          scoped_sql: str, limit: int = 128) -> list[sqlite3.Row]:
-    statement, parameters = selected_statement(tx, sql, scoped_sql, values)
+def _rows(tx: Transaction, sql: str, values: Sequence[Any] = (), *, limit: int = 128) -> list[sqlite3.Row]:
+    statement, parameters = run_statement(tx, sql, values)
     return tx.rows(statement, parameters, limit=limit)
 
 
-def all_rows(tx: Transaction, sql: str, values: Sequence[Any] = (), *,
-             scoped_sql: str | None = None) -> list[dict[str, Any]]:
-    # Paging and byte accounting remain in the existing Transaction. A staged
-    # caller without its complete Run-bound statement is not yet migrated.
-    return [dict(row) for row in tx.all(*selected_statement(tx, sql, scoped_sql, values))]
+def all_rows(tx: Transaction, sql: str, values: Sequence[Any] = ()) -> list[dict[str, Any]]:
+    # Paging and byte accounting remain in the original transaction owner.
+    return [dict(row) for row in tx.all(*run_statement(tx, sql, values))]
 
 
 def material(tx: Transaction, identity: str | None, subject: str) -> Any:
@@ -141,22 +134,20 @@ def timestamp(value: Any) -> float | None:
 
 
 def _abandonment(tx: Transaction) -> dict[str, Any] | None:
-    rows = _rows(tx, "SELECT id,status FROM actions WHERE kind='abandon'", limit=1,
-                 scoped_sql="SELECT id,status FROM actions WHERE run_id=? AND kind='abandon'")
+    rows = _rows(tx, "SELECT id,status FROM actions WHERE run_id=? AND kind='abandon'", limit=1)
     return {"action": rows[0]["id"], "status": rows[0]["status"]} if rows else None
 
 
 def read_header(tx: Transaction, path: Path | None = None) -> dict[str, Any]:
-    run = dict(_one(tx, "SELECT * FROM runs", scoped_sql="SELECT * FROM runs WHERE id=?"))
+    run = dict(_one(tx, 'SELECT * FROM runs WHERE id=?'))
     if not isinstance(run["id"], str) or not isinstance(run["repository"], str) or not isinstance(run["parent_issue"], int):
         raise QueryError("incompatible_run_state", "Invalid Run identity")
     root = run.get("repository_root")
     if root is not None and (not isinstance(root, str) or not Path(root).is_absolute()):
         raise QueryError("incompatible_run_state", "Invalid recorded repository root")
-    owners = all_rows(tx, "SELECT kind,phase FROM subjects ORDER BY id",
-                      scoped_sql="SELECT kind,phase FROM subjects WHERE run_id=? ORDER BY id")
+    owners = all_rows(tx, 'SELECT kind,phase FROM subjects WHERE run_id=? ORDER BY id')
     phases = sorted({row["phase"] for row in owners})
-    final_target = bool(_rows(tx, "SELECT id FROM final_target", scoped_sql="SELECT id FROM final_target WHERE run_id=?"))
+    final_target = bool(_rows(tx, 'SELECT id FROM final_target WHERE run_id=?'))
     terminal = not any(row["phase"] not in {"complete", "abandoned"} for row in owners)
     if final_target and not any(row["kind"] == "final_run" and row["phase"] in {"complete", "abandoned"} for row in owners):
         terminal = False
@@ -168,8 +159,8 @@ def read_header(tx: Transaction, path: Path | None = None) -> dict[str, Any]:
             "phases": phases, "is_terminal": terminal, "abandonment": abandonment,
             "stopped": bool(run["stopped"]), "blocked": run["blocked"]}
     if path is not None:
-        locations = RunPaths.for_run(path, run["id"], repository_layout=isinstance(tx, RunTransaction))
-        result.update(state_dir=str(locations.artifacts) if isinstance(tx, RunTransaction) else str(path.parent),
+        locations = RunPaths.for_run(path, run["id"])
+        result.update(state_dir=str(path.absolute().parent), artifacts_dir=str(locations.artifacts),
                       database=str(path))
     return result
 
@@ -198,18 +189,7 @@ def _preparation_scope(tx: Transaction, run: Mapping[str, Any], row: Mapping[str
             or scope["reported_thread"] is not None and (
                 not isinstance(scope["reported_thread"], str) or not scope["reported_thread"])):
         raise invalid
-    bindings = _rows(tx, "SELECT a.role,a.purpose,a.thread_id,a.current_invocation,a.resume_action,a.new_thread,"
-                       "s.kind,t.role AS thread_role,t.profile_revision FROM attempts a "
-                       "JOIN subjects s ON s.id=a.subject JOIN threads t ON t.id=? AND t.subject=a.subject "
-                       "JOIN material m ON m.id=? AND m.subject=a.subject AND m.purpose='role_context' "
-                       "WHERE a.id=? AND a.subject=? AND s.run_id=? AND s.current_attempt=a.id",
-                       (scope["thread_id"], scope["context_id"], scope["attempt_id"], row["subject"], run["id"]),
-                       scoped_sql="SELECT a.role,a.purpose,a.thread_id,a.current_invocation,a.resume_action,a.new_thread,"
-                       "s.kind,t.role AS thread_role,t.profile_revision FROM attempts a "
-                       "JOIN subjects s ON s.run_id=? AND s.run_id=a.run_id AND s.id=a.subject "
-                       "JOIN threads t ON t.run_id=a.run_id AND t.id=? AND t.subject=a.subject "
-                       "JOIN material m ON m.run_id=a.run_id AND m.id=? AND m.subject=a.subject AND m.purpose='role_context' "
-                       "WHERE a.id=? AND a.subject=? AND s.run_id=? AND s.current_attempt=a.id")
+    bindings = _rows(tx, "SELECT a.role,a.purpose,a.thread_id,a.current_invocation,a.resume_action,a.new_thread,s.kind,t.role AS thread_role,t.profile_revision FROM attempts a JOIN subjects s ON s.run_id=? AND s.run_id=a.run_id AND s.id=a.subject JOIN threads t ON t.run_id=a.run_id AND t.id=? AND t.subject=a.subject JOIN material m ON m.run_id=a.run_id AND m.id=? AND m.subject=a.subject AND m.purpose='role_context' WHERE a.id=? AND a.subject=? AND s.run_id=? AND s.current_attempt=a.id", (scope['thread_id'], scope['context_id'], scope['attempt_id'], row['subject'], run['id']))
     if len(bindings) != 1:
         raise invalid
     bound = bindings[0]
@@ -244,36 +224,15 @@ def _preparation_scope(tx: Transaction, run: Mapping[str, Any], row: Mapping[str
 
 def supervision(tx: Transaction, now: float) -> list[dict[str, Any]]:
     """Read canonical wait scopes; only a recorded Core gate proves timeout."""
-    run = dict(_one(tx, "SELECT * FROM runs", scoped_sql="SELECT * FROM runs WHERE id=?"))
+    run = dict(_one(tx, 'SELECT * FROM runs WHERE id=?'))
     timeouts: dict[str | None, Any] = {}
     if run["blocked"] == "supervision_timeout":
-        paused = _rows(tx, "SELECT h.material_id,h.subject FROM history h JOIN material m ON m.id=h.material_id "
-                         "JOIN waits w ON w.subject IS NULL AND w.scope_id=json_extract(CAST(m.body AS TEXT),'$.scope_id') "
-                         "AND w.kind=json_extract(CAST(m.body AS TEXT),'$.kind') "
-                         "WHERE h.kind='paused' AND h.identity='supervision_timeout' "
-                         "AND m.purpose='supervision_timeout' ORDER BY h.position DESC LIMIT 1",
-                         scoped_sql="SELECT h.material_id,h.subject FROM history h "
-                         "JOIN material m ON m.run_id=h.run_id AND m.id=h.material_id "
-                         "JOIN waits w ON w.run_id=h.run_id AND w.subject IS NULL "
-                         "AND w.scope_id=json_extract(CAST(m.body AS TEXT),'$.scope_id') "
-                         "AND w.kind=json_extract(CAST(m.body AS TEXT),'$.kind') "
-                         "WHERE h.run_id=? AND h.kind='paused' AND h.identity='supervision_timeout' "
-                         "AND m.purpose='supervision_timeout' ORDER BY h.position DESC LIMIT 1")
+        paused = _rows(tx, "SELECT h.material_id,h.subject FROM history h JOIN material m ON m.run_id=h.run_id AND m.id=h.material_id JOIN waits w ON w.run_id=h.run_id AND w.subject IS NULL AND w.scope_id=json_extract(CAST(m.body AS TEXT),'$.scope_id') AND w.kind=json_extract(CAST(m.body AS TEXT),'$.kind') WHERE h.run_id=? AND h.kind='paused' AND h.identity='supervision_timeout' AND m.purpose='supervision_timeout' ORDER BY h.position DESC LIMIT 1")
         if paused:
             timeouts[None] = material(tx, paused[0]["material_id"], paused[0]["subject"])
-    for gate in all_rows(tx, "SELECT subject,evidence FROM gates WHERE code='supervision_timeout'",
-                         scoped_sql="SELECT subject,evidence FROM gates WHERE run_id=? AND code='supervision_timeout'"):
+    for gate in all_rows(tx, "SELECT subject,evidence FROM gates WHERE run_id=? AND code='supervision_timeout'"):
         timeouts[gate["subject"]] = material(tx, gate["evidence"], gate["subject"])
-    rows = all_rows(tx, "SELECT w.*,m.subject AS scope_owner,m.purpose AS scope_purpose,"
-                "e.subject AS evidence_owner,e.purpose AS evidence_purpose,s.kind AS delivery_kind,s.issue "
-                "FROM waits w JOIN material m ON m.id=w.scope_id LEFT JOIN material e ON e.id=w.evidence "
-                "LEFT JOIN subjects s ON s.id=w.subject ORDER BY w.deadline,w.scope_id,w.kind",
-                scoped_sql="SELECT w.*,m.subject AS scope_owner,m.purpose AS scope_purpose,"
-                "e.subject AS evidence_owner,e.purpose AS evidence_purpose,s.kind AS delivery_kind,s.issue "
-                "FROM waits w JOIN material m ON m.run_id=w.run_id AND m.id=w.scope_id "
-                "LEFT JOIN material e ON e.run_id=w.run_id AND e.id=w.evidence "
-                "LEFT JOIN subjects s ON s.run_id=w.run_id AND s.id=w.subject "
-                "WHERE w.run_id=? ORDER BY w.deadline,w.scope_id,w.kind")
+    rows = all_rows(tx, 'SELECT w.*,m.subject AS scope_owner,m.purpose AS scope_purpose,e.subject AS evidence_owner,e.purpose AS evidence_purpose,s.kind AS delivery_kind,s.issue FROM waits w JOIN material m ON m.run_id=w.run_id AND m.id=w.scope_id LEFT JOIN material e ON e.run_id=w.run_id AND e.id=w.evidence LEFT JOIN subjects s ON s.run_id=w.run_id AND s.id=w.subject WHERE w.run_id=? ORDER BY w.deadline,w.scope_id,w.kind')
     result = []
     for row in rows:
         scope = material(tx, row["scope_id"], row["scope_owner"])
@@ -441,21 +400,17 @@ def _cleanup(run: Mapping[str, Any], subjects: list[dict[str, Any]]) -> dict[str
 
 def read_boundaries(tx: Transaction, now: float) -> dict[str, Any]:
     """Read current gates and cleanup, leaving audit and receipt expansion to consumers."""
-    run = dict(_one(tx, "SELECT * FROM runs", scoped_sql="SELECT * FROM runs WHERE id=?"))
+    run = dict(_one(tx, 'SELECT * FROM runs WHERE id=?'))
     location = read_header(tx)
     subjects = []
-    for job in all_rows(tx, "SELECT id,kind,issue,phase,generation,candidate_sha,pr_number,current_attempt FROM subjects ORDER BY id",
-        scoped_sql="SELECT id,kind,issue,phase,generation,candidate_sha,pr_number,current_attempt FROM subjects WHERE run_id=? ORDER BY id"):
+    for job in all_rows(tx, 'SELECT id,kind,issue,phase,generation,candidate_sha,pr_number,current_attempt FROM subjects WHERE run_id=? ORDER BY id'):
         subject = job.pop("id")
-        gates = all_rows(tx, "SELECT * FROM gates WHERE subject=? ORDER BY code", (subject,),
-                         scoped_sql="SELECT * FROM gates WHERE run_id=? AND subject=? ORDER BY code")
+        gates = all_rows(tx, 'SELECT * FROM gates WHERE run_id=? AND subject=? ORDER BY code', (subject,))
         for gate in gates:
             gate["detail"] = material(tx, gate["evidence"], subject)
-        pending = (dict(_one(tx, "SELECT role FROM attempts WHERE id=? AND subject=?", (job["current_attempt"], subject),
-                             scoped_sql="SELECT role FROM attempts WHERE run_id=? AND id=? AND subject=?"))
+        pending = (dict(_one(tx, 'SELECT role FROM attempts WHERE run_id=? AND id=? AND subject=?', (job['current_attempt'], subject)))
                    if job["current_attempt"] else None)
-        cleanup = _rows(tx, "SELECT * FROM resource_cleanup WHERE subject=? AND generation=?", (subject, job["generation"]),
-                        scoped_sql="SELECT * FROM resource_cleanup WHERE run_id=? AND subject=? AND generation=?")
+        cleanup = _rows(tx, 'SELECT * FROM resource_cleanup WHERE run_id=? AND subject=? AND generation=?', (subject, job['generation']))
         subjects.append({**job, "subject": subject, "gates": gates, "pending_attempt": pending,
                          "delivery_cleanup": dict(cleanup[0]) if cleanup else None})
     windows = supervision(tx, now)
@@ -467,11 +422,5 @@ def read_boundaries(tx: Transaction, now: float) -> dict[str, Any]:
             "status": public_status(run, subjects, location["is_terminal"], abandonment=abandonment, supervision_windows=windows),
             "is_terminal": location["is_terminal"], "abandonment": abandonment,
             "delivery_cleanup": _cleanup(run, subjects),
-            "closures": all_rows(tx, "SELECT e.subject,e.generation,e.id AS effect_id,e.receipt_id,e.pr_number "
-                "FROM effects e JOIN subjects s ON s.id=e.subject AND s.generation=e.generation "
-                "WHERE s.kind!='ticket' AND e.operation='close' AND e.status='confirmed' ORDER BY e.rowid",
-                scoped_sql="SELECT e.subject,e.generation,e.id AS effect_id,e.receipt_id,e.pr_number "
-                "FROM effects e JOIN subjects s ON s.run_id=e.run_id AND s.id=e.subject AND s.generation=e.generation "
-                "WHERE e.run_id=? AND s.kind!='ticket' AND e.operation='close' AND e.status='confirmed' ORDER BY e.rowid"),
-            "highwater": _one(tx, "SELECT coalesce(max(position),0) FROM history",
-                              scoped_sql="SELECT coalesce(max(position),0) FROM history WHERE run_id=?")[0]}
+            "closures": all_rows(tx, "SELECT e.subject,e.generation,e.id AS effect_id,e.receipt_id,e.pr_number FROM effects e JOIN subjects s ON s.run_id=e.run_id AND s.id=e.subject AND s.generation=e.generation WHERE e.run_id=? AND s.kind!='ticket' AND e.operation='close' AND e.status='confirmed' ORDER BY e.rowid"),
+            "highwater": _one(tx, 'SELECT coalesce(max(position),0) FROM history WHERE run_id=?')[0]}

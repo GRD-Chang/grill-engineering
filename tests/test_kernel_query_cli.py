@@ -1,6 +1,8 @@
 """Public read-only consumers; fixtures use the real canonical Kernel store."""
 from __future__ import annotations
 
+from support.repository_fixture import create_kernel
+
 from pathlib import Path
 from dataclasses import replace
 import json
@@ -11,6 +13,7 @@ import sys
 import pytest
 
 from agent_run.contracts.agent_profiles import resolve_profiles
+from agent_run.adapters.workspace import ManagedWorkspace
 
 from agent_run.model import Blocker, Commit, Delivery, DeliveryKind, Issue, ParentIssue, Policy, Profile, Requirements, RunSpec
 from agent_run.core.kernel import Kernel
@@ -68,13 +71,13 @@ def _create(root: Path, run_id: str = "run-query", *, language: str | None = "en
                    language=language, repository_root=str(repository_root or root / "checkout"))
     if language is None:
         # Explicit incompatible historical reader input; no runner is admitted.
-        return Kernel.create(root / run_id / "kernel.sqlite3", spec)
+        return create_kernel(root / "kernel.sqlite3", spec)
     inputs = fixture_inputs()
     profiles = resolve_profiles(preset="economy", overrides={
         "development_model": "recorded-development-model", "development_effort": "high"})
     final = Delivery("query-final", DeliveryKind.FINAL_RUN, parent, "unread", deliveries[0].base,
                      deliveries[0].target_ref, "refs/heads/query-main")
-    return Kernel.create(root / run_id / "kernel.sqlite3", replace(spec, inputs=replace(inputs, profiles=profiles),
+    return create_kernel(root / "kernel.sqlite3", replace(spec, inputs=replace(inputs, profiles=profiles),
         deliveries=(*deliveries, final)), requirements=_fixture_source(deliveries, parent))
 
 
@@ -93,21 +96,21 @@ def test_valid_large_queue_dependency_set_and_default_history_are_not_truncated(
     execution = kernel.claim_executor("queue-executor")
     assert _operations(kernel, execution, deliveries=(*independent, dependent)).once().call is not None
     before = _snapshot(tmp_path)
-    document = query.read(kernel.storage.path, "status").data
+    document = query.read(kernel.storage.path, "status", storage=kernel.storage).data
     assert document["scheduling"]["work_fifo"] == [job.key for job in independent[1:]]
     assert len(document["scheduling"]["work_fifo"]) == 129
     ticket = next(item for item in document["subjects"] if item["issue"] == 999)
     assert ticket["blocked_by"] == [job.issue for job in independent[:129]]
-    history = query.read(kernel.storage.path, "history").data
+    history = query.read(kernel.storage.path, "history", storage=kernel.storage).data
     assert len(history["history"]["events"]) >= 260
     assert history["history"]["has_more"] is False
-    first = query.read(kernel.storage.path, "history", limit=17).data
+    first = query.read(kernel.storage.path, "history", limit=17, storage=kernel.storage).data
     assert len(first["history"]["events"]) == 17 and first["history"]["has_more"] is True
     assert _snapshot(tmp_path) == before
 
 
 def _arguments(kernel: Kernel, command: str = "status", *extra: str) -> list[str]:
-    return [command, kernel.storage.path.parent.name, "--state-dir", str(kernel.storage.path), *extra]
+    return [command, kernel.storage.run_id, "--state-dir", str(kernel.storage.path), *extra]
 
 
 def test_status_shows_ticket_progress_without_claiming_whole_delivery_complete(tmp_path: Path, capsys) -> None:
@@ -132,7 +135,7 @@ def test_parent_only_status_keeps_recorded_pass_evidence_and_hides_completed_all
     # Both languages render the same canonical facts; no new Run or translated
     # Agent evidence is manufactured to exercise a different display channel.
     assert scenario.run().kind == "approval"
-    document = query.read(scenario.kernel.storage.path, "status")
+    document = query.read(scenario.kernel.storage.path, "status", storage=scenario.kernel.storage)
     before = _snapshot(tmp_path)
     for language, progress, passed in (("zh", "无子任务，直接推进需求", "已记录验收结论: 通过"),
                                       ("en", "No Tickets; working directly on the requirement", "Recorded review: Passed")):
@@ -151,8 +154,8 @@ def test_parent_only_status_keeps_recorded_pass_evidence_and_hides_completed_all
     output = capsys.readouterr().out
     assert "累计用量" not in output
     assert "Known synthetic acceptance evidence" in output
-    assert query.read(scenario.kernel.storage.path, "status").data["subjects"][0]["budgets"]
-    history = query.read(scenario.kernel.storage.path, "history")
+    assert query.read(scenario.kernel.storage.path, "status", storage=scenario.kernel.storage).data["subjects"][0]["budgets"]
+    history = query.read(scenario.kernel.storage.path, "history", storage=scenario.kernel.storage)
     assert len(history.data["subjects"][0]["budgets"]) == 3
     for language, label in (("zh", "累计用量:"), ("en", "Cumulative usage:")):
         for style in ("plain", "rich"):
@@ -168,7 +171,8 @@ def test_missing_progress_facts_are_not_called_parent_only(tmp_path: Path) -> No
     from io import StringIO
     from agent_run.cli.render import render
 
-    document = query.read(_create(tmp_path).storage.path, "status")
+    kernel = _create(tmp_path)
+    document = query.read(kernel.storage.path, "status", storage=kernel.storage)
     # A partial display document cannot prove either delivery shape. This is a
     # renderer input, not a modification of the authoritative Run.
     output = StringIO()
@@ -221,10 +225,10 @@ def test_latest_resume_distinguishes_application_from_the_target_start_and_ignor
     assert latest["status"] == "applied" and latest["resume"]["progress"] is None
     for style in ("plain", "rich"):
         stream = StringIO()
-        render(query.read(kernel.storage.path, "status"), style=style, details=False, stream=stream)
+        render(query.read(kernel.storage.path, "status", storage=kernel.storage), style=style, details=False, stream=stream)
         assert "Resume: resume-target-2" in stream.getvalue()
         assert "applied; target progress not yet observed" in stream.getvalue()
-    history = query.read(kernel.storage.path, "history").data
+    history = query.read(kernel.storage.path, "history", storage=kernel.storage).data
     assert history["latest_resume"] == latest
     assert [action for action in history["history"]["actions"] if action["kind"] == "resume"][-1] == latest
     assert _snapshot(tmp_path) == before
@@ -234,11 +238,11 @@ def test_latest_resume_distinguishes_application_from_the_target_start_and_ignor
     assert target is not None and kernel.dispatch_agent(target)
     target_process = {**sibling_process, "pid": 22, "pgid": 22, "start_token": "query-target"}
     kernel.agent_started(target, target_process)
-    assert query.read(kernel.storage.path, "status").data["latest_resume"]["resume"]["progress"] is None
+    assert query.read(kernel.storage.path, "status", storage=kernel.storage).data["latest_resume"]["resume"]["progress"] is None
     kernel.observe_worker_activity(target, "target-turn", active=True, observed_at=102.0,
                                    evidence={"type": "turn.started"})
     before = _snapshot(tmp_path)
-    latest = query.read(kernel.storage.path, "status").data["latest_resume"]
+    latest = query.read(kernel.storage.path, "status", storage=kernel.storage).data["latest_resume"]
     assert latest["status"] == "applied"
     assert latest["resume"]["progress"]["resume_outcome"] == "started"
     assert latest["resume"]["progress"]["action_id"] == "resume-target-2"
@@ -248,14 +252,14 @@ def test_latest_resume_distinguishes_application_from_the_target_start_and_ignor
     assert _snapshot(tmp_path) == before
     kernel.agent_exited(target, target_process, 2, failure_kind="fatal")
     before = _snapshot(tmp_path)
-    failed = query.read(kernel.storage.path, "status")
+    failed = query.read(kernel.storage.path, "status", storage=kernel.storage)
     assert failed.data["latest_resume"]["resume"]["progress"]["resume_outcome"] == "failed"
     assert failed.data["latest_resume"]["resume"]["progress"]["work_subject"] == "ticket:2"
     assert failed.data["latest_resume"]["resume"]["progress"]["reason_code"] == "execution_failed"
     stream = StringIO()
     render(failed, style="plain", details=False, stream=stream)
     assert "Target execution failed" in stream.getvalue()
-    assert [action for action in query.read(kernel.storage.path, "history").data["history"]["actions"] if action["kind"] == "resume"][-1] == failed.data["latest_resume"]
+    assert [action for action in query.read(kernel.storage.path, "history", storage=kernel.storage).data["history"]["actions"] if action["kind"] == "resume"][-1] == failed.data["latest_resume"]
     assert _snapshot(tmp_path) == before
 
 
@@ -277,7 +281,7 @@ def test_status_reports_the_original_worker_exit_wait_without_inventing_an_accep
     with pytest.raises(KernelError, match="worker_exit_unproven"):
         kernel.control("resume", "rejected-resume-2", subject="ticket:2")
     before = _snapshot(tmp_path)
-    document = query.read(kernel.storage.path, "status")
+    document = query.read(kernel.storage.path, "status", storage=kernel.storage)
     assert document.data["latest_resume"] is None
     waits = document.data["resume_waits"]
     assert len(waits) == 1
@@ -287,12 +291,12 @@ def test_status_reports_the_original_worker_exit_wait_without_inventing_an_accep
     stream = StringIO()
     render(document, style="plain", details=False, stream=stream)
     assert "Worker exit not yet confirmed: #2" in stream.getvalue()
-    history = query.read(kernel.storage.path, "history").data
+    history = query.read(kernel.storage.path, "history", storage=kernel.storage).data
     assert [action for action in history["history"]["actions"] if action["kind"] == "resume"] == []
     assert not any(action["id"] == "rejected-resume-2" for action in history["history"]["actions"])
     assert _snapshot(tmp_path) == before
     kernel.agent_exited(call, process, -15)
-    assert query.read(kernel.storage.path, "status").data["resume_waits"] == []
+    assert query.read(kernel.storage.path, "status", storage=kernel.storage).data["resume_waits"] == []
 
 
 def test_current_status_and_one_history_page_do_not_load_unrelated_archived_snapshots(
@@ -310,10 +314,10 @@ def test_current_status_and_one_history_page_do_not_load_unrelated_archived_snap
         snapshot = " " * (7 * 1024 * 1024) + original["status"]
         assert json.loads(snapshot) == json.loads(original["status"])
         for ordinal in range(5):
-            tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at,phase,purpose,status) "
-                       "VALUES (?,'boundary_update',?,NULL,?,?,?,?,?)",
+            tx.execute("INSERT INTO history(subject,kind,identity,material_id,generation,created_at,phase,purpose,status,run_id) "
+                       "VALUES (?,'boundary_update',?,NULL,?,?,?,?,?,?)",
                        (original["subject"], f"archived-boundary-{ordinal}", original["generation"],
-                        original["created_at"], original["phase"], original["purpose"], snapshot))
+                        original["created_at"], original["phase"], original["purpose"], snapshot, kernel.storage.run_id))
         after = tx.one("SELECT max(position) FROM history")[0]
     assert kernel.control("stop", "current-stop", subject="ticket:2") == "applied"
     before = _snapshot(tmp_path)
@@ -381,7 +385,7 @@ def test_local_human_boundary_does_not_present_its_sibling_as_globally_paused(tm
     call = _operations(kernel, execution, deliveries=deliveries).once().call
     assert call is not None
     before = _snapshot(tmp_path)
-    document = query.read(kernel.storage.path, "status").data
+    document = query.read(kernel.storage.path, "status", storage=kernel.storage).data
     assert document["status"] == "active"
     assert len(document["operator_actions"]) == 1
     action = document["operator_actions"][0]
@@ -400,7 +404,7 @@ def test_stopped_run_shows_explicit_recovery_without_claiming_executor_exit(tmp_
     kernel = _create(tmp_path)
     assert kernel.control("stop", "whole-run-stop") == "applied"
     before = _snapshot(tmp_path)
-    document = query.read(kernel.storage.path, "status").data
+    document = query.read(kernel.storage.path, "status", storage=kernel.storage).data
     assert document["status"] == "operator_stopped"
     action = document["operator_actions"][0]
     assert action["scope"] == "global" and action["run_paused"] is True
@@ -414,12 +418,13 @@ def test_stopped_run_shows_explicit_recovery_without_claiming_executor_exit(tmp_
 def test_parent_selector_works_in_a_repo_and_across_directories(tmp_path: Path, git_repo: Path) -> None:
     subprocess.run(["git", "remote", "add", "origin", "https://github.com/example/project.git"],
                    cwd=git_repo, check=True, capture_output=True)
-    _create(tmp_path / "catalog", repository_root=git_repo)
+    workspace = ManagedWorkspace.for_repository("example/project")
+    _create(workspace.state_root, repository_root=workspace.repository_root)
     outside = tmp_path / "outside"
     outside.mkdir()
-    before = _snapshot(tmp_path / "catalog")
+    before = _snapshot(workspace.state_root)
     command = [sys.executable, "-m", "agent_run", "status", "--parent", "1",
-               "--data-root", str(tmp_path / "catalog"), "--json"]
+               "--json"]
     for cwd, arguments in ((git_repo, []), (outside, ["--repo", "EXAMPLE/project"])):
         result = subprocess.run([*command, *arguments], cwd=cwd, text=True,
                                 capture_output=True, check=False, timeout=15)
@@ -432,30 +437,32 @@ def test_parent_selector_works_in_a_repo_and_across_directories(tmp_path: Path, 
                              check=False, timeout=15)
     assert missing.returncode == 2
     assert json.loads(missing.stdout)["diagnostics"][0]["code"] == "workspace_required"
-    assert _snapshot(tmp_path / "catalog") == before
+    assert _snapshot(workspace.state_root) == before
 
 
 def test_parent_selector_rejects_multiple_runs_and_exact_id_remains_available(
     tmp_path: Path, capsys,
 ) -> None:
-    one, two = _create(tmp_path, "run-one"), _create(tmp_path, "run-two")
+    one, proposed = _create(tmp_path, "run-one"), _create(tmp_path, "run-two")
+    # One active Task has one complete current Run. A competing proposal reuses
+    # the winner; it cannot create the duplicate old per-Run layout permitted.
+    assert proposed.storage.run_id == one.storage.run_id == "run-one"
     before = _snapshot(tmp_path)
-    selected = ["--repo", "EXAMPLE/project", "--parent", "1", "--data-root", str(tmp_path), "--json"]
-    assert main(["status", *selected]) == 2
-    error = json.loads(capsys.readouterr().out)
-    assert error["diagnostics"][0]["code"] == "run_locator_conflict"
-    assert {item["run_id"] for item in error["candidates"]} == {"run-one", "run-two"}
-    assert main(_arguments(one, "status", "--data-root", str(tmp_path), "--json")) == 0
+    selected = ["--repo", "EXAMPLE/project", "--parent", "1", "--state-dir", str(one.storage.path), "--json"]
+    assert main(["status", *selected]) == 0
     assert json.loads(capsys.readouterr().out)["run_id"] == "run-one"
-    assert main(_arguments(two, "status", "--data-root", str(tmp_path), "--json")) == 0
-    assert json.loads(capsys.readouterr().out)["run_id"] == "run-two"
+    assert main(_arguments(one, "status", "--json")) == 0
+    assert json.loads(capsys.readouterr().out)["run_id"] == "run-one"
+    assert main(["status", "run-two", "--state-dir", str(one.storage.path), "--json"]) == 2
+    assert json.loads(capsys.readouterr().out)["diagnostics"][0]["code"] == "run_locator_missing"
     assert _snapshot(tmp_path) == before
 
 
 def test_runs_filters_repository_and_parent_without_creating_an_index(tmp_path: Path, capsys) -> None:
     _create(tmp_path, "selected", parent=10)
     _create(tmp_path, "another-parent", parent=20)
-    _create(tmp_path, "other-repository", repository="other/project", parent=10)
+    _create(ManagedWorkspace.for_repository("other/project").state_root, "other-repository",
+            repository="other/project", parent=10)
     before = _snapshot(tmp_path)
     assert main(["runs", "--repo", "example/project", "--parent", "10", "--data-root", str(tmp_path), "--json"]) == 0
     assert [item["run_id"] for item in json.loads(capsys.readouterr().out)["runs"]] == ["selected"]
@@ -470,7 +477,8 @@ def test_explicit_state_directory_selects_its_clone_without_scanning_other_roots
     _human(second, "Explicit clone decision")
     before = _snapshot(tmp_path)
     assert main(["status", "run-query", "--data-root", str(catalog), "--json"]) == 2
-    assert json.loads(capsys.readouterr().out)["diagnostics"][0]["code"] == "run_locator_conflict"
+    assert json.loads(capsys.readouterr().out)["diagnostics"][0]["code"] == "unsupported_state"
+    # An arbitrary catalog is not a registry. Explicit selection remains exact.
     assert main(_arguments(second, "status", "--data-root", str(catalog), "--json")) == 0
     selected = json.loads(capsys.readouterr().out)
     assert selected["subjects"][0]["pending_attempt"]["result"]["human_blockers"] == ["Explicit clone decision"]
@@ -513,14 +521,18 @@ def test_interrupted_read_returns_130_without_advancing_or_writing(
     def interrupted(_root, **_kwargs):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(cli_selection, "discover", interrupted)
+    from agent_run.storage.routing import RepositoryRoute
+    monkeypatch.setattr(RepositoryRoute, "discover", interrupted)
     assert main(_arguments(kernel, "status", "--json")) == 130
     assert capsys.readouterr().out == ""
     assert _snapshot(tmp_path) == before
 
 
 def test_missing_run_language_is_rejected_without_using_personal_defaults(tmp_path: Path, capsys) -> None:
-    kernel = _create(tmp_path, language=None)
+    kernel = _create(tmp_path)
+    # Deliberately corrupted final-schema input, not a producer fallback.
+    with kernel.storage.transaction() as tx:
+        tx.execute("UPDATE runs SET language=NULL WHERE id=?", (kernel.storage.run_id,))
     before = _snapshot(tmp_path)
     assert main(_arguments(kernel, "status", "--json")) == 2
     error = json.loads(capsys.readouterr().out)
@@ -560,7 +572,7 @@ def test_invalid_personal_defaults_do_not_override_or_block_existing_run(
     assert document["subjects"][0]["pending_attempt"]["invocations"][0]["outputs"][-1]["raw_id"] is not None
     invocation = document["subjects"][0]["pending_attempt"]["invocations"][0]
     assert invocation["model"] == "recorded-development-model"
-    assert query.read(kernel.storage.path, "status").language == "en"
+    assert query.read(kernel.storage.path, "status", storage=kernel.storage).language == "en"
     assert _snapshot(tmp_path) == before
 
 
@@ -570,9 +582,12 @@ def test_machine_data_is_independent_of_run_language_and_history_details(
     monkeypatch.setattr(query.time, "time", lambda: 2_000_000_000.0)
     english = _create(tmp_path / "english", repository_root=tmp_path / "repository")
     chinese = _create(tmp_path / "chinese", language="zh", repository_root=tmp_path / "repository")
-    documents = [query.read(item.storage.path, "status") for item in (english, chinese)]
+    documents = [query.read(item.storage.path, "status", storage=item.storage) for item in (english, chinese)]
     assert documents[0].language == "en" and documents[1].language == "zh"
-    assert documents[0].data == documents[1].data
+    assert {key: value for key, value in documents[0].data.items() if key not in {"state_dir", "artifacts_dir"}} == {
+        key: value for key, value in documents[1].data.items() if key not in {"state_dir", "artifacts_dir"}}
+    assert documents[0].data["state_dir"] == str(english.storage.path.parent)
+    assert documents[1].data["state_dir"] == str(chinese.storage.path.parent)
     assert main(_arguments(english, "history", "--json")) == 0
     ordinary = json.loads(capsys.readouterr().out)
     assert main(_arguments(english, "history", "--json", "--details")) == 0
@@ -586,7 +601,7 @@ def test_history_keeps_raw_feedback_and_pages_without_losing_events(tmp_path: Pa
     _human(kernel)
     kernel.control("resume", "original-response", subject="ticket:2", message="保持原文\r\nDo exactly this.\n")
     before = _snapshot(tmp_path)
-    document = query.read(kernel.storage.path, "history")
+    document = query.read(kernel.storage.path, "history", storage=kernel.storage)
     response = next(event for event in document.data["history"]["events"] if event["kind"] == "human_response")
     assert response["evidence"] == "保持原文\r\nDo exactly this.\n"
     action = next(row for row in document.data["history"]["actions"] if row["id"] == "original-response")
@@ -604,13 +619,13 @@ def test_history_keeps_raw_feedback_and_pages_without_losing_events(tmp_path: Pa
         return original_get(tx, identity, subject)
 
     monkeypatch.setattr(Transaction, "get", recorded_get)
-    query.read(kernel.storage.path, "status")
+    query.read(kernel.storage.path, "status", storage=kernel.storage)
     assert response["material_id"] not in reads
     observed: list[int] = []
     after = 0
     for _ in range(20):
         reads.clear()
-        page = query.read(kernel.storage.path, "history", after=after, limit=2).data
+        page = query.read(kernel.storage.path, "history", after=after, limit=2, storage=kernel.storage).data
         assert (response["material_id"] in reads) == any(
             event["position"] == response["position"] for event in page["history"]["events"])
         observed.extend(event["position"] for event in page["history"]["events"])
@@ -686,13 +701,14 @@ def test_public_delivery_boundaries_match_observed_02_meanings(
     # source/workspace/Completion callers here. A completed Ticket in a full
     # Parent awaits Run Acceptance (02 controller.py), unlike an isolated Ticket
     # Run. This changed input is not an old/new same-input comparison.
-    original_create = Kernel.create
+    from support import offline
+    original_create = offline.create_kernel
 
     def configured_create(path, spec, **kwargs):
         return original_create(path, replace(spec, language="en", repository="example/repository",
                                              repository_root=spec.repository_root), **kwargs)
 
-    monkeypatch.setattr(Kernel, "create", staticmethod(configured_create))
+    monkeypatch.setattr(offline, "create_kernel", configured_create)
     tickets = () if kind == DeliveryKind.PARENT_ONLY else (2,)
     source = Requirements(ParentIssue(1, "Full Parent", "Original requirements", tickets),
                           () if not tickets else (Issue(2, "Ticket", "Original task", "OPEN",
@@ -711,7 +727,7 @@ def test_public_delivery_boundaries_match_observed_02_meanings(
     if kind != DeliveryKind.TICKET:
         assert scenario.run().kind == "approval"
         before = _snapshot(tmp_path)
-        approval = query.read(scenario.kernel.storage.path, "status").data
+        approval = query.read(scenario.kernel.storage.path, "status", storage=scenario.kernel.storage).data
         assert approval["phase"] == "ready_for_approval"
         assert approval["next_action"] == "agent-run approve --repo example/repository -- offline-run"
         focused = next(job for job in approval["subjects"] if job["subject"] == approval["focus_subject"])
@@ -722,7 +738,7 @@ def test_public_delivery_boundaries_match_observed_02_meanings(
         assert _snapshot(tmp_path) == before
     assert scenario.run(approve=True).kind == "complete"
     before = _snapshot(tmp_path)
-    document = query.read(scenario.kernel.storage.path, "status").data
+    document = query.read(scenario.kernel.storage.path, "status", storage=scenario.kernel.storage).data
     assert document["phase"] == completed_phase
     focused = next((job for job in document["subjects"] if job["subject"] == document["focus_subject"]), None)
     assert focused is None or focused["kind"] != "ticket"
@@ -736,7 +752,7 @@ def test_public_delivery_boundaries_match_observed_02_meanings(
         assert [record["subject"] for record in scenario.kernel.source_status()["completions"]] == ["ticket:2"]
     assert "progress" not in document
     assert document["phase"] == completed_phase
-    history = query.read(scenario.kernel.storage.path, "history").data
+    history = query.read(scenario.kernel.storage.path, "history", storage=scenario.kernel.storage).data
     prefix = {DeliveryKind.TICKET: "ticket", DeliveryKind.PARENT_ONLY: "parent", DeliveryKind.FINAL_RUN: "run"}[kind]
     assert history["history"]["rounds"][prefix + "_publication"] == 1
     assert history["history"]["rounds"][prefix + "_review"] == 1

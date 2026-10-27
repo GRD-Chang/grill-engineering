@@ -102,7 +102,7 @@ import subprocess
 import sys
 from pathlib import Path
 import pytest
-from agent_run.storage.tasks import read_task_bindings
+from support.repository_fixture import managed_bindings
 from support.environment import _assert_python_and_git_environment
 
 @pytest.mark.parametrize("case", ["first", "second"])
@@ -111,7 +111,7 @@ def test_case(git_repo, tmp_path, monkeypatch, case):
     for key in ("HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
                 "XDG_CACHE_HOME", "XDG_RUNTIME_DIR"):
         assert Path(os.environ[key]).is_relative_to(tmp_path), key
-    assert not list(read_task_bindings())
+    assert not list(managed_bindings())
     assert (git_repo / "README.md").read_text() == "# fixture\\n"
     assert not (git_repo / "previous-case").exists()
     assert subprocess.check_output(["git", "config", "user.name"], cwd=git_repo, text=True).strip() == "Agent Run Tests"
@@ -143,7 +143,11 @@ delivery = Delivery("parent:1", DeliveryKind.PARENT_ONLY, 1, "requirement", base
 spec = RunSpec(run_id, "example/project", 1, "parent", "graph", (delivery,),
                language="en", repository_root=str(repository))
 managed = ManagedWorkspace.for_repository(spec.repository)
-Kernel.create_task(managed.state_root / run_id / "kernel.sqlite3", spec,
+from dataclasses import replace
+from agent_run.config.creation import freeze_creation
+from agent_run.config.defaults import UserDefaultsStore
+spec = freeze_creation(replace(spec, repository_root=str(managed.ensure_path(str(repository)))), UserDefaultsStore())
+Kernel.create_task(managed.state_root / "kernel.sqlite3", spec,
                    requirements=Requirements(ParentIssue(1, "Parent", "Isolated requirement"), ()))
 print(json.dumps({"run_id": run_id}))
 \"\"\"
@@ -151,7 +155,7 @@ print(json.dumps({"run_id": run_id}))
                              cwd=git_repo, text=True, capture_output=True, timeout=20)
     assert started.returncode == 0, started.stderr
     run_id = json.loads(started.stdout)["run_id"]
-    assert [identity for identity, _path in read_task_bindings()] == [run_id]
+    assert [identity for identity, _path in managed_bindings()] == [run_id]
     # Outside the checkout the public subprocess finds the native Task binding.
     result = subprocess.run([sys.executable, "-m", "agent_run", "status", run_id, "--json"],
                             cwd=tmp_path, text=True, capture_output=True, timeout=20)

@@ -1,4 +1,6 @@
 """Finite post-exit credentials use the original Host and Runner lease."""
+
+from support.repository_fixture import create_kernel
 from dataclasses import asdict
 import json
 import os
@@ -94,9 +96,7 @@ def test_killed_original_host_notice_is_exact_current_and_business_read_only(tmp
             before = kernel.storage.path.read_bytes()
             from agent_run.queries.host_exit import host_exit_notice, host_exit_current
             from agent_run.notifications.event_projection import host_exit_event
-            notice = host_exit_notice(kernel.storage.path, "original", handoff.receipt,
-                                      service_result="signal", exit_code="killed", exit_status="KILL",
-                                      invocation_id="1" * 32)
+            notice = host_exit_notice(kernel.storage.path, 'original', handoff.receipt, service_result='signal', exit_code='killed', exit_status='KILL', invocation_id='1' * 32, storage=kernel.storage)
             assert notice is not None
             assert {key: notice[key] for key in ("run_id", "action_id", "epoch", "owner", "nonce")} == {
                 "run_id": "run-native", "action_id": "original", "epoch": request.epoch,
@@ -105,36 +105,32 @@ def test_killed_original_host_notice_is_exact_current_and_business_read_only(tmp
             assert notice["runner"] == handoff.receipt["runner"]
             assert notice["pid"] == child.pid and notice["process_start_token"] == token
             assert (notice["service_result"], notice["exit_code"], notice["exit_status"]) == ("signal", "killed", "KILL")
-            assert host_exit_current(kernel.storage.path, notice)
+            assert host_exit_current(kernel.storage.path, notice, storage=kernel.storage)
             unavailable = kernel.storage.path.with_suffix(".temporarily-unavailable")
             kernel.storage.path.rename(unavailable)
             try:
                 with pytest.raises(RuntimeError, match="unavailable"):
-                    host_exit_current(kernel.storage.path, notice)
+                    host_exit_current(kernel.storage.path, notice, storage=kernel.storage)
             finally:
                 unavailable.rename(kernel.storage.path)
-            assert host_exit_current(kernel.storage.path, notice)
-            event = host_exit_event(kernel.storage.path, notice)
+            assert host_exit_current(kernel.storage.path, notice, storage=kernel.storage)
+            event = host_exit_event(kernel.storage.path, notice, storage=kernel.storage)
             assert event is not None and event["kind"] == "executor_exit" and event["important"] is True
             assert event["exit_evidence"] == notice
-            duplicate = host_exit_notice(kernel.storage.path, "original", handoff.receipt,
-                                         service_result="signal", exit_code="killed", exit_status="KILL",
-                                         invocation_id="1" * 32)
+            duplicate = host_exit_notice(kernel.storage.path, 'original', handoff.receipt, service_result='signal', exit_code='killed', exit_status='KILL', invocation_id='1' * 32, storage=kernel.storage)
             assert duplicate is not None
-            assert host_exit_event(kernel.storage.path, duplicate)["id"] == event["id"]
-            assert host_exit_notice(kernel.storage.path, "original", handoff.receipt,
-                                    service_result="success", exit_code="exited", exit_status="0",
-                                    invocation_id="1" * 32) is None
+            assert host_exit_event(kernel.storage.path, duplicate, storage=kernel.storage)["id"] == event["id"]
+            assert host_exit_notice(kernel.storage.path, 'original', handoff.receipt, service_result='success', exit_code='exited', exit_status='0', invocation_id='1' * 32, storage=kernel.storage) is None
             for field, wrong in (("nonce", "another-nonce"), ("action_id", "another-action"),
                                  ("epoch", request.epoch + 1), ("owner", "another-owner"),
                                  ("run_id", "another-run"), ("invocation_id", "2" * 32),
                                  ("workspace", str(tmp_path / "another-workspace")),
                                  ("request_digest", "another-request")):
                 changed = {**notice, field: wrong}
-                assert not host_exit_current(kernel.storage.path, changed), field
+                assert not host_exit_current(kernel.storage.path, changed, storage=kernel.storage), field
             changed = deepcopy(notice)
             changed["runner"]["inode"] += 1
-            assert not host_exit_current(kernel.storage.path, changed)
+            assert not host_exit_current(kernel.storage.path, changed, storage=kernel.storage)
             assert kernel.storage.path.read_bytes() == before
             assert not (tmp_path / "notifications").exists()  # Projection is not a sender.
             with kernel.storage.transaction(write=False) as tx:
@@ -144,10 +140,10 @@ def test_killed_original_host_notice_is_exact_current_and_business_read_only(tmp
             assert kernel.operation_state().disposition == "quiescent"
             with kernel.storage.transaction(write=False) as tx:
                 assert tuple(tx.one("SELECT stopped,executor,epoch FROM runs")) == (0, request.owner, request.epoch)
-            assert not host_exit_current(kernel.storage.path, notice)  # Original normal wait, same Host.
+            assert not host_exit_current(kernel.storage.path, notice, storage=kernel.storage)  # Original normal wait, same Host.
             kernel.stop_task("stop")
-            assert not host_exit_current(kernel.storage.path, notice)
-            assert host_exit_event(kernel.storage.path, notice) is None
+            assert not host_exit_current(kernel.storage.path, notice, storage=kernel.storage)
+            assert host_exit_event(kernel.storage.path, notice, storage=kernel.storage) is None
     finally:
         if child.poll() is None:
             child.kill()
@@ -191,12 +187,10 @@ def test_startup_exit_requires_exact_manager_identity_when_readiness_was_never_r
             kernel.observe_host(request, HostObservation("unknown", request.unit_name, evidence=encoded,
                                                         usage_pending=True))
             before = kernel.storage.path.read_bytes()
-            notice = host_exit_notice(kernel.storage.path, "startup", handoff.receipt,
-                                      service_result="exit-code", exit_code="exited", exit_status="7",
-                                      invocation_id="1" * 32)
+            notice = host_exit_notice(kernel.storage.path, 'startup', handoff.receipt, service_result='exit-code', exit_code='exited', exit_status='7', invocation_id='1' * 32, storage=kernel.storage)
             assert notice is not None
             assert notice["pid"] is None and notice["process_start_token"] is None
-            assert host_exit_current(kernel.storage.path, notice)
+            assert host_exit_current(kernel.storage.path, notice, storage=kernel.storage)
             with kernel.storage.transaction(write=False) as tx:
                 original = tx.one("SELECT invocation_id,status,usage_ready,usage_released FROM hosts")
                 assert tuple(original) == (None, "unknown", 0, 0)
@@ -204,20 +198,20 @@ def test_startup_exit_requires_exact_manager_identity_when_readiness_was_never_r
             del state["fields"]["InvocationID"]
             response.write_text(json.dumps(state))
             with pytest.raises(RuntimeError, match="unavailable"):
-                host_exit_current(kernel.storage.path, notice)
+                host_exit_current(kernel.storage.path, notice, storage=kernel.storage)
             state["fields"] = complete
             response.write_text(json.dumps(state))
-            assert host_exit_current(kernel.storage.path, notice)
+            assert host_exit_current(kernel.storage.path, notice, storage=kernel.storage)
             state["fields"]["Description"] = "another Host with the same service name"
             response.write_text(json.dumps(state))
-            assert not host_exit_current(kernel.storage.path, notice)
+            assert not host_exit_current(kernel.storage.path, notice, storage=kernel.storage)
             state["fields"].update(Description=request.description, InvocationID="2" * 32)
             response.write_text(json.dumps(state))
-            assert not host_exit_current(kernel.storage.path, notice)
+            assert not host_exit_current(kernel.storage.path, notice, storage=kernel.storage)
             state["fields"]["InvocationID"] = "1" * 32
             state["next_fields"] = {**state["fields"], "InvocationID": "2" * 32}
             response.write_text(json.dumps(state))
-            assert not host_exit_current(kernel.storage.path, notice)  # Changed between the two real CLI reads.
+            assert not host_exit_current(kernel.storage.path, notice, storage=kernel.storage)  # Changed between the two real CLI reads.
             assert kernel.storage.path.read_bytes() == before
             assert not (tmp_path / "notifications").exists()
     finally:
@@ -248,7 +242,7 @@ def test_enabled_host_arms_only_the_exact_bounded_exit_command_without_private_e
     environment = {"PATH": os.defpath, "PRIVATE_TEST_VALUE": "must-never-enter-unit-properties",
                    "LD_LIBRARY_PATH": "/test/sqlite path%literal/$library"}
     from agent_run.cli.host_exit import exit_properties
-    properties = exit_properties(kernel.storage.path, "enabled", request, lock, environment)
+    properties = exit_properties(kernel.storage.path, 'enabled', request, lock, environment, storage=kernel.storage)
     command, = [value for value in properties if value.startswith("ExecStopPost=")]
     assert command.startswith("ExecStopPost=-:") and "from agent_run.cli.host_exit import main" in command
     assert environment["PRIVATE_TEST_VALUE"] not in " ".join(properties)
@@ -287,10 +281,10 @@ def test_enabled_host_arms_only_the_exact_bounded_exit_command_without_private_e
     spec = freeze_creation(RunSpec("disabled", "example/project", 1, "requirements", "graph", (delivery,),
                                    repository_root=str(disabled)), defaults,
                            prompt_resources={key: "Frozen " + key for key in RESOURCE_KEYS})
-    other = Kernel.create(disabled / "kernel.sqlite3", spec)
+    other = create_kernel(disabled / "kernel.sqlite3", spec)
     off = other.admit_host("disabled", kind="run", command=fixture.command,
                            environment_carrier=disabled / "environment.json", preflight=lambda: None)
-    status_properties = exit_properties(other.storage.path, "disabled", off, lock, environment)
+    status_properties = exit_properties(other.storage.path, 'disabled', off, lock, environment, storage=other.storage)
     assert len([item for item in status_properties if item.startswith("ExecStopPost=")]) == 1
     assert "TimeoutStopSec=5s" in status_properties and "TimeoutStopSec=70s" not in status_properties
     assert not (disabled / "notifications").exists()

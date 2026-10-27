@@ -64,7 +64,7 @@ def test_completed_graph_history_preserves_run_wide_action_material_owners(tmp_p
     # Creation and completion of the real Final, without synthetic DB insertion.
     scenario.select('final:1')
     assert scenario.run(approve=True).kind == 'complete'
-    kernel = Kernel(kernel.storage.path)
+    kernel = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     with kernel.storage.transaction(write=False) as tx:
         assert tx.one('SELECT id FROM subjects ORDER BY id LIMIT 1')[0] == 'final:1'
     before = _snapshot(tmp_path)

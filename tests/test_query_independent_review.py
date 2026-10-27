@@ -4,7 +4,7 @@ from pathlib import Path
 from agent_run.adapters.workspace import ManagedWorkspace
 from agent_run.config.paths import app_data_root
 from agent_run.contracts.task import TaskKey
-from agent_run.queries.run import task_binding
+from support.repository_fixture import read_binding
 from agent_run.cli.main import main
 from support.environment import durable_snapshot as _bytes
 from test_kernel_query_discovery import _published
@@ -34,12 +34,12 @@ def test_retired_empty_run_locator_cannot_override_exact_native_task_binding(tmp
     }
     assert output["run_id"] == "native-exact" and output["parent"]["number"] == 1
     assert output["repository"] == "example/project"
-    assert task_binding(TaskKey(Path(output["repository_root"]), "example/project", 1)) == (
+    assert read_binding(TaskKey(Path(output["repository_root"]), "example/project", 1), selected.storage.path) == (
         "native-exact", selected.storage.path)
     assert main(["status", "--parent", "9", "--repo", "example/project", "--json"]) == 0
     output = json.loads(capsys.readouterr().out)
     assert output["run_id"] == "other-parent" and output["parent"]["number"] == 9
-    assert task_binding(TaskKey(Path(output["repository_root"]), "example/project", 9)) == (
+    assert read_binding(TaskKey(Path(output["repository_root"]), "example/project", 9), other.storage.path) == (
         "other-parent", other.storage.path)
     assert main(["status", "not-published", "--repo", "example/project", "--json"]) == 2
     assert json.loads(capsys.readouterr().out)["diagnostics"][0]["code"] == "run_locator_missing"

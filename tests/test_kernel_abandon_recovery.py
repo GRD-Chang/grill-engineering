@@ -152,7 +152,7 @@ def test_abandon_read_wait_preserves_action_scope_without_bypassing_ordinary_sto
     token = kernel.begin_observation(scenario.delivery.key, execution=scenario.execution).fence
     assert kernel.source_status()["abandonment"] == {"action": "original-abandon", "status": "pending"}
     assert kernel.status(scenario.delivery.key)["gates"] == ["operator_stopped"]
-    assert read(kernel.storage.path, "status").data["status"] == "abandonment_pending"
+    assert read(kernel.storage.path, 'status', storage=kernel.storage).data["status"] == "abandonment_pending"
     with pytest.raises(KernelError, match="run_abandoned"):
         kernel.control_host(request, "resume", "cannot-resume-business")
     waiting = kernel._wait_for_read(token, scenario.execution, "github_recovery_observation_pending", "Timeline is not current")

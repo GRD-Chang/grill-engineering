@@ -448,7 +448,7 @@ def test_unknown_proposal_or_unbound_header_is_never_adopted(scenario):
     unbound = proposal(task, 'unbound')
     with writer.transaction(ordered=False) as owner:
         kernel._create_run(owner, unbound, kernel._creation_profiles(unbound),
-            requirements=source(task), scoped=True)
+            requirements=source(task))
     before = snapshot(db)
     with pytest.raises(KernelError, match='task_creation_unknown'):
         create(kernel, task, 'unbound')
@@ -504,16 +504,16 @@ def test_completed_abandonment_preserves_original_replacement_exemptions(scenari
 @pytest.mark.parametrize('shorten', [False, True])
 def test_original_storage_caps_or_shortens_explicit_contention_deadline(tmp_path, monkeypatch, shorten):
     import agent_run.storage.sqlite as storage_module
-    storage = Storage.create(tmp_path / 'current-protocol.sqlite3')
+    storage = Storage.create(tmp_path / 'current-protocol.sqlite3', namespace=('example/project', str(tmp_path.resolve())))
     requested = storage_module.monotonic() + (.5 if shorten else 60.)
     observed = []
-    original = storage_module.save_turn
+    original = storage_module.write_owner
     @contextmanager
     def record(*args, **kwargs):
         observed.append(kwargs['deadline'])
         with original(*args, **kwargs) as identity:
             yield identity
-    monkeypatch.setattr(storage_module, 'save_turn', record)
+    monkeypatch.setattr(storage_module, 'write_owner', record)
     with storage.transaction(ordered=False, deadline=requested):
         pass
     assert len(observed) == 1

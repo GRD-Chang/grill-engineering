@@ -136,7 +136,7 @@ def test_late_stopped_activity_does_not_take_the_first_start_or_resume_milestone
     replacement = dict(process, start_token="resumed-bootstrap")
     kernel.agent_started(resumed, replacement)
     assert not any(event.get("resume_id") == "resume-original" for event in _project(kernel, "concise"))
-    waiting = read(kernel.storage.path, "status").data["latest_resume"]["resume"]
+    waiting = read(kernel.storage.path, 'status', storage=kernel.storage).data["latest_resume"]["resume"]
     assert waiting["progress"] is None and waiting["started_at"] is None
     kernel.agent_source_ready(resumed)
     kernel.observe_worker_activity(resumed, "actual", active=True, observed_at=102.0,
@@ -144,7 +144,7 @@ def test_late_stopped_activity_does_not_take_the_first_start_or_resume_milestone
     events = [event for event in _project(kernel, "concise") if event["kind"] == "parent_started"]
     assert len(events) == 1 and events[0]["resume_id"] == "resume-original"
     assert events[0]["invocation_id"] == resumed.invocation_id
-    progress = read(kernel.storage.path, "status").data["latest_resume"]["resume"]["progress"]
+    progress = read(kernel.storage.path, 'status', storage=kernel.storage).data["latest_resume"]["resume"]["progress"]
     assert progress["evidence"] == ("worker_started" if old_observer else "worker_active")
     assert progress["invocation_id"] == resumed.invocation_id
     # An old owner's newly arriving turn cannot replace the current milestone.
@@ -291,7 +291,7 @@ def test_same_protocol_activity_without_observer_trigger_keeps_real_start_and_re
     operations.runner.authorize_agent(resumed)
     replacement = dict(process, start_token="old-resumed-output")
     kernel.agent_started(resumed, replacement)
-    assert read(kernel.storage.path, "status").data["latest_resume"]["resume"]["progress"] is None
+    assert read(kernel.storage.path, 'status', storage=kernel.storage).data["latest_resume"]["resume"]["progress"] is None
     kernel.agent_source_ready(resumed)
     now[0] = 104.0
     kernel.observe_worker_activity(resumed, "old-resumed-turn", active=True, observed_at=now[0], evidence={"type": "turn.started"})
@@ -299,7 +299,7 @@ def test_same_protocol_activity_without_observer_trigger_keeps_real_start_and_re
     assert sum(event["kind"] == "parent_started" for event in projected) == 1
     resumed_event, = [event for event in projected if event.get("resume_id") == "old-resume"]
     assert resumed_event["invocation_id"] == resumed.invocation_id
-    view = read(kernel.storage.path, "status").data["latest_resume"]["resume"]
+    view = read(kernel.storage.path, 'status', storage=kernel.storage).data["latest_resume"]["resume"]
     assert view["started_at"] == 104.0 and view["progress"]["resume_outcome"] == "started"
     kernel.agent_exited(resumed, replacement, 1, failure="Controlled fixture finished", failure_kind="fatal")
 
@@ -357,7 +357,7 @@ def test_completed_ticket_effort_spans_budget_renewal_without_recounting_resume(
     assert scenario.port.objects.issue(2)["state"] == "closed"
     projected = _project(scenario.kernel, "concise")
     event, = [item for item in projected if item["kind"] == "ticket_completed"]
-    attempts = read(scenario.kernel.storage.path, "history").data["history"]["attempts"]
+    attempts = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage).data["history"]["attempts"]
     assert prior_attempts <= {attempt["id"] for attempt in attempts}
     for role, seconds in ((Role.DEVELOPMENT, 6), (Role.REVIEW, 9)):
         actual = {call.attempt_id for call in calls if call.role == role}

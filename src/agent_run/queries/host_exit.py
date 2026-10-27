@@ -14,7 +14,7 @@ import shutil
 import sqlite3
 from typing import Any
 
-from agent_run.storage.run_scope import selected_statement
+from agent_run.storage.run_scope import run_statement
 from agent_run.contracts.task import TaskKey
 
 from agent_run.core.kernel import Kernel
@@ -41,11 +41,11 @@ def _abnormal(result: object, code: object, status: object) -> bool:
     return code in {"killed", "dumped"} and bool(re.fullmatch(r"[A-Z][A-Z0-9+-]{0,31}", status))
 
 
-def host_exit_current(database: Path, notice: Mapping[str, Any], *, storage: Storage | None = None) -> bool:
+def host_exit_current(database: Path, notice: Mapping[str, Any], *, storage: Storage) -> bool:
     """Recheck the original Task, Host and Runner without recording any state."""
-    if storage is not None and storage.run_id is not None and notice.get("run_id") != storage.run_id:
+    if notice.get("run_id") != storage.run_id:
         return False
-    options: dict[str, Any] = {} if storage is None else {"storage": storage}
+    options: dict[str, Any] = {"storage": storage}
     if notice.get('backend') == 'foreground':
         current = foreground_exit_notice(database, str(notice.get('action_id')), Path(str(notice.get('physical_record'))), **options)
         return current is not None and current == notice
@@ -53,10 +53,9 @@ def host_exit_current(database: Path, notice: Mapping[str, Any], *, storage: Sto
         if (database.is_symlink() or not _abnormal(notice.get("service_result"), notice.get("exit_code"),
                                                   notice.get("exit_status"))):
             return False
-        kernel = Kernel(database) if storage is None else Kernel._from_storage(open_run(database, storage=storage))
+        kernel = Kernel._from_storage(open_run(database, storage=storage))
         with kernel.storage.transaction(write=False) as tx:
-            if not tx.rows(*selected_statement(tx, 'SELECT action_id FROM hosts WHERE action_id=?',
-                       'SELECT action_id FROM hosts WHERE run_id=? AND action_id=?', (notice["action_id"],))):
+            if not tx.rows(*run_statement(tx, 'SELECT action_id FROM hosts WHERE run_id=? AND action_id=?', (notice["action_id"],))):
                 return False
         request = kernel.host_request(notice["action_id"])
         usage = kernel.host_usage(notice["action_id"])
@@ -75,12 +74,10 @@ def host_exit_current(database: Path, notice: Mapping[str, Any], *, storage: Sto
                 or notice["pid_namespace"] != os.readlink("/proc/self/ns/pid")):
             return False
         with kernel.storage.transaction(write=False) as tx:
-            run = tx.one(*selected_statement(tx, 'SELECT * FROM runs',
-                      'SELECT * FROM runs WHERE id=?', ()))
-            host = tx.one(*selected_statement(tx, 'SELECT * FROM hosts WHERE action_id=?',
-                       'SELECT * FROM hosts WHERE run_id=? AND action_id=?', (notice["action_id"],)))
+            run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?', ()))
+            host = tx.one(*run_statement(tx, 'SELECT * FROM hosts WHERE run_id=? AND action_id=?', (notice["action_id"],)))
             task = TaskKey(Path(run["repository_root"]), run["repository"], run["parent_issue"])
-            if (not run_is_current(tx, database.resolve())
+            if (not run_is_current(tx)
                     or task.identity != {"workspace": notice["workspace"], "repository": notice["repository"],
                                          "parent": notice["parent"]}
                     or (run["id"], run["epoch"], run["executor"])
@@ -89,8 +86,7 @@ def host_exit_current(database: Path, notice: Mapping[str, Any], *, storage: Sto
                     != (notice["run_id"], notice["epoch"], notice["owner"], notice["nonce"], notice["unit_name"])
                     or host["dispatched_at"] is None
                     or host["status"] == "exited" or run["stopped"] or run["language"] not in {"zh", "en"}
-                    or tx.rows(*selected_statement(tx, "SELECT id FROM actions WHERE kind='abandon' LIMIT 1",
-                           "SELECT id FROM actions WHERE run_id=? AND kind='abandon' LIMIT 1", ()))):
+                    or tx.rows(*run_statement(tx, "SELECT id FROM actions WHERE run_id=? AND kind='abandon' LIMIT 1", ()))):
                 return False
             startup = host["invocation_id"] is None
             if startup:
@@ -120,19 +116,17 @@ def host_exit_current(database: Path, notice: Mapping[str, Any], *, storage: Sto
 
 def host_exit_notice(database: Path, action_id: str, receipt: Mapping[str, Any], *,
                      service_result: str, exit_code: str, exit_status: str,
-                     invocation_id: str, storage: Storage | None = None) -> dict[str, Any] | None:
+                     invocation_id: str, storage: Storage) -> dict[str, Any] | None:
     """Project an exact manager exit and original durable receipt for the sender."""
     if not _abnormal(service_result, exit_code, exit_status):
         return None
-    kernel = Kernel(database) if storage is None else Kernel._from_storage(open_run(database, storage=storage))
+    kernel = Kernel._from_storage(open_run(database, storage=storage))
     request, usage = kernel.host_request(action_id), kernel.host_usage(action_id)
     if usage is None or json.loads(usage.evidence) != receipt:
         return None
     with kernel.storage.transaction(write=False) as tx:
-        run = tx.one(*selected_statement(tx, 'SELECT * FROM runs',
-                  'SELECT * FROM runs WHERE id=?', ()))
-        host = tx.one(*selected_statement(tx, 'SELECT * FROM hosts WHERE action_id=?',
-                   'SELECT * FROM hosts WHERE run_id=? AND action_id=?', (action_id,)))
+        run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?', ()))
+        host = tx.one(*run_statement(tx, 'SELECT * FROM hosts WHERE run_id=? AND action_id=?', (action_id,)))
         notice = {"workspace": run["repository_root"], "repository": run["repository"], "parent": run["parent_issue"],
                   "run_id": request.run_id, "action_id": action_id, "epoch": request.epoch,
                   "owner": request.owner, "nonce": request.nonce, "unit_name": request.unit_name,
@@ -142,10 +136,10 @@ def host_exit_notice(database: Path, action_id: str, receipt: Mapping[str, Any],
                   "process_start_token": host["start_token"], "cgroup": host["cgroup"],
                   "service_result": service_result, "exit_code": exit_code, "exit_status": exit_status,
                   "observed_at": datetime.now(UTC).isoformat()}
-    return notice if host_exit_current(database, notice, **({} if storage is None else {"storage": storage})) else None
+    return notice if host_exit_current(database, notice, **({"storage": storage})) else None
 
 
-def foreground_exit_notice(database: Path, action_id: str, path: Path, *, storage: Storage | None = None) -> dict[str, Any] | None:
+def foreground_exit_notice(database: Path, action_id: str, path: Path, *, storage: Storage) -> dict[str, Any] | None:
     """Read the exact persisted physical exit before Core retires this Host.
 
     No cgroup/unit facts are invented. Missing executor status remains unknown;
@@ -153,7 +147,7 @@ def foreground_exit_notice(database: Path, action_id: str, path: Path, *, storag
     """
     from agent_run.adapters.foreground import DomainUnknown, read_record, record_root
     try:
-        kernel = Kernel(database) if storage is None else Kernel._from_storage(open_run(database, storage=storage))
+        kernel = Kernel._from_storage(open_run(database, storage=storage))
         request, usage = kernel.host_request(action_id), kernel.host_usage(action_id)
         if request.backend != 'foreground' or usage is None:
             return None
@@ -172,14 +166,11 @@ def foreground_exit_notice(database: Path, action_id: str, path: Path, *, storag
                 or record.get('executor_exit_code') == 0):
             return None
         with kernel.storage.transaction(write=False) as tx:
-            run = tx.one(*selected_statement(tx, 'SELECT * FROM runs',
-                      'SELECT * FROM runs WHERE id=?', ()))
-            host = tx.one(*selected_statement(tx, 'SELECT * FROM hosts WHERE action_id=?',
-                       'SELECT * FROM hosts WHERE run_id=? AND action_id=?', (action_id,)))
-            if (not run_is_current(tx, database.resolve()) or run['stopped']
+            run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?', ()))
+            host = tx.one(*run_statement(tx, 'SELECT * FROM hosts WHERE run_id=? AND action_id=?', (action_id,)))
+            if (not run_is_current(tx) or run['stopped']
                     or (run['id'], run['executor'], run['epoch']) != (request.run_id, request.owner, request.epoch)
-                    or host['status'] == 'exited' or tx.rows(*selected_statement(tx, "SELECT id FROM actions WHERE kind='abandon' LIMIT 1",
-                                                         "SELECT id FROM actions WHERE run_id=? AND kind='abandon' LIMIT 1", ()))):
+                    or host['status'] == 'exited' or tx.rows(*run_statement(tx, "SELECT id FROM actions WHERE run_id=? AND kind='abandon' LIMIT 1", ()))):
                 return None
             originals = tx.rows('SELECT subject,material_id FROM run_inputs WHERE run_id=?', (run['id'],))
             if not originals:return None

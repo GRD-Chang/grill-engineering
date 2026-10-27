@@ -58,7 +58,7 @@ def test_cli_creator_reaps_its_guardian_on_return_and_exception(tmp_path, monkey
 
     monkeypatch.setattr(native, "prepare_handoff", short_handoff)
     if entry == "attach":
-        directory = _runtime_directory("original", environment)
+        directory = _runtime_directory("original", environment, run_partition=kernel.run_paths().host_partition)
         kernel.admit_host("original", kind="run", command=fixture.command,
                           environment_carrier=directory / "environment.json", preflight=manager.preflight)
     if launch_error:

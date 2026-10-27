@@ -24,7 +24,7 @@ def test_terminal_notification_keeps_close_cleanup_and_completed_as_distinct_fac
         return {'outcome': 'success', 'reason': None}
 
     def observe() -> list[dict[str, Any]]:
-        observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport)
+        observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
         observer.close()
         assert observer.failure_reason is None
         return [record for record in outbox.read_notifications(tmp_path, scenario.spec.run_id)['records']
@@ -86,7 +86,7 @@ def test_abandon_notification_waits_for_original_finite_cleanup_and_does_not_ann
         return {'outcome': 'success', 'reason': None}
 
     def observe() -> list[dict[str, Any]]:
-        observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport)
+        observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
         observer.close()
         assert observer.failure_reason is None
         return [record for record in outbox.read_notifications(tmp_path, scenario.spec.run_id)['records']

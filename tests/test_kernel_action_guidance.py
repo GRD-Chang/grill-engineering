@@ -1,4 +1,6 @@
 """Displayed actions select the original Task through the real CLI grammar."""
+
+from support.repository_fixture import create_kernel
 from dataclasses import replace
 from hashlib import sha256
 import json
@@ -52,7 +54,7 @@ def unavailable_manager(tmp_path, monkeypatch):
     selected = []
 
     def manager(kernel, parsed, environment):
-        selected.append((read(kernel.storage.path, "status").data["run_id"], kernel.storage.path))
+        selected.append((read(kernel.storage.path, 'status', storage=kernel.storage).data["run_id"], kernel.storage.path))
         # Actual ENOENT from the manager boundary, after real lifecycle Task
         # selection. No Host or external business operation is launched.
         return SystemdHost(systemctl=str(tmp_path / "absent-systemctl"),
@@ -76,7 +78,7 @@ def test_completed_parent_cleanup_displays_parseable_original_identity(
     scenario = GraphScenario(tmp_path / "physical", Requirements(ParentIssue(1, "Parent", "Scope"), ()))
     # A fresh public producer, before any work or prepared intent exists.
     scenario.spec = replace(scenario.spec, run_id="a  b", language=language)
-    scenario.kernel = Kernel.create_task(tmp_path / "wanted" / "kernel.sqlite3",
+    scenario.kernel = create_kernel(tmp_path / "wanted" / "kernel.sqlite3",
                                          scenario.spec, requirements=scenario.requirements)
     scenario.execution = scenario.kernel.claim_executor("original-owner")
     assert scenario.run().kind == "approval"
@@ -97,7 +99,7 @@ def test_completed_parent_cleanup_displays_parseable_original_identity(
     argv = shell_argv(guidance)
     parsed = _parser(language).parse_args(argv)
     assert parsed.command == "resume" and parsed.run_id == "a  b" and parsed.repo == scenario.spec.repository
-    document = read(scenario.kernel.storage.path, "status").data
+    document = read(scenario.kernel.storage.path, 'status', storage=scenario.kernel.storage).data
     assert document["next_action"] == guidance == document["delivery_cleanup"]["items"][0]["recovery_action"]
     assert document["run_id"] == "a  b" and document["parent"]["number"] == 1
     assert scenario.kernel.active_host_action() is None
@@ -118,7 +120,7 @@ def _published_task(remote, repository, identity, parent, *, language="en", tick
     spec = RunSpec(identity, workspace.repository, parent, "parent", "graph", jobs,
                    repository_root=str(workspace.repository_root), language=language, inputs=fixture_inputs())
     directory = sha256(identity.encode()).hexdigest()[:16]
-    return Kernel.create_task(workspace.state_root / str(parent) / directory / "kernel.sqlite3", spec, requirements=source)
+    return Kernel.create_task(workspace.state_root / "kernel.sqlite3", spec, requirements=source)
 
 
 @pytest.mark.parametrize("language", ["zh", "en"])
@@ -215,7 +217,7 @@ def test_stale_numeric_run_card_cannot_control_its_normal_successor(
     assert original.source_status()["abandonment"]["status"] == "complete"
     successor = _published_task(git_repo, "example/project", "successor", 1, language=language)
     assert successor.storage.path != original.storage.path
-    assert read(successor.storage.path, "status").data["run_id"] == "successor"
+    assert read(successor.storage.path, 'status', storage=successor.storage).data["run_id"] == "successor"
     before = successor.source_status()
     executable = _displayed_commands(old_card)
     for command in executable:
@@ -255,8 +257,8 @@ def test_terminal_guidance_never_deletes_a_control_character_to_target_another_r
     assert main(["runs", "--repo", "example/project"]) == 0
     inventory = capsys.readouterr().out
     assert encoded in inventory and identity not in inventory
-    assert read(wanted.storage.path, "status").data["run_id"] == identity
-    assert read(other.storage.path, "status").data["run_id"] == "ab"
+    assert read(wanted.storage.path, 'status', storage=wanted.storage).data["run_id"] == identity
+    assert read(other.storage.path, 'status', storage=other.storage).data["run_id"] == "ab"
 
 
 @pytest.mark.parametrize("language", ["zh", "en"])

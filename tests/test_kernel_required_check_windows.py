@@ -82,7 +82,7 @@ def test_checks_keep_the_first_absolute_window_across_observation_and_restart(
     assert kernel.status(subject)["holds_integration"] == before["holds_integration"]
     assert kernel.status(subject)["budgets"] == before["budgets"]
     assert kernel.status(subject)["pending_attempt"] is None
-    reopened = Kernel(kernel.storage.path)
+    reopened = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     reopened.clock = lambda: now[0]
     runner = OperationRunner(reopened, scenario.execution, selected)
     if expected_window[1] > 700.25:

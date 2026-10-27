@@ -144,7 +144,7 @@ def test_real_worker_credential_expiry_persists_only_safe_last_failure(tmp_path,
         stopped.set()
         controller.join(timeout=1)
     assert not controller.is_alive() and not errors and cancelled.is_set()
-    document = read(kernel.storage.path, 'status').data
+    document = read(kernel.storage.path, 'status', storage=kernel.storage).data
     subject = next(item for item in document['subjects'] if item['subject'] == request.subject)
     output = subject['pending_attempt']['invocations'][0]['outputs'][0]
     proof = output['failure_evidence']

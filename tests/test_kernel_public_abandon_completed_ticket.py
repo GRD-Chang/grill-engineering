@@ -52,7 +52,7 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
                 accepted = public("run", "1", "--no-notifications")
                 assert accepted["result"] == "accepted"
                 command = commands[0]
-                kernel = Kernel(Path(command[command.index("--database") + 1]))
+                kernel = Kernel(Path(command[command.index('--database') + 1]), run_id=next((item.partition('=')[2] for item in command if item.startswith('--run-id='))))
                 databases.append(kernel)
                 environment.pop("ENTRY_APPROVAL_CONTROL")
                 while not reached.wait(0.1):

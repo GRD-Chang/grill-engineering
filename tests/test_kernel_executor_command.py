@@ -1,6 +1,8 @@
 """The actual service command preserves its selected Python and loader input."""
 from __future__ import annotations
 
+from support.repository_fixture import create_kernel
+
 from pathlib import Path
 import sys
 from contextlib import contextmanager
@@ -24,14 +26,14 @@ def test_host_command_seals_library_path_without_resolving_venv_or_leaking_secre
     monkeypatch.setattr(sys, "executable", str(selected))
     database, lock = tmp_path / "native.sqlite", tmp_path / "install.lock"
     environment = {"LD_LIBRARY_PATH": "/private/sqlite/lib:/another path/lib", "GH_TOKEN": "secret-sentinel"}
-    command = executor.command(database, "original-action", lock, environment)
+    command = executor.command(database, "original-action", lock, environment, run_id="original-run")
     assert command == (
         "/usr/bin/env", "LD_LIBRARY_PATH=/private/sqlite/lib:/another path/lib", str(selected),
         "-m", 'agent_run.runtime.executor', "--database", str(database),
-        "--action", "original-action", "--runner-lock", str(lock),
+        "--action", "original-action", "--runner-lock", str(lock), "--run-id=original-run",
     )
     assert "secret-sentinel" not in " ".join(command)
-    assert executor.command(database, "original-action", lock, {})[0] == str(selected)
+    assert executor.command(database, "original-action", lock, {}, run_id="original-run")[0] == str(selected)
     assert not database.exists() and not lock.exists()
 
 
@@ -49,12 +51,12 @@ def test_unmanaged_executor_entry_refuses_before_accessing_a_database(
     for name in markers:
         monkeypatch.setenv(name, "incomplete-material")
 
-    def forbidden_database(path):
+    def forbidden_database(path, **kwargs):
         pytest.fail("Unmanaged invocation touched the database boundary")
 
     monkeypatch.setattr(executor, "Kernel", forbidden_database)
     database, lock = tmp_path / "never-created.sqlite", tmp_path / "never-created.lock"
-    assert executor.main(["--database", str(database), "--action", "unadmitted", "--runner-lock", str(lock)]) == 1
+    assert executor.main(['--database', str(database), '--action', 'unadmitted', '--runner-lock', str(lock), '--run-id=original-run']) == 1
     assert "managed_host_required" in capsys.readouterr().err
     assert not database.exists() and not lock.exists()
 
@@ -76,8 +78,8 @@ def test_complete_transport_markers_still_require_the_original_handshake(
     request = SimpleNamespace(backend=backend)
     kernel = SimpleNamespace(host_request=lambda action: request)
 
-    def open_database(path):
-        assert path == database
+    def open_database(path, *, run_id):
+        assert path == database and run_id == "original-run"
         requests.append(path)
         return kernel
 
@@ -94,8 +96,7 @@ def test_complete_transport_markers_still_require_the_original_handshake(
     monkeypatch.setattr(executor, "managed_host_environment", managed_handshake)
     monkeypatch.setattr(foreground, "execute_foreground", require_handshake)
     monkeypatch.setattr(executor, "run", lambda *args: pytest.fail("Markers granted execution without a handshake"))
-    assert executor.main(["--database", str(database), "--action", "original",
-                          "--runner-lock", str(tmp_path / "runner.lock")]) == 1
+    assert executor.main(['--database', str(database), '--action', 'original', '--runner-lock', str(tmp_path / 'runner.lock'), '--run-id=original-run']) == 1
     assert "original_handshake_required" in capsys.readouterr().err
     assert requests == [database]
 
@@ -113,15 +114,14 @@ def test_other_transport_cannot_replace_the_frozen_host_backend(
     for name in other:
         monkeypatch.setenv(name, "wrong-transport")
     kernel = SimpleNamespace(host_request=lambda action: SimpleNamespace(backend=backend))
-    monkeypatch.setattr(executor, "Kernel", lambda path: kernel)
+    monkeypatch.setattr(executor, "Kernel", lambda path, *, run_id: kernel)
 
     def forbidden(*args, **kwargs):
         pytest.fail("Wrong transport reached another backend's handshake")
 
     monkeypatch.setattr(executor, "managed_host_environment", forbidden)
     monkeypatch.setattr(foreground, "execute_foreground", forbidden)
-    assert executor.main(["--database", str(tmp_path / "native.sqlite"), "--action", "original",
-                          "--runner-lock", str(tmp_path / "runner.lock")]) == 1
+    assert executor.main(['--database', str(tmp_path / 'native.sqlite'), '--action', 'original', '--runner-lock', str(tmp_path / 'runner.lock'), '--run-id=original-run']) == 1
     assert "managed_host_required" in capsys.readouterr().err
 
 
@@ -134,7 +134,7 @@ def test_native_executor_enumerates_more_than_one_query_page(tmp_path: Path) -> 
                             "refs/heads/run", "refs/heads/main"),)
     source = Requirements(ParentIssue(1, "Parent", "Whole requirement", numbers), tuple(
         Issue(n, f"Ticket {n}", "Required change", "OPEN", frozenset({"ready-for-agent"})) for n in numbers))
-    kernel = Kernel.create(tmp_path / "wide.sqlite", RunSpec("wide", "example/project", 1, "parent", "graph", deliveries),
+    kernel = create_kernel(tmp_path / "wide.sqlite", RunSpec("wide", "example/project", 1, "parent", "graph", deliveries),
                            requirements=source)
     before = kernel.history("ticket:131")
     state = kernel.operation_state()

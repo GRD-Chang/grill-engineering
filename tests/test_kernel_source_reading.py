@@ -1,4 +1,6 @@
 """Real fake-gh transport into native Requirements; Kernel owns all decisions."""
+
+from support.repository_fixture import create_kernel
 import json
 import os
 from pathlib import Path
@@ -150,9 +152,9 @@ def test_closed_local_dependency_is_still_decided_by_native_completion_not_reade
     jobs = tuple(Delivery(f'ticket:{number}', DeliveryKind.TICKET, number, 'untrusted', base,
         f'refs/heads/ticket-{number}', 'refs/heads/run') for number in source.parent.sub_issue_numbers)
     final = Delivery('final', DeliveryKind.FINAL_RUN, 1, 'untrusted', base, 'refs/heads/run', 'refs/heads/main')
-    kernel = Kernel.create(tmp_path / 'kernel.sqlite3', RunSpec('run', 'example/project', 1,
+    kernel = create_kernel(tmp_path / 'kernel.sqlite3', RunSpec('run', 'example/project', 1,
         'untrusted-parent', 'untrusted-graph', (*jobs, final)), requirements=source)
-    observed = Kernel(kernel.storage.path).source_status()
+    observed = Kernel(kernel.storage.path, run_id=kernel.storage.run_id).source_status()
     assert observed['frontier'] == []
     assert observed['remaining'] == {'ticket:9': 'blocked_by_incomplete_tickets', 'ticket:3': 'ticket_closed'}
     assert observed['final_subject'] is None
