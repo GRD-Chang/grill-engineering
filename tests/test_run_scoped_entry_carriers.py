@@ -63,9 +63,11 @@ def test_existing_handle_is_carried_unchanged_and_never_reopened_as_an_unscoped_
     for database, run in ((repository.database, 'B'), (tmp_path / 'other.sqlite3', 'A')):
         with pytest.raises(KernelError, match='run_scope_changed'):
             open_run(database, run_id=run, storage=a)
-    # Explicit carriers cannot make the private marker publicly supported.
-    with pytest.raises(KernelError, match='unknown_protocol'):
-        Kernel(repository.database, run_id='A')
+    # Final public opening requires the same exact Run, never an implicit root.
+    opened = Kernel(repository.database, run_id='A')
+    assert opened.storage.run_id == a.run_id == 'A'
+    with pytest.raises(TypeError):
+        Kernel(repository.database)
 
 
 def test_current_public_stop_keeps_durable_fence_and_exact_selected_run_without_host(tmp_path, monkeypatch):

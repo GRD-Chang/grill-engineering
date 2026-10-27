@@ -440,6 +440,10 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
     if after < 0 or (limit is not None and not 1 <= limit <= 128):
         raise QueryError("query_limit", "History requires after >= 0 and an optional limit between 1 and 128")
     try:
+        # A supplied owner is already an exact selection. A contradictory
+        # requested selector is a location conflict, not corrupt stored state.
+        if storage is not None and expected_run is not None and storage.run_id != expected_run:
+            raise QueryError("run_locator_conflict", "Selected database no longer matches its Run identity")
         if storage is None:
             require_supported_state(path)
         selected = open_run(path, run_id=expected_run, storage=storage)

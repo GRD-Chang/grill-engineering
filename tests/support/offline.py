@@ -73,6 +73,7 @@ _SHARED_REMOTE = frozenset({"pr_write", "merge", "completion_comment", "close", 
 class OfflinePort:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
+        self._managed_workspace = None
         self.git = LocalGit(self.root / "authority")
         self.git.env.update({"GIT_AUTHOR_NAME": "Offline Publisher", "GIT_AUTHOR_EMAIL": "offline@example.invalid",
                              "GIT_COMMITTER_NAME": "Offline Publisher", "GIT_COMMITTER_EMAIL": "offline@example.invalid",
@@ -110,14 +111,29 @@ class OfflinePort:
             path.write_text(body, encoding="utf-8")
         port.git.run("add", "--all")
         port.git.run("commit", "-m", "initial fixture" if initial_git is None else initial_git["initial_message"])
-        with sqlite3.connect(port.database) as db:
+        port._initialize_external_objects()
+        return port
+
+    @classmethod
+    def from_managed_clone(cls, workspace, source: Path) -> OfflinePort:
+        """Real managed clone; only its remote GitHub/Agent adapter is synthetic."""
+        checkout = workspace.ensure_path(str(source))
+        port = cls(workspace.root)
+        environment = port.git.env
+        port.git = LocalGit(checkout)
+        port.git.env.update(environment)
+        port._managed_workspace = workspace
+        port._initialize_external_objects()
+        return port
+
+    def _initialize_external_objects(self) -> None:
+        with sqlite3.connect(self.database) as db:
             db.executescript("""
                 CREATE TABLE writes(position INTEGER PRIMARY KEY AUTOINCREMENT,operation TEXT,subject TEXT,intent TEXT,facts BLOB);
                 CREATE TABLE links(issue INTEGER PRIMARY KEY,ref TEXT NOT NULL,sha TEXT NOT NULL,intent TEXT NOT NULL);
             """)
             ExternalObjects.create(db)
-        port.physical.initialize({"refs/heads/main": port.git.commit("HEAD").sha})
-        return port
+        self.physical.initialize({"refs/heads/main": self.git.commit("HEAD").sha})
 
     def prepare(self, kind: DeliveryKind, *, policy: Policy | None = None,
                 ticket_number: int = 2, repository: str = "example/repository") -> tuple[RunSpec, Delivery]:
@@ -195,7 +211,7 @@ class OfflinePort:
 
     @property
     def physical(self) -> OfflineGit:
-        return OfflineGit(self.root, environment=self.git.env)
+        return OfflineGit(self.root, environment=self.git.env, managed_workspace=self._managed_workspace)
 
 
     def remote_refs(self) -> dict[str, str]:
@@ -233,7 +249,8 @@ class OfflinePort:
     def _remote(self, repository: str, written: Callable[..., None] | None = None) -> RemoteEffects:
         api = SyntheticGitHub(self.git, self.database, repository, physical=self.physical,
                               written=written or (lambda *args: None), read_faults=self.read_faults)
-        git_writes = OfflineGit(self.root, environment=self.git.env, written=api.record_git_write)
+        git_writes = OfflineGit(self.root, environment=self.git.env, written=api.record_git_write,
+            managed_workspace=self._managed_workspace)
         return RemoteEffects(self.git.root, repository, runner_identity={"source": "host"},
                              remote=self.remote_name, api=api, git_writes=git_writes)
 

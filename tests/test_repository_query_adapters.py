@@ -59,7 +59,7 @@ def parsed(arguments):
 
 
 @pytest.mark.parametrize('kind', ['status', 'history', 'settings'])
-def test_existing_reader_projects_exact_selected_run_without_fallback_or_write(repository, kind):
+def test_existing_reader_projects_exact_selected_run_without_fallback_or_write(repository, kind, monkeypatch):
     before = dump(repository.database)
     storage = repository.at_run('A')
     document = read(repository.database, kind, storage=storage,
@@ -70,8 +70,12 @@ def test_existing_reader_projects_exact_selected_run_without_fallback_or_write(r
     assert info['state_dir'] == str(repository.database.parent)
     assert info['artifacts_dir'] == str(repository.kernel('A').run_paths().artifacts)
     assert dump(repository.database) == before
-    with pytest.raises(QueryError) as wrong:
-        read(repository.database, kind, storage=storage, expected_run='B')
+    def no_conflicting_read(*args, **kwargs):
+        raise AssertionError('Conflicting selector entered a database transaction')
+    with monkeypatch.context() as patch:
+        patch.setattr(storage, 'transaction', no_conflicting_read)
+        with pytest.raises(QueryError) as wrong:
+            read(repository.database, kind, storage=storage, expected_run='B')
     assert wrong.value.code == 'run_locator_conflict'
     assert dump(repository.database) == before
 
@@ -193,7 +197,7 @@ def test_direct_profile_adapter_is_also_closed_before_selection(repository, monk
     def no_selection(*args):
         raise QueryError('fixture_selection_boundary', 'Canonical selection reached')
     monkeypatch.setattr(selection, 'repository_target', no_selection)
-    with pytest.raises(KernelError) as refused:
+    with pytest.raises(QueryError) as refused:
         profile_cli.execute(request, repository_routes=(repository,))
     assert refused.value.code == 'fixture_selection_boundary'
 

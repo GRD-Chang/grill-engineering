@@ -130,6 +130,8 @@ def test_default_discovery_diagnoses_a_missing_published_database_without_repair
     published = _published(root, 'published')
     if missing == 'database':
         published.storage.path.unlink()
+        residues = {str(path) for path in root.iterdir()
+            if path.name in {'kernel.sqlite3-wal', 'kernel.sqlite3-shm', 'kernel.sqlite3-journal'}}
     else:
         shutil.rmtree(root)
     before = _snapshot(data)
@@ -138,13 +140,16 @@ def test_default_discovery_diagnoses_a_missing_published_database_without_repair
     diagnostic = output['diagnostics'][0]
     if missing == 'database':
         assert diagnostic['code'] == 'unsupported_state'
-        assert diagnostic['path'] == str(published.storage.path)
-        assert diagnostic['reason'] == 'unreadable_state' and diagnostic['recovery_hint']
+        assert diagnostic['path'] in (residues or {str(published.storage.path)})
+        assert diagnostic['reason'] == ('repository_state_occupied' if residues else 'unreadable_state')
+        assert diagnostic['recovery_hint']
         assert output['selection'] == {'repo': 'example/project', 'parent': 1}
     else:
-        # Removing the entire sole authority erases its identity. No retired JSON
-        # is decoded into a fictitious current Run, and no replacement is created.
-        assert diagnostic['code'] == 'run_locator_missing'
+        # An explicit repository requests its canonical authority even when
+        # the entire state directory vanished. Never report that as empty runs.
+        assert diagnostic['code'] == 'unsupported_state'
+        assert diagnostic['path'] == str(published.storage.path)
+        assert diagnostic['reason'] == 'unreadable_state' and diagnostic['recovery_hint']
     assert 'candidates' not in output
     assert not published.storage.path.exists() and _snapshot(data) == before
 
@@ -219,17 +224,33 @@ def test_unpublished_shells_do_not_consume_the_default_run_candidate_limit(
     assert _snapshot(data) == before
 
 
-def test_default_parent_selects_the_exact_published_run_and_retains_terminal_history(tmp_path, monkeypatch, capsys):
+def test_default_parent_selects_the_exact_published_run_and_retains_terminal_history(tmp_path, monkeypatch, capsys, git_repo):
+    from support import offline
     from agent_run.model import DeliveryKind
-    scenario = Scenario(tmp_path / 'history', DeliveryKind.PARENT_ONLY)
+    workspace = ManagedWorkspace.for_repository('example/repository')
+    def managed_port(cls, root, initial_git=None):
+        assert root == workspace.root and initial_git is None
+        return cls.from_managed_clone(workspace, git_repo)
+    def managed_kernel(path, spec, **kwargs):
+        assert path == workspace.root / 'kernel.sqlite3'
+        assert spec.repository_root == str(workspace.repository_root)
+        return Kernel.create_task(workspace.state_root / 'kernel.sqlite3', spec, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(OfflinePort, 'create', classmethod(managed_port))
+        patch.setattr(offline, 'create_kernel', managed_kernel)
+        scenario = Scenario(workspace.root, DeliveryKind.PARENT_ONLY)
+    assert workspace.open_path() == workspace.repository_root
     assert scenario.run(approve=True).kind == 'complete'
     scenario.kernel.confirm_executor_exit(scenario.execution)
     original = scenario.kernel
     successor_spec = replace(scenario.spec, run_id='published')
-    successor = create_kernel(original.storage.path, successor_spec, requirements=scenario.requirements)
+    successor = Kernel.create_task(original.storage.path, successor_spec, requirements=scenario.requirements)
     assert original.storage.path == successor.storage.path and successor.storage.run_id == 'published'
-    before = _snapshot(tmp_path)
-    args = ['--repo', scenario.spec.repository, '--state-dir', str(original.storage.path), '--json']
+    before = _snapshot(workspace.root)
+    # No explicit state directory or supplied routes: the default real managed
+    # registry must find the current successor and exact original history.
+    args = ['--repo', scenario.spec.repository, '--json']
+    assert '--state-dir' not in args
     assert main(['status', '--parent', str(scenario.spec.parent_issue), *args]) == 0
     assert json.loads(capsys.readouterr().out)['run_id'] == 'published'
     assert main(['runs', *args]) == 0
@@ -237,7 +258,7 @@ def test_default_parent_selects_the_exact_published_run_and_retains_terminal_his
     assert {item['run_id']: item['is_terminal'] for item in runs} == {'offline-run': True, 'published': False}
     assert main(['history', 'offline-run', *args]) == 0
     assert json.loads(capsys.readouterr().out)['run_id'] == 'offline-run'
-    assert _snapshot(tmp_path) == before
+    assert _snapshot(workspace.root) == before
 
 
 @pytest.mark.parametrize("fault", ["damaged", "missing"])
@@ -253,6 +274,8 @@ def test_exact_default_query_isolates_another_parents_bound_database_failure(tmp
         other.storage.path.write_bytes(b'not a SQLite database')
     else:
         other.storage.path.unlink()
+    residues = {str(path) for path in root.iterdir()
+        if path.name in {'kernel.sqlite3-wal', 'kernel.sqlite3-shm', 'kernel.sqlite3-journal'}}
     before = _snapshot(data)
     arguments = ['--parent', '1'] if selector == 'parent' else ['published']
     # Physical loss of the sole repository authority affects both Tasks. A
@@ -261,12 +284,30 @@ def test_exact_default_query_isolates_another_parents_bound_database_failure(tmp
     output = json.loads(capsys.readouterr().out)
     diagnostic = output['diagnostics'][0]
     assert diagnostic['code'] == 'unsupported_state'
-    assert diagnostic['path'] == str(other.storage.path)
-    assert diagnostic['reason'] == ('uncertain_state' if fault == 'damaged' else 'unreadable_state')
+    assert diagnostic['path'] in ({str(other.storage.path)} if fault == 'damaged' else
+        residues or {str(other.storage.path)})
+    assert diagnostic['reason'] == ('uncertain_state' if fault == 'damaged' else
+        'repository_state_occupied' if residues else 'unreadable_state')
     assert diagnostic['recovery_hint']
     assert 'candidates' not in output
     assert main(['status', '--parent', '9', '--repo', 'example/project', '--json']) == 2
-    assert json.loads(capsys.readouterr().out)['diagnostics'][0]['path'] == str(other.storage.path)
+    assert json.loads(capsys.readouterr().out)['diagnostics'][0]['path'] == diagnostic['path']
     assert main(['runs', '--repo', 'example/project', '--json']) == 2
-    assert json.loads(capsys.readouterr().out)['diagnostics'][0]['path'] == str(other.storage.path)
+    assert json.loads(capsys.readouterr().out)['diagnostics'][0]['path'] == diagnostic['path']
     assert _snapshot(data) == before
+
+
+def test_managed_scenario_adapter_keeps_canonical_workspace_and_git_config_guards(tmp_path, git_repo):
+    from support.offline_git import OfflineGit
+    workspace = ManagedWorkspace.for_repository('example/repository')
+    port = OfflinePort.from_managed_clone(workspace, git_repo)
+    assert port.git.root == workspace.open_path() == workspace.repository_root
+    before = _snapshot(port.root / 'remote.git')
+    foreign = replace(workspace, root=tmp_path / 'foreign-workspace')
+    with pytest.raises(ValueError, match='exact canonical workspace'):
+        OfflineGit(workspace.root, environment=port.git.env, managed_workspace=foreign)
+    assert not foreign.root.exists()
+    port.git.run('config', '--local', 'core.hooksPath', str(tmp_path / 'unexecuted-hooks'))
+    with pytest.raises(ValueError, match='unsupported offline Git configuration: core.hookspath'):
+        port.physical
+    assert _snapshot(port.root / 'remote.git') == before

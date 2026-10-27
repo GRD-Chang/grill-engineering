@@ -37,9 +37,9 @@ class StateDecisionClock:
 
 
 @pytest.fixture
-def managed(tmp_path, monkeypatch):
+def managed(tmp_path, monkeypatch, git_repo):
     workspace = ManagedWorkspace.for_repository('example/project')
-    workspace.repository_root.mkdir(parents=True)
+    workspace.ensure_path(str(git_repo))
     monkeypatch.setattr(storage_module, 'SaveClock', StateDecisionClock)
     return workspace
 
@@ -92,7 +92,12 @@ def test_default_status_history_settings_and_profile_keep_the_exact_run(managed,
         arguments = [command, *tail, 'A', '--repo', managed.repository, '--json']
         assert main(arguments) == 0
         output = json.loads(capsys.readouterr().out)
-        assert output['run_id'] == 'A' and output['repository'] == managed.repository
+        assert output['run_id'] == 'A'
+        if command == 'settings':
+            assert output['scope'] == 'run' and output['source'] == 'run_snapshot'
+            assert output['repository_root'] == str(managed.repository_root)
+        else:
+            assert output['repository'] == managed.repository
     assert dump(first.storage.path) == before
     with sibling.storage.transaction(write=False) as tx:
         sibling_profile = tx.one('SELECT profile_revision FROM runs WHERE id=?', ('B',))[0]
@@ -143,10 +148,23 @@ def test_same_action_and_subject_never_alias_host_receipts_or_carriers(managed):
     assert a.run_id == 'A' and b.run_id == 'B' and a.nonce != b.nonce
     assert first.run_paths().host_partition != sibling.run_paths().host_partition
     assert first.run_paths().artifacts != sibling.run_paths().artifacts
+    # A refused business callback may register then retire its own save ticket.
+    # Exclude only that queue sequence; every business table/material/budget,
+    # other sequence and the complete outstanding ticket set must stay exact.
+    queue_sequence = "INSERT INTO \"sqlite_sequence\" VALUES('save_admissions',"
     before = dump(first.storage.path)
     with pytest.raises(KernelError, match='host_binding_changed'):
         sibling.observe_host(a, HostObservation('unknown', a.unit_name))
-    assert dump(first.storage.path) == before
+    after = dump(first.storage.path)
+    assert tuple(row for row in after if not row.startswith(queue_sequence)) == tuple(
+        row for row in before if not row.startswith(queue_sequence))
+    def sequence(rows):
+        values = [int(row[len(queue_sequence):-2]) for row in rows if row.startswith(queue_sequence)]
+        assert len(values) <= 1
+        return values[0] if values else 0
+    assert sequence(after) == sequence(before) + 1
+    with RepositoryRoute.for_workspace(managed).metadata().transaction(write=False) as owner:
+        assert owner.one('SELECT count(*) FROM save_admissions')[0] == 0
     assert first.host_request('same-action') == a and sibling.host_request('same-action') == b
 
 

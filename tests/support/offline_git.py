@@ -22,10 +22,20 @@ from agent_run.runtime.git_command import MAX_GIT_ERROR_BYTES, _kill_group, run_
 
 class OfflineGit:
     def __init__(self, root: Path, *, environment: Mapping[str, str],
-                 written: Callable[[str, Mapping[str, Any], subprocess.CompletedProcess[str]], None] | None = None) -> None:
+                 written: Callable[[str, Mapping[str, Any], subprocess.CompletedProcess[str]], None] | None = None,
+                 managed_workspace=None) -> None:
         self.written = written
         self.root = root.resolve(strict=True)
-        self.repository = self.root / "authority"
+        self.managed_workspace = managed_workspace
+        if managed_workspace is None:
+            self.repository = self.root / "authority"
+        else:
+            from agent_run.adapters.workspace import ManagedWorkspace
+            if (type(managed_workspace) is not ManagedWorkspace
+                    or managed_workspace != ManagedWorkspace.for_repository(managed_workspace.repository)
+                    or managed_workspace.root.resolve() != self.root):
+                raise ValueError("offline managed clone must be the exact canonical workspace")
+            self.repository = managed_workspace.open_path()
         self.remote = self.root / "remote.git"
         # Only Scenario-owned paths are accepted, never a configured remote URL.
         for path in (self.repository, self.remote):
@@ -82,6 +92,15 @@ class OfflineGit:
             "core.ignorecase": {"true", "false"}, "core.precomposeunicode": {"true", "false"},
             "extensions.objectformat": {"sha1", "sha256"}, "gc.auto": {"0"}, "maintenance.auto": {"false"},
             "user.name": None, "user.email": None}
+        if not bare and self.managed_workspace is not None:
+            if repository != self.managed_workspace.open_path():
+                raise ValueError("offline managed repository changed")
+            document = self.managed_workspace._owned_document()
+            # Exact fixture clone configuration; includes/rewrites/hooks and
+            # every other formerly unsupported key still refuse unchanged.
+            allowed.update({"remote.origin.url": {document["remote_url"]},
+                "remote.origin.fetch": {"+refs/heads/*:refs/remotes/origin/*"},
+                "branch.main.remote": {"origin"}, "branch.main.merge": {"refs/heads/main"}})
         config = self._run(self.root, "config", "--no-includes", "--file", str(directory / "config"), "--null", "--list")
         for item in config.stdout.split("\0"):
             if not item:
