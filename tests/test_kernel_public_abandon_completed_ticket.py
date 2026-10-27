@@ -9,7 +9,7 @@ import time
 from agent_run.runtime.package_lease import default_runner_lock_path, runner_management_lease
 from agent_run.core.kernel import Kernel
 from support.managed_abandon_transport import install_currentness
-from tests.test_kernel_managed_entry_end_to_end import (
+from support.systemd_manager import (
     _CODEX, _approval_read_barrier, _control_environment, _git, _hold_host_operation_return, _local_manager,
 )
 

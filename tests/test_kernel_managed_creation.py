@@ -23,11 +23,7 @@ from agent_run.runtime.executor import _make_ports
 from support.core_operations import CoreOperations
 
 from agent_run.adapters.workspace import ManagedWorkspace, read_git_identity
-
-
-def git(root: Path, *arguments: str) -> str:
-    return subprocess.run(["git", *arguments], cwd=root, check=True, text=True,
-                          capture_output=True).stdout.strip()
+from support.workspace import git
 
 
 def test_native_clone_copies_only_original_identity_and_opens_without_legacy_runtime(
@@ -108,7 +104,7 @@ def test_prepare_creation_uses_original_defaults_real_remote_and_independent_clo
 ) -> None:
     import json
     import os
-    from tests.test_kernel_remote_effects import FAKE_GH
+    from support.remote_effects import FAKE_GH
     from agent_run.config.defaults import UserDefaultsStore
     from agent_run.cli.lifecycle import prepare_creation
     from agent_run.model import DeliveryKind
@@ -226,7 +222,7 @@ def test_dispatched_unknown_host_is_attached_without_applying_a_new_action(tmp_p
     import json
     import os
     from support.systemd_manager import controlled_manager
-    from test_kernel_host_adapter import host_kernel
+    from support.core_operations import host_kernel
     from agent_run.cli.lifecycle import attach
     kernel = host_kernel(tmp_path)
     manager, fixture, response, calls = controlled_manager(tmp_path)
@@ -256,7 +252,7 @@ def test_allocated_original_host_continues_its_one_dispatch_and_then_only_attach
     import json
     import os
     from support.systemd_manager import controlled_manager
-    from test_kernel_host_adapter import host_kernel
+    from support.core_operations import host_kernel
     import agent_run.runtime.handoff as native_host
     from agent_run.cli.lifecycle import attach
     kernel = host_kernel(tmp_path)
@@ -322,7 +318,7 @@ def _running_public_parent(git_repo: Path, tmp_path: Path, monkeypatch, *, admit
     from agent_run.model import Commit, Delivery, DeliveryKind, Issue, ParentIssue, Requirements, RunSpec
     from agent_run.core.kernel import Kernel
     from agent_run.config.creation import freeze_creation
-    from tests.test_kernel_remote_effects import FAKE_GH
+    from support.remote_effects import FAKE_GH
     binary = tmp_path / "source-bin"
     binary.mkdir()
     executable = binary / "gh"

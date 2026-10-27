@@ -10,7 +10,7 @@ import pytest
 
 from agent_run.core.kernel import Kernel
 from agent_run.model import ReadWait
-from test_kernel_operation_runner import setup
+from support.core_operations import setup
 
 
 def test_cold_github_import_does_not_cycle_through_operation_runner():

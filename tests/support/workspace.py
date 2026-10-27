@@ -79,3 +79,8 @@ def prepare_workspace(
             process.stdout.close()
             process.stderr.close()
     return workspace
+
+
+def git(root: Path, *arguments: str) -> str:
+    return subprocess.run(["git", *arguments], cwd=root, check=True, text=True,
+                          capture_output=True).stdout.strip()

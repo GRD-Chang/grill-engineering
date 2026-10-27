@@ -1,50 +1,12 @@
 """Retirement proof, not an arbitrary CLOSED flag, permits stale-base closeout."""
 from support.core_operations import prepare_scripted_agent
 from dataclasses import replace
-import json
 
 import pytest
 
 from agent_run.errors import KernelError
-from agent_run.model import DeliveryKind
-from support.offline import Scenario
 from support.offline_api import SyntheticGitHub
-
-
-def _parent_requeue(tmp_path, monkeypatch):
-    scenario = Scenario(tmp_path / 'scenario', DeliveryKind.PARENT_ONLY)
-    assert scenario.run().kind == 'approval'
-    old = scenario.world()
-    assert old.pr is not None and old.target is not None
-    target = scenario.port.external_append(scenario.delivery.target_ref,
-        {'target.txt': 'A real target append before explicit requeue.\n'}, 'target-before-retirement')
-    read = SyntheticGitHub.object
-
-    def stale(api, endpoint):
-        value = read(api, endpoint)
-        if (endpoint.startswith(f'repos/{scenario.spec.repository}/pulls/')
-                and value.get('number') == old.pr.number and not value.get('merged')):
-            return {**value, 'base': {**value['base'], 'sha': old.target.sha}}
-        return value
-
-    monkeypatch.setattr(SyntheticGitHub, 'object', stale)
-    scenario.requirements = replace(scenario.requirements,
-        parent=replace(scenario.requirements.parent, body=scenario.requirements.parent.body + '\nExplicit revised scope.'))
-    world = scenario.world()
-    original = scenario.kernel.delivery(scenario.delivery.key)
-    replacement = replace(original, source_ref=original.source_ref + '-g2', base=target,
-        checkout=str(tmp_path / 'scenario' / 'work' / 'parent-1-g2'))
-    assert world.pr is not None and world.pr.base == old.target and world.target == target
-    return scenario, old, replacement, world
-
-
-def _retirement(scenario):
-    with scenario.kernel.storage.transaction(write=False) as tx:
-        rows = tx.rows("SELECT * FROM effects WHERE subject=? AND operation='retire_pr'",
-                       (scenario.delivery.key,))
-        assert len(rows) == 1
-        row = dict(rows[0])
-        return row, json.loads(tx.get(row['payload_id'], scenario.delivery.key)), json.loads(tx.get(row['receipt_id'], scenario.delivery.key))
+from support.control_scenarios import _parent_requeue, _retirement
 
 
 @pytest.mark.parametrize('reuse_confirmed', [False, True])

@@ -6,23 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.model import Effect, Execution
 from agent_run.errors import KernelError
 from agent_run.adapters.cleanup import cleanup_local_ref, cleanup_remote_ref, cleanup_worktree, inspect_local_ref, inspect_remote_ref, inspect_worktree
 from agent_run.adapters.git_objects import LocalGit
-
-
-REF = "refs/heads/task"
-
-
-def _intent(git: LocalGit, operation: str, **payload: object) -> Effect:
-    base = git.commit("HEAD")
-    return Effect(
-        "cleanup-original", "ticket:3", operation, "example/repository",
-        REF, "refs/heads/run", base.sha, None, None, base, 1,
-        "offline-publisher", {"branch_ref": REF, "expected_head": base.sha, **payload},
-        Execution("run", "executor", 1),
-    )
+from support.cleanup_scenarios import _intent, _checkout, REF
 
 
 def test_local_ref_cleanup_uses_original_source_not_a_different_merge(git_repo: Path) -> None:
@@ -181,16 +168,6 @@ def test_remote_cleanup_preserves_commit_added_at_delete_dispatch(
     assert len(dispatched) == 1
     assert f"--force-with-lease={REF}:{effect.before_sha}" in dispatched[0]
     assert later.sha in actual_run(git, "ls-remote", remote, REF).stdout
-
-
-def _checkout(git: LocalGit, tmp_path: Path, *, attached: bool = False) -> tuple[Path, Effect]:
-    owned = tmp_path / "owned"
-    owned.mkdir()
-    checkout = owned / "development"
-    git.run("update-ref", REF, git.commit("HEAD").sha)
-    git.run("worktree", "add", *( () if attached else ("--detach",)), str(checkout), REF)
-    common = git.run("rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
-    return checkout, _intent(git, "cleanup_worktree", checkout=str(checkout), owned_root=str(owned), common_git_dir=common)
 
 
 @pytest.mark.parametrize("attached", [False, True])

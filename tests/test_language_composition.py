@@ -13,7 +13,7 @@ from agent_run.install.probe import RunnerProbeBackend, RunnerProbeError
 from agent_run.config.defaults import UserDefaultsStore
 from agent_run.queries.run import read
 from agent_run.cli.main import main
-from test_kernel_query_cli import _create
+from support.cli_fixtures import _create
 
 
 def test_builtin_language_and_error_audit_do_not_read_personal_defaults(monkeypatch) -> None:

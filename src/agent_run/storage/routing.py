@@ -213,12 +213,11 @@ class RepositoryRoute:
     def read(self, run_id: str, kind: Literal["status", "history", "settings"], *,
              after: int = 0, limit: int | None = None) -> QueryDocument:
         """A display consumer only; creation/control never parse this projection."""
-        from agent_run.queries.run import read_snapshot
+        from agent_run.queries.run import read
         if kind not in {"status", "history", "settings"}:
             raise ValueError("Unknown Run query")
-        with self.at_run(run_id).transaction(write=False) as owner:
-            return read_snapshot(owner, self.database, kind,
-                after=after, limit=limit, expected_run=run_id, expected_repository=self.repository)
+        return read(self.database, kind, storage=self.at_run(run_id),
+            after=after, limit=limit, expected_run=run_id, expected_repository=self.repository)
 
     def idle(self, task: TaskKey) -> None:
         from agent_run.core.task_creation import ensure_idle_task

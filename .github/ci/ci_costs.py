@@ -14,7 +14,7 @@ import subprocess
 DEPENDENCIES = {
     "Set up Python", "Set up Python for private checks", "Install system dependencies",
     "Prepare verified SQLite runtime", "Install product and development tools",
-    "Install E2E test dependency",
+    "Install E2E test dependency", "Prepare product package test dependencies",
 }
 CHECKS = {
     "Detect changes", "Select checks", "Verify selection", "Test CI selection rules",

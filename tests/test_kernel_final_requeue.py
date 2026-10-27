@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from test_kernel_abandon import managed_abandon_scenario
+from support.control_scenarios import managed_abandon_scenario
 from support.core_operations import CoreOperations, scripted_return
 
 

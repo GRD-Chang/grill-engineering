@@ -2,13 +2,26 @@
 
 The helpers execute normally, while unit/cgroup facts are synthetic.
 """
+import array
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
 import sys
+import signal
+import socket
+import subprocess
+import threading
+
+import pytest
 
 from agent_run.adapters.systemd import SystemdHost
 from agent_run.model import HostLaunch
+from agent_run.config.paths import app_data_root
+from agent_run.config.defaults import UserDefaultsStore
+from agent_run.core.kernel import Kernel
+from agent_run.runtime.package_lease import RunnerLeaseBusy, default_runner_lock_path, runner_management_lease
+from support.remote_effects import FAKE_GH
 
 
 def controlled_manager(tmp_path: Path) -> tuple[SystemdHost, HostLaunch, Path, Path]:
@@ -56,3 +69,375 @@ else:
     host = SystemdHost(systemctl=str(tmp_path / "systemctl"), systemd_run=str(tmp_path / "systemd-run"),
                        environment={"PATH": os.defpath, "HOME": str(tmp_path)}, cgroup_root=tmp_path / "cgroups")
     return host, request, response, calls
+
+
+def _git(root: Path, *arguments: str) -> str:
+    return subprocess.run(["git", *arguments], cwd=root, check=True, text=True,
+                          capture_output=True, timeout=10).stdout.strip()
+
+
+def _executable(path: Path, program: str) -> None:
+    path.write_text("#!" + sys.executable + "\n" + program)
+    path.chmod(0o700)
+
+
+_CODEX = r'''import errno, json, os, subprocess, sys
+from pathlib import Path
+prompt = sys.stdin.read()
+if prompt.startswith('You are the development engineer'):
+    role = 'development'
+elif prompt.startswith('You are the independent acceptance engineer'):
+    role = 'review'
+elif prompt.startswith('You are the engineer responsible for describing'):
+    role = 'publication'
+else:
+    raise AssertionError('Unexpected allocated role prompt: ' + prompt[:100])
+thread = (sys.argv[sys.argv.index('--dangerously-bypass-approvals-and-sandbox') + 1]
+          if sys.argv[1:3] == ['exec', 'resume'] else 'managed-entry-' + role)
+head = subprocess.run(['git', 'rev-parse', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip()
+with open(os.environ['ENTRY_ROLE_TRACE'], 'a') as log:
+    log.write(json.dumps({'role': role, 'thread': thread, 'checkout': str(Path.cwd()), 'head': head}) + '\n')
+print(json.dumps({'type': 'thread.started', 'thread_id': thread}), flush=True)
+print(json.dumps({'type': 'turn.started'}), flush=True)
+content = 'Implementation from the managed native Worker.\n'
+if role == 'development':
+    Path('managed-delivery.txt').write_text(content)
+    result = {'result_kind': 'development', 'summary': 'Implemented the requested file.', 'human_blockers': None}
+elif role == 'review':
+    assert Path('managed-delivery.txt').read_text() == content
+    try:
+        Path('managed-delivery.txt').write_text('Forbidden review mutation')
+    except OSError as error:
+        assert error.errno in (errno.EROFS, errno.EACCES, errno.EPERM)
+    else:
+        raise AssertionError('Review delivery content was writable')
+    temporary = Path(sys.argv[sys.argv.index('--output-last-message') + 1]).parent / 'validation.tmp'
+    temporary.write_text('Disposable validation output outside the read-only checkout.\n')
+    result = {'checks': {lane: {'status': 'pass', 'evidence': 'Read the exact committed file in the isolated checkout.',
+                              'findings': []} for lane in ('e2e', 'standards', 'spec')}}
+else:
+    assert Path('managed-delivery.txt').read_text() == content
+    result = {'result_kind': 'publication', 'commit_message': 'feat: managed native delivery',
+              'pr_title': 'feat: managed native delivery', 'pr_body_markdown': 'Implemented and independently inspected the requested file.',
+              'human_blockers': None}
+Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text(json.dumps(result))
+print(json.dumps({'type': 'turn.completed'}), flush=True)
+'''
+
+
+@contextmanager
+def _local_manager(directory: Path, environment: dict[str, str], *, host_timeout: float = 90):
+    """Only replace the external manager CLI; execute its original argv intact."""
+    directory.mkdir()
+    manager, _, response, calls = controlled_manager(directory)
+    launch = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    launch.bind(str(directory / "launch"))
+    launch.listen(1)
+    launch.settimeout(15)
+    notify = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    notify.bind("")  # Short, isolated abstract address, consumed by real SCM_RIGHTS.
+    notify.settimeout(15)
+    notify_address = "@" + notify.getsockname()[1:].decode()
+    _executable(Path(manager.systemd_run), f'''import json, socket, sys
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+    channel.settimeout(10)
+    channel.connect({str(directory / 'launch')!r})
+    channel.sendall(json.dumps(sys.argv[1:]).encode())
+    channel.shutdown(socket.SHUT_WR)
+    assert channel.recv(1) == b'1'
+''')
+    # Actual systemctl subprocesses must use the sealed terminal bus selection.
+    systemctl = Path(manager.systemctl)
+    systemctl.write_text(systemctl.read_text().replace(
+        "state = json.loads(response.read_text())",
+        "import os\nassert os.environ['DBUS_SESSION_BUS_ADDRESS'] == 'unix:path=/fixture-terminal/bus'\n"
+        "state = json.loads(response.read_text())",
+    ))
+    errors: list[BaseException] = []
+    host: list[subprocess.Popen[bytes]] = []
+    stored: list[int] = []
+    trace: list[str] = []
+    launched: list[list[str]] = []
+    output: list[tuple[bytes, bytes]] = []
+
+    def serve() -> None:
+        gate_read = gate_write = -1
+        try:
+            with launch.accept()[0] as channel:
+                data = bytearray()
+                while chunk := channel.recv(65536):
+                    data.extend(chunk)
+                    assert len(data) <= 65536
+                arguments = json.loads(data)
+                command = arguments[arguments.index("--") + 1:]
+                launched.append(command)
+                properties = dict(value.removeprefix("--property=").split("=", 1)
+                                  for value in arguments if value.startswith("--property="))
+                assert properties["FileDescriptorStorePreserve"] == "restart"
+                assert properties["RemainAfterExit"] == "no" and properties["Restart"] == "no"
+                name, carrier = properties["LoadCredential"].split(":", 1)
+                credentials = directory / "credentials"
+                credentials.mkdir(mode=0o700)
+                original = Path(carrier).read_bytes()
+                credential = credentials / name
+                credential.write_bytes(original)
+                credential.chmod(0o600)
+                unit = next(arg.removeprefix("--unit=") for arg in arguments if arg.startswith("--unit="))
+                description = next(arg.removeprefix("--description=") for arg in arguments if arg.startswith("--description="))
+                gate_read, gate_write = os.pipe()
+                # This barrier only registers the actual PID before exec. The
+                # exact production command is neither substituted nor patched.
+                bootstrap = "import os,sys;os.read(int(sys.argv[1]),1);os.close(int(sys.argv[1]));os.execvpe(sys.argv[2],sys.argv[2:],os.environ)"
+                service_environment = {**environment, "CREDENTIALS_DIRECTORY": str(credentials),
+                                       "NOTIFY_SOCKET": notify_address,
+                                       "DBUS_SESSION_BUS_ADDRESS": "unix:path=/stale-service/bus"}
+                child = subprocess.Popen([sys.executable, "-c", bootstrap, str(gate_read), *command],
+                                         env=service_environment, pass_fds=(gate_read,), start_new_session=True,
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                host.append(child)
+                os.close(gate_read); gate_read = -1
+                group = next(line[3:] for line in Path(f"/proc/{child.pid}/cgroup").read_text().splitlines()
+                             if line.startswith("0::"))
+                state = json.loads(response.read_text())
+                state["fields"].update(Id=unit, Description=description, ActiveState="active", SubState="running",
+                                       MainPID=str(child.pid), ControlGroup=group, NFileDescriptorStore="0")
+                response.write_text(json.dumps(state))
+                os.write(gate_write, b"1")
+                os.close(gate_write); gate_write = -1
+                channel.sendall(b"1")
+            for expected in (b"FDSTORE=1", b"BARRIER=1"):
+                data, ancillary, _, _ = notify.recvmsg(1024, socket.CMSG_SPACE(array.array("i").itemsize))
+                assert data.startswith(expected)
+                descriptors = array.array("i")
+                for level, kind, value in ancillary:
+                    assert (level, kind) == (socket.SOL_SOCKET, socket.SCM_RIGHTS)
+                    descriptors.frombytes(value[:len(value) - len(value) % descriptors.itemsize])
+                assert len(descriptors) == 1
+                if expected == b"FDSTORE=1":
+                    stored.append(descriptors[0])
+                    state["fields"]["NFileDescriptorStore"] = "1"
+                    response.write_text(json.dumps(state))
+                    trace.append("fdstore")
+                else:
+                    os.close(descriptors[0])
+                    trace.append("barrier")
+            with pytest.raises(RunnerLeaseBusy):
+                with runner_management_lease(default_runner_lock_path(environment)):
+                    raise AssertionError("Runner management crossed the real Host handoff")
+            output.append(child.communicate(timeout=host_timeout))
+            (directory / "host.stdout").write_bytes(output[-1][0])
+            (directory / "host.stderr").write_bytes(output[-1][1])
+            trace.append("host_exited")
+            assert child.returncode == 0, output[-1]
+            # Model the manager's physical automatic close after its actual
+            # child exits. Do not invent an empty cgroup or a Kernel release.
+            os.close(stored.pop())
+            trace.append("store_closed")
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            for descriptor in (gate_read, gate_write):
+                if descriptor >= 0:
+                    os.close(descriptor)
+
+    serving = threading.Thread(target=serve)
+    serving.start()
+    try:
+        yield manager, serving, errors, host, trace, launched, output
+    finally:
+        for process in host:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=3)
+        launch.close()
+        notify.close()
+        serving.join(timeout=16)
+        for descriptor in stored:
+            os.close(descriptor)
+        assert not serving.is_alive(), "Controlled manager did not finish cleanup"
+
+
+def _control_environment(git_repo: Path, directory: Path, monkeypatch, *, codex: str,
+                         tickets: tuple[int, ...] = (2, 3)) -> tuple[dict[str, str], Path]:
+    import agent_run.cli.lifecycle as lifecycle_cli
+    remote = directory / "origin.git"
+    _git(git_repo, "init", "--bare", "--initial-branch=main", str(remote))
+    _git(remote, "config", "gc.auto", "0")
+    _git(remote, "config", "maintenance.auto", "false")
+    _git(git_repo, "push", str(remote), "HEAD:refs/heads/main")
+    binary = directory / "control-bin"
+    binary.mkdir()
+    state, calls, roles = directory / "github.json", directory / "gh-calls.jsonl", directory / "roles.jsonl"
+    state.write_text(json.dumps({"prs": [], "comments": [], "events": [], "issue_state": "open",
+        "source_graph": {"parent": {"number": 1, "title": "Native control Parent",
+        "body": "Deliver each ready Ticket using the exact recorded requirements.", "sub_issues": list(tickets)}, "issues": {
+        str(number): {"number": number, "title": f"Managed Ticket {number}",
+                     "body": f"Original requirement for Ticket {number}.", "state": "OPEN", "labels": ["ready-for-agent"]}
+        for number in tickets}}}))
+    clone = ('import sys\nsys.path.insert(0, ' + repr(str(Path(__file__).parent.parent)) + ')\n'
+             'from support.fixture_text import read_text\n') + r'''import json, os, sys
+if sys.argv[1:3] == ['issue', 'view']:
+    number = sys.argv[3]
+    source = json.loads(read_text(os.environ['REMOTE_TEST_STATE']))
+    print(json.dumps(source['source_graph']['parent'] if number == '1' else source['source_graph']['issues'][number]))
+    raise SystemExit(0)
+if sys.argv[1:3] == ['repo', 'clone']:
+    import subprocess
+    raise SystemExit(subprocess.run(['git', 'clone', '--no-local', '--quiet', '--', os.environ['REMOTE_TEST_BARE'], sys.argv[4]]).returncode)
+if '--hostname' in sys.argv:
+    position = sys.argv.index('--hostname'); assert sys.argv[position + 1] == 'github.com'
+    del sys.argv[position:position + 2]
+if os.environ.get('ENTRY_APPROVAL_CONTROL') and sys.argv[1:3] == ['api', 'graphql']:
+    import socket
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+        channel.settimeout(25)
+        channel.connect(chr(0) + os.environ['ENTRY_APPROVAL_CONTROL'][1:])
+        channel.sendall(b'1'); channel.shutdown(socket.SHUT_WR)
+        assert channel.recv(1) == b'1'
+'''
+    gh = FAKE_GH
+    gh = gh.replace("v['issueId']=='issue-node-2'",
+        "v['issueId'] in {f\"issue-node-{issue['number']}\" for issue in "
+        "(d['source_graph']['parent'], *d['source_graph']['issues'].values())}")
+    gh = gh.replace("'number':17,'state':'open'", "'number':17+len(d['prs']),'state':'open'")
+    gh = gh.replace("else: result=[d['prs']] if '--slurp' in args else d['prs']", """else:
+            from urllib.parse import parse_qs, urlsplit
+            query = parse_qs(urlsplit(args[1]).query)
+            matches = [pull for pull in d['prs'] if pull['head']['ref'] == query['head'][0].split(':', 1)[1]
+                       and pull['base']['ref'] == query['base'][0]]
+            result=[matches] if '--slurp' in args else matches""")
+    gh = gh.replace("elif endpoint.startswith('repos/example/project/pulls'):\n",
+        """elif endpoint.startswith('repos/example/project/pulls'):
+    for pull in d['prs']:
+        if not pull['merged']:
+            for field in ('head', 'base'):
+                observed = head('refs/heads/' + pull[field]['ref'])
+                if observed: pull[field]['sha'] = observed
+""")
+    # The shared leaf fixture represents one Ticket. Managed controls also
+    # observe their Parent (and original PR issue endpoints) independently.
+    closed_event = "d['events'].append({'id':len(d['events'])+1,'event':'closed','actor':{'login':'publisher'},'created_at':'2026-10-21T10:01:00Z'})"
+    gh = gh.replace(closed_event, closed_event + ";d.setdefault('events_by_issue',{}).setdefault(str(number),[]).append(d['events'][-1])")
+    issue_start = gh.index("elif endpoint.startswith('repos/example/project/issues/'):\n")
+    issue_end = gh.index("\nelse:raise SystemExit('unexpected endpoint '+endpoint)", issue_start)
+    gh = gh[:issue_start] + r'''elif endpoint.startswith('repos/example/project/issues/'):
+    if d.get('issue_read_error') and method=='GET':
+        print('HTTP 403 Issue unavailable',file=sys.stderr);raise SystemExit(1)
+    number=int(endpoint.split('/issues/',1)[1].split('/')[0])
+    graph=d['source_graph']
+    resource=graph['parent'] if number==graph['parent']['number'] else graph['issues'].get(str(number))
+    if resource is None:
+        resource=next((pull for pull in d['prs'] if pull['number']==number),None)
+    if resource is None:
+        print('HTTP 404 Issue not found',file=sys.stderr);raise SystemExit(1)
+    comments=d.setdefault('comments_by_issue',{}).setdefault(str(number),[])
+    events=d.setdefault('events_by_issue',{}).setdefault(str(number),[])
+    if endpoint.endswith('/comments'):
+        if method=='POST':
+            comment={'id':len(d['comments'])+1,'body':body['body'],'user':{'login':'publisher'},'created_at':'2026-10-21T10:00:00Z'}
+            d['comments'].append(comment);comments.append(comment);result=comment
+        else:result=[comments] if '--slurp' in args else comments
+    elif endpoint.endswith('/events'):result=[events] if '--slurp' in args else events
+    elif method=='PATCH':
+        resource['state']=body['state'].upper()
+        d['issue_state']=body['state']
+        event='closed' if body['state']=='closed' else 'reopened'
+        at='2026-10-21T10:01:00Z' if event=='closed' else '2026-10-21T10:02:00Z'
+        observed={'id':len(d['events'])+1,'event':event,'actor':{'login':'publisher'},'created_at':at}
+        d['events'].append(observed);events.append(observed);result={'state':body['state']}
+    else:result={'number':number,'node_id':f'issue-node-{number}','state':resource.get('state','OPEN').lower()}
+''' + gh[issue_end:]
+    _executable(binary / "gh", clone + gh)
+    _executable(binary / "codex", codex)
+    for name, value in {"PATH": str(binary) + os.pathsep + os.environ["PATH"], "REMOTE_TEST_STATE": str(state),
+                        "REMOTE_TEST_CALLS": str(calls), "REMOTE_TEST_BARE": str(remote), "ENTRY_ROLE_TRACE": str(roles),
+                        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/fixture-terminal/bus"}.items():
+        monkeypatch.setenv(name, value)
+    UserDefaultsStore().configure(language="en", profile={"preset": "economy"}, policy={"ticket_development_workers": 2})
+    active = app_data_root() / "active" / "current"
+    active.parent.mkdir(parents=True)
+    active.symlink_to(Path(lifecycle_cli.__file__).resolve().parents[3], target_is_directory=True)
+    return dict(os.environ), state
+
+
+@contextmanager
+def _approval_read_barrier(*, boundary=None, released=None):
+    """Delay one real remote read at a recorded control boundary."""
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind("")
+    listener.listen(8)
+    listener.settimeout(0.1)
+    address = "@" + listener.getsockname()[1:].decode()
+    databases: list[Kernel] = []
+    reached, release, stopped = threading.Event(), threading.Event(), threading.Event()
+    errors: list[BaseException] = []
+
+    def serve() -> None:
+        try:
+            while not stopped.is_set():
+                try:
+                    channel, _ = listener.accept()
+                except TimeoutError:
+                    continue
+                with channel:
+                    channel.settimeout(10)
+                    assert channel.recv(2) == b"1"
+                    if databases and not reached.is_set():
+                        if boundary is None:
+                            with databases[0].storage.transaction(write=False) as tx:
+                                approval = tx.rows("SELECT id FROM subjects WHERE kind='final_run' AND phase='approval'")
+                        else:
+                            approval = boundary(databases[0])
+                        if approval:
+                            reached.set()
+                            assert release.wait(25), "Control boundary read was never released"
+                            if released is not None:
+                                released.set()
+                    channel.sendall(b"1")
+        except BaseException as error:
+            if not stopped.is_set():
+                errors.append(error)
+
+    serving = threading.Thread(target=serve)
+    serving.start()
+    try:
+        yield address, databases, reached, release
+    finally:
+        release.set()
+        stopped.set()
+        serving.join(timeout=2)
+        listener.close()
+        assert not serving.is_alive() and not errors, errors
+
+
+def _hold_host_operation_return(directory: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Offer committed operation returns to the existing control barrier.
+
+    A quiescent approval needs no extra source poll. Instrument only the actual
+    Host process at the public operation seam; keep its command, Core execution
+    and returned Step intact. Other Python processes retain their normal entry.
+    """
+    hook = directory / "host-return-hook"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text("""import os, sys
+if sys.orig_argv[1:3] == ["-m", 'agent_run.runtime.executor']:
+    import socket
+    from agent_run.core.operation_runner import OperationRunner
+    original_run_once = OperationRunner.run_once
+    def observe_return(self, *, agent_capacity=1):
+        step = original_run_once(self, agent_capacity=agent_capacity)
+        if step.kind in {"progress", "approval"} and step.call is None:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+                channel.settimeout(25)
+                channel.connect(chr(0) + os.environ["ENTRY_APPROVAL_CONTROL"][1:])
+                channel.sendall(b"1")
+                channel.shutdown(socket.SHUT_WR)
+                assert channel.recv(1) == b"1"
+        return step
+    OperationRunner.run_once = observe_return
+""")
+    monkeypatch.setenv("PYTHONPATH", str(hook) + os.pathsep + os.environ.get("PYTHONPATH", ""))

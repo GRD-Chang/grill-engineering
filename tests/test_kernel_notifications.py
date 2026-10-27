@@ -18,45 +18,12 @@ import agent_run.runtime.process_identity as process_binding
 from agent_run.runtime.process_identity import _process_start_token
 from agent_run.contracts.prompt import RESOURCE_KEYS
 from agent_run.config.defaults import UserDefaultsStore
-from agent_run.model import Commit, Delivery, DeliveryKind, Issue, ParentIssue, Requirements, RunSpec, World
+from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec, World
 from agent_run.core.kernel import Kernel
 from agent_run.config.creation import freeze_creation
 from agent_run.notifications.sender import NativeNotifications
 from support.offline import OfflinePort, Scenario
-from agent_run.core.operation_contract import DeliveryFacts
-from support.core_operations import CoreOperations, ReadOnlyPorts
-
-
-def _source(count: int = 1) -> Requirements:
-    return Requirements(ParentIssue(1, "Parent", "Original notification requirement", tuple(range(2, count + 2))),
-        tuple(Issue(number, "Ticket", "ticket-v1", "OPEN", frozenset({"ready-for-agent"}))
-              for number in range(2, count + 2)))
-
-
-def _operations(kernel, execution, *, count: int = 1) -> CoreOperations:
-    ports = ReadOnlyPorts(_source(count), "refs/heads/source", "refs/heads/target",
-                          DeliveryFacts(Commit("base", "tree"), None))
-    return CoreOperations(kernel, execution, lambda binding: ports)
-
-
-def _kernel(root: Path, count: int = 1) -> Kernel:
-    defaults = UserDefaultsStore(root / "defaults.json")
-    defaults.configure(language="en", notifications={"enabled": False, "mode": "detailed"})
-    base = Commit("base", "tree")
-    delivery = Delivery("native-ticket", DeliveryKind.TICKET, 2, "ticket-v1", base,
-                        "refs/heads/source", "refs/heads/target")
-    deliveries = ((delivery,) if count == 1 else tuple(
-        replace(delivery, key=f"native-ticket-{index}", issue=index + 2) for index in range(count)))
-    spec = freeze_creation(RunSpec("run-native", "example/project", 1, "parent-v1", "graph-v1",
-                                   deliveries, repository_root=str(root)), defaults,
-                           prompt_resources={key: "Frozen " + key for key in RESOURCE_KEYS})
-    assert spec.inputs is not None
-    inputs = replace(spec.inputs, notifications={"enabled": True, "mode": "detailed",
-                                                 "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
-    final = Delivery("notification-final", DeliveryKind.FINAL_RUN, 1, "unread", base,
-                     delivery.target_ref, "refs/heads/main")
-    return create_kernel(root / "kernel.sqlite3", replace(spec, inputs=inputs, deliveries=(*deliveries, final)),
-                         requirements=_source(count))
+from support.notification import _kernel, _operations
 
 
 def test_native_run_start_is_sent_once_from_the_frozen_run_and_query_does_not_send(tmp_path: Path) -> None:

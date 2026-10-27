@@ -13,7 +13,7 @@ from support.offline import GraphScenario
 from support.repository_fixture import foreign_task_run
 from agent_run.storage.routing import RepositoryRoute
 import sqlite3
-from test_kernel_requirements import independent_source
+from support.requirements_scenarios import independent_source
 from support.core_operations import CoreOperations
 
 

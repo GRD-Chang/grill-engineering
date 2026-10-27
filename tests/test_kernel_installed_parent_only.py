@@ -11,7 +11,7 @@ import time
 from agent_run.runtime.package_lease import default_runner_lock_path, runner_management_lease
 import agent_run.cli.lifecycle as lifecycle_cli
 from agent_run.core.kernel import Kernel
-from tests.test_kernel_managed_entry_end_to_end import (
+from support.systemd_manager import (
     _CODEX, _approval_read_barrier, _control_environment, _git, _local_manager,
     _hold_host_operation_return,
 )

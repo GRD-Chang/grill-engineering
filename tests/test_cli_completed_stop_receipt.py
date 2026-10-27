@@ -6,7 +6,7 @@ import pytest
 
 from agent_run.cli.main import main
 from agent_run.config.defaults import UserDefaultsStore
-from test_kernel_control_operation_observation import managed_approval
+from support.control_scenarios import managed_approval
 from support.environment import durable_snapshot as _snapshot
 
 

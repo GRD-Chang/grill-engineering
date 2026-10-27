@@ -13,7 +13,7 @@ import pytest
 
 from agent_run.install.installer import _runtime_identity
 from support.environment import _user_environment as _isolated_environment
-from test_kernel_doctor_cli import _file_snapshot
+from support.environment import _file_snapshot
 
 
 @pytest.mark.parametrize("mode", ["discard", "discard_input", "stdout", "merged"])
@@ -233,7 +233,7 @@ def test_doctor_preserves_current_settings_profile_and_task(
     from agent_run.contracts.task import TaskKey
     from agent_run.cli.main import main
     from support.repository_fixture import read_binding
-    from test_kernel_profile_prompt_cli import _published_profile_task
+    from support.cli_fixtures import _published_profile_task
 
     # The existing native fixture uses freeze_creation and Kernel.create_task,
     # never the retired Controller/AgentProfileStore seeder.

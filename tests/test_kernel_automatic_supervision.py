@@ -8,41 +8,15 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.model import Commit, Delivery, DeliveryKind, Policy, RunSpec
+from agent_run.model import DeliveryKind
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.model import Issue, ParentIssue, ReadWait, Requirements
-from support.offline import GraphScenario, Scenario, fixture_inputs
-from agent_run.core.operation_contract import DeliveryFacts, ReadUnavailable
+from support.offline import GraphScenario, Scenario
+from agent_run.core.operation_contract import ReadUnavailable
 from agent_run.queries.run import read
-from support.core_operations import CoreOperations, ReadOnlyPorts, scripted_return
-
-
-def delivery_run(path: Path, *, language: str = "en") -> tuple[Kernel, Requirements]:
-    source = Requirements(ParentIssue(1, "Parent", "Requirement", (2, 3)), (
-        Issue(2, "First", "First work", "OPEN", frozenset({"ready-for-agent"})),
-        Issue(3, "Second", "Second work", "OPEN", frozenset({"ready-for-agent"})),
-    ))
-    base = Commit("base", "base-tree")
-    deliveries = tuple(Delivery(f"ticket:{number}", DeliveryKind.TICKET, number, "unread", base,
-                                f"refs/heads/ticket-{number}", "refs/heads/run") for number in (2, 3))
-    final = Delivery("final:1", DeliveryKind.FINAL_RUN, 1, "unread", base, "refs/heads/run", "refs/heads/main")
-    return create_kernel(path, RunSpec("run", "example/repository", 1, "unread", "unread", (*deliveries, final),
-        Policy(concurrency=2), language=language, repository_root=str(path.parent.resolve()), inputs=fixture_inputs()), requirements=source), source
-
-
-def source_operations(kernel, source, execution):
-    """Explicit read-only external facts; selection is shared production Core."""
-    deliveries = [kernel.delivery(f"ticket:{issue.number}") for issue in source.issues]
-    facts = {(delivery.source_ref, delivery.target_ref): DeliveryFacts(delivery.base, None) for delivery in deliveries}
-    first = deliveries[0]
-    ports = ReadOnlyPorts(source, first.source_ref, first.target_ref, facts[(first.source_ref, first.target_ref)])
-    ports.delivery = lambda request: facts[(request.source_ref, request.target_ref)]
-    return CoreOperations(kernel, execution, lambda binding: ports)
-
-
-def unavailable(parent):
-    raise ReadUnavailable("github_read_failed", "Original source outage")
+from support.core_operations import CoreOperations, scripted_return
+from support.core_operations import delivery_run, source_operations, unavailable
 
 
 def test_whole_operation_progress_requires_its_own_business_change(tmp_path: Path, monkeypatch) -> None:

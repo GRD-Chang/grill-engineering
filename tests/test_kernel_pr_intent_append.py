@@ -12,8 +12,8 @@ from agent_run.errors import KernelError
 from agent_run.model import ReadWait
 from support.offline import Scenario
 from support.offline_api import SyntheticGitHub
-from test_kernel_exploration import advance_to_effect
-from test_kernel_remote_effects import _fixture, _pr_effect
+from support.effect_boundary import advance_to_effect
+from support.remote_effects import _fixture, _pr_effect
 
 
 @pytest.mark.parametrize('change', ['append', 'rewrite', 'source'])

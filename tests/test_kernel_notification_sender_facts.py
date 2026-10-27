@@ -14,9 +14,7 @@ from agent_run.model import DeliveryKind, Role
 from agent_run.core.kernel import Kernel
 from agent_run.model import wire_json
 from agent_run.notifications.sender import NativeNotifications
-from support.notification import recorded_agents as _recorded_agents
-from test_kernel_notification_lifecycle import _enabled_scenario
-from test_kernel_notifications import _kernel, _operations
+from support.notification import recorded_agents as _recorded_agents, _enabled_scenario, _kernel, _operations
 
 
 def _state(scenario) -> dict[str, Any]:

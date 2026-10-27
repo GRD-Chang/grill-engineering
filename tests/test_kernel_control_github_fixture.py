@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 import subprocess
 
-from tests.test_kernel_managed_entry_end_to_end import _CODEX, _control_environment
+from support.systemd_manager import _CODEX, _control_environment
 
 
 def test_managed_control_github_keeps_parent_and_ticket_rest_facts_separate(

@@ -10,7 +10,7 @@ from agent_run.errors import KernelError
 from agent_run.model import Effect, EffectResult, Execution, HostObservation
 from agent_run.queries.run import read
 from agent_run.core.operation_contract import EffectIO
-from test_kernel_abandon import managed_abandon_scenario
+from support.control_scenarios import managed_abandon_scenario
 from support.core_operations import CoreOperations
 
 

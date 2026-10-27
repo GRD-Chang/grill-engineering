@@ -90,3 +90,8 @@ def durable_snapshot(root: Path) -> dict[str, bytes]:
     return {str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*")
             if path.is_file() and not path.name.endswith("-shm") and
             not (path.name.endswith("-wal") and path.stat().st_size == 0)}
+
+
+def _file_snapshot(root: Path) -> dict[str, bytes]:
+    return {str(path.relative_to(root)): path.read_bytes()
+            for path in root.rglob("*") if path.is_file()}

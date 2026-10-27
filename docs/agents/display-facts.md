@@ -16,15 +16,28 @@ Status、History、CLI 和通知投影从已提交事实派生，不另存展示
 | 原始调用、Thread/Profile 和物理输出关联 | `queries.run._attempt`、`_invocations`、`queries.execution.recorded_profile` |
 | 原始审计与分页历史 | `queries.run._native_history`、`_control_history`、`_resume_progress` |
 | Worker 活动段与累计 effort | [`queries/execution.py`](../../src/agent_run/queries/execution.py) 的 `activity`、`execution_facts` |
+| 当前本机进程观察，独立于历史 | [`queries/current_observation.py`](../../src/agent_run/queries/current_observation.py)；Core 核验只读绑定，Foreground Host 提供只读物理观察 |
 | JSON、plain、Rich 与 settings 文案 | [`cli/render.py`](../../src/agent_run/cli/render.py) 的 `render`、`render_settings` |
 | 已提交通知事件、里程碑与 Resume 结果 | [`notifications/event_projection.py`](../../src/agent_run/notifications/event_projection.py) |
 | 通知的当前 gate/完成边界与过时进展过滤 | `queries.read_facts.read_boundaries`、[`notifications/progress.py`](../../src/agent_run/notifications/progress.py) |
 | 事件观察、outbox 和实际投递 | [`notifications/sender.py`](../../src/agent_run/notifications/sender.py) 的 `NativeNotifications`，以及 `agent_run.storage.notification_outbox` / `adapters.notification_transport` |
 
 `QueryDocument` 是显示结果，不是另一套可保存或推进的 Run。
-`executor_control.live_status` 与 Invocation 的 `live_status` 为 `unknown`；查询不探测或恢复
-Host，不能由持久 `running` 记录推断进程仍存活。`scheduling` 保存实际席位、并发上限、
+`current_observation` 是本次有界读取，不是保存的状态、执行授权或连续活性保证。
+Core 从原 Run/owner/epoch、HostRequest 和准确当前 AgentCall 核验观察绑定；物理读取在
+SQLite 事务外完成，再读取并比较原绑定。身份变化、读取失败、超出本次 IO 预算或证据不足
+均降为 `unknown`，不结算退出、不改 lease、不推进恢复。
+本机 foreground 可提供准确 namespace/start token 绑定的 `running` 或 `exited`；
+远端、不可比较的观察域及尚未接入的 systemd 查询保持 `unknown`，不调用后台管理服务。
+Status 的 `executor_control.live_status` 与准确当前 Invocation 的 `live_status` 从该字段派生；
+History 只在独立标为“当前进程观察”的摘要中显示，不覆盖历史事件或 Invocation 的冻结事实。
+不能由持久 `running` 记录推断进程仍存活。普通 Status 可单独显示同一物理输出
+已记录的准确 Worker 退出及其时间；只消费原输出的启动、退出字段，不将旧 Invocation
+的退出改写成当前 Host 或新 epoch 的活性证明。`scheduling` 保存实际席位、并发上限、
 集成持有者及两条 FIFO；不再另造 scheduler 或 Ticket 活性镜像。
+Host 或 namespace 域退出可以证明原成员已退出，却不能替代每个 Worker 的准确结束时间。
+缺少独立 Worker 退出时间时，保留域退出证据，显示已记录退出、准确结束时间未知；
+不得把首次发现域退出的时刻填入 Worker 的 `exited_at` 或实际执行时长。
 通知观察者与 Host 的真实活动证据分别核验，不由显示布局倒推执行许可。
 
 ## 原始工作与历史

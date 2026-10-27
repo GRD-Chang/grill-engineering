@@ -18,7 +18,7 @@ from support.offline import Scenario, review_result
 from agent_run.model import wire_json
 from support.core_operations import CoreOperations, native_agent_fixture, scripted_return
 from support.agent_continuation import ticket_spec
-from support.effect_boundary import EffectBoundary, effect_boundary
+from support.effect_boundary import advance_to_effect
 
 
 
@@ -177,25 +177,6 @@ def test_unknown_successful_pr_write_is_read_back_without_a_second_write(tmp_pat
     assert scenario.publication_count == 1
 
 
-def advance_to_effect(scenario: Scenario, monkeypatch, operation: str, *, developments: int = 0,
-                      sent: bool = False) -> EffectBoundary:
-    # The existing runner chooses every subject and transition. Only the real
-    # physical port is held, using the same boundary fixture as remote tests.
-    for _ in range(150):
-        if scenario.development_count >= developments:
-            break
-        scenario.step()
-    with effect_boundary(scenario, monkeypatch, operation, sent=sent):
-        with pytest.raises(EffectBoundary) as boundary:
-            for _ in range(150):
-                step = scenario.step()
-                assert step.kind not in {"paused", "complete", "approval", "waiting"}
-    assert boundary.value.effect.operation == operation and boundary.value.phase == "execute"
-    if sent:
-        assert scenario.kernel.status(boundary.value.effect.subject)["pending_write"]["status"] == "sent"
-    return boundary.value
-
-
 
 @pytest.mark.parametrize("boundary", ["current", "stopped", "checkout_changed", "unclaimed"])
 def test_noop_integration_requires_current_dispatch_before_consuming_exact_candidate(
@@ -303,7 +284,7 @@ def test_explicit_final_publication_reuse_requires_lazy_current_authority(tmp_pa
 @pytest.mark.parametrize("operation", ["validation_cleanup", "cleanup_worktree", "cleanup_local_ref"])
 def test_original_absent_local_cleanup_requires_lazy_authority(tmp_path: Path, monkeypatch, operation: str) -> None:
     from support.offline import GraphScenario
-    from test_kernel_requirements import independent_source
+    from support.requirements_scenarios import independent_source
 
     scenario = GraphScenario(tmp_path / "scenario", independent_source())
     held = advance_to_effect(scenario, monkeypatch, operation)

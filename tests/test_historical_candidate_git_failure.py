@@ -34,7 +34,7 @@ def test_crlf_conflict_repair_reaches_a_recoverable_current_work_boundary(tmp_pa
 
 def _candidate(git_repo, tmp_path):
     from dataclasses import replace
-    from test_kernel_local_effects import publication
+    from support.remote_effects import publication
     git, local, seed = publication(git_repo, tmp_path)
     return git, local, replace(seed, operation='candidate', effect_id='content-check',
                               payload={**seed.payload, 'parents': [seed.before_sha]})

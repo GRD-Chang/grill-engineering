@@ -192,7 +192,7 @@ def test_stop_receipt_uses_frozen_language_and_keeps_internal_identity_only_in_j
 
 def test_ambiguous_run_error_keeps_locations_and_machine_identity_without_repeating_private_ids(tmp_path: Path, capsys) -> None:
     from agent_run.cli.main import main
-    from test_kernel_query_cli import _create
+    from support.cli_fixtures import _create
     from support.environment import durable_snapshot as _snapshot
 
     kernels = [_create(tmp_path, identity) for identity in ("private-one", "private-two")]

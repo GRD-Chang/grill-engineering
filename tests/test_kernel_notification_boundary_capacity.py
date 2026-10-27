@@ -1,7 +1,7 @@
 """Each current object keeps its notification slot beyond the ordinary queue."""
 import agent_run.storage.notification_outbox as outbox
 from agent_run.notifications.sender import NativeNotifications
-from test_kernel_notifications import _kernel
+from support.notification import _kernel
 
 
 def test_current_ticket_boundaries_do_not_compete_for_ordinary_capacity(tmp_path, monkeypatch):

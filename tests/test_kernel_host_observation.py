@@ -1,34 +1,17 @@
 """An admitted Host gets one finite observation pass, never new write authority."""
+from support.control_scenarios import managed_parent, admit_scenario, sent_workspaces
 from support.core_operations import prepare_scripted_agent
 from pathlib import Path
 
 import pytest
 
-from agent_run.model import DeliveryKind, EffectResult, Policy
+from agent_run.model import DeliveryKind, EffectResult
 from agent_run.errors import KernelError
-from agent_run.model import Execution, HostObservation, Issue, ParentIssue, Requirements
+from agent_run.model import HostObservation, Issue, ParentIssue, Requirements
 from agent_run.errors import ObservationSuperseded
 from support.offline import GraphScenario, Scenario
 from agent_run.queries.run import read
 from agent_run.core.operation_contract import ReadUnavailable
-
-
-def managed_parent(tmp_path):
-    return admit_scenario(Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY), tmp_path)
-
-
-def admit_scenario(scenario, tmp_path):
-    kernel = scenario.kernel
-    kernel.control("stop", "retire-fixture")
-    kernel.confirm_executor_exit(scenario.execution)
-    kernel.control("resume", "prepare-managed")
-    request = kernel.admit_host("start", kind="run", command=("synthetic-native-host",),
-        environment_carrier=tmp_path / "carrier", preflight=lambda: None)
-    assert kernel.dispatch_host(request)
-    assert kernel.observe_host(request, HostObservation("running", request.unit_name, "original", "/host", "boot",
-        42, "start", usage_ready=True)) == "running"
-    scenario.execution = Execution(request.run_id, request.owner, request.epoch)
-    return scenario
 
 
 def test_activation_rejects_direct_claim_without_external_reads(tmp_path, monkeypatch):
@@ -112,36 +95,6 @@ def test_managed_approval_observation_is_finite_and_passive_afterwards(tmp_path,
     assert scenario.kernel.status(scenario.delivery.key)["budgets"] == before
     assert calls == ["source", "delivery"]
 
-
-
-def sent_workspaces(tmp_path, *, count=2, execute=True):
-    numbers = tuple(range(2, 2 + count))
-    source = Requirements(ParentIssue(1, "Parent", "Original requirement", numbers), tuple(
-        Issue(number, "Ticket", "Original task", "OPEN", frozenset({"ready-for-agent"})) for number in numbers))
-    scenario = admit_scenario(GraphScenario(tmp_path / "graph", source, policy=Policy(concurrency=2)), tmp_path)
-    runner = scenario.runner()
-    physical = runner.ports.execute
-    sent = []
-
-    def uncertain(effect, authorize):
-        if effect.operation != "workspace":
-            return physical(effect, authorize)
-        if execute:
-            assert physical(effect, authorize).disposition == "target"
-        else:
-            authorize.prepare()()  # The request was admitted; its transport has not applied it.
-        sent.append(effect)
-        return EffectResult("unknown")
-
-    runner.ports.execute = uncertain
-    for _ in range(16):
-        step = prepare_scripted_agent(scenario.kernel, runner.run_once())
-        assert step.call is None
-        if len(sent) == count:
-            break
-    assert len(sent) == count
-    runner.ports.execute = lambda *a: pytest.fail("observation cannot issue a new write")
-    return scenario, runner, sent
 
 
 @pytest.mark.parametrize("first_result", ["unknown", "third"])

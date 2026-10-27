@@ -9,9 +9,7 @@ from agent_run.core.kernel import Kernel
 from agent_run.runtime.executor import _make_ports
 from agent_run.model import Execution
 from support.core_operations import CoreOperations
-from test_kernel_executor_controls import (
-    test_native_executor_consumes_the_original_control_action_with_fresh_source_and_resources as _control_case,
-)
+from support.control_scenarios import prepared_control
 
 
 def test_original_executor_abandons_with_its_optional_link_still_indeterminate(
@@ -47,7 +45,25 @@ def test_original_executor_abandons_with_its_optional_link_still_indeterminate(
         return result
 
     monkeypatch.setattr(Kernel, "control_host", control_with_original_link)
-    _control_case(tmp_path, monkeypatch, "abandon")
+    scenario, request, original, state, calls, operations, world = prepared_control(tmp_path, monkeypatch, "abandon")
+    kernel, subject = scenario.kernel, scenario.delivery.key
+    resources = kernel.generation_resources()
+    inspections = operations.runner.ports.inspect(resources)
+    assert kernel.control_host(request, "abandon", "abandon-original", resource_inspections=inspections) == "pending"
+    for _ in range(30):
+        step = operations.once()
+        assert step.call is None and step.kind in {"progress", "complete"}
+        if step.kind == "complete":
+            break
+    else:
+        raise AssertionError("The original Action's finite effects did not complete")
+    assert all(not Path(resource.checkout).exists() for resource in resources)
+    actual = json.loads(state.read_text())
+    assert actual["prs"][0]["state"] == "closed"
+    assert len(actual["comments"]) == len(actual["events"]) == 1
+    observed_calls = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert sum("POST" in call for call in observed_calls) == sum("PATCH" in call for call in observed_calls) == 1
+    assert any(call[:2] == ["api", "graphql"] for call in observed_calls)
     assert len(captured) == 1
     kernel, original = captured[0]
     assert kernel.source_status()["abandonment"]["status"] == "complete"

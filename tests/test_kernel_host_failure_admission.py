@@ -17,10 +17,10 @@ from agent_run.model import Execution, HostObservation, Policy
 from agent_run.runtime.execution import _cgroup
 from agent_run.runtime.process_identity import _process_start_token
 from support.offline import GraphScenario
-from test_kernel_operation_integration import _admit_host
-from test_kernel_operation_runner import Ports
-from test_kernel_requirements import independent_source
-from test_kernel_host_admission import task_run
+from support.control_scenarios import _admit_host
+from support.core_operations import Ports
+from support.requirements_scenarios import independent_source
+from support.core_operations import task_run
 
 
 @pytest.mark.parametrize("storage_failure", ["none", "write_unavailable", "committed_reply_loss"])

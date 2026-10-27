@@ -11,7 +11,7 @@ import pytest
 
 import agent_run.storage.notification_outbox as outbox
 import agent_run.notifications.sender as notifications
-from test_kernel_notifications import _kernel
+from support.notification import _kernel
 
 
 @pytest.mark.parametrize("recovery_request", ["business", "close"])

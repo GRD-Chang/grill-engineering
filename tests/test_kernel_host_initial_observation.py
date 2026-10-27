@@ -12,7 +12,7 @@ import agent_run.runtime.executor as executor
 from agent_run.model import DeliveryKind, Policy
 from agent_run.model import EffectResult, Execution, HostObservation
 from support.offline import GraphScenario, Scenario
-from test_kernel_requirements import independent_source
+from support.requirements_scenarios import independent_source
 
 
 def _admit(scenario: Scenario, tmp_path: Path) -> None:

@@ -8,7 +8,7 @@ import pytest
 import agent_run.storage.notification_outbox as outbox
 from agent_run.notifications.envelope import event_envelope
 from agent_run.notifications.sender import NativeNotifications
-from test_kernel_notifications import _kernel
+from support.notification import _kernel
 
 
 @pytest.mark.parametrize('attempted', [False, True])

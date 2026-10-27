@@ -16,7 +16,7 @@ from agent_run.model import RunSpec
 from agent_run.cli.lifecycle import creation_resources
 from agent_run.adapters.source import read_requirements
 from agent_run.adapters.github import GhGitHubReader
-from test_kernel_remote_effects import _fixture, _source_kernel, _publish_pr
+from support.remote_effects import _fixture, _source_kernel, _publish_pr
 from support.core_operations import CoreOperations
 
 

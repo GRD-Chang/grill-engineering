@@ -1,4 +1,4 @@
-"""Observe the actual SQLite loaded by isolated Snapshot processes."""
+"""Native process fixtures and actual SQLite observation in isolated Snapshots."""
 from __future__ import annotations
 
 import json
@@ -8,6 +8,11 @@ import sys
 import venv
 from pathlib import Path
 from typing import Any
+import os
+from agent_run.core.kernel import Kernel
+from agent_run.model import AgentPreparation
+from agent_run.runtime.codex import execute_codex
+from agent_run.runtime.execution import ProcessExit
 
 
 def current_runtime() -> dict[str, Any]:
@@ -44,3 +49,17 @@ sys.addaudithook(observe)
 
 def observed_runtimes(report: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in report.read_text().splitlines()]
+
+
+def local_codex(kernel: Kernel, call: AgentPreparation, tmp_path: Path, program: str) -> ProcessExit | None:
+    executable = tmp_path / "local-codex"
+    executable.write_text(f"#!{sys.executable}\n" + "import json, os, sys\nfrom pathlib import Path\n" + program)
+    executable.chmod(0o700)
+    credential = tmp_path / "selected-hosts.yml"
+    credential.write_text("github.com:\n  oauth_token: local-fixture-only\n")
+    credential.chmod(0o600)
+    return execute_codex(
+        kernel, call, executable=str(executable), prompt="Continue the allocated task.",
+        environment={"PATH": os.defpath, "HOME": str(tmp_path)}, credential_file=credential,
+        hidden_paths=(), authorize_source=lambda admitted: None, timeout=5,
+    )

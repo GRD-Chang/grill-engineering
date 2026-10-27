@@ -12,7 +12,7 @@ from agent_run.adapters.foreground import DomainUnknown, record_root
 from agent_run.runtime.foreground_host import ForegroundHost
 from agent_run.runtime.executor import command
 from agent_run.runtime.package_lease import runner_usage_lease, runner_management_lease
-from test_kernel_host_admission import task_run
+from support.core_operations import task_run
 
 
 @pytest.mark.parametrize('boundary', ['before-hello', 'after-hello'])

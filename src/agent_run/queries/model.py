@@ -51,3 +51,4 @@ class RunStatus(TypedDict):
     abandonment: dict[str, Any] | None
     unavailable_facts: list[str]
     history: NotRequired[HistoryPage]
+    current_observation: NotRequired[dict[str, Any]]

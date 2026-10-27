@@ -11,8 +11,8 @@ from agent_run.model import Policy
 from agent_run.model import Execution, HostObservation
 from support.offline import GraphScenario
 from agent_run.adapters.remote import RemoteEffects
-from test_kernel_remote_effects import _fixture
-from test_kernel_requirements import independent_source
+from support.remote_effects import _fixture
+from support.requirements_scenarios import independent_source
 
 
 def test_original_requeue_action_closes_once_after_real_remote_ack_loss(

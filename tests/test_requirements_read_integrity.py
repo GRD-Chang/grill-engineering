@@ -7,7 +7,7 @@ import pytest
 
 from agent_run.adapters.source import read_requirements
 from agent_run.errors import GitHubReadError
-from test_kernel_source_reading import _reader
+from support.remote_effects import _reader
 
 
 @pytest.mark.parametrize('errors', [[{'message': 'Resource not accessible', 'path': ['repository', 'issue']}], None, {}, False])
@@ -22,7 +22,7 @@ def test_graphql_partial_data_and_errors_is_not_a_requirement_snapshot(tmp_path,
 
 
 def test_partial_source_cannot_be_committed_by_the_normal_kernel_refresh(tmp_path, monkeypatch):
-    from test_kernel_requirements import source_run
+    from support.requirements_scenarios import source_run
 
     reader, _ = _reader(tmp_path, monkeypatch)
     source = read_requirements(reader, 1)

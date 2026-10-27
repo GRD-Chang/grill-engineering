@@ -10,7 +10,7 @@ from agent_run.errors import KernelError
 from agent_run.model import DeliveryKind
 from support.offline import Scenario
 from support.offline_api import SyntheticGitHub
-from test_kernel_remote_effects import _fixture, _publish_pr
+from support.remote_effects import _fixture, _publish_pr
 
 
 def test_ticket_ci_repair_finishes_when_the_pr_reports_an_ancestor_base(tmp_path, monkeypatch):

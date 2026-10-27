@@ -14,9 +14,9 @@ from agent_run.errors import KernelError
 from agent_run.model import Checks, DeliveryKind, Execution
 from support.offline import Scenario
 from support.core_operations import prepare_scripted_agent
-from test_kernel_control_operation_observation import managed_approval
-from test_kernel_host_observation import managed_parent
-from test_kernel_remote_effects import _change
+from support.control_scenarios import managed_approval
+from support.control_scenarios import managed_parent
+from support.remote_effects import _change
 
 
 @pytest.mark.parametrize("change", ["target", "ci"])

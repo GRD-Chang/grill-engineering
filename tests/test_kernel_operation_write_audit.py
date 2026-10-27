@@ -12,7 +12,7 @@ from agent_run.model import Delivery, DeliveryKind, RunSpec
 from agent_run.core.kernel import Kernel
 from agent_run.model import ParentIssue, Requirements
 from support.offline import Scenario, fixture_inputs
-from test_kernel_remote_effects import _fixture
+from support.remote_effects import _fixture
 
 
 def test_actual_nonzero_push_is_audited_once_despite_target_readback(tmp_path, monkeypatch):

@@ -15,17 +15,7 @@ from agent_run.model import DeliveryKind, EffectResult
 from agent_run.errors import KernelError
 from agent_run.model import Execution, HostObservation
 from support.offline import Scenario
-
-
-class _NoNotifications:
-    def __init__(self, *_arguments):
-        pass
-
-    def observe_committed(self):
-        pass
-
-    def close(self, **_arguments):
-        pass
+from support.notification import _NoNotifications
 
 
 def test_direct_claim_quiesces_at_unknown_push_and_resume_reads_its_original(

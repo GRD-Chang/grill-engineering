@@ -12,7 +12,7 @@ from support.offline import GraphScenario, Scenario
 from agent_run.core.operation_contract import ReadUnavailable
 from support.core_operations import CoreOperations
 from agent_run.cli.render import render
-from test_kernel_automatic_supervision import delivery_run, source_operations
+from support.core_operations import delivery_run, source_operations
 from support.environment import durable_snapshot as _snapshot
 
 

@@ -3,23 +3,12 @@ from pathlib import Path
 
 import pytest
 
-from support.core_operations import CoreOperations, scripted_return, final_scenario
+from support.core_operations import CoreOperations, final_scenario
 from agent_run.model import AgentCall, DeliveryKind, Role
 from support.offline import Scenario
 from agent_run.core.prompts.role import render_role_prompt
-from test_kernel_codex_transport import local_codex
-
-
-def next_call(scenario: Scenario, role: Role) -> AgentCall:
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
-    for _ in range(160):
-        step = operations.once()
-        if step.call is not None and step.call.role == role:
-            return step.call
-        assert step.kind not in {"paused", "waiting", "complete", "approval"}, step
-        if step.call is not None:
-            scripted_return(scenario.kernel, operations.runner, step.call, scenario.agent)
-    raise AssertionError("The requested role never became ready")
+from support.native_runtime import local_codex
+from support.core_operations import next_call
 
 
 def finish_call(scenario: Scenario, call: AgentCall) -> None:
