@@ -21,7 +21,7 @@ from typing import Any, Iterator, Sequence
 from agent_run.storage.sqlite_runtime import require_wal_runtime
 
 from agent_run.errors import KernelError
-from agent_run.storage.preflight import PROTOCOL, UnsupportedState, read_state, require_supported_connection, require_supported_state
+from agent_run.storage.preflight import UnsupportedState, read_state, require_supported_connection, require_supported_state
 from agent_run.storage.save_order import (WRITE_CONTENTION_SECONDS, MAX_PENDING_WRITES, RepositorySave, SaveClock, SaveCommit,
     SaveNotHead, check_cancelled, database_identity, remaining, write_owner)
 
@@ -32,7 +32,7 @@ PHYSICAL_LIMIT = 1024 * 1024 * 1024
 QUERY_LIMIT = 32 * 1024 * 1024
 
 # The schema has one definition; early experimental layouts are refused.
-from agent_run.storage.repository_schema import REPOSITORY_RUN_SCHEMA, REPOSITORY_TASK_SCHEMA, REPOSITORY_ROUTING_SCHEMA
+from agent_run.storage.repository_schema import PROTOCOL, REPOSITORY_RUN_SCHEMA, REPOSITORY_TASK_SCHEMA, REPOSITORY_ROUTING_SCHEMA
 SCHEMA = REPOSITORY_RUN_SCHEMA + REPOSITORY_TASK_SCHEMA + REPOSITORY_ROUTING_SCHEMA
 
 

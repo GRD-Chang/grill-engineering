@@ -182,6 +182,9 @@ def test_null_current_on_an_existing_task_never_authorizes_a_fresh_proposal(mana
     # NULL itself satisfies the SQL FK but is not legitimate idle history.
     with closing(sqlite3.connect(first.storage.path)) as connection:
         connection.execute('UPDATE tasks SET current_run=NULL WHERE id=?', (task.fingerprint,))
+        connection.commit()  # closing() alone would roll this corruption back.
+    with route.metadata().transaction(write=False) as owner:
+        assert owner.one('SELECT current_run FROM tasks WHERE id=?', (task.fingerprint,))[0] is None
     before = dump(first.storage.path)
     spec, source = proposal(managed, 'must-not-create')
     with pytest.raises(KernelError, match='task_location_identity'):

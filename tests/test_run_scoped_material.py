@@ -8,7 +8,7 @@ import pytest
 from agent_run.errors import KernelError
 from agent_run.storage import run_scope
 from agent_run.storage.run_scope import RunTransaction
-from agent_run.storage.sqlite import SCHEMA, Transaction
+from agent_run.storage.sqlite import Transaction
 from support.repository_scope import add_subject, connection, seed
 
 
@@ -132,7 +132,11 @@ def test_corrupt_material_never_becomes_a_valid_payload(database, damage):
 def test_current_unscoped_schema_is_refused_without_interpreting_or_writing_it():
     with closing(sqlite3.connect(":memory:")) as database:
         database.row_factory = sqlite3.Row
-        database.executescript(SCHEMA)
+        # Actual unscoped material primary key, not today's v22 SCHEMA.
+        # This rejects the layout before any Run header/payload is interpreted.
+        database.executescript("CREATE TABLE material ("
+            "id TEXT PRIMARY KEY, subject TEXT NOT NULL, purpose TEXT NOT NULL, "
+            "digest TEXT NOT NULL, size INTEGER NOT NULL, body BLOB NOT NULL);")
         before = database.total_changes
         with pytest.raises(KernelError, match="run_scope_schema_required"):
             RunTransaction(Transaction(database), "old-or-unknown")
