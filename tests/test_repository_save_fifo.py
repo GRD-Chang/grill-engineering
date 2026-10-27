@@ -9,6 +9,7 @@ import json
 import sqlite3
 from threading import Event
 from types import SimpleNamespace
+from threading import get_native_id
 
 import pytest
 
@@ -907,13 +908,13 @@ def native_task_observation(monkeypatch):
     current_path = '/proc/thread-self/ns/time'
     children_path = '/proc/thread-self/ns/time_for_children'
     boot_path = '/proc/sys/kernel/random/boot_id'
-    offsets_path = '/proc/thread-self/timens_offsets'
+    offsets_path = f'/proc/{get_native_id()}/timens_offsets'
     current_fd, children_fd = 100001, 100002
     observed = SimpleNamespace(
         pins={current_fd: 2, children_fd: 2},
         paths={current_path: 2, children_path: 2},
         filesystems={current_fd: save_order._NSFS_MAGIC, children_fd: save_order._NSFS_MAGIC},
-        opened=[], closed=[], reads=[], on_read=lambda phase: None,
+        opened=[], closed=[], reads=[], offset_paths=[], on_read=lambda phase: None,
         children_open_error=None, children_close_error=None, offsets_error=None,
         offsets='monotonic 0 0\nboottime 0 0')
     original_open, original_close = save_order.os.open, save_order.os.close
@@ -946,6 +947,7 @@ def native_task_observation(monkeypatch):
     def text(path, limit):
         if str(path) in {boot_path, offsets_path}:
             phase = 'boot' if str(path) == boot_path else 'offsets'
+            if phase == 'offsets':observed.offset_paths.append(str(path))
             observed.reads.append(phase)
             observed.on_read(phase)
             if phase == 'offsets' and observed.offsets_error is not None:
@@ -953,6 +955,14 @@ def native_task_observation(monkeypatch):
             return ('12345678-1234-1234-1234-123456789abc'
                     if phase == 'boot' else observed.offsets)
         return original_text(path, limit)
+    def source(path):
+        if str(path) in {boot_path, offsets_path}:
+            return (3, 4 if str(path) == boot_path else 5)
+        if str(path).endswith('/timens_offsets'):
+            # Linux exposes this file at /proc/<tid>, not its task directory.
+            # The controlled layout must not read another real task or source.
+            raise FileNotFoundError(2, 'No calling-task offsets at this proc path', str(path))
+        return original_source(path)
     monkeypatch.setattr(foreground, 'require_proc_view', lambda: None)
     monkeypatch.setattr(save_order, 'get_clock_info', lambda name: SimpleNamespace(
         implementation='clock_gettime(CLOCK_MONOTONIC)', monotonic=True, adjustable=False))
@@ -962,11 +972,51 @@ def native_task_observation(monkeypatch):
     monkeypatch.setattr(save_order.os, 'fstat', stat_fd)
     monkeypatch.setattr(save_order, '_filesystem_type', lambda fd:
         observed.filesystems[fd] if fd in observed.pins else original_fs(fd))
-    monkeypatch.setattr(save_order, '_source_identity', lambda path:
-        (3, 4 if str(path) == boot_path else 5) if str(path) in {boot_path, offsets_path}
-        else original_source(path))
+    monkeypatch.setattr(save_order, '_source_identity', source)
     monkeypatch.setattr(save_order, '_bounded_text', text)
     return observed
+
+
+def test_native_calling_task_clock_uses_linux_top_level_offsets(monkeypatch):
+    """Read-only real-kernel coverage; no synthetic clock or namespace changes."""
+    opened = []
+    original = save_order.os.open
+    def capture(path, *args, **kwargs):
+        opened.append(str(path))
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(save_order.os, 'open', capture)
+    clock = SaveClock()
+    try:
+        clock.require()
+        assert f'/proc/{get_native_id()}/timens_offsets' in opened
+        assert '/proc/thread-self/timens_offsets' not in opened
+        pinned = save_order.os.fstat(clock.descriptor)
+        assert json.loads(clock.domain)[3:5] == [pinned.st_dev, pinned.st_ino]
+    finally:
+        clock.close()
+
+
+def test_native_clock_reads_top_level_calling_tid_offsets_not_group_leader(native_task_observation, monkeypatch):
+    observed = native_task_observation
+    native_tid = get_native_id()
+    monkeypatch.setattr(save_order.os, 'getpid', lambda: native_tid + 1000)
+    clock = SaveClock()
+    try:
+        assert clock.domain == native_domain()
+        assert observed.offset_paths == [f'/proc/{native_tid}/timens_offsets'] * 2
+    finally:
+        clock.close()
+    assert observed.opened.count(100001) == observed.closed.count(100001) == 1
+    assert observed.opened.count(100002) == observed.closed.count(100002) == 2
+
+
+def test_native_clock_wrong_task_offsets_fail_closed_without_leader_fallback(native_task_observation, monkeypatch):
+    observed = native_task_observation
+    monkeypatch.setattr(save_order, 'get_native_id', lambda: get_native_id() + 1000, raising=False)
+    with pytest.raises(FileNotFoundError):
+        SaveClock()
+    assert observed.offset_paths == []
+    assert observed.closed == [100002, 100001]
 
 
 def test_same_calling_task_current_and_children_sources_remain_pinned(native_task_observation):

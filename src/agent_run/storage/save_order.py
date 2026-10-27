@@ -12,7 +12,7 @@ import math
 import os
 from pathlib import Path
 import stat
-from threading import Event, Lock, get_ident
+from threading import Event, Lock, get_ident, get_native_id
 from time import get_clock_info, monotonic
 from typing import Any, Callable, Iterator, Literal, TYPE_CHECKING
 from uuid import UUID, uuid4
@@ -186,7 +186,10 @@ def _clock_fields(descriptor: int) -> tuple[str, str, int, int, int, int,
     if (before.st_dev, before.st_ino) != (pinned.st_dev, pinned.st_ino):
         raise ValueError('Current time namespace changed')
     with _offset_namespace(descriptor) as same_namespace:
-        boot_path, offsets_path = Path('/proc/sys/kernel/random/boot_id'), Path('/proc/thread-self/timens_offsets')
+        boot_path = Path('/proc/sys/kernel/random/boot_id')
+        # The kernel exposes offsets in the top-level PID/TID directory, not
+        # /proc/<pid>/task/<tid> (thread-self). Read this caller, not its leader.
+        offsets_path = Path(f'/proc/{get_native_id()}/timens_offsets')
         boot_source, offsets_source = _source_identity(boot_path), _source_identity(offsets_path)
         boot = _bounded_text(boot_path, 64)
         if str(UUID(boot)) != boot:
