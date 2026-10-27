@@ -342,7 +342,7 @@ def _native_history(tx: Transaction, subjects: list[dict[str, Any]], *,
         rounds[key] = rounds.get(key, 0) + 1
     return {"events": events, "attempts": attempts, "time_zone": "UTC",
             "effect_failures": [failure for identity in identities for failure in _effect_failures(tx, effect=identity)],
-            "effects": [dict(row) for identity in sorted(identities) for row in _rows(tx, 'SELECT id,subject,operation,attempts,status FROM effects WHERE run_id=? AND id=?', (identity,))],
+            "effects": [dict(row) for identity in sorted(identities) for row in _rows(tx, 'SELECT id,subject,operation,generation,candidate_sha,attempts,status FROM effects WHERE run_id=? AND id=?', (identity,))],
             "actions": _control_history(tx, identities=identities), "rounds": rounds,
             "after": after, "next_after": next_after, "has_more": has_more}
 

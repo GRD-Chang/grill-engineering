@@ -8,6 +8,7 @@ import pytest
 
 from agent_run.model import Issue, ParentIssue, Policy, Requirements, Role, wire_json
 from agent_run.errors import KernelError
+from agent_run.queries.run import read
 from agent_run.runtime.execution import execute
 from support.core_operations import CoreOperations, scripted_return
 from support.offline import GraphScenario
@@ -104,6 +105,27 @@ def test_pure_conflict_keeps_the_original_seat_while_the_other_ticket_waits(tmp_
             scripted_return(kernel, operations.runner, step.call, agent)
     else:
         raise AssertionError("Resolved conflict did not finish its original Ticket")
+    # The public projection supplies the real chain consumed by #324 coverage.
+    # Normal allocation intentionally exposes no copied Development context.
+    page = read(kernel.storage.path, "history", storage=kernel.storage).data["history"]
+    events, effects = page["events"], {row["id"]: row for row in page["effects"]}
+    allocation, = [row for row in events if row["kind"] == "agent_allocated" and row["identity"] == repair.invocation_id]
+    assert allocation["evidence"] is None
+    failed, = [row for row in events if row["kind"] == "effect_observed" and row["evidence"] == receipt]
+    assert effects[failed["identity"]]["operation"] == "integrate"
+    assert effects[failed["identity"]]["generation"] == repair.context["generation"]
+    assert effects[failed["identity"]]["candidate_sha"] == repair.context["candidate_sha"]
+    prepared, = [row for row in events if row["kind"] == "effect_prepared"
+                and effects[row["identity"]]["operation"] == "candidate"
+                and row["evidence"].get("summary_attempt") == repair.attempt_id]
+    assert prepared["evidence"]["parents"] == [receipt["raw"]["head"], receipt["raw"]["merge_head"]]
+    candidate, = [row for row in events if row["kind"] == "effect_consumed" and row["identity"] == prepared["identity"]]
+    assert candidate["evidence"]["raw"]["parents"] == prepared["evidence"]["parents"]
+    integrated, = [row for row in events if row["kind"] == "effect_consumed"
+                  and effects[row["identity"]]["operation"] == "integrate"
+                  and effects[row["identity"]]["candidate_sha"] == candidate["evidence"]["commit"]["sha"]]
+    assert integrated["evidence"]["disposition"] == "target"
+    assert failed["position"] < allocation["position"] < prepared["position"] < candidate["position"] < integrated["position"]
     for _ in range(8):
         operations.once()
         if kernel.status("ticket:3")["holds_integration"]:
