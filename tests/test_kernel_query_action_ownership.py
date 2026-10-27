@@ -48,10 +48,14 @@ def test_completed_graph_history_preserves_run_wide_action_material_owners(tmp_p
     scenario.execution = kernel.claim_executor('resumed-before-final')
     with kernel.storage.transaction(write=False) as tx:
         original = {row['id']:dict(row) for row in tx.rows('SELECT * FROM actions')}
+        materials = {}
         assert set(original) == {'profiles-before-final', 'stop-before-final', 'resume-before-final'}
         for action in original.values():
             assert action['subject'] is None
-            assert tx.one('SELECT subject FROM material WHERE id=?', (action['payload_id'],))[0] == 'ticket:2'
+            for field in ('payload_id', 'receipt_id'):
+                identity = action[field]
+                owner = tx.one('SELECT subject FROM material WHERE run_id=? AND id=?', (tx.run_id, identity))[0]
+                materials[identity] = (owner, tx.get(identity, owner))
     for subject in ('ticket:2', 'ticket:3'):
         scenario.select(subject)
         assert scenario.run().kind == 'complete'
@@ -67,6 +71,9 @@ def test_completed_graph_history_preserves_run_wide_action_material_owners(tmp_p
     kernel = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     with kernel.storage.transaction(write=False) as tx:
         assert tx.one('SELECT id FROM subjects ORDER BY id LIMIT 1')[0] == 'final:1'
+        for identity, (owner, body) in materials.items():
+            assert tx.one('SELECT subject FROM material WHERE run_id=? AND id=?', (tx.run_id, identity))[0] == owner
+            assert tx.get(identity, owner) == body
     before = _snapshot(tmp_path)
     output = _cli_history(kernel)
     actions = {item['id']:item for item in output['history']['actions']}
@@ -90,9 +97,11 @@ def test_completed_graph_history_preserves_run_wide_action_material_owners(tmp_p
     assert _snapshot(tmp_path) == before
     # Wrong-scope material reads still fail; no subject probing or fallback.
     with kernel.storage.transaction(write=False) as tx:
-        for owner in ('ticket:3', 'final:1'):
+        payload = original['profiles-before-final']['payload_id']
+        recorded_owner = materials[payload][0]
+        for owner in (row['id'] for row in tx.rows('SELECT id FROM subjects') if row['id'] != recorded_owner):
             with pytest.raises(KernelError, match='material_corrupt'):
-                tx.get(original['profiles-before-final']['payload_id'], owner)
+                tx.get(payload, owner)
     wrong = subprocess.run([sys.executable, '-m', 'agent_run', 'history', 'another-run',
                             '--state-dir', str(kernel.storage.path), '--json'],
                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -100,7 +109,7 @@ def test_completed_graph_history_preserves_run_wide_action_material_owners(tmp_p
     assert wrong.returncode == 2
     assert 'run_locator_missing' in wrong.stdout
     with pytest.raises(QueryError) as mismatch:
-        read(kernel.storage.path, 'history', expected_run='another-run')
+        read(kernel.storage.path, 'history', expected_run='another-run', storage=kernel.storage)
     assert mismatch.value.code == 'run_locator_conflict'
     assert _snapshot(tmp_path) == before
 
@@ -109,6 +118,9 @@ def test_action_history_keeps_original_generation_after_explicit_requeue(tmp_pat
     scenario = _graph(tmp_path/'graph')
     kernel = scenario.kernel
     kernel.configure_profiles('profiles-g1', preset='economy')
+    with kernel.storage.transaction(write=False) as tx:
+        action = tx.one("SELECT payload_id FROM actions WHERE id='profiles-g1'")
+        owner = tx.one('SELECT subject FROM material WHERE run_id=? AND id=?', (tx.run_id, action['payload_id']))[0]
     runner = scenario.runner()
     for _ in range(10):
         call = prepare_scripted_agent(kernel, runner.run_once()).call
@@ -133,7 +145,7 @@ def test_action_history_keeps_original_generation_after_explicit_requeue(tmp_pat
     before = _snapshot(tmp_path)
     output = _cli_history(kernel)
     event = next(item for item in output['history']['events'] if item['kind']=='profiles_configured')
-    assert event['subject'] == 'ticket:2' and event['generation'] == 1
+    assert event['subject'] == owner and event['generation'] == 1
     action = next(item for item in output['history']['actions'] if item['id']=='profiles-g1')
     assert action['subject'] is None and action['payload']['kind'] == 'configure_profiles'
     assert _snapshot(tmp_path) == before

@@ -333,7 +333,7 @@ def test_real_post_exit_entry_restores_only_original_environment_and_calls_the_o
         with runner_management_lease(lock):
             pass  # Neither the terminal nor expired guardian holds this test lock.
         output = tmp_path / "captured-notice.json"
-        bootstrap = f"import sys,os,json,fcntl\nfrom pathlib import Path\nsys.path.insert(0,sys.argv[1])\nimport agent_run.notifications.sender as notifications\ndef capture(database,state_root,notice):\n    assert os.environ['HOST_EXIT_TEST_VALUE']=='terminal-original'\n    with open({str(lock)!r},'r') as held:\n        try:\n            fcntl.flock(held.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)\n        except BlockingIOError:\n            pass\n        else:\n            raise AssertionError('post-exit entry did not hold its original Runner lease')\n    Path({str(output)!r}).write_text(json.dumps({{'notice':notice,'database':str(database),'state_root':str(state_root)}}))\nnotifications.deliver_host_exit_notice=capture\nfrom agent_run.cli.host_exit import main\nraise SystemExit(main(sys.argv[2:]))\n"
+        bootstrap = f"import sys,os,json,fcntl\nfrom pathlib import Path\nsys.path.insert(0,sys.argv[1])\nimport agent_run.notifications.sender as notifications\ndef capture(database,state_root,notice,*,storage):\n    assert storage.path==database and storage.run_id==notice['run_id']\n    assert os.environ['HOST_EXIT_TEST_VALUE']=='terminal-original'\n    with open({str(lock)!r},'r') as held:\n        try:\n            fcntl.flock(held.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)\n        except BlockingIOError:\n            pass\n        else:\n            raise AssertionError('post-exit entry did not hold its original Runner lease')\n    Path({str(output)!r}).write_text(json.dumps({{'notice':notice,'database':str(database),'state_root':str(state_root)}}))\nnotifications.deliver_host_exit_notice=capture\nfrom agent_run.cli.host_exit import main\nraise SystemExit(main(sys.argv[2:]))\n"
         environment = {"PATH": os.defpath, "CREDENTIALS_DIRECTORY": str(credentials),
                        "SERVICE_RESULT": "signal", "EXIT_CODE": "killed", "EXIT_STATUS": "KILL",
                        "INVOCATION_ID": "1" * 32, "HOST_EXIT_TEST_VALUE": "manager-wrong"}
@@ -341,7 +341,7 @@ def test_real_post_exit_entry_restores_only_original_environment_and_calls_the_o
             environment["LD_LIBRARY_PATH"] = captured["LD_LIBRARY_PATH"]
         before = kernel.storage.path.read_bytes()
         hook = subprocess.Popen([sys.executable, "-I", "-c", bootstrap, str(Path(native.__file__).resolve().parents[2]),
-                                 "--database", str(kernel.storage.path), "--action", "entry", "--runner-lock", str(lock)],
+                                 "--database", str(kernel.storage.path), "--action", "entry", "--runner-lock", str(lock), "--run-id=" + kernel.storage.run_id],
                                 env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         stdout, stderr = hook.communicate(timeout=8)
         assert hook.returncode == 0, stderr.decode()

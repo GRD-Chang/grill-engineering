@@ -31,7 +31,10 @@ def tick():
     value = datetime(2026,10,21,10,0,0,tzinfo=timezone.utc) + timedelta(seconds=d['operation_clock'])
     return value.isoformat().replace('+00:00','Z')""")
     replace("'merge_commit_sha':None,", "'merge_commit_sha':None,'updated_at':tick(),")
-    replace("'created_at':'2026-10-21T10:00:00Z'", "'created_at':tick()")
+    replace("comment={'id':len(d['comments'])+1,'body':body['body'],'user':{'login':'publisher'},"
+            "'created_at':'2026-10-21T10:00:00Z'}",
+            "comment={'id':len(d['comments'])+1,'body':body['body'],'user':{'login':'publisher'},"
+            "'created_at':tick()}")
     replace("d['comments'].append(comment);comments.append(comment);result=comment",
             "d['comments'].append(comment);comments.append(comment);resource['updated_at']=comment['created_at'];result=comment")
     replace("'created_at':'2026-10-21T10:01:00Z'", "'created_at':tick()")

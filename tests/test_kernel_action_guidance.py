@@ -216,7 +216,8 @@ def test_stale_numeric_run_card_cannot_control_its_normal_successor(
     original.confirm_executor_exit(driver)
     assert original.source_status()["abandonment"]["status"] == "complete"
     successor = _published_task(git_repo, "example/project", "successor", 1, language=language)
-    assert successor.storage.path != original.storage.path
+    assert successor.storage.path == original.storage.path
+    assert successor.storage.run_id == 'successor' and original.storage.run_id == '7'
     assert read(successor.storage.path, 'status', storage=successor.storage).data["run_id"] == "successor"
     before = successor.source_status()
     executable = _displayed_commands(old_card)

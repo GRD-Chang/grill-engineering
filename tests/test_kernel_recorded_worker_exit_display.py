@@ -24,7 +24,7 @@ def test_status_distinguishes_recorded_worker_exit_from_raw_return_and_current_h
         # The existing controlled observer records through dispatch/start/exit
         # Core APIs. It is a synthetic process contract, NOT physical Host proof.
         def on_start(_call):
-            starts.append(read(scenario.kernel.storage.path, "status"))
+            starts.append(read(scenario.kernel.storage.path, "status", storage=scenario.kernel.storage))
 
         recorded_agents(scenario, monkeypatch, started=on_start)
     for _ in range(30):
@@ -36,7 +36,7 @@ def test_status_distinguishes_recorded_worker_exit_from_raw_return_and_current_h
         raise AssertionError("The normal producer did not allocate Development")
     assert step.call.role == "development"
     before = durable_snapshot(tmp_path)
-    document = read(scenario.kernel.storage.path, "status")
+    document = read(scenario.kernel.storage.path, "status", storage=scenario.kernel.storage)
     job, = document.data["subjects"]
     invocation, = job["pending_attempt"]["invocations"]
     output, = invocation["outputs"]

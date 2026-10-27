@@ -62,7 +62,12 @@ def test_installed_foreground_parent_only_public_lifecycle(git_repo, tmp_path, m
             if stop_first:
                 deadline = time.monotonic() + 40
                 while not ready.exists():
-                    assert first.poll() is None and time.monotonic() < deadline
+                    assert first.poll() is None and time.monotonic() < deadline, (
+                        {'stage': 'before_development_ready', 'returncode': first.returncode,
+                         'stdout_stderr_head_tail': tuple({'head': stream[:4096], 'tail': stream[-4096:]}
+                             for stream in first.communicate(timeout=5))}
+                        if first.returncode is not None else
+                        {'stage': 'before_development_ready', 'returncode': None})
                     time.sleep(.02)
                 stopped = public('stop', '1')
                 assert stopped['status'] == 'action_applied'

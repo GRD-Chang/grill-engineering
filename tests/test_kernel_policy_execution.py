@@ -19,7 +19,13 @@ def test_ci_allowance_uses_the_actual_ticket_or_parent_owner(tmp_path: Path, kin
     base = Commit("base", "tree")
     delivery = Delivery("delivery", kind, 1, "requirements", base, "refs/heads/source", "refs/heads/target")
     policy = Policy(ticket_ci_developments=1, parent_ci_developments=2)
-    kernel = create_kernel(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,), policy))
+    if kind == DeliveryKind.FINAL_RUN:
+        # Final is admitted only after a real Ticket Completion. A standalone
+        # Final template is not a live subject whose budget can be queried.
+        scenario = final_scenario(tmp_path / 'final', policy=policy)
+        kernel, delivery = scenario.kernel, scenario.delivery
+    else:
+        kernel = create_kernel(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,), policy))
     assert kernel.status(delivery.key)["budgets"]["ci"]["development_limit"] == expected
 
 

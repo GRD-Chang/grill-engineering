@@ -405,8 +405,12 @@ def test_parent_selector_works_in_a_repo_and_across_directories(tmp_path: Path, 
         assert result.stderr == ""
     missing = subprocess.run(command, cwd=outside, text=True, capture_output=True,
                              check=False, timeout=15)
-    assert missing.returncode == 2
-    assert json.loads(missing.stdout)["diagnostics"][0]["code"] == "workspace_required"
+    # Outside a checkout the managed registry still supplies one exact current
+    # Task; cwd is not a second source of Run identity or a write permission.
+    assert missing.returncode == 0, missing.stdout + missing.stderr
+    selected = json.loads(missing.stdout)
+    assert selected['run_id'] == 'run-query' and selected['parent']['number'] == 1
+    assert selected['repository'] == 'example/project' and missing.stderr == ''
     assert _snapshot(workspace.state_root) == before
 
 
@@ -556,8 +560,16 @@ def test_machine_data_is_independent_of_run_language_and_history_details(
     assert documents[0].language == "en" and documents[1].language == "zh"
     assert {key: value for key, value in documents[0].data.items() if key not in {"state_dir", "artifacts_dir"}} == {
         key: value for key, value in documents[1].data.items() if key not in {"state_dir", "artifacts_dir"}}
-    assert documents[0].data["state_dir"] == str(english.storage.path.parent)
-    assert documents[1].data["state_dir"] == str(chinese.storage.path.parent)
+    from agent_run.queries.read_facts import read_header
+    headers = []
+    for kernel in (english, chinese):
+        with kernel.storage.transaction(write=False) as tx:
+            headers.append(read_header(tx, kernel.storage.path))
+    # Location metadata belongs to the explicit header, not the typed public
+    # RunStatus JSON. Preserve its path binding without restoring retired keys.
+    assert headers[0]["state_dir"] == str(english.storage.path.parent)
+    assert headers[1]["state_dir"] == str(chinese.storage.path.parent)
+    assert all('state_dir' not in document.data and 'artifacts_dir' not in document.data for document in documents)
     assert main(_arguments(english, "history", "--json")) == 0
     ordinary = json.loads(capsys.readouterr().out)
     assert main(_arguments(english, "history", "--json", "--details")) == 0
@@ -565,7 +577,7 @@ def test_machine_data_is_independent_of_run_language_and_history_details(
 
 
 def test_history_keeps_raw_feedback_and_pages_without_losing_events(tmp_path: Path, capsys, monkeypatch) -> None:
-    from agent_run.storage.sqlite import Transaction
+    from agent_run.storage.run_scope import RunTransaction
 
     kernel = _create(tmp_path)
     _human(kernel)
@@ -582,13 +594,13 @@ def test_history_keeps_raw_feedback_and_pages_without_losing_events(tmp_path: Pa
     assert action["resume"]["started_at"] is None
     assert document.data["history"]["rounds"]["ticket_development"] == 1
     reads: set[str] = set()
-    original_get = Transaction.get
+    original_get = RunTransaction.get
 
     def recorded_get(tx, identity, subject):
         reads.add(identity)
         return original_get(tx, identity, subject)
 
-    monkeypatch.setattr(Transaction, "get", recorded_get)
+    monkeypatch.setattr(RunTransaction, "get", recorded_get)
     query.read(kernel.storage.path, "status", storage=kernel.storage)
     assert response["material_id"] not in reads
     observed: list[int] = []

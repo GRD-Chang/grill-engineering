@@ -42,7 +42,9 @@ def test_completion_query_reaches_exact_run_among_numeric_and_other_parent_tasks
     assert result["run_id"] == run_id
     assert result["parent"]["number"] == 1
     assert result["repository"] == workspace.repository
-    assert other.storage.path != wanted.storage.path
+    assert other.storage.path == wanted.storage.path
+    assert other.storage.run_id == '1' and wanted.storage.run_id == run_id
+    assert other.storage.run_id != wanted.storage.run_id
 
 
 @pytest.mark.parametrize("language", ["zh", "en"])

@@ -75,7 +75,7 @@ def test_publication_query_keeps_semantic_role_and_original_development_profile(
 
     # Existing synthetic process-observation seam; this is a query consumer,
     # not an installed Worker/Host or external notification delivery claim.
-    _recorded_agents(scenario, monkeypatch, agent, started)
+    _recorded_agents(scenario, monkeypatch, agent, started, activity=False)
     assert scenario.run().kind == ("complete" if kind == "ticket" else "approval")
     assert [call.role for call in calls] == [Role.DEVELOPMENT, Role.REVIEW, Role.PUBLICATION]
     assert len(observations) == 1

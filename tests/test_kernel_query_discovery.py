@@ -10,7 +10,8 @@ import pytest
 
 from agent_run.adapters.workspace import ManagedWorkspace
 from agent_run.contracts.task import TaskKey
-from agent_run.model import DeliveryKind
+from agent_run.core.kernel import Kernel
+from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
 from support.offline import OfflinePort, Scenario
 from agent_run.cli.main import main
 from agent_run.storage.tasks import task_path

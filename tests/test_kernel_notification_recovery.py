@@ -4,7 +4,7 @@ from __future__ import annotations
 import agent_run.queries.read_facts
 
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from typing import Any
 
 import pytest
@@ -225,16 +225,31 @@ def test_fatal_close_wins_over_a_late_healthy_recovery_read(tmp_path: Path, monk
 
     monkeypatch.setattr(notifications, "read_boundaries", unavailable)
     observer = notifications.NativeNotifications(kernel.storage.path, tmp_path, transport=transport, storage=kernel.storage)
+    close_returned = Event()
+    close_errors: list[Exception] = []
+
+    def close_sender() -> None:
+        try:
+            observer.close(drain=False)
+        except Exception as error:
+            close_errors.append(error)
+        finally:
+            close_returned.set()
+
+    closing = Thread(target=close_sender, name='test-notification-close')
     try:
         assert observer.failure_reason is not None
         monkeypatch.setattr(notifications, "read_boundaries", healthy_but_delayed)
         observer.observe_committed()
         assert entered.wait(3)
-        observer.close(drain=False)
+        closing.start()
+        assert observer.cancel.wait(3)
         # close requests cancellation; a deliberately held callback still owns
         # its thread until released. Do not call that physical cleanup proved.
-        assert not observer.closed and observer.cancel.is_set()
+        assert not observer.closed and observer.cancel.is_set() and not close_returned.is_set()
         release.set()
+        closing.join(timeout=3)
+        assert close_returned.is_set() and not closing.is_alive() and close_errors == []
         assert observer.thread is not None
         observer.thread.join(timeout=3)
         observer.close(drain=False)
@@ -245,6 +260,8 @@ def test_fatal_close_wins_over_a_late_healthy_recovery_read(tmp_path: Path, monk
         assert all(item["attempts"] == 0 for item in document["pending"])
     finally:
         release.set()
+        if closing.ident is not None:
+            closing.join(timeout=3)
         observer.close(drain=False)
         if observer.thread is not None:
             observer.thread.join(timeout=3)

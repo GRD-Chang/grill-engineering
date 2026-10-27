@@ -17,7 +17,8 @@ def test_local_status_does_not_present_the_previous_pass_as_current_after_target
     scenario = Scenario(tmp_path / "run", DeliveryKind.PARENT_ONLY)
     kernel, subject = scenario.kernel, scenario.delivery.key
     assert scenario.run().kind == "approval"
-    original = query.read(kernel.storage.path, "status").data["subjects"][0]["review"]
+    document = query.read(kernel.storage.path, "status", storage=kernel.storage)
+    original = next(row["review"] for row in document.data["subjects"] if row["subject"] == scenario.delivery.key)
     assert original["outcome"] == "pass"
     arguments = ["status", scenario.spec.run_id, "--state-dir", str(kernel.storage.path), "--plain"]
     assert main(arguments) == 0
@@ -29,15 +30,16 @@ def test_local_status_does_not_present_the_previous_pass_as_current_after_target
     assert main(arguments) == 0
     output = capsys.readouterr().out
     assert "已记录验收结论: 通过" not in output
-    document = query.read(kernel.storage.path, "status")
-    assert document.data["subjects"][0]["review"] == original  # Original audit evidence stays available.
-    assert document.data["subjects"][0]["review_state"] == "stale"
+    document = query.read(kernel.storage.path, "status", storage=kernel.storage)
+    job = next(row for row in document.data["subjects"] if row["subject"] == subject)
+    assert job["review"] == original  # Original audit evidence stays available.
+    assert job["review_state"] == "stale"
     assert durable_snapshot(tmp_path) == before
 
 
 def _assert_current_view(scenario, state, capsys, *, hidden_finding=None):
     before = durable_snapshot(scenario.kernel.storage.path.parent)
-    document = query.read(scenario.kernel.storage.path, "status")
+    document = query.read(scenario.kernel.storage.path, "status", storage=scenario.kernel.storage)
     job = next(item for item in document.data["subjects"] if item["subject"] == scenario.delivery.key)
     assert job["review_state"] == state
     for language in ("en", "zh"):
@@ -64,7 +66,8 @@ def test_local_status_binds_failure_pending_and_pass_to_their_original_candidate
     _assert_current_view(scenario, "not_recorded", capsys)
     for _ in range(100):
         scenario.step()
-        job = query.read(scenario.kernel.storage.path, "status").data["subjects"][0]
+        document = query.read(scenario.kernel.storage.path, "status", storage=scenario.kernel.storage)
+        job = next(row for row in document.data["subjects"] if row["subject"] == scenario.delivery.key)
         if job["review"] and job["review"]["outcome"] == "fail":
             break
     else:
@@ -77,7 +80,8 @@ def test_local_status_binds_failure_pending_and_pass_to_their_original_candidate
     observed = set()
     for _ in range(100):
         step = scenario.step()
-        job = query.read(scenario.kernel.storage.path, "status").data["subjects"][0]
+        document = query.read(scenario.kernel.storage.path, "status", storage=scenario.kernel.storage)
+        job = next(row for row in document.data["subjects"] if row["subject"] == scenario.delivery.key)
         if job["candidate_sha"] != original_candidate:
             assert job["review"] == original  # An unconsumed return does not replace the original audit record.
             observed.add(job["review_state"])
@@ -93,7 +97,7 @@ def test_local_status_binds_failure_pending_and_pass_to_their_original_candidate
     current = _assert_current_view(scenario, "pass", capsys, hidden_finding=finding)
     assert current["review"]["attempt_id"] != original["attempt_id"]
     assert current["review"]["outcome"] == "pass"
-    history = query.read(scenario.kernel.storage.path, "history").data["history"]
+    history = query.read(scenario.kernel.storage.path, "history", storage=scenario.kernel.storage).data["history"]
     previous = next(item for item in history["attempts"] if item["id"] == original["attempt_id"])
     assert previous["result"] == original["artifact"]
 
@@ -101,7 +105,7 @@ def test_local_status_binds_failure_pending_and_pass_to_their_original_candidate
 def test_source_revision_change_does_not_reuse_the_recorded_pass(tmp_path, capsys):
     scenario = Scenario(tmp_path / "run", DeliveryKind.PARENT_ONLY)
     assert scenario.run().kind == "approval"
-    original = query.read(scenario.kernel.storage.path, "status").data["subjects"][0]["review"]
+    original = query.read(scenario.kernel.storage.path, "status", storage=scenario.kernel.storage).data["subjects"][0]["review"]
     scenario.requirements = replace(scenario.requirements,
         parent=replace(scenario.requirements.parent, body="A changed requirement needing a new review"))
     scenario.kernel.refresh(lambda: scenario.requirements)

@@ -42,11 +42,22 @@ def test_material_accepts_empty_and_exact_four_mib_without_truncation(tmp_path, 
 def test_oversize_material_rolls_back_earlier_writes_and_preserves_budget(tmp_path):
     kernel, preparation = native_work(tmp_path)
     before = logical_state(kernel.storage.path)
+    with closing(sqlite3.connect(kernel.storage.path)) as connection:
+        sequence = connection.execute("SELECT seq FROM sqlite_sequence WHERE name='save_admissions'").fetchone()
+        original_sequence = sequence[0] if sequence is not None else 0
     with pytest.raises(KernelError, match='^material_limit'):
         with kernel.storage.transaction() as tx:
             tx.put(preparation.subject, 'earlier-uncommitted-material', b'Keep this exact original evidence.')
             tx.put(preparation.subject, 'too-large', b'x' * (storage.MATERIAL_LIMIT + 1))
-    assert logical_state(kernel.storage.path) == before
+    after = logical_state(kernel.storage.path)
+    # The separate committed FIFO registration consumes exactly one technical
+    # sequence number. It is not a partial business material/budget commit.
+    technical = 'INSERT INTO "sqlite_sequence" VALUES(\'save_admissions\','
+    assert tuple(row for row in after if not row.startswith(technical)) == tuple(
+        row for row in before if not row.startswith(technical))
+    with closing(sqlite3.connect(kernel.storage.path)) as connection:
+        assert connection.execute("SELECT seq FROM sqlite_sequence WHERE name='save_admissions'").fetchone()[0] == original_sequence + 1
+        assert connection.execute('SELECT count(*) FROM save_admissions').fetchone()[0] == 0
 
 
 @pytest.mark.parametrize('limit', [-1, 0, 129])
@@ -63,9 +74,15 @@ def test_query_accepts_exact_row_budget_and_rejects_one_more_row(tmp_path):
     kernel, _ = native_work(tmp_path)
     batch = 'WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<128) SELECT n FROM seq'
     with kernel.storage.transaction(write=False) as tx:
-        for _ in range(65536 // 128):
+        assert tx.rows_read > 0
+        batches, remaining = divmod(65536 - tx.rows_read, 128)
+        for _ in range(batches):
             rows = tx.rows(batch)
             assert len(rows) == 128 and rows[0][0] == 1 and rows[-1][0] == 128
+        if remaining:
+            rows = tx.rows(batch + ' WHERE n<=?', (remaining,))
+            assert [row[0] for row in rows] == list(range(1, remaining + 1))
+        assert tx.rows_read == 65536
         assert tx.rows('SELECT 1 WHERE 0') == []
         with pytest.raises(KernelError, match='^query_limit'):
             tx.rows('SELECT 1')
@@ -78,8 +95,13 @@ def test_query_accepts_exact_byte_budget_then_rejects_one_more_byte(tmp_path):
         identity = tx.put(preparation.subject, 'query-boundary', body)
     before = logical_state(kernel.storage.path)
     with kernel.storage.transaction(write=False) as tx:
-        for _ in range(storage.QUERY_LIMIT // len(body)):
-            assert tx.rows('SELECT body FROM material WHERE id=?', (identity,))[0][0] == body
+        assert tx.bytes_read > 0  # The selected Run identity already used this owner budget.
+        for _ in range((storage.QUERY_LIMIT - tx.bytes_read) // len(body)):
+            assert tx.rows('SELECT body FROM material WHERE run_id=? AND id=?', (tx.run_id, identity))[0][0] == body
+        remaining = storage.QUERY_LIMIT - tx.bytes_read
+        if remaining:
+            assert tx.rows('SELECT substr(body,1,?) FROM material WHERE run_id=? AND id=?',
+                           (remaining, tx.run_id, identity))[0][0] == body[:remaining]
         assert tx.bytes_read == storage.QUERY_LIMIT
         with pytest.raises(KernelError, match='^query_limit'):
             tx.rows("SELECT CAST('x' AS BLOB)")

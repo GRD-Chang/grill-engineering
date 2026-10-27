@@ -25,18 +25,24 @@ def test_task_profile_revision_requires_exact_binding_and_only_changes_new_threa
     # This contract concerns one Task's Thread/Profile binding, not sibling scheduling.
     source = replace(source, parent=replace(source.parent, sub_issue_numbers=(3,)),
                      issues=tuple(issue for issue in source.issues if issue.number == 3))
-    scenario = GraphScenario(tmp_path / 'source', source)
-    task = TaskKey(Path(scenario.spec.repository_root), scenario.spec.repository, scenario.spec.parent_issue)
     if binding == 'unbound':
+        # An idle Task has no Run or Executor to prepare. Exercise its real
+        # metadata producer rather than first starting an unrelated Scenario.
+        task = TaskKey(tmp_path / 'repository', 'example/project', source.parent.number)
         route = RepositoryRoute(tmp_path / 'idle' / 'kernel.sqlite3', task.workspace, task.repository)
         route.initialize()
         route.idle(task)
-        with pytest.raises(KernelError, match='run_scope_missing'):
-            route.kernel(scenario.spec.run_id)
+        before = route.database.read_bytes()
+        with pytest.raises(KernelError, match='missing_or_ambiguous_fact'):
+            route.kernel('unallocated-profile-run')
+        assert route.database.read_bytes() == before
+        assert route.task(task).current_run is None
         with route.metadata().transaction(write=False) as tx:
             for table in ('runs', 'invocations', 'actions', 'profile_revisions'):
                 assert tx.one('SELECT count(*) FROM ' + table)[0] == 0
         return
+    scenario = GraphScenario(tmp_path / 'source', source)
+    task = TaskKey(Path(scenario.spec.repository_root), scenario.spec.repository, scenario.spec.parent_issue)
     kernel = create_kernel(tmp_path / 'profile.sqlite3', scenario.spec, requirements=scenario.requirements)
     if binding == 'foreign':
         other = foreign_task_run(kernel, scenario.spec, scenario.requirements)

@@ -146,11 +146,20 @@ def test_unclassified_sqlite_errors_and_interruptions_keep_their_original_identi
     kernel, _, _, original = allocated_work(tmp_path)
     for error in (sqlite3.OperationalError('unclassified failure'), KeyboardInterrupt(), SystemExit(7)):
         before = logical_state(kernel.storage.path)
+        with closing(sqlite3.connect(kernel.storage.path)) as connection:
+            sequence = connection.execute("SELECT seq FROM sqlite_sequence WHERE name='save_admissions'").fetchone()
+            original_sequence = sequence[0] if sequence is not None else 0
         with pytest.raises(type(error)) as caught:
             with kernel.storage.transaction():
                 raise error
         assert caught.value is error
-        assert logical_state(kernel.storage.path) == before
+        after = logical_state(kernel.storage.path)
+        technical = 'INSERT INTO "sqlite_sequence" VALUES(\'save_admissions\','
+        assert tuple(row for row in after if not row.startswith(technical)) == tuple(
+            row for row in before if not row.startswith(technical))
+        with closing(sqlite3.connect(kernel.storage.path)) as connection:
+            assert connection.execute("SELECT seq FROM sqlite_sequence WHERE name='save_admissions'").fetchone()[0] == original_sequence + 1
+            assert connection.execute('SELECT count(*) FROM save_admissions').fetchone()[0] == 0
 
 
 def test_public_stop_reports_real_commit_interruption_without_partial_action(

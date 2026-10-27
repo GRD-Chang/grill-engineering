@@ -231,7 +231,7 @@ def test_committed_wal_metadata_is_visible_and_readers_do_not_change_database_or
 @pytest.mark.parametrize('operation', ['task', 'discover', 'open', 'create', 'reconcile'])
 def test_read_failure_or_missing_database_never_implicitly_initializes_or_creates(tmp_path, operation):
     route = RepositoryRoute(tmp_path / 'absent' / 'kernel.sqlite3', tmp_path / 'repository', 'example/project')
-    with pytest.raises(KernelError, match='missing_database'):
+    with pytest.raises(UnsupportedState, match='unsupported_state') as failure:
         if operation == 'task':
             route.task(task(route))
         elif operation == 'discover':
@@ -242,6 +242,8 @@ def test_read_failure_or_missing_database_never_implicitly_initializes_or_create
             create(route)
         else:
             route.reconcile(task(route), 'original-proposal')
+    assert failure.value.reason == 'unreadable_state' and failure.value.path == route.database
+    assert failure.value.recovery_hint
     assert not route.database.exists() and not route.database.parent.exists()
 
 

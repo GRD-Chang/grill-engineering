@@ -3,12 +3,16 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import selectors
 import subprocess
 import sys
+import time
+from types import SimpleNamespace
+import xml.etree.ElementTree as ET
 
 import pytest
 
-from support.sharding import select_shard
+from support.sharding import FAILURE_TRACEBACK_CHARACTERS, PASSED_SUBTESTS_PROPERTY, _Reports, pytest_configure, select_shard
 
 
 @pytest.mark.parametrize("count", [1, 2, 3, 7])
@@ -50,3 +54,179 @@ def test_real_pytest_shards_cover_the_unfiltered_collection(tmp_path: Path) -> N
                              capture_output=True, text=True, timeout=15)
     assert invalid.returncode == 4
     assert "0 <= index < count" in invalid.stderr
+
+
+@pytest.mark.parametrize('phase', ['setup', 'call', 'teardown'])
+def test_failure_report_is_flushed_before_session_finish_or_interruption(phase):
+    lines, flushed = [], []
+    terminal = SimpleNamespace(write_line=lines.append, flush=lambda: flushed.append(tuple(lines)))
+    observer = _Reports(None, terminal)
+    with pytest.raises(ValueError) as cause:
+        raise ValueError('Original failure; not a replacement outcome')
+    report = pytest.TestReport('test_sample.py::test_original', ('test_sample.py', 0, 'test_original'),
+                              {}, 'failed', cause.getrepr(), phase)
+    before = vars(report).copy()
+    with pytest.raises(KeyboardInterrupt):
+        observer.pytest_runtest_logreport(report)
+        assert len(flushed) == 1
+        assert flushed[0][0] == f"[agent-run failure] phase={phase} nodeid='test_sample.py::test_original'"
+        assert 'ValueError: Original failure; not a replacement outcome' in flushed[0][1]
+        raise KeyboardInterrupt('No sessionfinish is delivered after this point')
+    assert vars(report) == before and report.failed
+    assert len(flushed) == 1
+
+
+def test_live_traceback_is_bounded_without_changing_the_original_report():
+    lines, flushed = [], []
+    observer = _Reports(None, SimpleNamespace(write_line=lines.append, flush=lambda: flushed.append(True)))
+    original = 'Original first frame\n' + 'x' * (2 * FAILURE_TRACEBACK_CHARACTERS) + '\nValueError: root cause'
+    report = pytest.TestReport('test_large.py::test_original', ('test_large.py', 0, 'test_original'),
+                              {}, 'failed', original, 'call')
+    observer.pytest_runtest_logreport(report)
+    assert len(lines[1]) == FAILURE_TRACEBACK_CHARACTERS and flushed == [True]
+    assert lines[1].startswith('Original first frame') and lines[1].endswith('ValueError: root cause')
+    assert 'traceback truncated' in lines[1]
+    assert report.longrepr == original and report.failed
+
+
+@pytest.mark.parametrize('outcome', ['passed', 'skipped'])
+@pytest.mark.parametrize('duration', [0.0, 4.999999])
+def test_nonfailure_reports_do_not_emit_live_failure_diagnostics(outcome, duration):
+    lines = []
+    observer = _Reports(None, SimpleNamespace(write_line=lines.append, flush=lambda: lines.append('flush')))
+    report = pytest.TestReport('test_sample.py::test_original', ('test_sample.py', 0, 'test_original'),
+                              {}, outcome, None, 'call', duration=duration)
+    observer.pytest_runtest_logreport(report)
+    assert lines == [] and report.outcome == outcome
+
+
+@pytest.mark.parametrize('worker', [False, True])
+def test_only_controller_registers_live_reporting(worker, capsys):
+    registered = []
+    config = SimpleNamespace(getoption=lambda key: {'test_shard_count': 1, 'test_shard_index': 0}[key],
+        stash={}, pluginmanager=SimpleNamespace(register=registered.append, get_plugin=lambda name: None))
+    if worker:
+        config.workerinput = {}
+    pytest_configure(config)
+    assert len(registered) == (0 if worker else 1)
+    report = pytest.TestReport('test_sample.py::test_slow', ('test_sample.py', 0, 'test_slow'),
+                              {}, 'passed', None, 'call', duration=5.0)
+    for observer in registered:
+        observer.pytest_runtest_logreport(report)
+    captured = capsys.readouterr()
+    assert captured.out == ''
+    assert captured.err.count('[agent-run slow]') == (0 if worker else 1)
+
+
+@pytest.mark.parametrize('phase', ['setup', 'call', 'teardown'])
+@pytest.mark.parametrize('duration', [5.0, 17.12500001])
+@pytest.mark.parametrize('outcome', ['passed', 'failed'])
+def test_slow_completed_phase_logs_exact_report_duration_without_changing_outcome(phase, duration, outcome):
+    lines, flushed = [], []
+    observer = _Reports(None, SimpleNamespace(write_line=lines.append, flush=lambda: flushed.append(tuple(lines))))
+    report = pytest.TestReport('test_sample.py::test_slow', ('test_sample.py', 0, 'test_slow'),
+                              {}, outcome, 'RuntimeError: original slow failure' if outcome == 'failed' else None,
+                              phase, duration=duration)
+    before = vars(report).copy()
+    observer.pytest_runtest_logreport(report)
+    assert lines[0] == (f"[agent-run slow] phase={phase} duration_seconds={duration!r} "
+                        "nodeid='test_sample.py::test_slow'")
+    assert len(flushed) == (2 if outcome == 'failed' else 1)
+    assert flushed[0] == (lines[0],)
+    if outcome == 'failed':
+        assert lines[1].startswith('[agent-run failure]')
+        assert lines[2] == 'RuntimeError: original slow failure'
+    else:
+        assert len(lines) == 1
+    assert vars(report) == before and report.outcome == outcome
+
+
+@pytest.mark.parametrize('workers', [0, 2])
+def test_real_failure_reports_preserve_summary_junit_and_exit_code(tmp_path, workers):
+    sample = tmp_path / 'test_failures.py'
+    sample.write_text('''import pytest
+@pytest.fixture
+def bad_setup():
+    raise RuntimeError('original setup failure')
+@pytest.fixture
+def bad_teardown():
+    yield
+    raise RuntimeError('original teardown failure')
+def test_setup(bad_setup):
+    pass
+def test_call():
+    assert False, 'original call failure'
+def test_teardown(bad_teardown):
+    pass
+def test_subtests(subtests):
+    with subtests.test(case='passed'):
+        assert True
+    with subtests.test(case='failed'):
+        assert False, 'original subtest failure'
+''')
+    junit = tmp_path / 'failures.xml'
+    command = [sys.executable, '-m', 'pytest', '--noconftest', '-p', 'support.sharding',
+               '-q', str(sample), '--junitxml=' + str(junit)]
+    if workers:
+        command += ['-p', 'xdist.plugin', '-n', str(workers)]
+    environment = {**os.environ, 'PYTHONPATH': str(Path(__file__).parent),
+                   'PYTEST_DISABLE_PLUGIN_AUTOLOAD': '1', 'PYTHONDONTWRITEBYTECODE': '1'}
+    result = subprocess.run(command, cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 1, result.stdout + result.stderr
+    # pytest 9 retains both the failed subtest and its failed parent call.
+    # Observe that classification after the normal reporting hooks, without
+    # deduplicating outcomes or counting worker-side console output.
+    assert result.stdout.count('[agent-run failure]') == 5
+    for name in ('test_setup', 'test_call', 'test_teardown'):
+        assert result.stdout.count("nodeid='test_failures.py::" + name + "'") == 1
+    for phase in ('setup', 'call', 'teardown'):
+        assert '[agent-run failure] phase=' + phase in result.stdout
+    assert 'short test summary info' in result.stdout
+    for reason in ('original setup failure', 'original call failure', 'original teardown failure', 'original subtest failure'):
+        assert reason in result.stdout
+    document = ET.parse(junit)
+    assert len(document.findall('.//failure')) == 3
+    assert len(document.findall('.//error')) == 2
+    properties = document.findall('.//property')
+    assert any(row.attrib == {'name': PASSED_SUBTESTS_PROPERTY, 'value': '1'} for row in properties)
+
+
+def test_live_failure_is_available_before_controlled_pytest_cancellation(tmp_path):
+    sample = tmp_path / 'test_interrupted.py'
+    sample.write_text('''import sys
+def test_a_failure():
+    assert False, 'original failure before interruption'
+def test_b_hold_for_owner():
+    print('held-for-controlled-cancellation', flush=True)
+    sys.stdin.read(1)
+''')
+    command = [sys.executable, '-m', 'pytest', '--noconftest', '-p', 'support.sharding', '-q', '-s', str(sample)]
+    environment = {**os.environ, 'PYTHONPATH': str(Path(__file__).parent),
+                   'PYTEST_DISABLE_PLUGIN_AUTOLOAD': '1', 'PYTHONDONTWRITEBYTECODE': '1'}
+    # This direct child has no xdist/Host/Worker or child-launching test. Kill
+    # only its still-owned Popen handle after reading the flushed diagnostic.
+    with subprocess.Popen(command, cwd=tmp_path, env=environment, stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as child:
+        try:
+            assert child.stdout is not None
+            output = bytearray()
+            deadline = time.monotonic() + 10
+            with selectors.DefaultSelector() as ready:
+                ready.register(child.stdout, selectors.EVENT_READ)
+                while b'held-for-controlled-cancellation\n' not in output:
+                    assert time.monotonic() < deadline, output.decode(errors='replace')
+                    for key, _ in ready.select(timeout=max(0, deadline - time.monotonic())):
+                        data = os.read(key.fd, 65536)
+                        assert data, output.decode(errors='replace')
+                        output.extend(data)
+                        assert len(output) <= 1024 * 1024
+            assert child.poll() is None
+            assert b"[agent-run failure] phase=call nodeid='test_interrupted.py::test_a_failure'" in output
+            assert b'AssertionError: original failure before interruption' in output
+            assert b'short test summary info' not in output
+            child.kill()
+            assert child.wait(timeout=5) != 0
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=5)

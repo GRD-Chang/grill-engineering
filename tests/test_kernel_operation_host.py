@@ -85,8 +85,8 @@ def test_host_dispatches_call_then_polls_independent_io_and_requires_durable_exi
             exited.set()
 
     class Notifications:
-        def __init__(self, *_args):
-            pass
+        def __init__(self, *_args, storage):
+            assert storage is Core.storage
         def observe_committed(self):
             pass
         def close(self, **_kwargs):

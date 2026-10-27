@@ -76,6 +76,7 @@ def test_status_rejects_damaged_journal_and_task_without_mutating_core(tmp_path,
     with pytest.raises(ValueError, match="journal"):
         sender.stage(subject)
     location = task_path(TaskKey(Path(scenario.spec.repository_root), scenario.spec.repository, 1))
+    location.parent.mkdir(parents=True, exist_ok=True)
     location.write_text('{"run_id":"other","database":"/tmp/other.sqlite3"}')
     projection = project_status(database, subject, storage=scenario.kernel.storage)
     assert projection.target.run_id == scenario.spec.run_id
@@ -292,8 +293,10 @@ from pathlib import Path
 from support.status_comments import CommentsAPI
 from agent_run.queries.status_comment import project_status
 from agent_run.notifications.status_comment import StatusComments
+from agent_run.core.kernel import Kernel
 p,subject,output=Path(sys.argv[1]),sys.argv[2],Path(sys.argv[3])
 dispatched=sys.argv[4]=='True'
+storage=Kernel(p,run_id=sys.argv[5]).storage
 class Interrupted(CommentsAPI):
  def object(self,endpoint):
   if not dispatched:os._exit(18)
@@ -302,13 +305,13 @@ class Interrupted(CommentsAPI):
   super().write(*args)
   output.write_text(json.dumps({'comments':self.comments,'commands':self.commands}))
   os._exit(17)
-a=Interrupted(project_status(p,subject).target)
-StatusComments(p).deliver(subject,api=a)
+a=Interrupted(project_status(p,subject,storage=storage).target)
+StatusComments(p,storage=storage).deliver(subject,api=a)
 raise AssertionError('physical dispatch was not reached')
 '''
     before = database.read_bytes()
     script = "import sys;sys.path.insert(0,sys.argv.pop(1))\n" + script
-    result = subprocess.run([sys.executable, "-c", script, str(Path(__file__).parent), str(database), subject, str(evidence), str(dispatched)],
+    result = subprocess.run([sys.executable, "-c", script, str(Path(__file__).parent), str(database), subject, str(evidence), str(dispatched), scenario.kernel.storage.run_id],
                             env=dict(os.environ), capture_output=True, text=True, timeout=20)
     assert result.returncode == (17 if dispatched else 18), result.stderr
     assert database.read_bytes() == before
@@ -670,7 +673,7 @@ from agent_run.cli.host_exit import main
 raise SystemExit(main(sys.argv[3:]))
 '''
             args = [sys.executable, "-c", script, subject, str(output), "--database", str(kernel.storage.path),
-                    "--action", "status-normal-exit", "--runner-lock", str(lock)]
+                    "--action", "status-normal-exit", "--runner-lock", str(lock), "--run-id=" + kernel.storage.run_id]
             hook_environment = {**environment, "CREDENTIALS_DIRECTORY": str(credentials),
                                 "SERVICE_RESULT": "success", "EXIT_CODE": "exited", "EXIT_STATUS": "0", "INVOCATION_ID": "1" * 32}
             hook = subprocess.run(args, env=hook_environment, capture_output=True, text=True, timeout=10)

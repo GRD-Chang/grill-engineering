@@ -117,8 +117,15 @@ def contract_scope(nodes: list[str]) -> list[str]:
     return selected
 
 
-def record(folder: Path, shard: int, *, contract: bool) -> None:
-    if shard not in (0, 1):
+def _shard_count(value: int) -> int:
+    if type(value) is not int or not 1 <= value <= 256:
+        raise ValueError("Expected an explicit shard count from 1 through 256")
+    return value
+
+
+def record(folder: Path, shard: int, *, contract: bool, shard_count: int = 2) -> None:
+    shard_count = _shard_count(shard_count)
+    if type(shard) is not int or not 0 <= shard < shard_count:
         raise ValueError("Unexpected shard index")
     report = read_environment(folder)
     if (report["python"]["version"] != sys.version
@@ -126,11 +133,11 @@ def record(folder: Path, shard: int, *, contract: bool) -> None:
         raise ValueError("Test environment differs from the recording interpreter")
     cases = junit_cases(folder)
     nodes = collect_nodeids()
-    expected = {junit_key(node) for node in nodes[shard::2]}
-    if cases != expected or len({junit_key(node) for node in nodes}) != len(nodes):
+    expected = {junit_key(node) for node in nodes[shard::shard_count]}
+    if len(nodes) < shard_count or cases != expected or len({junit_key(node) for node in nodes}) != len(nodes):
         raise ValueError("JUnit coverage does not match the complete shard collection")
     receipt = {
-        "identity": identity(), "shard_count": 2, "shard_index": shard,
+        "identity": identity(), "shard_count": shard_count, "shard_index": shard,
         "collection_sha256": digest(nodes), "total_count": len(nodes), "selected_count": len(cases),
         "dependencies_sha256": dependency_digest(),
         "junit_sha256": file_digest(folder / "junit.xml"),
@@ -146,7 +153,7 @@ def boolean(value: str) -> bool:
     return value == "true"
 
 
-def verify(folder: Path, *, selected: str, product: str, contract: str, result: str) -> int:
+def verify(folder: Path, *, selected: str, product: str, contract: str, result: str, shard_count: int = 2) -> int:
     runs, tests, consumed = boolean(selected), boolean(product), boolean(contract)
     if (tests and not runs) or (consumed and not tests):
         raise ValueError("Inconsistent check selection")
@@ -154,11 +161,12 @@ def verify(folder: Path, *, selected: str, product: str, contract: str, result: 
         raise ValueError(f"Unexpected checks result: {result!r}")
     if not tests:
         return 0
-    expected = {f"test-diagnostics-shard-{index}" for index in range(2)}
+    shard_count = _shard_count(shard_count)
+    expected = {f"test-diagnostics-shard-{index}" for index in range(shard_count)}
     if {path.name for path in folder.iterdir()} != expected:
         raise ValueError("Missing or unexpected test shards")
     receipts, environments, observed = [], [], []
-    for index in range(2):
+    for index in range(shard_count):
         shard = folder / f"test-diagnostics-shard-{index}"
         receipt = json.loads((shard / "evidence.json").read_text())
         current, source = identity(), receipt["identity"]
@@ -170,7 +178,8 @@ def verify(folder: Path, *, selected: str, product: str, contract: str, result: 
         if (not isinstance(source.get(attempt), str) or not source[attempt].isdigit()
                 or not 1 <= int(source[attempt]) <= int(current[attempt])):
             raise ValueError("Test shard has an invalid or future attempt identity")
-        if receipt["shard_count"] != 2 or receipt["shard_index"] != index:
+        if (type(receipt["shard_count"]) is not int or receipt["shard_count"] != shard_count
+                or type(receipt["shard_index"]) is not int or receipt["shard_index"] != index):
             raise ValueError("Duplicate or inconsistent shard identity")
         if receipt["dependencies_sha256"] != dependency_digest():
             raise ValueError("Test dependency inputs changed")
@@ -179,22 +188,26 @@ def verify(folder: Path, *, selected: str, product: str, contract: str, result: 
             if receipt[f"{name}_sha256"] != file_digest(shard / f"{name}.{suffix}"):
                 raise ValueError(f"Test {name} artifact changed")
         cases = junit_cases(shard)
-        if type(receipt["total_count"]) is not int or receipt["total_count"] < 2:
+        if type(receipt["total_count"]) is not int or receipt["total_count"] < shard_count:
             raise ValueError("Invalid complete collection count")
         if (receipt["selected_count"] != len(cases)
-                or len(cases) != len(range(index, receipt["total_count"], 2))):
+                or len(cases) != len(range(index, receipt["total_count"], shard_count))):
             raise ValueError("Incomplete shard coverage")
         receipts.append(receipt)
         environments.append(environment_signature(read_environment(shard)))
         observed.append(cases)
-    if environments[0] != environments[1]:
+    if len(set(environments)) != 1:
         raise ValueError("Test shards used different environments")
     for field in ("collection_sha256", "total_count", "contract_nodeids"):
-        if receipts[0][field] != receipts[1][field]:
+        if any(receipt[field] != receipts[0][field] for receipt in receipts[1:]):
             raise ValueError(f"Test shards used different collection scope: {field}")
-    if observed[0] & observed[1]:
-        raise ValueError("Test shard coverage overlaps")
-    all_cases = observed[0] | observed[1]
+    all_cases: set[tuple[str, str]] = set()
+    for cases in observed:
+        if all_cases & cases:
+            raise ValueError("Test shard coverage overlaps")
+        all_cases.update(cases)
+    if len(all_cases) != receipts[0]["total_count"]:
+        raise ValueError("Incomplete complete collection coverage")
     scope = receipts[0]["contract_nodeids"]
     if consumed:
         bases = {junit_key(node) for node in CONTRACT_TESTS}
@@ -214,18 +227,21 @@ def main() -> None:
     writer = commands.add_parser("record")
     writer.add_argument("--results", type=Path, required=True)
     writer.add_argument("--shard", type=int, required=True)
+    writer.add_argument("--shard-count", type=int, default=2)
     writer.add_argument("--contract", choices=("true", "false"), default="false")
     reader = commands.add_parser("verify")
     reader.add_argument("--results", type=Path, required=True)
+    reader.add_argument("--shard-count", type=int, default=2)
     args = parser.parse_args()
     try:
         if args.command == "record":
-            record(args.results, args.shard, contract=boolean(args.contract))
+            record(args.results, args.shard, contract=boolean(args.contract), shard_count=args.shard_count)
             print(f"Recorded complete test shard {args.shard}")
         else:
             total = verify(
                 args.results, selected=os.environ["CHECKS_SELECTED"], product=os.environ["PRODUCT_SELECTED"],
                 contract=os.environ.get("CONTRACT_SELECTED", "false"), result=os.environ["PRODUCT_RESULT"],
+                shard_count=args.shard_count,
             )
             print(f"CI checks verified: {total} product tests")
     except (ValueError, OSError, KeyError, TypeError, ET.ParseError, subprocess.SubprocessError) as error:

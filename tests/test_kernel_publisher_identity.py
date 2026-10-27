@@ -75,18 +75,44 @@ def close_intent(effect: Effect) -> dict:
 
 
 def test_unconfigured_run_cannot_publish_with_two_missing_identity_selections(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
-    scenario.execution = scenario.kernel.claim_executor("unconfigured-owner")
-    # A deliberately unconfigured input is a publisher-validation unit, not
-    # a managed native Run. The runner rejects its missing creation binding.
-    from agent_run.model import World
-    world = World("parent", "graph", "subject", scenario.initial,
+    from agent_run.contracts.task import TaskKey
+    from agent_run.errors import GitHubIdentityError
+    from agent_run.model import Commit, Delivery, ParentIssue, Requirements, RunSpec, World
+    from agent_run.storage.routing import RepositoryRoute
+    from support.offline import fixture_inputs
+
+    route = RepositoryRoute(tmp_path / 'state' / 'kernel.sqlite3', tmp_path / 'repository', 'example/project')
+    route.initialize()
+    base = Commit('base', 'tree')
+    delivery = Delivery('parent:1', DeliveryKind.PARENT_ONLY, 1, 'revision', base, 'source', 'target')
+    inputs = fixture_inputs()
+    source = Requirements(ParentIssue(1, 'Parent', 'Original scope'), ())
+    task = TaskKey(route.repository_root, route.repository, 1)
+    spec = RunSpec('publisher-validation', route.repository, 1, 'parent', 'graph', (delivery,),
+        language='en', repository_root=str(route.repository_root),
+        inputs=replace(inputs, worker_identity=None, runner_identity=None))
+    before = route.database.read_bytes()
+    # Missing selections cannot publish even the initial frozen Run. Exercise
+    # its normal atomic producer, without claiming a second fixture Executor.
+    with pytest.raises(GitHubIdentityError):
+        route.create(task, spec, source)
+    assert route.database.read_bytes() == before
+    with route.metadata().transaction(write=False) as tx:
+        for table in ('tasks', 'runs', 'actions', 'hosts', 'invocations', 'effects'):
+            assert tx.one('SELECT count(*) FROM ' + table)[0] == 0
+    assert route.create(task, replace(spec, inputs=inputs), source).created
+    kernel = route.kernel(spec.run_id)
+    # A valid frozen selection still cannot publish from an observation whose
+    # identity is missing; None must not be accepted as matching authority.
+    world = World("parent", "graph", "subject", base,
                   publisher_actor="offline-publisher", publisher_identity=None)
     assert world.publisher_actor is not None and world.publisher_identity is None
-    with scenario.kernel.storage.transaction(write=False) as tx:
+    with kernel.storage.transaction(write=False) as tx:
         run = tx.one("SELECT * FROM runs")
         with pytest.raises(KernelError, match="publisher_identity_unproven"):
-            scenario.kernel._publisher_actor(tx, run, world)
+            kernel._publisher_actor(tx, run, world)
+        assert tx.one('SELECT executor FROM runs')[0] is None
+        assert tx.one('SELECT count(*) FROM effects')[0] == 0
 
 
 @pytest.mark.parametrize("changed", ["missing-actor", "missing-selection", "other-selection"])

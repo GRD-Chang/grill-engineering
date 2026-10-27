@@ -21,9 +21,9 @@ def test_resume_without_a_managed_workspace_explains_how_to_start(tmp_path: Path
     )
     assert result.returncode == 2
     diagnostic = json.loads(result.stdout)['diagnostics'][0]
-    assert diagnostic['code'] == 'run_locator_missing'
-    assert 'Runner 工作区' in diagnostic['message']
-    assert 'run' in diagnostic['message']
+    assert diagnostic['code'] == 'unsupported_state'
+    assert diagnostic['reason'] == 'unreadable_state' and diagnostic['recovery_hint']
+    assert not Path(diagnostic['path']).exists()
     assert not (tmp_path / '.agent-run').exists()
 
 
@@ -76,8 +76,9 @@ def test_invalid_choice_localizes_copy_and_preserves_argument_facts(
 
 @pytest.mark.parametrize("language", ["zh", "en"])
 @pytest.mark.parametrize("as_json", [False, True], ids=["plain", "json"])
+@pytest.mark.parametrize('authority', ['absent', 'empty'])
 def test_missing_run_keeps_current_code_and_explains_discovery_before_creation(
-    tmp_path: Path, monkeypatch, capsys, language: str, as_json: bool,
+    tmp_path: Path, monkeypatch, capsys, language: str, as_json: bool, authority: str,
 ) -> None:
     from agent_run.config.defaults import UserDefaultsStore
     from agent_run.cli.main import main
@@ -86,22 +87,43 @@ def test_missing_run_keeps_current_code_and_explains_discovery_before_creation(
     store = UserDefaultsStore()
     store.configure(language=language)
     original = store.path.read_bytes()
+    from agent_run.adapters.workspace import ManagedWorkspace
+    from agent_run.storage.routing import RepositoryRoute
+    from support.environment import durable_snapshot
+    workspace = ManagedWorkspace.for_repository('example/project')
+    if authority == 'empty':
+        RepositoryRoute.for_workspace(workspace).initialize()
+    before = durable_snapshot(workspace.root)
     arguments = ["resume", "213", "--repo", "example/project"]
     assert main([*arguments, *(["--json"] if as_json else [])]) == 2
     captured = capsys.readouterr()
     assert captured.err == ""
+    code = 'unsupported_state' if authority == 'absent' else 'run_locator_missing'
     if as_json:
         diagnostic = json.loads(captured.out)["diagnostics"][0]
-        assert diagnostic["code"] == "run_locator_missing"
-        message = diagnostic["message"]
+        assert diagnostic['code'] == code
+        if authority == 'absent':
+            assert diagnostic['reason'] == 'unreadable_state'
+            assert diagnostic['path'] == str(workspace.state_root / 'kernel.sqlite3')
+            message = diagnostic['recovery_hint']
+        else:
+            message = diagnostic['message']
     else:
-        assert "run_locator_missing" in captured.out
+        assert code in captured.out
+        if authority == 'absent':
+            assert str(workspace.state_root / 'kernel.sqlite3') in captured.out
         message = captured.out
-    assert ("找不到匹配的 Run" if language == "zh" else "No matching Run") in message
-    assert ("Runner 工作区" if language == "zh" else "Runner workspace") in message
-    assert "agent-run runs --repo OWNER/NAME" in message
-    assert "agent-run run PARENT --repo OWNER/NAME" in message
+    # An absent requested authority is not proof of an empty Task. Retain the
+    # exact preservation/recovery diagnosis instead of suggesting recreation.
+    if authority == 'absent':
+        assert 'Preserve the database and sidecars' in message
+    else:
+        assert ("找不到匹配的 Run" if language == "zh" else "No matching Run") in message
+        assert ("Runner 工作区" if language == "zh" else "Runner workspace") in message
+        assert "agent-run runs --repo OWNER/NAME" in message
+        assert "agent-run run PARENT --repo OWNER/NAME" in message
     assert store.path.read_bytes() == original
+    assert durable_snapshot(workspace.root) == before
     assert not (tmp_path / ".agent-run").exists()
 
 
@@ -190,12 +212,19 @@ def test_stop_receipt_uses_frozen_language_and_keeps_internal_identity_only_in_j
         assert ("Host 状态未确认" if language == "zh" else "Host state unconfirmed") in output.out
 
 
-def test_ambiguous_run_error_keeps_locations_and_machine_identity_without_repeating_private_ids(tmp_path: Path, capsys) -> None:
+def test_ambiguous_run_error_keeps_locations_and_machine_identity_without_repeating_private_ids(tmp_path: Path, capsys, monkeypatch) -> None:
     from agent_run.cli.main import main
     from support.cli_fixtures import _create
     from support.environment import durable_snapshot as _snapshot
 
-    kernels = [_create(tmp_path, identity) for identity in ("private-one", "private-two")]
+    from agent_run.storage.routing import RepositoryRoute
+
+    # One Task cannot publish two active Runs in one authority. Supply two
+    # independently created authorities at the routing boundary to exercise
+    # the CLI's refusal and private-ID presentation, rather than reuse one Task.
+    kernels = [_create(tmp_path / identity, identity) for identity in ("private-one", "private-two")]
+    routes = tuple(RepositoryRoute.from_database(kernel.storage.path) for kernel in kernels)
+    monkeypatch.setattr('agent_run.cli.selection.managed_repository_routes', lambda parsed: routes)
     before = _snapshot(tmp_path)
     arguments = ["status", "--repo", "example/project", "--parent", "1", "--data-root", str(tmp_path)]
     assert main(arguments) == 2

@@ -1,6 +1,8 @@
 """CI 只接受同一运行、完整且成功的候选证据。"""
 
 from copy import deepcopy
+from contextlib import redirect_stdout, redirect_stderr
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -142,6 +144,117 @@ class EvidenceTests(unittest.TestCase):
         receipt = json.loads(path.read_text())
         receipt.update(changes)
         path.write_text(json.dumps(receipt))
+
+    def declared_shards(self, count):
+        self.results = self.root / f"declared-{count}"
+        for index in range(count):
+            folder = self.folder(index)
+            folder.mkdir(parents=True)
+            (folder / "environment.json").write_text(json.dumps(self.report))
+            self.junit(folder, sorted(self.nodes)[index::count])
+            evidence.record(folder, index, contract=True, shard_count=count)
+
+    def verify_declared(self, count):
+        return evidence.verify(self.results, selected="true", product="true", contract="true", result="success",
+                               shard_count=count)
+
+    def test_predeclared_two_and_four_shards_keep_complete_parent_coverage(self):
+        for count in (2, 4):
+            with self.subTest(count=count):
+                self.declared_shards(count)
+                self.assertEqual(self.verify_declared(count), len(self.nodes))
+                for index in range(count):
+                    receipt = json.loads((self.folder(index) / 'evidence.json').read_text())
+                    self.assertEqual(receipt['shard_count'], count)
+                    self.assertEqual(receipt['selected_count'], len(sorted(self.nodes)[index::count]))
+
+    def test_four_shards_reject_missing_duplicate_wrong_count_and_foreign_sha(self):
+        self.declared_shards(4)
+        folder = self.folder(3)
+        relocated = self.root / 'missing-fourth'
+        folder.rename(relocated)
+        try:
+            with self.assertRaisesRegex(ValueError, 'shards'):
+                self.verify_declared(4)
+        finally:
+            relocated.rename(folder)
+        path = folder / 'evidence.json'
+        original = path.read_text()
+        for changed in ({'shard_index': 2}, {'shard_count': 2},
+                        {'identity': self.identity | {'GITHUB_SHA': 'b' * 40}},
+                        {'collection_sha256': 'another-collection'}):
+            with self.subTest(changed=changed):
+                self.change_receipt(3, **changed)
+                with self.assertRaises(ValueError):
+                    self.verify_declared(4)
+                path.write_text(original)
+        for count in (0, 2, 3, 5):
+            with self.subTest(expected=count), self.assertRaises(ValueError):
+                self.verify_declared(count)
+        self.assertEqual(self.verify_declared(4), len(self.nodes))
+
+    def test_four_shards_check_late_shard_overlap_and_environment(self):
+        self.declared_shards(4)
+        folder = self.folder(3)
+        xml, receipt = (folder / 'junit.xml').read_bytes(), (folder / 'evidence.json').read_bytes()
+        self.junit(folder, sorted(self.nodes)[2::4])
+        self.change_receipt(3, junit_sha256=evidence.file_digest(folder / 'junit.xml'))
+        with self.assertRaisesRegex(ValueError, 'overlap'):
+            self.verify_declared(4)
+        (folder / 'junit.xml').write_bytes(xml)
+        (folder / 'evidence.json').write_bytes(receipt)
+        report = self.report | {'cpu_count': 9}
+        (folder / 'environment.json').write_text(json.dumps(report))
+        self.change_receipt(3, environment_sha256=evidence.file_digest(folder / 'environment.json'))
+        with self.assertRaisesRegex(ValueError, 'environments'):
+            self.verify_declared(4)
+
+    def test_four_shard_record_requires_its_exact_partition(self):
+        self.declared_shards(4)
+        folder, nodes = self.folder(3), sorted(self.nodes)[3::4]
+        for changed in ([], nodes[:-1], sorted(self.nodes)[2::4], nodes + [nodes[0]]):
+            self.junit(folder, changed)
+            with self.subTest(nodes=changed), self.assertRaises(ValueError):
+                evidence.record(folder, 3, contract=True, shard_count=4)
+        self.junit(folder, nodes)
+        for count, index in ((0, 0), (257, 0), (4, 4), (4, -1), (True, 0), (4, True)):
+            with self.subTest(count=count, index=index), self.assertRaises(ValueError):
+                evidence.record(folder, index, contract=True, shard_count=count)
+
+    def test_verify_cli_consumes_declared_count_and_rejects_missing_matrix_output(self):
+        self.declared_shards(4)
+        environment = {'CHECKS_SELECTED': 'true', 'PRODUCT_SELECTED': 'true', 'CONTRACT_SELECTED': 'true',
+                       'PRODUCT_RESULT': 'success'}
+        arguments = ['ci_evidence.py', 'verify', '--results', str(self.results), '--shard-count']
+        output = StringIO()
+        with patch.dict(os.environ, environment), patch.object(sys, 'argv', [*arguments, '4']), redirect_stdout(output):
+            evidence.main()
+        self.assertIn(str(len(self.nodes)) + ' product tests', output.getvalue())
+        with patch.dict(os.environ, environment), patch.object(sys, 'argv', [*arguments, '0']), redirect_stderr(StringIO()):
+            with self.assertRaises(SystemExit) as failure:
+                evidence.main()
+            self.assertEqual(failure.exception.code, 1)
+        environment.update(PRODUCT_SELECTED='false', CONTRACT_SELECTED='false')
+        with patch.dict(os.environ, environment), patch.object(sys, 'argv', [*arguments, '0']), redirect_stdout(StringIO()):
+            evidence.main()  # Private-only checks declare no product matrix.
+
+    def test_real_four_shard_pytest_results_form_one_complete_evidence_set(self):
+        (self.product / 'pyproject.toml').write_text('[tool.pytest.ini_options]\ntestpaths = ["tests"]\n')
+        (self.product / 'tests/test_sample.py').write_text(
+            'import pytest\n@pytest.mark.parametrize("value", range(8))\n'
+            'def test_value(value): assert value >= 0\n')
+        self.results = self.root / 'real-four-shards'
+        with patch.object(evidence, 'collect_nodeids', self.real_collect):
+            for index in range(4):
+                folder = self.folder(index)
+                folder.mkdir(parents=True)
+                (folder / 'environment.json').write_text(json.dumps(self.report))
+                result = self.run_pytest(folder, '--test-shard-count=4', f'--test-shard-index={index}',
+                                         '-n', '2', '--dist', 'worksteal')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                evidence.record(folder, index, contract=False, shard_count=4)
+        self.assertEqual(evidence.verify(self.results, selected='true', product='true', contract='false',
+                                         result='success', shard_count=4), 8)
 
     def test_complete_candidate_is_accepted_without_running_tests_again(self):
         self.assertEqual(self.verify(), len(self.nodes))

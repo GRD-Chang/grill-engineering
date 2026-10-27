@@ -10,7 +10,7 @@ from pathlib import Path
 
 from agent_run.contracts.task import TaskKey
 from agent_run.core.kernel import Kernel
-from agent_run.model import Blocker, Delivery, DeliveryKind, Issue, ParentIssue, Requirements, Role, RunSpec
+from agent_run.model import Blocker, Delivery, DeliveryKind, Issue, ParentIssue, Profile, Requirements, Role, RunSpec
 from agent_run.storage.routing import RepositoryRoute
 from agent_run.storage.sqlite import Storage
 
@@ -20,11 +20,14 @@ def create_kernel(path: Path, spec: RunSpec, *, requirements: Requirements | Non
 
     inputs = spec.inputs
     if inputs is None:
+        inputs = fixture_inputs()
         profiles = {'preset': None, 'profiles': {
             role.value: {'model': getattr(spec.policy, role.value + '_profile').model,
-                         'reasoning_effort': getattr(spec.policy, role.value + '_profile').effort,
+                         'reasoning_effort': (inputs.profiles['profiles'][role.value]['reasoning_effort']
+                             if getattr(spec.policy, role.value + '_profile').effort == Profile().effort
+                             else getattr(spec.policy, role.value + '_profile').effort),
                          'reference': None, 'provenance': {'source': 'explicit-fixture-policy'}} for role in Role}}
-        inputs = replace(fixture_inputs(), profiles=profiles)
+        inputs = replace(inputs, profiles=profiles)
     spec = replace(spec, inputs=inputs, language=spec.language or 'zh',
                    repository_root=spec.repository_root or str(path.parent.resolve()))
     if requirements is None:

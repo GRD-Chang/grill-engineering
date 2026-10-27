@@ -145,13 +145,13 @@ def test_exit_invalidated_after_claim_is_recorded_unsent_not_unknown(tmp_path: P
     with _killed_host(tmp_path) as (kernel, notice):
         original_current = facts.host_exit_current
         stopped = False
-        def current(database, evidence):
+        def current(database, evidence, *, storage):
             nonlocal stopped
             document = outbox.read_notifications(tmp_path, "run-native")
             if not stopped and any(item["outcome"] == "sending" for item in document.get("pending", [])):
                 kernel.stop_task("stop-after-journal-claim")
                 stopped = True
-            return original_current(database, evidence)
+            return original_current(database, evidence, storage=storage)
         monkeypatch.setattr(facts, "host_exit_current", current)
         def forbidden(*_args, **_kwargs):
             raise AssertionError("the known obsolete claim must never enter transport")
@@ -170,13 +170,13 @@ def test_temporary_unsent_claim_does_not_label_later_success_unsent(tmp_path: Pa
     with _killed_host(tmp_path) as (kernel, notice):
         original_current = facts.host_exit_current
         interrupted = False
-        def current(database, evidence):
+        def current(database, evidence, *, storage):
             nonlocal interrupted
             document = outbox.read_notifications(tmp_path, "run-native")
             if not interrupted and any(item["outcome"] == "sending" for item in document.get("pending", [])):
                 interrupted = True
                 return False  # This one physical preflight cannot verify its original Host.
-            return original_current(database, evidence)
+            return original_current(database, evidence, storage=storage)
         monkeypatch.setattr(facts, "host_exit_current", current)
         calls = []
         def transport(_config, _card, identity, *_args, **kwargs):
@@ -204,12 +204,12 @@ def test_exit_identity_read_fault_before_submit_keeps_original_unsent_attempt(tm
         identity_ready = False
         interrupted = False
         commands = []
-        def current(database, evidence):
+        def current(database, evidence, *, storage):
             nonlocal interrupted
             if identity_ready and not interrupted:
                 interrupted = True
                 raise facts.HostExitUnavailable("temporary original Host read failure")
-            return original_current(database, evidence)
+            return original_current(database, evidence, storage=storage)
         def run(argv, _deadline, _cancel):
             nonlocal identity_ready
             commands.append(argv)

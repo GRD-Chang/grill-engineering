@@ -83,17 +83,23 @@ def test_host_observation_cannot_replace_the_first_systemd_invocation(tmp_path: 
 
 def test_two_processes_cannot_admit_different_runs_for_one_task(tmp_path: Path) -> None:
     first, other = task_run(tmp_path, "first")[0], task_run(tmp_path, "other")[0]
+    # Competing creation proposals reuse this Task's original complete Run.
+    # The two processes still contend for one durable Host admission/dispatch.
+    assert first.storage.path == other.storage.path
+    assert first.storage.run_id == other.storage.run_id == 'first'
     script = """import json,sys
 from pathlib import Path
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 sys.stdin.read(1)
 kernel = Kernel(Path(sys.argv[1]),run_id=sys.argv[3])
+stage = 'admit_host'
 try:
     request = kernel.admit_host(sys.argv[4], kind='run', command=('native-host',), environment_carrier=Path(sys.argv[2]), preflight=lambda: None)
+    stage = 'dispatch_host'
     print(json.dumps({'run': request.run_id, 'dispatch': kernel.dispatch_host(request)}))
 except KernelError as error:
-    print(json.dumps({'error': error.code}))
+    print(json.dumps({'error': error.code, 'stage': stage, 'run': kernel.storage.run_id}))
 """
     children = [subprocess.Popen([sys.executable, "-c", script, str(kernel.storage.path), str(tmp_path / "carrier"),
                                  kernel.storage.run_id, "start-" + str(index)],
@@ -107,8 +113,8 @@ except KernelError as error:
         outputs = [child.communicate(timeout=15) for child in children]
         assert all(child.returncode == 0 for child in children), outputs
         facts = [json.loads(output) for output, _ in outputs]
-        assert sum(fact.get("dispatch") is True for fact in facts) == 1
-        assert sum(fact.get("error") == "executor_exit_unproven" for fact in facts) == 1
+        assert sum(fact.get("dispatch") is True for fact in facts) == 1, {'facts': facts, 'outputs': outputs}
+        assert sum(fact.get("error") == "executor_exit_unproven" for fact in facts) == 1, {'facts': facts, 'outputs': outputs}
     finally:
         for child in children:
             if child.poll() is None:

@@ -20,6 +20,7 @@ from agent_run.model import Commit, Delivery, DeliveryKind, Execution, HostObser
 from agent_run.queries.read_facts import QueryError
 from agent_run.storage import routing, sqlite as storage_module, tasks
 from agent_run.storage.routing import RepositoryRoute
+from agent_run.storage.preflight import UnsupportedState
 from agent_run.storage.sqlite import Storage
 from support.offline import fixture_inputs
 
@@ -287,8 +288,10 @@ def test_unreadable_or_missing_metadata_does_not_mean_new_task_or_initialization
         with pytest.raises(OSError):
             repository_candidates(parsed(parent=1), (repository,))
     missing = RepositoryRoute(tmp_path / 'missing' / 'kernel.sqlite3', repository.repository_root, repository.repository)
-    with pytest.raises(KernelError, match='missing_database'):
+    with pytest.raises(UnsupportedState, match='unsupported_state') as failure:
         repository_candidates(parsed(parent=1), (missing,))
+    assert failure.value.reason == 'unreadable_state' and failure.value.path == missing.database
+    assert failure.value.recovery_hint
     assert not missing.database.exists() and not missing.database.parent.exists()
     assert dump(repository) == before
 
