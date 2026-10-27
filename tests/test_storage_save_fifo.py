@@ -213,30 +213,36 @@ def test_queue_wait_and_sqlite_busy_share_one_second(tmp_path, monkeypatch):
     clients = [Storage(kernel.storage.path, run_id=kernel.storage.run_id), Storage(kernel.storage.path, run_id=kernel.storage.run_id)]
     entered = [threading.Event(), threading.Event()]
     results, ran = {}, []
-    original = sqlite3.connect
-    def connect(*args, **kwargs):
-        db = original(*args, **kwargs)
-        name = threading.current_thread().name
-        if name in {'budget-A', 'budget-B'}:
-            index = int(name == 'budget-B')
-            db.set_trace_callback(lambda sql: entered[index].set() if sql == 'BEGIN IMMEDIATE' else None)
-        return db
-    monkeypatch.setattr(sqlite3, 'connect', connect)
+    release = threading.Event()
+    code = Storage._transaction.__wrapped__.__code__
+    lines, start = inspect.getsourcelines(Storage._transaction.__wrapped__)
+    before_begin = start + next(i for i, line in enumerate(lines) if 'connection.execute("BEGIN IMMEDIATE")' in line)
     def save(index):
+        def trace(frame, event, arg):
+            if (frame.f_code is code and event == 'line' and frame.f_lineno == before_begin
+                    and frame.f_locals.get('request') is not None):
+                entered[index].set()
+                assert release.wait(2), 'business BEGIN barrier was not released'
+            return trace
         start = time.monotonic()
+        sys.settrace(trace)
         try:
             with clients[index].transaction():
                 ran.append(index)
         except BaseException as error:
             results[index] = (time.monotonic() - start, error)
+        finally:
+            sys.settrace(None)
     threads = [threading.Thread(target=save, args=(i,), name='budget-' + 'AB'[i]) for i in range(2)]
-    external = original(kernel.storage.path, isolation_level=None)
+    external = sqlite3.connect(kernel.storage.path, isolation_level=None)
     try:
-        external.execute('BEGIN IMMEDIATE')
         threads[0].start()
         assert entered[0].wait(0.5)
         threads[1].start()
+        assert entered[1].wait(0.5)
         wait_for_queue(kernel.storage.path, 2)
+        external.execute('BEGIN IMMEDIATE')
+        release.set()
         for thread in threads:
             thread.join(1.5)
         assert all(not thread.is_alive() for thread in threads) and not ran
@@ -245,6 +251,7 @@ def test_queue_wait_and_sqlite_busy_share_one_second(tmp_path, monkeypatch):
             assert isinstance(error, KernelError) and error.code == 'storage_busy'
             assert 0.8 <= elapsed < 1.3, elapsed
     finally:
+        release.set()
         external.rollback()
         external.close()
         for thread in threads:
@@ -446,7 +453,7 @@ def test_writer_lock_acquired_after_original_deadline_cannot_enter_body(tmp_path
 
     def save():
         def trace(frame, event, arg):
-            if frame.f_code is code and event == 'line':
+            if frame.f_code is code and event == 'line' and frame.f_locals.get('select_run') is True:
                 if frame.f_lineno == before_begin:
                     # Preserve the real timeout already installed in SQLite,
                     # then model scheduling delay before its actual BEGIN.
@@ -470,17 +477,19 @@ def test_writer_lock_acquired_after_original_deadline_cannot_enter_body(tmp_path
     waiter = threading.Thread(target=save)
     with closing(sqlite3.connect(kernel.storage.path, isolation_level=None)) as external:
         try:
-            external.execute('BEGIN IMMEDIATE')
             waiter.start()
             assert prepared.wait(2)
+            external.execute('BEGIN IMMEDIATE')
             # The original real busy timeout is now longer than the remaining
             # total budget. Neither the clock nor SQLite's result is replaced.
             threading.Event().wait(0.4)
-            release.set()
-            assert executing.wait(2)
             threading.Event().wait(max(0, deadlines[0] + 0.05 - time.monotonic()))
             assert not acquired, 'writer lock was acquired while the other writer held it'
             external.rollback()
+            # Metadata registration already committed. Let the original
+            # business/control BEGIN acquire only after its unchanged deadline.
+            release.set()
+            assert executing.wait(2)
             waiter.join(2)
         finally:
             external.rollback()

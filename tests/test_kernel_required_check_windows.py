@@ -2,6 +2,7 @@
 from support.core_operations import prepare_scripted_agent
 from agent_run.core.operation_runner import OperationRunner
 from dataclasses import replace
+import json
 
 import pytest
 
@@ -57,7 +58,7 @@ def test_checks_keep_the_first_absolute_window_across_observation_and_restart(
 
     def window():
         with kernel.storage.transaction(write=False) as tx:
-            rows = tx.rows("SELECT started_at,deadline,retry_count FROM waits WHERE subject=?", (subject,))
+            rows = tx.rows("SELECT started_at,deadline,retry_count FROM waits WHERE run_id=? AND subject=?", (kernel.storage.run_id, subject))
             assert len(rows) == 1
             return tuple(rows[0])
 
@@ -97,6 +98,21 @@ def test_checks_keep_the_first_absolute_window_across_observation_and_restart(
     step = prepare_scripted_agent(kernel, runner.run_once())
     assert (step.kind, step.reason, step.call) == ("paused", "supervision_timeout", None)
     assert window() == expected_window
-    assert reopened.status(subject)["budgets"] == before["budgets"]
-    assert reopened.status(subject)["holds_integration"] == before["holds_integration"]
-    assert reopened.status(subject)["pending_attempt"] is None
+    # A local supervision gate safely releases the integration seat only when
+    # no original formal write is pending. It does not renew the CI window.
+    fresh = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
+    fresh.clock = lambda: now[0]
+    for selected_kernel in (kernel, reopened, fresh):
+        after = selected_kernel.status(subject)
+        assert after["budgets"] == before["budgets"]
+        assert after["phase"] == "checks" and after["gates"] == ["supervision_timeout"]
+        assert after["holds_integration"] is False
+        assert after["pending_attempt"] is None and after["pending_write"] is None
+        with selected_kernel.storage.transaction(write=False) as tx:
+            run_id = selected_kernel.storage.run_id
+            assert tx.one('SELECT integration_holder FROM runs WHERE id=?', (run_id,))[0] is None
+            assert not tx.rows("SELECT id FROM effects WHERE run_id=? AND subject=? AND status IN ('prepared','sent','observed')", (run_id, subject))
+            row = tx.one("SELECT evidence FROM gates WHERE run_id=? AND subject=? AND code='supervision_timeout'", (run_id, subject))
+            evidence = json.loads(tx.get(row[0], subject))
+            assert (evidence['started_at'], evidence['deadline'], evidence['retry_count']) == expected_window
+            assert tuple(tx.one('SELECT started_at,deadline,retry_count FROM waits WHERE run_id=? AND subject=?', (run_id, subject))) == expected_window

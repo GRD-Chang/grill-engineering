@@ -9,15 +9,7 @@ import agent_run.runtime.executor as executor
 from support.offline import GraphScenario
 from support.core_operations import Ports
 from support.requirements_scenarios import independent_source
-
-
-class Notifications:
-    def __init__(self, *_args):
-        pass
-    def observe_committed(self):
-        pass
-    def close(self, **_kwargs):
-        pass
+from support.notification import _NoNotifications as Notifications
 
 
 def test_github_reader_can_be_imported_cold_in_an_independent_process():

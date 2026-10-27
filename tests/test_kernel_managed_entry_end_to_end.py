@@ -10,7 +10,7 @@ from contextlib import ExitStack, contextmanager
 import json
 import os
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 import select
 import signal
 import socket
@@ -25,10 +25,12 @@ from agent_run.config.paths import app_data_root
 from agent_run.runtime.package_lease import RunnerLeaseBusy, default_runner_lock_path, runner_management_lease
 from agent_run.config.defaults import UserDefaultsStore
 from agent_run.core.kernel import Kernel
+from agent_run.adapters.workspace import ManagedWorkspace
+from agent_run.storage.routing import RepositoryRoute
 from support.systemd_manager import controlled_manager
 from support.remote_effects import FAKE_GH
 from support.worker_process_timing import wait_until
-from support.systemd_manager import _CODEX, _approval_read_barrier, _control_environment, _executable, _git, _hold_host_operation_return, _local_manager
+from support.systemd_manager import _CODEX, _approval_read_barrier, _control_environment, _diagnostic_tail, _executable, _git, _hold_host_operation_return, _local_manager, _managed_diagnostics
 
 
 def test_public_run_reaches_ticket_close_through_managed_host_after_lost_merge_reply(
@@ -86,7 +88,11 @@ if '--hostname' in sys.argv:
         accepted = json.loads(result.stdout)
         assert accepted["result"] == "accepted"
         serving.join(timeout=95)
-        assert not serving.is_alive() and not errors, errors
+        assert not serving.is_alive() and not errors, {
+            'errors': errors,
+            'output_head_tail': tuple(tuple((stream[:4096], stream[-4096:]) for stream in pair) for pair in output),
+            'worker_errors': _diagnostic_tail(Path(str(roles) + '.errors')),
+        }
         assert len(children) == len(commands) == 1 and children[0].returncode == 0, output
         assert trace == ["fdstore", "barrier", "host_exited", "store_closed"]
         command = commands[0]
@@ -511,7 +517,24 @@ content = 'Implementation""")
             return attempt, original
 
         try:
-            events = [arrivals.get(timeout=30) for _ in range(2)]
+            try:
+                events = [arrivals.get(timeout=30) for _ in range(2)]
+            except Empty as error:
+                available_output = {}
+                for name in ('stdout', 'stderr'):
+                    stream = getattr(child, name)
+                    try:
+                        readable = stream is not None and not stream.closed and bool(select.select([stream], [], [], 0)[0])
+                        available_output[name] = (os.read(stream.fileno(), 8192).decode('utf-8', errors='replace')
+                                                  if readable else 'not ready')
+                    except (OSError, ValueError) as unavailable:
+                        available_output[name] = type(unavailable).__name__
+                error.add_note('Worker arrival missing: ' + repr({
+                    'cli_returncode': child.poll(),
+                    'available_output': available_output,
+                    'worker_errors': _diagnostic_tail(remote_state.parent / 'roles.jsonl.errors'),
+                }))
+                raise
             channels = {event['role']: (event, channel) for event, channel in events}
             assert set(channels) == {'review', 'publication'}
             status = public('status')
@@ -652,6 +675,13 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
                         'physical_exit': [pin.observe() for pin in continued_pins],
                         'returncode': continued.returncode, 'stdout': stdout, 'stderr': stderr})
                     return subprocess.CompletedProcess(command, continued.returncode, stdout, stderr)
+                except subprocess.TimeoutExpired as error:
+                    facts = _managed_diagnostics(Path(observations['original_record']['database']),
+                        observations['run'], tmp_path / 'roles.jsonl')
+                    observations['continuation_timeout'] = {'stage': 'foreground-' + arguments[0],
+                        'returncode': continued.poll(), 'facts': facts}
+                    error.add_note(json.dumps(observations['continuation_timeout']))
+                    raise
                 finally:
                     _finish_control_host(continued, continued_pins, child_fd=continued_fd)
 
@@ -855,7 +885,18 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                 return result.returncode, json.loads(result.stdout)
             code, accepted = public("run", "1", "--no-notifications")
             assert code == 0, accepted
-            initial = [arrivals.get(timeout=min(15, remaining())) for _ in range(2)]
+            try:
+                initial = [arrivals.get(timeout=min(15, remaining())) for _ in range(2)]
+            except Empty as error:
+                facts = {'stage': 'initial-workers-before-stop', 'commands': len(commands),
+                    'manager_error_types': [type(item).__name__ for item in errors],
+                    'worker_errors': _diagnostic_tail(tmp_path / 'roles.jsonl.errors')}
+                if commands:
+                    command = commands[0]
+                    facts['run'] = _managed_diagnostics(Path(command[command.index('--database') + 1]),
+                        accepted['run_id'], tmp_path / 'roles.jsonl')
+                error.add_note(json.dumps(facts))
+                raise
             assert {Path(event["checkout"]).name for event, _channel in initial} == {"ticket-2", "ticket-3"}
             command = commands[0]
             kernel = Kernel(Path(command[command.index('--database') + 1]), run_id=next((item.partition('=')[2] for item in command if item.startswith('--run-id='))))
@@ -1005,8 +1046,15 @@ if role == 'development':
                 environment.pop("ENTRY_APPROVAL_CONTROL")
                 # Preparation is bounded within one overall supervision window.
                 # Repair, approval and normal exit share its remaining time.
-                while not reached.wait(0.1):
-                    assert serving.is_alive() and time.monotonic() < preparation_deadline, (kernel.source_status(), output, errors)
+                try:
+                    while not reached.wait(0.1):
+                        assert serving.is_alive() and time.monotonic() < preparation_deadline, (kernel.source_status(), output, errors)
+                except AssertionError as error:
+                    error.add_note(json.dumps({'stage': 'first-final-approval-before-revise',
+                        'facts': _managed_diagnostics(kernel.storage.path, kernel.storage.run_id,
+                            tmp_path / 'roles.jsonl'),
+                        'host_stderr': _diagnostic_tail(tmp_path / 'manager' / 'host.stderr')}))
+                    raise
                 preparation_seconds = time.monotonic() - preparation_started
                 (tmp_path / "control-timing.json").write_text(json.dumps({"preparation_seconds": preparation_seconds}))
                 subject = kernel.source_status()["final_subject"]
@@ -1130,7 +1178,8 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                 assert original_event["requirement"]["body"] == "Original requirement for Ticket 2."
                 channel.sendall(b"1")
                 while not reached.wait(0.1):
-                    assert serving.is_alive() and time.monotonic() < deadline, (kernel.source_status(), output, errors)
+                    assert serving.is_alive() and time.monotonic() < deadline, (kernel.source_status(), output, errors,
+                        _managed_diagnostics(kernel.storage.path, kernel.storage.run_id, tmp_path / 'roles.jsonl'))
                 preparation_seconds = time.monotonic() - started
                 timing["preparation_seconds"] = preparation_seconds
                 request = kernel.host_request(accepted["action_id"])
@@ -1156,7 +1205,8 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                 release.clear()
                 reached.clear()
                 while not reached.wait(0.1):
-                    assert serving.is_alive() and time.monotonic() < deadline, (kernel.source_status(), output, errors)
+                    assert serving.is_alive() and time.monotonic() < deadline, (kernel.source_status(), output, errors,
+                        _managed_diagnostics(kernel.storage.path, kernel.storage.run_id, tmp_path / 'roles.jsonl'))
                 ticket_to_approval_seconds = time.monotonic() - controlled_at
                 timing["ticket_requeue_to_final_approval_seconds"] = ticket_to_approval_seconds
                 final = kernel.source_status()["final_subject"]
@@ -1191,7 +1241,8 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                 release.clear()
                 reached.clear()
                 while not reached.wait(0.1):
-                    assert serving.is_alive() and time.monotonic() < deadline, (kernel.source_status(), output, errors)
+                    assert serving.is_alive() and time.monotonic() < deadline, (kernel.source_status(), output, errors,
+                        _managed_diagnostics(kernel.storage.path, kernel.storage.run_id, tmp_path / 'roles.jsonl'))
                 assert kernel.status(final)["phase"] == "approval"
                 timing["final_requeue_to_approval_seconds"] = time.monotonic() - final_controlled_at
                 assert _git(tmp_path / "origin.git", "rev-parse", final_delivery.source_ref) == original_run_head
@@ -1309,7 +1360,9 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
         accepted = public("run", "1", "--no-notifications")
         assert accepted["result"] == "accepted"
         serving.join(timeout=max(0, deadline - time.monotonic()))
-        assert not serving.is_alive() and not errors, (errors, output)
+        assert not serving.is_alive() and not errors, (errors, output,
+            _managed_diagnostics(RepositoryRoute.for_workspace(ManagedWorkspace.for_repository('example/project')).database,
+                                 accepted['run_id'], tmp_path / 'roles.jsonl'))
         assert len(commands) == len(children) == 1 and children[0].returncode == 0
         assert trace == ["fdstore", "barrier", "host_exited", "store_closed"]
         status = public("status", accepted["run_id"])
@@ -1416,7 +1469,22 @@ issue = int(re.search(r'https://github.com/example/project/issues/(\\d+)', promp
             return {row['subject']: row for row in document['subjects']}
 
         try:
-            ready = [arrivals.get(timeout=min(60, remaining())) for _ in range(2)]
+            try:
+                ready = [arrivals.get(timeout=min(60, remaining())) for _ in range(2)]
+            except Empty as error:
+                facts = {'stage': 'initial-workers-before-local-failure', 'cli_returncode': child.poll(),
+                    'worker_errors': _diagnostic_tail(tmp_path / 'roles.jsonl.errors')}
+                try:
+                    paths = iter(record_root(default_runner_lock_path(environment)).glob('*.json'))
+                    path = next(paths, None)
+                    if path is not None and next(paths, None) is None:
+                        record = read_record(path)
+                        facts['run'] = _managed_diagnostics(Path(record['database']), record['binding'][0],
+                            tmp_path / 'roles.jsonl')
+                except Exception as unavailable:
+                    facts['snapshot_unavailable'] = type(unavailable).__name__
+                error.add_note(json.dumps(facts))
+                raise
             channels = {event['subject']: (event, channel) for event, channel in ready}
             assert set(channels) == {'ticket-3', 'ticket-4'}
             before = public('status')
@@ -1787,9 +1855,14 @@ else:
                 actual_exit_at=exited_at, unrelated_alive_before_disarm=True)
             scope.set_active(False)
             observations['disarmed_at'] = time.monotonic()
-            resumed = subprocess.run([sys.executable, '-m', 'agent_run', 'resume', spec.run_id,
-                '--foreground', '--repo', 'example/project', '--json'], cwd=git_repo, env=environment,
-                text=True, capture_output=True, timeout=remaining())
+            try:
+                resumed = subprocess.run([sys.executable, '-m', 'agent_run', 'resume', spec.run_id,
+                    '--foreground', '--repo', 'example/project', '--json'], cwd=git_repo, env=environment,
+                    text=True, capture_output=True, timeout=remaining())
+            except subprocess.TimeoutExpired as error:
+                observations['resume_timeout_diagnostics'] = _managed_diagnostics(kernel.storage.path, spec.run_id, tmp_path / 'roles.jsonl')
+                error.add_note('Disarmed original Run Resume: ' + json.dumps(observations['resume_timeout_diagnostics']))
+                raise
             assert resumed.returncode == 0, (resumed.stdout, resumed.stderr)
             receipt = json.loads(resumed.stdout)
             assert receipt['run_id'] == spec.run_id and receipt['host'] == 'exited'

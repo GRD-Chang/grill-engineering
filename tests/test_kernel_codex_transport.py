@@ -350,7 +350,13 @@ raise SystemExit(7)
         assert tx.get(output["raw_id"], first.subject) == b""
         failure = json.loads(tx.get(output["start_evidence"], first.subject))
         if error is None:
-            assert failure["diagnostic"] is None
+            diagnostic = failure["diagnostic"]
+            assert diagnostic["source"] == "codex-output"
+            assert diagnostic["final_output_exists"] is True and diagnostic["final_output_kind"] == "regular"
+            assert diagnostic["final_output_bytes"] == 0 and diagnostic["final_output_json_shape"] == "empty"
+            assert diagnostic["thread_observed"] is True and diagnostic["thread_bound"] is True
+            assert diagnostic["stdout_bytes"] > 0 and diagnostic["stderr_tail_present"] is True
+            assert not {"message", "machine", "machine_present"} & diagnostic.keys()
         else:
             assert failure["diagnostic"]["message"] == error["message"]
             assert failure["diagnostic"]["machine_present"] is ("codex_error_info" in error)

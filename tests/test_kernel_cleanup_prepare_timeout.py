@@ -22,6 +22,7 @@ from agent_run.errors import KernelError
 import agent_run.adapters.cleanup as cleanup
 from support.worker_process_timing import wait_until
 from support.cleanup_scenarios import _native_scenario, _local_head
+from support.systemd_manager import _diagnostic_tail, _managed_diagnostics
 
 
 def _kill_owned_group(root: Path) -> None:
@@ -288,8 +289,20 @@ def _exercise(root: Path) -> None:
 def test_cleanup_prepare_timeout_preserves_complete_delivery_and_reenters(tmp_path: Path) -> None:
     project = Path(__file__).resolve().parents[1]
     environment = {**os.environ, "PYTHONPATH": os.pathsep.join(str(project / p) for p in ("src", ".", "tests"))}
-    controller, stdout, stderr = _controller_output(
-        [sys.executable, str(Path(__file__).resolve()), str(tmp_path)], tmp_path, environment)
+    try:
+        controller, stdout, stderr = _controller_output(
+            [sys.executable, str(Path(__file__).resolve()), str(tmp_path)], tmp_path, environment)
+    except subprocess.TimeoutExpired as error:
+        # _controller_output has completed its original descendant cleanup.
+        # GraphScenario declares this exact Run; do not discover a successor.
+        error.add_note(json.dumps({'stage': 'cleanup-controller-timeout',
+            'stdout': _diagnostic_tail(tmp_path / 'controller.stdout'),
+            'stderr': _diagnostic_tail(tmp_path / 'controller.stderr'),
+            'controller_cleanup': _diagnostic_tail(tmp_path / 'controller-cleanup.json'),
+            'cleanup_timeout': _diagnostic_tail(tmp_path / 'timeout.json'),
+            'facts': _managed_diagnostics(tmp_path / 'scenario' / 'kernel.sqlite3',
+                'offline-run', tmp_path / 'roles.jsonl')}))
+        raise
     assert controller.returncode == 0, stdout + "\n" + stderr
     evidence = json.loads((tmp_path / "evidence.json").read_text())
     assert evidence["cleanup_complete"] and evidence["recorded_locks_absent"]

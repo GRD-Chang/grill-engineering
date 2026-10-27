@@ -10,7 +10,8 @@ from agent_run.runtime.package_lease import default_runner_lock_path, runner_man
 from agent_run.core.kernel import Kernel
 from support.managed_abandon_transport import install_currentness
 from support.systemd_manager import (
-    _CODEX, _approval_read_barrier, _control_environment, _git, _hold_host_operation_return, _local_manager,
+    _CODEX, _approval_read_barrier, _control_environment, _diagnostic_tail, _git,
+    _hold_host_operation_return, _local_manager, _managed_diagnostics,
 )
 
 
@@ -81,7 +82,14 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
                 assert kernel.host_request(accepted["action_id"]) == request
                 release.set()
                 serving.join(timeout=max(0.01, deadline - time.monotonic()))
-                assert not serving.is_alive() and not errors, errors
+                try:
+                    assert not serving.is_alive() and not errors, errors
+                except AssertionError as error:
+                    error.add_note(json.dumps({'stage': 'abandon-host-after-barrier-release',
+                        'facts': _managed_diagnostics(kernel.storage.path, kernel.storage.run_id,
+                            tmp_path / 'roles.jsonl'),
+                        'host_stderr': _diagnostic_tail(tmp_path / 'manager' / 'host.stderr')}))
+                    raise
                 assert len(children) == len(commands) == 1 and children[0].returncode == 0, output
                 assert trace == ["fdstore", "barrier", "host_exited", "store_closed"]
                 assert kernel.source_status()["abandonment"] == {"action": abandoned["action_id"], "status": "complete"}

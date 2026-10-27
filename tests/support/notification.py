@@ -221,11 +221,36 @@ def _enabled_scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: Del
 
 
 class _NoNotifications:
-    def __init__(self, *_arguments):
-        pass
+    def __init__(self, *_arguments, storage):
+        self.storage = storage
 
     def observe_committed(self):
         pass
 
     def close(self, **_arguments):
         pass
+
+
+def assert_confirmed_status_comment(projection, journal, comments, writes):
+    """Account for one exact display receipt, never a marker-prefix exception."""
+    from agent_run.notifications.status_comment import StatusComments
+
+    target = projection.target
+    assert journal.get('native_binding') == [target.run_id, target.repository, target.parent_issue]
+    assert set(journal['remote_status']['bindings']) == {target.key}
+    entry = StatusComments._entry(deepcopy(journal), projection)
+    receipt = entry['receipt']
+    comment, = comments
+    assert type(comment['id']) is int and type(receipt['comment_id']) is int
+    assert comment['id'] == entry['comment_id'] == receipt['comment_id']
+    assert comment['body'] == entry['confirmed_body']
+    assert comment['body'].startswith(entry['marker'] + '\n')
+    assert comment['user']['login'] == target.actor
+    assert comment['issue_url'] == f'https://api.github.com/repos/{target.repository}/issues/{target.pr_number}'
+    post = f'repos/{target.repository}/issues/{target.pr_number}/comments'
+    patch = f'repos/{target.repository}/issues/comments/{comment["id"]}'
+    completion = f'repos/{target.repository}/issues/{target.issue}/comments'
+    status_writes = [(row[1], row[row.index('--method') + 1]) for row in writes
+                     if '/comments' in row[1] and row[1] != completion]
+    assert status_writes.count((post, 'POST')) == 1
+    assert all(item in {(post, 'POST'), (patch, 'PATCH')} for item in status_writes)

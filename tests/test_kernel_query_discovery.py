@@ -21,6 +21,63 @@ from support.environment import durable_snapshot as _snapshot
 from support.cli_fixtures import _published
 
 
+@pytest.mark.parametrize('missing', ['registry', 'owner', 'repository'])
+def test_missing_managed_repository_reports_no_run_without_creating_state(tmp_path, monkeypatch, capsys, missing):
+    data = tmp_path / 'data'
+    monkeypatch.setenv('XDG_DATA_HOME', str(data))
+    workspace = ManagedWorkspace.for_repository('example/project')
+    path = {'registry': workspace.root.parent.parent, 'owner': workspace.root.parent,
+            'repository': workspace.root}[missing]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    before = _snapshot(data)
+    assert main(['requeue', '1', '--repo', 'example/project', '--json']) == 2
+    assert json.loads(capsys.readouterr().out)['diagnostics'][0]['code'] == 'run_locator_missing'
+    assert main(['runs', '--repo', 'example/project', '--json']) == 0
+    assert json.loads(capsys.readouterr().out)['runs'] == []
+    assert not path.exists() and _snapshot(data) == before
+
+
+@pytest.mark.parametrize('segment', ['registry', 'owner', 'repository', 'state'])
+@pytest.mark.parametrize('fault', ['file', 'symlink'])
+def test_missing_run_discovery_keeps_invalid_managed_paths_refused(tmp_path, monkeypatch, capsys, segment, fault):
+    data = tmp_path / 'data'
+    monkeypatch.setenv('XDG_DATA_HOME', str(data))
+    workspace = ManagedWorkspace.for_repository('example/project')
+    path = {'registry': workspace.root.parent.parent, 'owner': workspace.root.parent,
+            'repository': workspace.root, 'state': workspace.state_root}[segment]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if fault == 'file':
+        path.write_bytes(b'Original occupied path')
+    else:
+        target = tmp_path / 'unrelated'
+        target.mkdir()
+        (target / 'sentinel').write_bytes(b'Original target bytes')
+        path.symlink_to(target, target_is_directory=True)
+    before = _snapshot(tmp_path)
+    assert main(['requeue', '1', '--repo', 'example/project', '--json']) == 2
+    assert json.loads(capsys.readouterr().out)['diagnostics'][0]['code'] == 'run_locator_invalid'
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize('fault', ['missing-state', 'occupied-state', 'damaged-database'])
+def test_existing_repository_state_failure_is_never_empty_discovery(tmp_path, monkeypatch, capsys, fault):
+    data = tmp_path / 'data'
+    monkeypatch.setenv('XDG_DATA_HOME', str(data))
+    workspace = ManagedWorkspace.for_repository('example/project')
+    workspace.root.mkdir(parents=True)
+    if fault != 'missing-state':
+        workspace.state_root.mkdir()
+        path = workspace.state_root / ('residue' if fault == 'occupied-state' else 'kernel.sqlite3')
+        path.write_bytes(b'Original non-database bytes')
+    before = _snapshot(data)
+    assert main(['requeue', '1', '--repo', 'example/project', '--json']) == 2
+    diagnostic = json.loads(capsys.readouterr().out)['diagnostics'][0]
+    assert diagnostic['code'] == 'unsupported_state'
+    assert diagnostic['reason'] == {'missing-state': 'unreadable_state',
+        'occupied-state': 'repository_state_occupied', 'damaged-database': 'uncertain_state'}[fault]
+    assert diagnostic['recovery_hint'] and _snapshot(data) == before
+
+
 def test_default_discovery_does_not_walk_a_large_real_managed_clone(
     git_repo: Path, tmp_path: Path, monkeypatch, capsys,
 ) -> None:
@@ -229,6 +286,7 @@ def test_default_parent_selects_the_exact_published_run_and_retains_terminal_his
         scenario = Scenario(workspace.root, DeliveryKind.PARENT_ONLY)
     assert workspace.open_path() == workspace.repository_root
     assert scenario.run(approve=True).kind == 'complete'
+    assert scenario.kernel.control('stop', 'retire-query-driver') == 'applied'
     scenario.kernel.confirm_executor_exit(scenario.execution)
     original = scenario.kernel
     successor_spec = replace(scenario.spec, run_id='published')

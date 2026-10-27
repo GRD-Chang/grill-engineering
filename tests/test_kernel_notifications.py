@@ -228,6 +228,9 @@ def test_native_first_worker_event_uses_committed_start_once(tmp_path: Path) -> 
     process = {"pid": 21, "pgid": 21, "start_token": "fixture", "host_pid": 10,
                "host_start_token": "fixture-host"}
     kernel.agent_started(call, process)
+    kernel.agent_source_ready(call)
+    kernel.observe_worker_activity(call, "native-first-turn", active=True,
+        observed_at=kernel.clock(), evidence={"type": "turn.started", "source": "synthetic-agent"})
     sent: list[str] = []
 
     def fake(_config: Any, rendered: dict[str, Any], *_args: Any, **_kwargs: Any) -> dict[str, Any]:

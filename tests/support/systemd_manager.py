@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 import signal
 import socket
+import stat
 import subprocess
 import threading
 
@@ -77,8 +78,94 @@ def _git(root: Path, *arguments: str) -> str:
 
 
 def _executable(path: Path, program: str) -> None:
+    if path.name == 'codex':
+        # Preserve the synthetic program and its original exception/exit. The
+        # owned trace survives production capture cleanup; never dump env/argv.
+        program = '''import json as _trace_json, os as _trace_os, stat as _trace_stat, sys as _trace_sys, traceback as _traceback
+_original_exception_hook = _trace_sys.excepthook
+def _fixture_exception_hook(kind, value, trace):
+    descriptor = -1
+    try:
+        raw = ''.join(_traceback.format_exception(kind, value, trace)).encode('utf-8')
+        if len(raw) > 8192:
+            marker = b'\\n... fixture traceback truncated ...\\n'
+            raw = raw[:2048] + marker + raw[-(8192 - 2048 - len(marker)):]
+        text = raw.decode('utf-8', errors='ignore')
+        descriptor = _trace_os.open(_trace_os.environ['ENTRY_ROLE_TRACE'] + '.errors',
+            _trace_os.O_WRONLY | _trace_os.O_CREAT | _trace_os.O_APPEND | _trace_os.O_NONBLOCK | _trace_os.O_NOFOLLOW, 0o600)
+        if not _trace_stat.S_ISREG(_trace_os.fstat(descriptor).st_mode):
+            raise ValueError('Synthetic trace is not a regular file')
+        with _trace_os.fdopen(descriptor, 'a') as output:
+            descriptor = -1
+            output.write(_trace_json.dumps({'error_type': kind.__name__, 'traceback': text}) + '\\n')
+    except (OSError, KeyError, ValueError):
+        pass
+    finally:
+        if descriptor >= 0:
+            try:
+                _trace_os.close(descriptor)
+            except OSError:
+                pass
+    _original_exception_hook(kind, value, trace)
+_trace_sys.excepthook = _fixture_exception_hook
+''' + program
     path.write_text("#!" + sys.executable + "\n" + program)
     path.chmod(0o700)
+
+
+def _diagnostic_tail(path: Path) -> str:
+    """Only the caller's synthetic failure trace, with a fixed read bound."""
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return 'NonRegularFile'
+        with os.fdopen(descriptor, 'rb') as stream:
+            descriptor = -1
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - 8192))
+            return stream.read(8192).decode('utf-8', errors='replace')
+    except (OSError, ValueError) as error:
+        return type(error).__name__
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass  # Diagnostic cleanup cannot replace the caller's failure.
+
+
+def _managed_diagnostics(database: Path, run_id: str, roles: Path) -> dict:
+    """Bounded exact-Run facts on failure; no live probe, retry, raw or mutation."""
+    result = {'worker_errors': _diagnostic_tail(Path(str(roles) + '.errors')), 'row_limit': 32}
+    try:
+        kernel = Kernel(database, run_id=run_id)
+        with kernel.storage.transaction(write=False) as tx:
+            result['run'] = dict(tx.one('SELECT id,stopped,blocked,epoch,integration_holder FROM runs WHERE id=?', (run_id,)))
+            result['subjects'] = [dict(row) for row in tx.rows(
+                'SELECT id,generation,phase,purpose,current_attempt,repair_source FROM subjects WHERE run_id=? ORDER BY id LIMIT 32', (run_id,))]
+            result['gates'] = [dict(row) for row in tx.rows(
+                'SELECT subject,code FROM gates WHERE run_id=? ORDER BY subject,code LIMIT 32', (run_id,))]
+            result['outputs'] = [dict(row) for row in tx.rows(
+                'SELECT a.subject,a.role,a.accounted,i.id AS invocation,i.thread,t.backend_id,t.profile_revision,i.deadline_at,o.ordinal,o.dispatch_state,'
+                'o.failure_kind,o.raw_id,o.started_at,o.returned_at,o.exit_code FROM invocation_outputs o '
+                'JOIN invocations i ON i.run_id=o.run_id AND i.id=o.invocation '
+                'JOIN attempts a ON a.run_id=i.run_id AND a.id=i.attempt '
+                'LEFT JOIN threads t ON t.run_id=i.run_id AND t.id=i.thread '
+                'WHERE o.run_id=? ORDER BY i.rowid DESC,o.ordinal DESC LIMIT 32', (run_id,))]
+            result['activity'] = [dict(row) for row in tx.rows(
+                'SELECT invocation,ordinal,identity,active,observed_at FROM worker_activity WHERE run_id=? ORDER BY rowid DESC LIMIT 32', (run_id,))]
+            result['effects'] = [dict(row) for row in tx.rows(
+                'SELECT id,subject,operation,status,attempts FROM effects WHERE run_id=? ORDER BY rowid DESC LIMIT 32', (run_id,))]
+            result['waits'] = [dict(row) for row in tx.rows(
+                'SELECT subject,kind,started_at,deadline,retry_count,next_retry_at FROM waits WHERE run_id=? LIMIT 32', (run_id,))]
+            result['budgets'] = [dict(row) for row in tx.rows(
+                'SELECT subject,purpose,window,developments_used,reviews_used FROM budgets WHERE run_id=? AND current=1 LIMIT 32', (run_id,))]
+            result['history_tail'] = [dict(row) for row in tx.rows(
+                'SELECT position,subject,kind,identity,phase FROM history WHERE run_id=? ORDER BY position DESC LIMIT 16', (run_id,))]
+    except Exception as error:
+        result['unavailable'] = {'type': type(error).__name__, 'code': getattr(error, 'code', None)}
+    return result
 
 
 _CODEX = r'''import errno, json, os, subprocess, sys
@@ -234,6 +321,8 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
             os.close(stored.pop())
             trace.append("store_closed")
         except BaseException as error:
+            if isinstance(error, subprocess.TimeoutExpired):
+                output.append((error.stdout or b'', error.stderr or b''))
             errors.append(error)
         finally:
             for descriptor in (gate_read, gate_write):

@@ -11,6 +11,9 @@ import time
 from agent_run.runtime.package_lease import default_runner_lock_path, runner_management_lease
 import agent_run.cli.lifecycle as lifecycle_cli
 from agent_run.core.kernel import Kernel
+from agent_run.queries.status_comment import project_status
+from agent_run.storage.notification_outbox import read_notifications
+from support.notification import assert_confirmed_status_comment
 from support.systemd_manager import (
     _CODEX, _approval_read_barrier, _control_environment, _git, _local_manager,
     _hold_host_operation_return,
@@ -111,6 +114,10 @@ def test_installed_public_parent_only_reaches_approval_close_cleanup_and_normal_
                     # completions table indexes Ticket-to-Final witnesses only.
                     closed = tx.one("SELECT receipt_id FROM effects WHERE subject='parent:1' AND operation='close' AND status='confirmed'")
                     assert json.loads(tx.get(closed["receipt_id"], "parent:1"))["disposition"] == "target"
+                    completion = tx.one("SELECT id,receipt_id FROM effects WHERE subject='parent:1' AND operation='completion_comment' AND status='confirmed'")
+                    completion_receipt = json.loads(tx.get(completion['receipt_id'], 'parent:1'))
+                    assert completion_receipt['disposition'] == 'target'
+                    close_intent = completion_receipt['raw']['close_intent']
                     assert not tx.rows("SELECT c.subject FROM completions c JOIN subjects s ON s.id=c.subject WHERE s.kind='ticket'")
                     assert not tx.rows("SELECT subject FROM final_barriers")
                 document = json.loads(state.read_text())
@@ -135,7 +142,20 @@ def test_installed_public_parent_only_reaches_approval_close_cleanup_and_normal_
                 assert all(not Path(row["checkout"]).exists() for row in observed)
                 writes = [row for row in (json.loads(line) for line in (tmp_path / "gh-calls.jsonl").read_text().splitlines()) if "--method" in row]
                 merges = [i for i, row in enumerate(writes) if row[1].endswith("/merge")]
-                comments = [i for i, row in enumerate(writes) if row[1].endswith("/comments")]
+                marker = '<!-- agent-run-kernel:' + completion['id'] + ' -->'
+                assert len({comment['id'] for comment in document['comments']}) == len(document['comments'])
+                completed_comment, = [comment for comment in document['comments'] if comment['body'].startswith(marker)]
+                assert completed_comment['id'] == close_intent['comment_id']
+                assert completed_comment['body'] == close_intent['comment_body']
+                assert completed_comment['user']['login'] == close_intent['actor']
+                assert (close_intent['run_id'], close_intent['subject'], close_intent['issue'],
+                        close_intent['pr_number'], close_intent['merge_sha'], close_intent['kind']) == (
+                            accepted['run_id'], 'parent:1', 1, pr['number'], merged, 'parent_only')
+                projection = project_status(kernel.storage.path, 'parent:1', storage=kernel.storage)
+                journal = read_notifications(kernel.storage.path.parent, accepted['run_id'])
+                assert_confirmed_status_comment(projection, journal,
+                    [comment for comment in document['comments'] if comment['id'] != completed_comment['id']], writes)
+                comments = [i for i, row in enumerate(writes) if row[1] == 'repos/example/project/issues/1/comments']
                 closes = [i for i, row in enumerate(writes) if row[1] == "repos/example/project/issues/1"]
                 assert len(merges) == len(comments) == len(closes) == 1
                 assert merges[0] < comments[0] < closes[0]

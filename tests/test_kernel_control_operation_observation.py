@@ -417,9 +417,13 @@ def _delayed_public_recovery_case(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "write_text", delayed)
     import subprocess
     prepared = restorable_public_resume(tmp_path, monkeypatch, "managed-checkout")
-    subprocess.run(prepared.command, env=prepared.environment, cwd=tmp_path,
-                   text=True, capture_output=True, timeout=15)
-    pytest.fail("Delayed recovery returned before the expected guardian timeout")
+    result = subprocess.run(prepared.command, env=prepared.environment, cwd=tmp_path,
+                            text=True, capture_output=True, timeout=15)
+    pytest.fail("Delayed recovery returned before the expected guardian timeout: " + repr({
+        "returncode": result.returncode, "guardian_receipt_exists": receipt.exists(),
+        "stdout": {"bytes": len(result.stdout.encode()), "head": result.stdout[:4096], "tail": result.stdout[-4096:]},
+        "stderr": {"bytes": len(result.stderr.encode()), "head": result.stderr[:4096], "tail": result.stderr[-4096:]},
+    }))
 
 
 def test_public_resume_timeout_reaps_exact_guardian_without_touching_unrelated_child(tmp_path, monkeypatch):

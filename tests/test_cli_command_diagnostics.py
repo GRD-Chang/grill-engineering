@@ -257,12 +257,14 @@ def test_receipt_distinguishes_known_failed_action_from_unconfirmed_state(capsys
     assert "action_failed" not in output
 
 
-def test_ambiguous_databases_in_the_same_directory_have_distinct_copyable_locations(tmp_path: Path, capsys) -> None:
+def test_ambiguous_databases_in_the_same_directory_have_distinct_copyable_locations(tmp_path: Path, capsys, monkeypatch) -> None:
     from agent_run.cli.main import main
     from agent_run.core.kernel import Kernel
     from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
     from support.offline import fixture_inputs
     from support.environment import durable_snapshot as _snapshot
+    from agent_run.cli import selection
+    from agent_run.storage.routing import RepositoryRoute
 
     delivery = Delivery("parent:1", DeliveryKind.PARENT_ONLY, 1, "original", Commit("base", "tree"),
                         "refs/heads/task", "refs/heads/main")
@@ -272,6 +274,15 @@ def test_ambiguous_databases_in_the_same_directory_have_distinct_copyable_locati
                       language="en", repository_root=str(tmp_path / "checkout"), inputs=fixture_inputs()), requirements=source)
     before = _snapshot(tmp_path)
     arguments = ["status", "--repo", "example/project", "--parent", "1", "--state-dir", str(tmp_path)]
+    # The explicit directory has one canonical database, not a filename scan.
+    assert main([*arguments, "--json"]) == 0
+    selected = json.loads(capsys.readouterr().out)
+    assert selected["run_id"] == "first-private-id"
+    assert _snapshot(tmp_path) == before
+    # Preserve the ambiguous-authority presentation contract when discovery
+    # actually supplies two real databases sharing one parent directory.
+    routes = tuple(RepositoryRoute.from_database(tmp_path / name) for name in ("kernel.sqlite3", "state.sqlite3"))
+    monkeypatch.setattr(selection, 'managed_repository_routes', lambda _parsed: routes)
     assert main(arguments) == 2
     output = capsys.readouterr().out
     assert f"[{tmp_path / 'kernel.sqlite3'}]" in output

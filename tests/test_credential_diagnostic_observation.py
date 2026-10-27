@@ -68,6 +68,7 @@ def test_real_worker_credential_expiry_persists_only_safe_last_failure(tmp_path,
     from agent_run.adapters.auth import app, worker_credentials
     from agent_run.adapters.auth.credential_lifecycle import WorkerCredentialError
     from agent_run.queries.run import read
+    from agent_run.runtime import codex as codex_runtime
     from agent_run.runtime.codex import execute_selected_codex
     from agent_run.core.operation_runner import OperationRunner
     from agent_run.model import Commit, Delivery, DeliveryKind, Policy, RunSpec
@@ -93,8 +94,16 @@ def test_real_worker_credential_expiry_persists_only_safe_last_failure(tmp_path,
             break
     assert request is not None
     now, lives, calls, errors = [1000.0], [], [], []
-    stopped, cancelled = threading.Event(), threading.Event()
+    stopped, cancelled, bound = threading.Event(), threading.Event(), threading.Event()
     marker = tmp_path / 'actual-worker-entered'
+    original_feed = codex_runtime._CodexCapture.feed
+    def feed(capture, chunk):
+        result = original_feed(capture, chunk)
+        if capture.kernel is kernel and capture.observed_thread is not None:
+            assert capture.observed_thread == capture.thread == 'credential-thread'
+            bound.set()  # Actual decoder and durable bind both finished.
+        return result
+    monkeypatch.setattr(codex_runtime._CodexCapture, 'feed', feed)
     class Provider:
         def __init__(self, *args, **kwargs):
             pass
@@ -114,7 +123,7 @@ def test_real_worker_credential_expiry_persists_only_safe_last_failure(tmp_path,
     def advance():
         try:
             deadline = time.monotonic() + 4
-            while not marker.exists():
+            while not marker.exists() or not bound.is_set():
                 if stopped.wait(0.005):
                     return
                 assert time.monotonic() < deadline, 'Actual Worker did not enter'
@@ -155,6 +164,8 @@ def test_real_worker_credential_expiry_persists_only_safe_last_failure(tmp_path,
     assert diagnostic['credential_valid_at_last_failure'] is True
     assert diagnostic['credential_remaining_seconds_at_last_failure'] == 290.0
     assert diagnostic['http_status'] == 503 and diagnostic['final_output_json_shape'] == 'empty'
+    assert bound.is_set() and diagnostic['thread_observed'] is True and diagnostic['thread_bound'] is True
+    assert diagnostic['stdout_bytes'] > 0 and diagnostic['final_output_bytes'] == 0
     serialized = json.dumps(document)
     assert 'private-test-token' not in serialized and 'private issuer response' not in serialized
     assert kernel.status(request.subject)['budgets']['requirements']['developments_used'] == 1

@@ -68,8 +68,12 @@ def _managed_state_roots(repository: str | None) -> list[Path]:
         owner_name, repository_name = repository.split("/")
         paths = (base, base / owner_name, base / owner_name / repository_name,
                  base / owner_name / repository_name / "state")
-        for path in paths:
-            directory(path)
+        for path in paths[:-1]:
+            if not directory(path):
+                return []
+        # An existing repository with lost state is still an unreadable
+        # authority. Only an absent repository is an empty discovery result.
+        directory(paths[-1])
         return [paths[-1]]
     if not directory(base):
         return []

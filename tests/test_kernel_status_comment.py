@@ -1413,3 +1413,60 @@ def test_status_review_rejects_stale_scope_and_unknown_records_without_remote_wr
             tx.execute("UPDATE subjects SET review_attempt=? WHERE id=?", (review["id"], subject))
     assert "Recorded Review: pass" in project_status(kernel.storage.path, subject, storage=kernel.storage).body
     assert not any(write["operation"] == "merge" for write in scenario.writes())
+
+
+@pytest.fixture
+def confirmed_display_receipt():
+    """Controlled assertion input, not a Core publication or external write."""
+    from agent_run.contracts.status_comment import StatusProjection, StatusTarget
+    target = StatusTarget('example/project', 'frozen-run', 1, 'parent:1', 1, 1, 7,
+        'publisher', 'publication-effect', 'publication-receipt', 'refs/heads/parent', 'refs/heads/main')
+    projection = StatusProjection(target, 'Recorded display')
+    journal = {'pending': [], 'records': [], 'seen': []}
+    entry = StatusComments._entry(journal, projection)
+    body = entry['marker'] + '\n' + projection.body
+    entry.update(comment_id=77, confirmed_body=body, receipt={
+        'intent': 'a' * 32, 'comment_id': 77, 'write_result': None})
+    comment = {'id': 77, 'body': body, 'user': {'login': target.actor},
+        'issue_url': 'https://api.github.com/repos/example/project/issues/7'}
+    writes = [['api', 'repos/example/project/issues/7/comments', '--method', 'POST', '--input', '-']]
+    return projection, journal, [comment], writes
+
+
+def test_parent_only_comment_accounting_requires_the_existing_exact_status_receipt(confirmed_display_receipt):
+    from copy import deepcopy
+    from support.notification import assert_confirmed_status_comment
+    projection, journal, comments, writes = confirmed_display_receipt
+    before = deepcopy(journal)
+    assert_confirmed_status_comment(projection, journal, comments, writes)
+    assert journal == before
+
+
+@pytest.mark.parametrize('changed', ['issue', 'marker', 'actor', 'comment_id', 'endpoint', 'receipt', 'run_binding', 'extra'])
+def test_parent_only_comment_accounting_rejects_foreign_display_facts(confirmed_display_receipt, changed):
+    from copy import deepcopy
+    from dataclasses import replace
+    from support.notification import assert_confirmed_status_comment
+    projection, journal, comments, writes = confirmed_display_receipt
+    if changed == 'issue':
+        comments[0]['issue_url'] = 'https://api.github.com/repos/example/project/issues/999'
+    elif changed == 'marker':
+        foreign = replace(projection, target=replace(projection.target, run_id='foreign-run'))
+        foreign_entry = StatusComments._entry({'pending': [], 'records': [], 'seen': []}, foreign)
+        comments[0]['body'] = foreign_entry['marker'] + '\n' + foreign.body
+    elif changed == 'actor':
+        comments[0]['user']['login'] = 'foreign-actor'
+    elif changed == 'comment_id':
+        comments[0]['id'] = 78
+    elif changed == 'endpoint':
+        writes[0][1] = 'repos/example/project/issues/999/comments'
+    elif changed == 'receipt':
+        journal['remote_status']['bindings'][projection.target.key]['receipt']['comment_id'] = 78
+    elif changed == 'run_binding':
+        journal['native_binding'][0] = 'foreign-run'
+    else:
+        comments.append(deepcopy(comments[0]))
+    before = deepcopy(journal)
+    with pytest.raises((AssertionError, ValueError)):
+        assert_confirmed_status_comment(projection, journal, comments, writes)
+    assert journal == before

@@ -11,6 +11,18 @@ from agent_run.runtime.execution import ProcessExitUnknown
 from agent_run.model import AgentCall, AgentPreparation, Execution, Profile, Purpose, Role, Step
 from support.offline import fixture_inputs
 from agent_run.core.operation_contract import OperationBinding, OperationState
+from support.notification import _NoNotifications
+
+
+def test_disabled_notification_substitute_preserves_required_storage_keyword(tmp_path):
+    selected = SimpleNamespace(path=tmp_path / 'unopened.sqlite3', run_id='exact-run')
+    observer = _NoNotifications(selected.path, tmp_path, {}, storage=selected)
+    assert observer.storage is selected
+    observer.observe_committed()
+    observer.close(drain=False)
+    with pytest.raises(TypeError, match='storage'):
+        _NoNotifications(selected.path, tmp_path, {})
+    assert not selected.path.exists()
 
 
 @pytest.mark.parametrize("settled", [True, False])

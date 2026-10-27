@@ -21,6 +21,7 @@ from agent_run.storage.run_scope import RunTransaction, transaction_scope
 from agent_run.storage.sqlite import Storage, Transaction
 from agent_run.storage.tasks import read_repository_task
 from support.offline import fixture_inputs
+from support.sqlite_faults import assert_save_rollback
 
 SUBJECT = 'shared-subject'
 
@@ -199,7 +200,7 @@ def test_bound_views_share_original_owner_poison_and_roll_back_both_aliases(rout
             except sqlite3.OperationalError:
                 pass
             assert a.failed and b.failed
-    assert dump(route) == before
+    assert_save_rollback(route.database, before, registrations=1)
     with route.at_run('A').transaction(write=False) as a:
         b = RunTransaction(a, 'B')
         a.rows_read = 65536
@@ -253,6 +254,7 @@ def test_existing_current_protocol_is_refused_by_staged_route_without_migration_
     with closing(sqlite3.connect(database)) as connection:
         connection.execute('CREATE TABLE meta(protocol TEXT NOT NULL)')
         connection.execute('INSERT INTO meta VALUES (?)', ('independent-delivery-kernel-v21',))
+        connection.commit()
     route = RepositoryRoute(database, tmp_path / 'repository', 'example/project')
     before = database.read_bytes()
     with pytest.raises(UnsupportedState, match='unknown_protocol'):

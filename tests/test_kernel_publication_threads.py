@@ -26,7 +26,14 @@ def test_publication_reuses_development_binding_after_future_profiles_change(tmp
     reviewer = next_call(scenario, Role.REVIEW)
     assert reviewer.thread_id != development.thread_id and reviewer.reported_thread is None and reviewer.mode == "fresh"
     finish_call(scenario, reviewer)
-    publication = next_call(scenario, Role.PUBLICATION)
+    if kind == DeliveryKind.TICKET:
+        # Native capture owns preparation -> credentials -> admission. Do not
+        # pre-admit an AgentCall and manufacture a preparation deadline later.
+        native = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports, prepare_agents=False)
+        publication = native.until(lambda step: step.preparation is not None).preparation
+        assert publication is not None and publication.role == Role.PUBLICATION
+    else:
+        publication = next_call(scenario, Role.PUBLICATION)
     assert publication.thread_id == development.thread_id
     assert publication.reported_thread == "offline-" + development.thread_id
     assert publication.mode == "resume" and publication.role == Role.PUBLICATION

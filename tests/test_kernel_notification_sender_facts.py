@@ -170,22 +170,24 @@ def test_sender_compresses_real_development_to_review_and_preserves_gate_budget_
             assert old["cancelled"] is True and old["attempts"] == 0 and old["deadline_at"] == deadline
             assert any(item["event"]["title"] == "Unknown recorded origin" for item in document["pending"])
             assert any(item["event"].get("attempt_id") == call.attempt_id for item in document["pending"])
-            unknown = []
-            with outbox.transaction(tmp_path, scenario.spec.run_id) as journal:
-                while len(journal["pending"]) < outbox.MAX_PENDING:
-                    event = event_envelope(_state(scenario), "stage_start", f"unknown-origin-{len(unknown) + 1}", "Capacity-only unknown")
-                    unknown.append(event["id"])
-                    outbox.enqueue(journal, event, time.time())
-            assert scenario.kernel.control("stop", "protect-current-gate", subject=scenario.delivery.key) == "applied"
-            observer.observe_committed()
-            document = outbox.read_notifications(tmp_path, scenario.spec.run_id)
-            assert len(document["pending"]) <= outbox.MAX_PENDING
-            gates = [item for item in document["pending"] if item["event"]["kind"] == "boundary"]
-            assert len(gates) == 1 and gates[0]["important"] is True and gates[0]["attempts"] == 0
-            retained = {item["event"]["id"] for item in document["pending"]} | {record["id"] for record in document["records"]}
-            assert set(unknown).issubset(retained)
-            cancelled = [record for record in document["records"] if record["id"] in unknown]
-            assert cancelled and all(record["cancel_reason"] == "pending capacity" and record["attempts"] == 0 for record in cancelled)
+            # Keep generation, poll and snapshot ahead of the sender claim.
+            with observer.condition:
+                unknown = []
+                with outbox.transaction(tmp_path, scenario.spec.run_id) as journal:
+                    while len(journal["pending"]) < outbox.MAX_PENDING:
+                        event = event_envelope(_state(scenario), "stage_start", f"unknown-origin-{len(unknown) + 1}", "Capacity-only unknown")
+                        unknown.append(event["id"])
+                        outbox.enqueue(journal, event, time.time())
+                assert scenario.kernel.control("stop", "protect-current-gate", subject=scenario.delivery.key) == "applied"
+                observer.observe_committed()
+                document = outbox.read_notifications(tmp_path, scenario.spec.run_id)
+                assert len(document["pending"]) <= outbox.MAX_PENDING
+                gates = [item for item in document["pending"] if item["event"]["kind"] == "boundary"]
+                assert len(gates) == 1 and gates[0]["important"] is True and gates[0]["attempts"] == 0
+                retained = {item["event"]["id"] for item in document["pending"]} | {record["id"] for record in document["records"]}
+                assert set(unknown).issubset(retained)
+                cancelled = [record for record in document["records"] if record["id"] in unknown]
+                assert cancelled and all(record["cancel_reason"] == "pending capacity" and record["attempts"] == 0 for record in cancelled)
             observed.append(call.attempt_id)
 
     try:
@@ -203,7 +205,10 @@ def test_sender_compresses_real_development_to_review_and_preserves_gate_budget_
     assert sent[1]["kind"] == "boundary"  # Important Gate precedes retained unknown ordinary cards.
 
 
-def test_sender_one_poll_replaces_failed_live_start_with_the_newer_real_sibling_start(tmp_path):
+def test_sender_one_poll_replaces_failed_live_start_with_the_newer_real_sibling_start(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import agent_run.notifications.sender as notifications
+
     kernel = _kernel(tmp_path, count=2)
     execution = kernel.claim_executor("executor")
     operations = _operations(kernel, execution, count=2)
@@ -231,6 +236,10 @@ def test_sender_one_poll_replaces_failed_live_start_with_the_newer_real_sibling_
 
     second = [None]
     second_call = None
+    # Pin only the notification clock. Sibling preparation must not spend this
+    # event's real one-second retry window; Storage/Core clocks stay native.
+    notification_now = [time.time()]
+    monkeypatch.setattr(notifications, 'time', SimpleNamespace(time=lambda: notification_now[0]))
     observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport, storage=kernel.storage)
     try:
         assert returned.wait(5)
@@ -243,6 +252,13 @@ def test_sender_one_poll_replaces_failed_live_start_with_the_newer_real_sibling_
             time.sleep(0.01)
         assert len(failed) == 1 and failed[0]["attempts"] == 1
         deadline = failed[0]["deadline_at"]
+        history = [dict(item) for item in failed[0]['attempt_history']]
+        assert history == [{'number': 1, 'started_at': notification_now[0], 'outcome': 'failed',
+            'reason': 'Original physical delivery failed', 'finished_at': notification_now[0]}]
+        retry_at = failed[0]['next_attempt_at']
+        assert retry_at == history[0]['finished_at'] + outbox.RETRY_DELAY_SECONDS
+        assert deadline == failed[0]['created_at'] + outbox.DELIVERY_LIFETIME_SECONDS
+        assert notification_now[0] < retry_at < deadline
         call = operations.once().call
         assert call is not None and kernel.dispatch_agent(call)
         second_call = call
@@ -252,13 +268,18 @@ def test_sender_one_poll_replaces_failed_live_start_with_the_newer_real_sibling_
         kernel.agent_source_ready(call)
         kernel.observe_worker_activity(call, "second-turn", active=True, observed_at=kernel.clock(),
                                        evidence={"type": "turn.started"})
-        observer.observe_committed()
+        # At the exact retry boundary, the same poll must first consume the
+        # committed sibling and cancel the old Start, not send it again.
+        with observer.condition:
+            notification_now[0] = retry_at
+            observer.observe_committed()
         assert newer_entered.wait(5)
         document = outbox.read_notifications(tmp_path, "run-native")
         cancelled, = [record for record in document["records"] if record["id"] == original[0]]
         assert cancelled["cancelled"] is True and cancelled["outcome"] == "failed"
         assert cancelled["attempts"] == 1 and cancelled["deadline_at"] == deadline
         assert cancelled["attempt_history"][0]["outcome"] == "failed"
+        assert cancelled['attempt_history'] == history
         assert any(item["event"].get("attempt_id") == call.attempt_id for item in document["pending"])
         assert len(original) == 1
     finally:
