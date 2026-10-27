@@ -122,6 +122,8 @@ class OfflinePort:
         environment = port.git.env
         port.git = LocalGit(checkout)
         port.git.env.update(environment)
+        port.git.run("config", "maintenance.auto", "false")
+        port.git.run("config", "gc.auto", "0")
         port._managed_workspace = workspace
         port._initialize_external_objects()
         return port
