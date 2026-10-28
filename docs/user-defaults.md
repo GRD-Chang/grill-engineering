@@ -229,7 +229,11 @@ agent-run resume 228 --ticket-review-rounds 4 --development-deadline 6h
 
 ## 配置来源与错误处理
 
-个人配置只读取 `user-defaults.json`。文件不存在时使用内置默认值，不读取旧 `delivery-policy.json`，也不自动导入、修改或删除其中的值。`settings show/configure` 是个人设置的正式入口；旧 `policy show/configure` 路由已退出。当前文件中的稀疏覆盖只影响未来创建的 Run；已有 Run 和后续预算窗口继续使用其冻结策略，显式检查点覆盖以该冻结值补齐未提供字段。
+`user-defaults.json` 是唯一写入权威。仅在它不存在时，只读兼容同目录旧 `delivery-policy.json` 的扁平策略对象，使用现有策略解析与校验规则；两份文件均不存在时使用内置默认值。查询通过 `source: legacy-delivery-policy`、`source_path` 和 `notice` 说明兼容来源与首次保存迁移，不创建或修改配置文件。
+
+首次 `settings configure` 在同一文件锁内保留全部有效旧策略，合并本次修改并原子保存到 `user-defaults.json`。新文件存在后完全优先，旧文件不再参与解析；查询与保存结果的 `notice` 明确旧文件已忽略并保留。迁移不会改写或删除旧文件，也不恢复旧独立 writer。实际读取文件的未知字段、非法值或损坏内容均按现有合同明确报错；损坏的新文件不会回退旧文件。
+
+`settings show/configure` 是个人设置的正式入口；旧 `policy show/configure` 路由已退出。个人配置迁移只影响未来创建的 Run，不迁移旧 Run 或改变其权限。已有 Run 和后续预算窗口继续使用其冻结策略，显式检查点覆盖以该冻结值补齐未提供字段。
 
 策略和模型中的未知字段、null、非法值及文件损坏 JSON 均明确报错，诊断含文件或配置项；不静默恢复默认、不覆盖损坏文件。CLI 更新加文件锁，先完整校验再原子替换；并发 CLI 更新保留彼此未修改字段。写入失败恢复原配置并清理临时文件；若底层存储连回滚也拒绝，错误会报告保留的恢复备份。手工编辑请保存完整 JSON，避免与 CLI 同时写入；外部编辑器不参与 CLI 锁。
 

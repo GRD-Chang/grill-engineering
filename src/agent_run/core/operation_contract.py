@@ -39,6 +39,8 @@ class DeliveryRead:
     # None retains the complete anchor relation. An explicit tuple requests
     # only these directed edges; "source" resolves to this observation's head.
     ancestry_pairs: tuple[tuple[str, str], ...] | None = None
+    # False omits only Required Checks, never PR/ref identity observation.
+    read_checks: bool = True
 
 @dataclass(frozen=True)
 class DeliveryFacts:
@@ -51,6 +53,9 @@ class DeliveryFacts:
     publisher_identity: Mapping[str, Any] | None = None
     # Checked-but-not-positive is false. None is never proof of a false edge.
     ancestry_checked: tuple[tuple[str, str], ...] | None = None
+    # False means not requested. With an observed PR, True + no open PR is
+    # inapplicable; True + open PR + checks=None is unknown, never a pass.
+    checks_requested: bool = True
 
 
 def requested_ancestry(request: DeliveryRead, source: Commit | None) -> tuple[tuple[str, str], ...] | None:
@@ -111,6 +116,8 @@ class ReadFence:
     scope: bytes
     source_sequence: int | None
     control_version: tuple[str | int | None, ...]
+    # A check-free result belongs only to this exact local write admission.
+    local_effect: Effect | None = None
 
 
 @dataclass(frozen=True)

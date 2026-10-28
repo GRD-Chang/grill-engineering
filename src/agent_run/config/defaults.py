@@ -146,16 +146,37 @@ class UserDefaultsStore:
             raise UserDefaultsError(reason) from error
 
     def _read(self) -> tuple[dict[str, Any], str]:
-        path = self.path
-        if not path.exists():
-            return {}, "builtin"
+        document = self._read_file(self.path)
+        if document is not None:
+            return document, "user-defaults"
+        legacy_error = None
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-            document = _document(raw)
+            document = self._read_file(self.path.with_name("delivery-policy.json"), policy_only=True)
+        except UserDefaultsError as error:
+            document, legacy_error = None, error
+        # A settings writer may have created the authority while fallback was read.
+        # Prefer it even when the old file was missing or invalid; queries never write.
+        current = self._read_file(self.path)
+        if current is not None:
+            return current, "user-defaults"
+        if legacy_error is not None:
+            raise legacy_error
+        return (document, "legacy-delivery-policy") if document is not None else ({}, "builtin")
+
+    @staticmethod
+    def _read_file(path: Path, *, policy_only: bool = False) -> dict[str, Any] | None:
+        try:
+            try:
+                contents = path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                if not path.is_symlink():
+                    return None
+                raise  # A broken config link is not an absent configuration.
+            raw = json.loads(contents)
+            return _document({"policy": raw} if policy_only else raw)
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, UserDefaultsError) as error:
             reason = error.args[0] if error.args and isinstance(error.args[0], ErrorMessage) else str(error)
             raise UserDefaultsError(error_message("defaults.read_error", path=path, reason=reason)) from error
-        return document, "user-defaults"
 
     def load(self) -> dict[str, Any]:
         return self._read()[0]
@@ -203,10 +224,28 @@ class UserDefaultsStore:
             role: source if role in policy_defaults.get("invocation_deadlines", {}) else "builtin"
             for role in policy["invocation_deadlines"]
         }
+        language = self.language(document)
+        notice = text("settings.scope_notice", language=language)
+        legacy = self.path.with_name("delivery-policy.json")
+        source_path = str(self.path) if source == "user-defaults" else None
+        if source == "legacy-delivery-policy":
+            source_path = str(legacy)
+            notice += (
+                f"；兼容读取 {legacy}；首次 settings configure 将保留有效旧设置并迁入 {self.path}，旧文件保留"
+                if language == "zh" else
+                f"; Reading legacy {legacy}; the first settings configure preserves valid settings in "
+                f"{self.path} and keeps the old file"
+            )
+        elif source == "user-defaults" and legacy.exists():
+            notice += (
+                f"；以 {self.path} 为准，旧文件 {legacy} 已忽略并保留"
+                if language == "zh" else
+                f"; {self.path} is authoritative; legacy {legacy} is ignored and preserved"
+            )
         return {
             "result": "settings",
             "path": str(self.path), "source": source,
-            "source_path": str(self.path) if source == "user-defaults" else None,
+            "source_path": source_path,
             "defaults": document,
             "policy": policy, "policy_sources": policy_sources,
             "profile": resolved, "profile_sources": sources,
@@ -215,7 +254,7 @@ class UserDefaultsStore:
             "language": self.language(document),
             "language_source": source if "language" in document else "builtin",
             "scope": "future-runs",
-            "notice": text("settings.scope_notice", language=self.language(document)),
+            "notice": notice,
         }
 
     def describe(self, document: dict[str, Any] | None = None) -> dict[str, Any]:

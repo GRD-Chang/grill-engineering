@@ -194,7 +194,7 @@ class Storage:
                 # clears inherited ownership after fork. Control bypass remains explicit.
                 identity = scopes.enter_context(write_owner(self.path,
                     deadline=deadline, cancelled=cancelled))
-                require_supported_state(self.path, timeout=remaining(deadline))
+                require_supported_state(self.path, timeout=remaining(deadline), deadline=deadline)
                 if database_identity(self.path) != identity:
                     raise UnsupportedState(self.path, "uncertain_state")
             if write and ordered:
@@ -208,7 +208,7 @@ class Storage:
     def _verify_save_database(self, identity: tuple[int, int], deadline: float) -> None:
         if database_identity(self.path) != identity:
             raise UnsupportedState(self.path, "uncertain_state")
-        with read_state(self.path, timeout=remaining(deadline)) as connection:
+        with read_state(self.path, timeout=remaining(deadline), deadline=deadline) as connection:
             connection.row_factory = sqlite3.Row
             require_supported_connection(connection, self.path)
             self._require_namespace(Transaction(connection))
@@ -332,7 +332,7 @@ class Storage:
             self._verify_save_database(identity, deadline)
         with ExitStack() as scopes:
             scope = (_owned_connection(sqlite3.connect(self.path.absolute().as_uri() + "?mode=rw", uri=True,
-                                            isolation_level=None, timeout=remaining(deadline))) if write else read_state(self.path))
+                                            isolation_level=None, timeout=remaining(deadline))) if write else read_state(self.path, deadline=deadline))
             connection = scopes.enter_context(scope)
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA trusted_schema=OFF")

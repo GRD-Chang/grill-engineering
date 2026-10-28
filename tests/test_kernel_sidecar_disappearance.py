@@ -73,7 +73,7 @@ def test_zero_link_sidecar_recheck_cannot_adopt_existing_or_unreadable_object(tm
         calls.append(path)
         if len(calls) == 1:
             return SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_nlink=0, st_size=32768, st_dev=1, st_ino=2)
-        assert len(calls) == 2
+        assert len(calls) <= 33 if outcome == 'zero' else len(calls) == 2
         if outcome in {'EACCES', 'EIO', 'ENOTDIR'}:
             raise OSError(getattr(errno, outcome), 'controlled access error')
         if outcome == 'false_ENOENT':
@@ -85,7 +85,7 @@ def test_zero_link_sidecar_recheck_cannot_adopt_existing_or_unreadable_object(tm
     with pytest.raises(preflight.UnsupportedState):
         with preflight.read_state(native.path):
             pytest.fail('unsafe sidecar yielded a connection')
-    assert len(calls) == 2
+    assert len(calls) == (33 if outcome == 'zero' else 2)
 
 
 @pytest.mark.parametrize('target', ['database', 'directory'])

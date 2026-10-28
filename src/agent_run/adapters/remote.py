@@ -651,7 +651,9 @@ class RemoteEffects:
     @_operation_errors
     def delivery(self, request: DeliveryRead) -> DeliveryFacts:
         """Read exact Core-supplied refs and immutable ancestry anchors."""
-        from agent_run.core.operation_contract import DeliveryFacts, requested_ancestry
+        from agent_run.core.operation_contract import DeliveryFacts, ReadUnavailable, requested_ancestry
+        if type(request.read_checks) is not bool or not request.read_checks and request.check_head is not None:
+            raise ReadUnavailable("checks_request_invalid", "An exact checks head requires a checks observation")
         requested_ancestry(request, None)  # Validate literal demand before I/O.
         commits: dict[str, Commit] = {}
         reused: set[str] = set()
@@ -701,13 +703,15 @@ class RemoteEffects:
                     source_ref=request.source_ref, target_ref=request.target_ref,
                     source=source, target=target, ancestry=ancestry) is None:
                 raise GitHubReadError("github_observation_pending", "PR and remote ref observations have not converged")
-            reader = GhGitHubReader(self.repository, working_directory=self.root, runner_identity=self.identity)
-            checks = normalize_required_checks(read_required_check_facts(
-                reader, pr.number, expected_head_sha=request.check_head or source.sha))
+            if request.read_checks:
+                reader = GhGitHubReader(self.repository, working_directory=self.root, runner_identity=self.identity)
+                checks = normalize_required_checks(read_required_check_facts(
+                    reader, pr.number, expected_head_sha=request.check_head or source.sha))
         if read_remote_heads(self.root, request.source_ref, request.target_ref,
                 runner_identity=self.identity, remote=self.remote) != (source_sha, target_sha):
             raise GitHubReadError("github_observation_pending", "Remote refs changed during delivery observation")
-        return DeliveryFacts(target, source, pr, checks, ancestry, self.actor(), dict(self.identity), checked)
+        return DeliveryFacts(target, source, pr, checks, ancestry, self.actor(), dict(self.identity), checked,
+                             request.read_checks)
 
     @_operation_errors
     def inspect(self, resources: tuple[ResourceWitness, ...]) -> tuple[ResourceInspection, ...]:

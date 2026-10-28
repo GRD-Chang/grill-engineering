@@ -24,7 +24,7 @@ def test_resync_limit_configures_future_runs() -> None:
     assert shown["policy_sources"]["integration_resync_limit"] == "user-defaults"
 
 
-def test_public_settings_ignore_old_policy_and_preserve_atomic_failure(
+def test_public_settings_migrate_old_policy_and_preserve_atomic_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -34,11 +34,17 @@ def test_public_settings_ignore_old_policy_and_preserve_atomic_failure(
     legacy.write_text('{"ticket_review_rounds": 7}')
     old_bytes = legacy.read_bytes()
     code, initial = settings("show")
-    assert code == 0 and initial["source"] == "builtin"
-    assert initial["defaults"] == {} and "legacy_ignored" not in initial
+    assert code == 0 and initial["source"] == "legacy-delivery-policy"
+    assert initial["source_path"] == str(legacy)
+    assert initial["defaults"] == {"policy": {"ticket_review_rounds": 7}}
+    assert "首次 settings configure" in initial["notice"]
+    assert legacy.read_bytes() == old_bytes
     assert not store.path.exists()
     code, saved = settings("configure", "--preset", "premium")
-    assert code == 0 and saved["defaults"] == {"policy": {}, "profile": {"preset": "premium"}}
+    assert code == 0 and saved["defaults"] == {
+        "policy": {"ticket_review_rounds": 7}, "profile": {"preset": "premium"}}
+    assert saved["source"] == "user-defaults" and saved["source_path"] == str(store.path)
+    assert "已忽略并保留" in saved["notice"]
     assert legacy.read_bytes() == old_bytes
     previous = store.path.read_bytes()
     code, rejected = settings("configure", "--development-effort", "invalid")

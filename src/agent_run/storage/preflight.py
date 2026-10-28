@@ -9,9 +9,11 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import errno
+import math
 from pathlib import Path
 import sqlite3
 import stat
+from time import get_clock_info
 from typing import Iterator
 
 from agent_run.errors import KernelError
@@ -45,13 +47,77 @@ class UnsupportedState(KernelError):
                 "protocol": self.protocol, "recovery_hint": self.recovery_hint}
 
 
+class _ReadBudget:
+    """One local observation allowance, never a persisted save clock authority."""
+
+    def __init__(self, path: Path, timeout: float, deadline: float | None) -> None:
+        self.path = path
+        try:
+            clock = get_clock_info('monotonic')
+            if not clock.monotonic or clock.adjustable:
+                raise ValueError('Monotonic observation budget unavailable')
+            if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError('Finite positive observation allowance required')
+            self.last = self._now()
+            self.deadline = self.last + timeout
+            if deadline is not None:
+                if type(deadline) not in (int, float) or not math.isfinite(deadline):
+                    raise ValueError('Finite observation deadline required')
+                self.deadline = min(self.deadline, deadline)
+            if not math.isfinite(self.deadline) or self.deadline <= self.last:
+                raise ValueError('Observation allowance expired')
+        except (OSError, TypeError, ValueError, OverflowError) as error:
+            raise UnsupportedState(path, 'uncertain_state') from error
+
+    def _now(self) -> float:
+        # Use the caller's existing contention-clock source. Import lazily:
+        # save_order also uses UnsupportedState, but no save clock is captured.
+        from agent_run.storage import save_order
+        try:
+            value = save_order.monotonic()  # type: ignore[attr-defined]  # Share the owner's internal source.
+            if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                raise ValueError('Monotonic observation budget unavailable')
+            return value
+        except (OSError, TypeError, ValueError, OverflowError) as error:
+            raise UnsupportedState(self.path, 'uncertain_state') from error
+
+    def remaining(self) -> float:
+        now = self._now()
+        if now < self.last or now >= self.deadline:
+            raise UnsupportedState(self.path, 'uncertain_state')
+        self.last = now
+        return self.deadline - now
+
+
+def _wait_sidecar_absent(path: Path, sidecar: Path, identity: tuple[int, int], budget: _ReadBudget) -> None:
+    # A pending unlink can remain visible to several fresh pathname lookups.
+    # Only absence resolves it; an existing replacement is never adopted.
+    for _ in range(32):
+        budget.remaining()
+        try:
+            current = sidecar.stat(follow_symlinks=False)
+        except OSError as error:
+            if error.errno != errno.ENOENT:
+                raise
+            budget.remaining()
+            return
+        budget.remaining()
+        if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 0
+                or (current.st_dev, current.st_ino) != identity):
+            raise UnsupportedState(path, 'uncertain_state')
+    raise UnsupportedState(path, 'uncertain_state')
+
+
 @contextmanager
-def read_state(path: Path, *, timeout: float = 1.0) -> Iterator[sqlite3.Connection]:
+def read_state(path: Path, *, timeout: float = 1.0,
+               deadline: float | None = None) -> Iterator[sqlite3.Connection]:
     """Open an existing ordinary file with WAL visibility and no recovery writes.
 
     A rollback journal may require recovery even for a reader: refuse it rather
     than repairing the original. Missing files and aliases never mean new state.
     """
+    budget = _ReadBudget(path, timeout, deadline)
+    waited = False
     try:
         info = path.lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
@@ -63,35 +129,40 @@ def read_state(path: Path, *, timeout: float = 1.0) -> Iterator[sqlite3.Connecti
             sidecar = Path(str(path) + suffix)
             try:
                 metadata = sidecar.stat(follow_symlinks=False)
-            except FileNotFoundError:
+            except OSError as error:
                 # SQLite's last connection can remove its WAL/SHM normally.
                 # Only an absent sidecar is optional; the database is not.
-                continue
+                if error.errno == errno.ENOENT:
+                    continue
+                raise
             if (suffix in {"-wal", "-shm"} and stat.S_ISREG(metadata.st_mode)
                     and metadata.st_nlink == 0):
-                # Lookup can retain an inode while SQLite's last close unlinks
-                # it. Only proven absence, not a replacement, resolves this read.
-                try:
-                    sidecar.stat(follow_symlinks=False)
-                except OSError as error:
-                    if error.errno == errno.ENOENT:
-                        continue
-                    raise
-                raise UnsupportedState(path, "uncertain_state")
+                _wait_sidecar_absent(path, sidecar, (metadata.st_dev, metadata.st_ino), budget)
+                waited = True
+                continue
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or suffix == "-journal" and metadata.st_size:
                 raise UnsupportedState(path, "uncertain_state")
+        if waited:
+            current, parent = path.lstat(), path.parent.stat()
+            if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+                    or (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino)
+                    or not stat.S_ISDIR(parent.st_mode)
+                    or (parent.st_dev, parent.st_ino) != (directory.st_dev, directory.st_ino)):
+                raise UnsupportedState(path, 'uncertain_state')
         db = sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True,
-                             isolation_level=None, timeout=timeout)
+                             isolation_level=None, timeout=budget.remaining())
     except (OSError, sqlite3.Error) as error:
         raise UnsupportedState(path, "unreadable_state") from error
     try:
         try:
+            budget.remaining()
             db.execute("PRAGMA query_only=ON")
             db.execute("PRAGMA trusted_schema=OFF")
             db.execute("BEGIN")
             # BEGIN is deferred: read the database before checking the identity
             # of the snapshot we are about to expose to the caller.
             try:
+                db.execute(f"PRAGMA busy_timeout={int(budget.remaining() * 1000)}")
                 db.execute("SELECT name FROM sqlite_schema LIMIT 1").fetchone()
             except sqlite3.Error as error:
                 # This schema read formerly happened in support classification.
@@ -105,6 +176,7 @@ def read_state(path: Path, *, timeout: float = 1.0) -> Iterator[sqlite3.Connecti
                 raise UnsupportedState(path, "uncertain_state")
         except (OSError, sqlite3.Error) as error:
             raise UnsupportedState(path, "unreadable_state") from error
+        budget.remaining()
         yield db
     finally:
         db.close()
@@ -157,7 +229,7 @@ def require_supported_connection(db: sqlite3.Connection, path: Path) -> str:
         raise UnsupportedState(path, "uncertain_state") from error
 
 
-def require_supported_state(path: Path, *, timeout: float = 1.0) -> str:
+def require_supported_state(path: Path, *, timeout: float = 1.0, deadline: float | None = None) -> str:
     """Return a supported native protocol, otherwise raise a located refusal."""
-    with read_state(path, timeout=timeout) as db:
+    with read_state(path, timeout=timeout, deadline=deadline) as db:
         return require_supported_connection(db, path)

@@ -179,11 +179,13 @@ class OfflinePort:
     def delivery(self, request: DeliveryRead, checks_script: Sequence[str], heads: list[str], *,
                  publisher_identity: Mapping[str, Any] | None = None) -> DeliveryFacts:
         """Read the synthetic remote; revisions and World belong to Core."""
+        if type(request.read_checks) is not bool or not request.read_checks and request.check_head is not None:
+            raise ReadUnavailable("checks_request_invalid", "An exact checks head requires a checks observation")
         requested_ancestry(request, None)
         pr = (None if not request.read_pr else self.pr_by_number(request.pr_number)
               if request.pr_number is not None else self.pull_request_by_ref(request.source_ref, request.target_ref))
         checks = None
-        if pr is not None and pr.state == "OPEN":
+        if pr is not None and pr.state == "OPEN" and request.read_checks:
             if request.check_head is not None and request.check_head != pr.head.sha:
                 raise ReadUnavailable("github_observation_pending", "Synthetic checks head is not current")
             if pr.head.sha not in heads:
@@ -209,7 +211,8 @@ class OfflinePort:
         pairs = ((before, after) for before in sorted(ancestry_heads) for after in sorted(ancestry_heads)) if request.ancestry_pairs is None else iter(checked or ())
         ancestry = tuple((before, after) for before, after in pairs
                          if before == after or self.git.is_ancestor(before, after))
-        return DeliveryFacts(target, source, pr, checks, ancestry, "offline-publisher", publisher_identity, checked)
+        return DeliveryFacts(target, source, pr, checks, ancestry, "offline-publisher", publisher_identity, checked,
+                             request.read_checks)
 
     def pull_request_by_ref(self, source_ref: str, target_ref: str) -> PullRequest | None:
         return self._remote(self.objects.repository).find_pull_request(source_ref, target_ref)

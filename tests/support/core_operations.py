@@ -66,7 +66,8 @@ class ReadOnlyPorts:
 
     def delivery(self, request: DeliveryRead) -> DeliveryFacts:
         assert (request.source_ref, request.target_ref) == (self.source_ref, self.target_ref)
-        return self.facts
+        return replace(self.facts, checks=self.facts.checks if request.read_checks else None,
+                       checks_requested=request.read_checks)
 
     def inspect(self, resources: tuple[ResourceWitness, ...]) -> tuple[ResourceInspection, ...]:
         raise AssertionError("This read-only fixture cannot inspect physical resources")

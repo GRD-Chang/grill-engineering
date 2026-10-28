@@ -9,28 +9,154 @@ from agent_run.contracts.agent_profiles import resolve_profiles
 from agent_run.config.defaults import UserDefaultsError, UserDefaultsStore
 
 
-@pytest.mark.parametrize("old_contents", ['{"ticket_review_rounds":7}', 'broken old JSON'])
-def test_only_current_defaults_are_read_and_old_policy_materials_are_preserved(tmp_path: Path, old_contents: str) -> None:
+def test_read_only_legacy_policy_and_first_save_preserve_all_settings(tmp_path: Path) -> None:
     store = UserDefaultsStore(tmp_path / "config" / "user-defaults.json")
     assert store.describe()["source"] == "builtin"
     assert not store.path.parent.exists()
     store.path.parent.mkdir()
     legacy = store.path.with_name("delivery-policy.json")
-    legacy.write_text(old_contents)
+    legacy.write_text(json.dumps({"ticket_review_rounds": 7, "parent_only_paired_round": 8,
+                                  "run_repair_rounds": 9, "review_deadline": "3h",
+                                  "development_timeout_seconds": 1800}))
     original = legacy.read_bytes()
     shown = store.describe()
-    assert shown["source"] == "builtin" and shown["source_path"] is None
-    assert shown["defaults"] == {} and "legacy_ignored" not in shown
+    expected = {"ticket_review_rounds": 7, "parent_only_paired_rounds": 8, "run_repair_rounds": 9,
+                "invocation_deadlines": {"review": "3h", "development": 1800}}
+    assert shown["source"] == "legacy-delivery-policy" and shown["source_path"] == str(legacy)
+    assert shown["defaults"] == {"policy": expected}
+    assert shown["policy_sources"]["ticket_review_rounds"] == "legacy-delivery-policy"
+    assert shown["policy_sources"]["invocation_deadlines"]["review"] == "legacy-delivery-policy"
+    assert "首次" in shown["notice"] and str(legacy) in shown["notice"]
     assert not store.path.exists()
+    assert list(store.path.parent.iterdir()) == [legacy]
+    with pytest.raises(UserDefaultsError):
+        store.configure()
+    assert list(store.path.parent.iterdir()) == [legacy] and legacy.read_bytes() == original
     result = store.configure(profile={"preset": "premium"})
-    assert result["defaults"] == {"profile": {"preset": "premium"}}
-    assert "legacy_ignored" not in result
+    assert result["defaults"] == {"policy": expected, "profile": {"preset": "premium"}}
+    assert "忽略" in result["notice"] and "保留" in result["notice"]
     assert json.loads(store.path.read_text()) == result["defaults"]
     assert legacy.read_bytes() == original
-    store.configure(policy={"ticket_review_rounds": 8})
+    store.configure(policy={"ticket_review_rounds": 8, "development_deadline": "2h"})
     assert store.describe()["policy"]["ticket_review_rounds"] == 8
+    assert store.load()["policy"]["invocation_deadlines"] == {"review": "3h", "development": "2h"}
     assert legacy.read_bytes() == original
     assert store.describe()["source"] == "user-defaults"
+
+
+@pytest.mark.parametrize("raw,diagnostic", [
+    (b"{broken", "line"), (b"\xff", "utf-8"), (b"[]", "Policy"),
+    (b'{"surprise":1}', "surprise"), (b'{"ticket_review_rounds":null}', "ticket_review_rounds"),
+    (b'{"review_deadline":0}', "review"),
+    (b'{"review_deadline":"1h","review_timeout":"2h"}', "review"),
+])
+def test_corrupt_legacy_policy_fails_closed(tmp_path: Path, raw: bytes, diagnostic: str) -> None:
+    store = UserDefaultsStore(tmp_path / "user-defaults.json")
+    legacy = store.path.with_name("delivery-policy.json")
+    legacy.write_bytes(raw)
+    for action in (store.describe, lambda: store.configure(language="en")):
+        with pytest.raises(UserDefaultsError, match=diagnostic) as caught:
+            action()
+        assert str(legacy) in str(caught.value)
+        assert not store.path.exists() and legacy.read_bytes() == raw
+
+
+@pytest.mark.parametrize("current", ['{}', '{"policy":{"ticket_review_rounds":4}}', '{broken'])
+def test_current_file_is_authoritative_even_when_empty_or_corrupt(tmp_path: Path, current: str) -> None:
+    store = UserDefaultsStore(tmp_path / "user-defaults.json")
+    legacy = store.path.with_name("delivery-policy.json")
+    legacy.write_text("broken ignored old file")
+    store.path.write_text(current)
+    if current == '{broken':
+        for action in (store.describe, lambda: store.configure(language="en")):
+            with pytest.raises(UserDefaultsError) as caught:
+                action()
+            assert str(store.path) in str(caught.value)
+        assert store.path.read_text() == current
+    else:
+        assert store.describe()["source"] == "user-defaults"
+        assert store.load() == json.loads(current)
+        result = store.configure(language="en")
+        assert result["defaults"] == {**json.loads(current), "language": "en"}
+        assert "ignored" in result["notice"] and "preserved" in result["notice"]
+    assert legacy.read_text() == "broken ignored old file"
+
+
+@pytest.mark.parametrize("name", ["user-defaults.json", "delivery-policy.json"])
+@pytest.mark.parametrize("failure", ["unreadable", "broken-link"])
+def test_inaccessible_config_is_not_treated_as_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, failure: str,
+) -> None:
+    store = UserDefaultsStore(tmp_path / "user-defaults.json")
+    path = tmp_path / name
+    if failure == "broken-link":
+        path.symlink_to(tmp_path / "missing-target")
+    else:
+        read_text = Path.read_text
+
+        def read(candidate: Path, *args, **kwargs):
+            if candidate == path:
+                raise PermissionError("injected read failure")
+            return read_text(candidate, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read)
+    for action in (store.describe, lambda: store.configure(language="en")):
+        with pytest.raises(UserDefaultsError) as caught:
+            action()
+        assert str(path) in str(caught.value)
+    assert not store.path.exists()
+    assert not (tmp_path / "missing-target").exists()
+
+
+@pytest.mark.parametrize("old", ['{"ticket_review_rounds":7}', '{broken', None])
+def test_new_file_appearing_during_fallback_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, old: str | None,
+) -> None:
+    store = UserDefaultsStore(tmp_path / "user-defaults.json")
+    legacy = store.path.with_name("delivery-policy.json")
+    if old is not None:
+        legacy.write_text(old)
+    read_text = Path.read_text
+    appeared = False
+
+    def read(path: Path, *args, **kwargs):
+        nonlocal appeared
+        if path == legacy and not appeared:
+            appeared = True
+            # A competing settings writer completes before this read resumes.
+            # Its current document keeps the test independent of old corruption.
+            store.path.write_text('{"language":"en"}')
+            UserDefaultsStore(store.path).configure(policy={"ticket_review_rounds": 4})
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    shown = store.describe()
+    assert appeared and shown["source"] == "user-defaults"
+    assert shown["defaults"] == {"language": "en", "policy": {"ticket_review_rounds": 4}}
+    assert (legacy.read_text() if old is not None else None) == old
+
+
+@pytest.mark.parametrize("failure", ["replace", "directory-sync"])
+def test_first_save_failure_keeps_read_only_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    store = UserDefaultsStore(tmp_path / "user-defaults.json")
+    legacy = store.path.with_name("delivery-policy.json")
+    legacy.write_text('{"ticket_review_rounds":7}')
+    original = legacy.read_bytes()
+
+    def fail(*args: object) -> None:
+        raise OSError("injected first-save failure")
+
+    if failure == "replace":
+        monkeypatch.setattr('agent_run.config.defaults.os.replace', fail)
+    else:
+        monkeypatch.setattr(store, "_sync_directory", fail)
+    with pytest.raises(OSError, match="injected first-save failure"):
+        store.configure(language="en")
+    assert not store.path.exists() and legacy.read_bytes() == original
+    assert store.describe()["source"] == "legacy-delivery-policy"
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 @pytest.mark.parametrize("raw,diagnostic", [
@@ -93,6 +219,9 @@ def test_validation_and_atomic_replace_failure_preserve_file(tmp_path: Path, mon
 
 def test_concurrent_updates_preserve_policy_fields_and_other_sections(tmp_path: Path) -> None:
     path = tmp_path / "user-defaults.json"
+    legacy = path.with_name("delivery-policy.json")
+    legacy.write_text('{"run_repair_rounds":7,"development_deadline":"4h"}')
+    original = legacy.read_bytes()
     barrier = Barrier(4, timeout=5)
     def update(section: str) -> None:
         barrier.wait()
@@ -111,7 +240,9 @@ def test_concurrent_updates_preserve_policy_fields_and_other_sections(tmp_path: 
             future.result(timeout=10)
     document = UserDefaultsStore(path).load()
     assert document["policy"]["ticket_review_rounds"] == 9
-    assert document["policy"]["invocation_deadlines"] == {"review": "90m"}
+    assert document["policy"]["invocation_deadlines"] == {"development": "4h", "review": "90m"}
+    assert document["policy"]["run_repair_rounds"] == 7
+    assert legacy.read_bytes() == original
     assert document["profile"]["review_model"] == "custom-review"
     assert document["language"] == "en"
 

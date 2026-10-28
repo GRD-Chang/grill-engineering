@@ -188,19 +188,40 @@ def test_public_configure_preserves_original_on_atomic_storage_failure(
     assert not list(personal.parent.glob("*.tmp"))
 
 
-def test_personal_settings_preserve_old_policy_materials_without_import_or_old_routes(personal: Path, capsys) -> None:
+def test_personal_settings_migrate_old_policy_without_restoring_old_routes(personal: Path, capsys) -> None:
     personal.parent.mkdir(parents=True)
     legacy = personal.with_name("delivery-policy.json")
     legacy.write_text(json.dumps({"ticket_review_rounds": 7, "review_deadline": "3h"}))
     original = legacy.read_bytes()
     code, result = _call(main, ["settings", "show", "--json"], capsys)
-    assert code == 0 and result["source"] == "builtin"
-    assert result["defaults"] == {} and "legacy_ignored" not in result
+    expected_policy = {"ticket_review_rounds": 7, "invocation_deadlines": {"review": "3h"}}
+    assert code == 0 and result["source"] == "legacy-delivery-policy"
+    assert result["source_path"] == str(legacy)
+    assert result["defaults"] == {"policy": expected_policy}
+    assert result["policy"]["invocation_deadlines"]["review"] == 10800
+    assert result["policy_sources"]["ticket_review_rounds"] == "legacy-delivery-policy"
+    assert "首次 settings configure" in result["notice"] and "旧文件保留" in result["notice"]
+    assert str(legacy) in result["notice"] and str(personal) in result["notice"]
+    assert main(["settings", "show"]) == 0
+    plain = capsys.readouterr()
+    assert plain.err == "" and result["notice"] in plain.out
     assert not personal.exists() and legacy.read_bytes() == original
-    assert _call(main, ["settings", "configure", "--language", "en", "--json"], capsys)[0] == 0
-    assert UserDefaultsStore().load() == {"language": "en", "policy": {}, "profile": {}}
+    assert set(personal.parent.iterdir()) == {legacy}
+    code, migrated = _call(main, ["settings", "configure", "--language", "en", "--json"], capsys)
+    assert code == 0 and migrated["source"] == "user-defaults"
+    assert migrated["source_path"] == str(personal)
+    assert "ignored and preserved" in migrated["notice"]
+    assert UserDefaultsStore().load() == {"language": "en", "policy": expected_policy, "profile": {}}
     assert legacy.read_bytes() == original
     before = personal.read_bytes()
+    entries = set(personal.parent.iterdir())
+    code, shown = _call(main, ["settings", "show", "--json"], capsys)
+    assert code == 0 and shown["notice"] == migrated["notice"]
+    assert main(["settings", "show"]) == 0
+    plain = capsys.readouterr()
+    assert plain.err == "" and shown["notice"] in plain.out
+    assert personal.read_bytes() == before and legacy.read_bytes() == original
+    assert set(personal.parent.iterdir()) == entries
     for arguments in (["policy", "show"], ["policy", "configure", "--ticket-review-rounds", "8"]):
         assert main(arguments) == 2
         rejected = capsys.readouterr()
@@ -208,6 +229,7 @@ def test_personal_settings_preserve_old_policy_materials_without_import_or_old_r
         assert personal.read_bytes() == before and legacy.read_bytes() == original
     assert _call(main, ["settings", "configure", "--ticket-review-rounds", "8", "--json"], capsys)[0] == 0
     assert UserDefaultsStore().load()["policy"]["ticket_review_rounds"] == 8
+    assert UserDefaultsStore().load()["policy"]["invocation_deadlines"] == {"review": "3h"}
     assert legacy.read_bytes() == original
 
 

@@ -61,6 +61,7 @@ class InspectionBindings:
 
 
 class Kernel:
+    LOCAL_PREPARATION = ("candidate", "validation_checkout", "validation_cleanup")
     CLEANUP = ("cleanup_worktree", "cleanup_local_ref", "cleanup_remote_ref")
     ABANDON_EFFECTS = ("inspect_resources", "retire_pr", "reopen_ticket", "recovery_comment", "abandon_worktree")
     REMOTE = ("push", "run_branch", "pr_write", "merge", "completion_comment", "close", "issue_link", "cleanup_remote_ref", "retire_pr", "reopen_ticket", "recovery_comment")
@@ -147,7 +148,8 @@ class Kernel:
         with self.storage.transaction() as tx:
             self._check_operation(tx, fence, fence.execution)
             self._refresh(tx, source)
-            current = self._read_fence(tx, fence.subject, fence.execution, fence.cleanup)
+            current = replace(self._read_fence(tx, fence.subject, fence.execution, fence.cleanup),
+                              local_effect=fence.local_effect)
             if fence.subject is None:
                 job = tx.one(*run_statement(tx, 'SELECT * FROM final_target WHERE run_id=?',
                           (), run_last=True))
@@ -167,7 +169,8 @@ class Kernel:
             query = DeliveryRead(job["source_ref"], job["target_ref"], job["pr_number"] if fence.subject is not None else None,
                                  tuple(sorted(anchors)), job["source_sha"] if fence.subject is not None and job["phase"] == "checks" else None,
                                  fence.subject is not None,
-                                 tuple((sha, "source") for sha in sorted(anchors)) if fence.subject is None else None)
+                                 tuple((sha, "source") for sha in sorted(anchors)) if fence.subject is None else None,
+                                 read_checks=fence.local_effect is None)
         return DeliveryObservation(current, query)
 
     def accept_delivery(self, request: DeliveryObservation, facts: DeliveryFacts) -> tuple[World, ReadFence]:
@@ -178,6 +181,11 @@ class Kernel:
                 raise ReadWait(waiting)
         with self.storage.transaction(write=False) as tx:
             self._check_operation(tx, fence, fence.execution)
+            required = fence.local_effect is None
+            if (type(request.query.read_checks) is not bool or request.query.read_checks != required
+                    or type(facts.checks_requested) is not bool or facts.checks_requested != required
+                    or not required and facts.checks is not None):
+                raise ReadUnavailable("checks_observation_incomplete", "Required Checks demand was not exactly observed")
             if request.query.ancestry_pairs is not None:
                 checked = requested_ancestry(request.query, facts.source)
                 if (facts.ancestry_checked != checked
@@ -205,6 +213,8 @@ class Kernel:
 
     def authorize_agent_observation(self, call: AgentCall, world: World, fence: ReadFence) -> None:
         with self.storage.transaction() as tx:
+            if fence.local_effect is not None:
+                raise KernelError("observation_binding")
             self._check_operation(tx, fence, call.execution)
             if fence.subject != call.subject:
                 raise KernelError("invocation_binding")
@@ -245,7 +255,21 @@ class Kernel:
             if local:
                 self._local_cleanup_effect(tx, effect)
         source = self.begin_observation(effect.subject, execution=effect.execution)
-        return LocalCleanupRead(effect, source) if local else source
+        return (LocalCleanupRead(effect, source) if local else
+                replace(source, fence=replace(source.fence, local_effect=effect))
+                if effect.operation in self.LOCAL_PREPARATION else source)
+
+    def _local_preparation_read(self, tx: Transaction, effect: Effect, fence: ReadFence) -> None:
+        """Bind a check-free read to its one already selected local Effect."""
+        if (effect.operation not in self.LOCAL_PREPARATION
+                or (fence.subject, fence.execution) != (effect.subject, effect.execution) or fence.cleanup):
+            raise KernelError("local_preparation_observation_binding")
+        self._effect_owned(tx, effect, effect.execution)
+        row = tx.one(*run_statement(tx, 'SELECT * FROM effects WHERE id=? AND subject=? AND run_id=?',
+                    (effect.effect_id, effect.subject), run_last=True))
+        if (row["status"] not in {"prepared", "sent"} or row["control_action"] is not None
+                or self._effect(tx, row, effect.execution) != effect):
+            raise KernelError("local_preparation_observation_binding")
 
     def accept_local_cleanup_requirements(self, request: LocalCleanupRead, source: Requirements) -> LocalCleanupObservation:
         if (not isinstance(request, LocalCleanupRead)
@@ -263,6 +287,9 @@ class Kernel:
 
     def authorize_effect_observation(self, effect: Effect, world: World | LocalCleanupObservation, fence: ReadFence, *,
                                      prepared: bool, inspections: tuple[ResourceInspection, ...] | None) -> None:
+        if fence.local_effect is not None and (
+                fence.local_effect != effect or not isinstance(world, World) or world.checks is not None):
+            raise KernelError("local_preparation_observation_binding")
         if isinstance(world, LocalCleanupObservation):
             if (not isinstance(fence, ReadFence) or (world.effect, world.fence) != (effect, fence)
                     or fence.subject != effect.subject or fence.execution != effect.execution or fence.cleanup):
@@ -374,6 +401,8 @@ class Kernel:
                 or value["source_sequence"] != run["source_sequence"]
                 or execution is None and value["control_version"] != [run[key] for key in ("executor", "epoch", "stopped", "blocked", "final_action")]):
             raise ObservationSuperseded("automatic_step_superseded")
+        if isinstance(token, ReadFence) and token.local_effect is not None:
+            self._local_preparation_read(tx, token.local_effect, token)
 
     def _continuation_wait(self, tx: Transaction, job: sqlite3.Row) -> Step | None:
         """Use the Attempt's single native-or-Opening facts loader."""
@@ -673,7 +702,7 @@ class Kernel:
             if not isinstance(result, tuple):
                 raise KernelError("observation_binding")
             world, fence = result
-            if (fence.execution, fence.subject, fence.cleanup) != (
+            if fence.local_effect is not None or (fence.execution, fence.subject, fence.cleanup) != (
                     work.execution, request.request.fence.subject, request.request.fence.cleanup):
                 raise KernelError("observation_binding")
             if request.after is None:
