@@ -1,4 +1,5 @@
 """One Run-owned relational schema per managed repository, no migration reader."""
+from functools import lru_cache
 
 PROTOCOL = "independent-delivery-repository-v22"
 
@@ -720,11 +721,20 @@ BEGIN SELECT RAISE(ABORT,'repository namespace mismatch'); END;
 
 def repository_schema_objects() -> dict[tuple[str, str], str]:
     """Exact owned DDL for protocol admission; parse only, never execute a model."""
+    # Each caller owns its mutable view. The key contains all current source
+    # declarations, never a database identity or an earlier admission result.
+    return dict(_parse_repository_schema_objects(
+        REPOSITORY_RUN_SCHEMA, REPOSITORY_TASK_SCHEMA, REPOSITORY_ROUTING_SCHEMA))
+
+
+@lru_cache(maxsize=1)
+def _parse_repository_schema_objects(run_schema: str, task_schema: str,
+                                    routing_schema: str) -> tuple[tuple[tuple[str, str], str], ...]:
     import re
     import sqlite3
     result: dict[tuple[str, str], str] = {}
     statement = ""
-    for line in (REPOSITORY_RUN_SCHEMA + REPOSITORY_TASK_SCHEMA + REPOSITORY_ROUTING_SCHEMA).splitlines(keepends=True):
+    for line in (run_schema + task_schema + routing_schema).splitlines(keepends=True):
         statement += line
         if not sqlite3.complete_statement(statement):
             continue
@@ -736,4 +746,4 @@ def repository_schema_objects() -> dict[tuple[str, str], str]:
         statement = ""
     if statement.strip():
         raise RuntimeError("Incomplete schema declaration")
-    return result
+    return tuple(result.items())
