@@ -28,7 +28,7 @@ from agent_run.adapters.remote import EffectReadError, RemoteEffects
 from .offline_api import ExternalObjects, SyntheticGitHub
 from .offline_git import OfflineGit
 from agent_run.core.kernel import Kernel
-from agent_run.core.operation_contract import DeliveryFacts, DeliveryRead, OperationBinding, OperationPorts, ReadUnavailable
+from agent_run.core.operation_contract import DeliveryFacts, DeliveryRead, OperationBinding, OperationPorts, ReadUnavailable, requested_ancestry
 from agent_run.core.operation_runner import OperationRunner
 from agent_run.model import AgentCall, Checks, Commit, CreationInputs, Delivery, DeliveryKind, Effect, EffectResult, Execution, Issue, ParentIssue, Policy, PullRequest, Requirements, ResourceInspection, ResourceWitness, Role, RunSpec, Step, World, wire_json
 from agent_run.errors import KernelError
@@ -179,6 +179,7 @@ class OfflinePort:
     def delivery(self, request: DeliveryRead, checks_script: Sequence[str], heads: list[str], *,
                  publisher_identity: Mapping[str, Any] | None = None) -> DeliveryFacts:
         """Read the synthetic remote; revisions and World belong to Core."""
+        requested_ancestry(request, None)
         pr = (None if not request.read_pr else self.pr_by_number(request.pr_number)
               if request.pr_number is not None else self.pull_request_by_ref(request.source_ref, request.target_ref))
         checks = None
@@ -197,10 +198,18 @@ class OfflinePort:
         physical = self.physical
         source = self.remote_commit(request.source_ref, physical=physical)
         target = self.remote_commit(request.target_ref, physical=physical)
+        checked = requested_ancestry(request, source)
         ancestry_heads = set(request.anchors) | {head.sha for head in (source, target) if head is not None}
-        ancestry = tuple((before, after) for before in sorted(ancestry_heads) for after in sorted(ancestry_heads)
+        if checked is not None:
+            ancestry_heads.update(head for pair in checked for head in pair)
+            # Even a reflexive edge requires its actual commit object.
+            for head in sorted(ancestry_heads):
+                if self.git.run("cat-file", "-e", head + "^{commit}", check=False).returncode:
+                    raise KernelError("git_ancestry_unknown")
+        pairs = ((before, after) for before in sorted(ancestry_heads) for after in sorted(ancestry_heads)) if request.ancestry_pairs is None else iter(checked or ())
+        ancestry = tuple((before, after) for before, after in pairs
                          if before == after or self.git.is_ancestor(before, after))
-        return DeliveryFacts(target, source, pr, checks, ancestry, "offline-publisher", publisher_identity)
+        return DeliveryFacts(target, source, pr, checks, ancestry, "offline-publisher", publisher_identity, checked)
 
     def pull_request_by_ref(self, source_ref: str, target_ref: str) -> PullRequest | None:
         return self._remote(self.objects.repository).find_pull_request(source_ref, target_ref)

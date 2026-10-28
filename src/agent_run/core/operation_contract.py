@@ -36,6 +36,9 @@ class DeliveryRead:
     anchors: tuple[str, ...]
     check_head: str | None = None
     read_pr: bool = True
+    # None retains the complete anchor relation. An explicit tuple requests
+    # only these directed edges; "source" resolves to this observation's head.
+    ancestry_pairs: tuple[tuple[str, str], ...] | None = None
 
 @dataclass(frozen=True)
 class DeliveryFacts:
@@ -46,6 +49,34 @@ class DeliveryFacts:
     ancestry: tuple[tuple[str, str], ...] = ()
     publisher_actor: str | None = None
     publisher_identity: Mapping[str, Any] | None = None
+    # Checked-but-not-positive is false. None is never proof of a false edge.
+    ancestry_checked: tuple[tuple[str, str], ...] | None = None
+
+
+def requested_ancestry(request: DeliveryRead, source: Commit | None) -> tuple[tuple[str, str], ...] | None:
+    """Resolve explicit demand, without inventing a missing remote head.
+
+    None also denotes an unresolved source. The consumer retains its original
+    missing-ref boundary; it cannot use that observation as ancestry evidence.
+    """
+    if request.ancestry_pairs is None:
+        return None
+    if (not isinstance(request.ancestry_pairs, tuple)
+            or any(not isinstance(pair, tuple) or len(pair) != 2
+                   or any(not isinstance(value, str) for value in pair) for pair in request.ancestry_pairs)):
+        raise ReadUnavailable("ancestry_request_invalid", "Ancestry requires directed pairs")
+    endpoints = {value for pair in request.ancestry_pairs for value in pair}
+    if any(value != "source" and (len(value) not in (40, 64)
+            or any(char not in "0123456789abcdef" for char in value)) for value in endpoints):
+        raise ReadUnavailable("ancestry_request_invalid", "Ancestry requires exact commit identities")
+    if "source" in endpoints:
+        if source is None:
+            return None
+        if len(source.sha) not in (40, 64) or any(char not in "0123456789abcdef" for char in source.sha):
+            raise ReadUnavailable("ancestry_request_invalid", "Observed source is not an exact commit identity")
+    return tuple(sorted({(source.sha if before == "source" and source is not None else before,
+                          source.sha if after == "source" and source is not None else after)
+                         for before, after in request.ancestry_pairs}))
 
 @dataclass(frozen=True)
 class OperationState:

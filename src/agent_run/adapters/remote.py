@@ -651,7 +651,8 @@ class RemoteEffects:
     @_operation_errors
     def delivery(self, request: DeliveryRead) -> DeliveryFacts:
         """Read exact Core-supplied refs and immutable ancestry anchors."""
-        from agent_run.core.operation_contract import DeliveryFacts
+        from agent_run.core.operation_contract import DeliveryFacts, requested_ancestry
+        requested_ancestry(request, None)  # Validate literal demand before I/O.
         commits: dict[str, Commit] = {}
         reused: set[str] = set()
         def read_commit(sha: str) -> Commit:
@@ -670,7 +671,10 @@ class RemoteEffects:
             commits[target.sha] = target
         raw_pr = self._find_pr(request.source_ref, request.target_ref, request.pr_number) if request.read_pr else None
         pr = None if raw_pr is None else self._pr(raw_pr, read_commit=read_commit)
+        checked = requested_ancestry(request, source)
         heads = set(request.anchors) | {head for head in (source_sha, target_sha) if head is not None}
+        if checked is not None:
+            heads.update(head for pair in checked for head in pair)
         if pr is not None:
             heads.add(pr.base.sha)
         # Only exact objects are reused within this observation. Live refs are
@@ -688,7 +692,8 @@ class RemoteEffects:
                 *identities, "--").stdout.splitlines()
             if objects != [sha + " " + commits[sha].tree for sha in identities]:
                 raise GitHubReadError("github_observation_pending", "Commit object and API tree do not agree")
-        ancestry = tuple((before, after) for before in prepared for after in prepared
+        pairs = ((before, after) for before in prepared for after in prepared) if request.ancestry_pairs is None else iter(checked or ())
+        ancestry = tuple((before, after) for before, after in pairs
                          if before == after or self.git.is_ancestor(before, after))
         checks = None
         if pr is not None and pr.state == "OPEN":
@@ -702,7 +707,7 @@ class RemoteEffects:
         if read_remote_heads(self.root, request.source_ref, request.target_ref,
                 runner_identity=self.identity, remote=self.remote) != (source_sha, target_sha):
             raise GitHubReadError("github_observation_pending", "Remote refs changed during delivery observation")
-        return DeliveryFacts(target, source, pr, checks, ancestry, self.actor(), dict(self.identity))
+        return DeliveryFacts(target, source, pr, checks, ancestry, self.actor(), dict(self.identity), checked)
 
     @_operation_errors
     def inspect(self, resources: tuple[ResourceWitness, ...]) -> tuple[ResourceInspection, ...]:

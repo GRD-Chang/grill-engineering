@@ -43,7 +43,8 @@ from agent_run.contracts.policy import AGENT_PREPARATION_SECONDS
 from agent_run.storage.tasks import task_lock, run_is_current
 from agent_run.core.operation_contract import (OperationBinding, OperationState, ReadUnavailable, ReadFence,
                                  RequirementsRead, LocalCleanupRead, LocalCleanupObservation, DeliveryObservation, DeliveryRead, DeliveryFacts,
-                                 _SentRead, _ApprovalRead, _ObservationPass, Work, PrepareIO, EffectIO, ObserveIO, IORequest, IOResult)
+                                 _SentRead, _ApprovalRead, _ObservationPass, Work, PrepareIO, EffectIO, ObserveIO, IORequest, IOResult,
+                                 requested_ancestry)
 
 
 def identity() -> str:
@@ -150,8 +151,7 @@ class Kernel:
             if fence.subject is None:
                 job = tx.one(*run_statement(tx, 'SELECT * FROM final_target WHERE run_id=?',
                           (), run_last=True))
-                anchors = {row["merge_sha"] for row in tx.all(*run_statement(tx, "SELECT c.* FROM completions c JOIN subjects s ON s.run_id=c.run_id AND s.id=c.subject AND s.generation=c.generation WHERE s.phase='complete' AND c.run_id=? ORDER BY s.issue",
-                                                           (), run_last=True))}
+                anchors = set(self._final_ancestry_anchors(tx))
             else:
                 job = self._job(tx, fence.subject)
                 anchors = {job[key] for key in ("base_sha", "source_sha", "candidate_sha", "integrated_sha") if job[key] is not None}
@@ -166,7 +166,8 @@ class Kernel:
                         anchors.add(context["reviewed_commit"])
             query = DeliveryRead(job["source_ref"], job["target_ref"], job["pr_number"] if fence.subject is not None else None,
                                  tuple(sorted(anchors)), job["source_sha"] if fence.subject is not None and job["phase"] == "checks" else None,
-                                 fence.subject is not None)
+                                 fence.subject is not None,
+                                 tuple((sha, "source") for sha in sorted(anchors)) if fence.subject is None else None)
         return DeliveryObservation(current, query)
 
     def accept_delivery(self, request: DeliveryObservation, facts: DeliveryFacts) -> tuple[World, ReadFence]:
@@ -177,6 +178,12 @@ class Kernel:
                 raise ReadWait(waiting)
         with self.storage.transaction(write=False) as tx:
             self._check_operation(tx, fence, fence.execution)
+            if request.query.ancestry_pairs is not None:
+                checked = requested_ancestry(request.query, facts.source)
+                if (facts.ancestry_checked != checked
+                        or checked is None and facts.ancestry
+                        or checked is not None and not set(facts.ancestry) <= set(checked)):
+                    raise ReadUnavailable("ancestry_observation_incomplete", "Requested ancestry was not exactly observed")
             run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
                       (), run_last=True))
             revision, completion = run["observed_parent_revision"], "no-tickets"
@@ -1070,6 +1077,14 @@ class Kernel:
         rows = tx.rows(*run_statement(tx, 'SELECT c.* FROM completions c JOIN runs r ON r.id=c.run_id WHERE c.subject=? AND c.generation=? AND c.revision=? AND c.graph_revision=r.graph_revision AND c.run_id=?',
                    (job["id"], job["generation"], job["revision"]), run_last=True))
         return rows[0] if rows and job["phase"] == "complete" else None
+
+    def _final_ancestry_anchors(self, tx: Transaction) -> tuple[str, ...]:
+        # The same current Completion demand owns both query and read fence.
+        return tuple(sorted({str(row[0]) for row in tx.all(*run_statement(tx,
+            "SELECT c.merge_sha FROM completions c JOIN subjects s ON s.run_id=c.run_id AND s.id=c.subject "
+            "AND s.generation=c.generation AND s.revision=c.revision JOIN runs r ON r.id=c.run_id "
+            "WHERE s.kind='ticket' AND s.phase='complete' AND c.graph_revision=r.graph_revision AND c.run_id=?",
+            (), run_last=True))}))
 
     def _eligibility(self, tx: Transaction, job: sqlite3.Row) -> str | None:
         if job["kind"] != DeliveryKind.TICKET or tx.one(*run_statement(tx, 'SELECT source_sequence FROM runs WHERE id=?',
@@ -2715,6 +2730,8 @@ class Kernel:
         if subject is None:
             scope["final_target"] = [dict(row) for row in tx.rows(*run_statement(tx, 'SELECT * FROM final_target WHERE run_id=?',
                                                               (), run_last=True))]
+            if abandoned is None:
+                scope["final_ancestry"] = self._fingerprint(self._final_ancestry_anchors(tx))
         else:
             job = self._job(tx, subject)
             scope["delivery"] = {key: job[key] for key in (
