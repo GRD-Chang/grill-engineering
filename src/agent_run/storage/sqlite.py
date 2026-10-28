@@ -93,12 +93,15 @@ class Transaction:
         if len(headers) > limit:
             raise KernelError("query_limit", "request a bounded history page")
         byte_count = sum(sum(value or 0 for value in header) for header in headers)
-        if self.rows_read + len(headers) > 65536 or self.bytes_read + byte_count > QUERY_LIMIT:
-            raise KernelError("query_limit")
+        self._check_read_budget(len(headers), byte_count)
         rows = self.execute(f"SELECT * FROM ({sql}) LIMIT ?", (*parameters, limit)).fetchall()
         self.rows_read += len(rows)
         self.bytes_read += byte_count
         return rows
+
+    def _check_read_budget(self, rows: int, byte_count: int) -> None:
+        if self.rows_read + rows > 65536 or self.bytes_read + byte_count > QUERY_LIMIT:
+            raise KernelError("query_limit")
 
     def one(self, sql: str, parameters: Sequence[Any] = ()) -> sqlite3.Row:
         rows = self.rows(sql, parameters, limit=1)

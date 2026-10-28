@@ -93,6 +93,24 @@ class RunTransaction(Transaction):
         return RunScope(run_id, repository, parent, root)
 
     def _require_scope(self) -> None:
+        # Compare the current row on every use, without running the generic
+        # shape/size/body queries again for these already-bound identity fields.
+        # The scalar is the original row's exact SQL byte charge, not a cached
+        # permission. Nonmatching/invalid rows retain the full reader's errors.
+        scope = self.scope
+        matched = self.execute("SELECT CASE WHEN typeof(repository)='text' "
+            "AND lower(repository) COLLATE BINARY=? AND typeof(parent_issue)='integer' "
+            "AND parent_issue=? AND typeof(repository_root)='text' "
+            "AND repository_root COLLATE BINARY=? THEN "
+            "length(CAST(id AS BLOB))+length(CAST(repository AS BLOB))+16+"
+            "length(CAST(repository_root AS BLOB)) END FROM runs WHERE id=? LIMIT 2",
+            (scope.repository, scope.parent_issue, scope.repository_root, scope.run_id)).fetchmany(2)
+        if len(matched) == 1 and type(matched[0][0]) is int:
+            byte_count = matched[0][0]
+            self._check_read_budget(1, byte_count)
+            self.rows_read += 1
+            self.bytes_read += byte_count
+            return
         if self._read_scope(self.run_id) != self.scope:
             raise KernelError("run_scope_changed")
 

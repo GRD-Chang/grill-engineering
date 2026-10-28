@@ -51,6 +51,10 @@ def identity() -> str:
     return uuid4().hex
 
 
+class _SupervisionWriteRequired(Exception):
+    """The original expired read window needs a fresh ordered writer check."""
+
+
 @dataclass(frozen=True)
 class InspectionBindings:
     """Ephemeral readonly bindings, never a saved state or execution grant."""
@@ -2880,7 +2884,19 @@ class Kernel:
             return self._operation_read_wait(tx, run, scope, after_read=after_read)
 
     def _finish_operation_read(self, token: str | ReadFence, execution: Execution) -> Step | None:
-        """A fresh observation grants nothing; only its original read window can expire."""
+        """Check healthy reads without saving; expiration rechecks under its writer."""
+        with self.storage.transaction(write=False) as tx:
+            self._check_operation(tx, token, execution)
+            scope = self._automatic_token(token)["scope"]
+            try:
+                return self._operation_read_wait(tx, tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
+                                                         (), run_last=True)), scope, after_read=True,
+                                                 write_timeout=False)
+            except _SupervisionWriteRequired:
+                pass  # Exit the reader normally so cleanup failures propagate.
+        # No read-snapshot row or deadline authorizes this save. A concurrent
+        # Stop, scope change or retired wait must be checked by the original
+        # ordered transaction before it can record any timeout.
         with self.storage.transaction() as tx:
             self._check_operation(tx, token, execution)
             scope = self._automatic_token(token)["scope"]
@@ -2888,7 +2904,7 @@ class Kernel:
                                                      (), run_last=True)), scope, after_read=True)
 
     def _operation_read_wait(self, tx: Transaction, run: sqlite3.Row, scope: dict[str, Any], *,
-                             after_read: bool) -> Step | None:
+                             after_read: bool, write_timeout: bool = True) -> Step | None:
         selected = transaction_scope(tx)
         if run['id'] != selected.run_id or scope.get('run') != selected.run_id:
             raise KernelError("effect_binding")
@@ -2899,6 +2915,8 @@ class Kernel:
         if rows:
             row = rows[0]
             if self.clock() >= row["deadline"]:
+                if not write_timeout:
+                    raise _SupervisionWriteRequired
                 seconds = row["deadline"] - row["started_at"]
                 return self._supervised_wait(tx, run, scope["subject"], scope, row["kind"], seconds)
             if not after_read and row["next_retry_at"] is not None and self.clock() < row["next_retry_at"]:
