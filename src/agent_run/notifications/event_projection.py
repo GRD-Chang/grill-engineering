@@ -217,6 +217,10 @@ def _result(tx: Transaction, row: Mapping[str, Any], subject: Mapping[str, Any],
 
 def _project(tx: Transaction, row: Mapping[str, Any], state: dict[str, Any], mode: str) -> list[EventProjection]:
     """Project this original history record without changing its source facts."""
+    if row['kind'] == 'host_interrupted':
+        from agent_run.queries.host_exit import retired_foreground_exit_notice
+        notice = retired_foreground_exit_notice(tx, nonce=row['identity'])
+        return [] if notice is None else [EventProjection(_host_exit_envelope(state, notice), True)]
     if row["kind"] not in {"worker_started", "worker_active", "role_consumed", "paused", "effect_consumed", "acceptance_promoted", "boundary_update"}:
         return []
     subject = dict(tx.one(*run_statement(tx, 'SELECT * FROM subjects WHERE run_id=? AND id=?', (row["subject"],))))
@@ -336,6 +340,10 @@ def host_exit_event(database: Path, notice: Mapping[str, Any], *, storage: Stora
         state = {"run_id": run["id"], "repository": run["repository"], "language": run["language"],
                  "created_at": run["created_at"],
                  "parent": {"number": run["parent_issue"], "title": title[0][0] if title else ""}}
+    return _host_exit_envelope(state, notice)
+
+
+def _host_exit_envelope(state: dict[str, Any], notice: Mapping[str, Any]) -> dict[str, Any]:
     return event_envelope(state, "executor_exit", [notice["action_id"], notice["epoch"], notice["nonce"], notice["runner"]],
                           event_copy(state, "executor_exit"), "red", important=True,
                           generation=notice["epoch"], exit_evidence=dict(notice),

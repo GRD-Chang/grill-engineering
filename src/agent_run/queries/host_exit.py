@@ -7,6 +7,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import UTC, datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -14,7 +15,7 @@ import shutil
 import sqlite3
 from typing import Any
 
-from agent_run.storage.run_scope import run_statement
+from agent_run.storage.run_scope import run_statement, transaction_scope
 from agent_run.contracts.task import TaskKey
 
 from agent_run.core.kernel import Kernel
@@ -23,7 +24,8 @@ from agent_run.errors import KernelError
 from agent_run.runtime.handoff import _BOOT, _digest, _runner_witness
 from agent_run.storage.tasks import run_is_current
 from agent_run.storage.routing import open_run
-from agent_run.storage.sqlite import Storage
+from agent_run.storage.sqlite import Storage, Transaction
+from agent_run.model import HostObservation
 
 
 _RESULTS = {"signal", "core-dump", "oom-kill", "exit-code", "timeout", "success"}
@@ -42,13 +44,23 @@ def _abnormal(result: object, code: object, status: object) -> bool:
 
 
 def host_exit_current(database: Path, notice: Mapping[str, Any], *, storage: Storage) -> bool:
-    """Recheck the original Task, Host and Runner without recording any state."""
+    """Recheck original authority; foreground also confirms deletion durability."""
     if notice.get("run_id") != storage.run_id:
         return False
     options: dict[str, Any] = {"storage": storage}
     if notice.get('backend') == 'foreground':
         current = foreground_exit_notice(database, str(notice.get('action_id')), Path(str(notice.get('physical_record'))), **options)
-        return current is not None and current == notice
+        if current is None or current != notice:
+            return False
+        # Outside the SQLite snapshot: absence alone does not prove the prior
+        # unlink's directory sync succeeded. Never retry deletion here.
+        from agent_run.runtime.foreground_host import _confirm_record_removed
+        from agent_run.adapters.foreground import DomainUnknown
+        try:
+            _confirm_record_removed(Path(current['physical_record']))
+        except (OSError, ValueError, DomainUnknown) as error:
+            raise HostExitUnavailable('Foreground record removal is unavailable') from error
+        return foreground_exit_notice(database, str(current['action_id']), Path(current['physical_record']), **options) == current
     try:
         if (database.is_symlink() or not _abnormal(notice.get("service_result"), notice.get("exit_code"),
                                                   notice.get("exit_status"))):
@@ -140,7 +152,7 @@ def host_exit_notice(database: Path, action_id: str, receipt: Mapping[str, Any],
 
 
 def foreground_exit_notice(database: Path, action_id: str, path: Path, *, storage: Storage) -> dict[str, Any] | None:
-    """Read the exact persisted physical exit before Core retires this Host.
+    """Read the exact physical receipt or its accepted retired Host facts.
 
     No cgroup/unit facts are invented. Missing executor status remains unknown;
     it is not silently turned into a successful command or a guessed signal.
@@ -151,6 +163,10 @@ def foreground_exit_notice(database: Path, action_id: str, path: Path, *, storag
         request, usage = kernel.host_request(action_id), kernel.host_usage(action_id)
         if request.backend != 'foreground' or usage is None:
             return None
+        if usage.disposition == 'exited' and usage.usage_released:
+            with kernel.storage.transaction(write=False) as tx:
+                notice = retired_foreground_exit_notice(tx, action_id=action_id)
+            return notice if notice is not None and notice['physical_record'] == str(path) else None
         receipt = json.loads(usage.evidence)
         lock = Path(receipt['runner']['lock'])
         if path != record_root(lock) / (request.nonce + '.json'):
@@ -188,3 +204,79 @@ def foreground_exit_notice(database: Path, action_id: str, path: Path, *, storag
                 'domain': record['domain']}
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, KernelError, DomainUnknown) as error:
         raise HostExitUnavailable('Foreground exit currentness is unavailable') from error
+
+
+def retired_foreground_exit_notice(tx: Transaction, *, action_id: str | None = None,
+                                   nonce: str | None = None) -> dict[str, Any] | None:
+    """Project an accepted original exit; no physical record or PID is needed.
+
+    The interruption event records applicability before retirement changed the
+    leases, gates or integration seat. Current state only fences its delivery.
+    """
+    from agent_run.contracts.host import valid_foreground_domain
+
+    selected = transaction_scope(tx)
+    hosts = tx.rows('SELECT * FROM hosts WHERE run_id=? AND ' +
+                    ('action_id=?' if action_id is not None else 'nonce=?'),
+                    (selected.run_id, action_id if action_id is not None else nonce), limit=1)
+    if not hosts:
+        return None
+    host = hosts[0]
+    if (host['backend'] != 'foreground' or host['status'] != 'exited'
+            or not host['usage_released'] or host['dispatched_at'] is None
+            or host['observation_id'] is None or host['domain_id'] is None):
+        return None
+    request = Kernel._host_launch(tx, host)
+    observation = HostObservation(**json.loads(tx.get(host['observation_id'], host['subject'])))
+    domain = json.loads(tx.get(host['domain_id'], host['subject']))
+    ended = observation.ended_at
+    if (not isinstance(ended, (int, float)) or isinstance(ended, bool)
+            or not math.isfinite(ended) or ended <= 0):
+        return None
+    if (request.backend != 'foreground' or observation.backend != 'foreground' or observation.disposition != 'exited'
+            or not observation.usage_released or observation.exit_status == 0
+            or not valid_foreground_domain(domain, request.nonce) or observation.domain != domain
+            or observation.exit_evidence not in {'retained_namespace_pidfd', 'same_observer_init_exit'}
+            or any(value is not None and type(value) is not int for value in
+                   (observation.exit_status, observation.namespace_exit_status))
+            or (host['exit_status'], host['ended_at']) != (observation.exit_status, ended)
+            or observation.boot_id != domain['observer']['boot_id']
+            or (observation.unit_name, observation.invocation_id, observation.cgroup) != (None, None, None)):
+        return None
+    executor = domain['executor']
+    identity = (None, None) if executor is None else (executor['pid'], executor['start_token'])
+    if ((observation.main_pid, observation.start_token) != identity
+            or (host['main_pid'], host['start_token']) != identity
+            or host['boot_id'] != observation.boot_id
+            or executor is None and observation.exit_status is not None):
+        return None
+    run = tx.one('SELECT * FROM runs WHERE id=?', (selected.run_id,))
+    if (not run_is_current(tx) or run['stopped'] or run['language'] not in {'zh', 'en'}
+            or run['executor'] is not None or run['epoch'] != request.epoch + 1
+            or (host['run_id'], host['owner'], host['epoch'], host['nonce']) !=
+               (request.run_id, request.owner, request.epoch, request.nonce)
+            or tx.rows("SELECT id FROM actions WHERE run_id=? AND kind='abandon' LIMIT 1", (selected.run_id,))
+            or tx.rows('SELECT owner FROM hosts WHERE run_id=? AND epoch>? LIMIT 1',
+                       (selected.run_id, request.epoch))
+            or not tx.rows("SELECT owner FROM retired_executors WHERE run_id=? AND owner=? AND epoch=? AND status='exited'",
+                           (selected.run_id, request.owner, request.epoch))
+            or not tx.rows("SELECT position FROM history WHERE run_id=? AND subject=? AND kind='host_interrupted' "
+                           'AND identity=? AND material_id=? LIMIT 1',
+                           (selected.run_id, host['subject'], request.nonce, host['observation_id']))):
+        return None
+    receipt = json.loads(observation.evidence)
+    runner = receipt['runner']
+    lock = Path(runner['lock'])
+    if (receipt['request_digest'] != _digest(request) or receipt['nonce'] != request.nonce
+            or runner != _runner_witness(lock) or receipt['boot_id'] != domain['observer']['boot_id']
+            or receipt['pid_namespace'] != domain['observer']['pid_namespace']):
+        return None
+    inputs = tx.one('SELECT subject,material_id FROM run_inputs WHERE run_id=?', (selected.run_id,))
+    config = json.loads(tx.get(inputs['material_id'], inputs['subject'])).get('notifications')
+    if not isinstance(config, dict) or config.get('enabled') is not True:
+        return None
+    return {'backend': 'foreground', 'physical_record': str(lock.parent / 'foreground-hosts' / (request.nonce + '.json')),
+            'action_id': host['action_id'], 'run_id': request.run_id, 'owner': request.owner,
+            'epoch': request.epoch, 'nonce': request.nonce, 'runner': runner,
+            'request_digest': receipt['request_digest'], 'executor_exit_code': observation.exit_status,
+            'ended_at': ended, 'domain': domain}

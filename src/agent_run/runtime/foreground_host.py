@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
+import errno
 import json
 import math
 import os
@@ -16,6 +17,7 @@ import select
 import shutil
 import socket
 import struct
+import stat
 import sys
 import time
 from typing import Any, Literal, Mapping
@@ -109,29 +111,49 @@ def _bound_record(request: HostLaunch, lock: Path, database: Path) -> tuple[Path
 def _settle(kernel: Kernel, request: HostLaunch, path: Path, record: dict[str, Any]) -> HostObservation:
     # A durable exact exit receipt precedes Core retirement. Failure leaves the
     # management barrier intact; a later observer may retry this same settlement.
+    _validate_record(request, record)
     observation = _observation(request, record, 'exited', released=True)
-    options: dict[str, Any] = {"storage": kernel.storage}
-    if not record.get('notice_settled'):
-        from agent_run.queries.host_exit import foreground_exit_notice
-        from agent_run.notifications.sender import deliver_host_exit_notice
-        notice = foreground_exit_notice(kernel.storage.path, kernel.host_action(request), path, **options)
-        if notice is not None:
-            deliver_host_exit_notice(kernel.storage.path, kernel.storage.path.parent, notice, **options)
-        record['notice_settled'] = True
-        write_record(path, record)
     if kernel.observe_host(request, observation) != 'exited':
         raise DomainUnknown('Core did not accept the original foreground exit')
-    from agent_run.notifications.sender import notify_committed
-    notify_committed(kernel.storage.path, **options)
     _remove_record(path)
     return observation
 
 
 def _remove_record(path: Path) -> None:
     path.unlink(missing_ok=True)
-    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:os.fsync(directory)
+    _sync_record_directory(path.parent)
+
+
+def _sync_record_directory(root: Path) -> None:
+    before = root.lstat()
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        actual = os.fstat(directory)
+        if (not stat.S_ISDIR(actual.st_mode) or actual.st_uid != os.geteuid() or actual.st_mode & 0o077
+                or (actual.st_dev, actual.st_ino) != (before.st_dev, before.st_ino)):
+            raise DomainUnknown('Foreground protection directory changed')
+        os.fsync(directory)
+        after = root.lstat()
+        if (after.st_dev, after.st_ino) != (actual.st_dev, actual.st_ino):
+            raise DomainUnknown('Foreground protection directory changed')
     finally:os.close(directory)
+
+
+def _confirm_record_removed(path: Path) -> None:
+    """Complete the original directory sync without deleting or recreating a record."""
+    def absent() -> None:
+        try:path.lstat()
+        except OSError as error:
+            if error.errno != errno.ENOENT:raise
+        else:raise DomainUnknown('Foreground protection record still exists')
+
+    before = path.parent.lstat()
+    absent()
+    _sync_record_directory(path.parent)
+    absent()
+    after = path.parent.lstat()
+    if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+        raise DomainUnknown('Foreground protection directory changed')
 
 
 class ForegroundHost:
@@ -252,8 +274,10 @@ class ForegroundHost:
         try:
             if original is not None and original.disposition == 'exited' and original.usage_released:
                 try:path, record = _bound_record(request, lock, kernel.storage.path)
-                except FileNotFoundError:return original
-                if (record['phase'] != 'exited' or not record.get('notice_settled')
+                except FileNotFoundError:
+                    _confirm_record_removed(record_root(lock) / (request.nonce + '.json'))
+                    return original
+                if (record['phase'] != 'exited'
                         or _observation(request, record, 'exited', released=True) != original):
                     raise DomainUnknown('Physical closure does not match committed exit settlement')
                 _remove_record(path)
@@ -291,6 +315,7 @@ class ForegroundHost:
             if original is not None and original.disposition == 'exited' and original.usage_released:
                 if self.observe(kernel, kernel.host_request(action), lock).disposition != 'exited':
                     raise DomainUnknown('Committed foreground exit still has unclosed protection')
+        _sync_record_directory(root)
 
     def launch(self, kernel: Kernel, request: HostLaunch, *, lock: Path, lease: RunnerLease) -> HostObservation:
         self.preflight()

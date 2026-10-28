@@ -47,7 +47,7 @@ def test_public_run_profile_revision_changes_only_future_threads(git_repo, comma
         raise AssertionError('Profile configuration launched or controlled a Host')
 
     monkeypatch.setattr(host_adapter, 'SystemdHost', forbidden)
-    monkeypatch.setattr(lifecycle_cli, 'submit', forbidden)
+    monkeypatch.setattr(lifecycle_cli, '_admit_submit', forbidden)
     monkeypatch.setattr(Kernel, 'admit_host', forbidden)
     monkeypatch.setattr(Kernel, 'control_host', forbidden)
     selector = '1' if command == 'configure' else 'profile-public'

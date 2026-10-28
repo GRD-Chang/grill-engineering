@@ -451,6 +451,13 @@ class NativeNotifications:
               or any(item["id"] == event_id for item in document["records"])):
             return
         else:
+            if event['kind'] == 'executor_exit' and event['exit_evidence'].get('backend') == 'foreground':
+                # Recovery after retirement uses the original exit window,
+                # including a crash before this first outbox insertion.
+                now = float(event['exit_evidence']['ended_at'])
+                prior = document.get('executor_exit')
+                if prior is None or prior['epoch'] < event['exit_evidence']['epoch']:
+                    document['executor_exit'] = dict(event['exit_evidence'])
             outbox.enqueue(document, event, now)
             document["seen"].append(event_id)
             del document["seen"][:-outbox.MAX_RECORDS]

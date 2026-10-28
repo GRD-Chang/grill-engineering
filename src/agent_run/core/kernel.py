@@ -823,42 +823,46 @@ class Kernel:
 
     def _operation_state(self, observation: _ObservationPass | None = None) -> OperationState:
         with self.storage.transaction(write=False) as tx:
-            run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
-                      (), run_last=True))
-            active = tx.all(*run_statement(tx, 'SELECT l.*,i.deadline_at FROM leases l JOIN invocations i ON i.run_id=l.run_id AND i.id=l.invocation WHERE l.run_id=?',
-                         (), run_last=True))
-            preparations = [(row, self._preparation(tx, row)[0]) for row in tx.all(*run_statement(tx, "SELECT * FROM waits WHERE kind='agent_preparation' AND run_id=?",
-                                                                                (), run_last=True))]
-            deadlines = [float(row["deadline_at"]) for row in active] + [p.preparation_deadline for _, p in preparations]
-            for row in tx.all(*run_statement(tx, 'SELECT w.*,m.body FROM waits w JOIN material m ON m.run_id=w.run_id AND m.id=w.scope_id WHERE w.run_id=?',
-                           (), run_last=True)):
-                if json.loads(row["body"]) in (self._automatic_scope(tx, run, row["subject"], False), self._automatic_scope(tx, run, row["subject"], True)):
-                    deadlines.append(float(row["next_retry_at"] or row["deadline"]))
-            lifetime_wait = False
-            for job in tx.all(*run_statement(tx, 'SELECT * FROM subjects WHERE run_id=? ORDER BY rowid',
-                           (), run_last=True)):
-                waiting = self._continuation_wait(tx, job)
-                lifetime_wait |= waiting is not None and waiting.reason in {"agent_running", "previous_invocation_exit"}
-                if waiting is not None and waiting.retry_at is not None and self._subject_wait(tx, run, job) == waiting:
-                    deadlines.append(waiting.retry_at)
-            choice = self._operation_choice(tx, run, observation=observation)
-            abandoned = self._abandon_action(tx)
-            complete = (abandoned is not None and abandoned["status"] == "complete" or
-                not tx.rows(*run_statement(tx, "SELECT id FROM subjects WHERE phase!='complete' AND run_id=? LIMIT 1",
+            return self._operation_state_in(tx, observation)
+
+    def _operation_state_in(self, tx: Transaction, observation: _ObservationPass | None = None) -> OperationState:
+        """Read scheduling facts within the caller's existing transaction."""
+        run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
+                  (), run_last=True))
+        active = tx.all(*run_statement(tx, 'SELECT l.*,i.deadline_at FROM leases l JOIN invocations i ON i.run_id=l.run_id AND i.id=l.invocation WHERE l.run_id=?',
+                     (), run_last=True))
+        preparations = [(row, self._preparation(tx, row)[0]) for row in tx.all(*run_statement(tx, "SELECT * FROM waits WHERE kind='agent_preparation' AND run_id=?",
+                                                                            (), run_last=True))]
+        deadlines = [float(row["deadline_at"]) for row in active] + [p.preparation_deadline for _, p in preparations]
+        for row in tx.all(*run_statement(tx, 'SELECT w.*,m.body FROM waits w JOIN material m ON m.run_id=w.run_id AND m.id=w.scope_id WHERE w.run_id=?',
+                       (), run_last=True)):
+            if json.loads(row["body"]) in (self._automatic_scope(tx, run, row["subject"], False), self._automatic_scope(tx, run, row["subject"], True)):
+                deadlines.append(float(row["next_retry_at"] or row["deadline"]))
+        lifetime_wait = False
+        for job in tx.all(*run_statement(tx, 'SELECT * FROM subjects WHERE run_id=? ORDER BY rowid',
+                       (), run_last=True)):
+            waiting = self._continuation_wait(tx, job)
+            lifetime_wait |= waiting is not None and waiting.reason in {"agent_running", "previous_invocation_exit"}
+            if waiting is not None and waiting.retry_at is not None and self._subject_wait(tx, run, job) == waiting:
+                deadlines.append(waiting.retry_at)
+        choice = self._operation_choice(tx, run, observation=observation)
+        abandoned = self._abandon_action(tx)
+        complete = (abandoned is not None and abandoned["status"] == "complete" or
+            not tx.rows(*run_statement(tx, "SELECT id FROM subjects WHERE phase!='complete' AND run_id=? LIMIT 1",
+                    (), run_last=True))
+            and not tx.rows(*run_statement(tx, "SELECT id FROM final_target f WHERE id NOT IN (SELECT id FROM subjects s WHERE s.kind='final_run' AND s.run_id=f.run_id) AND f.run_id=?",
                         (), run_last=True))
-                and not tx.rows(*run_statement(tx, "SELECT id FROM final_target f WHERE id NOT IN (SELECT id FROM subjects s WHERE s.kind='final_run' AND s.run_id=f.run_id) AND f.run_id=?",
-                            (), run_last=True))
-                and not tx.rows(*run_statement(tx, "SELECT subject FROM resource_cleanup WHERE state!='complete' AND run_id=? LIMIT 1",
-                            (), run_last=True))
-                and not tx.rows(*run_statement(tx, "SELECT id FROM effects WHERE status IN ('prepared','sent','observed') AND operation!='issue_link' AND run_id=? LIMIT 1",
-                            (), run_last=True)))
-            disposition: Literal["ready", "waiting", "quiescent", "complete"] = "ready" if choice is not None else "waiting" if active or preparations or lifetime_wait or any(t > self.clock() for t in deadlines) else "complete" if complete else "quiescent"
-            cancel = tuple(row["id"] for row in active if run["stopped"] or run["blocked"] or abandoned is not None or self._gates(tx, row["subject"]) or self.clock() >= row["deadline_at"])
-            cancel += tuple(p.reservation_id for _, p in preparations if run["stopped"] or run["blocked"] or abandoned is not None
-                            or self._gates(tx, p.subject) or self.clock() >= p.preparation_deadline)
-            return OperationState(run["concurrency"], tuple(row["id"] for row in active), cancel,
-                                  min((t for t in deadlines if t > self.clock()), default=None), disposition,
-                                  tuple(p.reservation_id for _, p in preparations))
+            and not tx.rows(*run_statement(tx, "SELECT subject FROM resource_cleanup WHERE state!='complete' AND run_id=? LIMIT 1",
+                        (), run_last=True))
+            and not tx.rows(*run_statement(tx, "SELECT id FROM effects WHERE status IN ('prepared','sent','observed') AND operation!='issue_link' AND run_id=? LIMIT 1",
+                        (), run_last=True)))
+        disposition: Literal["ready", "waiting", "quiescent", "complete"] = "ready" if choice is not None else "waiting" if active or preparations or lifetime_wait or any(t > self.clock() for t in deadlines) else "complete" if complete else "quiescent"
+        cancel = tuple(row["id"] for row in active if run["stopped"] or run["blocked"] or abandoned is not None or self._gates(tx, row["subject"]) or self.clock() >= row["deadline_at"])
+        cancel += tuple(p.reservation_id for _, p in preparations if run["stopped"] or run["blocked"] or abandoned is not None
+                        or self._gates(tx, p.subject) or self.clock() >= p.preparation_deadline)
+        return OperationState(run["concurrency"], tuple(row["id"] for row in active), cancel,
+                              min((t for t in deadlines if t > self.clock()), default=None), disposition,
+                              tuple(p.reservation_id for _, p in preparations))
 
     @classmethod
     def create_task(cls, path: Path, spec: RunSpec, *, requirements: Requirements) -> Kernel:
@@ -2449,6 +2453,25 @@ class Kernel:
                       and isinstance(observation.ended_at, (float, int)) and not isinstance(observation.ended_at, bool)
                       and math.isfinite(observation.ended_at) and observation.ended_at > 0)
             disposition = "running" if running else "exited" if exited else "unknown"
+            host_interrupted = False
+            if exited and request.backend == "foreground" and observation.exit_status != 0:
+                try:
+                    stopped = tx.one(*run_statement(tx, 'SELECT stopped FROM runs WHERE id=?',
+                                                  (), run_last=True))[0]
+                    if not stopped and self._abandon_action(tx) is None:
+                        # Capture before retirement removes leases, preparations
+                        # and integration seats or adds failure gates.
+                        # Seats already prove ready/waiting. Decode preparation
+                        # contexts only during retirement, within the read quota.
+                        host_interrupted = bool(self._agent_seats(tx))
+                        if not host_interrupted:
+                            state = self._operation_state_in(tx)
+                            host_interrupted = bool(state.active or state.disposition not in {"complete", "quiescent"})
+                except KernelError:
+                    if tx.failed:
+                        raise
+                    # Unknown applicability grants no interruption notice. It
+                    # does not invalidate the independently proved physical exit.
             if known and (running or exited):
                 if domain_id is not None:
                     tx.execute("UPDATE hosts SET domain_id=coalesce(domain_id,?) WHERE run_id=? AND epoch=?",
@@ -2503,6 +2526,8 @@ class Kernel:
                 tx.execute("UPDATE runs SET executor=NULL,epoch=epoch+1 WHERE id=? AND executor=? AND epoch=?",
                            (request.run_id, request.owner, request.epoch))
                 tx.execute("UPDATE runs SET executor=NULL WHERE id=? AND executor=? AND epoch>?", (request.run_id, request.owner, request.epoch))
+            if host_interrupted:
+                self._event(tx, row["subject"], "host_interrupted", request.nonce, material)
             self._event(tx, row["subject"], "host_observed", request.nonce, material)
             return disposition
 

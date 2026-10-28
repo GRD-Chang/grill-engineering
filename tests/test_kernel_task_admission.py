@@ -76,7 +76,7 @@ def forbid_new_launches(monkeypatch):
     def forbidden(*_args, **_kwargs):
         raise AssertionError('Occupied Task entered creation or new Host submission')
     monkeypatch.setattr(lifecycle, 'prepare_creation', forbidden)
-    monkeypatch.setattr(lifecycle, 'submit', forbidden)
+    monkeypatch.setattr(lifecycle, '_admit_submit', forbidden)
 
 
 def assert_original_only(kernel, workspace, spec, calls, before):

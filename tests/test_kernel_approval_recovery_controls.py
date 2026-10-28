@@ -53,20 +53,28 @@ def test_idle_public_approve_starts_existing_recovery_without_a_merge_grant(tmp_
             "state": "FAILURE", "link": "https://ci.example.invalid/failure", "description": "Original failure"}])
     requests = []
 
-    def admit(selected, kind, *, action_id, command, manager, environment, runner_lock, **intent):
-        # Only the physical handoff is controlled. Core admission, Action and
-        # all subsequent selection/reads/Git operations are the real interfaces.
-        request = selected.admit_host(action_id, kind=kind, command=command,
-            environment_carrier=tmp_path / "recovery-carrier", preflight=manager.preflight, **intent)
+    original_admit = lifecycle._admit_submit
+
+    def admit(selected, kind, *, action_id, command, manager, environment, **intent):
+        # Keep original CLI/Core admission and the same-request idempotency check.
+        request = original_admit(selected, kind, action_id=action_id, command=command,
+            manager=manager, environment=environment, **intent)
         assert selected.admit_host(action_id, kind=kind, command=command,
-            environment_carrier=tmp_path / "recovery-carrier", preflight=manager.preflight, **intent) == request
+            environment_carrier=request.environment_carrier, preflight=manager.preflight,
+            backend=request.backend, **intent) == request
         requests.append(request)
+        return request
+
+    def handoff(selected, request, *, action_id, kind, terminal, **_transport):
+        # Only physical handoff is controlled; no dispatch or usage proof is claimed.
+        assert not terminal.file.closed and selected.host_request(action_id) == request
         with selected.storage.transaction(write=False) as tx:
             status = tx.one("SELECT status FROM actions WHERE id=?", (action_id,))[0]
-        return {"result": "accepted", "status": "action_" + status, "run_id": request.run_id,
-                "action_id": action_id, "action": kind, "host": "unknown"}
+        return ({"result": "accepted", "status": "action_" + status, "run_id": request.run_id,
+                 "action_id": action_id, "action": kind, "host": "unknown"}, None)
 
-    monkeypatch.setattr(lifecycle, "submit", admit)
+    monkeypatch.setattr(lifecycle, "_admit_submit", admit)
+    monkeypatch.setattr(lifecycle, "_submit", handoff)
     arguments = ["approve", original.run_id, "--repo", physical.repository,
                  "--state-dir", str(kernel.storage.path), "--json"]
     writes = [line for line in calls.read_text().splitlines() if "--method" in json.loads(line)]

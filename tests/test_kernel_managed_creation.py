@@ -501,7 +501,7 @@ def test_public_requeue_replaces_the_exact_stale_parent_generation_on_its_origin
         reader = GhGitHubReader("example/project", working_directory=root, runner_identity=identity)
         kernel.refresh(lambda: read_requirements(reader, 1))
         assert kernel.source_status()["blocked"] == "requeue_required"
-        monkeypatch.setattr(lifecycle_cli, "submit", lambda *_a, **_kw: pytest.fail("Requeue must use the exact ready original Host"))
+        monkeypatch.setattr(lifecycle_cli, "_admit_submit", lambda *_a, **_kw: pytest.fail("Requeue must use the exact ready original Host"))
         assert main(["requeue", "1", "--repo", "example/project", "--json"]) == 0
         result = json.loads(capsys.readouterr().out)
         assert result["action"] == "requeue" and result["host"] == "running" and result["status"] == "action_applied"
@@ -597,15 +597,14 @@ def test_public_idle_requeue_binds_the_exact_replacement_to_the_original_host_in
         state.write_text(json.dumps(changed))
         admitted = []
 
-        def record_host_intent(selected, kind, *, action_id, command, manager, environment, runner_lock, **intent):
-            # A real durable admission; the long consumer proves physical handoff separately.
-            request = selected.admit_host(action_id, kind=kind, command=command,
-                environment_carrier=tmp_path / "requeue-environment.json", preflight=manager.preflight, **intent)
+        def record_host_intent(selected, request, *, action_id, kind, terminal, **_transport):
+            # Original CLI/Core admission is real; only physical handoff is controlled.
+            assert not terminal.file.closed and selected.host_request(action_id) == request
             admitted.append(request)
-            return {"result": "accepted", "status": "action_applied", "run_id": request.run_id,
-                    "action_id": action_id, "action": kind, "host": "unknown", "host_unit": request.unit_name}
+            return ({"result": "accepted", "status": "action_applied", "run_id": request.run_id,
+                     "action_id": action_id, "action": kind, "host": "unknown", "host_unit": request.unit_name}, None)
 
-        monkeypatch.setattr(lifecycle_cli, "submit", record_host_intent)
+        monkeypatch.setattr(lifecycle_cli, "_submit", record_host_intent)
         assert main(["requeue", "1", "--repo", "example/project", "--json"]) == 0
         result = json.loads(capsys.readouterr().out)
         assert len(admitted) == 1 and result["host"] == "unknown"
@@ -644,8 +643,8 @@ def test_public_abandon_of_an_unknown_host_only_fences_the_published_task(
             pytest.fail("Unknown-Host Abandon must not launch, attach, read remote state, or claim cleanup")
 
         monkeypatch.setattr(host_adapter, "SystemdHost", forbidden)
-        monkeypatch.setattr(lifecycle_cli, "attach", forbidden)
-        monkeypatch.setattr(lifecycle_cli, "submit", forbidden)
+        monkeypatch.setattr(lifecycle_cli, "_attach_request", forbidden)
+        monkeypatch.setattr(lifecycle_cli, "_admit_submit", forbidden)
         monkeypatch.setattr(remote_effects, "RemoteEffects", forbidden)
         assert main(["abandon", "1", "--repo", "example/project", "--json"]) == 0
         result = json.loads(capsys.readouterr().out)
@@ -701,7 +700,7 @@ def test_public_abandon_uses_the_original_ready_host_without_a_second_launch(
     from agent_run.cli.main import main
 
     with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, _execution, _world, calls):
-        monkeypatch.setattr(lifecycle_cli, "submit", lambda *_a, **_kw: pytest.fail("A ready original Host must not be replaced"))
+        monkeypatch.setattr(lifecycle_cli, "_admit_submit", lambda *_a, **_kw: pytest.fail("A ready original Host must not be replaced"))
         assert main(["abandon", "1", "--repo", "example/project", "--json"]) == 0
         result = json.loads(capsys.readouterr().out)
         assert result["result"] == "accepted" and result["status"] == "action_pending"
@@ -731,17 +730,16 @@ def test_public_idle_abandon_records_the_exact_initial_or_continuation_host_inte
             assert kernel.abandon_task("original-abandon", resource_inspections=inspections) == "pending"
         submitted = []
 
-        def record_host_intent(selected, kind, *, action_id, command, manager, environment, runner_lock, **intent):
-            # This verifies real Core admission, not physical Host handoff.
-            request = selected.admit_host(action_id, kind=kind, command=command,
-                environment_carrier=tmp_path / "new-environment.json", preflight=manager.preflight, **intent)
+        def record_host_intent(selected, request, *, action_id, kind, terminal, **_transport):
+            # Original CLI/Core admission is real; only physical handoff is controlled.
+            assert not terminal.file.closed and selected.host_request(action_id) == request
             submitted.append(request)
             with selected.storage.transaction(write=False) as tx:
                 status = tx.one("SELECT status FROM actions WHERE id=?", (action_id,))[0]
-            return {"result": "accepted", "status": "action_" + status, "run_id": request.run_id,
-                    "action_id": action_id, "action": kind, "host": "unknown", "host_unit": request.unit_name}
+            return ({"result": "accepted", "status": "action_" + status, "run_id": request.run_id,
+                     "action_id": action_id, "action": kind, "host": "unknown", "host_unit": request.unit_name}, None)
 
-        monkeypatch.setattr(lifecycle_cli, "submit", record_host_intent)
+        monkeypatch.setattr(lifecycle_cli, "_submit", record_host_intent)
         assert main(["abandon", "1", "--repo", "example/project", "--discard-worktree", "--json"]) == 0
         result = json.loads(capsys.readouterr().out)
         assert result["result"] == "accepted" and result["host"] == "unknown"
