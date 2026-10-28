@@ -1133,6 +1133,8 @@ def test_status_dirty_journal_fault_keeps_worker_alive_until_explicit_recovery(t
     original_work, original_pause = notifications.NativeNotifications._work, notifications.NativeNotifications._pause
     original_transaction = outbox.transaction
     def held_work(self):
+        # The worker owns the initial projection before this claim-fault barrier.
+        assert self._observe_committed()
         started.set()
         assert release.wait(5)
         try:
@@ -1161,13 +1163,13 @@ def test_status_dirty_journal_fault_keeps_worker_alive_until_explicit_recovery(t
         assert started.wait(5)
         before = outbox.read_notifications(database.parent, scenario.spec.run_id)
         important = [item for item in before["pending"] if item.get("important")]
-        assert important and observer._status_preempt.is_set() and observer._status_dirty
+        assert important and observer._status_dirty
         deadlines = {item["event"]["id"]: item["deadline_at"] for item in important}
         monkeypatch.setattr(outbox, "transaction", one_failure)
         release.set()
         assert paused.wait(5) and failed.is_set()
         assert not ended.wait(.5), "Unclosed sender died with dirty Status after a single journal fault"
-        assert observer.thread.is_alive() and not observer.closing and sent == []
+        assert observer.thread.is_alive() and observer._mode == "running" and sent == []
         faulted = outbox.read_notifications(database.parent, scenario.spec.run_id)
         assert all(item["attempts"] == 0 for item in faulted["pending"])
         observer.observe_committed()
@@ -1184,8 +1186,8 @@ def test_status_dirty_journal_fault_keeps_worker_alive_until_explicit_recovery(t
         observer.close(drain=False)
 
 
-def test_older_observer_cannot_clear_newer_important_status_preemption(tmp_path, monkeypatch):
-    from threading import Event, Thread, current_thread
+def test_repeated_wakes_during_projection_keep_new_important_card_ahead_of_status(tmp_path, monkeypatch):
+    from threading import Event
     import agent_run.notifications.sender as notifications
     from support.worker_process_timing import wait_until
 
@@ -1193,63 +1195,50 @@ def test_older_observer_cannot_clear_newer_important_status_preemption(tmp_path,
         "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
     database, subject = scenario.kernel.storage.path, scenario.delivery.key
     api = CommentsAPI(project_status(database, subject, storage=scenario.kernel.storage).target)
-    reading, read_release, older_ready, older_release = (Event() for _ in range(4))
+    older_ready, older_release, important_release = (Event() for _ in range(3))
     important_sent = Event()
-    ordering, errors = [], []
-    original_object, original_write = api.object, api.write
-    def held_object(endpoint):
-        if not reading.is_set():
-            reading.set()
-            assert read_release.wait(6)
-        return original_object(endpoint)
+    ordering = []
+    original_write = api.write
     def write(*args):
         ordering.append("status")
         return original_write(*args)
-    api.object, api.write = held_object, write
+    api.write = write
     def transport(*_args, **_kwargs):
-        if older_ready.is_set():
+        pending = outbox.read_notifications(database.parent, scenario.spec.run_id)["pending"]
+        if older_ready.is_set() and any(item.get("important") and item["outcome"] == "sending" for item in pending):
             ordering.append("important")
             important_sent.set()
+            assert important_release.wait(5)
         return {"outcome": "success", "reason": None}
     original_wake = notifications.NativeNotifications._wake_pending
     def reordered_wake(self, document, *args):
-        if current_thread().name == "older-observation":
+        if not older_ready.is_set() and not any(item.get("important") for item in document["pending"]):
             older_ready.set()
             assert older_release.wait(5)
         return original_wake(self, document, *args)
     monkeypatch.setattr(notifications.NativeNotifications, "_wake_pending", reordered_wake)
     observer = notifications.NativeNotifications(database, database.parent, transport=transport, status_api=api, storage=scenario.kernel.storage)
-    def older():
-        try:
-            observer.observe_committed()
-        except BaseException as error:
-            errors.append(error)
-    thread = Thread(target=older, name="older-observation")
     try:
-        assert reading.wait(5)
-        assert not observer._status_preempt.is_set()
-        thread.start()
         assert older_ready.wait(5)
         scenario.kernel.control("stop", "new-important-after-old-observation", subject=subject)
-        observer.observe_committed()
-        assert observer._status_preempt.is_set()
+        for _ in range(3):
+            observer.observe_committed()
+        assert observer._call is None, "A wake alone cannot start physical Status work"
         older_release.set()
-        thread.join(timeout=5)
-        assert not thread.is_alive() and not errors
+        assert important_sent.wait(5)
         pending = outbox.read_notifications(database.parent, scenario.spec.run_id)["pending"]
         assert len([item for item in pending if item.get("important")]) == 1
-        assert observer._status_preempt.is_set(), "Older empty snapshot cleared a newer important claim"
-        read_release.set()
-        assert important_sent.wait(5)
+        assert observer._call is not None and observer._call.kind == "feishu"
+        assert ordering == ["important"]
+        important_release.set()
         wait_until(lambda: len(api.comments) == 1 and "operator_stopped" in api.comments[0]["body"], timeout=5)
         observer.close()
         assert ordering[0] == "important"
         assert [row[1] for row in api.commands] == ["POST"]
         assert not observer.thread.is_alive()
     finally:
-        older_release.set(); read_release.set()
-        if thread.ident is not None:
-            thread.join(timeout=5)
+        older_release.set()
+        important_release.set()
         observer.close(drain=False)
 
 

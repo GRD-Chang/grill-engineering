@@ -10,7 +10,7 @@ import agent_run.storage.notification_outbox as outbox
 from agent_run.model import DeliveryKind
 from agent_run.notifications.sender import NativeNotifications
 from agent_run.config.defaults import UserDefaultsStore
-from support.notification import _enabled_scenario
+from support.notification import _enabled_scenario, observe_and_wait
 
 
 @pytest.mark.parametrize("kind", [DeliveryKind.PARENT_ONLY, DeliveryKind.FINAL_RUN])
@@ -206,7 +206,9 @@ def test_notification_degradation_uses_frozen_language_and_original_technical_re
     monkeypatch.setattr(sender, "read_boundaries", unavailable)
     observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=lambda *_a, **_kw: {'outcome': 'success', 'reason': None}, storage=scenario.kernel.storage)
     try:
-        assert observer.failure_reason == reason
+        with observer.condition:
+            assert observer.condition.wait_for(lambda: observer.failure_reason == reason, timeout=3)
+        observer.close(drain=False)
         error = capsys.readouterr().err
         assert prefix in error and reason in error
     finally:
@@ -278,11 +280,19 @@ def test_final_pr_coalescing_requires_an_exact_current_approval_and_an_unsent_cr
 
 
 def test_healthy_multi_page_observation_does_not_repeat_pr_creation_after_approval_was_sent(tmp_path, monkeypatch):
-    import threading
-    import time
+    from support.worker_process_timing import wait_until
 
     scenario = _enabled_scenario(tmp_path, monkeypatch, DeliveryKind.PARENT_ONLY, mode="detailed")
     sent = []
+    pages = []
+    original_page = NativeNotifications._page
+
+    def observed_page(self, after):
+        result = original_page(self, after)
+        pages.append((after, result[1]))
+        return result
+
+    monkeypatch.setattr(NativeNotifications, "_page", observed_page)
 
     def transport(_config, rendered, _identity, *_args, **_kwargs):
         sent.append(rendered)
@@ -291,33 +301,22 @@ def test_healthy_multi_page_observation_does_not_repeat_pr_creation_after_approv
     observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
     try:
         assert scenario.run().kind == "approval"
-        wake = observer._wake_pending
-        approval_retired = []
-
-        def wake_after_approval(document, serial):
-            wake(document, serial)
-            if threading.current_thread() is observer.thread or approval_retired:
-                return
-            # Force the legitimate sender to finish the important approval
-            # before this same read observation reaches later history pages.
-            deadline = time.monotonic() + 3
-            while time.monotonic() < deadline:
-                records = outbox.read_notifications(tmp_path, scenario.spec.run_id).get("records", [])
-                if any(item["kind"] == "boundary" and item["outcome"] == "success" for item in records):
-                    approval_retired.append(True)
-                    return
-                time.sleep(.005)
-            raise AssertionError("The real local sender did not finish its approval card")
-
-        monkeypatch.setattr(observer, "_wake_pending", wake_after_approval)
-        observer.observe_committed()
+        observe_and_wait(observer)
+        approval_retired = wait_until(lambda: [item for item in
+            outbox.read_notifications(tmp_path, scenario.spec.run_id).get("records", [])
+            if item["kind"] == "boundary" and item["outcome"] == "success"], timeout=3)
+        assert len(approval_retired) == 1
+        assert any(more for _after, more in pages), "The real observation never reached a second history page"
+        # A later wake rechecks the durable receipt after the same worker has
+        # completed paginated observation and retired the important approval.
+        observe_and_wait(observer)
         observer.close()
-        assert approval_retired == [True]
         assert observer.failure_reason is None
         titles = [item["header"]["title"]["content"] for item in sent]
         assert titles.count("Please approve the PR merge") == 1
         assert not any(title.startswith("Final PR #") and title.endswith(" created") for title in titles)
         records = outbox.read_notifications(tmp_path, scenario.spec.run_id)["records"]
+        assert [item for item in records if item["id"] == approval_retired[0]["id"]] == approval_retired
         assert not any(item["kind"] == "pr_created" and item["attempts"] for item in records)
     finally:
         observer.close(drain=False)

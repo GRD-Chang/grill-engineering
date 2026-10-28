@@ -27,13 +27,16 @@ def test_one_repair_milestone_updates_only_an_unsent_card_and_keeps_its_original
     monkeypatch.setattr(NativeNotifications, '_work', lambda _self: None)
     sender = NativeNotifications(kernel.storage.path, tmp_path, storage=kernel.storage)
     try:
+        # Exercise the worker's projection seam with its physical worker stopped;
+        # the producer wake itself intentionally performs no journal IO.
+        assert sender._observe_committed()
         with outbox.transaction(tmp_path, 'run-native') as document:
             item = next(row for row in document['pending'] if row['event']['id'] == planned['id'])
             if attempted:
                 item.update(attempts=1, outcome='failed')
                 item['attempt_history'] = [{'number': 1, 'started_at': item['created_at'], 'outcome': 'failed'}]
             before = deepcopy(item)
-        sender.observe_committed()
+        assert sender._observe_committed()
         assert sender.failure_reason is None
         document = outbox.read_notifications(tmp_path, 'run-native')
         matches = [row for row in document['pending'] if row['event']['id'] == planned['id']]
@@ -52,7 +55,7 @@ def test_one_repair_milestone_updates_only_an_unsent_card_and_keeps_its_original
             outbox.finish_attempt(item, {'outcome': 'success', 'reason': None}, item['created_at'] + 1)
             outbox.settle(document, item['created_at'] + 1)
             delivered = deepcopy(next(row for row in document['records'] if row['id'] == planned['id']))
-        sender.observe_committed()
+        assert sender._observe_committed()
         assert sender.failure_reason is None
         document = outbox.read_notifications(tmp_path, 'run-native')
         assert not any(row['event']['id'] == planned['id'] for row in document['pending'])

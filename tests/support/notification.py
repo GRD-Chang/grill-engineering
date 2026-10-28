@@ -24,6 +24,35 @@ from support.offline import GraphScenario, Scenario
 from support.requirements_scenarios import independent_source
 
 
+def observe_and_wait(observer: Any, *, timeout: float = 3) -> None:
+    """Await one owned bounded projection, without production request counters."""
+    from threading import Event
+    from agent_run.storage import notification_outbox as outbox
+
+    before = outbox.read_notifications(observer.state_root, observer.run_id)
+    projected = Event()
+    original = observer._observe_committed
+
+    def observed() -> bool:
+        healthy = original()
+        if healthy:
+            projected.set()
+        return bool(healthy)
+
+    # An already-caught-up cursor cannot prove a new material read. This test
+    # barrier waits for the real owner; large history may still need more pages.
+    observer._observe_committed = observed
+    try:
+        observer.observe_committed()
+        assert projected.wait(timeout), "Notification owner did not complete a healthy projection"
+        document = outbox.read_notifications(observer.state_root, observer.run_id)
+        assert document.get("native_run_start") is True
+        for cursor in ("native_cursor", "native_boundary_cursor"):
+            assert document[cursor] >= before.get(cursor, 0)
+    finally:
+        observer._observe_committed = original
+
+
 def sender_attempt_note(error: BaseException, root: Path, run_id: str, *,
                         first_id: str | None, gate_ids: list[str]) -> None:
     """Read the original first/Gate records after sender close; never replay."""
@@ -180,7 +209,7 @@ def _operations(kernel, execution, *, count: int = 1) -> CoreOperations:
     return CoreOperations(kernel, execution, lambda binding: ports)
 
 
-def _kernel(root: Path, count: int = 1) -> Kernel:
+def _kernel(root: Path, count: int = 1, *, notifications: bool = True) -> Kernel:
     defaults = UserDefaultsStore(root / "defaults.json")
     defaults.configure(language="en", notifications={"enabled": False, "mode": "detailed"})
     base = Commit("base", "tree")
@@ -192,7 +221,7 @@ def _kernel(root: Path, count: int = 1) -> Kernel:
                                    deliveries, repository_root=str(root)), defaults,
                            prompt_resources={key: "Frozen " + key for key in RESOURCE_KEYS})
     assert spec.inputs is not None
-    inputs = replace(spec.inputs, notifications={"enabled": True, "mode": "detailed",
+    inputs = replace(spec.inputs, notifications={"enabled": notifications, "mode": "detailed",
                                                  "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
     final = Delivery("notification-final", DeliveryKind.FINAL_RUN, 1, "unread", base,
                      delivery.target_ref, "refs/heads/main")

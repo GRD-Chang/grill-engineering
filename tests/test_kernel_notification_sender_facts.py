@@ -15,7 +15,7 @@ from agent_run.model import DeliveryKind, Role
 from agent_run.core.kernel import Kernel
 from agent_run.model import wire_json
 from agent_run.notifications.sender import NativeNotifications
-from support.notification import recorded_agents as _recorded_agents, _enabled_scenario, _kernel, _operations
+from support.notification import recorded_agents as _recorded_agents, _enabled_scenario, _kernel, _operations, observe_and_wait
 from support.observer_errors import ObserverErrors
 
 
@@ -158,7 +158,7 @@ def test_sender_compresses_real_development_to_review_and_preserves_gate_budget_
     observed = []
 
     def started(call):
-        observer.observe_committed()
+        observe_and_wait(observer, timeout=5)
         document = outbox.read_notifications(tmp_path, scenario.spec.run_id)
         if call.role == Role.DEVELOPMENT:
             item, = [item for item in document["pending"] if item["event"]["kind"] == "parent_started"]
@@ -172,25 +172,25 @@ def test_sender_compresses_real_development_to_review_and_preserves_gate_budget_
             assert old["cancelled"] is True and old["attempts"] == 0 and old["deadline_at"] == deadline
             assert any(item["event"]["title"] == "Unknown recorded origin" for item in document["pending"])
             assert any(item["event"].get("attempt_id") == call.attempt_id for item in document["pending"])
-            # Keep generation, poll and snapshot ahead of the sender claim.
-            with observer.condition:
-                unknown = []
-                with outbox.transaction(tmp_path, scenario.spec.run_id) as journal:
-                    while len(journal["pending"]) < outbox.MAX_PENDING:
-                        event = event_envelope(_state(scenario), "stage_start", f"unknown-origin-{len(unknown) + 1}", "Capacity-only unknown")
-                        unknown.append(event["id"])
-                        outbox.enqueue(journal, event, time.time())
-                assert scenario.kernel.control("stop", "protect-current-gate", subject=scenario.delivery.key) == "applied"
-                observer.observe_committed()
-                document = outbox.read_notifications(tmp_path, scenario.spec.run_id)
-                assert len(document["pending"]) <= outbox.MAX_PENDING
-                gates = [item for item in document["pending"] if item["event"]["kind"] == "boundary"]
-                assert len(gates) == 1 and gates[0]["important"] is True and gates[0]["attempts"] == 0
-                gate_ids.append(gates[0]['event']['id'])
-                retained = {item["event"]["id"] for item in document["pending"]} | {record["id"] for record in document["records"]}
-                assert set(unknown).issubset(retained)
-                cancelled = [record for record in document["records"] if record["id"] in unknown]
-                assert cancelled and all(record["cancel_reason"] == "pending capacity" and record["attempts"] == 0 for record in cancelled)
+            # The original physical call still owns the single send slot.
+            # The observation worker can project without a test-held condition.
+            unknown = []
+            with outbox.transaction(tmp_path, scenario.spec.run_id) as journal:
+                while len(journal["pending"]) < outbox.MAX_PENDING:
+                    event = event_envelope(_state(scenario), "stage_start", f"unknown-origin-{len(unknown) + 1}", "Capacity-only unknown")
+                    unknown.append(event["id"])
+                    outbox.enqueue(journal, event, time.time())
+            assert scenario.kernel.control("stop", "protect-current-gate", subject=scenario.delivery.key) == "applied"
+            observe_and_wait(observer, timeout=5)
+            document = outbox.read_notifications(tmp_path, scenario.spec.run_id)
+            assert len(document["pending"]) <= outbox.MAX_PENDING
+            gates = [item for item in document["pending"] if item["event"]["kind"] == "boundary"]
+            assert len(gates) == 1 and gates[0]["important"] is True and gates[0]["attempts"] == 0
+            gate_ids.append(gates[0]['event']['id'])
+            retained = {item["event"]["id"] for item in document["pending"]} | {record["id"] for record in document["records"]}
+            assert set(unknown).issubset(retained)
+            cancelled = [record for record in document["records"] if record["id"] in unknown]
+            assert cancelled and all(record["cancel_reason"] == "pending capacity" and record["attempts"] == 0 for record in cancelled)
             observed.append(call.attempt_id)
 
     try:

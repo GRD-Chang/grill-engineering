@@ -11,7 +11,7 @@ import pytest
 from agent_run.core import kernel as core
 from agent_run.core.operation_contract import DeliveryFacts, ObserveIO, ReadUnavailable, Work
 from agent_run.errors import KernelError
-from agent_run.model import Commit, EffectResult, Execution, ParentIssue, Policy, Requirements, World, wire_json
+from agent_run.model import Commit, EffectResult, Execution, ParentIssue, Policy, ReadWait, Requirements, World, wire_json
 from agent_run.storage.run_scope import RunTransaction
 from agent_run.storage.sqlite import Transaction
 from support.offline import fixture_inputs
@@ -283,7 +283,10 @@ def _until_preparation(kernel, run, source, role, candidate, *, facts=None):
             return result.preparation
         if isinstance(result, EffectIO):
             observation = kernel.accept_requirements(kernel.begin_effect_observation(result.effect), source)
-            world, fence = kernel.accept_delivery(observation, DeliveryFacts(BASE, BASE) if facts is None else facts)
+            observed = DeliveryFacts(BASE, BASE) if facts is None else facts
+            observed = replace(observed, checks_requested=observation.query.read_checks,
+                               checks=observed.checks if observation.query.read_checks else None)
+            world, fence = kernel.accept_delivery(observation, observed)
             kernel.authorize_effect_observation(result.effect, world, fence, prepared=True, inspections=None)
             if result.effect.operation == 'candidate':
                 receipt = EffectResult('target', commit=candidate)
@@ -498,4 +501,195 @@ def test_foreign_source_fence_cannot_refresh_same_numbered_parent_in_selected_ru
     before = {run: _rows(db, run) for run in ('A', 'B')}
     with pytest.raises(KernelError):
         kernels['A'].accept_requirements(request, _source('A', 'must not commit'))
+    assert {run: _rows(db, run) for run in ('A', 'B')} == before
+
+
+def test_source_consumption_checks_original_read_deadline_after_writer_admission(scenario, monkeypatch):
+    db, kernels = scenario
+    kernel, execution = kernels['A'], _execution('A')
+    now = [100.25]
+    kernel.clock = lambda: now[0]
+    request = kernel.begin_observation(SUBJECT, execution=execution)
+    kernel._wait_for_read(request.fence, execution, 'controlled_read', 'Original read unavailable')
+    original = dict(db.execute("SELECT * FROM waits WHERE run_id='A'").fetchone())
+    source = db.execute("SELECT source_sequence,observed_parent_revision FROM runs WHERE id='A'").fetchone()[:]
+    before_b = _rows(db, 'B')
+    transaction = kernel.storage.transaction
+    now[0] = 700.20
+
+    @contextmanager
+    def delayed_writer(**options):
+        if options.get('write', True):
+            now[0] = 700.25
+        with transaction(**options) as tx:
+            yield tx
+
+    monkeypatch.setattr(kernel.storage, 'transaction', delayed_writer)
+    with pytest.raises(ReadWait) as expired:
+        kernel.accept_requirements(request, _source('A', 'returned-before-save-admission'))
+    assert expired.value.step.reason == 'supervision_timeout'
+    assert db.execute("SELECT source_sequence,observed_parent_revision FROM runs WHERE id='A'").fetchone()[:] == source
+    assert dict(db.execute("SELECT * FROM waits WHERE run_id='A'").fetchone()) == original
+    assert db.execute("SELECT code FROM gates WHERE run_id='A'").fetchone()[0] == 'supervision_timeout'
+    assert not db.execute("SELECT id FROM attempts WHERE run_id='A'").fetchall()
+    assert _rows(db, 'B') == before_b
+
+
+@pytest.mark.parametrize('has_wait', [False, True])
+def test_observation_consumption_checks_and_uses_one_transaction(scenario, monkeypatch, has_wait):
+    db, kernels = scenario
+    kernel, execution = kernels['A'], _execution('A')
+    kernel.clock = lambda: 100.25
+    request = kernel.begin_observation(SUBJECT, execution=execution)
+    if has_wait:
+        kernel._wait_for_read(request.fence, execution, 'controlled_read', 'Original read unavailable')
+    before = {run: _rows(db, run) for run in ('A', 'B')}
+    transaction, modes = kernel.storage.transaction, []
+
+    @contextmanager
+    def recorded(**options):
+        write = options.get('write', True)
+        modes.append((write, options.get('ordered', True)))
+        if not write:
+            db.execute('PRAGMA query_only=ON')
+        try:
+            with transaction(**options) as tx:
+                yield tx
+        finally:
+            db.execute('PRAGMA query_only=OFF')
+
+    monkeypatch.setattr(kernel.storage, 'transaction', recorded)
+    observation = kernel.accept_requirements(request, _source('A'))
+    assert modes == [(True, True)]
+    modes.clear()
+    world, fence = kernel.accept_delivery(observation, DeliveryFacts(BASE, BASE))
+    assert fence == observation.fence and world.source == BASE
+    assert modes == [(False, True)]
+    assert {run: _rows(db, run) for run in ('A', 'B')} == before
+
+
+@pytest.mark.parametrize('writer_failure', [None, 'open', 'before_commit', 'after_commit'])
+def test_delivery_timeout_commits_before_wait_and_preserves_writer_failure(scenario, monkeypatch, writer_failure):
+    db, kernels = scenario
+    kernel, execution = kernels['A'], _execution('A')
+    kernel.clock = lambda: 100.25
+    request = kernel.begin_observation(SUBJECT, execution=execution)
+    observation = kernel.accept_requirements(request, _source('A'))
+    kernel._wait_for_read(observation.fence, execution, 'controlled_read', 'Original read unavailable')
+    original = dict(db.execute("SELECT * FROM waits WHERE run_id='A'").fetchone())
+    before_b = _rows(db, 'B')
+    transaction, modes = kernel.storage.transaction, []
+    failure = OSError('Original timeout writer failure')
+    kernel.clock = lambda: 700.25
+
+    @contextmanager
+    def recorded(**options):
+        write = options.get('write', True)
+        modes.append((write, options.get('ordered', True)))
+        if write and writer_failure == 'open':
+            raise failure
+        with transaction(**options) as tx:
+            yield tx
+            if write and writer_failure == 'before_commit':
+                raise failure
+        if write and writer_failure == 'after_commit':
+            raise failure
+
+    monkeypatch.setattr(kernel.storage, 'transaction', recorded)
+    if writer_failure:
+        with pytest.raises(OSError) as caught:
+            kernel.accept_delivery(observation, DeliveryFacts(BASE, BASE))
+        assert caught.value is failure
+    else:
+        with pytest.raises(ReadWait) as expired:
+            kernel.accept_delivery(observation, DeliveryFacts(BASE, BASE))
+        assert expired.value.step.reason == 'supervision_timeout'
+    if writer_failure in {None, 'after_commit'}:
+        assert db.execute("SELECT code FROM gates WHERE run_id='A'").fetchone()[0] == 'supervision_timeout'
+    else:
+        assert not db.execute("SELECT code FROM gates WHERE run_id='A'").fetchall()
+    assert modes == [(False, True), (True, True)]
+    assert dict(db.execute("SELECT * FROM waits WHERE run_id='A'").fetchone()) == original
+    assert _rows(db, 'B') == before_b
+
+
+@pytest.mark.parametrize('change', ['stop', 'source', 'owner', 'removed_wait', 'replaced_wait'])
+def test_delivery_consumption_rechecks_timeout_under_its_writer(scenario, monkeypatch, change):
+    db, kernels = scenario
+    kernel, execution = kernels['A'], _execution('A')
+    kernel.clock = lambda: 100.25
+    request = kernel.begin_observation(SUBJECT, execution=execution)
+    observation = kernel.accept_requirements(request, _source('A'))
+    kernel._wait_for_read(observation.fence, execution, 'controlled_read', 'Original read unavailable')
+    kernel.clock = lambda: 700.25
+    transaction, changed, modes = kernel.storage.transaction, False, []
+    before_b = _rows(db, 'B')
+
+    @contextmanager
+    def interleaved(**options):
+        nonlocal changed
+        modes.append(options.get('write', True))
+        with transaction(**options) as tx:
+            yield tx
+        if not options.get('write', True) and not changed:
+            assert not db.in_transaction
+            changed = True
+            if change == 'stop':
+                kernel.control('stop', 'stop-before-delivery-timeout')
+            elif change == 'source':
+                kernel.refresh(lambda: _source('A', 'changed-before-delivery-timeout'))
+            elif change == 'owner':
+                db.execute("UPDATE runs SET executor='successor',epoch=epoch+1 WHERE id='A'")
+            elif change == 'removed_wait':
+                db.execute("DELETE FROM waits WHERE run_id='A'")
+            else:
+                db.execute("UPDATE waits SET started_at=700.25,deadline=1300.25 WHERE run_id='A'")
+
+    monkeypatch.setattr(kernel.storage, 'transaction', interleaved)
+    if change in {'stop', 'owner', 'source'}:
+        with pytest.raises(KernelError, match='automatic_step_superseded' if change == 'source' else 'executor_fenced'):
+            kernel.accept_delivery(observation, DeliveryFacts(BASE, BASE))
+    else:
+        world, fence = kernel.accept_delivery(observation, DeliveryFacts(BASE, BASE))
+        assert world.source == BASE and fence == observation.fence
+        assert modes == [False, True]
+        rows = db.execute("SELECT deadline FROM waits WHERE run_id='A'").fetchall()
+        assert [row[0] for row in rows] == ([] if change == 'removed_wait' else [1300.25])
+    assert changed and not db.execute("SELECT 1 FROM gates WHERE run_id='A' AND code='supervision_timeout'").fetchall()
+    assert _rows(db, 'B') == before_b
+
+
+@pytest.mark.parametrize('failure_at', ['open', 'close', 'consumer'])
+def test_delivery_consumption_failure_does_not_retry_the_consumer_or_save(scenario, monkeypatch, failure_at):
+    db, kernels = scenario
+    kernel, execution = kernels['A'], _execution('A')
+    kernel.clock = lambda: 100.25
+    request = kernel.begin_observation(SUBJECT, execution=execution)
+    observation = kernel.accept_requirements(request, _source('A'))
+    kernel._wait_for_read(observation.fence, execution, 'controlled_read', 'Original read unavailable')
+    if failure_at != 'consumer':
+        kernel.clock = lambda: 700.25
+    transaction, modes = kernel.storage.transaction, []
+    before = {run: _rows(db, run) for run in ('A', 'B')}
+    failure = OSError('Original observation storage failure')
+
+    @contextmanager
+    def failed(**options):
+        modes.append(options.get('write', True))
+        if failure_at == 'open':
+            raise failure
+        with transaction(**options) as tx:
+            yield tx
+        if failure_at == 'close':
+            raise failure
+
+    monkeypatch.setattr(kernel.storage, 'transaction', failed)
+    if failure_at == 'consumer':
+        with pytest.raises(ReadUnavailable, match='Required Checks demand'):
+            kernel.accept_delivery(observation, DeliveryFacts(BASE, BASE, checks_requested=False))
+    else:
+        with pytest.raises(OSError) as caught:
+            kernel.accept_delivery(observation, DeliveryFacts(BASE, BASE))
+        assert caught.value is failure
+    assert modes == [False]
     assert {run: _rows(db, run) for run in ('A', 'B')} == before

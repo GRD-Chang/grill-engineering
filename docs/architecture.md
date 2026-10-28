@@ -62,6 +62,11 @@ OperationRunner 以冻结的 `OperationBinding` 组合真实端口，将观察�
 `run_once` 返回 AgentPreparation 后由 Executor 准备凭据；Core 原子准入返回 AgentCall 后才派发 Agent，不在 I/O 驱动中等待模型或 CI 完成。
 公开 status/history 只读数据库，不调用这条会接受新观察的运行链路。
 
+Core 在消费观察事实的同一事务内核对 ReadFence 和原读取期限。
+Requirements 在有序写入准入后先核对期限，再接受来源变化；Delivery 事实在同一只读快照内核对并组装。
+只读消费发现过期时正常关闭读事务，由新有序写事务重新核对并保存超时，再返回等待结果；
+原观察期限不因等待保存而延长，消费逻辑只执行一次。这里不缓存跨事务权限，后续实际写入仍独立授权。
+
 ## 状态与证据
 
 本开发候选的唯一状态协议是 **`independent-delivery-repository-v22`**；

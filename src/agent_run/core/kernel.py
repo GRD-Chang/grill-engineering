@@ -145,12 +145,7 @@ class Kernel:
 
     def accept_requirements(self, request: RequirementsRead, source: Requirements) -> DeliveryObservation:
         fence = request.fence
-        if fence.execution is not None:
-            waiting = self._finish_operation_read(fence, fence.execution)
-            if waiting is not None:
-                raise ReadWait(waiting)
-        with self.storage.transaction() as tx:
-            self._check_operation(tx, fence, fence.execution)
+        with self._observation_transaction(fence, write=True) as (tx, _):
             self._refresh(tx, source)
             current = replace(self._read_fence(tx, fence.subject, fence.execution, fence.cleanup),
                               local_effect=fence.local_effect)
@@ -179,12 +174,7 @@ class Kernel:
 
     def accept_delivery(self, request: DeliveryObservation, facts: DeliveryFacts) -> tuple[World, ReadFence]:
         fence = request.fence
-        if fence.execution is not None:
-            waiting = self._finish_operation_read(fence, fence.execution)
-            if waiting is not None:
-                raise ReadWait(waiting)
-        with self.storage.transaction(write=False) as tx:
-            self._check_operation(tx, fence, fence.execution)
+        with self._observation_transaction(fence, write=False) as (tx, run):
             required = fence.local_effect is None
             if (type(request.query.read_checks) is not bool or request.query.read_checks != required
                     or type(facts.checks_requested) is not bool or facts.checks_requested != required
@@ -196,8 +186,6 @@ class Kernel:
                         or checked is None and facts.ancestry
                         or checked is not None and not set(facts.ancestry) <= set(checked)):
                     raise ReadUnavailable("ancestry_observation_incomplete", "Requested ancestry was not exactly observed")
-            run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
-                      (), run_last=True))
             revision, completion = run["observed_parent_revision"], "no-tickets"
             if fence.subject is not None:
                 job = self._job(tx, fence.subject)
@@ -214,6 +202,28 @@ class Kernel:
             return World(run["observed_parent_revision"], run["observed_graph_revision"], revision, facts.target,
                          facts.source, facts.pr, facts.checks, completion, facts.ancestry,
                          facts.publisher_actor, facts.publisher_identity), fence
+
+    @contextmanager
+    def _observation_transaction(self, fence: ReadFence, *, write: bool) -> Iterator[tuple[Transaction, sqlite3.Row]]:
+        """Validate and consume returned facts in the same transaction.
+
+        Only an expired read window needs a readonly consumer to enter the
+        ordered writer. The consumer runs once, after fresh checks; a timeout
+        commits before ReadWait leaves this boundary. No row or permission
+        from the first snapshot is reused by that writer.
+        """
+        for writable in ((True,) if write else (False, True)):
+            with self.storage.transaction(write=writable) as tx:
+                run = self._check_operation(tx, fence, fence.execution)
+                try:
+                    waiting = (None if fence.execution is None else self._operation_read_wait(
+                        tx, run, self._automatic_token(fence)["scope"], after_read=True, write_timeout=writable))
+                except _SupervisionWriteRequired:
+                    continue  # Close the reader normally; never retry a failed close or consumer.
+                if waiting is None:
+                    yield tx, run
+                    return
+            raise ReadWait(waiting)
 
     def authorize_agent_observation(self, call: AgentCall, world: World, fence: ReadFence) -> None:
         with self.storage.transaction() as tx:
@@ -393,7 +403,7 @@ class Kernel:
                           "source_sequence": run["source_sequence"],
                           "control_version": [run[key] for key in ("executor", "epoch", "stopped", "blocked", "final_action")]}).decode()
 
-    def _check_operation(self, tx: Transaction, token: str | ReadFence, execution: Execution | None) -> None:
+    def _check_operation(self, tx: Transaction, token: str | ReadFence, execution: Execution | None) -> sqlite3.Row:
         value, run = self._automatic_token(token), tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
                                                        (), run_last=True))
         if isinstance(token, ReadFence) and token.execution != execution:
@@ -407,6 +417,7 @@ class Kernel:
             raise ObservationSuperseded("automatic_step_superseded")
         if isinstance(token, ReadFence) and token.local_effect is not None:
             self._local_preparation_read(tx, token.local_effect, token)
+        return run
 
     def _continuation_wait(self, tx: Transaction, job: sqlite3.Row) -> Step | None:
         """Use the Attempt's single native-or-Opening facts loader."""

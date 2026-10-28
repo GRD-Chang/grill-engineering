@@ -14,10 +14,12 @@ import sqlite3
 import threading
 import time
 import uuid
+from time import monotonic
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from agent_run.storage.run_scope import run_statement
 from agent_run.contracts.repository import normalize_repository
@@ -43,6 +45,18 @@ from agent_run.storage.routing import open_run
 
 CLOSE_TIMEOUT_SECONDS = 60.0
 Send = Callable[..., Mapping[str, Any]]
+
+
+@dataclass
+class CurrentCall:
+    """One physical operation; keep its receipt until original claim settlement."""
+
+    kind: Literal["feishu", "status"]
+    claim: tuple[str, int] | None = None
+    thread: threading.Thread | None = None
+    cancel: threading.Event = field(default_factory=threading.Event)
+    result: tuple[dict[str, Any], float, Exception | None] | None = None
+    settlement_deferred: bool = False
 
 
 def _pull_request_identity(url: object) -> tuple[str, int] | None:
@@ -86,22 +100,15 @@ class NativeNotifications:
             self.status_enabled = False
         self.enabled = self.feishu_enabled or self.status_enabled
         self._status_dirty = self.status_enabled
-        self._status_cancel = threading.Event()
-        self._status_preempt = threading.Event()
         self.condition = threading.Condition()
-        self.cancel = threading.Event()
         self.owner = {"pid": os.getpid(), "token": _process_start_token(os.getpid()),
                       "sender": uuid.uuid4().hex}
-        self.closing = False
-        self.closed = False
         self.failure_reason: str | None = None
         self.thread: threading.Thread | None = None
         self._more = False
-        self._shutdown = False
-        self._recovery_requested = False
-        self._fault_serial = 0
-        self._pending_serial = 0  # Ordered by the existing journal transaction lock.
-        self._woken_serial = 0
+        self._mode: Literal["running", "drain", "cancel", "cancel_after_drain"] = "running"
+        self._refresh_dirty = False
+        self._call: CurrentCall | None = None
         if self.enabled:
             self.observe_committed()
             self.thread = threading.Thread(target=self._work, name="kernel-notifications", daemon=True)
@@ -354,83 +361,80 @@ class NativeNotifications:
                     and (event.get("work_subject"), event.get("generation"), identity) in approvals):
                 outbox.cancel_item(document, item, "included in current Final PR approval")
 
+    @property
+    def closed(self) -> bool:
+        call = self._call
+        return ((self.thread is None or not self.thread.is_alive())
+                and (call is None or call.thread is None or not call.thread.is_alive()))
+
     def observe_committed(self) -> None:
-        """Observe healthy facts, or request one sender-owned fault recovery."""
-        if not self.enabled or self.closed or self._shutdown:
-            return
+        """Merge a wake only; the notification owner reads committed facts."""
         with self.condition:
+            if not self.enabled or self._mode in {"cancel", "cancel_after_drain"}:
+                return
+            self._refresh_dirty = True
             if self.status_enabled:
                 self._status_dirty = True
-                self.condition.notify_all()
-            if self.failure_reason is not None:
-                self._recovery_requested = True
-                self.condition.notify_all()
-                return
-        if self.feishu_enabled:
-            self._observe_committed()
+            self.condition.notify_all()
 
-    def _send_status(self) -> None:
-        """Coalesce display only; never infer business progress or schedule work."""
+    def _send_status(self, call: CurrentCall) -> None:
+        """Keep the existing Status intent/readback protocol in this physical slot."""
         for subject in status_subjects(self.database, **self._storage_options):
-            if self._shutdown or self._status_cancel.is_set():
-                return
+            if call.cancel.is_set():
+                break
             projection = project_status(self.database, subject, **self._storage_options)
             fingerprint = (projection.target.key, hashlib.sha256(projection.body.encode()).hexdigest())
             if self._status_seen.get(subject) == fingerprint:
                 continue
-            # A successful readback may settle an older sent intent. One more
-            # opportunity can then apply current copy, without replaying it.
+            # Readback may settle an older sent intent before applying current copy.
             for _ in range(2):
-                result = self.status.deliver(subject, api=self.status_api,
-                    cancelled=lambda: self._status_cancel.is_set() or self._status_preempt.is_set())
-                if self._status_preempt.is_set():
-                    # A queued important notification keeps its original
-                    # window. Interrupted Status retains its intent for later
-                    # readback, and is not cached as already observed.
-                    with self.condition:
-                        self._status_dirty = True
-                    return
+                result = self.status.deliver(subject, api=self.status_api, cancelled=call.cancel.is_set)
+                if call.cancel.is_set():
+                    break  # Preserve the original intent and retry display after important delivery.
                 if result != "confirmed":
                     break
+            if call.cancel.is_set():
+                break
             self._status_seen[subject] = fingerprint
+        if call.cancel.is_set():
+            with self.condition:
+                self._status_dirty = True
         self.status_failure_reason = None
 
-    def _wake_pending(self, document: dict[str, Any], serial: int) -> None:
-        """Give existing important Feishu claims priority over display reads."""
+    def _wake_pending(self, document: dict[str, Any]) -> None:
+        """Only projected important work can interrupt the current Status call."""
         pending = document["pending"]
         if self.exit_notice is not None:
             pending = [item for item in pending if item["event"]["id"] == self.exit_event_id]
         with self.condition:
-            if serial < self._woken_serial:
-                return  # A newer committed snapshot already owns the signal.
-            self._woken_serial = serial
-            if any(item.get("important") and not item.get("cancelled") for item in pending):
-                self._status_preempt.set()
-            else:
-                self._status_preempt.clear()
+            call = self._call
+            if (call is not None and call.kind == "status"
+                    and any(item.get("important") and not item.get("cancelled") for item in pending)):
+                call.cancel.set()
+                self._status_dirty = True
             self.condition.notify_all()
 
     def _pause(self, error: Exception) -> None:
         reason = bounded_error(str(error))
-        # Every journal fault write/clear follows condition -> outbox order.
-        # A late report or recovery cannot overwrite a newer fault receipt.
         with self.condition:
             self.failure_reason = reason
-            self._fault_serial += 1
-            self.cancel.set()
+            if self._call is not None and self._call.kind == "feishu":
+                self._call.cancel.set()
             self.condition.notify_all()
-            try:
-                existed = outbox.notification_path(self.state_root, self.run_id).exists()
-                with outbox.transaction(self.state_root, self.run_id) as document:
-                    if (existed and not document.get("native_run_start")
-                            and document.get("native_binding") != [self.run_id, *self.binding]):
-                        return
-                    if not existed:
-                        document["native_binding"] = [self.run_id, *self.binding]
-                    document["unavailable_reason"] = reason
-                    document["delivery_error"] = {"reason": reason, "observed_at": time.time()}
-            except Exception:
-                pass  # Best effort after the original transaction rolled back.
+        # The worker owns fault receipts and recovery. Never hold the producer
+        # condition while waiting for the journal or its durability operations.
+        try:
+            existed = outbox.notification_path(self.state_root, self.run_id).exists()
+            with outbox.transaction(self.state_root, self.run_id) as document:
+                if (existed and not document.get("native_run_start")
+                        and document.get("native_binding") != [self.run_id, *self.binding]):
+                    return
+                if not existed:
+                    document["native_binding"] = [self.run_id, *self.binding]
+                document["unavailable_reason"] = reason
+                document["delivery_error"] = {"reason": reason, "observed_at": time.time()}
+        except Exception:
+            pass  # Best effort after the original transaction rolled back.
         print(event_copy(self.state, "unavailable_development_continues", reason=reason), file=sys.stderr)
 
     @staticmethod
@@ -509,15 +513,13 @@ class NativeNotifications:
                         outbox.retire(document, item)
                     document["seen"].append(event["id"])
                     del document["seen"][:-outbox.MAX_RECORDS]
-            self._pending_serial += 1
-            serial = self._pending_serial
-        self._wake_pending(document, serial)
+        self._wake_pending(document)
         self._more = False
         return True
 
     def _observe_committed(self) -> bool:
         """Read only committed facts; claim no transport while a kernel lock is held."""
-        if not self.enabled or self.closed or self._shutdown:
+        if not self.enabled or self._mode in {"cancel", "cancel_after_drain"}:
             return False
         if not self.feishu_enabled:
             return True
@@ -556,9 +558,7 @@ class NativeNotifications:
                             if not self._same_binding(*self._run(tx)):
                                 raise ValueError("notification Run or recipient binding changed")
                             self._compress_progress(tx, document, read_boundaries(tx, time.time()), added=True)
-                    self._pending_serial += 1
-                    serial = self._pending_serial
-                self._wake_pending(document, serial)
+                self._wake_pending(document)
                 self._more = more
                 if not more or full or boundary_more:
                     return True
@@ -567,206 +567,257 @@ class NativeNotifications:
             self._pause(error)
             return False
 
-    def _work(self) -> None:
-        active_event_id: str | None = None
-        active_result: dict[str, Any] | None = None
-        active_attempt: int | None = None
-        returned_at: float | None = None
-        while not self._shutdown:
+    def _send_one(self, event: dict[str, Any], deadline_at: float, cancel: threading.Event) -> tuple[Mapping[str, Any], Exception | None]:
+        """Use the original binding, cancellation and absolute event deadline."""
+        result: Mapping[str, Any]
+        try:
+            with self.storage.transaction(write=False) as tx:
+                if not self._same_binding(*self._run(tx)):
+                    raise ValueError("notification Run or recipient binding changed")
+        except Exception as error:
+            result = {"outcome": "failed", "reason": bounded_error(str(error))}
+        else:
             try:
-                with self.condition:
-                    status_dirty = self._status_dirty and not self._status_preempt.is_set()
-                    if status_dirty:
-                        self._status_dirty = False
-                if status_dirty:
-                    try:
-                        self._send_status()
-                    except Exception:
-                        # This is the asynchronous channel boundary, not a
-                        # success classification in the public Status port.
-                        self.status_failure_reason = "status_sender_failed"
-                        print("Agent Run Status unavailable; business continues", file=sys.stderr)
-                if not self.feishu_enabled:
-                    with self.condition:
-                        if self._shutdown:
-                            return
-                        if self._status_dirty:
-                            continue
-                        if self.closing:
-                            return
-                        self.condition.wait()
-                    continue
-                with self.condition:
-                    while (self.failure_reason is not None and not self._recovery_requested
-                           and not self.closing and not self._shutdown):
-                        self.condition.wait()
-                    if self._shutdown:
-                        return
-                    if self._status_dirty and not self._status_preempt.is_set():
-                        continue
-                    recovering = self.failure_reason is not None
-                    if recovering and not self._recovery_requested:
-                        return  # A normal close already made its one recovery attempt.
-                    serial = self._fault_serial
-                    self._recovery_requested = False
-                # A returned physical result survives journal failure in this
-                # one active slot. Persist it before recovering or claiming.
-                if active_event_id is not None:
-                    if active_result is not None:
-                        assert returned_at is not None
-                        self._finish_result(active_event_id, active_result, returned_at)
+                current = event["kind"] != "executor_exit" or self._exit_current(event)
+            except Exception as error:
+                # No physical request began. The owner pauses and persists
+                # this original claim as known unsent before any recovery.
+                return {"outcome": "failed", "reason": "journal claim interrupted before transport", "not_sent": True}, error
+            if not current:
+                result = {"outcome": "failed", "reason": "original Host exit no longer current", "not_sent": True}
+            else:
+                try:
+                    options: dict[str, Any] = {"timeout_seconds": max(0.0, deadline_at - time.time())}
+                    if event["kind"] == "executor_exit":
+                        options["is_current"] = lambda: self._exit_current(event)
+                    identity = hashlib.sha256(event["id"].encode()).hexdigest()[:32]
+                    result = self.transport(self.config, card(event), identity, cancel, **options)
+                except Exception as error:
+                    from agent_run.queries.host_exit import HostExitUnavailable
+                    if event["kind"] == "executor_exit" and isinstance(error, HostExitUnavailable):
+                        result = {"outcome": "failed", "reason": bounded_error(str(error)), "not_sent": True}
                     else:
-                        # The claim may have reached os.replace before a final
-                        # fsync error. No transport call occurred in this path.
-                        assert active_attempt is not None and returned_at is not None
-                        self._finish_not_sent(active_event_id, active_attempt, returned_at)
-                    active_event_id, active_result, active_attempt, returned_at = None, None, None, None
-                if not self._observe_committed():
-                    continue
-                validity = self._exit_validity()
-                with self.condition:
-                    if self._shutdown:
+                        result = {"outcome": "unknown", "reason": bounded_error(str(error))}
+        return result, None
+
+    def _deliver(self, call: CurrentCall, event: dict[str, Any] | None, deadline_at: float) -> None:
+        """Publish a physical result without surrendering the original slot."""
+        fault = None
+        result: dict[str, Any] = {}
+        try:
+            if call.kind == "status":
+                self._send_status(call)
+            else:
+                assert event is not None
+                returned, fault = self._send_one(event, deadline_at, call.cancel)
+                result = dict(returned)
+        except BaseException as error:
+            if call.kind == "status":
+                self.status_failure_reason = "status_sender_failed"
+                print("Agent Run Status unavailable; business continues", file=sys.stderr)
+            else:
+                result = {"outcome": "unknown", "reason": bounded_error(str(error))}
+        returned_at = time.time()
+        with self.condition:
+            call.result = result, returned_at, fault
+            self.condition.notify_all()
+
+    def _start_call(self, call: CurrentCall, event: dict[str, Any] | None = None,
+                    deadline_at: float = 0.0) -> None:
+        with self.condition:
+            if self._mode in {"cancel", "cancel_after_drain"}:
+                call.cancel.set()
+                call.result = ({"outcome": "failed", "reason": "journal claim interrupted before transport",
+                                "not_sent": True}, time.time(), None)
+                return
+            call.thread = threading.Thread(target=self._deliver, args=(call, event, deadline_at),
+                                           name="kernel-notification-call", daemon=True)
+        call.thread.start()
+
+    def _work(self) -> None:
+        """Own Feishu projection/recovery; one cancellable physical call at a time."""
+        last_kind = "feishu"  # Give both ordinary Feishu and Status bounded opportunities.
+        try:
+            while True:
+                try:
+                    with self.condition:
+                        call = self._call
+                        running = call is not None and call.result is None
+                        fresh = call is not None and call.result is not None and not call.settlement_deferred
+                        stopping = self._mode in {"cancel", "cancel_after_drain"}
+                        if stopping and running:
+                            self.condition.wait()
+                            continue
+                        if not stopping and self.failure_reason is not None:
+                            if running or not self._refresh_dirty and not fresh:
+                                if self._mode == "drain" and not running:
+                                    return
+                                self.condition.wait()
+                                continue
+                        refresh = self._refresh_dirty
+                        self._refresh_dirty = False  # New producer wakes during IO remain pending.
+                        recovering = self.failure_reason is not None
+                    if call is not None and call.result is not None:
+                        if call.thread is not None and call.thread.ident is not None:
+                            call.thread.join()
+                        result, returned_at, fault = call.result
+                        call.settlement_deferred = True
+                        if fresh and fault is not None:
+                            self._pause(fault)
+                            recovering, refresh = True, False
+                        if call.claim is not None:
+                            self._finish_result(call.claim, result, returned_at)
+                        last_kind = call.kind
+                        with self.condition:
+                            self._call = None  # Only after original ACK/known-unsent settlement.
+                    if stopping:
                         return
-                    if serial != self._fault_serial:
-                        continue
-                    if not recovering and (self.failure_reason is not None or self.cancel.is_set()):
-                        continue
-                    with outbox.transaction(self.state_root, self.run_id) as document:
-                        document.pop("unavailable_reason", None)
-                        outbox.settle(document, time.time())
-                        self._cancel_exit_notices(document, validity)
-                        all_pending = document["pending"]
-                        pending = [item for item in all_pending
-                                   if self.exit_notice is None or item["event"]["id"] == self.exit_event_id]
-                        inflight = any(item["outcome"] == "sending" for item in all_pending)
-                        item = None if inflight else next((item for item in sorted(pending, key=lambda entry: not entry.get("important")) if not item.get("cancelled")
-                                                            and (item["event"]["kind"] != "executor_exit"
-                                                                 or validity.get(item["event"]["id"]) == (item["event"], True))
-                                                            and not (document.get("native_boundary_catching_up")
-                                                                     and item["event"].get("current")
-                                                                     and item["event"].get("kind") == "boundary")
-                                                            and item["next_attempt_at"] <= time.time()), None)
-                        if item is not None:
-                            item.update(owner=self.owner, outcome="sending")
-                            item["attempts"] += 1
-                            item["attempt_history"].append({"number": item["attempts"],
-                                                            "started_at": time.time(), "outcome": "sending"})
-                            event = dict(item["event"])
-                            active_event_id = event["id"]
-                            active_attempt = item["attempts"]
-                            deadline_at = float(item["deadline_at"])
-                        else:
-                            event = None
-                            deadline_at = 0.0
+                    if recovering and not refresh:
+                        continue  # A completion is no permission to recover from a projection fault.
+                    if refresh or not running:
+                        if not self._observe_committed():
+                            continue
+                    with self.condition:
+                        if self._mode in {"cancel", "cancel_after_drain"}:
+                            continue
+                        if running:
+                            self.condition.wait_for(lambda: self._mode in {"cancel", "cancel_after_drain"}
+                                                    or self._call is None or self._call.result is not None
+                                                    or self._refresh_dirty)
+                            continue
+                    # Every bounded healthy projection gets a scheduling opportunity,
+                    # even if later producer wakes remain pending.
+                    event = None
+                    deadline_at = 0.0
+                    pending: list[dict[str, Any]] = []
+                    status_due = self._status_dirty
+                    if recovering and not self.feishu_enabled:
+                        with outbox.transaction(self.state_root, self.run_id) as document:
+                            with self.condition:
+                                if self._mode in {"cancel", "cancel_after_drain"}:
+                                    return
+                            document.pop("unavailable_reason", None)
+                    if self.feishu_enabled:
+                        validity = self._exit_validity()
+                        with outbox.transaction(self.state_root, self.run_id) as document:
+                            with self.condition:
+                                if self._mode in {"cancel", "cancel_after_drain"}:
+                                    return
+                            document.pop("unavailable_reason", None)
+                            outbox.settle(document, time.time())
+                            self._cancel_exit_notices(document, validity)
+                            all_pending = document["pending"]
+                            pending = [item for item in all_pending
+                                       if self.exit_notice is None or item["event"]["id"] == self.exit_event_id]
+                            inflight = any(item["outcome"] == "sending" for item in all_pending)
+                            important = any(item.get("important") and not item.get("cancelled") for item in pending)
+                            status_due = status_due and not important
+                            item = None if inflight else next((item for item in sorted(pending, key=lambda entry: not entry.get("important")) if not item.get("cancelled")
+                                                                and (item["event"]["kind"] != "executor_exit"
+                                                                     or validity.get(item["event"]["id"]) == (item["event"], True))
+                                                                and not (document.get("native_boundary_catching_up")
+                                                                         and item["event"].get("current")
+                                                                         and item["event"].get("kind") == "boundary")
+                                                                and item["next_attempt_at"] <= time.time()), None)
+                            if item is not None and (not status_due or last_kind == "status"):
+                                item.update(owner=self.owner, outcome="sending")
+                                item["attempts"] += 1
+                                item["attempt_history"].append({"number": item["attempts"],
+                                                                "started_at": time.time(), "outcome": "sending"})
+                                event = dict(item["event"])
+                                deadline_at = float(item["deadline_at"])
+                                with self.condition:
+                                    self._call = CurrentCall("feishu", (event["id"], item["attempts"]))
                             wait = min((max(0.0, min(entry["next_attempt_at"], entry["deadline_at"]) - time.time())
                                         for entry in pending), default=0.1)
-                    self.failure_reason = None
-                    self.cancel.clear()
-                    if event is None:
-                        if self._status_dirty and not self._status_preempt.is_set():
+                    with self.condition:
+                        # Mirror the successful journal recovery even if close
+                        # raced its commit. Cancellation remains irreversible.
+                        self.failure_reason = None
+                        if self._mode in {"cancel", "cancel_after_drain"}:
+                            if self._call is not None:
+                                self._call.result = ({"outcome": "failed", "reason": "journal claim interrupted before transport",
+                                                      "not_sent": True}, time.time(), None)
                             continue
-                        if self.closing and not pending and not self._more:
-                            return
-                        self.condition.wait(timeout=(max(0.01, min(wait, 0.1))
-                                                     if pending or self._more else None))
-                        continue
-                identity = hashlib.sha256(event["id"].encode()).hexdigest()[:32]
-                result: Mapping[str, Any]
-                try:
-                    with self.storage.transaction(write=False) as tx:
-                        if not self._same_binding(*self._run(tx)):
-                            raise ValueError("notification Run or recipient binding changed")
+                        if event is None and status_due:
+                            self._status_dirty = False
+                            self._call = CurrentCall("status")
+                        call = self._call
+                        if call is None:
+                            if self._mode == "drain" and not pending and not self._more:
+                                return
+                            if self._refresh_dirty:
+                                continue
+                            self.condition.wait(timeout=(max(0.01, min(wait, 0.1))
+                                                         if pending or self._more else None))
+                            continue
+                    self._start_call(call, event, deadline_at)
                 except Exception as error:
-                    result = {"outcome": "failed", "reason": bounded_error(str(error))}
-                else:
-                    if event["kind"] == "executor_exit" and not self._exit_current(event):
-                        result = {"outcome": "failed", "reason": "original Host exit no longer current",
-                                  "not_sent": True}
-                    else:
-                        try:
-                            options: dict[str, Any] = {"timeout_seconds": max(0.0, deadline_at - time.time())}
-                            if event["kind"] == "executor_exit":
-                                exit_event = event
-                                options["is_current"] = lambda: self._exit_current(exit_event)
-                            result = self.transport(self.config, card(event), identity, self.cancel, **options)
-                        except Exception as error:
-                            from agent_run.queries.host_exit import HostExitUnavailable
-                            if event["kind"] == "executor_exit" and isinstance(error, HostExitUnavailable):
-                                result = {"outcome": "failed", "reason": bounded_error(str(error)), "not_sent": True}
-                            else:
-                                result = {"outcome": "unknown", "reason": bounded_error(str(error))}
-                returned_at = time.time()
-                active_result = dict(result)
-                assert active_event_id is not None
-                self._finish_result(active_event_id, active_result, returned_at)
-                active_event_id, active_result, active_attempt, returned_at = None, None, None, None
-            except Exception as error:
-                # Keep an exact uncertain journal claim; it is known unsent,
-                # unlike an external request whose ACK was actually lost.
-                if active_event_id is not None and returned_at is None:
-                    returned_at = time.time()
-                self._pause(error)
+                    call = self._call
+                    if call is not None and call.result is None and (call.thread is None or call.thread.ident is None):
+                        call.settlement_deferred = True  # No physical completion grants a fresh settlement.
+                        call.result = ({"outcome": "failed", "reason": "journal claim interrupted before transport",
+                                        "not_sent": True}, time.time(), None)
+                    self._pause(error)
+                    if self._mode in {"cancel", "cancel_after_drain"}:
+                        return  # One final settlement opportunity, never spin on unavailable IO.
+        finally:
+            self._finalize_fault()
 
-    def _finish_result(self, event_id: str, result: dict[str, Any], returned_at: float) -> None:
+    def _finalize_fault(self) -> None:
+        """Best effort owned cleanup; close never reenters a blocked journal."""
+        if self._mode not in {"drain", "cancel_after_drain"} or self.failure_reason is None:
+            return
+        try:
+            with outbox.transaction(self.state_root, self.run_id) as document:
+                if (document.get("native_run_start")
+                        or document.get("native_binding") == [self.run_id, *self.binding]):
+                    for item in document["pending"]:
+                        if item["attempts"] == 0:
+                            item.update(outcome="failed", reason=self.failure_reason)
+                    document["unavailable_reason"] = self.failure_reason
+                    document["delivery_error"] = {"reason": self.failure_reason, "observed_at": time.time()}
+        except Exception:
+            pass
+
+    def _finish_result(self, claim: tuple[str, int], result: dict[str, Any], returned_at: float) -> None:
         with outbox.transaction(self.state_root, self.run_id) as document:
-            claim = next((entry for entry in document["pending"] if entry["event"]["id"] == event_id
-                          and entry.get("owner") == self.owner), None)
-            if claim is not None:
+            item = next((entry for entry in document["pending"] if entry["event"]["id"] == claim[0]
+                         and entry.get("owner") == self.owner and entry["attempts"] == claim[1]), None)
+            if item is not None:
                 not_sent = result.get("not_sent") is True
-                outbox.finish_attempt(claim, {key: value for key, value in result.items() if key != "not_sent"}, returned_at)
+                outbox.finish_attempt(item, {key: value for key, value in result.items() if key != "not_sent"}, returned_at)
                 if not_sent:
-                    claim["attempt_history"][-1]["not_sent"] = True
-                outbox.settle(document, time.time())
-
-    def _finish_not_sent(self, event_id: str, attempt: int, failed_at: float) -> None:
-        with outbox.transaction(self.state_root, self.run_id) as document:
-            claim = next((entry for entry in document["pending"] if entry["event"]["id"] == event_id
-                          and entry.get("owner") == self.owner and entry["attempts"] == attempt
-                          and entry["outcome"] == "sending"), None)
-            if claim is not None:
-                outbox.finish_attempt(claim, {"outcome": "failed",
-                                             "reason": "journal claim interrupted before transport"}, failed_at)
-                claim["attempt_history"][-1]["not_sent"] = True
+                    item["attempt_history"][-1]["not_sent"] = True
                 outbox.settle(document, time.time())
 
     def close(self, *, drain: bool = True, timeout_seconds: float = CLOSE_TIMEOUT_SECONDS) -> None:
         if not self.enabled or self.closed:
             return
         with self.condition:
-            self.closing = True
-            if drain:
-                self._recovery_requested = True
+            if drain and self._mode == "running":
+                self._mode = "drain"
+                self._refresh_dirty = True
                 self._status_dirty = self.status_enabled
-            else:
-                self._shutdown = True
-                self.cancel.set()
-                self._status_cancel.set()
+            elif not drain:
+                self._mode = "cancel_after_drain" if self._mode in {"drain", "cancel_after_drain"} else "cancel"
+                if self._call is not None:
+                    self._call.cancel.set()
             self.condition.notify_all()
         if self.thread is not None and drain:
             self.thread.join(timeout=max(0.0, min(timeout_seconds, CLOSE_TIMEOUT_SECONDS)))
         with self.condition:
-            self._shutdown = True
-            self.cancel.set()
-            self._status_cancel.set()
+            self._mode = "cancel_after_drain" if self._mode in {"drain", "cancel_after_drain"} else "cancel"
+            if self._call is not None:
+                self._call.cancel.set()
             self.condition.notify_all()
         if self.thread is not None:
-            # Existing provider preparation has at most signing + HTTP work;
-            # allow its own bounded cleanup after cancelling physical commands.
             grace = 2 * WORKER_CREDENTIAL_PROVIDER_OPERATION_TIMEOUT_SECONDS + 5 if self.status_enabled else 2
+            cleanup_deadline = monotonic() + grace
             self.thread.join(timeout=grace)
-        if drain and self.failure_reason is not None:
-            try:
-                with outbox.transaction(self.state_root, self.run_id) as document:
-                    if (document.get("native_run_start")
-                            or document.get("native_binding") == [self.run_id, *self.binding]):
-                        for item in document["pending"]:
-                            if item["attempts"] == 0:
-                                item.update(outcome="failed", reason=self.failure_reason)
-                        document["unavailable_reason"] = self.failure_reason
-                        document["delivery_error"] = {"reason": self.failure_reason, "observed_at": time.time()}
-            except Exception:
-                pass
-        self.closed = self.thread is None or not self.thread.is_alive()
+            call = self._call
+            if call is not None and call.thread is not None and call.thread.ident is not None:
+                call.thread.join(timeout=max(0.0, cleanup_deadline - monotonic()))
         if not self.closed:
             self.status_failure_reason = "status_sender_cleanup_unproven"
             print("Notification sender cleanup unproven", file=sys.stderr)

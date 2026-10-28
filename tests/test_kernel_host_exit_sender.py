@@ -244,6 +244,66 @@ def test_late_exit_observation_does_not_downgrade_latest_exit_receipt(tmp_path, 
         # event; this probe neither creates nor authorizes a successor Host.
         monkeypatch.setattr(NativeNotifications, "_work", lambda _self: None)
         observer = NativeNotifications(kernel.storage.path, tmp_path, exit_notice=notice, storage=kernel.storage)
+        # Projection-only receipt ordering, with the physical worker stopped.
+        assert observer._observe_committed()
         observer.close(drain=False)
         assert observer.failure_reason is None
         assert outbox.read_notifications(tmp_path, "run-native")["executor_exit"] == later
+
+
+def test_controlled_exit_first_postclaim_currentness_fault_is_paused_and_known_unsent(tmp_path, monkeypatch):
+    """Prevalidated Host facts isolate sender ownership, not native Host proof."""
+    from threading import Event
+    from agent_run.queries.host_exit import HostExitUnavailable
+    from agent_run.notifications.envelope import event_envelope
+    from agent_run.notifications.event_projection import event_state
+
+    kernel = _kernel(tmp_path)
+    notice = {"run_id": "run-native", "epoch": 1, "action_id": "original-exit"}
+    with kernel.storage.transaction(write=False) as tx:
+        event = event_envelope(event_state(tx), "executor_exit", "original-exit", "Original Host exit",
+                               important=True, exit_evidence=notice)
+    monkeypatch.setattr('agent_run.notifications.event_projection.host_exit_event',
+                        lambda *_args, **_kwargs: event)
+    faulted, persisted = Event(), Event()
+    calls = []
+    original_finish = NativeNotifications._finish_result
+
+    def current(self, event):
+        pending = outbox.read_notifications(tmp_path, 'run-native').get('pending', [])
+        if not faulted.is_set() and any(item['outcome'] == 'sending' for item in pending):
+            faulted.set()
+            raise HostExitUnavailable('original postclaim Host read unavailable')
+        return True
+
+    def finish(self, event_id, result, returned_at):
+        original_finish(self, event_id, result, returned_at)
+        persisted.set()
+
+    def transport(*_args, **_kwargs):
+        calls.append('physical request')
+        return {'outcome': 'success', 'reason': None}
+
+    monkeypatch.setattr(NativeNotifications, '_exit_current', current)
+    monkeypatch.setattr(NativeNotifications, '_finish_result', finish)
+    observer = NativeNotifications(kernel.storage.path, tmp_path, exit_notice=notice,
+                                   transport=transport, storage=kernel.storage)
+    try:
+        assert persisted.wait(3)
+        assert observer.failure_reason == 'original postclaim Host read unavailable'
+        assert calls == []
+        before, = outbox.read_notifications(tmp_path, 'run-native')['pending']
+        assert before['attempts'] == 1 and before['outcome'] == 'failed'
+        assert before['attempt_history'][0]['not_sent'] is True
+        observer.observe_committed()
+        observer.close(timeout_seconds=3)
+        assert observer.closed and observer.failure_reason is None
+        record, = outbox.read_notifications(tmp_path, 'run-native')['records']
+        assert record['attempts'] == 2 and record['outcome'] == 'success'
+        assert record['deadline_at'] == before['deadline_at']
+        assert record['attempt_history'][0]['not_sent'] is True
+        assert 'not_sent' not in record['attempt_history'][1]
+        assert calls == ['physical request']
+    finally:
+        observer.close(drain=False)
+        assert observer.closed

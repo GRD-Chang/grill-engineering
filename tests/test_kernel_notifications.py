@@ -23,7 +23,7 @@ from agent_run.core.kernel import Kernel
 from agent_run.config.creation import freeze_creation
 from agent_run.notifications.sender import NativeNotifications
 from support.offline import OfflinePort, Scenario
-from support.notification import _kernel, _operations
+from support.notification import _kernel, _operations, observe_and_wait
 
 
 def test_native_run_start_is_sent_once_from_the_frozen_run_and_query_does_not_send(tmp_path: Path) -> None:
@@ -214,9 +214,14 @@ def test_native_does_not_adopt_an_unmigrated_existing_journal(tmp_path: Path) ->
         return {"outcome": "success", "reason": None}
 
     sender = NativeNotifications(kernel.storage.path, tmp_path, transport=fake, storage=kernel.storage)
-    assert sender.failure_reason == "existing notification journal has no native receipt"
-    sender.close()
-    assert calls == [] and outbox.read_notifications(tmp_path, "run-native") == before
+    try:
+        with sender.condition:
+            assert sender.condition.wait_for(lambda: sender.failure_reason is not None, timeout=3)
+        assert sender.failure_reason == "existing notification journal has no native receipt"
+        sender.close()
+        assert calls == [] and outbox.read_notifications(tmp_path, "run-native") == before
+    finally:
+        sender.close(drain=False)
 
 
 def test_native_first_worker_event_uses_committed_start_once(tmp_path: Path) -> None:
@@ -295,7 +300,7 @@ def test_parent_requirement_refresh_keeps_notification_delivery_available(tmp_pa
         assert delivered.wait(3)
         changed = replace(source, parent=replace(source.parent, title="Revised Parent"))
         kernel.refresh(lambda: changed)
-        sender.observe_committed()
+        observe_and_wait(sender)
         with kernel.storage.transaction(write=False) as tx:
             end = tx.one("SELECT max(position) FROM history")[0]
         document = outbox.read_notifications(tmp_path, "run-native")
@@ -399,13 +404,13 @@ def test_leaving_a_gate_cancels_its_unsent_card_without_claiming_delivery(tmp_pa
     try:
         assert started.wait(3)
         kernel.control("stop", "first-stop", subject="native-ticket")
-        observer.observe_committed()
+        observe_and_wait(observer)
         pending = outbox.read_notifications(tmp_path, "run-native")["pending"]
         gate = [item for item in pending if item["event"]["kind"] == "boundary"]
         assert len(gate) == 1 and gate[0]["attempts"] == 0
         deadline = gate[0]["deadline_at"]
         kernel.control("resume", "leave-before-send", subject="native-ticket")
-        observer.observe_committed()
+        observe_and_wait(observer)
         document = outbox.read_notifications(tmp_path, "run-native")
         cancelled = [item for item in document["records"] if item["kind"] == "boundary"]
         assert len(cancelled) == 1
@@ -482,7 +487,7 @@ def test_gate_reentry_during_paged_catchup_never_claims_the_old_card(tmp_path: P
     try:
         assert started.wait(3)
         kernel.control("stop", "original-stop", subject="native-ticket")
-        observer.observe_committed()
+        observe_and_wait(observer)
         old = next(item["event"]["id"] for item in outbox.read_notifications(tmp_path, "run-native")["pending"]
                    if item["event"]["kind"] == "boundary")
         # Keep the same gate for more than two replay pages before leaving it.
@@ -491,7 +496,7 @@ def test_gate_reentry_during_paged_catchup_never_claims_the_old_card(tmp_path: P
             kernel.control("stop", f"still-stopped-{index}", subject="native-ticket")
         kernel.control("resume", "leave-old", subject="native-ticket")
         kernel.control("stop", "new-occurrence", subject="native-ticket")
-        observer.observe_committed()
+        observe_and_wait(observer)
         release.set()
         observer.close()
         assert observer.failure_reason is None
