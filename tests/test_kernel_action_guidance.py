@@ -133,6 +133,9 @@ def test_displayed_stop_resume_and_queries_select_only_the_original_published_ta
     other = _published_task(git_repo, "example/project", "1", 7)
     foreign = _published_task(git_repo, "other/project", identity, 1)
     other_before, foreign_before = other.source_status(), foreign.source_status()
+    # This story exercises a real Stop Action and its Resume guidance. Claim
+    # only the synchronous Core driver; no physical Host or Worker is launched.
+    execution = None if local else wanted.claim_executor("original-guidance-driver")
     stop = action_guidance("stop", run_id=identity, repository="example/project",
                           ticket=2 if local else None, language=language)
     if identity.isdecimal():
@@ -148,6 +151,8 @@ def test_displayed_stop_resume_and_queries_select_only_the_original_published_ta
         assert wanted.status("ticket:3")["gates"] == []
     else:
         assert wanted.source_status()["stopped"] is True
+        assert execution is not None
+        wanted.confirm_executor_exit(execution)
     with wanted.storage.transaction(write=False) as tx:
         view, state = read_boundaries(tx, 0.0), event_state(tx)
     action, = view["actions"]

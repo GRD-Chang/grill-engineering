@@ -72,8 +72,17 @@ def admit(kernel, directory, action='same-host'):
 
 def test_normal_task_controls_profiles_and_host_intent_use_only_canonical_current_rows(repository, tmp_path):
     a, b = repository.kernel('A'), repository.kernel('B')
+    # Normal synthetic claims make both Stops actual fences. Their original
+    # exit producer must settle each Run before Resume may admit another Host.
+    executions = (a.claim_executor('same-executor'), b.claim_executor('same-executor'))
     assert a.stop_task('same-stop') == b.stop_task('same-stop') == 'applied'
     assert a.status(SUBJECT)['stopped'] and b.status(SUBJECT)['stopped']
+    for kernel, execution in zip((a, b), executions):
+        kernel.confirm_executor_exit(execution)
+        with kernel.storage.transaction(write=False) as tx:
+            assert tx.one('SELECT executor FROM runs WHERE id=?', (execution.run_id,))[0] is None
+            assert tx.one('SELECT status FROM retired_executors WHERE run_id=? AND owner=? AND epoch=?',
+                          (execution.run_id, execution.owner, execution.epoch))[0] == 'exited'
     assert a.configure_task_profiles('same-config') == 2
     with b.storage.transaction(write=False) as tx:
         assert tx.one('SELECT profile_revision FROM runs WHERE id=?', ('B',))[0] == 1

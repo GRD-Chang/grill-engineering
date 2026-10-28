@@ -31,7 +31,7 @@ from support.systemd_manager import controlled_manager
 from support.remote_effects import FAKE_GH
 from support.worker_process_timing import wait_until
 from support.systemd_manager import _CODEX, _approval_read_barrier, _control_environment, _diagnostic_tail, _executable, _git, _hold_host_operation_return, _local_manager, _managed_diagnostics, _managed_failure_note
-from support.systemd_manager import SidecarStatTrace
+from support.systemd_manager import SidecarStatTrace, _resumed_ticket_completion
 
 
 def test_public_run_reaches_ticket_close_through_managed_host_after_lost_merge_reply(
@@ -1009,16 +1009,14 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
             code, _ = public("stop", accepted["run_id"], "--ticket", "3")
             assert code == 0
             phases = []
-            def completed():
-                with kernel.storage.transaction(write=False) as tx:
-                    phase = tx.one("SELECT phase FROM subjects WHERE id='ticket:2'")[0]
-                    gates = [row["code"] for row in tx.all("SELECT code FROM gates WHERE subject='ticket:2'")]
+            def observed_phase(phase):
+                # These are observation times; durable history retains every
+                # target pause even when it is cleared between samples.
                 if not phases or phases[-1]["phase"] != phase:
                     phases.append({"phase": phase, "since_run_seconds": time.monotonic() - supervision_started,
                                    "since_resume_seconds": time.monotonic() - resume_started})
-                assert not gates and not errors, (gates, errors)
-                assert children[0].poll() is None or phase == "complete", (children[0].returncode, phase, output)
-                return phase == "complete"
+            completed = _resumed_ticket_completion(kernel, 'ticket:2', resumed['action_id'],
+                deadline=supervision_deadline, child=children[0], errors=errors, output=output, on_phase=observed_phase)
             def record_timing():
                 with kernel.storage.transaction(write=False) as tx:
                     history = [dict(row) for row in tx.all("SELECT position,subject,kind,phase,created_at FROM history ORDER BY position DESC LIMIT 20")]

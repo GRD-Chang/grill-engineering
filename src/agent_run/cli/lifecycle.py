@@ -392,6 +392,9 @@ def execute(parsed: argparse.Namespace, *, language: str,
                     subject = str(targets[0]["id"])
             action_id = uuid4().hex
             action_status = kernel.stop_task(action_id, subject=subject)
+            if action_status == "not_running":
+                return {"result": "no_op", "status": "not_running", "run_id": run["id"],
+                        "action_id": None, "action": "stop", "host": "exited", "language": run["language"]}
             if action_status == "complete":
                 return {"result": "completed", "status": "completed", "run_id": run["id"],
                         "action_id": None, "action": "stop", "host": "exited", "language": run["language"]}

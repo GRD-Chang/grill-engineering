@@ -11,11 +11,13 @@ from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.model import Execution, HostObservation
 from support.offline import GraphScenario
-from support.repository_fixture import foreign_task_run
+from support.repository_fixture import foreign_task_run, read_binding
 import sqlite3
 from support.requirements_scenarios import independent_source
 from support.core_operations import CoreOperations
 from support.control_scenarios import managed_parent
+from support.environment import durable_snapshot
+from agent_run.storage.tasks import task_lock
 
 
 def test_completed_task_stop_preserves_the_terminal_result_without_an_action(tmp_path: Path) -> None:
@@ -84,9 +86,20 @@ def test_task_stop_uses_the_exact_pointer_without_launching_a_host(tmp_path: Pat
         return
     before_refs = scenario.port.remote_refs()
     before_writes = scenario.port.writes()
-    assert kernel.stop_task("stop-original-task") == "applied"
-    assert kernel.stop_task("stop-original-task") == "applied"
-    assert kernel.source_status()["stopped"] is True
+    if host_state == "unlaunched":
+        # Formal publication already owns this original Task mutex.
+        with task_lock(task):
+            pass
+        binding = read_binding(task, kernel.storage.path)
+        assert binding == (scenario.spec.run_id, kernel.storage.path.resolve())
+        original = durable_snapshot(tmp_path)
+    expected = "not_running" if host_state == "unlaunched" else "applied"
+    assert kernel.stop_task("stop-original-task") == expected
+    assert kernel.stop_task("stop-original-task") == expected
+    assert kernel.source_status()["stopped"] is (host_state != "unlaunched")
+    if host_state == "unlaunched":
+        assert read_binding(task, kernel.storage.path) == binding
+        assert durable_snapshot(tmp_path) == original
     assert scenario.port.remote_refs() == before_refs
     assert scenario.port.writes() == before_writes
     assert kernel.active_host_action() == (None if request is None else "original-launch")

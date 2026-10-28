@@ -157,11 +157,30 @@ def test_sidecar_capture_keeps_primary_failure_runs_timing_and_restores_stat(tmp
     assert Path.stat is original_stat and finished == [True]
     assert failure is (body_error if body_fails else timing_error if timing_fails else None)
     if failure is not None:
-        facts = json.loads(failure.__notes__[-1])
-        assert [row['phase'] for row in facts['sidecar_stat_trace']] == ['completion-poll', 'timing-finally']
-        assert facts['total_calls'] == 2
+        facts = json.loads(failure.__notes__[0])
+        assert [row['phase'] for row in facts['sidecar_stat_trace']] == (
+            ['completion-poll'] if body_fails else ['completion-poll', 'timing-finally'])
+        assert facts['total_calls'] == (1 if body_fails else 2)
         if body_fails and timing_fails:
-            assert failure.__notes__[0] == 'Managed timing evidence unavailable: OSError'
+            assert failure.__notes__[1] == 'Managed timing evidence unavailable: OSError'
+
+
+def test_timing_cleanup_cannot_overwrite_the_failing_sidecar_ring(tmp_path, monkeypatch):
+    database = tmp_path / 'kernel.sqlite3'
+    sidecar = Path(str(database) + '-wal')
+    sidecar.touch()
+    trace, failure = SidecarStatTrace(database), ValueError('Original failure')
+    def finish():
+        for _ in range(40):
+            sidecar.stat(follow_symlinks=False)
+    with pytest.raises(ValueError) as caught:
+        with trace.capture(monkeypatch, finish=finish):
+            sidecar.stat(follow_symlinks=False)
+            raise failure
+    assert caught.value is failure
+    facts = json.loads(failure.__notes__[0])
+    assert facts['total_calls'] == facts['retained_calls'] == 1
+    assert facts['sidecar_stat_trace'][0]['phase'] == 'completion-poll'
 
 
 @pytest.mark.parametrize('kind', ['fifo', 'directory', 'socket', 'symlink'])

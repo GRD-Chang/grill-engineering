@@ -32,6 +32,7 @@ from agent_run.runtime import executor
 from agent_run.storage import routing, tasks
 from agent_run.storage.routing import RepositoryRoute, open_run
 from agent_run.storage.tasks import run_is_current
+from support.environment import durable_snapshot
 from support.offline import fixture_inputs
 
 SUBJECT = 'shared-subject'
@@ -70,7 +71,8 @@ def test_existing_handle_is_carried_unchanged_and_never_reopened_as_an_unscoped_
         Kernel(repository.database)
 
 
-def test_current_public_stop_keeps_durable_fence_and_exact_selected_run_without_host(tmp_path, monkeypatch):
+@pytest.mark.parametrize('has_executor', [False, True], ids=['idle', 'executor'])
+def test_current_public_stop_keeps_durable_fence_and_exact_selected_run_without_host(tmp_path, monkeypatch, has_executor):
     from agent_run.adapters import workspace as workspace_module
     from agent_run.cli import selection
     from agent_run.runtime import package_lease
@@ -78,7 +80,11 @@ def test_current_public_stop_keeps_durable_fence_and_exact_selected_run_without_
     database = tmp_path / 'legacy' / 'kernel.sqlite3'
     root = tmp_path / 'repository'
     spec, source = proposal(root, 'legacy-A', 99)
-    original = create_kernel(database, spec, requirements=source)
+    with tasks.task_lock(TaskKey(root, spec.repository, spec.parent_issue)):
+        original = create_kernel(database, spec, requirements=source)
+    # The synthetic Executor claim uses the unchanged native save-clock guard;
+    # it creates no Host or process. The idle branch needs no ordered write.
+    execution = original.claim_executor('original-executor') if has_executor else None
     selected, notices = [], []
     @contextmanager
     def lease(path):
@@ -94,26 +100,51 @@ def test_current_public_stop_keeps_durable_fence_and_exact_selected_run_without_
     monkeypatch.setattr(selection, 'managed_repository_routes', lambda request: (RepositoryRoute(database, root, spec.repository),))
     monkeypatch.setattr(sender, 'notify_committed', lambda path, **kw: notices.append((path, kw['storage'].run_id)))
     parsed = _parser('en').parse_args(['stop', spec.run_id, '--repo', spec.repository, '--json'])
+    state, history = original.status(SUBJECT), original.history(SUBJECT)
+    before = durable_snapshot(tmp_path)
     result = lifecycle.execute(parsed, language='en')
-    assert result['run_id'] == spec.run_id and result['action'] == 'stop' and result['status'] == 'action_applied'
-    assert original.status(SUBJECT)['stopped'] is True
-    assert selected == [tmp_path / 'runner.lock'] and notices == [(database, spec.run_id)]
+    assert result['run_id'] == spec.run_id and result['action'] == 'stop'
+    assert selected == [tmp_path / 'runner.lock']
+    if has_executor:
+        assert result['result'] == 'accepted' and result['status'] == 'action_applied'
+        assert result['action_id'] is not None and result['host'] == 'unknown'
+        assert original.status(SUBJECT)['stopped'] is True
+        assert notices == [(database, spec.run_id)]
+        assert durable_snapshot(tmp_path) != before
+    else:
+        assert result['result'] == 'no_op' and result['status'] == 'not_running'
+        assert result['action_id'] is None and notices == []
+        assert original.status(SUBJECT) == state and original.history(SUBJECT) == history
+        assert state['stopped'] is False and state['phase'] != 'complete'
+        assert durable_snapshot(tmp_path) == before
     with original.storage.transaction(write=False) as tx:
         assert tx.one('SELECT count(*) FROM hosts')[0] == 0
         assert tx.one('SELECT count(*) FROM invocations')[0] == 0
         assert run_is_current(tx)
+        if has_executor:
+            assert execution is not None
+            assert tx.one('SELECT status FROM actions WHERE run_id=? AND id=?',
+                          (spec.run_id, result['action_id']))[0] == 'applied'
+            assert tx.one('SELECT status FROM retired_executors WHERE run_id=? AND owner=? AND epoch=?',
+                          (execution.run_id, execution.owner, execution.epoch))[0] == 'pending'
+        else:
+            assert tx.one('SELECT count(*) FROM actions')[0] == 0
+            assert tx.one('SELECT count(*) FROM retired_executors')[0] == 0
 
 
 def test_current_producer_nonempty_notification_page_retains_the_original_history_layout(tmp_path):
     spec, source = proposal(tmp_path / 'repository', 'current-page', 99)
     kernel = create_kernel(tmp_path / 'current' / 'kernel.sqlite3', spec, requirements=source)
-    assert kernel.stop_task('page-stop') == 'applied'
+    # Explicit subject cancellation still records its Action on an idle Run.
+    assert kernel.stop_task('page-stop', subject=SUBJECT) == 'applied'
     observer = NativeNotifications.__new__(NativeNotifications)
     observer.database, observer.storage = kernel.storage.path, kernel.storage
     with kernel.storage.transaction(write=False) as tx:
         columns = tx.execute('PRAGMA table_info(history)').fetchall()
         assert 'run_id' in [column['name'] for column in columns]
         assert tx.one('SELECT count(*) FROM history')[0] > 0
+        assert tx.one("SELECT count(*) FROM history WHERE run_id=? AND kind='control_applied' AND identity=?",
+                      (spec.run_id, 'page-stop'))[0] == 1
         observer.run_id, observer.binding, observer.config, observer.state = observer._run(tx)
         highwater = tx.one('SELECT max(position) FROM history')[0]
     events, more, cursor = observer._page(0)

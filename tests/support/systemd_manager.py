@@ -185,6 +185,40 @@ def _managed_diagnostics(database: Path, run_id: str, roles: Path) -> dict:
 MANAGED_NOTE_BYTES = 24 * 1024
 
 
+def _resumed_ticket_completion(kernel, subject, resume_action, *, deadline, child, errors, output, on_phase):
+    """Sample one resumed Ticket; durable pauses cannot hide between samples."""
+    next_read = None
+
+    def completed():
+        nonlocal next_read
+        now = time.monotonic()
+        assert now < deadline, 'Worker did not reach the expected boundary'
+        assert not errors, errors
+        if child.poll() is None and next_read is not None and now < next_read:
+            return False
+        with kernel.storage.transaction(write=False) as tx:
+            run = kernel.storage.run_id
+            phase = tx.one('SELECT phase FROM subjects WHERE run_id=? AND id=?', (run, subject))[0]
+            gates = [row['code'] for row in tx.rows(
+                'SELECT code FROM gates WHERE run_id=? AND subject=?', (run, subject))]
+            # The exact Resume receipt precedes all subsequent target pauses.
+            # MAX(position) here would discard events committed before a poll.
+            resumed_at = tx.one("SELECT h.position FROM history h JOIN actions a "
+                "ON a.run_id=h.run_id AND a.id=h.identity WHERE h.run_id=? AND h.subject=? "
+                "AND h.kind='control_applied' AND h.identity=? AND a.kind='resume'", (run, subject, resume_action))[0]
+            pauses = tx.rows("SELECT position,identity FROM history WHERE run_id=? AND subject=? "
+                "AND position>? AND kind='paused' ORDER BY position LIMIT 1", (run, subject, resumed_at))
+        now = time.monotonic()
+        assert now < deadline, 'Worker did not reach the expected boundary'
+        next_read = now + 0.05
+        on_phase(phase)
+        assert not gates and not pauses and not errors, (gates, [tuple(row) for row in pauses], errors)
+        assert child.poll() is None or phase == 'complete', (child.returncode, phase, output)
+        return phase == 'complete'
+
+    return completed
+
+
 class SidecarStatTrace:
     """Bounded evidence from the original stat calls, never an extra probe."""
 
@@ -263,6 +297,9 @@ class SidecarStatTrace:
                 yield
             except BaseException as error:
                 failure = error
+                # Freeze the failing observation before timing cleanup can
+                # overwrite the bounded ring with unrelated later reads.
+                self.note(error)
                 raise
             finally:
                 try:
@@ -279,8 +316,6 @@ class SidecarStatTrace:
                         failure.add_note('Managed timing evidence unavailable: ' + type(cleanup_error).__name__)
                     except BaseException:
                         pass
-                if failure is not None:
-                    self.note(failure)
 
 
 def _managed_failure_note(error: BaseException, *, stage: str, database: Path,

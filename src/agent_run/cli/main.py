@@ -122,14 +122,19 @@ def _print_receipt(parsed: argparse.Namespace, output: Mapping[str, Any], langua
     completed = (parsed.command == "stop" and output.get("action") == "stop"
                  and output["result"] == output["status"] == "completed"
                  and output.get("action_id") is None and output["host"] == "exited")
-    print(safe_text(copy("completed" if completed else "attached" if output["result"] == "attached" else "accepted", command=parsed.command)))
-    if not completed:
+    idle = (parsed.command == "stop" and output.get("action") == "stop"
+            and output["result"] == "no_op" and output["status"] == "not_running"
+            and output.get("action_id") is None and output["host"] == "exited")
+    print(safe_text(text("cli.no_active_agent", language=language) if idle else
+                   copy("completed" if completed else "attached" if output["result"] == "attached" else "accepted", command=parsed.command)))
+    if not completed and not idle:
         status = {"action_pending": "pending", "action_applied": "applied", "action_complete": "complete",
                   "action_updating": "updating", "action_superseded": "superseded",
                   "action_failed": "failed"}.get(output["status"], "unknown")
         print(copy("status", status=copy(status)))
     host = output["host"] if output["host"] in {"running", "exited"} else "unknown"
-    print(copy("host_" + host))
+    if not idle:
+        print(copy("host_" + host))
     parent = getattr(parsed, "parent", None)
     selector = getattr(parsed, "run_id", None)
     if parent is None and isinstance(selector, str) and selector.isdecimal():
@@ -148,7 +153,7 @@ def _print_receipt(parsed: argparse.Namespace, output: Mapping[str, Any], langua
         command.append("--help")
     if parent is not None:
         command.extend(("--parent", str(parent)))
-    if not completed:
+    if not completed and not idle:
         print(copy("boundary"))
     print(safe_text(copy("next", command=shlex.join(command))))
 

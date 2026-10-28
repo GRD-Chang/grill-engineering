@@ -2252,15 +2252,23 @@ class Kernel:
         with self._task_admission(task):
             with self.storage.transaction(write=False) as tx:
                 self._require_current_task(tx, task, run_id)
-                terminal = (tx.one(*run_statement(tx, 'SELECT final_action FROM runs WHERE id=?',
-                                (), run_last=True))[0] is None
+                run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?', (), run_last=True))
+                unrecorded = (run["final_action"] is None
                             and self._abandon_action(tx) is None
                             and not tx.rows(*run_statement(tx, 'SELECT id FROM actions WHERE id=? AND run_id=?',
                                         (action_id,), run_last=True)))
-            # Reuse Task retirement's complete delivery/resource/exit proof.
-            # An unfinished or unknown Host still needs the durable Stop fence.
-            if terminal and self._replaceable(task, run_id):
-                return "complete"
+                if unrecorded and self._replaceable_in(tx, task, run_id):
+                    return "complete"
+                # Business may remain unfinished after all execution has ended.
+                # This Task-locked snapshot proves no execution to revoke; it
+                # does not consume returns, reconcile Effects or complete work.
+                if (subject is None and unrecorded and run["executor"] is None
+                        and not self._agent_seats(tx)
+                        and not tx.rows(*run_statement(tx,
+                            "SELECT owner FROM retired_executors WHERE run_id=? AND status!='exited' LIMIT 1", ()))
+                        and not tx.rows(*run_statement(tx,
+                            "SELECT owner FROM hosts WHERE run_id=? AND (status!='exited' OR usage_released!=1) LIMIT 1", ()))):
+                    return "not_running"
             with self.storage.transaction(ordered=False) as tx:
                 self._require_current_task(tx, task, run_id)
                 return self._control(tx, "stop", action_id, subject=subject)
