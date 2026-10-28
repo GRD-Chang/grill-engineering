@@ -6,6 +6,7 @@ import pytest
 from agent_run.adapters.source import read_required_check_facts, read_requirements
 from agent_run.errors import GitHubReadError
 from support.remote_effects import _reader
+from support.fixture_text import replace_once
 
 
 def test_requirements_do_not_need_an_unconsumed_missing_default_ref(tmp_path, monkeypatch):
@@ -25,7 +26,7 @@ def _metadata_reader(root, monkeypatch):
     reader, log = _reader(root, monkeypatch)
     script = root / 'bin' / 'gh'
     marker = "if args[:2]==['repo','view'] or (args[:1]==['api'] and '/git/ref/heads/' in args[1]):"
-    script.write_text(script.read_text().replace(marker, '''if args[:2]==['repo','view']:
+    program = replace_once(script.read_text(), marker, '''if args[:2]==['repo','view']:
     with open(os.environ['SOURCE_TEST_RESPONSES']) as f: data=json.load(f)
     if data.get('metadata_http'):
         print('HTTP '+str(data['metadata_http'])+' metadata unavailable',file=sys.stderr)
@@ -35,7 +36,8 @@ def _metadata_reader(root, monkeypatch):
         result['defaultBranchRef']={'name':data['default_branch']}
     print(json.dumps(result))
     raise SystemExit(0)
-''' + marker).replace("print(result.stdout,end='');print(result.stderr,end='',file=sys.stderr)", '''if result.returncode==0 and data.get('ref_type'):
+''' + marker)
+    script.write_text(replace_once(program, "print(result.stdout,end='');print(result.stderr,end='',file=sys.stderr)", '''if result.returncode==0 and data.get('ref_type'):
         value=json.loads(result.stdout); value['object']['type']=data['ref_type']; result.stdout=json.dumps(value)
     print(result.stdout,end='');print(result.stderr,end='',file=sys.stderr)'''))
     import agent_run.adapters.github_commands as commands

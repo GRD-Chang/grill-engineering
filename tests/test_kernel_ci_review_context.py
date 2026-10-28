@@ -7,16 +7,10 @@ from agent_run.core.prompts.role import render_role_prompt
 from agent_run.model import DeliveryKind, Policy, Role, wire_json
 from support.core_operations import CoreOperations, scripted_return
 from support.offline import Scenario, review_result
-from support.core_operations import next_call
+from support.core_operations import next_call, budgets
 
 
 FINDING = 'LATEST_CI_REVIEW_FINDING_7e281: repair the newly reviewed CI behavior.'
-
-
-def budgets(scenario):
-    with scenario.kernel.storage.transaction(write=False) as tx:
-        return {row['purpose']: dict(row) for row in tx.rows(
-            'SELECT * FROM budgets WHERE subject=? AND current=1 ORDER BY purpose', (scenario.delivery.key,))}
 
 
 def test_ci_review_findings_reach_next_development_with_original_ci_and_budget(tmp_path: Path) -> None:
@@ -45,7 +39,8 @@ def test_ci_review_findings_reach_next_development_with_original_ci_and_budget(t
             else:
                 assert first_budget is not None and failed_review is not None
                 with kernel.storage.transaction(write=False) as tx:
-                    job = tx.one('SELECT last_failure,ci_failure,review_attempt FROM subjects WHERE id=?', (subject,))
+                    job = tx.one('SELECT last_failure,ci_failure,review_attempt FROM subjects WHERE run_id=? AND id=?',
+                                 (kernel.storage.run_id, subject))
                     latest = json.loads(tx.get(job['last_failure'], subject))
                     original = json.loads(tx.get(job['ci_failure'], subject))
                     assert job['review_attempt'] == failed_review.attempt_id
@@ -123,7 +118,7 @@ def test_passing_ci_review_publishes_without_an_extra_repair_or_new_window(tmp_p
     assert current['ci']['developments_used'] == current['ci']['reviews_used'] == 1
     assert current['requirements']['developments_used'] == current['requirements']['reviews_used'] == 1
     with scenario.kernel.storage.transaction(write=False) as tx:
-        reviewed = tx.rows("SELECT result_id FROM attempts WHERE subject=? AND purpose='ci' AND role='review'",
-                           (scenario.delivery.key,))
+        reviewed = tx.rows("SELECT result_id FROM attempts WHERE run_id=? AND subject=? AND purpose='ci' AND role='review'",
+                           (scenario.kernel.storage.run_id, scenario.delivery.key))
         assert len(reviewed) == 1
         assert json.loads(tx.get(reviewed[0]['result_id'], scenario.delivery.key)) == review_result('pass')

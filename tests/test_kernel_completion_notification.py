@@ -7,17 +7,10 @@ import pytest
 from agent_run.model import Issue, ParentIssue, Requirements
 from agent_run.notifications.cards import card
 from agent_run.notifications.envelope import event_envelope
-from agent_run.notifications.event_projection import completion_context, event_state, project_event
+from agent_run.notifications.event_projection import completion_context, event_state
 from agent_run.queries.read_facts import read_boundaries
 from support.offline import GraphScenario
-
-
-def _completions(scenario):
-    with scenario.kernel.storage.transaction(write=False) as tx:
-        state = event_state(tx)
-        return [item.content for row in tx.all("SELECT * FROM history ORDER BY position")
-                for item in project_event(tx, dict(row), state, "concise")
-                if item.content["kind"] == "ticket_completed"]
+from support.notification import _completions
 
 
 def test_ticket_completion_keeps_original_summary_and_current_parent_progress(tmp_path):
@@ -33,7 +26,7 @@ def test_ticket_completion_keeps_original_summary_and_current_parent_progress(tm
             assert step.kind not in {"paused", "waiting", "approval"}, step
         else:
             raise AssertionError("The real Ticket did not complete")
-        completed = _completions(scenario)
+        completed = _completions(scenario.kernel)
         assert len(completed) == number - 1
         first = completed[0]
         assert first["ticket_progress"] == {"completed": number - 1, "total": 2}
@@ -49,7 +42,7 @@ def test_ticket_completion_keeps_original_summary_and_current_parent_progress(tm
         if number == 2:
             original = first
             assert scenario.kernel.control("stop", "stop-sibling", subject="ticket:3") == "applied"
-            paused, = _completions(scenario)
+            paused, = _completions(scenario.kernel)
             assert paused["id"] == original["id"]
             assert paused["next_step"] == "agent-run status --repo example/project -- offline-run"
             assert paused["completion_actions"] == [{"issue": 3, "scope": "local",

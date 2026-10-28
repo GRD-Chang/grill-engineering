@@ -1,4 +1,4 @@
-"""Persisted Effect domain on staged relations; no physical or public routing.
+"""Persisted Effect domain on current relations; no physical or public routing.
 
 Only relational creation prerequisites are supplied. Intent, dispatch/readback,
 receipt and consumption use existing Core methods and the real transaction owner.
@@ -19,7 +19,7 @@ from agent_run.storage.run_scope import RunTransaction
 from agent_run.storage.sqlite import Transaction
 from support.offline import fixture_inputs
 from support.repository_scope import connection, insert, seed
-from support.run_scoped_kernel import ScopedKernel
+from support.run_scoped_kernel import ScopedKernel, effect_runs
 
 
 SUBJECT = "parent:1"
@@ -30,29 +30,8 @@ WORLD = World("r", "g", "r", BASE, BASE, publisher_actor="controlled-actor",
 
 @pytest.fixture
 def scenario(monkeypatch):
-    with closing(connection()) as db:
-        db.execute("BEGIN")
-        owner = Transaction(db)
-        inputs = fixture_inputs()
-        for run in ("A", "B"):
-            seed(db, run)
-            tx = RunTransaction(owner, run)
-            policy = Policy(development_deadline_seconds=7., review_deadline_seconds=9.)
-            db.execute("UPDATE runs SET policy=?,executor='same-owner',epoch=1 WHERE id=?",
-                (wire_json(core.Kernel._policy_values(policy)), run))
-            profile = tx.put(SUBJECT, "profile", wire_json(inputs.profiles))
-            db.execute("UPDATE profile_revisions SET material_id=? WHERE run_id=?", (profile, run))
-            values = asdict(inputs)
-            del values["profiles"]
-            material = tx.put(SUBJECT, "creation_inputs", wire_json(values))
-            insert(db, "run_inputs", {"run_id": run, "subject": SUBJECT, "material_id": material})
-            insert(db, "budgets", {"run_id": run, "subject": SUBJECT, "purpose": "requirements",
-                "window": 1, "development_limit": 3, "review_limit": 3, "review_required": 1})
-            db.execute("UPDATE subjects SET phase='review',candidate_sha=?,candidate_tree=?,workspace_sha=?,checkout=? WHERE run_id=?",
-                (BASE.sha, BASE.tree, BASE.sha, "/fixture/" + run, run))
-        db.commit()
-        monkeypatch.setattr(core, "identity", lambda: "same-effect")
-        yield db, {run: ScopedKernel(db, run) for run in ("A", "B")}
+    with effect_runs(monkeypatch) as value:
+        yield value
 
 
 def _work(run):

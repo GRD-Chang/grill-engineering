@@ -97,3 +97,18 @@ assert 'pathlib' in sys.modules
                             capture_output=True, text=True, timeout=5)
     assert result.returncode == 0, result.stderr
     assert file.read_bytes() == b'new\r\n'
+
+
+@pytest.mark.parametrize('text,anchor', [('no boundary', 'missing'), ('twice twice', 'twice'), ('anything', '')])
+def test_script_transform_rejects_missing_ambiguous_or_empty_boundary(text, anchor):
+    from support.fixture_text import replace_once
+    with pytest.raises(ValueError, match='exactly once') as error:
+        replace_once(text, anchor, 'new')
+    assert text not in str(error.value)
+    if anchor:
+        assert anchor not in str(error.value)
+
+
+def test_script_transform_changes_one_boundary_without_rescanning_inserted_text():
+    from support.fixture_text import replace_once
+    assert replace_once('before exact after', 'exact', 'exact exact') == 'before exact exact after'

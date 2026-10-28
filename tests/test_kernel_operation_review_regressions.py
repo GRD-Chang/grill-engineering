@@ -8,6 +8,7 @@ The native push cases execute an actual local command and inspect its actual
 exit status. They never replace a CompletedProcess or forge write_returncode.
 """
 from __future__ import annotations
+from support.core_operations import _window
 from support.core_operations import prepare_scripted_agent
 
 from agent_run.contracts.write_authority import WriteAuthority
@@ -34,10 +35,6 @@ def _outage(parent_number: int) -> None:
     raise ReadUnavailable("github_read_failed", "Independent synthetic source outage")
 
 
-def _window(scenario: Scenario) -> dict[str, float]:
-    with scenario.kernel.storage.transaction(write=False) as tx:
-        row = tx.one("SELECT started_at,deadline FROM waits WHERE subject=?", (scenario.delivery.key,))
-        return {"started_at": row["started_at"], "deadline": row["deadline"]}
 
 
 def _failures(scenario: Scenario) -> list[dict]:

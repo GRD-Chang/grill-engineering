@@ -16,6 +16,7 @@ from agent_run.core.kernel import Kernel
 from agent_run.core.operation_contract import DeliveryFacts, DeliveryRead, OperationBinding, OperationPorts
 from agent_run.core.operation_runner import OperationRunner
 from agent_run.contracts.write_authority import WriteAuthority
+from agent_run.storage.run_scope import transaction_scope
 
 from support.offline import GraphScenario
 from support.requirements_scenarios import independent_source, native_input
@@ -25,31 +26,21 @@ from support.offline import Scenario, fixture_inputs
 
 
 def prepare_scripted_agent(kernel: Kernel, step: Step | AgentPreparation) -> Step:
-    """Deliver controlled native credentials before admitting a fixture Agent.
+    """Admit a controlled-ready issuer result at the real Core boundary.
 
-    This is the external issuer substitute for Core/SQLite/Git contract tests,
-    not a ready flag or process/exit witness. Native transport tests keep the
-    original preparation and use their actual Codex capture instead.
+    Pure Core/SQLite/Git scenarios do not consume native credential files. The
+    fixture supplies that external prerequisite explicitly; Core still validates
+    the original preparation, owner, seat, frozen request and absolute deadline.
+    No Go, Thread binding, activity, raw or exit observation is supplied here.
+    Native transport tests retain AgentPreparation and their real issuer/Capture;
+    they must not use this shortcut as credential/startup proof.
     """
     if isinstance(step, Step) and step.preparation is None:
         return step
-    import json
-    import tempfile
-    import time
-    from agent_run.adapters.auth.credential_lifecycle import ReadCredential
-    from agent_run.adapters.auth.worker_credentials import NativeCredentialDelivery
-
     preparation = step if isinstance(step, AgentPreparation) else step.preparation
     assert preparation is not None
-    with tempfile.TemporaryDirectory(prefix='controlled-credential-') as temporary:
-        directory = Path(temporary) / 'gh'
-        credential = ReadCredential('controlled-native-unit-credential', time.time() + 3600)
-        with NativeCredentialDelivery(lambda: credential, directory) as delivery:
-            delivery.start(guard=lambda: kernel.guard_preparation(preparation),
-                deadline=time.monotonic() + max(0, preparation.preparation_deadline-kernel.clock()))
-            config = json.loads((directory / 'hosts.yml').read_text())
-            assert config['github.com']['oauth_token'] == credential.token
-            return kernel.admit_agent(preparation)
+    kernel.guard_preparation(preparation)
+    return kernel.admit_agent(preparation)
 
 
 def scripted_return(kernel: Kernel, runner: OperationRunner, call: AgentCall,
@@ -186,8 +177,11 @@ def observed_call(kernel: Kernel, request: AgentPreparation) -> AgentCall:
     execution, credential readiness, raw result or exit evidence is fabricated.
     """
     with kernel.storage.transaction(write=False) as tx:
+        scope = transaction_scope(tx)
+        assert scope.run_id == request.execution.run_id
         row = tx.one("SELECT i.id,i.deadline_seconds,i.deadline_at,o.ordinal,o.context_id FROM invocations i "
-                     "JOIN invocation_outputs o ON o.invocation=i.id WHERE o.lease=?", (request.reservation_id,))
+                     "JOIN invocation_outputs o ON o.run_id=i.run_id AND o.invocation=i.id "
+                     "WHERE i.run_id=? AND o.lease=?", (scope.run_id, request.reservation_id))
         assert tx.get(row['context_id'], request.subject) == wire_json(request.context)
         return AgentCall(request.attempt_id, row['id'], request.subject, request.role, request.purpose,
             request.thread_id, request.reservation_id, request.execution, request.context, request.profile,
@@ -326,3 +320,18 @@ def next_call(scenario: Scenario, role: Role) -> AgentCall:
         if step.call is not None:
             scripted_return(scenario.kernel, operations.runner, step.call, scenario.agent)
     raise AssertionError("The requested role never became ready")
+
+
+def budgets(scenario):
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        scope = transaction_scope(tx)
+        return {row['purpose']: dict(row) for row in tx.rows(
+            'SELECT * FROM budgets WHERE run_id=? AND subject=? AND current=1 ORDER BY purpose',
+            (scope.run_id, scenario.delivery.key))}
+
+
+def _window(scenario: Scenario) -> dict[str, float]:
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        scope = transaction_scope(tx)
+        row = tx.one("SELECT started_at,deadline FROM waits WHERE run_id=? AND subject=?", (scope.run_id, scenario.delivery.key))
+        return {"started_at": row["started_at"], "deadline": row["deadline"]}

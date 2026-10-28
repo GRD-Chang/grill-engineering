@@ -9,19 +9,19 @@ import pytest
 
 import agent_run.storage.notification_outbox as outbox
 from agent_run.notifications.envelope import event_copy, event_envelope
+from agent_run.notifications.event_projection import event_state
 from support.core_operations import CoreOperations, scripted_return
 from agent_run.model import DeliveryKind, Role
 from agent_run.core.kernel import Kernel
 from agent_run.model import wire_json
 from agent_run.notifications.sender import NativeNotifications
 from support.notification import recorded_agents as _recorded_agents, _enabled_scenario, _kernel, _operations
+from support.observer_errors import ObserverErrors
 
 
 def _state(scenario) -> dict[str, Any]:
     with scenario.kernel.storage.transaction(write=False) as tx:
-        row = tx.one("SELECT id,repository,parent_issue,language FROM runs")
-        return {"run_id": row["id"], "repository": row["repository"], "language": row["language"],
-                "parent": {"number": row["parent_issue"]}}
+        return event_state(tx)
 
 
 def _active(root: Path, run: str) -> dict[str, Any]:
@@ -139,18 +139,20 @@ def test_sender_compresses_real_development_to_review_and_preserves_gate_budget_
         scenario = _enabled_scenario(tmp_path, monkeypatch, DeliveryKind.PARENT_ONLY)
     entered, release = Event(), Event()
     sent = []
+    transport_errors, gate_ids = ObserverErrors(), []
 
     def transport(*_args, **_kwargs):
-        event = _active(tmp_path, scenario.spec.run_id)
-        if not sent:
-            sent.append(event)
-            entered.set()
-            assert release.wait(15)
-        else:
-            document = outbox.read_notifications(tmp_path, scenario.spec.run_id)
-            assert any(record["id"] == sent[0]["id"] and record["outcome"] == "success" for record in document["records"])
-            sent.append(event)
-        return {"outcome": "success", "reason": None}
+        with transport_errors.capture():
+            event = _active(tmp_path, scenario.spec.run_id)
+            if not sent:
+                sent.append(event)
+                entered.set()
+                assert release.wait(15)
+            else:
+                document = outbox.read_notifications(tmp_path, scenario.spec.run_id)
+                assert any(record["id"] == sent[0]["id"] and record["outcome"] == "success" for record in document["records"])
+                sent.append(event)
+            return {"outcome": "success", "reason": None}
 
     observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
     observed = []
@@ -184,6 +186,7 @@ def test_sender_compresses_real_development_to_review_and_preserves_gate_budget_
                 assert len(document["pending"]) <= outbox.MAX_PENDING
                 gates = [item for item in document["pending"] if item["event"]["kind"] == "boundary"]
                 assert len(gates) == 1 and gates[0]["important"] is True and gates[0]["attempts"] == 0
+                gate_ids.append(gates[0]['event']['id'])
                 retained = {item["event"]["id"] for item in document["pending"]} | {record["id"] for record in document["records"]}
                 assert set(unknown).issubset(retained)
                 cancelled = [record for record in document["records"] if record["id"] in unknown]
@@ -191,18 +194,27 @@ def test_sender_compresses_real_development_to_review_and_preserves_gate_budget_
             observed.append(call.attempt_id)
 
     try:
-        assert entered.wait(5)
-        _recorded_agents(scenario, monkeypatch, started=started)
-        for _ in range(40):
-            scenario.step()
-            if len(observed) == 2:
-                break
-        assert len(observed) == 2
-    finally:
-        release.set()
-        observer.close()
-    assert observer.failure_reason is None
-    assert sent[1]["kind"] == "boundary"  # Important Gate precedes retained unknown ordinary cards.
+        try:
+            assert entered.wait(5)
+            _recorded_agents(scenario, monkeypatch, started=started)
+            for _ in range(40):
+                scenario.step()
+                if len(observed) == 2:
+                    break
+            assert len(observed) == 2
+        finally:
+            release.set()
+            observer.close()
+        transport_errors.raise_if_any()
+        assert observer.failure_reason is None
+        assert sent[1]["kind"] == "boundary"  # Important Gate precedes retained unknown ordinary cards.
+    except BaseException as error:
+        # The sender can turn a transport assertion into unknown. Preserve the
+        # actual exception above and show only its exact first/Gate journal facts.
+        from support.notification import sender_attempt_note
+        sender_attempt_note(error, tmp_path, scenario.spec.run_id,
+                            first_id=sent[0]['id'] if sent else None, gate_ids=gate_ids)
+        raise
 
 
 def test_sender_one_poll_replaces_failed_live_start_with_the_newer_real_sibling_start(tmp_path, monkeypatch):

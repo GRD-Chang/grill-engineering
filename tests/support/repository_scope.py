@@ -1,4 +1,4 @@
-"""Minimal relational keys for the inactive schema, never a Core/Host story.
+"""Minimal relational keys for current schema constraints, never a Core/Host story.
 
 The profile bytes are intentionally opaque to these SQL-constraint tests. Do
 not use this producer as an authorization, Invocation or lifecycle fixture.

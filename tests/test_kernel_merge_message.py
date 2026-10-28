@@ -1,4 +1,5 @@
 """Full merge messages are physical facts bound to the original intent."""
+from support.effect_boundary import _merge_record
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -26,13 +27,6 @@ def _message_agent(scenario: Scenario, monkeypatch: pytest.MonkeyPatch, message:
     monkeypatch.setattr(scenario, "agent", agent)
 
 
-def _merge_record(scenario: Scenario):
-    # Audit only records produced through real Core APIs, never prepare a row.
-    with scenario.kernel.storage.transaction(write=False) as tx:
-        row = tx.one("SELECT * FROM effects WHERE subject=? AND operation='merge' ORDER BY rowid DESC LIMIT 1",
-                     (scenario.delivery.key,))
-        return dict(row), json.loads(tx.get(row["payload_id"], row["subject"])), (
-            None if row["receipt_id"] is None else json.loads(tx.get(row["receipt_id"], row["subject"])))
 
 
 @pytest.mark.parametrize("repair", [False, True], ids=["first-publication", "updated-after-ci"])

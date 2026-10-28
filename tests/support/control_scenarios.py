@@ -53,9 +53,8 @@ def prepared_control(tmp_path: Path, monkeypatch, control_kind: str):
             for issue in scenario.requirements.issues))
     transport = tmp_path / "transport"
     transport.mkdir()
-    _port, _git, _push, state, calls = _fixture(transport, monkeypatch)
-    fake = transport / "bin" / "gh"
-    fake.write_text(fake.read_text().replace("example/project", prior.repository).replace("publisher", prior.actor))
+    _port, _git, _push, state, calls = _fixture(transport, monkeypatch,
+        repository=prior.repository, actor=prior.actor)
     scenario.port.git.run("remote", "add", "offline-remote", str(transport / "origin.git"))
     anchors = [prior.head.sha + ":" + prior.source_ref, prior.base.sha + ":" + prior.target_ref,
                scenario.initial.sha + ":refs/heads/main"]
@@ -222,10 +221,10 @@ def restorable_public_resume(tmp_path, monkeypatch, missing):
     database = kernel.storage.path
     before = kernel.status(subject)
     with kernel.storage.transaction(write=False) as tx:
-        inputs = tx.one("SELECT subject,material_id FROM run_inputs")
+        inputs = tx.one("SELECT subject,material_id FROM run_inputs WHERE run_id=?", (kernel.storage.run_id,))
         frozen = tx.get(inputs["material_id"], inputs["subject"])
-        attempt = tx.one("SELECT current_attempt FROM subjects WHERE id=?", (subject,))[0]
-        count = tx.one("SELECT count(*) FROM actions")[0]
+        attempt = tx.one("SELECT current_attempt FROM subjects WHERE run_id=? AND id=?", (kernel.storage.run_id, subject))[0]
+        count = tx.one("SELECT count(*) FROM actions WHERE run_id=?", (kernel.storage.run_id,))[0]
     backup = database.read_bytes()
     checkout = physical.git.root
     saved_checkout = tmp_path / "trusted-checkout"
@@ -343,8 +342,8 @@ def _parent_requeue(tmp_path, monkeypatch):
 
 def _retirement(scenario):
     with scenario.kernel.storage.transaction(write=False) as tx:
-        rows = tx.rows("SELECT * FROM effects WHERE subject=? AND operation='retire_pr'",
-                       (scenario.delivery.key,))
+        rows = tx.rows("SELECT * FROM effects WHERE run_id=? AND subject=? AND operation='retire_pr'",
+                       (scenario.kernel.storage.run_id, scenario.delivery.key))
         assert len(rows) == 1
         row = dict(rows[0])
         return row, json.loads(tx.get(row['payload_id'], scenario.delivery.key)), json.loads(tx.get(row['receipt_id'], scenario.delivery.key))

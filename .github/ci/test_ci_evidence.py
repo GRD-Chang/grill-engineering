@@ -16,6 +16,23 @@ from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
 import ci_evidence as evidence
+import test_scope as scope
+
+
+class LocalFeedbackScopeTests(unittest.TestCase):
+    def test_fast_prompt_contract_keeps_real_role_allocation_in_the_full_scope(self):
+        fast = scope.selection('fast')
+        self.assertEqual(fast, tuple(dict.fromkeys(fast)))
+        self.assertTrue(set(scope.PROMPT_CONTRACT_TESTS).issubset(fast))
+        allocation = 'tests/test_kernel_prompt_facts.py'
+        self.assertNotIn(allocation, fast)
+        self.assertIn(allocation, scope.selection('prompts'))
+        self.assertTrue(set(scope.PROMPT_CONTRACT_TESTS).issubset(scope.selection('prompts')))
+
+    def test_fast_scope_keeps_its_policy_state_and_query_contracts(self):
+        fast = set(scope.selection('fast'))
+        self.assertTrue(all(set(scope.selection(name)).issubset(fast)
+            for name in ('policy', 'state', 'locator')))
 
 
 class CurrentCollectionTests(unittest.TestCase):
@@ -51,6 +68,19 @@ class CurrentCollectionTests(unittest.TestCase):
         self.assertEqual(len(nodes), len(set(nodes)))
         self.assertTrue(set(nodes) <= set(self.nodes))
 
+    def test_boundary_selection_is_exact_current_subset_and_full_keeps_every_node(self):
+        targets = scope.selection('boundary')
+        self.assertEqual(targets, scope.BOUNDARY_TESTS)
+        self.assertEqual(len(targets), 14)
+        self.assertEqual(len(set(targets)), 14)
+        for target in targets:
+            with self.subTest(target=target):
+                self.assertIn(target, self.nodes)
+                self.assertEqual(sum(node == target for node in self.nodes), 1)
+        # The full suite still comes from pytest collection, not the boundary
+        # inventory. Existing receipt verification requires the entire set.
+        self.assertTrue(set(targets) < set(self.nodes))
+
     def test_named_make_groups_only_select_collected_current_targets(self):
         for group in ("policy", "state", "prompts", "locator", "github", "delivery", "run", "executor"):
             output = subprocess.check_output(
@@ -76,6 +106,35 @@ class CurrentCollectionTests(unittest.TestCase):
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_boundary_requires_exact_all_pass_without_creating_full_receipt(self):
+        folder = self.root / 'boundary'
+        folder.mkdir()
+        (folder / 'environment.json').write_text(json.dumps(self.report))
+        nodes = list(scope.BOUNDARY_TESTS)
+        self.junit(folder, nodes)
+        self.assertEqual(evidence.check_boundary(folder), len(nodes))
+        self.assertFalse((folder / 'evidence.json').exists())
+        for changed in (nodes[:-1], nodes + [nodes[0]], nodes + ['tests/test_extra.py::test_extra']):
+            self.junit(folder, changed)
+            with self.subTest(nodes=changed), self.assertRaises(ValueError):
+                evidence.check_boundary(folder)
+        for outcome in ('skipped', 'failure', 'error'):
+            self.junit(folder, nodes)
+            tree = ET.parse(folder / 'junit.xml')
+            suite = tree.getroot().find('testsuite')
+            suite.set({'skipped': 'skipped', 'failure': 'failures', 'error': 'errors'}[outcome], '1')
+            ET.SubElement(suite.find('testcase'), outcome)
+            tree.write(folder / 'junit.xml')
+            with self.subTest(outcome=outcome), self.assertRaises(ValueError):
+                evidence.check_boundary(folder)
+        self.junit(folder, nodes)
+        report = deepcopy(self.report)
+        report['commit']['stdout'] = 'b' * 40
+        (folder / 'environment.json').write_text(json.dumps(report))
+        with self.assertRaisesRegex(ValueError, 'candidate identity'):
+            evidence.check_boundary(folder)
+        self.assertFalse((folder / 'evidence.json').exists())
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

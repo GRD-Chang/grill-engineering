@@ -3,6 +3,7 @@
 The helpers execute normally, while unit/cgroup facts are synthetic.
 """
 import array
+from collections import deque
 from contextlib import contextmanager
 import json
 import os
@@ -13,8 +14,10 @@ import socket
 import stat
 import subprocess
 import threading
+import time
 
 import pytest
+from support.fixture_text import replace_once
 
 from agent_run.adapters.systemd import SystemdHost
 from agent_run.model import HostLaunch
@@ -141,11 +144,17 @@ def _managed_diagnostics(database: Path, run_id: str, roles: Path) -> dict:
     try:
         kernel = Kernel(database, run_id=run_id)
         with kernel.storage.transaction(write=False) as tx:
-            result['run'] = dict(tx.one('SELECT id,stopped,blocked,epoch,integration_holder FROM runs WHERE id=?', (run_id,)))
+            result['run'] = dict(tx.one('SELECT id,stopped,blocked,epoch,integration_holder,executor,final_action FROM runs WHERE id=?', (run_id,)))
             result['subjects'] = [dict(row) for row in tx.rows(
                 'SELECT id,generation,phase,purpose,current_attempt,repair_source FROM subjects WHERE run_id=? ORDER BY id LIMIT 32', (run_id,))]
+            result['actions'] = [dict(row) for row in tx.rows(
+                'SELECT id,kind,subject,status FROM actions WHERE run_id=? ORDER BY rowid DESC LIMIT 32', (run_id,))]
             result['gates'] = [dict(row) for row in tx.rows(
                 'SELECT subject,code FROM gates WHERE run_id=? ORDER BY subject,code LIMIT 32', (run_id,))]
+            # accounted is a charging fact, never a general consumption flag.
+            result['attempts'] = [dict(row) for row in tx.rows(
+                'SELECT id,subject,generation,role,status,result_id,current_invocation,accounted '
+                'FROM attempts WHERE run_id=? ORDER BY rowid DESC LIMIT 32', (run_id,))]
             result['outputs'] = [dict(row) for row in tx.rows(
                 'SELECT a.subject,a.role,a.accounted,i.id AS invocation,i.thread,t.backend_id,t.profile_revision,i.deadline_at,o.ordinal,o.dispatch_state,'
                 'o.failure_kind,o.raw_id,o.started_at,o.returned_at,o.exit_code FROM invocation_outputs o '
@@ -156,9 +165,14 @@ def _managed_diagnostics(database: Path, run_id: str, roles: Path) -> dict:
             result['activity'] = [dict(row) for row in tx.rows(
                 'SELECT invocation,ordinal,identity,active,observed_at FROM worker_activity WHERE run_id=? ORDER BY rowid DESC LIMIT 32', (run_id,))]
             result['effects'] = [dict(row) for row in tx.rows(
-                'SELECT id,subject,operation,status,attempts FROM effects WHERE run_id=? ORDER BY rowid DESC LIMIT 32', (run_id,))]
+                'SELECT id,subject,operation,status,attempts,control_action FROM effects WHERE run_id=? ORDER BY rowid DESC LIMIT 32', (run_id,))]
             result['waits'] = [dict(row) for row in tx.rows(
-                'SELECT subject,kind,started_at,deadline,retry_count,next_retry_at FROM waits WHERE run_id=? LIMIT 32', (run_id,))]
+                'SELECT subject,kind,scope_id,started_at,deadline,retry_count,next_retry_at FROM waits WHERE run_id=? LIMIT 32', (run_id,))]
+            result['leases'] = [dict(row) for row in tx.rows(
+                'SELECT id,subject,invocation,executor,epoch FROM leases WHERE run_id=? ORDER BY rowid LIMIT 32', (run_id,))]
+            for queue in ('work_queue', 'integration_queue'):
+                result[queue] = [dict(row) for row in tx.rows(
+                    'SELECT subject,ready FROM ' + queue + ' WHERE run_id=? ORDER BY ready LIMIT 32', (run_id,))]
             result['budgets'] = [dict(row) for row in tx.rows(
                 'SELECT subject,purpose,window,developments_used,reviews_used FROM budgets WHERE run_id=? AND current=1 LIMIT 32', (run_id,))]
             result['history_tail'] = [dict(row) for row in tx.rows(
@@ -166,6 +180,129 @@ def _managed_diagnostics(database: Path, run_id: str, roles: Path) -> dict:
     except Exception as error:
         result['unavailable'] = {'type': type(error).__name__, 'code': getattr(error, 'code', None)}
     return result
+
+
+MANAGED_NOTE_BYTES = 24 * 1024
+
+
+class SidecarStatTrace:
+    """Bounded evidence from the original stat calls, never an extra probe."""
+
+    def __init__(self, database: Path) -> None:
+        self._paths = {str(database) + suffix: suffix for suffix in ('-wal', '-shm', '-journal')}
+        self._rows: deque[dict] = deque(maxlen=16)
+        self._lock = threading.Lock()
+        self._phase = 'completion-poll'
+        self._count = 0
+
+    def phase(self, value: str) -> None:
+        with self._lock:
+            self._phase = value[:64]
+
+    def _record(self, row: dict) -> None:
+        # Diagnostics cannot replace the original stat return or exception.
+        try:
+            with self._lock:
+                self._count += 1
+                self._rows.append(row)
+        except BaseException:
+            pass
+
+    def wrap(self, original):
+        def traced(path, *args, **kwargs):
+            try:
+                suffix = self._paths.get(str(path))
+            except BaseException:
+                return original(path, *args, **kwargs)
+            if suffix is None:
+                return original(path, *args, **kwargs)
+            try:
+                with self._lock:
+                    phase = self._phase
+                row = {'suffix': suffix, 'phase': phase, 'thread': threading.get_ident(),
+                       'monotonic_ns': time.monotonic_ns(),
+                       'follow_symlinks': kwargs.get('follow_symlinks', True)}
+            except BaseException:
+                return original(path, *args, **kwargs)
+            try:
+                metadata = original(path, *args, **kwargs)
+            except BaseException as error:
+                try:
+                    row.update(outcome='raise', error=type(error).__name__, errno=getattr(error, 'errno', None))
+                    self._record(row)
+                except BaseException:
+                    pass
+                raise
+            try:
+                row.update(outcome='return', dev=metadata.st_dev, ino=metadata.st_ino, mode=metadata.st_mode,
+                           nlink=metadata.st_nlink, size=metadata.st_size)
+                self._record(row)
+            except BaseException:
+                pass
+            return metadata
+        return traced
+
+    def note(self, error: BaseException) -> None:
+        try:
+            with self._lock:
+                facts = {'sidecar_stat_trace': list(self._rows), 'total_calls': self._count,
+                         'retained_calls': len(self._rows)}
+            payload = json.dumps(facts, separators=(',', ':'))
+            if len(payload.encode()) > 8192:
+                payload = '{"sidecar_stat_trace":"note_byte_limit"}'
+            error.add_note(payload)
+        except BaseException:
+            pass
+
+    @contextmanager
+    def capture(self, monkeypatch, *, finish):
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, 'stat', self.wrap(Path.stat))
+            failure = None
+            try:
+                yield
+            except BaseException as error:
+                failure = error
+                raise
+            finally:
+                try:
+                    self.phase('timing-finally')
+                except BaseException:
+                    pass
+                try:
+                    finish()
+                except BaseException as cleanup_error:
+                    if failure is None:
+                        self.note(cleanup_error)
+                        raise
+                    try:
+                        failure.add_note('Managed timing evidence unavailable: ' + type(cleanup_error).__name__)
+                    except BaseException:
+                        pass
+                if failure is not None:
+                    self.note(failure)
+
+
+def _managed_failure_note(error: BaseException, *, stage: str, database: Path,
+                          run_id: str, roles: Path) -> None:
+    """One bounded structured note; never replace the original failure/cleanup."""
+    try:
+        facts = _managed_diagnostics(database, run_id, roles)
+        note = {'stage': stage, 'run_id': run_id, 'facts': facts, 'omitted_rows': {}}
+        for limit in (32, 8, 4, 1, 0):
+            for key, value in facts.items():
+                if isinstance(value, list) and len(value) > limit:
+                    note['omitted_rows'][key] = note['omitted_rows'].get(key, 0) + len(value) - limit
+                    facts[key] = value[:limit]
+            payload = json.dumps(note, ensure_ascii=False, separators=(',', ':'))
+            if len(payload.encode('utf-8')) <= MANAGED_NOTE_BYTES:
+                break
+        else:
+            payload = json.dumps({'stage': stage[:128], 'snapshot_omitted': 'note_byte_limit'})
+        error.add_note(payload)
+    except BaseException as unavailable:
+        # Diagnostic failure is secondary, including interruption of the read.
+        error.add_note('Managed snapshot unavailable: ' + type(unavailable).__name__)
 
 
 _CODEX = r'''import errno, json, os, subprocess, sys
@@ -389,17 +526,13 @@ if os.environ.get('ENTRY_APPROVAL_CONTROL') and sys.argv[1:3] == ['api', 'graphq
         assert channel.recv(1) == b'1'
 '''
     gh = FAKE_GH
-    gh = gh.replace("v['issueId']=='issue-node-2'",
+    gh = replace_once(gh, "v['issueId']=='issue-node-2'",
         "v['issueId'] in {f\"issue-node-{issue['number']}\" for issue in "
         "(d['source_graph']['parent'], *d['source_graph']['issues'].values())}")
-    gh = gh.replace("'number':17,'state':'open'", "'number':17+len(d['prs']),'state':'open'")
-    gh = gh.replace("else: result=[d['prs']] if '--slurp' in args else d['prs']", """else:
-            from urllib.parse import parse_qs, urlsplit
-            query = parse_qs(urlsplit(args[1]).query)
-            matches = [pull for pull in d['prs'] if pull['head']['ref'] == query['head'][0].split(':', 1)[1]
-                       and pull['base']['ref'] == query['base'][0]]
-            result=[matches] if '--slurp' in args else matches""")
-    gh = gh.replace("elif endpoint.startswith('repos/example/project/pulls'):\n",
+    gh = replace_once(gh, "'number':17,'state':'open'", "'number':17+len(d['prs']),'state':'open'")
+    # The canonical gh fixture already filters exact head/base query fields.
+    # Do not silently attempt to replace its retired unfiltered list branch.
+    gh = replace_once(gh, "elif endpoint.startswith('repos/example/project/pulls'):\n",
         """elif endpoint.startswith('repos/example/project/pulls'):
     for pull in d['prs']:
         if not pull['merged']:
@@ -410,7 +543,7 @@ if os.environ.get('ENTRY_APPROVAL_CONTROL') and sys.argv[1:3] == ['api', 'graphq
     # The shared leaf fixture represents one Ticket. Managed controls also
     # observe their Parent (and original PR issue endpoints) independently.
     closed_event = "d['events'].append({'id':len(d['events'])+1,'event':'closed','actor':{'login':'publisher'},'created_at':'2026-10-21T10:01:00Z'})"
-    gh = gh.replace(closed_event, closed_event + ";d.setdefault('events_by_issue',{}).setdefault(str(number),[]).append(d['events'][-1])")
+    gh = replace_once(gh, closed_event, closed_event + ";d.setdefault('events_by_issue',{}).setdefault(str(number),[]).append(d['events'][-1])")
     issue_start = gh.index("elif endpoint.startswith('repos/example/project/issues/'):\n")
     issue_end = gh.index("\nelse:raise SystemExit('unexpected endpoint '+endpoint)", issue_start)
     gh = gh[:issue_start] + r'''elif endpoint.startswith('repos/example/project/issues/'):
@@ -478,7 +611,7 @@ def _approval_read_barrier(*, boundary=None, released=None):
                     if databases and not reached.is_set():
                         if boundary is None:
                             with databases[0].storage.transaction(write=False) as tx:
-                                approval = tx.rows("SELECT id FROM subjects WHERE kind='final_run' AND phase='approval'")
+                                approval = tx.rows("SELECT id FROM subjects WHERE run_id=? AND kind='final_run' AND phase='approval'", (databases[0].storage.run_id,))
                         else:
                             approval = boundary(databases[0])
                         if approval:

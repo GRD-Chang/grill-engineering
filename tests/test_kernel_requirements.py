@@ -16,27 +16,35 @@ from support.offline import GraphScenario
 from agent_run.model import Effect, Execution, HostObservation
 from support.core_operations import CoreOperations, scripted_return
 from support.api_observation import api_writes, lose_api_reply, pr_author_read
-from support.requirements_scenarios import independent_source, native_input
+from support.requirements_scenarios import independent_source, native_input, source_run
 
 
 def test_closed_local_dependency_without_completion_never_unblocks_or_creates_final(tmp_path: Path) -> None:
-    source = Requirements.from_wire(native_input()["initial_requirements"])
-    scenario = GraphScenario(tmp_path / "source", source)
-    kernel = scenario.kernel
+    # Graph eligibility has no Git/PR precondition. The following test retains
+    # the real close -> Completion -> dependency -> Final boundary.
+    kernel, source = source_run(tmp_path / "source" / "kernel.sqlite3")
     initial = kernel.source_status()
     assert initial["frontier"] == ["ticket:3"]
     assert initial["remaining"] == {"ticket:4": "blocked_by_incomplete_tickets"}
     assert initial["final_subject"] is None
-    scenario.requirements = replace(source, issues=tuple(replace(issue, state="CLOSED") if issue.number == 3 else
+    closed = replace(source, issues=tuple(replace(issue, state="CLOSED") if issue.number == 3 else
         replace(issue, blocked_by=tuple(replace(blocker, state="CLOSED") for blocker in issue.blocked_by))
         for issue in source.issues))
-    scenario.refresh()
-    state = Kernel(kernel.storage.path, run_id=kernel.storage.run_id).source_status()
+    kernel.refresh(lambda: closed)
+    reopened = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
+    state = reopened.source_status()
     assert state["frontier"] == []
     assert state["remaining"] == {"ticket:3": "ticket_closed", "ticket:4": "blocked_by_incomplete_tickets"}
     assert state["final_subject"] is None
-    assert prepare_scripted_agent(kernel, scenario.runner().run_once()).call is None
-    assert kernel.status("ticket:4")["pending_attempt"] is None
+    # Observe normal scheduling without credential delivery or Git effects.
+    token = reopened.claim_executor("graph-eligibility")
+    from support.core_operations import ReadOnlyPorts
+    from agent_run.core.operation_contract import DeliveryFacts
+    delivery = reopened.delivery("ticket:4")
+    ports = ReadOnlyPorts(closed, delivery.source_ref, delivery.target_ref, DeliveryFacts(delivery.base, None))
+    step = CoreOperations(reopened, token, lambda _binding: ports, prepare_agents=False).once()
+    assert step.call is None and step.preparation is None
+    assert reopened.status("ticket:4")["pending_attempt"] is None
 
 
 def test_real_ticket_close_receipts_create_completion_before_dependency_and_final(tmp_path: Path) -> None:

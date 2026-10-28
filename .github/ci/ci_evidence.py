@@ -11,7 +11,7 @@ import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
-from test_scope import CONTRACT_TESTS
+from test_scope import BOUNDARY_TESTS, CONTRACT_TESTS
 
 PRODUCT_ROOT = Path(__file__).resolve().parents[2]
 DEPENDENCY_FILES = ("pyproject.toml", "tests/dev-requirements.txt", "tests/build-requirements.txt")
@@ -94,6 +94,17 @@ def junit_cases(folder: Path) -> set[tuple[str, str]]:
     if not result:
         raise ValueError("Empty JUnit coverage")
     return result
+
+
+def check_boundary(folder: Path) -> int:
+    """A partial gate, never a full receipt; require every trusted case passed."""
+    read_environment(folder)
+    expected = {junit_key(node) for node in BOUNDARY_TESTS}
+    if not expected or len(expected) != len(BOUNDARY_TESTS):
+        raise ValueError('Invalid trusted boundary selection')
+    if junit_cases(folder) != expected:
+        raise ValueError('Incomplete or unexpected boundary coverage')
+    return len(expected)
 
 
 def collect_nodeids() -> list[str]:
@@ -232,11 +243,15 @@ def main() -> None:
     reader = commands.add_parser("verify")
     reader.add_argument("--results", type=Path, required=True)
     reader.add_argument("--shard-count", type=int, default=2)
+    boundary = commands.add_parser('check-boundary')
+    boundary.add_argument('--results', type=Path, required=True)
     args = parser.parse_args()
     try:
         if args.command == "record":
             record(args.results, args.shard, contract=boolean(args.contract), shard_count=args.shard_count)
             print(f"Recorded complete test shard {args.shard}")
+        elif args.command == 'check-boundary':
+            print(f'Boundary regression verified: {check_boundary(args.results)} passed; not full acceptance')
         else:
             total = verify(
                 args.results, selected=os.environ["CHECKS_SELECTED"], product=os.environ["PRODUCT_SELECTED"],

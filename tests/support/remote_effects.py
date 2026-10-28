@@ -4,6 +4,9 @@ Only external responses are synthetic; each consumer owns its paths and patches.
 """
 from support.repository_fixture import create_kernel
 from dataclasses import replace
+import ast
+import io
+import tokenize
 import json
 import os
 from pathlib import Path
@@ -22,6 +25,37 @@ from agent_run.adapters.local_git import LocalEffects
 from agent_run.model import DeliveryKind, EffectResult
 from support.offline import Scenario
 from support.core_operations import prepare_scripted_agent, scripted_return
+
+
+def fake_gh(*, repository: str = "example/project", actor: str = "publisher") -> str:
+    """Bind two independent fields in the one existing synthetic program.
+
+    Replace only original Python string literals, in one pass. Inserted field
+    values are data, never searched again or allowed to change Python syntax.
+    Default bytes/anchors remain intact for existing controlled extensions.
+    """
+    if not all(isinstance(value, str) and value for value in (repository, actor)):
+        raise ValueError("Synthetic repository and actor must be nonempty strings")
+    if (repository, actor) == ("example/project", "publisher"):
+        return FAKE_GH
+    # These are the script's declared identity fields, not arbitrary words
+    # in comments, identifiers, error text, PR bodies or injected field values.
+    fields = {"example/project": repository, "publisher": actor,
+              "publisher@example.invalid": actor + "@example.invalid"}
+    for suffix in ("/commits/main", "/git/ref/heads/", "/rulesets", "/pulls",
+                   "/issues/comments/", "/issues/"):
+        fields["repos/example/project" + suffix] = "repos/" + repository + suffix
+    for suffix in ("/issues/", "/issues/2"):
+        fields["https://api.github.com/repos/example/project" + suffix] = (
+            "https://api.github.com/repos/" + repository + suffix)
+    tokens = []
+    for token in tokenize.generate_tokens(io.StringIO(FAKE_GH).readline):
+        if token.type == tokenize.STRING:
+            value = ast.literal_eval(token.string)
+            if isinstance(value, str) and value in fields and fields[value] != value:
+                token = token._replace(string=repr(fields[value]))
+        tokens.append(token)
+    return tokenize.untokenize(tokens)
 
 
 def _fixture(tmp_path, monkeypatch, *, repository="example/project", actor="publisher"):
@@ -52,7 +86,7 @@ def _fixture(tmp_path, monkeypatch, *, repository="example/project", actor="publ
     binary.mkdir()
     fake = binary / "gh"
     fake.write_text("#!" + sys.executable + "\n" +
-                    FAKE_GH.replace("example/project", repository).replace("publisher", actor))
+                    fake_gh(repository=repository, actor=actor))
     fake.chmod(0o755)
     monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("REMOTE_TEST_STATE", str(state))

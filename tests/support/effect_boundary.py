@@ -1,5 +1,9 @@
 """Hold only a real physical port; selection and authority stay in Core."""
 from contextlib import contextmanager
+import json
+
+from agent_run.errors import KernelError
+from agent_run.storage.run_scope import transaction_scope
 
 import pytest
 
@@ -69,3 +73,34 @@ def advance_to_effect(scenario: Scenario, monkeypatch, operation: str, *, develo
     if sent:
         assert scenario.kernel.status(boundary.value.effect.subject)["pending_write"]["status"] == "sent"
     return boundary.value
+
+
+def _merge_record(scenario: Scenario):
+    # Audit only records produced through real Core APIs, never prepare a row.
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        scope = transaction_scope(tx)
+        row = tx.one("SELECT * FROM effects WHERE run_id=? AND subject=? AND operation='merge' ORDER BY rowid DESC LIMIT 1",
+                     (scope.run_id, scenario.delivery.key))
+        return dict(row), json.loads(tx.get(row["payload_id"], row["subject"])), (
+            None if row["receipt_id"] is None else json.loads(tx.get(row["receipt_id"], row["subject"])))
+
+
+def _local_marker(scenario: Scenario) -> str:
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        scope = transaction_scope(tx)
+        return str(tx.one("SELECT e.before_sha FROM effects e JOIN subjects s ON s.run_id=e.run_id AND s.id=e.subject AND s.generation=e.generation WHERE e.run_id=? AND e.subject=? AND e.operation='workspace' AND e.status='confirmed'",
+                          (scope.run_id, scenario.delivery.key))[0])
+
+
+def state_of(s, original):
+    with s.kernel.storage.transaction(write=False) as tx:
+        scope = transaction_scope(tx)
+        return tuple(tx.one("SELECT status,attempts FROM effects WHERE run_id=? AND id=?", (scope.run_id, original["id"])))
+
+
+def effect_state(s, effect):
+    with s.kernel.storage.transaction(write=False) as tx:
+        scope = transaction_scope(tx)
+        if effect.execution.run_id != scope.run_id:
+            raise KernelError("effect_binding")
+        return tuple(tx.one("SELECT status,attempts,payload_id FROM effects WHERE run_id=? AND id=?", (scope.run_id, effect.effect_id)))

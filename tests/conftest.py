@@ -13,7 +13,14 @@ from support.installed_runtime import require_current_installation
 pytest_plugins = ("support.sharding",)
 
 
-def pytest_configure() -> None:
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.getgroup('test diagnostics').addoption('--host-loss-io-diagnostics',
+        action='store_true', default=False, help='Select the pre-sealed diagnostic entry only in the Host-loss story')
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    if config.getoption('host_loss_io_diagnostics') and config.getoption('test_shard_count') != 1:
+        raise pytest.UsageError('The diagnostic Host-loss entry cannot produce full CI shard evidence')
     require_current_installation()
 
 

@@ -30,7 +30,8 @@ from agent_run.storage.routing import RepositoryRoute
 from support.systemd_manager import controlled_manager
 from support.remote_effects import FAKE_GH
 from support.worker_process_timing import wait_until
-from support.systemd_manager import _CODEX, _approval_read_barrier, _control_environment, _diagnostic_tail, _executable, _git, _hold_host_operation_return, _local_manager, _managed_diagnostics
+from support.systemd_manager import _CODEX, _approval_read_barrier, _control_environment, _diagnostic_tail, _executable, _git, _hold_host_operation_return, _local_manager, _managed_diagnostics, _managed_failure_note
+from support.systemd_manager import SidecarStatTrace
 
 
 def test_public_run_reaches_ticket_close_through_managed_host_after_lost_merge_reply(
@@ -88,11 +89,20 @@ if '--hostname' in sys.argv:
         accepted = json.loads(result.stdout)
         assert accepted["result"] == "accepted"
         serving.join(timeout=95)
-        assert not serving.is_alive() and not errors, {
-            'errors': errors,
-            'output_head_tail': tuple(tuple((stream[:4096], stream[-4096:]) for stream in pair) for pair in output),
-            'worker_errors': _diagnostic_tail(Path(str(roles) + '.errors')),
-        }
+        try:
+            assert not serving.is_alive() and not errors, {
+                'errors': errors,
+                'output_head_tail': tuple(tuple((stream[:4096], stream[-4096:]) for stream in pair) for pair in output),
+                'worker_errors': _diagnostic_tail(Path(str(roles) + '.errors')),
+            }
+        except AssertionError as error:
+            try:
+                database = RepositoryRoute.for_workspace(ManagedWorkspace.for_repository('example/project')).database
+                _managed_failure_note(error, stage='lost-merge-after-cli-acceptance',
+                    database=database, run_id=accepted['run_id'], roles=roles)
+            except BaseException as unavailable:
+                error.add_note('Managed snapshot unavailable: ' + type(unavailable).__name__)
+            raise
         assert len(children) == len(commands) == 1 and children[0].returncode == 0, output
         assert trace == ["fdstore", "barrier", "host_exited", "store_closed"]
         command = commands[0]
@@ -534,6 +544,19 @@ content = 'Implementation""")
                     'available_output': available_output,
                     'worker_errors': _diagnostic_tail(remote_state.parent / 'roles.jsonl.errors'),
                 }))
+                try:
+                    workspace = ManagedWorkspace.for_repository('example/project')
+                    route = RepositoryRoute.for_workspace(workspace)
+                    from agent_run.contracts.task import TaskKey
+                    task = route.task(TaskKey(workspace.repository_root, workspace.repository, 1))
+                    if task is None or task.current_run is None:
+                        error.add_note('Managed snapshot unavailable: exact Parent Task has no current Run')
+                    else:
+                        error.add_note('Snapshot binding: exact current Parent Task; CLI has not returned its Run ID')
+                        _managed_failure_note(error, stage='parallel-workers-current-parent-before-arrival',
+                            database=route.database, run_id=task.current_run, roles=remote_state.parent / 'roles.jsonl')
+                except BaseException as unavailable:
+                    error.add_note('Managed snapshot unavailable: ' + type(unavailable).__name__)
                 raise
             channels = {event['role']: (event, channel) for event, channel in events}
             assert set(channels) == {'review', 'publication'}
@@ -614,9 +637,23 @@ content = 'Implementation""")
 
 
 def test_public_resume_after_exact_foreground_host_loss_preserves_parallel_work(
-    git_repo: Path, tmp_path: Path, monkeypatch, record_property,
+    git_repo: Path, tmp_path: Path, monkeypatch, record_property, request,
 ) -> None:
+    diagnostic = request.config.getoption('host_loss_io_diagnostics')
+    record_property('host_loss_entry', 'diagnostic-presealed' if diagnostic else 'official')
+    observed = _foreground_host_loss_story(git_repo, tmp_path, monkeypatch, record_property, diagnostic=diagnostic)
+    if diagnostic:
+        from support.host_io_trace import read_traces
+        traces = read_traces(tmp_path / 'host-io-trace', observed['run'])
+        assert traces and all(item.get('measurement_errors') == 0 for item in traces)
+        assert all(item['sample_status'] in {'sampled', 'not_due'} for item in traces)
+
+
+def _foreground_host_loss_story(git_repo, tmp_path, monkeypatch, record_property, *, diagnostic):
     from agent_run.adapters.foreground import ProcessPin, read_record, record_root, subreaper
+    trace_root = tmp_path / 'host-io-trace'
+    if diagnostic:
+        trace_root.mkdir(mode=0o700)
     classification = """schema = json.loads(Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text())
 role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commit_message' in schema['properties'] else 'development'
 """
@@ -652,6 +689,10 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
                 return subprocess.run(command, cwd=git_repo, env=environment,
                     capture_output=True, text=True, timeout=90)
             deadline = time.monotonic() + 90
+            if diagnostic:
+                entry = Path(__file__).parent / 'support' / 'host_io_entry.py'
+                command = [sys.executable, '-I', str(entry), '--trace-root', str(trace_root),
+                           '--sample-at', repr(deadline - 5), '--', *command[3:]]
             with _control_process(command, cwd=git_repo, env=environment,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as (continued, continued_fd):
                 continued_pins = []
@@ -676,6 +717,9 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
                         'returncode': continued.returncode, 'stdout': stdout, 'stderr': stderr})
                     return subprocess.CompletedProcess(command, continued.returncode, stdout, stderr)
                 except subprocess.TimeoutExpired as error:
+                    if diagnostic:
+                        from support.host_io_trace import read_traces
+                        error.add_note(json.dumps({'host_loss_io_trace': read_traces(trace_root, observations.get('run'))}))
                     facts = _managed_diagnostics(Path(observations['original_record']['database']),
                         observations['run'], tmp_path / 'roles.jsonl')
                     observations['continuation_timeout'] = {'stage': 'foreground-' + arguments[0],
@@ -842,8 +886,12 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
             try:
                 (tmp_path / 'host-loss-first-resume.json').write_text(json.dumps(observations))
                 record_property('host_loss_recovery', json.dumps(observations))
+                if diagnostic:
+                    from support.host_io_trace import read_traces
+                    record_property('host_loss_io_trace', json.dumps(read_traces(trace_root, observations.get('run'))))
             finally:
                 _finish_control_host(child, pins, child_fd=child_fd, signal_host=not sent)
+        return observations
 
 
 def test_public_ticket_stop_keeps_late_raw_unconsumed_then_resumes_in_the_original_managed_host(
@@ -971,10 +1019,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                 assert not gates and not errors, (gates, errors)
                 assert children[0].poll() is None or phase == "complete", (children[0].returncode, phase, output)
                 return phase == "complete"
-            try:
-                wait_until(completed, timeout=remaining())
-                serving.join(timeout=remaining())
-            finally:
+            def record_timing():
                 with kernel.storage.transaction(write=False) as tx:
                     history = [dict(row) for row in tx.all("SELECT position,subject,kind,phase,created_at FROM history ORDER BY position DESC LIMIT 20")]
                 (tmp_path / "control-timing.json").write_text(json.dumps({
@@ -983,6 +1028,12 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                     "total_seconds": time.monotonic() - supervision_started,
                     "phases_after_resume": phases, "host_poll": children[0].poll(),
                     "manager_trace": trace, "manager_errors": [repr(error) for error in errors], "history_tail": history}))
+            # Observe only original calls for this exact database; retain the
+            # first failure even if the existing timing read hits the same race.
+            sidecar_stats = SidecarStatTrace(kernel.storage.path)
+            with sidecar_stats.capture(monkeypatch, finish=record_timing):
+                wait_until(completed, timeout=remaining())
+                serving.join(timeout=remaining())
             assert kernel.status("ticket:2")["phase"] == "complete"
             assert kernel.host_request(accepted["action_id"]) == request
             with kernel.storage.transaction(write=False) as tx:
@@ -1177,9 +1228,9 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                 original_event, channel = arrivals.get(timeout=min(20, remaining()))
                 assert original_event["requirement"]["body"] == "Original requirement for Ticket 2."
                 channel.sendall(b"1")
+                timing['stage'] = 'first-final-before-ticket-requeue'
                 while not reached.wait(0.1):
-                    assert serving.is_alive() and time.monotonic() < deadline, (kernel.source_status(), output, errors,
-                        _managed_diagnostics(kernel.storage.path, kernel.storage.run_id, tmp_path / 'roles.jsonl'))
+                    assert serving.is_alive() and time.monotonic() < deadline, (kernel.source_status(), output, errors)
                 preparation_seconds = time.monotonic() - started
                 timing["preparation_seconds"] = preparation_seconds
                 request = kernel.host_request(accepted["action_id"])
@@ -1204,9 +1255,9 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                 assert released.wait(min(5, remaining()))
                 release.clear()
                 reached.clear()
+                timing['stage'] = 'final-after-ticket-requeue'
                 while not reached.wait(0.1):
-                    assert serving.is_alive() and time.monotonic() < deadline, (kernel.source_status(), output, errors,
-                        _managed_diagnostics(kernel.storage.path, kernel.storage.run_id, tmp_path / 'roles.jsonl'))
+                    assert serving.is_alive() and time.monotonic() < deadline, (kernel.source_status(), output, errors)
                 ticket_to_approval_seconds = time.monotonic() - controlled_at
                 timing["ticket_requeue_to_final_approval_seconds"] = ticket_to_approval_seconds
                 final = kernel.source_status()["final_subject"]
@@ -1240,9 +1291,9 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                 assert released.wait(min(5, remaining()))
                 release.clear()
                 reached.clear()
+                timing['stage'] = 'final-after-final-requeue'
                 while not reached.wait(0.1):
-                    assert serving.is_alive() and time.monotonic() < deadline, (kernel.source_status(), output, errors,
-                        _managed_diagnostics(kernel.storage.path, kernel.storage.run_id, tmp_path / 'roles.jsonl'))
+                    assert serving.is_alive() and time.monotonic() < deadline, (kernel.source_status(), output, errors)
                 assert kernel.status(final)["phase"] == "approval"
                 timing["final_requeue_to_approval_seconds"] = time.monotonic() - final_controlled_at
                 assert _git(tmp_path / "origin.git", "rev-parse", final_delivery.source_ref) == original_run_head
@@ -1301,6 +1352,11 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                 assert code == 0 and completed["status"] == "completed", completed
                 assert trace == ["fdstore", "barrier", "host_exited", "store_closed"]
                 timing["approve_to_complete_seconds"] = time.monotonic() - approve_started
+            except BaseException as error:
+                if kernel is not None:
+                    _managed_failure_note(error, stage=timing.get('stage', 'requeue'),
+                        database=kernel.storage.path, run_id=kernel.storage.run_id, roles=tmp_path / 'roles.jsonl')
+                raise
             finally:
                 release.set()
                 timing.update(total_seconds=time.monotonic() - started,
@@ -1360,9 +1416,13 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
         accepted = public("run", "1", "--no-notifications")
         assert accepted["result"] == "accepted"
         serving.join(timeout=max(0, deadline - time.monotonic()))
-        assert not serving.is_alive() and not errors, (errors, output,
-            _managed_diagnostics(RepositoryRoute.for_workspace(ManagedWorkspace.for_repository('example/project')).database,
-                                 accepted['run_id'], tmp_path / 'roles.jsonl'))
+        try:
+            assert not serving.is_alive() and not errors, (errors, output)
+        except AssertionError as error:
+            _managed_failure_note(error, stage='ticket-repair-before-normal-host-exit',
+                database=RepositoryRoute.for_workspace(ManagedWorkspace.for_repository('example/project')).database,
+                run_id=accepted['run_id'], roles=tmp_path / 'roles.jsonl')
+            raise
         assert len(commands) == len(children) == 1 and children[0].returncode == 0
         assert trace == ["fdstore", "barrier", "host_exited", "store_closed"]
         status = public("status", accepted["run_id"])

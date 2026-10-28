@@ -14,7 +14,7 @@ from agent_run.errors import KernelError
 from agent_run.model import DeliveryKind, ReadWait
 from support.offline import Scenario
 from support.effect_boundary import advance_to_effect
-from support.remote_effects import FAKE_GH
+from support.remote_effects import fake_gh
 
 
 @pytest.mark.parametrize('operation', ['pr_write', 'push'])
@@ -28,8 +28,7 @@ def test_public_stop_during_command_environment_preparation_prevents_process_wri
     binary = tmp_path / 'bin'
     binary.mkdir()
     fake = binary / 'gh'
-    fake.write_text('#!' + sys.executable + '\n' + FAKE_GH.replace(
-        'example/project', effect.repository).replace('publisher', effect.actor))
+    fake.write_text('#!' + sys.executable + '\n' + fake_gh(repository=effect.repository, actor=effect.actor))
     fake.chmod(0o700)
     state, calls = tmp_path / 'github.json', tmp_path / 'calls.jsonl'
     state.write_text(json.dumps({'prs': [], 'comments': [], 'events': [], 'issue_state': 'open'}))

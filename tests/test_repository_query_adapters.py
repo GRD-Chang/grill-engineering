@@ -208,7 +208,7 @@ def test_current_profile_entry_keeps_original_frozen_authority_and_default_query
     spec, source = proposal(root, 'current-profile')
     database = tmp_path / 'current' / 'kernel.sqlite3'
     kernel = create_kernel(database, spec, requirements=source)
-    before = read(database, 'settings', expected_run=spec.run_id).data
+    before = read(database, 'settings', expected_run=spec.run_id, storage=kernel.storage).data
     monkeypatch.setattr(selection, 'managed_repository_routes', lambda request: (RepositoryRoute(database, root, spec.repository),))
     monkeypatch.setattr(profile_cli, 'workspace_for_root', lambda path:
         SimpleNamespace(state_root=database.parent, repository_root=root))
@@ -217,7 +217,7 @@ def test_current_profile_entry_keeps_original_frozen_authority_and_default_query
     assert profile_cli.execute(request) == 0
     output = json.loads(capsys.readouterr().out)
     assert output['run_id'] == spec.run_id and output['profile_revision'] == 2
-    after = read(database, 'settings', expected_run=spec.run_id).data
+    after = read(database, 'settings', expected_run=spec.run_id, storage=kernel.storage).data
     assert before['profile']['profiles']['development']['model'] != after['profile']['profiles']['development']['model']
     assert after['profile']['profiles']['development']['model'] == 'explicit-current-model'
     with kernel.storage.transaction(write=False) as tx:

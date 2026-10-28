@@ -176,10 +176,11 @@ def test_findings_review_uses_previous_actual_result_and_current_development(tmp
 
 
 @pytest.mark.parametrize("kind", [DeliveryKind.TICKET, DeliveryKind.PARENT_ONLY, DeliveryKind.FINAL_RUN])
-@pytest.mark.parametrize("another_ci_failure", [False, True], ids=["findings", "next-ci-head"])
-def test_ci_review_uses_failed_head_then_the_actual_findings_review(tmp_path: Path, kind, another_ci_failure):
+def test_ci_review_uses_failed_head_then_the_actual_findings_review(tmp_path: Path, kind):
     policy = Policy(ticket_ci_review=True)
-    checks = ("fail", "fail", "none") if another_ci_failure else ("fail", "none")
+    # One isolated workflow covers both successors. Do not replay the entire
+    # original delivery (and Final's Ticket Completion) for a second parameter.
+    checks = ("fail", "fail", "none")
     scenario = (final_scenario(tmp_path / kind.value, policy=policy, checks=checks)
                 if kind == DeliveryKind.FINAL_RUN else
                 Scenario(tmp_path / kind.value, kind, policy=policy, checks=checks))
@@ -191,6 +192,7 @@ def test_ci_review_uses_failed_head_then_the_actual_findings_review(tmp_path: Pa
     runner = scenario.runner()
     previous_review = None
     development = None
+    reviewed = []
     for _ in range(220):
         step = prepare_scripted_agent(scenario.kernel, runner.run_once())
         call = step.call
@@ -200,6 +202,7 @@ def test_ci_review_uses_failed_head_then_the_actual_findings_review(tmp_path: Pa
         if call.role == Role.REVIEW and call.purpose == "ci":
             context = call.context["review_context"]
             failed_head = call.context["ci_evidence"]["head_sha"]
+            another_ci_failure = len(reviewed) == 2
             expected_base = (failed_head if previous_review is None or another_ci_failure
                              else previous_review.context["reviewed_commit"])
             actual_range = context.get("review_range", context.get("focus_range"))
@@ -210,15 +213,19 @@ def test_ci_review_uses_failed_head_then_the_actual_findings_review(tmp_path: Pa
             assert context["facts"]["development_summary"] == development[1]
             assert development[1] in render_role_prompt(call)
             if previous_review is not None:
+                assert call.thread_id != previous_review.thread_id
                 if another_ci_failure:
                     assert failed_head != previous_review.context["ci_evidence"]["head_sha"]
-                else:
-                    assert context["facts"]["previous_acceptance_artifact"] == review_result("fail")
-                return
+                    assert len(reviewed) == 2
+                    return
+                assert failed_head == previous_review.context["ci_evidence"]["head_sha"]
+                assert context["facts"]["previous_acceptance_artifact"] == review_result("fail")
+                assert context["facts"]["previous_review_identity"] == previous_review.context["current_review_identity"]
+            reviewed.append(call)
             previous_review = call
             runner.authorize_agent(call)
             scenario.agent(call)
-            scenario.kernel.receive(call, wire_json(review_result("pass" if another_ci_failure else "fail")))
+            scenario.kernel.receive(call, wire_json(review_result("fail" if len(reviewed) == 1 else "pass")))
             continue
         runner.authorize_agent(call)
         raw = json.loads(scenario.agent(call))
@@ -226,4 +233,4 @@ def test_ci_review_uses_failed_head_then_the_actual_findings_review(tmp_path: Pa
             raw["summary"] = f"Current actual development {call.attempt_id}, purpose {call.purpose}."
             development = call.attempt_id, raw["summary"]
         scenario.kernel.receive(call, wire_json(raw))
-    raise AssertionError("The existing workflow did not reach the second CI Review")
+    raise AssertionError("The existing workflow did not reach Findings and a new-head CI Review")

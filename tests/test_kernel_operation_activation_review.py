@@ -1,4 +1,5 @@
 """Independent activation contracts through public admission and synthetic Git."""
+from support.effect_boundary import state_of
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -50,9 +51,6 @@ def admit(s, tmp_path):
     return s
 
 
-def state_of(s, original):
-    with s.kernel.storage.transaction(write=False) as tx:
-        return tuple(tx.one("SELECT status,attempts FROM effects WHERE id=?", (original["id"],)))
 
 
 def test_readwait_defers_without_consuming_and_second_intent_is_observed(tmp_path, monkeypatch):

@@ -5,6 +5,7 @@ from support.repository_fixture import create_kernel
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import replace
+import json
 from pathlib import Path
 from typing import Any
 
@@ -17,10 +18,39 @@ from agent_run.config.defaults import UserDefaultsStore
 from agent_run.core.kernel import Kernel
 from agent_run.config.creation import freeze_creation
 from agent_run.core.operation_contract import DeliveryFacts
-from agent_run.notifications.event_projection import project_event
+from agent_run.notifications.event_projection import event_state, project_event
 from support.core_operations import CoreOperations, ReadOnlyPorts
 from support.offline import GraphScenario, Scenario
 from support.requirements_scenarios import independent_source
+
+
+def sender_attempt_note(error: BaseException, root: Path, run_id: str, *,
+                        first_id: str | None, gate_ids: list[str]) -> None:
+    """Read the original first/Gate records after sender close; never replay."""
+    try:
+        from agent_run.storage import notification_outbox as outbox
+        document = outbox.read_notifications(root, run_id)
+        selected = {first_id, *gate_ids}
+        entries = []
+        fields = ('outcome', 'attempts', 'deadline_at', 'next_attempt_at', 'cancelled', 'cancel_reason')
+        for section in ('pending', 'records'):
+            for item in document[section]:
+                identity = item['event']['id'] if section == 'pending' else item['id']
+                if identity not in selected:
+                    continue
+                row = {'id': identity, 'section': section,
+                       **{key: item[key] for key in fields if key in item}}
+                history = item.get('attempt_history', [])
+                kept = history if len(history) <= 4 else [history[0], *history[-3:]]
+                row['attempt_history'] = [{key: attempt[key] for key in
+                    ('number', 'started_at', 'finished_at', 'outcome', 'not_sent') if key in attempt}
+                    for attempt in kept]
+                entries.append(row)
+        payload = json.dumps({'run_id': run_id, 'first_id': first_id, 'gate_ids': gate_ids,
+                              'sender_attempts': entries}, separators=(',', ':'))
+        error.add_note(payload if len(payload.encode()) <= 8192 else 'Sender attempt evidence exceeded 8192 bytes')
+    except BaseException as unavailable:
+        error.add_note('Sender attempt evidence unavailable: ' + type(unavailable).__name__)
 
 
 def state_with_round(role: str = "development", outcome: str = "candidate") -> dict[str, Any]:
@@ -170,16 +200,16 @@ def _kernel(root: Path, count: int = 1) -> Kernel:
                          requirements=_source(count))
 
 
+def _completions(kernel: Kernel) -> list[dict[str, Any]]:
+    """Only the selected Run's real Completion projection, never seeded facts."""
+    return [item for item in _project(kernel, "concise") if item["kind"] == "ticket_completed"]
+
+
 def _project(kernel: Kernel, mode: str) -> list[dict[str, Any]]:
     with kernel.storage.transaction(write=False) as tx:
-        run = tx.one("SELECT id,repository,parent_issue,parent_revision,language,created_at FROM runs")
-        title = tx.rows("SELECT title FROM requirement_versions WHERE issue=? AND revision=?",
-                        (run["parent_issue"], run["parent_revision"]))
-        state = {"run_id": run["id"], "repository": run["repository"],
-                 "parent": {"number": run["parent_issue"], "title": title[0][0] if title else ""},
-                 "language": run["language"], "created_at": run["created_at"]}
+        state = event_state(tx)
         frozen = deepcopy(state)
-        result = [projected.content for row in tx.all("SELECT * FROM history ORDER BY position")
+        result = [projected.content for row in tx.all("SELECT * FROM history WHERE run_id=? ORDER BY position", (state['run_id'],))
                   for projected in project_event(tx, dict(row), state, mode) if projected.visible]
         assert state == frozen
         return result

@@ -14,12 +14,14 @@ pytest 不自动联网补包，缺少或损坏时明确失败并提示准备命�
 不能仅凭改动文件名判断已经覆盖所有影响。单个用例仍可直接运行
 `python -m pytest tests/文件.py::用例名 -q`。
 
-`make test` 在一次 pytest 中运行下表前四组快速回归的用例并集，重复目标只选择一次。
+`make test` 在一次 pytest 中运行 Policy、State、Locator 与轻量 Prompt 合同，重复目标只选择一次。
+Prompt 快速合同使用真实配置/渲染器与静态目录预览；实际角色分配、完整 Final 前置和
+修复范围仍由 `make test-prompts` 与 full 完整运行，不因快速入口缩小而删除。
 当前模块及 Locator 精确用例统一列在 `.github/ci/test_scope.py`；不再靠旧模块名或关键词筛选。
 CI 工具回归将该清单和 consumed CLI 合同与真实完整 collection 对照，缺失消费者明确失败。
 各组独立入口和 `make test-report` 继续可用。
 交付、Run、Executor、安装器等重型测试需显式选择模块或运行 `make test-full`。
-快速回归通过仅代表这四组通过；修改重型模块时仍需运行相关用例，不能仅凭默认入口判定修改正确。
+快速回归通过仅代表上述子集通过；修改重型模块时仍需运行相关用例，不能仅凭默认入口判定修改正确。
 
 | 入口 | 验证范围 | 需要补充的直接影响 |
 | --- | --- | --- |
@@ -28,8 +30,8 @@ CI 工具回归将该清单和 consumed CLI 合同与真实完整 collection 对
 | `make test-prompts` | 当前角色上下文与冻结 Prompt 的公开预览 | 请求结构、执行方式改变时补真实 Codex backend 和实际调用方 |
 | `make test-locator` | 当前 Repository / Parent / Run 与准确 state 目录选择 | 登记时机改变时补 Task publication；修改共享选择逻辑时补相关 CLI 动作 |
 | `make test-github` | GitHub adapter、Required Checks、外部监督 | 外部契约改变时补 Delivery / Publication 调用方 |
-| `make test-delivery` | Ticket、Parent-only、公开交付流程 | 共享 Engine 变化时补 Run Repair 和恢复路径 |
-| `make test-run` | Run 生命周期、Acceptance、Repair、Publication、任务控制 | Controller / StateStore / CLI 等直接调用方 |
+| `make test-delivery` | Ticket、Parent-only、公开交付流程 | 共享 Core / WriteAuthority 变化时补 Run Repair 和恢复路径 |
+| `make test-run` | Run 生命周期、Acceptance、Repair、Publication、任务控制 | Core / RepositoryRoute / CLI 等直接调用方 |
 | `make test-executor` | CLI 监督、Run Executor、lease、systemd | 进程执行边界变化时补 Codex backend、安装及恢复 |
 
 前四项适合相应模块的局部反馈；后四项覆盖较广，允许超过一分钟。
@@ -62,10 +64,12 @@ Git 初始模板每个 worker 只创建一次，每个用例复制独立文件�
 
 ## CI 对齐与诊断
 
-CI 每个分片的 `Run tests` 使用 `make test-report TEST_WORKERS=2 PYTEST_ARGS='-v --test-shard-count=2 --test-shard-index=0'`（另一分片为 index 1）。
-必需的 `quality` 只汇总选择、作业结果及两个分片的完整证据，不重复安装环境或执行测试。独立检查有明确的结果核验，失败、取消或意外跳过均不能使汇总通过。分片各自上传独立诊断，仍保留全部集成测试；单个分片的通过不代表全量通过。
+公开 CI 保留两片，每片的 `Run tests` 使用 `make test-report TEST_WORKERS=2 PYTEST_ARGS='-v --test-shard-count=2 --test-shard-index=0'`（另一分片为 index 1）。
+私有根 workflow 使用声明的四片（index 0–3），从 `strategy.job-total` 传递同一分片总数，
+并传入既有 14 个函数族、34 个节点的单个 `-k` 排除表达式；每片仍为两 worker、`max-parallel=2`。
+必需的 `quality` 只汇总选择、作业结果及已声明分片的完整证据，不重复安装环境或执行测试。独立检查有明确的结果核验，失败、取消或意外跳过均不能使汇总通过。分片各自上传独立诊断，仍保留全部未禁集成测试；单个分片的通过不代表全量通过。
 
-成功分片通过 `.github/ci/ci_evidence.py record` 生成 `evidence.json`：只重新收集 nodeid，不重新执行测试，逐项核对该分片的 JUnit 与完整集合应分配的范围。证据绑定仓库、准确提交、workflow run/attempt、workflow 身份、依赖文件以及原始 JUnit/环境报告。`quality` 只接受本次 workflow run 的两个完整分片，并核验相同收集范围和环境配置、互斥覆盖及全部成功结果；缺失、重复、过滤、不一致或跳过的结果明确失败。证据不跨 PR 或 workflow run 复用。同一 run 重跑失败作业时，可保留较早 attempt 的成功分片，仍核验相同候选和覆盖并保留原 attempt；不接受未来 attempt，附件上传覆盖同名旧结果。
+成功分片通过 `.github/ci/ci_evidence.py record` 生成 `evidence.json`：只重新收集 nodeid，不重新执行测试，逐项核对该分片的 JUnit 与完整集合应分配的范围。证据绑定仓库、准确提交、workflow run/attempt、workflow 身份、依赖文件以及原始 JUnit/环境报告。`quality` 只接受本次 workflow run 预先声明数量的完整分片（公开两片、私有四片），并核验相同收集范围和环境配置、互斥覆盖及全部成功结果；缺失、重复、过滤、不一致或跳过的结果明确失败。不能从收到的工件数推断期望片数。证据不跨 PR 或 workflow run 复用。同一 run 重跑失败作业时，可保留较早 attempt 的成功分片，仍核验相同候选和覆盖并保留原 attempt；不接受未来 attempt，附件上传覆盖同名旧结果。
 
 锁定的 pytest 9 将成功 subtest 计入 suite 的 `tests`，并复用父 `testcase`。
 `support.sharding` 在 JUnit controller 从真实报告统计成功 subtests，写入版本化属性

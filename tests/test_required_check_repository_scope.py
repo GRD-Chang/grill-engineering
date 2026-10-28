@@ -90,8 +90,14 @@ def test_required_checks_permission_errors_never_become_unprotected_success(tmp_
 
 
 def test_completed_observation_does_not_hide_a_later_repository_permission_failure(tmp_path, monkeypatch):
-    reader, _ = _reader(tmp_path, monkeypatch)
+    from agent_run.adapters import github_commands as commands
+    reader, log = _reader(tmp_path, monkeypatch)
+    # This is a freshness/error test, not a real-time backoff boundary. Keep
+    # every actual command and its scheduled delays without sleeping here.
+    delays = []
+    monkeypatch.setattr(commands.time, 'sleep', delays.append)
     assert normalize_required_checks(read_required_check_facts(reader, 17, expected_head_sha='2' * 40)).result == 'none'
+    before = len(log.read_text().splitlines())
     path = tmp_path / 'responses.json'
     data = json.loads(path.read_text())
     data['ref_errors'] = {'repos/example/project/git/ref/heads/main': 'HTTP 403 ref unavailable'}
@@ -100,3 +106,7 @@ def test_completed_observation_does_not_hide_a_later_repository_permission_failu
         read_required_check_facts(reader, 17, expected_head_sha='2' * 40)
     assert failed.value.code == 'github_read_failed'
     assert 'HTTP 403' in failed.value.message
+    later = [json.loads(line) for line in log.read_text().splitlines()[before:]]
+    assert sum(command[:2] == ['repo', 'view'] for command in later) == 1
+    assert sum(command[:2] == ['api', 'repos/example/project/git/ref/heads/main'] for command in later) == 3
+    assert len(delays) == 2 and 1 <= delays[0] <= 1.25 and 2 <= delays[1] <= 2.25

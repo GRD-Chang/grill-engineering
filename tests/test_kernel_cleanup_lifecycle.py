@@ -8,6 +8,7 @@ and D/R/P checkouts. These tests are candidate regression probes, not a claim
 that three new Scenario runs are an old/new same-input differential execution.
 """
 from __future__ import annotations
+from support.effect_boundary import _local_marker
 
 from agent_run.contracts.write_authority import WriteAuthority
 
@@ -28,10 +29,6 @@ from support.cleanup_scenarios import _native_scenario, _local_head
 CLEANUP_OPERATIONS = ("cleanup_worktree", "cleanup_local_ref", "cleanup_remote_ref")
 
 
-def _local_marker(scenario: Scenario) -> str:
-    with scenario.kernel.storage.transaction(write=False) as tx:
-        return str(tx.one("SELECT e.before_sha FROM effects e JOIN subjects s ON s.id=e.subject AND s.generation=e.generation WHERE e.subject=? AND e.operation='workspace' AND e.status='confirmed'",
-                          (scenario.delivery.key,))[0])
 
 
 @pytest.mark.parametrize("kind", list(DeliveryKind))

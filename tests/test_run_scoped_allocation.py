@@ -240,3 +240,48 @@ def test_prior_review_reference_cannot_fall_back_to_a_sibling_attempt(scenario):
             # even though the identically named B Attempt exists.
             kernels["A"]._context(tx, run, job, WORLD, Role.DEVELOPMENT)
     assert {run: _rows(db, run) for run in ("A", "B")} == before
+
+
+@pytest.mark.parametrize("boundary", ["current", "foreign", "expired"])
+def test_scripted_preparation_is_only_a_guarded_core_admission(scenario, monkeypatch, boundary):
+    """A pure Core fixture must not recreate credential files/renewal threads.
+
+    This transaction seam is not physical credential or Worker startup proof.
+    NativeCredentialDelivery/Capture integration remains in its boundary tests.
+    """
+    from dataclasses import replace
+    from agent_run.adapters.auth.worker_credentials import NativeCredentialDelivery
+    from support.core_operations import prepare_scripted_agent
+    db, kernels = scenario
+    kernel = kernels["A"]
+    preparation = _allocate(kernel, "A").preparation
+    assert preparation is not None
+    if boundary == "foreign":
+        preparation = replace(preparation, execution=Execution("B", "same-owner", 1))
+    elif boundary == "expired":
+        kernel.clock = lambda: preparation.preparation_deadline
+    before = {run: _rows(db, run) for run in ("A", "B")}
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Core admission cannot launch native credential preparation")
+    monkeypatch.setattr(NativeCredentialDelivery, "start", forbidden)
+    if boundary != "current":
+        with pytest.raises(KernelError, match="preparation_binding|preparation_deadline_exceeded"):
+            prepare_scripted_agent(kernel, preparation)
+        assert {run: _rows(db, run) for run in ("A", "B")} == before
+        return
+    admitted = prepare_scripted_agent(kernel, preparation)
+    call = admitted.call
+    assert call is not None
+    after = {run: _rows(db, run) for run in ("A", "B")}
+    assert prepare_scripted_agent(kernel, admitted) is admitted
+    assert {run: _rows(db, run) for run in ("A", "B")} == after
+    assert (call.execution, call.attempt_id, call.thread_id, call.lease_id, call.context) == (
+        preparation.execution, preparation.attempt_id, preparation.thread_id, preparation.reservation_id, preparation.context)
+    assert call.deadline_at == 107. and call.profile == preparation.profile
+    assert db.execute("SELECT count(*) FROM waits WHERE run_id='A' AND kind='agent_preparation'").fetchone()[0] == 0
+    output = db.execute("SELECT dispatch_state,process_identity,raw_id,started_at FROM invocation_outputs WHERE run_id='A'").fetchone()
+    assert tuple(output) == ("allocated", None, None, None)
+    assert db.execute("SELECT backend_id FROM threads WHERE run_id='A'").fetchone()[0] is None
+    assert db.execute("SELECT developments_used FROM budgets WHERE run_id='A'").fetchone()[0] == 0
+    assert db.execute("SELECT accounted FROM attempts WHERE run_id='A'").fetchone()[0] == 0
+    assert _rows(db, "B") == before["B"]

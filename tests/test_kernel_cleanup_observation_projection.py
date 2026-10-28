@@ -1,4 +1,5 @@
 """Current native cleanup: fresh source authority without unrelated Delivery I/O."""
+from support.effect_boundary import effect_state
 from pathlib import Path
 from dataclasses import replace
 
@@ -105,9 +106,6 @@ def pending_cleanup(tmp_path, monkeypatch, operation="cleanup_worktree", *, sibl
     return s, effect, authority, physical_ports[0], execute
 
 
-def effect_state(s, effect):
-    with s.kernel.storage.transaction(write=False) as tx:
-        return tuple(tx.one("SELECT status,attempts,payload_id FROM effects WHERE id=?", (effect.effect_id,)))
 
 
 @pytest.mark.parametrize("window", [1, 2, 3], ids=["before_lock", "after_lock", "before_command"])

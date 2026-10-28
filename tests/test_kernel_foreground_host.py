@@ -503,7 +503,8 @@ def test_public_observation_refuses_local_evidence_for_a_copied_database(inspect
     monkeypatch.setattr(foreground_host, 'recover_init', forbidden)
     monkeypatch.setattr(foreground_host.ProcessPin, 'open', forbidden)
     before = durable_snapshot(tmp_path)
-    current = read(copied, 'status', expected_run=kernel.storage.run_id).data['current_observation']
+    copied_view = Kernel(copied, run_id=kernel.storage.run_id)
+    current = read(copied, 'status', expected_run=kernel.storage.run_id, storage=copied_view.storage).data['current_observation']
     assert current['host']['disposition'] == 'unknown'
     assert all(item['disposition'] == 'unknown' for item in current['workers'])
     assert durable_snapshot(tmp_path) == before

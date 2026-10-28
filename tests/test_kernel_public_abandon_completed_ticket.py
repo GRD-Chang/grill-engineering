@@ -10,8 +10,9 @@ from agent_run.runtime.package_lease import default_runner_lock_path, runner_man
 from agent_run.core.kernel import Kernel
 from support.managed_abandon_transport import install_currentness
 from support.systemd_manager import (
+    _managed_failure_note,
     _CODEX, _approval_read_barrier, _control_environment, _diagnostic_tail, _git,
-    _hold_host_operation_return, _local_manager, _managed_diagnostics,
+    _hold_host_operation_return, _local_manager,
 )
 
 
@@ -85,10 +86,12 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
                 try:
                     assert not serving.is_alive() and not errors, errors
                 except AssertionError as error:
-                    error.add_note(json.dumps({'stage': 'abandon-host-after-barrier-release',
-                        'facts': _managed_diagnostics(kernel.storage.path, kernel.storage.run_id,
-                            tmp_path / 'roles.jsonl'),
-                        'host_stderr': _diagnostic_tail(tmp_path / 'manager' / 'host.stderr')}))
+                    _managed_failure_note(error, stage='abandon-host-after-barrier-release',
+                        database=kernel.storage.path, run_id=kernel.storage.run_id, roles=tmp_path / 'roles.jsonl')
+                    try:
+                        error.add_note('Host stderr: ' + _diagnostic_tail(tmp_path / 'manager' / 'host.stderr'))
+                    except BaseException as unavailable:
+                        error.add_note('Host stderr unavailable: ' + type(unavailable).__name__)
                     raise
                 assert len(children) == len(commands) == 1 and children[0].returncode == 0, output
                 assert trace == ["fdstore", "barrier", "host_exited", "store_closed"]

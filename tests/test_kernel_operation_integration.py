@@ -10,6 +10,7 @@ from support.offline import GraphScenario
 from support.core_operations import Ports
 from support.requirements_scenarios import independent_source
 from support.notification import _NoNotifications as Notifications
+from support.observer_errors import HeldCompletion
 
 
 def test_github_reader_can_be_imported_cold_in_an_independent_process():
@@ -157,7 +158,9 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
     scenario.requirements = independent_source()
     assert next(issue for issue in ports.source(1).issues if issue.number == 4).state == "OPEN"
     now[0] = 105.25
-    entered, polled, completed, returned = (threading.Event() for _ in range(4))
+    entered, polled = (threading.Event() for _ in range(2))
+    held = HeldCompletion()
+    completed, returned = held.completed, held.returned
     delivery = ports.delivery
     def read(request):
         facts = delivery(request)
@@ -185,11 +188,12 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
         try:
             if call.subject == "ticket:4" and not entered.is_set():
                 now[0] = 111.25
-                entered.set()
-                assert polled.wait(8), "CI poll stalled behind the only Agent worker"
-                assert completed.wait(8), "Ticket merge/close stalled behind the only Agent worker"
-                assert not returned.is_set()
-                returned.set()
+                with held.hold():
+                    entered.set()
+                    assert held.wait(polled, 8), "CI poll stalled behind the only Agent worker"
+                    assert held.wait(completed, 8), "Ticket merge/close stalled behind the only Agent worker"
+                    assert not returned.is_set()
+                    held.mark_returned()
             scenario.select(call.subject)
             kernel.receive(call, scenario.agent(call))
         finally:
@@ -211,7 +215,7 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
             assert any(item["subject"] == "ticket:3" for item in scenario.kernel.source_status()["completions"])
             writes = [item["operation"] for item in scenario.port.writes() if item["subject"] == "ticket:3"]
             assert writes.count("merge") == writes.count("close") == 1
-            completed.set()
+            assert held.complete_if_held(), held.snapshot()
 
     monkeypatch.setattr('agent_run.notifications.sender.NativeNotifications', CompletionObserver)
     # The bounded handshakes verify actual Ticket closeout alongside the Agent.

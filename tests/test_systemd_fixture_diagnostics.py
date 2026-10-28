@@ -9,11 +9,159 @@ import sys
 
 import pytest
 
-from support.systemd_manager import _diagnostic_tail, _executable, _managed_diagnostics
+from support.systemd_manager import _diagnostic_tail, _executable, _managed_diagnostics, _managed_failure_note, MANAGED_NOTE_BYTES
+from support.systemd_manager import SidecarStatTrace
+from agent_run.core.kernel import Kernel
 from support.repository_fixture import create_kernel
 from support.offline import fixture_inputs
 from support.sqlite_faults import logical_state
 from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
+
+
+def test_sidecar_trace_returns_exact_original_stat_once_and_bounds_only_exact_database(tmp_path):
+    database = tmp_path / 'kernel.sqlite3'
+    sidecar = Path(str(database) + '-wal')
+    sidecar.write_bytes(b'Original sidecar bytes')
+    metadata = sidecar.stat(follow_symlinks=False)
+    trace, calls = SidecarStatTrace(database), []
+    def original(path, *args, **kwargs):
+        calls.append((path, args, kwargs))
+        return metadata
+    wrapped = trace.wrap(original)
+    other = tmp_path / 'sibling.sqlite3-wal'
+    assert wrapped(other, follow_symlinks=False) is metadata
+    for _ in range(40):
+        assert wrapped(sidecar, follow_symlinks=False) is metadata
+    failure = ValueError('Original failure')
+    trace.note(failure)
+    facts = json.loads(failure.__notes__[0])
+    assert len(calls) == 41 and all(call[1:] == ((), {'follow_symlinks': False}) for call in calls)
+    assert facts['total_calls'] == 40 and facts['retained_calls'] == 16
+    assert len(facts['sidecar_stat_trace']) == 16 and len(failure.__notes__[0].encode()) <= 8192
+    for row in facts['sidecar_stat_trace']:
+        assert row['suffix'] == '-wal' and row['phase'] == 'completion-poll'
+        assert row['thread'] > 0 and row['monotonic_ns'] > 0 and row['follow_symlinks'] is False
+        assert {key: row[key] for key in ('dev', 'ino', 'mode', 'nlink', 'size')} == dict(
+            dev=metadata.st_dev, ino=metadata.st_ino, mode=metadata.st_mode,
+            nlink=metadata.st_nlink, size=metadata.st_size)
+    assert str(database) not in failure.__notes__[0]
+
+
+@pytest.mark.parametrize('failure_type,number', [(FileNotFoundError, 2),
+    (PermissionError, 13), (KeyboardInterrupt, None)])
+@pytest.mark.parametrize('selected', [False, True])
+def test_sidecar_trace_reraises_exact_exception_without_retry_or_private_detail(tmp_path, failure_type, number, selected):
+    failure = failure_type('Private detail') if number is None else failure_type(number, 'Private detail')
+    database = tmp_path / 'kernel.sqlite3'
+    trace, calls = SidecarStatTrace(database), []
+    path = Path(str(database) + '-shm') if selected else tmp_path / 'other-shm'
+    def original(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise failure
+    with pytest.raises(type(failure)) as caught:
+        trace.wrap(original)(path, follow_symlinks=False)
+    assert caught.value is failure and len(calls) == 1
+    trace.note(failure)
+    facts = json.loads(failure.__notes__[0])
+    assert facts['total_calls'] == int(selected)
+    if selected:
+        assert facts['sidecar_stat_trace'][0]['errno'] == getattr(failure, 'errno', None)
+        assert facts['sidecar_stat_trace'][0]['outcome'] == 'raise'
+    assert 'Private detail' not in failure.__notes__[0]
+
+
+def test_sidecar_recording_failure_cannot_change_stat_return_or_error(tmp_path, monkeypatch):
+    database = tmp_path / 'kernel.sqlite3'
+    sidecar = Path(str(database) + '-wal')
+    sidecar.touch()
+    metadata, trace = sidecar.stat(), SidecarStatTrace(database)
+    def unavailable(_row):
+        raise RuntimeError('Evidence unavailable')
+    monkeypatch.setattr(trace, '_record', unavailable)
+    assert trace.wrap(lambda *_a, **_kw: metadata)(sidecar) is metadata
+    failure = OSError(5, 'Original stat failure')
+    def original(*_args, **_kwargs):
+        raise failure
+    with pytest.raises(OSError) as caught:
+        trace.wrap(original)(sidecar)
+    assert caught.value is failure
+
+
+@pytest.mark.parametrize('suffix', ['-wal', '-shm'])
+@pytest.mark.parametrize('outcome', ['existing', 'replacement', 'unreadable'])
+def test_sidecar_trace_preserves_preflight_zero_link_rejection(tmp_path, monkeypatch, suffix, outcome):
+    from types import SimpleNamespace
+    import stat
+    from agent_run.storage import preflight
+    from agent_run.storage.sqlite import Storage
+    storage = Storage.create(tmp_path / 'kernel.sqlite3', namespace=('example/project', str(tmp_path.resolve())))
+    selected = Path(str(storage.path) + suffix)
+    original, calls, prior_wal = Path.stat, [], []
+    def observed(path, *args, **kwargs):
+        if path != selected:
+            metadata = original(path, *args, **kwargs)
+            if path == Path(str(storage.path) + '-wal'):
+                prior_wal.append(metadata)
+            return metadata
+        calls.append(path)
+        assert len(calls) <= 2 and kwargs == {'follow_symlinks': False}
+        if len(calls) == 2 and outcome == 'unreadable':
+            raise PermissionError(13, 'Controlled refusal')
+        return SimpleNamespace(st_dev=1, st_ino=3 if len(calls) == 2 and outcome == 'replacement' else 2,
+            st_mode=stat.S_IFREG | 0o600, st_nlink=0 if len(calls) == 1 else 1, st_size=32768)
+    monkeypatch.setattr(Path, 'stat', observed)
+    trace = SidecarStatTrace(storage.path)
+    with pytest.raises(preflight.UnsupportedState) as caught:
+        with trace.capture(monkeypatch, finish=lambda: None):
+            with preflight.read_state(storage.path):
+                pytest.fail('Trace allowed unsafe sidecar adoption')
+    assert calls == [selected, selected]
+    facts = json.loads(caught.value.__notes__[-1])
+    rows = facts['sidecar_stat_trace']
+    assert facts['total_calls'] == 2 + int(suffix == '-shm')
+    if suffix == '-shm':
+        assert len(prior_wal) == 1 and rows[0]['suffix'] == '-wal' and rows[0]['outcome'] == 'return'
+        assert {key: rows[0][key] for key in ('dev', 'ino', 'mode', 'nlink', 'size')} == dict(
+            dev=prior_wal[0].st_dev, ino=prior_wal[0].st_ino, mode=prior_wal[0].st_mode,
+            nlink=prior_wal[0].st_nlink, size=prior_wal[0].st_size)
+    selected_rows = [row for row in rows if row['suffix'] == suffix]
+    assert len(selected_rows) == 2 and selected_rows[0]['nlink'] == 0
+    second = selected_rows[1]
+    assert second['outcome'] == ('raise' if outcome == 'unreadable' else 'return')
+    if outcome != 'unreadable':
+        assert second['nlink'] == 1 and second['ino'] == (3 if outcome == 'replacement' else 2)
+
+
+@pytest.mark.parametrize('body_fails', [False, True])
+@pytest.mark.parametrize('timing_fails', [False, True])
+def test_sidecar_capture_keeps_primary_failure_runs_timing_and_restores_stat(tmp_path, monkeypatch,
+                                                                          body_fails, timing_fails):
+    database = tmp_path / 'kernel.sqlite3'
+    sidecar = Path(str(database) + '-wal')
+    sidecar.touch()
+    original_stat, trace, finished = Path.stat, SidecarStatTrace(database), []
+    body_error, timing_error = ValueError('Original failure'), OSError(5, 'Timing failure')
+    def finish():
+        finished.append(True)
+        sidecar.stat(follow_symlinks=False)
+        if timing_fails:
+            raise timing_error
+    failure = None
+    try:
+        with trace.capture(monkeypatch, finish=finish):
+            sidecar.stat(follow_symlinks=False)
+            if body_fails:
+                raise body_error
+    except BaseException as error:
+        failure = error
+    assert Path.stat is original_stat and finished == [True]
+    assert failure is (body_error if body_fails else timing_error if timing_fails else None)
+    if failure is not None:
+        facts = json.loads(failure.__notes__[-1])
+        assert [row['phase'] for row in facts['sidecar_stat_trace']] == ['completion-poll', 'timing-finally']
+        assert facts['total_calls'] == 2
+        if body_fails and timing_fails:
+            assert failure.__notes__[0] == 'Managed timing evidence unavailable: OSError'
 
 
 @pytest.mark.parametrize('kind', ['fifo', 'directory', 'socket', 'symlink'])
@@ -129,13 +277,63 @@ def test_managed_failure_snapshot_is_readonly_exact_run_and_handles_unavailable_
         facts = _managed_diagnostics(database, name, roles)
         assert 'unavailable' not in facts and facts['run']['id'] == name
         assert len(facts['subjects']) == 1 and facts['subjects'][0]['id'] == 'shared-parent'
+        assert facts['run']['executor'] is None and facts['run']['final_action'] is None
+        assert facts['actions'] == []
         assert facts['outputs'] == [] and facts['gates'] == [] and facts['waits'] == []
+        assert all(facts[key] == [] for key in ('attempts', 'leases', 'work_queue', 'integration_queue'))
         assert facts['worker_errors'] == 'FileNotFoundError'
         assert 'PRIVATE_FROZEN_REQUIREMENT' not in json.dumps(facts)
     unavailable = _managed_diagnostics(database, 'absent', roles)
     assert 'unavailable' in unavailable and 'run' not in unavailable
     assert (logical_state(database), database.read_bytes()) == before
     assert not Path(str(roles) + '.errors').exists()
+
+    # Separate normal-control stage: keep the original empty-gate assertions
+    # above, then prove new Action diagnostics cannot mix same-subject Runs.
+    for name in ('one', 'two'):
+        selected = Kernel(database, run_id=name)
+        assert selected.control('stop', name + '-action', subject='shared-parent') == 'applied'
+    after_control = logical_state(database), database.read_bytes()
+    for name in ('one', 'two'):
+        facts = _managed_diagnostics(database, name, roles)
+        assert facts['actions'] == [{'id': name + '-action', 'kind': 'stop',
+            'subject': 'shared-parent', 'status': 'applied'}]
+        assert facts['gates'] == [{'subject': 'shared-parent', 'code': 'operator_stopped'}]
+    assert (logical_state(database), database.read_bytes()) == after_control
+
+
+def test_managed_failure_note_is_structured_bounded_and_keeps_the_original_error(tmp_path, monkeypatch):
+    from support import systemd_manager
+    facts = {'attempts': [{'id': str(i), 'status': 'returned', 'result_id': 'r' * 1000} for i in range(32)],
+        'leases': [], 'work_queue': [{'subject': str(i), 'ready': i} for i in range(32)]}
+    monkeypatch.setattr(systemd_manager, '_managed_diagnostics', lambda *_args: facts)
+    original = ValueError('Original owned failure')
+    with pytest.raises(ValueError) as observed:
+        try:
+            raise original
+        except ValueError as error:
+            _managed_failure_note(error, stage='original-stage', database=tmp_path / 'unused', run_id='A', roles=tmp_path / 'unused-roles')
+            raise
+    assert observed.value is original
+    note, = original.__notes__
+    assert len(note.encode('utf-8')) <= MANAGED_NOTE_BYTES
+    value = json.loads(note)
+    assert value['stage'] == 'original-stage' and value['run_id'] == 'A'
+    assert value['omitted_rows']['attempts'] > 0 and value['facts']['attempts'][0]['status'] == 'returned'
+    assert value['facts']['work_queue'][0] == {'subject': '0', 'ready': 0}
+    assert not (tmp_path / 'unused').exists()
+
+
+@pytest.mark.parametrize('failure', [OSError, KeyboardInterrupt])
+def test_failed_managed_diagnostic_read_cannot_replace_the_original_error(tmp_path, monkeypatch, failure):
+    from support import systemd_manager
+    def failed(*_args):
+        raise failure('Untrusted private diagnostic detail')
+    monkeypatch.setattr(systemd_manager, '_managed_diagnostics', failed)
+    original = AssertionError('Original predicate failed')
+    _managed_failure_note(original, stage='owned-stage', database=tmp_path / 'unused', run_id='A', roles=tmp_path / 'unused-roles')
+    assert original.__notes__ == ['Managed snapshot unavailable: ' + failure.__name__]
+    assert not (tmp_path / 'unused').exists()
 
 
 @pytest.mark.parametrize('outcome', ['success', 'failure', 'oversize', 'unavailable'])
@@ -169,3 +367,29 @@ def test_synthetic_worker_trace_preserves_exit_and_bounds_diagnostics(tmp_path, 
     assert sentinel not in result.stdout + result.stderr
     if outcome != 'success':
         assert 'ValueError: Synthetic Worker failure.' in result.stderr
+
+
+def test_managed_gh_retains_canonical_exact_head_base_filter_without_starting_host(tmp_path, git_repo, monkeypatch):
+    from support.systemd_manager import _control_environment, _git
+    directory = tmp_path / 'managed-fixture'
+    directory.mkdir()
+    environment, state = _control_environment(git_repo, directory, monkeypatch, codex='raise SystemExit(99)')
+    document = json.loads(state.read_text())
+    actual_main = _git(git_repo, 'rev-parse', 'HEAD')
+    document['prs'] = [
+        {'number': number, 'merged': False, 'head': {'ref': head, 'sha': 'a' * 40},
+         'base': {'ref': base, 'sha': actual_main if base == 'main' else 'b' * 40}}
+        for number, head, base in ((17, 'ticket-2', 'run'), (18, 'ticket-3', 'run'), (19, 'ticket-2', 'main'))]
+    state.write_text(json.dumps(document))
+    before = state.read_bytes()
+    gh = directory / 'control-bin' / 'gh'
+    for query, expected in (('head=owner:ticket-2&base=run', [17]),
+                             ('head=owner:ticket-3&base=run', [18]),
+                             ('head=owner:ticket-2&base=main', [19]), ('base=run', [17, 18])):
+        result = subprocess.run([str(gh), 'api', 'repos/example/project/pulls?' + query, '--paginate', '--slurp'],
+            cwd=git_repo, env=environment, capture_output=True, text=True, timeout=5)
+        assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+        page, = json.loads(result.stdout)
+        assert [pull['number'] for pull in page] == expected
+    assert state.read_bytes() == before
+    assert not (directory / 'roles.jsonl').exists()

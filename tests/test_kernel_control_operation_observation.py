@@ -417,6 +417,18 @@ def _delayed_public_recovery_case(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "write_text", delayed)
     import subprocess
     prepared = restorable_public_resume(tmp_path, monkeypatch, "managed-checkout")
+    # This case tests a guardian timeout, not the separate missing-checkout
+    # rejection. Restore the exact retained directory before public admission.
+    assert prepared.database.read_bytes() == prepared.backup
+    original = prepared.saved_checkout.stat()
+    original_git = (prepared.saved_checkout / ".git").stat()
+    assert not prepared.checkout.exists()
+    prepared.saved_checkout.rename(prepared.checkout)
+    restored = prepared.checkout.stat()
+    restored_git = (prepared.checkout / ".git").stat()
+    assert (restored.st_dev, restored.st_ino) == (original.st_dev, original.st_ino)
+    assert (restored_git.st_dev, restored_git.st_ino) == (original_git.st_dev, original_git.st_ino)
+    assert prepared.database.read_bytes() == prepared.backup
     result = subprocess.run(prepared.command, env=prepared.environment, cwd=tmp_path,
                             text=True, capture_output=True, timeout=15)
     pytest.fail("Delayed recovery returned before the expected guardian timeout: " + repr({
@@ -570,3 +582,50 @@ def test_guardian_timeout_scope_reaps_only_its_exact_receipted_child(tmp_path, m
                     guardian.terminate()
             finally:
                 guardian.wait(timeout=3)
+
+
+@pytest.mark.parametrize('database_changed', [False, True], ids=['original', 'changed-database'])
+def test_delayed_recovery_restores_original_checkout_before_its_timeout_window(tmp_path, monkeypatch, database_changed):
+    """Preparation order only; no guardian, Host, Worker or process is started."""
+    import subprocess
+    from types import SimpleNamespace
+    saved, checkout = tmp_path / 'trusted-checkout', tmp_path / 'original-checkout'
+    saved.mkdir()
+    (saved / '.git').mkdir()
+    (saved / 'original.txt').write_bytes(b'Original retained work\x00\xff')
+    identity = saved.stat().st_dev, saved.stat().st_ino
+    git_identity = (saved / '.git').stat().st_dev, (saved / '.git').stat().st_ino
+    database = tmp_path / 'original.sqlite3'
+    backup = b'Original retained database bytes'
+    database.write_bytes(backup + (b'changed' if database_changed else b''))
+    before = database.read_bytes()
+    command, environment = ['unexecuted-private-resume'], {'HOME': str(tmp_path)}
+    prepared = SimpleNamespace(saved_checkout=saved, checkout=checkout, database=database,
+        backup=backup, damaged=before, command=command, environment=environment)
+    module = __import__(__name__)
+    def preparation(root, patch, missing):
+        assert root == tmp_path and patch is monkeypatch and missing == 'managed-checkout'
+        return prepared
+    monkeypatch.setattr(module, 'restorable_public_resume', preparation)
+    timeout = subprocess.TimeoutExpired(command, 15)
+    calls = []
+    def resume(arguments, **options):
+        calls.append(arguments)
+        assert arguments is command and options['env'] is environment
+        assert options['cwd'] == tmp_path and options['timeout'] == 15
+        assert not saved.exists() and checkout.is_dir()
+        assert (checkout.stat().st_dev, checkout.stat().st_ino) == identity
+        assert ((checkout / '.git').stat().st_dev, (checkout / '.git').stat().st_ino) == git_identity
+        assert (checkout / 'original.txt').read_bytes() == b'Original retained work\x00\xff'
+        assert database.read_bytes() == backup
+        raise timeout
+    monkeypatch.setattr(subprocess, 'run', resume)
+    if database_changed:
+        with pytest.raises(AssertionError):
+            _delayed_public_recovery_case.__wrapped__(tmp_path, monkeypatch)
+        assert calls == [] and saved.is_dir() and not checkout.exists()
+    else:
+        with pytest.raises(subprocess.TimeoutExpired) as failed:
+            _delayed_public_recovery_case.__wrapped__(tmp_path, monkeypatch)
+        assert failed.value is timeout and calls == [command]
+    assert database.read_bytes() == before

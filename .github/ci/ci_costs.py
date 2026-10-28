@@ -42,6 +42,8 @@ def step_phase(job: str, step: str) -> str:
         return "cold_start"
     if step in DEPENDENCIES:
         return "dependencies"
+    if job == 'native-boundary-regression (not full acceptance)' and step == 'Run fixed native boundary regression':
+        return 'tests'
     if step == "Run tests":
         return "tests" if job.startswith("product-tests (") else "checks"
     return "checks" if step in CHECKS else "other"
@@ -68,6 +70,9 @@ def summarize(run: dict, jobs: list[dict], observed_at: str) -> dict:
         if job["name"].startswith("product-tests ("):
             required |= {"Set up Python", "Install system dependencies", "Prepare verified SQLite runtime",
                          "Install product and development tools", "Run tests", "Record complete test shard"}
+        elif job['name'] == 'native-boundary-regression (not full acceptance)':
+            required |= {'Set up Python', 'Prepare verified SQLite runtime',
+                         'Install product and development tools', 'Run fixed native boundary regression'}
         elif job["name"] == "quality":
             required |= {"Verify selection", "Run tests"}
         for name in sorted(required - {step["name"] for step in steps}):

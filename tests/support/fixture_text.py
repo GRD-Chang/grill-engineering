@@ -2,6 +2,13 @@
 import os
 
 
+def replace_once(text, original, replacement):
+    """Transform one declared fixture boundary; fail before executing drifted code."""
+    if not original or text.count(original) != 1:
+        raise ValueError('Fixture source boundary must occur exactly once')
+    return text.replace(original, replacement, 1)
+
+
 def read_text(filename):
     # normpath only recognizes the fast path. Its result never replaces input.
     if not isinstance(filename, str) or os.path.normpath(filename) != filename:

@@ -59,7 +59,7 @@ def prepared_generation_two_cleanup(tmp_path: Path, monkeypatch, foreign_move: b
         if effect.operation in kernel.CLEANUP:
             cleanups.append(effect)
             with kernel.storage.transaction(write=False) as tx:
-                workspace = tx.one("SELECT * FROM effects WHERE subject=? AND generation=2 AND operation='workspace' AND status='confirmed'", (subject,))
+                workspace = tx.one("SELECT * FROM effects WHERE run_id=? AND subject=? AND generation=2 AND operation='workspace' AND status='confirmed'", (kernel.storage.run_id, subject))
                 intent = json.loads(tx.get(workspace["payload_id"], subject))
             assert intent["create_ref"] is True and workspace["source_ref"] == replacement.source_ref
             marker[:] = [workspace["before_sha"]]

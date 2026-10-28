@@ -27,6 +27,18 @@ def job(name, start, end, *, steps=(), conclusion="success", created=0, runner=1
 
 
 class CostTests(unittest.TestCase):
+    def test_boundary_cost_is_visible_separately_from_full_test_shards(self):
+        name = 'native-boundary-regression (not full acceptance)'
+        jobs = [job(name, 0, 30, conclusion='failure', steps=(
+            ('Run fixed native boundary regression', 10, 25, 'failure'),))]
+        self.run['conclusion'] = 'failure'
+        report = summarize(self.run, jobs, stamp(35))
+        step, = [item for item in report['jobs'][0]['steps'] if item['name'] == 'Run fixed native boundary regression']
+        self.assertEqual((step['phase'], step['seconds'], step['conclusion']), ('tests', 15, 'failure'))
+        self.assertIn(name + ' / Run fixed native boundary regression', markdown(report))
+        self.assertIsNone(report['necessary_checks_seconds'])
+        self.assertIsNone(report['necessary_checks_conclusion'])
+
     def test_product_package_setup_and_validation_have_separate_cost_phases(self):
         self.assertEqual(step_phase("quality", "Prepare product package test dependencies"), "dependencies")
         self.assertEqual(step_phase("product-tests (1)", "Run sync tests"), "checks")

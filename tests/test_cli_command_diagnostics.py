@@ -12,18 +12,28 @@ import pytest
 
 
 def test_resume_without_a_managed_workspace_explains_how_to_start(tmp_path: Path) -> None:
+    from agent_run.adapters.workspace import ManagedWorkspace
+    from support.environment import durable_snapshot
+
     environment = os.environ.copy()
-    environment['PYTHONPATH'] = str(Path(__file__).parents[1] / 'src')
+    workspace = ManagedWorkspace.for_repository('example/project')
+    before = durable_snapshot(tmp_path)
+    assert not workspace.root.exists()
     result = subprocess.run(
-        [sys.executable, '-m', 'agent_run', 'resume', '213',
+        [sys.executable, '-I', '-m', 'agent_run', 'resume', '213',
          '--repo', 'example/project', '--json'],
         cwd=tmp_path, env=environment, text=True, capture_output=True, check=False,
     )
     assert result.returncode == 2
-    diagnostic = json.loads(result.stdout)['diagnostics'][0]
-    assert diagnostic['code'] == 'unsupported_state'
-    assert diagnostic['reason'] == 'unreadable_state' and diagnostic['recovery_hint']
-    assert not Path(diagnostic['path']).exists()
+    document = json.loads(result.stdout)
+    diagnostic, = document['diagnostics']
+    assert document['result'] == 'error' and document['status'] == 'command_failed'
+    assert diagnostic['code'] == 'run_locator_missing'
+    assert 'agent-run runs --repo OWNER/NAME' in diagnostic['message']
+    assert 'agent-run run PARENT --repo OWNER/NAME' in diagnostic['message']
+    assert result.stderr == ''
+    assert not workspace.root.exists() and not (workspace.state_root / 'kernel.sqlite3').exists()
+    assert durable_snapshot(tmp_path) == before
     assert not (tmp_path / '.agent-run').exists()
 
 
@@ -76,7 +86,7 @@ def test_invalid_choice_localizes_copy_and_preserves_argument_facts(
 
 @pytest.mark.parametrize("language", ["zh", "en"])
 @pytest.mark.parametrize("as_json", [False, True], ids=["plain", "json"])
-@pytest.mark.parametrize('authority', ['absent', 'empty'])
+@pytest.mark.parametrize('authority', ['absent', 'empty', 'lost-state'])
 def test_missing_run_keeps_current_code_and_explains_discovery_before_creation(
     tmp_path: Path, monkeypatch, capsys, language: str, as_json: bool, authority: str,
 ) -> None:
@@ -93,16 +103,18 @@ def test_missing_run_keeps_current_code_and_explains_discovery_before_creation(
     workspace = ManagedWorkspace.for_repository('example/project')
     if authority == 'empty':
         RepositoryRoute.for_workspace(workspace).initialize()
+    elif authority == 'lost-state':
+        workspace.root.mkdir(parents=True)
     before = durable_snapshot(workspace.root)
     arguments = ["resume", "213", "--repo", "example/project"]
     assert main([*arguments, *(["--json"] if as_json else [])]) == 2
     captured = capsys.readouterr()
     assert captured.err == ""
-    code = 'unsupported_state' if authority == 'absent' else 'run_locator_missing'
+    code = 'unsupported_state' if authority == 'lost-state' else 'run_locator_missing'
     if as_json:
         diagnostic = json.loads(captured.out)["diagnostics"][0]
         assert diagnostic['code'] == code
-        if authority == 'absent':
+        if authority == 'lost-state':
             assert diagnostic['reason'] == 'unreadable_state'
             assert diagnostic['path'] == str(workspace.state_root / 'kernel.sqlite3')
             message = diagnostic['recovery_hint']
@@ -110,12 +122,12 @@ def test_missing_run_keeps_current_code_and_explains_discovery_before_creation(
             message = diagnostic['message']
     else:
         assert code in captured.out
-        if authority == 'absent':
+        if authority == 'lost-state':
             assert str(workspace.state_root / 'kernel.sqlite3') in captured.out
         message = captured.out
-    # An absent requested authority is not proof of an empty Task. Retain the
-    # exact preservation/recovery diagnosis instead of suggesting recreation.
-    if authority == 'absent':
+    # A repository that lost its state remains a preservation/recovery case.
+    # An entirely absent repository and an empty valid registry have no Run.
+    if authority == 'lost-state':
         assert 'Preserve the database and sidecars' in message
     else:
         assert ("找不到匹配的 Run" if language == "zh" else "No matching Run") in message

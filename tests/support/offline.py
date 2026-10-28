@@ -734,8 +734,8 @@ class Scenario:
         current = self.kernel.status(self.delivery.key)
         projected = self.observable(script["id"], Step("complete", self.delivery.key))
         with self.kernel.storage.transaction(write=False) as tx:
-            publication = tx.one("SELECT result_id FROM attempts WHERE subject=? AND generation=? AND role='publication' AND status='consumed' ORDER BY ordinal DESC LIMIT 1",
-                                 (self.delivery.key, current["generation"]))
+            publication = tx.one("SELECT result_id FROM attempts WHERE run_id=? AND subject=? AND generation=? AND role='publication' AND status='consumed' ORDER BY ordinal DESC LIMIT 1",
+                                 (self.kernel.storage.run_id, self.delivery.key, current["generation"]))
             publication_wire = json.loads(tx.get(publication[0], self.delivery.key))
         approval = any(checkpoint["phase"] == "approval" for checkpoint in self.checkpoints)
         historical = script.get("completed_ticket_precondition")

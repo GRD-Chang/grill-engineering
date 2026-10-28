@@ -266,6 +266,17 @@ def test_status_capacity_and_damaged_records_leave_business_untouched(tmp_path, 
     assert api.reads == 0 and api.commands == []
     assert database.read_bytes() == before
     assert sender.deliver(subject, api=api) == "confirmed"
+    # Keep the real sender's missing-field rejection on this already-published
+    # Run; the pure field matrix below needs no duplicate delivery/Host setup.
+    with outbox.transaction(database.parent, scenario.spec.run_id) as document:
+        entry, = document["remote_status"]["bindings"].values()
+        intent = entry.pop("intent")
+    count, commands = api.reads, list(api.commands)
+    assert sender.deliver(subject, api=api) == "unavailable"
+    assert api.commands == commands and api.reads == count
+    with outbox.transaction(database.parent, scenario.spec.run_id) as document:
+        entry, = document["remote_status"]["bindings"].values()
+        entry["intent"] = intent
     path = outbox.notification_path(database.parent, scenario.spec.run_id)
     path.write_text('{"remote_status":')
     assert sender.deliver(subject, api=api) == "unavailable"
@@ -369,17 +380,16 @@ def test_status_denied_post_and_failed_readback_keep_observed_exit_without_retry
     assert database.read_bytes() == before
 
 
-def test_status_missing_intent_field_is_damaged_display_not_business_exception(tmp_path, monkeypatch):
-    scenario = published(tmp_path, monkeypatch)
-    database, subject = scenario.kernel.storage.path, scenario.delivery.key
-    sender = StatusComments(database, storage=scenario.kernel.storage)
-    sender.stage(subject)
-    with outbox.transaction(database.parent, scenario.spec.run_id) as document:
-        entry, = document["remote_status"]["bindings"].values()
-        del entry["intent"]
-    api = CommentsAPI(project_status(database, subject, storage=scenario.kernel.storage).target)
-    assert sender.deliver(subject, api=api) == "unavailable"
-    assert api.commands == [] and api.reads == 0
+@pytest.mark.parametrize("field", ["target", "marker", "comment_id", "confirmed_body", "intent"])
+def test_status_missing_intent_field_is_damaged_display_not_business_exception(confirmed_display_receipt, field):
+    # Journal-shape validation only, not proof of a real publication/dispatch.
+    # test_status_capacity_and_damaged_records_leave_business_untouched above
+    # retains the actual sender rejection, zero remote reads and Core isolation.
+    projection, document, _comments, _writes = confirmed_display_receipt
+    entry, = document["remote_status"]["bindings"].values()
+    del entry[field]
+    with pytest.raises(ValueError, match="Status binding changed"):
+        StatusComments._entry(document, projection)
 
 
 def test_status_and_existing_enabled_sender_share_one_original_run_binding(tmp_path, monkeypatch):
@@ -552,7 +562,7 @@ def test_automatic_unknown_status_is_not_polled_by_clock_or_passive_queries(tmp_
         wait_until(unresolved, timeout=5)
         reads = api.reads
         for _ in range(3):
-            read(database, "status", expected_run=scenario.spec.run_id)
+            read(database, "status", expected_run=scenario.spec.run_id, storage=scenario.kernel.storage)
             observer.observe_committed()
     finally:
         observer.close()

@@ -114,6 +114,20 @@ def test_catalog_routes_fixed_facts_and_original_evidence_through_shared_rendere
                 assert evidence["pr_number"] == 3
                 assert evidence["logs"] == "【示例原始日志】AssertionError: expected greeting\r\n"
                 assert json.dumps(evidence, ensure_ascii=False, indent=2, sort_keys=True) in prompt
+                # Six pure scope/stage cells per language use the actual
+                # renderer. Allocation/head changes remain in the three real
+                # workflow chains in test_kernel_prompt_facts.
+                facts = context["facts"]
+                previous = facts.get("previous_review_identity")
+                expected_base = (previous["reviewed_candidate_sha"] if previous
+                                 else evidence["head_sha"])
+                assert context["review_range"]["base_sha"] == expected_base
+                assert expected_base != request["current_review_identity"]["reviewed_base_sha"]
+                assert facts["development_summary"] in prompt
+                if previous:
+                    original_artifact = facts["previous_acceptance_artifact"]
+                    assert original_artifact["checks"]["spec"]["status"] == "fail"
+                    assert json.dumps(original_artifact, ensure_ascii=False, indent=2, sort_keys=True) in prompt
             if "integration-review" in name:
                 evidence = context["facts"]["integration_record"]
                 assert json.dumps(evidence, ensure_ascii=False, indent=2, sort_keys=True) in prompt
