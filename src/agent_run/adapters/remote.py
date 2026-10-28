@@ -652,12 +652,24 @@ class RemoteEffects:
     def delivery(self, request: DeliveryRead) -> DeliveryFacts:
         """Read exact Core-supplied refs and immutable ancestry anchors."""
         from agent_run.core.operation_contract import DeliveryFacts
+        commits: dict[str, Commit] = {}
+        reused: set[str] = set()
+        def read_commit(sha: str) -> Commit:
+            sha = _sha(sha)
+            if sha in commits:
+                reused.add(sha)
+                return commits[sha]
+            return self._commit(sha)[0]
         source_sha, target_sha = read_remote_heads(self.root, request.source_ref, request.target_ref,
                                                   runner_identity=self.identity, remote=self.remote)
-        source = None if source_sha is None else self._commit(source_sha)[0]
-        target = None if target_sha is None else self._commit(target_sha)[0]
+        source = None if source_sha is None else read_commit(source_sha)
+        if source is not None:
+            commits[source.sha] = source
+        target = None if target_sha is None else read_commit(target_sha)
+        if target is not None:
+            commits[target.sha] = target
         raw_pr = self._find_pr(request.source_ref, request.target_ref, request.pr_number) if request.read_pr else None
-        pr = None if raw_pr is None else self._pr(raw_pr)
+        pr = None if raw_pr is None else self._pr(raw_pr, read_commit=read_commit)
         heads = set(request.anchors) | {head for head in (source_sha, target_sha) if head is not None}
         if pr is not None:
             heads.add(pr.base.sha)
@@ -666,6 +678,16 @@ class RemoteEffects:
         prepared = sorted({_sha(head) for head in heads})
         for head in prepared:
             self._prepare_ancestor_object(head)
+        if reused:
+            # Do not let reuse hide inconsistent API tree evidence. Resolve the
+            # exact immutable objects already prepared above, without decoding
+            # commit messages or deriving parents from shallow/grafted history.
+            identities = sorted(reused)
+            objects = self.git.run("log", "--no-patch", "--no-walk=unsorted", "--format=%H %T",
+                "--encoding=UTF-8", "--no-use-mailmap", "--no-show-signature", "--no-notes", "--no-color",
+                *identities, "--").stdout.splitlines()
+            if objects != [sha + " " + commits[sha].tree for sha in identities]:
+                raise GitHubReadError("github_observation_pending", "Commit object and API tree do not agree")
         ancestry = tuple((before, after) for before in prepared for after in prepared
                          if before == after or self.git.is_ancestor(before, after))
         checks = None
@@ -828,13 +850,16 @@ class RemoteEffects:
         return (Commit(sha, _sha(data["tree"]["sha"])), tuple(_sha(p["sha"]) for p in data["parents"]),
                 message if isinstance(message, str) else None)
 
-    def _pr(self, data: Mapping[str, Any]) -> PullRequest:
+    def _pr(self, data: Mapping[str, Any], *,
+            read_commit: Callable[[str], Commit] | None = None) -> PullRequest:
+        commit = (lambda sha: self._commit(sha)[0]) if read_commit is None else read_commit
         head, base = data["head"], data["base"]
         repository = _text(base["repo"]["full_name"])
         head_repository = None if head.get("repo") is None else _text(head["repo"]["full_name"])
         merged = None
-        base_commit = self._commit(_sha(base["sha"]))[0]
+        base_commit = commit(_sha(base["sha"]))
         if data.get("merged"):
+            # Parent order is separate receipt evidence; keep its original fresh read.
             merged, parents, _ = self._commit(_sha(data["merge_commit_sha"]))
             if not parents:
                 raise ValueError("merged commit has no original base parent")
@@ -842,7 +867,7 @@ class RemoteEffects:
             # live base-branch pointer. Its actual first parent is that base.
             base_commit = self._commit(parents[0])[0]
         return PullRequest(_number(data["number"]), repository, "refs/heads/" + _text(head["ref"]),
-            "refs/heads/" + _text(base["ref"]), self._commit(_sha(head["sha"]))[0], base_commit,
+            "refs/heads/" + _text(base["ref"]), commit(_sha(head["sha"])), base_commit,
             _text(data["title"]), _string(data["body"]), "MERGED" if merged else _text(data["state"]).upper(),
             _login(data.get("user")), merged, head_repository)
 

@@ -38,7 +38,7 @@ def test_delivery_prepares_each_exact_sha_once(tmp_path, monkeypatch, count):
     facts = port.delivery(query(effect, heads + heads))
     assert facts.ancestry == old
     assert facts.source == facts.target == effect.base
-    assert Counter(c[0] for c in calls) == {'cat-file': count, 'merge-base': count * (count - 1)}
+    assert Counter(c[0] for c in calls) == {'cat-file': count, 'merge-base': count * (count - 1), 'log': 1}
     # Independent real-Git oracle, including both directions and self pairs.
     for a in heads:
         for b in heads:
