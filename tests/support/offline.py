@@ -191,7 +191,12 @@ class OfflinePort:
             details = () if checks_result == "none" else (("required", checks_result),)
             checks = Checks(pr.number, pr.head.sha, checks_result, details,
                             "Raw synthetic failed job log" if checks_result == "fail" else "")
-        source, target = self.remote_commit(request.source_ref), self.remote_commit(request.target_ref)
+        # Share preparation only for this observation. Each refs/fetch method
+        # still revalidates ownership in the original order; no World or write
+        # authority is cached, and the next observation prepares anew.
+        physical = self.physical
+        source = self.remote_commit(request.source_ref, physical=physical)
+        target = self.remote_commit(request.target_ref, physical=physical)
         ancestry_heads = set(request.anchors) | {head.sha for head in (source, target) if head is not None}
         ancestry = tuple((before, after) for before in sorted(ancestry_heads) for after in sorted(ancestry_heads)
                          if before == after or self.git.is_ancestor(before, after))
@@ -219,11 +224,11 @@ class OfflinePort:
     def remote_refs(self) -> dict[str, str]:
         return self.physical.refs()
 
-    def remote_commit(self, ref: str) -> Commit | None:
-        head = self.remote_refs().get(ref)
+    def remote_commit(self, ref: str, *, physical: OfflineGit | None = None) -> Commit | None:
+        head = (self.remote_refs() if physical is None else physical.refs()).get(ref)
         if head is None:
             return None
-        self.physical.fetch(head)
+        (self.physical if physical is None else physical).fetch(head)
         return self.git.commit(head)
 
 
