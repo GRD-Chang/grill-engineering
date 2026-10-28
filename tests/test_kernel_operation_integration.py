@@ -208,14 +208,16 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
             if scenario.kernel.status("ticket:3")["phase"] != "complete":
                 return
             assert polled.is_set() and not returned.is_set()
+            assert any(item["subject"] == "ticket:3" for item in scenario.kernel.source_status()["completions"])
+            # Acknowledge actual Core completion within the original deadline.
+            # Subsequent acceptance I/O must not keep the Worker handshake open.
+            assert held.complete_if_held(), held.snapshot()
             pr = scenario.port.pull_request_by_ref("refs/heads/ticket-3", "refs/heads/run")
             assert pr is not None and pr.merged is not None
             assert scenario.port.remote_commit("refs/heads/run") == pr.merged
             assert scenario.port.objects.issue(3)["state"] == "closed"
-            assert any(item["subject"] == "ticket:3" for item in scenario.kernel.source_status()["completions"])
             writes = [item["operation"] for item in scenario.port.writes() if item["subject"] == "ticket:3"]
             assert writes.count("merge") == writes.count("close") == 1
-            assert held.complete_if_held(), held.snapshot()
 
     monkeypatch.setattr('agent_run.notifications.sender.NativeNotifications', CompletionObserver)
     # The bounded handshakes verify actual Ticket closeout alongside the Agent.

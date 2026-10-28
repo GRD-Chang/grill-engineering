@@ -81,6 +81,36 @@ def test_return_without_real_completion_is_rejected():
         assert not held.returned.is_set()
 
 
+@pytest.mark.parametrize('completed_at', [107.5, 108.0, 108.5])
+def test_completion_deadline_precedes_additional_acceptance_io(monkeypatch, completed_at):
+    held, now, acknowledgements = HeldCompletion(), [100.0], []
+    monkeypatch.setattr(observer_errors, 'monotonic', lambda: now[0])
+
+    def observe_completion(timeout):
+        assert timeout == 8
+        now[0] = completed_at
+        acknowledgements.append(held.complete_if_held())
+        return held.completed.is_set()
+
+    # A controlled scheduling boundary, not a Core Completion producer. The
+    # integration story must obtain its evidence from the real Kernel.
+    monkeypatch.setattr(held.completed, 'wait', observe_completion)
+    with held.hold():
+        ready = held.wait(held.completed, 8)
+        assert ready is (completed_at < 108.0)
+        if ready:
+            held.mark_returned()
+            # Extra Git/API acceptance can finish after the old deadline once
+            # the Worker has consumed its timely completion acknowledgement.
+            now[0] = 120.0
+            assert held.snapshot() == dict(held=True, timed_out=False, completed=True, returned=True)
+        else:
+            assert held.snapshot() == dict(held=True, timed_out=True, completed=False, returned=False)
+            with pytest.raises(AssertionError):
+                held.mark_returned()
+    assert acknowledgements == [completed_at < 108.0]
+
+
 def test_sender_unknown_conversion_cannot_hide_original_transport_assertion():
     errors, failure = ObserverErrors(), AssertionError('Original transport ordering failure')
     try:
