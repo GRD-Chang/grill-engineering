@@ -6,6 +6,20 @@ from contextlib import contextmanager
 from threading import Event, Lock
 from time import monotonic
 
+from agent_run.storage.run_scope import transaction_scope
+
+
+COMPLETION_SNAPSHOT_SQL = """SELECT s.phase, EXISTS(
+    SELECT 1 FROM completions c WHERE c.run_id=s.run_id AND c.subject=s.id
+) AS completed FROM subjects s WHERE s.run_id=? AND s.id=?"""
+
+
+def completion_snapshot(tx, subject: str) -> tuple[str, bool]:
+    """Read phase and the original any-Completion predicate in one Run snapshot."""
+    selected = transaction_scope(tx)
+    row = tx.one(COMPLETION_SNAPSHOT_SQL, (selected.run_id, subject))
+    return row['phase'], bool(row['completed'])
+
 
 class HeldCompletion:
     """A completion is evidence only while the original synthetic Worker waits."""

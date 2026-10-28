@@ -10,7 +10,7 @@ from support.offline import GraphScenario
 from support.core_operations import Ports
 from support.requirements_scenarios import independent_source
 from support.notification import _NoNotifications as Notifications
-from support.observer_errors import HeldCompletion
+from support.observer_errors import HeldCompletion, completion_snapshot
 
 
 def test_github_reader_can_be_imported_cold_in_an_independent_process():
@@ -205,13 +205,17 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
             # Completion while B is still blocked in its first Agent call.
             if not entered.is_set() or completed.is_set():
                 return
-            if scenario.kernel.status("ticket:3")["phase"] != "complete":
+            with scenario.kernel.storage.transaction(write=False) as tx:
+                phase, has_completion = completion_snapshot(tx, "ticket:3")
+            if phase != "complete":
                 return
             assert polled.is_set() and not returned.is_set()
-            assert any(item["subject"] == "ticket:3" for item in scenario.kernel.source_status()["completions"])
+            assert has_completion
             # Acknowledge actual Core completion within the original deadline.
             # Subsequent acceptance I/O must not keep the Worker handshake open.
             assert held.complete_if_held(), held.snapshot()
+            assert scenario.kernel.status("ticket:3")["phase"] == "complete"
+            assert any(item["subject"] == "ticket:3" for item in scenario.kernel.source_status()["completions"])
             pr = scenario.port.pull_request_by_ref("refs/heads/ticket-3", "refs/heads/run")
             assert pr is not None and pr.merged is not None
             assert scenario.port.remote_commit("refs/heads/run") == pr.merged
