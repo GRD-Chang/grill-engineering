@@ -996,6 +996,40 @@ def test_native_calling_task_clock_uses_linux_top_level_offsets(monkeypatch):
         clock.close()
 
 
+def test_native_nonleader_thread_clock_uses_its_own_top_level_offsets(monkeypatch):
+    """Real calling TID and namespace pin; no clock or procfs substitutes."""
+    import os
+    from threading import Thread
+
+    opened, failures, observed = [], [], []
+    original = save_order.os.open
+
+    def capture(path, *args, **kwargs):
+        opened.append(str(path))
+        return original(path, *args, **kwargs)
+
+    def probe():
+        try:
+            with closing(SaveClock()) as clock:
+                clock.require()
+                observed.append(get_native_id())
+        except BaseException as error:
+            failures.append(error)
+
+    monkeypatch.setattr(save_order.os, 'open', capture)
+    thread = Thread(target=probe, daemon=True)
+    thread.start()
+    thread.join(5)
+    assert not thread.is_alive(), 'Native calling-task clock probe did not return'
+    if failures:
+        raise failures[0]
+    tid, = observed
+    assert tid != os.getpid()
+    assert f'/proc/{tid}/timens_offsets' in opened
+    assert f'/proc/{os.getpid()}/timens_offsets' not in opened
+    assert '/proc/thread-self/timens_offsets' not in opened
+
+
 def test_native_clock_reads_top_level_calling_tid_offsets_not_group_leader(native_task_observation, monkeypatch):
     observed = native_task_observation
     native_tid = get_native_id()

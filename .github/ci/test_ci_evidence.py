@@ -81,6 +81,33 @@ class CurrentCollectionTests(unittest.TestCase):
         # inventory. Existing receipt verification requires the entire set.
         self.assertTrue(set(targets) < set(self.nodes))
 
+    def test_native_contracts_are_exact_current_subsets_and_keep_boundary_unchanged(self):
+        targets = scope.selection('native-contract')
+        self.assertEqual(targets, scope.NATIVE_CONTRACT_TESTS)
+        self.assertEqual(len(targets), len(set(targets)))
+        selected = evidence.collect_nodeids(targets)
+        self.assertTrue(set(selected) < set(self.nodes))
+        self.assertTrue(all(any(node == target or node.startswith(target + '[') for node in selected)
+                            for target in targets))
+        self.assertIn('tests/test_repository_save_fifo.py::test_native_calling_task_clock_uses_linux_top_level_offsets', targets)
+        self.assertIn('tests/test_repository_save_fifo.py::test_native_nonleader_thread_clock_uses_its_own_top_level_offsets', targets)
+        self.assertEqual(len(scope.BOUNDARY_TESTS), 14)
+
+    def test_local_contract_entry_stops_before_pytest_when_capability_check_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            calls = root / 'calls.json'
+            interpreter = root / 'python-control'
+            interpreter.write_text(f'#!{sys.executable}\nimport json, sys\nfrom pathlib import Path\n'
+                                   f'Path({str(calls)!r}).write_text(json.dumps(sys.argv[1:]))\nsys.exit(2)\n')
+            interpreter.chmod(0o700)
+            result = subprocess.run(['make', 'test-native-contracts', f'PYTHON={interpreter}'],
+                                    cwd=evidence.PRODUCT_ROOT, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(json.loads(calls.read_text()),
+                             ['tests/support/report_environment.py', '--require-native'])
+            self.assertNotIn('-m pytest', result.stdout)
+
     def test_named_make_groups_only_select_collected_current_targets(self):
         for group in ("policy", "state", "prompts", "locator", "github", "delivery", "run", "executor"):
             output = subprocess.check_output(
@@ -106,6 +133,42 @@ class CurrentCollectionTests(unittest.TestCase):
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_native_contracts_require_current_exact_junit_without_full_receipt(self):
+        folder = self.root / 'native-contracts'
+        folder.mkdir()
+        current_report = dict(self.report, ci_identity=evidence.identity())
+        (folder / 'environment.json').write_text(json.dumps(current_report))
+        nodes = ['tests/test_component.py::test_contract[a]', 'tests/test_component.py::test_contract[b]']
+        with patch.object(evidence, 'collect_nodeids', return_value=nodes) as collected:
+            self.junit(folder, nodes)
+            self.assertEqual(evidence.check_native_contracts(folder), 2)
+            collected.assert_called_once_with(scope.NATIVE_CONTRACT_TESTS)
+            for changed in (nodes[:-1], nodes + [nodes[0]], nodes + ['tests/test_unexpected.py::test_extra']):
+                self.junit(folder, changed)
+                with self.subTest(nodes=changed), self.assertRaises(ValueError):
+                    evidence.check_native_contracts(folder)
+            for outcome in ('skipped', 'failure', 'error'):
+                self.junit(folder, nodes)
+                tree = ET.parse(folder / 'junit.xml')
+                suite = tree.getroot().find('testsuite')
+                suite.set({'skipped': 'skipped', 'failure': 'failures', 'error': 'errors'}[outcome], '1')
+                ET.SubElement(suite.find('testcase'), outcome)
+                tree.write(folder / 'junit.xml')
+                with self.subTest(outcome=outcome), self.assertRaises(ValueError):
+                    evidence.check_native_contracts(folder)
+            self.junit(folder, nodes)
+            report = deepcopy(current_report)
+            report['ci_identity']['GITHUB_RUN_ID'] = 'another-run'
+            (folder / 'environment.json').write_text(json.dumps(report))
+            with self.assertRaisesRegex(ValueError, 'CI run identity'):
+                evidence.check_native_contracts(folder)
+            report = deepcopy(self.report)
+            report['commit']['stdout'] = 'b' * 40
+            (folder / 'environment.json').write_text(json.dumps(report))
+            with self.assertRaisesRegex(ValueError, 'candidate identity'):
+                evidence.check_native_contracts(folder)
+        self.assertFalse((folder / 'evidence.json').exists())
+
     def test_boundary_requires_exact_all_pass_without_creating_full_receipt(self):
         folder = self.root / 'boundary'
         folder.mkdir()

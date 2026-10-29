@@ -47,6 +47,54 @@ def _foreign_transition(document, event, actor):
     return observed
 
 
+@pytest.mark.parametrize('lost_ack', [False, True])
+def test_actual_comment_post_commits_its_timestamp_and_only_its_issue(git_repo, tmp_path, monkeypatch, lost_ack):
+    from datetime import datetime
+    import subprocess
+
+    port, reopen, state, calls = _closed_ticket(git_repo, tmp_path, monkeypatch)
+    reopened = port.execute(reopen, WriteAuthority(lambda: lambda: None))
+    assert reopened.disposition == 'target'
+    effect = replace(reopen, effect_id='timestamp-recovery', operation='recovery_comment',
+                     payload={**reopen.payload, 'reopen_effect': reopen.effect_id,
+                              'reopen_receipt': asdict(reopened), 'comment_body': 'Recorded recovery'})
+    before = json.loads(state.read_text())
+    if lost_ack:
+        before['lose_operation'] = 'comment'
+        state.write_text(json.dumps(before))
+    result = port.execute(effect, WriteAuthority(lambda: lambda: None))
+    assert result.disposition == 'target' and result.raw['write_returncode'] == int(lost_ack)
+    document = json.loads(state.read_text())
+    comment = next(row for row in document['comments'] if row['id'] == result.raw['comment']['id'])
+    assert comment['body'] == port._marker(effect) + '\nRecorded recovery'
+    assert comment['user']['login'] == result.raw['comment']['actor'] == 'publisher'
+    assert datetime.fromisoformat(comment['created_at']) > datetime.fromisoformat(reopened.raw['reopened_event']['created_at'])
+    assert document['source_graph']['issues']['2']['updated_at'] == comment['created_at'] == result.raw['comment']['created_at']
+    assert document['source_graph']['parent'] == before['source_graph']['parent']
+    assert document['operation_clock'] == before['operation_clock'] + 1
+
+    def edit(number):
+        body = tmp_path / 'metadata.json'
+        body.write_text(json.dumps({'body': 'Later metadata edit'}))
+        result = subprocess.run([str(tmp_path / 'control-bin' / 'gh'), 'api',
+            f'repos/example/project/issues/{number}', '--method', 'PATCH', '--input', str(body)],
+            cwd=git_repo, text=True, capture_output=True, timeout=5)
+        assert result.returncode == 0, result.stderr
+
+    edit(1)
+    parent_edit = json.loads(state.read_text())
+    assert parent_edit['source_graph']['issues']['2'] == document['source_graph']['issues']['2']
+    edit(2)
+    later = json.loads(state.read_text())
+    assert datetime.fromisoformat(later['source_graph']['issues']['2']['updated_at']) > datetime.fromisoformat(comment['created_at'])
+    assert next(row for row in later['comments'] if row['id'] == comment['id']) == comment
+    assert port.reconcile(effect).raw['comment'] == result.raw['comment']
+    assert port.execute(effect, WriteAuthority(lambda: lambda: pytest.fail('Exact sent comment cannot write twice'))).disposition == 'target'
+    assert json.loads(state.read_text())['operation_clock'] == later['operation_clock']
+    written = [row for row in map(json.loads, calls.read_text().splitlines()) if 'POST' in row]
+    assert len(written) == 2  # Original completion and this one recovery comment.
+
+
 @pytest.mark.parametrize("mode", ["closed", "already_open", "foreign_close", "missing_event",
                                   "missing_comment", "metadata", "missing_timestamp", "equivalent_timestamp", "changed", "stopped"])
 def test_ticket_recovery_preserves_original_close_ownership_and_fresh_authority(git_repo, tmp_path, monkeypatch, mode):

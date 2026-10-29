@@ -62,10 +62,12 @@ def test_abandon_comment_index_matches_actual_rest_receipts(git_repo, tmp_path, 
 
     def api(endpoint, *, method='GET', body=None):
         command = [str(tmp_path / 'control-bin' / 'gh'), 'api', 'repos/example/project/' + endpoint]
+        if method != 'GET':
+            command += ['--method', method]
         if body is not None:
             payload = tmp_path / 'request.json'
             payload.write_text(json.dumps(body))
-            command += ['--method', method, '--input', str(payload)]
+            command += ['--input', str(payload)]
         elif endpoint.endswith('/comments'):
             command += ['--paginate', '--slurp']
         result = subprocess.run(command, cwd=git_repo, env=environment, text=True, capture_output=True, timeout=5)
@@ -84,8 +86,12 @@ def test_abandon_comment_index_matches_actual_rest_receipts(git_repo, tmp_path, 
     recovery = api('issues/2/comments', method='POST', body={'body': '<!-- agent-run-kernel:recovery-effect -->\nRecovery'})
     assert api('issues/2/comments') == [[recovery]]
     if deleted:
-        # Negative fixture input: remove the actual service row but retain a
-        # stale derived index. A mirror must never manufacture a real comment.
+        api(f'issues/comments/{comment["id"]}', method='DELETE')
+        removed = json.loads(state.read_text())
+        assert comment not in removed['comments']
+        assert removed['comments_by_issue'][str(number)] == []
+        # Negative fixture input: inject a stale derived index after real DELETE.
+        # A mirror must never manufacture a real comment.
         document = json.loads(state.read_text())
         document['comments'] = [row for row in document['comments'] if row['id'] != comment['id']]
         document['comments_by_issue'][str(number)] = [comment]
@@ -95,3 +101,116 @@ def test_abandon_comment_index_matches_actual_rest_receipts(git_repo, tmp_path, 
     document = json.loads(state.read_text())
     assert document['comments_by_issue'][str(number)] == actual
     assert document['comments_by_issue']['2'] == [recovery]
+
+
+@pytest.mark.parametrize('currentness', [False, True])
+def test_comment_handler_commits_canonical_rows_and_mirrors_without_read_ticks(
+    git_repo, tmp_path, monkeypatch, currentness,
+):
+    environment, state = _control_environment(git_repo, tmp_path, monkeypatch, codex=_CODEX, tickets=(2,))
+    if currentness:
+        install_currentness(tmp_path, state)
+
+    def api(endpoint, *, method='GET', body=None):
+        command = [str(tmp_path / 'control-bin/gh'), 'api', 'repos/example/project/' + endpoint,
+                   '--method', method]
+        if body is not None:
+            payload = tmp_path / 'request.json'
+            payload.write_text(json.dumps(body))
+            command += ['--input', str(payload)]
+        result = subprocess.run(command, cwd=git_repo, env=environment, text=True, capture_output=True, timeout=5)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+
+    original = json.loads(state.read_text())
+    parent = api('issues/1/comments', method='POST', body={'body': 'Parent evidence'})
+    after_parent = json.loads(state.read_text())
+    ticket = api('issues/2/comments', method='POST', body={'body': 'Ticket evidence'})
+    written = json.loads(state.read_text())
+    assert written['comments'] == [parent, ticket]
+    assert written['comments_by_issue'] == {'1': [parent], '2': [ticket]}
+    assert after_parent['source_graph']['issues']['2'] == original['source_graph']['issues']['2']
+    assert written['source_graph']['parent'] == after_parent['source_graph']['parent']
+    if currentness:
+        assert written['operation_clock'] == 2
+        assert written['source_graph']['parent']['updated_at'] == parent['created_at']
+        assert written['source_graph']['issues']['2']['updated_at'] == ticket['created_at']
+    assert api('issues/1/comments') == [parent] and api('issues/2/comments') == [ticket]
+    assert json.loads(state.read_text()) == written
+
+    pr = api('pulls', method='POST', body={'head': 'main', 'base': 'main', 'title': 'Status', 'body': 'Original'})
+    number = pr['number']
+    status = api(f'issues/{number}/comments', method='POST', body={'body': '<!-- agent-run-status:original -->\nBefore'})
+    before_patch = json.loads(state.read_text())
+    changed = api(f'issues/comments/{status["id"]}', method='PATCH', body={'body': '<!-- agent-run-status:original -->\nAfter'})
+    patched = json.loads(state.read_text())
+    assert changed == {**status, 'body': '<!-- agent-run-status:original -->\nAfter'}
+    assert patched['comments'][-1] == changed == patched['comments_by_issue'][str(number)][0]
+    assert patched['source_graph'] == before_patch['source_graph']
+    assert patched['status_writes'][-1] == {'method': 'PATCH', 'id': status['id'], 'body': changed['body']}
+    if currentness:
+        assert patched['operation_clock'] == before_patch['operation_clock'] + 1
+        assert patched['prs'][0]['updated_at'] > status['created_at']
+    assert api(f'issues/{number}/comments') == [changed]
+    assert json.loads(state.read_text()) == patched
+    api(f'issues/comments/{status["id"]}', method='DELETE')
+    deleted = json.loads(state.read_text())
+    assert deleted['comments'] == [parent, ticket]
+    assert deleted['comments_by_issue'][str(number)] == []
+    assert deleted['source_graph'] == patched['source_graph']
+    assert api(f'issues/{number}/comments') == []
+    assert json.loads(state.read_text()) == deleted
+    replacement = api(f'issues/{number}/comments', method='POST', body={'body': 'New physical comment'})
+    assert replacement['id'] > status['id']  # Deleted receipt IDs cannot name a later write.
+    foreign = {**ticket, 'id': 90, 'issue_url': 'https://api.github.com/repos/foreign/project/issues/2'}
+    legacy = {**ticket, 'id': 91}
+    del legacy['issue_url']
+    document = json.loads(state.read_text())
+    document['comments'] += [foreign, legacy]
+    state.write_text(json.dumps(document))
+    assert api('issues/2/comments') == [ticket, legacy]
+    readback = json.loads(state.read_text())
+    assert readback['comments_by_issue']['2'] == [ticket, legacy]
+    assert readback['comments'] == document['comments']
+    assert readback.get('operation_clock') == document.get('operation_clock')
+    assert readback['comment_sequence'] == document['comment_sequence']
+
+
+@pytest.mark.parametrize('sequence,preloaded_id', [(None, 1), (2, 17)], ids=['missing-sequence', 'behind-sequence'])
+def test_comment_delete_preserves_preloaded_id_high_water_without_get_advancing_it(
+    git_repo, tmp_path, monkeypatch, sequence, preloaded_id,
+):
+    environment, state = _control_environment(git_repo, tmp_path, monkeypatch, codex=_CODEX, tickets=(2,))
+    install_currentness(tmp_path, state)
+    document = json.loads(state.read_text())
+    comment = {'id': preloaded_id, 'body': 'Preloaded canonical evidence', 'user': {'login': 'publisher'},
+               'issue_url': 'https://api.github.com/repos/example/project/issues/2',
+               'created_at': '2026-10-21T10:00:00Z'}
+    document['comments'] = [comment]
+    if sequence is not None:
+        document['comment_sequence'] = sequence
+    state.write_text(json.dumps(document))
+
+    def api(endpoint, method, body=None):
+        command = [str(tmp_path / 'control-bin/gh'), 'api', 'repos/example/project/' + endpoint,
+                   '--method', method]
+        if body is not None:
+            payload = tmp_path / 'request.json'
+            payload.write_text(json.dumps(body))
+            command += ['--input', str(payload)]
+        result = subprocess.run(command, cwd=git_repo, env=environment, text=True, capture_output=True, timeout=5)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+
+    assert api('issues/2/comments', 'GET') == [comment]
+    readback = json.loads(state.read_text())
+    assert readback.get('comment_sequence') == sequence and readback['operation_clock'] == 0
+    assert ('comment_sequence' in readback) == (sequence is not None)
+    api(f'issues/comments/{preloaded_id}', 'DELETE')
+    deleted = json.loads(state.read_text())
+    assert deleted['comments'] == [] and deleted['comments_by_issue']['2'] == []
+    assert api('issues/2/comments', 'GET') == []
+    assert json.loads(state.read_text()) == deleted
+    replacement = api('issues/2/comments', 'POST', {'body': 'New physical evidence'})
+    assert replacement['id'] == preloaded_id + 1
+    assert deleted['comment_sequence'] == preloaded_id

@@ -11,7 +11,7 @@ REPORT_MAKE = $(MAKE)
 TEST_SCOPE = $(PYTHON) .github/ci/test_scope.py
 test_scope = $(shell $(TEST_SCOPE) $(1) || echo .invalid-test-selection)
 
-.PHONY: test test-full test-report test-bootstrap test-prepare test-policy test-state test-prompts test-locator test-github test-delivery test-run test-executor typecheck
+.PHONY: test test-full test-report test-bootstrap test-prepare test-native-capabilities test-native-contracts test-policy test-state test-prompts test-locator test-github test-delivery test-run test-executor typecheck
 
 # Shared dependency preparation for local validation and CI.
 test-bootstrap:
@@ -27,6 +27,13 @@ test-prepare:
 test:
 	@echo "本地快速回归：Policy / State / Prompts / Locator；完整套件请运行 make test-full"
 	$(PYTHON) -m pytest $(call test_scope,fast) $(PYTEST_ARGS)
+
+# Missing native evidence is a failing precondition, never a pytest skip.
+test-native-capabilities:
+	$(PYTHON) tests/support/report_environment.py --require-native
+
+test-native-contracts: test-native-capabilities
+	$(PYTHON) -m pytest $(call test_scope,native-contract) $(PYTEST_ARGS)
 
 # Complete suite for CI and final validation, with a fixed process limit.
 test-full:

@@ -25,18 +25,10 @@ def install_currentness(directory: Path, state: Path) -> None:
         program = program.replace(original, changed)
 
     replace("d=json.loads(read_text(state))", """d=json.loads(read_text(state))
-from datetime import datetime, timedelta, timezone
+from support.github_comments import service_time
 def tick():
-    d['operation_clock'] += 1
-    value = datetime(2026,10,21,10,0,0,tzinfo=timezone.utc) + timedelta(seconds=d['operation_clock'])
-    return value.isoformat().replace('+00:00','Z')""")
+    return service_time(d)""")
     replace("'merge_commit_sha':None,", "'merge_commit_sha':None,'updated_at':tick(),")
-    replace("comment={'id':len(d['comments'])+1,'body':body['body'],'user':{'login':'publisher'},"
-            "'created_at':'2026-10-21T10:00:00Z'}",
-            "comment={'id':len(d['comments'])+1,'body':body['body'],'user':{'login':'publisher'},"
-            "'created_at':tick()}")
-    replace("d['comments'].append(comment);comments.append(comment);result=comment",
-            "d['comments'].append(comment);comments.append(comment);resource['updated_at']=comment['created_at'];result=comment")
     replace("'created_at':'2026-10-21T10:01:00Z'", "'created_at':tick()")
     replace(";d.setdefault('events_by_issue',{}).setdefault(str(number),[]).append(d['events'][-1])",
             ";d.setdefault('events_by_issue',{}).setdefault(str(number),[]).append(d['events'][-1]);pr['updated_at']=d['events'][-1]['created_at']")
@@ -54,13 +46,4 @@ def tick():
         resource['state']=body['state'].upper()""")
     replace("'state':resource.get('state','OPEN').lower()}",
             "'state':resource.get('state','OPEN').lower(),'updated_at':resource['updated_at']}")
-    # The shared comments route writes/reads canonical rows with issue_url;
-    # rebuild the diagnostic index from those rows, never the other way round.
-    replace("\nwrite_text(state,json.dumps(d))", """
-for issue in d.get('comments_by_issue',{}):
-    d['comments_by_issue'][issue]=[]
-for comment in d['comments']:
-    issue=comment.get('issue_url','https://api.github.com/repos/example/project/issues/2').rsplit('/',1)[-1]
-    d.setdefault('comments_by_issue',{}).setdefault(issue,[]).append(comment)
-write_text(state,json.dumps(d))""")
     executable.write_text(program)

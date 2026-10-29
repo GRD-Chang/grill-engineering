@@ -591,14 +591,8 @@ if os.environ.get('ENTRY_APPROVAL_CONTROL') and sys.argv[1:3] == ['api', 'graphq
         resource=next((pull for pull in d['prs'] if pull['number']==number),None)
     if resource is None:
         print('HTTP 404 Issue not found',file=sys.stderr);raise SystemExit(1)
-    comments=d.setdefault('comments_by_issue',{}).setdefault(str(number),[])
     events=d.setdefault('events_by_issue',{}).setdefault(str(number),[])
-    if endpoint.endswith('/comments'):
-        if method=='POST':
-            comment={'id':len(d['comments'])+1,'body':body['body'],'user':{'login':'publisher'},'created_at':'2026-10-21T10:00:00Z'}
-            d['comments'].append(comment);comments.append(comment);result=comment
-        else:result=[comments] if '--slurp' in args else comments
-    elif endpoint.endswith('/events'):result=[events] if '--slurp' in args else events
+    if endpoint.endswith('/events'):result=[events] if '--slurp' in args else events
     elif method=='PATCH':
         resource['state']=body['state'].upper()
         d['issue_state']=body['state']

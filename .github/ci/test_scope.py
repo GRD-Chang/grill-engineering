@@ -14,6 +14,27 @@ CONTRACT_TESTS = (
     "tests/test_kernel_query_cli.py::test_history_keeps_raw_feedback_and_pages_without_losing_events",
 )
 PROMPT_CONTRACT_TESTS = ("tests/test_prompt_settings.py", "tests/test_show_prompts_catalog.py")
+# Small component contracts precede long lifecycle stories; all remain in full.
+# DecisionClock fault tests are storage decisions, not native clock evidence.
+NATIVE_CONTRACT_TESTS = (
+    'tests/test_repository_save_fifo.py::test_native_calling_task_clock_uses_linux_top_level_offsets',
+    'tests/test_repository_save_fifo.py::test_native_nonleader_thread_clock_uses_its_own_top_level_offsets',
+    'tests/test_storage_save_fifo.py::test_earlier_save_cannot_be_overtaken_after_preflight[separate]',
+    'tests/test_storage_save_fifo.py::test_queue_wait_and_sqlite_busy_share_one_second',
+    'tests/test_repository_save_fifo.py::test_registration_commit_unknown_reads_only_original_uuid_and_never_reinserts',
+    'tests/test_repository_save_fifo.py::test_business_commit_unknown_keeps_actual_write_and_never_replays_body',
+    'tests/test_repository_save_fifo.py::test_registration_commit_known_failure_keeps_category_and_never_registers_again',
+    'tests/test_repository_save_fifo.py::test_shared_owner_poison_rolls_back_whole_body_without_reentry',
+    'tests/test_repository_save_fifo.py::test_readonly_and_exact_control_bypass_do_not_capture_clock_or_touch_tickets',
+    'tests/test_kernel_remote_effects.py::test_comment_collections_keep_distinct_issue_pr_and_foreign_identity',
+    'tests/test_kernel_remote_effects.py::test_close_uses_original_comment_watermark_and_rejects_reopened_or_foreign_issue',
+    'tests/test_kernel_ticket_recovery_transport.py::test_recovery_comment_has_one_exact_marker_and_independent_fresh_authority[lost_ack]',
+    'tests/test_kernel_ticket_recovery_transport.py::test_recovery_comment_has_one_exact_marker_and_independent_fresh_authority[equivalent_timestamp]',
+    'tests/test_kernel_ticket_recovery_transport.py::test_recovery_comment_has_one_exact_marker_and_independent_fresh_authority[metadata]',
+    'tests/test_kernel_control_github_fixture.py::test_managed_control_github_keeps_parent_and_ticket_rest_facts_separate',
+    'tests/test_kernel_control_github_fixture.py::test_comment_handler_commits_canonical_rows_and_mirrors_without_read_ticks[False]',
+    'tests/test_kernel_control_github_fixture.py::test_comment_handler_commits_canonical_rows_and_mirrors_without_read_ticks[True]',
+)
 # Fail early on unresolved native boundaries; these remain in the full suite.
 # A successful boundary stage is not complete product acceptance.
 BOUNDARY_TESTS = (
@@ -34,6 +55,7 @@ BOUNDARY_TESTS = (
     'tests/test_kernel_notification_sender_facts.py::test_sender_compresses_real_development_to_review_and_preserves_gate_budget_and_return_order',
 )
 TEST_GROUPS = {
+    'native-contract': NATIVE_CONTRACT_TESTS,
     'boundary': BOUNDARY_TESTS,
     "policy": ("tests/test_delivery_policy.py", "tests/test_kernel_policy_values.py"),
     "state": ("tests/test_kernel_state_preflight.py", "tests/test_kernel_task_admission.py",

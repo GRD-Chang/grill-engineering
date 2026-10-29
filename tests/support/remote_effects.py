@@ -236,36 +236,11 @@ elif endpoint.startswith('repos/example/project/pulls'):
             if body.get('state')=='closed':
                 d['events'].append({'id':len(d['events'])+1,'event':'closed','actor':{'login':'publisher'},'created_at':'2026-10-21T10:01:00Z'})
         else:result=pr
-elif endpoint.startswith('repos/example/project/issues/comments/'):
-    status_operation=True
-    identifier=int(endpoint.rsplit('/',1)[1])
-    matches=[row for row in d['comments'] if row['id']==identifier and row['body'].startswith('<!-- agent-run-status:')]
-    if len(matches)!=1 or method!='PATCH' or set(body)!={'body'}:
-        raise SystemExit('unexpected Status comment object')
-    result=matches[0];result['body']=body['body']
-    d.setdefault('status_writes',[]).append({'method':'PATCH','id':identifier,'body':body['body']})
-elif endpoint.startswith('repos/example/project/issues/') and endpoint.endswith('/comments'):
-    if d.get('issue_read_error') and method=='GET':
-        print('HTTP 403 Issue unavailable',file=sys.stderr);raise SystemExit(1)
-    number=int(endpoint.split('/issues/',1)[1].split('/',1)[0])
-    graph=d.get('source_graph',{})
-    known_issue=number==2 or number==graph.get('parent',{}).get('number') or str(number) in graph.get('issues',{})
-    known_pr=any(pr['number']==number for pr in d['prs'])
-    if not (known_issue or known_pr):raise SystemExit('unknown comment target')
-    url='https://api.github.com/repos/example/project/issues/'+str(number)
-    status_operation=method=='POST' and body.get('body','').startswith('<!-- agent-run-status:')
-    if method=='POST':
-        if status_operation and not known_pr:raise SystemExit('unknown Status target PR')
-        result={'id':max((row['id'] for row in d['comments']),default=0)+1,'body':body['body'],
-                'user':{'login':d.get('actor','publisher')},'issue_url':url,'created_at':'2026-10-21T10:00:00Z'}
-        d['comments'].append(result)
-        if status_operation:d.setdefault('status_writes',[]).append({'method':'POST','id':result['id'],'body':body['body']})
-    elif method=='GET':
-        # Legacy fixture rows without issue_url are the declared Ticket #2's
-        # completion comments. Never expose those rows on the distinct PR.
-        rows=[row for row in d['comments'] if row.get('issue_url','https://api.github.com/repos/example/project/issues/2')==url]
-        result=[rows] if '--slurp' in args else rows
-    else:raise SystemExit('unexpected comment method')
+elif (endpoint.startswith('repos/example/project/issues/comments/')
+      or endpoint.startswith('repos/example/project/issues/') and endpoint.endswith('/comments')):
+    from support.github_comments import comment_request
+    result,status_operation=comment_request(d,endpoint,method,body,repository='example/project',
+                                            actor=d.get('actor','publisher'),slurp='--slurp' in args)
 elif endpoint.startswith('repos/example/project/issues/'):
     if d.get('issue_read_error') and method=='GET':
         print('HTTP 403 Issue unavailable',file=sys.stderr);raise SystemExit(1)

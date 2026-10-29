@@ -8,6 +8,8 @@ import sys
 import pytest
 
 from support.remote_effects import FAKE_GH, fake_gh, _fixture, _publish_pr
+from agent_run.contracts.write_authority import WriteAuthority
+from dataclasses import replace
 
 
 def test_default_remote_fixture_program_is_byte_for_byte_unchanged():
@@ -65,3 +67,12 @@ def test_remote_fixture_keeps_exact_repository_actor_and_publication_receipt(tmp
     actual = [json.loads(line) for line in calls.read_text().splitlines()]
     assert sum(call[1] == "repos/publisher/project/pulls" and "POST" in call for call in actual) == 1
     assert port.reconcile(effect).disposition == "target"
+    comment = replace(push, effect_id='bound-comment', operation='completion_comment', after_sha=None,
+        pr_number=publication.number, payload={'issue': 2, 'merge_sha': push.after_sha, 'kind': 'ticket'})
+    receipt = port.execute(comment, WriteAuthority(lambda: lambda: None))
+    assert receipt.disposition == 'target'
+    stored, = json.loads(state.read_text())['comments']
+    assert stored['user']['login'] == actor
+    assert stored['issue_url'] == f'https://api.github.com/repos/{repository}/issues/2'
+    assert stored['id'] == receipt.raw['close_intent']['comment_id']
+    assert stored['body'] == receipt.raw['close_intent']['comment_body']

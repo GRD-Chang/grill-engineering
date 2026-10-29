@@ -11,7 +11,7 @@ import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
-from test_scope import BOUNDARY_TESTS, CONTRACT_TESTS
+from test_scope import BOUNDARY_TESTS, CONTRACT_TESTS, NATIVE_CONTRACT_TESTS
 
 PRODUCT_ROOT = Path(__file__).resolve().parents[2]
 DEPENDENCY_FILES = ("pyproject.toml", "tests/dev-requirements.txt", "tests/build-requirements.txt")
@@ -107,11 +107,25 @@ def check_boundary(folder: Path) -> int:
     return len(expected)
 
 
-def collect_nodeids() -> list[str]:
+def check_native_contracts(folder: Path) -> int:
+    """Require this candidate's exact component collection, never a full receipt."""
+    report = read_environment(folder)
+    if report.get('ci_identity') != identity():
+        raise ValueError('Native contract environment belongs to another CI run identity')
+    if not NATIVE_CONTRACT_TESTS or len(set(NATIVE_CONTRACT_TESTS)) != len(NATIVE_CONTRACT_TESTS):
+        raise ValueError('Invalid native contract selection')
+    nodes = collect_nodeids(NATIVE_CONTRACT_TESTS)
+    expected = {junit_key(node) for node in nodes}
+    if len(expected) != len(nodes) or junit_cases(folder) != expected:
+        raise ValueError('Incomplete or unexpected native contract coverage')
+    return len(expected)
+
+
+def collect_nodeids(targets: tuple[str, ...] = ()) -> list[str]:
     # 只收集，不执行。清除隐含过滤，使少跑用例不能生成完整分片证据。
     result = subprocess.run(
         [sys.executable, "-m", "pytest", "--collect-only", "-q", "--disable-warnings",
-         "-p", "no:cacheprovider", "-o", "addopts="],
+         "-p", "no:cacheprovider", "-o", "addopts=", *targets],
         cwd=PRODUCT_ROOT, env=dict(os.environ, PYTEST_ADDOPTS="", PYTHONDONTWRITEBYTECODE="1"),
         capture_output=True, text=True, timeout=120, check=True,
     )
@@ -245,6 +259,8 @@ def main() -> None:
     reader.add_argument("--shard-count", type=int, default=2)
     boundary = commands.add_parser('check-boundary')
     boundary.add_argument('--results', type=Path, required=True)
+    native = commands.add_parser('check-native-contracts')
+    native.add_argument('--results', type=Path, required=True)
     args = parser.parse_args()
     try:
         if args.command == "record":
@@ -252,6 +268,8 @@ def main() -> None:
             print(f"Recorded complete test shard {args.shard}")
         elif args.command == 'check-boundary':
             print(f'Boundary regression verified: {check_boundary(args.results)} passed; not full acceptance')
+        elif args.command == 'check-native-contracts':
+            print(f'Native contracts verified: {check_native_contracts(args.results)} passed; not full acceptance')
         else:
             total = verify(
                 args.results, selected=os.environ["CHECKS_SELECTED"], product=os.environ["PRODUCT_SELECTED"],
