@@ -3,7 +3,10 @@ import json
 from pathlib import Path
 import subprocess
 
-from support.systemd_manager import _CODEX, _control_environment
+import pytest
+
+from support.managed_abandon_transport import install_currentness
+from support.systemd_manager import _CODEX, _control_environment, _git
 
 
 def test_managed_control_github_keeps_parent_and_ticket_rest_facts_separate(
@@ -47,3 +50,48 @@ def test_managed_control_github_keeps_parent_and_ticket_rest_facts_separate(
     document = json.loads(state.read_text())
     assert document["source_graph"]["parent"]["state"] == "CLOSED"
     assert document["source_graph"]["issues"]["2"]["state"] == "OPEN"
+
+
+@pytest.mark.parametrize('deleted', [False, True], ids=['actual-comment', 'stale-index'])
+def test_abandon_comment_index_matches_actual_rest_receipts(git_repo, tmp_path, monkeypatch, deleted):
+    environment, state = _control_environment(git_repo, tmp_path, monkeypatch, codex=_CODEX, tickets=(2,))
+    install_currentness(tmp_path, state)
+    _git(git_repo, 'checkout', '-b', 'candidate')
+    _git(git_repo, 'commit', '--allow-empty', '-m', 'Candidate for retirement')
+    _git(git_repo, 'push', str(tmp_path / 'origin.git'), 'HEAD:refs/heads/candidate')
+
+    def api(endpoint, *, method='GET', body=None):
+        command = [str(tmp_path / 'control-bin' / 'gh'), 'api', 'repos/example/project/' + endpoint]
+        if body is not None:
+            payload = tmp_path / 'request.json'
+            payload.write_text(json.dumps(body))
+            command += ['--method', method, '--input', str(payload)]
+        elif endpoint.endswith('/comments'):
+            command += ['--paginate', '--slurp']
+        result = subprocess.run(command, cwd=git_repo, env=environment, text=True, capture_output=True, timeout=5)
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        return json.loads(result.stdout)
+
+    pr = api('pulls', method='POST', body={'head': 'candidate', 'base': 'main', 'title': 'Original', 'body': 'Original'})
+    number = pr['number']
+    api(f'issues/{number}')  # The original per-Issue diagnostic view exists.
+    marker = '<!-- agent-run-retirement:original-effect -->'
+    comment = api(f'issues/{number}/comments', method='POST', body={'body': 'Retiring original Run.\n\n' + marker})
+    api(f'pulls/{number}', method='PATCH', body={'state': 'closed'})
+    # Actual external POST and readback, not a Core status or injected receipt.
+    assert api(f'issues/{number}/comments') == [[comment]]
+    assert comment['user']['login'] == 'publisher' and marker in comment['body']
+    recovery = api('issues/2/comments', method='POST', body={'body': '<!-- agent-run-kernel:recovery-effect -->\nRecovery'})
+    assert api('issues/2/comments') == [[recovery]]
+    if deleted:
+        # Negative fixture input: remove the actual service row but retain a
+        # stale derived index. A mirror must never manufacture a real comment.
+        document = json.loads(state.read_text())
+        document['comments'] = [row for row in document['comments'] if row['id'] != comment['id']]
+        document['comments_by_issue'][str(number)] = [comment]
+        state.write_text(json.dumps(document))
+    actual = api(f'issues/{number}/comments')[0]
+    assert actual == ([] if deleted else [comment])
+    document = json.loads(state.read_text())
+    assert document['comments_by_issue'][str(number)] == actual
+    assert document['comments_by_issue']['2'] == [recovery]

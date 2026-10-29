@@ -39,6 +39,120 @@ def decision_scenario(tmp_path, monkeypatch):
         yield scenario, connections[0]
 
 
+def _hold_development(scenario, monkeypatch):
+    class Held(Exception):
+        pass
+
+    captured = []
+
+    def hold(call):
+        captured.append(call)
+        raise Held
+
+    with monkeypatch.context() as boundary:
+        boundary.setattr(scenario, 'agent', hold)
+        with pytest.raises(Held):
+            for _ in range(16):
+                scenario.step()
+    assert len(captured) == 1 and captured[0].role.value == 'development'
+    return captured[0]
+
+
+def test_continuation_loader_reads_current_records_once(decision_scenario, monkeypatch):
+    from collections import Counter
+    from hashlib import sha256
+    from time import perf_counter_ns, thread_time_ns
+    from types import SimpleNamespace
+    from agent_run.core import attempt_continuation as continuation
+    from agent_run.storage.attempts import AttemptRecords
+    from agent_run.storage.run_scope import RunTransaction
+
+    s, db = decision_scenario
+    call = _hold_development(s, monkeypatch)
+    counts, decoded, bodies = Counter(), Counter(), Counter()
+    material, decoder = RunTransaction.get, continuation.json.loads
+
+    def watched(name, method):
+        def read(*args, **kwargs):
+            counts[name] += 1
+            return method(*args, **kwargs)
+        return read
+
+    def read_material(tx, identity, subject):
+        body = material(tx, identity, subject)
+        bodies[sha256(body).hexdigest()] += 1
+        return body
+
+    def decode(body):
+        decoded[sha256(body).hexdigest()] += 1
+        return decoder(body)
+
+    def sql(statement):
+        counts['sql'] += 1
+
+    for name in ('attempt', 'thread', 'subject_kind', 'profile_revision'):
+        monkeypatch.setattr(AttemptRecords, name, watched(name, getattr(AttemptRecords, name)))
+    monkeypatch.setattr(RunTransaction, 'get', read_material)
+    monkeypatch.setattr(continuation, 'json', SimpleNamespace(loads=decode))
+    with s.kernel.storage.transaction(write=False) as tx:
+        before = db.total_changes
+        db.set_trace_callback(sql)
+        cpu, wall = thread_time_ns(), perf_counter_ns()
+        try:
+            facts = continuation.load_continuation(tx, call.attempt_id)
+        finally:
+            cpu, wall = thread_time_ns() - cpu, perf_counter_ns() - wall
+            db.set_trace_callback(None)
+        assert db.total_changes == before
+    assert facts.thread_id == call.thread_id and facts.prior.invocation_id == call.invocation_id
+    assert facts.prior.status == 'running' and facts.prior.raw_id is None
+    print('current continuation load', dict(counts), 'material_reads', sum(bodies.values()),
+          'decodes', sum(decoded.values()), 'cpu_ns', cpu, 'wall_ns', wall)
+    assert {name: counts[name] for name in ('attempt', 'thread', 'subject_kind', 'profile_revision')} == {
+        'attempt': 1, 'thread': 1, 'subject_kind': 1, 'profile_revision': 1}
+    assert len(bodies) == sum(bodies.values()) == 3
+    assert len(decoded) == sum(decoded.values()) == 2
+
+
+def test_continuation_loader_rereads_return_without_lease_and_capacity_zero(decision_scenario, monkeypatch):
+    from agent_run.core.attempt_continuation import load_continuation
+
+    s, db = decision_scenario
+    call = _hold_development(s, monkeypatch)
+    with s.kernel.storage.transaction(write=False) as tx:
+        live = load_continuation(tx, call.attempt_id)
+    assert live.prior.status == 'running' and live.prior.raw_id is None
+    s.kernel.receive(call, s.agent(call))
+    assert db.execute('SELECT count(*) FROM leases').fetchone()[0] == 0
+    with s.kernel.storage.transaction(write=False) as tx:
+        returned = load_continuation(tx, call.attempt_id)
+    assert returned.thread_id == live.thread_id and returned.context == live.context
+    assert returned.prior.status == 'returned' and returned.prior.raw_id is not None
+    step = s.runner().run_once(agent_capacity=0)
+    assert step.kind == 'progress' and step.call is None
+    assert s.development_count == 1 and not db.execute('SELECT id FROM leases').fetchall()
+
+
+@pytest.mark.parametrize('missing_lease', [False, True])
+def test_continuation_loader_does_not_treat_sent_return_as_exit(decision_scenario, monkeypatch, missing_lease):
+    from agent_run.core.attempt_continuation import load_continuation
+
+    s, db = decision_scenario
+    call = _hold_development(s, monkeypatch)
+    assert s.kernel.dispatch_agent(call)
+    s.kernel.receive(call, s.agent(call))
+    if missing_lease:
+        # Negative input removes only capacity, never supplies exit evidence.
+        db.execute('DELETE FROM leases WHERE run_id=?', (s.execution.run_id,))
+    with s.kernel.storage.transaction(write=False) as tx:
+        facts = load_continuation(tx, call.attempt_id)
+        waiting = s.kernel._continuation_wait(tx, s.kernel._job(tx, call.subject))
+    assert facts.prior.status == 'returned' and facts.prior.dispatch_state == 'sent'
+    assert facts.prior.exit_code is None and facts.prior.process_identity is None
+    assert waiting.reason == 'previous_invocation_exit'
+    assert db.execute('SELECT count(*) FROM invocations').fetchone()[0] == 1
+
+
 def test_healthy_guard_and_identical_source_avoid_empty_saves(decision_scenario, monkeypatch):
     scenario, db = decision_scenario
     kernel, active, records = scenario.kernel, [], []
@@ -73,6 +187,98 @@ def test_healthy_guard_and_identical_source_avoid_empty_saves(decision_scenario,
     assert all(counts[name]['transactions'] for name in counts)
     assert all(row[2] == 0 for row in selected)
     assert not [row for row in selected if row[1]], 'Healthy observation paths must not request an ordered save'
+
+
+def test_scheduler_and_advance_load_each_continuation_once_per_unchanged_transaction(decision_scenario, monkeypatch):
+    from collections import Counter
+    from time import process_time, perf_counter
+    from agent_run.core import kernel as core
+    from agent_run.storage.run_scope import RunTransaction
+
+    s, db = decision_scenario
+    load, observed, statements = core.load_continuation, [], []
+    get, reads = RunTransaction.get, []
+    transaction, modes = s.kernel.storage.transaction, []
+    make_ports, observations = s.make_ports, []
+
+    def ports_for(binding):
+        ports = make_ports(binding)
+        source, delivery, execute = ports.source, ports.delivery, ports.execute
+        counts = {'source': 0, 'delivery': 0, 'operations': []}
+        observations.append(counts)
+
+        def read_source(parent):
+            counts['source'] += 1
+            return source(parent)
+
+        def read_delivery(request):
+            counts['delivery'] += 1
+            return delivery(request)
+
+        def write(effect, authority):
+            counts['operations'].append(effect.operation)
+            return execute(effect, authority)
+
+        ports.source, ports.delivery, ports.execute = read_source, read_delivery, write
+        return ports
+
+    def material(tx, *args):
+        value = get(tx, *args)
+        reads.append(True)  # A successful get verifies the original body digest.
+        return value
+
+    @contextmanager
+    def counted_transaction(**options):
+        modes.append(options.get('write', True))
+        with transaction(**options) as tx:
+            yield tx
+
+    def counted(tx, attempt):
+        # Retain the owner itself, so Python object-id reuse cannot merge samples.
+        observed.append((tx, db.total_changes, attempt))
+        return load(tx, attempt)
+
+    monkeypatch.setattr(core, 'load_continuation', counted)
+    monkeypatch.setattr(RunTransaction, 'get', material)
+    monkeypatch.setattr(s.kernel.storage, 'transaction', counted_transaction)
+    monkeypatch.setattr(s, 'make_ports', ports_for)
+    db.set_trace_callback(statements.append)
+    cpu, wall = process_time(), perf_counter()
+    try:
+        assert s.run().kind == 'approval'
+    finally:
+        db.set_trace_callback(None)
+    counts = Counter(observed)
+    candidate_pairs = [(item['source'], item['delivery']) for item in observations
+                       if item['operations'] == ['candidate']]
+    print(dict(selects=sum(sql.startswith('SELECT') for sql in statements),
+               continuation_loads=len(observed), distinct_continuations=len(counts),
+               material_digests=len(reads), readers=modes.count(False), writers=modes.count(True),
+               candidate_observation_pairs=candidate_pairs,
+               cpu=process_time()-cpu, wall=perf_counter()-wall))
+    assert candidate_pairs and all(pair == (5, 5) for pair in candidate_pairs)
+    assert counts and max(counts.values()) == 1
+
+
+def test_zero_physical_capacity_still_consumes_the_original_return(decision_scenario):
+    s, db = decision_scenario
+    for _ in range(12):
+        step = s.step()
+        if step.call is not None:
+            break
+    else:
+        pytest.fail('Normal producer did not allocate its first development call')
+    call = step.call
+    original = db.execute('SELECT result_id FROM attempts WHERE run_id=? AND id=?',
+                          (call.execution.run_id, call.attempt_id)).fetchone()[0]
+    assert original is not None
+    count = db.execute('SELECT count(*) FROM invocations').fetchone()[0]
+    result = s.runner().run_once(agent_capacity=0)
+    assert result.kind == 'progress' and result.call is None and result.preparation is None
+    assert s.kernel.status(call.subject)['phase'] == 'candidate'
+    assert db.execute('SELECT count(*) FROM invocations').fetchone()[0] == count
+    assert db.execute('SELECT result_id FROM attempts WHERE run_id=? AND id=?',
+                      (call.execution.run_id, call.attempt_id)).fetchone()[0] == original
 
 
 def _consume_read(scenario, request, consumer, source=None):

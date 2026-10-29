@@ -183,3 +183,99 @@ def test_retargeted_scope_cannot_reuse_an_existing_consumer(database):
     with pytest.raises(KernelError, match="run_scope_changed"):
         bind_attempt_continuation(tx, "attempt", basis)
     assert database.total_changes == before
+
+
+@pytest.mark.parametrize('corruption,code', [
+    ('thread_role', 'continuation_binding'),
+    ('profile_hash', 'material_corrupt'),
+    ('profile_size', 'material_corrupt'),
+    ('foreign_profile', 'missing_or_ambiguous_fact'),
+    ('context', 'continuation_input_changed'),
+    ('cycle', 'continuation_lineage'),
+    ('orphan', 'continuation_lineage'),
+])
+def test_load_rereads_after_related_dml_without_reusing_checked_facts(database, corruption, code):
+    bases = {run: _attempt(database, run) for run in ('A', 'B')}
+    for run, basis in bases.items():
+        bind_attempt_continuation(RunTransaction(Transaction(database), run), 'attempt', basis)
+        _output(database, run, 'first', basis)
+    profile = database.execute("SELECT material_id FROM profile_revisions WHERE run_id='B' AND id=1").fetchone()[0]
+    insert(database, 'profile_revisions', {'run_id': 'B', 'id': 2, 'subject': SUBJECT,
+        'material_id': profile, 'created_at': 100.})
+    database.execute('BEGIN')
+    try:
+        tx = RunTransaction(Transaction(database), 'A')
+        first = load_continuation(tx, 'attempt')
+        assert first.prior.invocation_id == 'first'
+        if corruption == 'thread_role':
+            database.execute("UPDATE threads SET role='publication' WHERE run_id='A'")
+        elif corruption in {'profile_hash', 'profile_size'}:
+            material = database.execute("SELECT material_id FROM profile_revisions WHERE run_id='A' AND id=1").fetchone()[0]
+            body = tx.get(material, SUBJECT)
+            damaged = b'x' * len(body) if corruption == 'profile_hash' else body[:-1]
+            database.execute("UPDATE material SET body=? WHERE run_id='A' AND id=?", (damaged, material))
+        elif corruption == 'foreign_profile':
+            # A deliberately invalid input stays in this rolled-back unit
+            # transaction. Foreign keys remain enabled; never commit it.
+            database.execute('PRAGMA defer_foreign_keys=ON')
+            database.execute("UPDATE threads SET profile_revision=2 WHERE run_id='A'")
+        elif corruption == 'context':
+            import json
+            body = json.loads(tx.get(bases['A'].context_id, SUBJECT))
+            material = tx.put(SUBJECT, 'changed-context', wire_json({**body, 'revision': 'changed'}))
+            database.execute("UPDATE attempts SET context_id=? WHERE run_id='A'", (material,))
+        elif corruption == 'cycle':
+            database.execute("UPDATE invocations SET predecessor=id WHERE run_id='A'")
+        else:
+            _output(database, 'A', 'second', bases['A'])
+        with pytest.raises(KernelError, match=code):
+            load_continuation(tx, 'attempt')
+    finally:
+        database.rollback()
+    assert load_continuation(RunTransaction(Transaction(database), 'A'), 'attempt').prior.invocation_id == 'first'
+    assert load_continuation(RunTransaction(Transaction(database), 'B'), 'attempt').prior.invocation_id == 'first'
+
+
+def test_lineage_still_validates_a_different_historical_thread(database):
+    basis = _attempt(database, 'A')
+    bind_attempt_continuation(RunTransaction(Transaction(database), 'A'), 'attempt', basis)
+    _output(database, 'A', 'first', basis)
+    insert(database, 'threads', {'run_id': 'A', 'id': 'new-thread', 'subject': SUBJECT,
+        'role': 'development', 'profile_revision': 1})
+    _output(database, 'A', 'second', basis, predecessor='first', recovery='explicit')
+    database.execute("UPDATE invocations SET thread='new-thread' WHERE run_id='A' AND id='second'")
+    database.execute("UPDATE attempts SET thread_id='new-thread' WHERE run_id='A'")
+    assert load_continuation(RunTransaction(Transaction(database), 'A'), 'attempt').thread_id == 'new-thread'
+    database.execute("UPDATE threads SET role='publication' WHERE run_id='A' AND id='thread'")
+    with pytest.raises(KernelError, match='continuation_binding'):
+        load_continuation(RunTransaction(Transaction(database), 'A'), 'attempt')
+
+
+@pytest.mark.parametrize('failure', ['budget', 'sql'])
+def test_subsequent_load_retains_original_owner_budget_and_poison(database, failure):
+    import sqlite3
+    from agent_run.storage.sqlite import QUERY_LIMIT
+
+    basis = _attempt(database, 'A')
+    bind_attempt_continuation(RunTransaction(Transaction(database), 'A'), 'attempt', basis)
+    _output(database, 'A', 'first', basis)
+    database.execute('BEGIN')
+    owner = Transaction(database)
+    tx = RunTransaction(owner, 'A')
+    try:
+        load_continuation(tx, 'attempt')
+        if failure == 'budget':
+            tx.bytes_read = QUERY_LIMIT
+            assert owner.bytes_read == QUERY_LIMIT
+            with pytest.raises(KernelError, match='query_limit'):
+                load_continuation(tx, 'attempt')
+        else:
+            def denied(action, table, column, database_name, source):
+                return sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_READ and table == 'material' else sqlite3.SQLITE_OK
+            database.set_authorizer(denied)
+            with pytest.raises(sqlite3.DatabaseError):
+                load_continuation(tx, 'attempt')
+            assert owner.failed and tx.failed
+    finally:
+        database.set_authorizer(None)
+        database.rollback()

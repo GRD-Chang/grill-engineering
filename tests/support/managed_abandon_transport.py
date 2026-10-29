@@ -54,4 +54,13 @@ def tick():
         resource['state']=body['state'].upper()""")
     replace("'state':resource.get('state','OPEN').lower()}",
             "'state':resource.get('state','OPEN').lower(),'updated_at':resource['updated_at']}")
+    # The shared comments route writes/reads canonical rows with issue_url;
+    # rebuild the diagnostic index from those rows, never the other way round.
+    replace("\nwrite_text(state,json.dumps(d))", """
+for issue in d.get('comments_by_issue',{}):
+    d['comments_by_issue'][issue]=[]
+for comment in d['comments']:
+    issue=comment.get('issue_url','https://api.github.com/repos/example/project/issues/2').rsplit('/',1)[-1]
+    d.setdefault('comments_by_issue',{}).setdefault(issue,[]).append(comment)
+write_text(state,json.dumps(d))""")
     executable.write_text(program)

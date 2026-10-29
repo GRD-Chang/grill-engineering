@@ -10,6 +10,7 @@ from __future__ import annotations
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
+from functools import cached_property
 import hashlib
 import json
 import math
@@ -62,6 +63,100 @@ class InspectionBindings:
     request: HostLaunch | None
     host: Mapping[str, Any] | None
     workers: tuple[tuple[AgentCall, Mapping[str, Any]], ...]
+
+
+class _OperationSnapshot:
+    """One call's current transaction facts; never a grant or an IO payload.
+
+    Helpers share these explicit reads, not individual caches. A writer must
+    construct a new view after DML; even unrelated DML conservatively ends it.
+    """
+    def __init__(self, kernel: Kernel, tx: Transaction, run: sqlite3.Row) -> None:
+        self.kernel, self.tx, self.run = kernel, tx, run
+        self.changes = tx.connection.total_changes
+        self.subjects: dict[str, _SubjectSnapshot] = {}
+        self.require(tx)
+
+    def require(self, tx: Transaction) -> None:
+        try:
+            valid = (tx is self.tx and tx.connection.in_transaction
+                     and tx.connection.total_changes == self.changes and not tx.failed)
+        except sqlite3.Error as error:
+            raise KernelError('operation_snapshot_closed') from error
+        if not valid:
+            raise KernelError('operation_snapshot_changed')
+        if transaction_scope(tx).run_id != self.run['id']:
+            raise KernelError('operation_snapshot_binding')
+
+    def subject(self, subject: str, job: sqlite3.Row | None = None) -> _SubjectSnapshot:
+        self.require(self.tx)
+        if subject not in self.subjects:
+            job = self.kernel._job(self.tx, subject) if job is None else job
+            if job['id'] != subject or job['run_id'] != self.run['id']:
+                raise KernelError('operation_snapshot_binding')
+            if sum(len(value.encode()) if isinstance(value, str) else 16 for value in job) > CURRENT_LIMIT:
+                raise KernelError('current_record_limit')
+            self.subjects[subject] = _SubjectSnapshot(self, job)
+        return self.subjects[subject]
+
+    @cached_property
+    def abandoned(self) -> sqlite3.Row | None:
+        return self.kernel._abandon_action(self.tx)
+
+
+class _SubjectSnapshot:
+    """Demand-loaded subject facts belonging solely to an OperationSnapshot."""
+    def __init__(self, snapshot: _OperationSnapshot, job: sqlite3.Row) -> None:
+        self.snapshot, self.job = snapshot, job
+
+    def require(self, tx: Transaction, job: sqlite3.Row) -> None:
+        self.snapshot.require(tx)
+        if job is not self.job:
+            raise KernelError('operation_snapshot_binding')
+
+    @cached_property
+    def pending(self) -> sqlite3.Row | None:
+        return self.snapshot.kernel._pending_effect(self.snapshot.tx, self.job['id'])
+
+    @cached_property
+    def gates(self) -> tuple[sqlite3.Row, ...]:
+        return tuple(self.snapshot.kernel._gates(self.snapshot.tx, self.job['id']))
+
+    @cached_property
+    def requeue(self) -> sqlite3.Row | None:
+        return self.snapshot.kernel._pending_requeue(self.snapshot.tx, self.job['id'])
+
+    @cached_property
+    def attempt(self) -> sqlite3.Row | None:
+        if not self.job['current_attempt']:
+            return None
+        tx = self.snapshot.tx
+        return tx.one(*run_statement(tx, 'SELECT * FROM attempts WHERE id=? AND run_id=?',
+                                    (self.job['current_attempt'],), run_last=True))
+
+    @cached_property
+    def continuation(self) -> ContinuationFacts | None:
+        attempt = self.attempt
+        return (load_continuation(self.snapshot.tx, attempt['id']) if attempt is not None
+                and (attempt['thread_id'] is not None or attempt['opening_id'] is not None) else None)
+
+    @cached_property
+    def preparing(self) -> bool:
+        tx = self.snapshot.tx
+        return bool(tx.rows(*run_statement(tx,
+            "SELECT scope_id FROM waits WHERE subject=? AND kind='agent_preparation' AND run_id=?",
+            (self.job['id'],), run_last=True)))
+
+    @cached_property
+    def leased(self) -> bool:
+        tx = self.snapshot.tx
+        return bool(tx.rows(*run_statement(tx, 'SELECT id FROM leases WHERE subject=? AND run_id=?',
+                                         (self.job['id'],), run_last=True)))
+
+    @property
+    def waiting(self) -> Step | None:
+        # Time may advance inside one SQLite snapshot; reuse facts, not decisions.
+        return self.snapshot.kernel._continuation_wait(self.snapshot.tx, self.job, read=self)
 
 
 class Kernel:
@@ -359,7 +454,7 @@ class Kernel:
             return self._observation
 
     def _observation_member(self, tx: Transaction, run: sqlite3.Row, observation: _ObservationPass | None,
-                            subject: str | None = None) -> _SentRead | _ApprovalRead | None:
+                            subject: str | None = None, *, snapshot: _OperationSnapshot | None = None) -> _SentRead | _ApprovalRead | None:
         if observation is None:
             return None
         selected = transaction_scope(tx)
@@ -376,7 +471,8 @@ class Kernel:
                 observation.pending.clear()
                 return None
             for member in tuple(observation.pending):
-                job = self._job(tx, member.subject)
+                read = None if snapshot is None else snapshot.subject(member.subject)
+                job = self._job(tx, member.subject) if read is None else read.job
                 if isinstance(member, _SentRead):
                     rows = tx.rows(*run_statement(tx, 'SELECT status,attempts,subject,generation FROM effects WHERE id=? AND run_id=?',
                                (member.effect_id,), run_last=True))
@@ -391,7 +487,7 @@ class Kernel:
                     continue
                 if subject is not None and member.subject != subject:
                     continue
-                if isinstance(member, _ApprovalRead) and self._subject_wait(tx, run, job) is not None:
+                if isinstance(member, _ApprovalRead) and self._subject_wait(tx, run, job, read=read) is not None:
                     continue
                 if (run["blocked"] == "supervision_timeout" or any(gate["code"] == "supervision_timeout" for gate in self._gates(tx, member.subject))
                         or self._operation_wait(tx, run, member.subject, False) is not None):
@@ -399,11 +495,15 @@ class Kernel:
                 return member
             return None
 
-    def _operation_token(self, tx: Transaction, subject: str | None, cleanup: bool = False) -> str:
-        run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
-                  (), run_last=True))
-        return wire_json({"scope": self._automatic_scope(tx, run, subject, cleanup),
-                          "progress": self._automatic_progress(tx, run, subject, cleanup),
+    def _operation_token(self, tx: Transaction, subject: str | None, cleanup: bool = False, *,
+                         snapshot: _OperationSnapshot | None = None) -> str:
+        if snapshot is not None:
+            snapshot.require(tx)
+        run = snapshot.run if snapshot is not None else tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
+                                                                            (), run_last=True))
+        read = None if snapshot is None or subject is None else snapshot.subject(subject)
+        return wire_json({"scope": self._automatic_scope(tx, run, subject, cleanup, read=read),
+                          "progress": self._automatic_progress(tx, run, subject, cleanup, read=read),
                           "source_sequence": run["source_sequence"],
                           "control_version": [run[key] for key in ("executor", "epoch", "stopped", "blocked", "final_action")]}).decode()
 
@@ -423,16 +523,21 @@ class Kernel:
             self._local_preparation_read(tx, token.local_effect, token)
         return run
 
-    def _continuation_wait(self, tx: Transaction, job: sqlite3.Row) -> Step | None:
+    def _continuation_wait(self, tx: Transaction, job: sqlite3.Row, *, read: _SubjectSnapshot | None = None) -> Step | None:
         """Use the Attempt's single native-or-Opening facts loader."""
         subject = job["id"]
-        if tx.rows(*run_statement(tx, "SELECT scope_id FROM waits WHERE subject=? AND kind='agent_preparation' AND run_id=?",
-               (subject,), run_last=True)):
+        if read is not None:
+            read.require(tx, job)
+        if (read.preparing if read is not None else tx.rows(*run_statement(tx,
+                "SELECT scope_id FROM waits WHERE subject=? AND kind='agent_preparation' AND run_id=?",
+                (subject,), run_last=True))):
             return Step("waiting", subject, "agent_preparing")
         if job["current_attempt"]:
-            attempt = tx.one(*run_statement(tx, 'SELECT * FROM attempts WHERE id=? AND run_id=?',
-                          (job["current_attempt"],), run_last=True))
-            facts = load_continuation(tx, attempt["id"]) if attempt["thread_id"] is not None or attempt["opening_id"] is not None else None
+            attempt = read.attempt if read is not None else tx.one(*run_statement(tx,
+                'SELECT * FROM attempts WHERE id=? AND run_id=?', (job["current_attempt"],), run_last=True))
+            assert attempt is not None
+            facts = (read.continuation if read is not None else load_continuation(tx, attempt["id"])
+                     if attempt["thread_id"] is not None or attempt["opening_id"] is not None else None)
             prior = None if facts is None else facts.prior
             if prior is not None:
                 if prior.status != "running" and prior.dispatch_state in {"sent", "started", "unknown"}:
@@ -445,33 +550,36 @@ class Kernel:
                     if deadline is None or self.clock() < deadline:
                         retry_at = prior.recovery_ready_at if deadline is None else min(deadline, prior.recovery_ready_at)
                         return Step("waiting", subject, "capacity_recovery_wait", retry_at=retry_at)
-            if tx.rows(*run_statement(tx, 'SELECT id FROM leases WHERE subject=? AND run_id=?',
-                   (subject,), run_last=True)) and not (
+            if (read.leased if read is not None else tx.rows(*run_statement(tx,
+                    'SELECT id FROM leases WHERE subject=? AND run_id=?', (subject,), run_last=True))) and not (
                     prior is not None and prior.dispatch_state == "allocated" and self.clock() >= prior.deadline_at):
                 return Step("waiting", subject, "previous_invocation_exit")
         return None
 
-    def _subject_wait(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row) -> Step | None:
+    def _subject_wait(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, *,
+                      read: _SubjectSnapshot | None = None) -> Step | None:
         """The transition's read-only admission prefix, also used at Host exit."""
         subject = job["id"]
-        pending = self._pending_effect(tx, subject)
-        gates = {row["code"] for row in self._gates(tx, subject)}
+        if read is not None:
+            read.require(tx, job)
+        pending = read.pending if read is not None else self._pending_effect(tx, subject)
+        gates = {row["code"] for row in (read.gates if read is not None else self._gates(tx, subject))}
         if pending is not None and pending["status"] == "sent":
             # Gates prohibit a fresh write, never the original sent readback.
             return Step("paused", subject, "supervision_timeout") if "supervision_timeout" in gates or run["blocked"] == "supervision_timeout" else None
-        if pending is not None and self._effect_stale(tx, run, job, pending):
+        if pending is not None and self._effect_stale(tx, run, job, pending, read=read):
             return None
-        requeue = self._pending_requeue(tx, subject)
+        requeue = read.requeue if read is not None else self._pending_requeue(tx, subject)
         if requeue is not None:
             if not self._requeue_versions_current(tx, run, job, requeue, None):
                 return None
-            return Step("paused", subject, self._pause_reason(tx, subject, run)) if run["stopped"] or gates - {"requeue_required"} else None
-        continuation = self._continuation_wait(tx, job)
+            return Step("paused", subject, self._pause_reason(tx, subject, run, read=read)) if run["stopped"] or gates - {"requeue_required"} else None
+        continuation = read.waiting if read is not None else self._continuation_wait(tx, job)
         if continuation is not None and continuation.reason in {"agent_running", "previous_invocation_exit"}:
             return continuation
-        refreshing = job["refresh_revision"] is not None and self._automatic_control_read(tx, run, subject, False)
+        refreshing = job["refresh_revision"] is not None and self._automatic_control_read(tx, run, subject, False, read=read)
         if run["stopped"] or (run["blocked"] or gates) and not refreshing:
-            return Step("paused", subject, self._pause_reason(tx, subject, run))
+            return Step("paused", subject, self._pause_reason(tx, subject, run, read=read))
         if pending is not None or refreshing or job["validation_cleanup"] or tx.rows(*run_statement(tx, "SELECT subject FROM issue_links l WHERE subject=? AND state='pending' AND effect_id IN (SELECT id FROM effects e WHERE e.run_id=l.run_id AND status='prepared') AND l.run_id=?",
                                                                                  (subject,), run_last=True)):
             return None
@@ -495,14 +603,17 @@ class Kernel:
         return None
 
     def _operation_choice(self, tx: Transaction, run: sqlite3.Row, *, agent_capacity: int = 1,
-                          poll_manual: bool = False, observation: _ObservationPass | None = None) -> tuple[str | None, bool, _SentRead | _ApprovalRead | None] | None:
-        member = self._observation_member(tx, run, observation)
+                          poll_manual: bool = False, observation: _ObservationPass | None = None,
+                          snapshot: _OperationSnapshot | None = None) -> tuple[str | None, bool, _SentRead | _ApprovalRead | None] | None:
+        snapshot = snapshot or _OperationSnapshot(self, tx, run)
+        snapshot.require(tx)
+        member = self._observation_member(tx, run, observation, snapshot=snapshot)
         if member is not None:
             return member.subject, False, member
         agent_capacity = min(agent_capacity, max(0, run["concurrency"] - self._agent_seats(tx)))
-        abandoned = self._abandon_action(tx)
+        abandoned = snapshot.abandoned
         if abandoned is not None:
-            if self._abandon_wait(tx, abandoned) is not None:
+            if self._abandon_wait(tx, abandoned, snapshot=snapshot) is not None:
                 return None
             return tx.one(*run_statement(tx, 'SELECT id FROM subjects WHERE run_id=? ORDER BY rowid LIMIT 1',
                        (), run_last=True))[0], False, None
@@ -512,19 +623,20 @@ class Kernel:
                                            (), run_last=True)))
         manual_poll = None
         for subject in dict.fromkeys(order):
-            job = self._job(tx, subject)
-            waiting = self._subject_wait(tx, run, job)
+            read = snapshot.subject(subject)
+            job = read.job
+            waiting = self._subject_wait(tx, run, job, read=read)
             cleanup = waiting is not None and waiting.kind == "complete"
             if cleanup:
-                if self._cleanup_wait(tx, run, job) is not None:
+                if self._cleanup_wait(tx, run, job, read=read) is not None:
                     continue
             elif waiting is not None:
                 continue
-            if self._operation_wait(tx, run, subject, cleanup) is not None:
+            if self._operation_wait(tx, run, subject, cleanup, read=read) is not None:
                 continue
-            pending = self._pending_effect(tx, subject)
+            pending = read.pending
             gated_readback = pending is not None and pending["status"] == "sent" and (
-                run["stopped"] or run["blocked"] or self._gates(tx, subject))
+                run["stopped"] or run["blocked"] or read.gates)
             if cleanup:
                 gated_readback = bool(tx.rows(*run_statement(tx, "SELECT c.subject FROM resource_cleanup c JOIN effects e ON e.run_id=c.run_id AND e.id=c.effect_id WHERE c.subject=? AND e.status='sent' AND c.outcome IS NOT NULL AND c.run_id=?",
                                           (subject,), run_last=True)))
@@ -535,18 +647,16 @@ class Kernel:
                     manual_poll = (subject, cleanup, None)
                 continue
             if (job["phase"] == "approval" and not job["validation_cleanup"] and job["refresh_revision"] is None
-                    and not self._pending_effect(tx, subject) and self._pending_requeue(tx, subject) is None):
+                    and not pending and read.requeue is None):
                 # An explicit operation call may poll the manual boundary once.
                 # Passive supervision must not advertise perpetual background work.
                 if poll_manual and manual_poll is None:
                     manual_poll = (subject, False, None)
                 continue
-            if not agent_capacity and job["phase"] in {"development", "review", "publish"} and not self._pending_effect(tx, subject):
+            if not agent_capacity and job["phase"] in {"development", "review", "publish"} and not pending:
                 # A ready return may still perform program work without a slot.
-                if not tx.rows(*run_statement(tx, 'SELECT id FROM leases WHERE subject=? AND run_id=?',
-                           (subject,), run_last=True)) and (
-                        not job["current_attempt"] or not tx.one(*run_statement(tx, 'SELECT result_id FROM attempts WHERE id=? AND run_id=?',
-                                                              (job["current_attempt"],), run_last=True))[0]) and tx.rows(*run_statement(tx, 'SELECT subject FROM work_queue WHERE subject=? AND run_id=?',
+                if not read.leased and (
+                        read.attempt is None or not read.attempt['result_id']) and tx.rows(*run_statement(tx, 'SELECT subject FROM work_queue WHERE subject=? AND run_id=?',
                                                                                                                                                      (subject,), run_last=True)):
                     continue
             return subject, cleanup, None
@@ -560,13 +670,16 @@ class Kernel:
             return None, False, None
         return manual_poll
 
-    def _operation_wait(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool) -> float | None:
-        scope = wire_json(self._automatic_scope(tx, run, subject, cleanup))
+    def _operation_wait(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool, *,
+                        read: _SubjectSnapshot | None = None) -> float | None:
+        scope = wire_json(self._automatic_scope(tx, run, subject, cleanup, read=read))
         rows = tx.rows(*run_statement(tx, 'SELECT w.next_retry_at FROM waits w JOIN material m ON m.run_id=w.run_id AND m.id=w.scope_id WHERE w.subject IS ? AND m.body=? AND w.run_id=? ORDER BY w.deadline LIMIT 1',
                    (subject, scope), run_last=True))
         return rows[0][0] if rows and rows[0][0] is not None and self.clock() < rows[0][0] else None
 
-    def _cleanup_wait(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row) -> Step | None:
+    def _cleanup_wait(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, *, read: _SubjectSnapshot | None = None) -> Step | None:
+        if read is not None:
+            read.require(tx, job)
         rows = tx.rows(*run_statement(tx, 'SELECT c.*,e.status AS effect_status FROM resource_cleanup c LEFT JOIN effects e ON e.run_id=c.run_id AND e.id=c.effect_id WHERE c.subject=? AND c.generation=? AND c.run_id=?',
                    (job["id"], job["generation"]), run_last=True))
         if not rows or rows[0]["state"] == "complete":
@@ -575,28 +688,30 @@ class Kernel:
         if cleanup["effect_status"] in {"observed", "cancelled"}:
             return None
         if cleanup["effect_status"] == "sent":
-            if run["blocked"] == "supervision_timeout" or any(gate["code"] == "supervision_timeout" for gate in self._gates(tx, job["id"])):
+            if run["blocked"] == "supervision_timeout" or any(gate["code"] == "supervision_timeout" for gate in (read.gates if read is not None else self._gates(tx, job["id"]))):
                 return Step("paused", job["id"], "supervision_timeout")
             return None
-        if run["stopped"] or run["blocked"] or self._gates(tx, job["id"]) or cleanup["outcome"] is not None:
+        if run["stopped"] or run["blocked"] or (read.gates if read is not None else self._gates(tx, job["id"])) or cleanup["outcome"] is not None:
             return Step("paused", job["id"], "cleanup_authority")
         return None
 
-    def _abandon_wait(self, tx: Transaction, action: sqlite3.Row) -> Step | None:
+    def _abandon_wait(self, tx: Transaction, action: sqlite3.Row, *, snapshot: _OperationSnapshot | None = None) -> Step | None:
+        if snapshot is not None:
+            snapshot.require(tx)
         subject = tx.one(*run_statement(tx, 'SELECT id FROM subjects WHERE run_id=? ORDER BY rowid LIMIT 1',
                       (), run_last=True))[0]
         if action["status"] == "complete":
             return Step("complete", subject, "abandoned")
         if self._agent_seats(tx):
             return Step("waiting", subject, "worker_exit_unproven")
-        if any((waiting := self._continuation_wait(tx, job)) is not None and waiting.reason in {
+        if any((waiting := (self._continuation_wait(tx, job) if snapshot is None else snapshot.subject(job['id'], job).waiting)) is not None and waiting.reason in {
                 "agent_running", "previous_invocation_exit"} for job in tx.all(*run_statement(tx, 'SELECT * FROM subjects WHERE run_id=? ORDER BY rowid',
                                                                             (), run_last=True))):
             return Step("waiting", subject, "worker_exit_unproven")
         if self._abandon_reconciliation_blocked(tx, action):
             return Step("paused", subject, "abandon_outcome_unproven")
-        run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
-                  (), run_last=True))
+        run = snapshot.run if snapshot is not None else tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
+                                                                            (), run_last=True))
         for job in tx.all(*run_statement(tx, 'SELECT id FROM subjects WHERE run_id=? ORDER BY rowid',
                        (), run_last=True)):
             retry_at = self._operation_wait(tx, run, job["id"], False)
@@ -626,13 +741,14 @@ class Kernel:
                 if error.code != "executor_fenced":
                     raise
                 return Step("paused", "", error.code)
+            snapshot = _OperationSnapshot(self, tx, run)
             choice = self._operation_choice(tx, run, agent_capacity=agent_capacity,
-                                            poll_manual=observation is None, observation=observation)
+                                            poll_manual=observation is None, observation=observation, snapshot=snapshot)
             if choice is None:
-                state = self._operation_state(observation)
+                state = self._operation_state_in(tx, observation, snapshot=snapshot)
                 return Step(state.disposition, "", retry_at=state.wake_at)
             subject, cleanup, member = choice
-            work = Work(execution, self._operation_token(tx, subject, cleanup), subject,
+            work = Work(execution, self._operation_token(tx, subject, cleanup, snapshot=snapshot), subject,
                         cleanup, bool(agent_capacity), observation, member)
             original = (self._effect(tx, tx.one(*run_statement(tx, 'SELECT * FROM effects WHERE id=? AND run_id=?',
                                              (member.effect_id,), run_last=True)), execution)
@@ -829,10 +945,13 @@ class Kernel:
         with self.storage.transaction(write=False) as tx:
             return self._operation_state_in(tx, observation)
 
-    def _operation_state_in(self, tx: Transaction, observation: _ObservationPass | None = None) -> OperationState:
+    def _operation_state_in(self, tx: Transaction, observation: _ObservationPass | None = None, *,
+                            snapshot: _OperationSnapshot | None = None) -> OperationState:
         """Read scheduling facts within the caller's existing transaction."""
-        run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
-                  (), run_last=True))
+        snapshot = snapshot or _OperationSnapshot(self, tx, tx.one(*run_statement(tx,
+            'SELECT * FROM runs WHERE id=?', (), run_last=True)))
+        snapshot.require(tx)
+        run = snapshot.run
         active = tx.all(*run_statement(tx, 'SELECT l.*,i.deadline_at FROM leases l JOIN invocations i ON i.run_id=l.run_id AND i.id=l.invocation WHERE l.run_id=?',
                      (), run_last=True))
         preparations = [(row, self._preparation(tx, row)[0]) for row in tx.all(*run_statement(tx, "SELECT * FROM waits WHERE kind='agent_preparation' AND run_id=?",
@@ -840,17 +959,20 @@ class Kernel:
         deadlines = [float(row["deadline_at"]) for row in active] + [p.preparation_deadline for _, p in preparations]
         for row in tx.all(*run_statement(tx, 'SELECT w.*,m.body FROM waits w JOIN material m ON m.run_id=w.run_id AND m.id=w.scope_id WHERE w.run_id=?',
                        (), run_last=True)):
-            if json.loads(row["body"]) in (self._automatic_scope(tx, run, row["subject"], False), self._automatic_scope(tx, run, row["subject"], True)):
+            read = None if row['subject'] is None else snapshot.subject(row['subject'])
+            if json.loads(row["body"]) in (self._automatic_scope(tx, run, row["subject"], False, read=read), self._automatic_scope(tx, run, row["subject"], True, read=read)):
                 deadlines.append(float(row["next_retry_at"] or row["deadline"]))
         lifetime_wait = False
         for job in tx.all(*run_statement(tx, 'SELECT * FROM subjects WHERE run_id=? ORDER BY rowid',
                        (), run_last=True)):
-            waiting = self._continuation_wait(tx, job)
+            read = snapshot.subject(job['id'], job)
+            job = read.job
+            waiting = read.waiting
             lifetime_wait |= waiting is not None and waiting.reason in {"agent_running", "previous_invocation_exit"}
-            if waiting is not None and waiting.retry_at is not None and self._subject_wait(tx, run, job) == waiting:
+            if waiting is not None and waiting.retry_at is not None and self._subject_wait(tx, run, job, read=read) == waiting:
                 deadlines.append(waiting.retry_at)
-        choice = self._operation_choice(tx, run, observation=observation)
-        abandoned = self._abandon_action(tx)
+        ready = self._operation_choice(tx, run, observation=observation, snapshot=snapshot) is not None
+        abandoned = snapshot.abandoned
         complete = (abandoned is not None and abandoned["status"] == "complete" or
             not tx.rows(*run_statement(tx, "SELECT id FROM subjects WHERE phase!='complete' AND run_id=? LIMIT 1",
                     (), run_last=True))
@@ -860,10 +982,10 @@ class Kernel:
                         (), run_last=True))
             and not tx.rows(*run_statement(tx, "SELECT id FROM effects WHERE status IN ('prepared','sent','observed') AND operation!='issue_link' AND run_id=? LIMIT 1",
                         (), run_last=True)))
-        disposition: Literal["ready", "waiting", "quiescent", "complete"] = "ready" if choice is not None else "waiting" if active or preparations or lifetime_wait or any(t > self.clock() for t in deadlines) else "complete" if complete else "quiescent"
-        cancel = tuple(row["id"] for row in active if run["stopped"] or run["blocked"] or abandoned is not None or self._gates(tx, row["subject"]) or self.clock() >= row["deadline_at"])
+        disposition: Literal["ready", "waiting", "quiescent", "complete"] = "ready" if ready else "waiting" if active or preparations or lifetime_wait or any(t > self.clock() for t in deadlines) else "complete" if complete else "quiescent"
+        cancel = tuple(row["id"] for row in active if run["stopped"] or run["blocked"] or abandoned is not None or snapshot.subject(row["subject"]).gates or self.clock() >= row["deadline_at"])
         cancel += tuple(p.reservation_id for _, p in preparations if run["stopped"] or run["blocked"] or abandoned is not None
-                        or self._gates(tx, p.subject) or self.clock() >= p.preparation_deadline)
+                        or snapshot.subject(p.subject).gates or self.clock() >= p.preparation_deadline)
         return OperationState(run["concurrency"], tuple(row["id"] for row in active), cancel,
                               min((t for t in deadlines if t > self.clock()), default=None), disposition,
                               tuple(p.reservation_id for _, p in preparations))
@@ -2700,20 +2822,21 @@ class Kernel:
             return self._advance_abandon(tx, tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
                                                  (), run_last=True)), abandoned, subject, work, world)
         run, job = self._owned(tx, subject, execution)
-        waiting = self._subject_wait(tx, run, job)
+        read = _OperationSnapshot(self, tx, run).subject(subject, job)
+        waiting = self._subject_wait(tx, run, job, read=read)
         if waiting is not None:
             return waiting
-        requeue = self._pending_requeue(tx, subject)
+        requeue = read.requeue
         if requeue is not None:
             return self._advance_requeue(tx, run, job, requeue, work, world)
-        pending = self._pending_effect(tx, subject)
+        pending = read.pending
         # An unknown write is read back before scope drift or any new work.
         if pending is not None:
             if pending["status"] == "sent":
                 return self._effect_work(tx, work, pending)
-            if pending["status"] == "observed" and self._effect_stale(tx, run, job, pending):
+            if pending["status"] == "observed" and self._effect_stale(tx, run, job, pending, read=read):
                 return self._settle_stale_effect(tx, job, pending)
-            if pending["status"] == "prepared" and self._effect_stale(tx, run, job, pending):
+            if pending["status"] == "prepared" and self._effect_stale(tx, run, job, pending, read=read):
                 tx.execute(*run_statement(tx, "UPDATE effects SET status='retired' WHERE id=? AND run_id=?",
                     (pending["id"],), run_last=True))
                 return Step("progress", subject, "stale_intent_retired")
@@ -2727,7 +2850,7 @@ class Kernel:
             if pending["status"] == "observed":
                 return self._apply_effect(tx, run, job, pending, world)
             return self._effect_work(tx, work, pending)
-        if job["refresh_revision"] is not None and self._automatic_control_read(tx, run, subject, False):
+        if job["refresh_revision"] is not None and self._automatic_control_read(tx, run, subject, False, read=read):
             if world is None:
                 return self._observe_work(tx, work, subject)
             return self._refresh_final(tx, run, job, world)
@@ -2755,10 +2878,11 @@ class Kernel:
         attempt = None
         facts = None
         if job["current_attempt"]:
-            attempt = tx.one(*run_statement(tx, 'SELECT * FROM attempts WHERE id=? AND run_id=?',
-                          (job["current_attempt"],), run_last=True))
+            attempt = read.attempt
+            assert attempt is not None
             if attempt["thread_id"] is not None or attempt["opening_id"] is not None:
-                facts = load_continuation(tx, attempt["id"])
+                facts = read.continuation
+                assert facts is not None
                 prior = facts.prior
                 if prior is not None and prior.status == "running" and prior.dispatch_state == "allocated" and self.clock() >= prior.deadline_at:
                     evidence = tx.put(subject, "allocation_expired", wire_json({"invocation": prior.invocation_id,
@@ -2804,7 +2928,8 @@ class Kernel:
         else:
             self._abandon_owned(tx, abandoned, execution)
 
-    def _automatic_scope(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool) -> dict[str, Any]:
+    def _automatic_scope(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool, *,
+                         read: _SubjectSnapshot | None = None) -> dict[str, Any]:
         selected = transaction_scope(tx)
         if run['id'] != selected.run_id:
             raise KernelError("effect_binding")
@@ -2819,36 +2944,50 @@ class Kernel:
             if abandoned is None:
                 scope["final_ancestry"] = self._fingerprint(self._final_ancestry_anchors(tx))
         else:
-            job = self._job(tx, subject)
+            if read is not None:
+                read.require(tx, read.job)
+                if read.job['id'] != subject:
+                    raise KernelError('operation_snapshot_binding')
+            job = self._job(tx, subject) if read is None else read.job
             scope["delivery"] = {key: job[key] for key in (
                 "generation", "revision", "phase", "purpose", "source_ref", "target_ref", "base_sha",
                 "source_sha", "candidate_sha", "integrated_sha", "publication_sha", "pr_number",
                 "current_attempt", "completion_revision")}
-            requeue = self._pending_requeue(tx, subject)
+            requeue = self._pending_requeue(tx, subject) if read is None else read.requeue
             if requeue is not None:
                 scope["requeue_action"] = requeue["id"]
         return scope
 
-    def _automatic_control_read(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool) -> bool:
+    def _automatic_control_read(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool, *,
+                                read: _SubjectSnapshot | None = None) -> bool:
         # Observation grants no write. The original approved Final Action owns
         # its proved-unapplied merge continuation; a new requeue cannot take it.
         if subject is None or cleanup or run["stopped"]:
             return False
+        if read is not None:
+            read.require(tx, read.job)
+            if read.job['id'] != subject:
+                raise KernelError('operation_snapshot_binding')
         if run["blocked"] == "final_refresh" and run["final_action"]:
-            job = self._job(tx, subject)
+            job = self._job(tx, subject) if read is None else read.job
             return bool(job["kind"] == DeliveryKind.FINAL_RUN and job["phase"] == "refresh_final"
-                        and job["refresh_revision"] == run["observed_parent_revision"] and not self._gates(tx, subject)
+                        and job["refresh_revision"] == run["observed_parent_revision"] and not (self._gates(tx, subject) if read is None else read.gates)
                         and tx.rows(*run_statement(tx, "SELECT id FROM actions WHERE id=? AND subject=? AND status='pending' AND kind IN ('approve','resume') AND run_id=?",
                                 (run["final_action"], subject), run_last=True)))
         # Retirement still checks accepted versions, PR identity and publisher.
         return bool(not run["final_action"] and run["blocked"] == "requeue_required"
-                    and self._pending_requeue(tx, subject) is not None
-                    and all(gate["code"] == "requeue_required" for gate in self._gates(tx, subject)))
+                    and (self._pending_requeue(tx, subject) if read is None else read.requeue) is not None
+                    and all(gate["code"] == "requeue_required" for gate in (self._gates(tx, subject) if read is None else read.gates)))
 
-    def _automatic_progress(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool) -> str:
+    def _automatic_progress(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool, *,
+                            read: _SubjectSnapshot | None = None) -> str:
         selected = transaction_scope(tx)
         if run['id'] != selected.run_id:
             raise KernelError("effect_binding")
+        if read is not None:
+            read.require(tx, read.job)
+            if read.job['id'] != subject:
+                raise KernelError('operation_snapshot_binding')
         # No sequence counters, diagnostics, history, clocks, polling attempts
         # or sibling records can make a stalled operation appear to progress.
         abandoned = self._abandon_action(tx)
@@ -2864,14 +3003,17 @@ class Kernel:
             facts = [dict(row) for row in tx.rows(*run_statement(tx, "SELECT id,generation,phase FROM subjects WHERE kind='final_run' AND run_id=?",
                                               (), run_last=True))]
         else:
-            job = self._job(tx, subject)
+            job = self._job(tx, subject) if read is None else read.job
+            attempt_keys = ('id', 'status', 'result_id', 'accounted', 'outcome', 'current_invocation', 'resume_action', 'new_thread')
             facts = {"delivery": {key: job[key] for key in job.keys() if key not in {"version", "last_failure", "checks_id"}},
                      "attempt": [dict(row) for row in tx.rows(*run_statement(tx, 'SELECT id,status,result_id,accounted,outcome,current_invocation,resume_action,new_thread FROM attempts WHERE id=? AND run_id=?',
-                                                          (job["current_attempt"],), run_last=True))],
+                                                          (job["current_attempt"],), run_last=True))] if read is None else
+                                ([] if read.attempt is None else [{key: read.attempt[key] for key in attempt_keys}]),
                      "effects": [dict(row) for row in tx.all(*run_statement(tx, "SELECT id,operation,status,receipt_id FROM effects WHERE subject=? AND status IN ('prepared','sent','observed') AND run_id=? ORDER BY id",
                                                           (subject,), run_last=True))],
                      "gates": [dict(row) for row in tx.rows(*run_statement(tx, 'SELECT code,purpose FROM gates WHERE subject=? AND run_id=? ORDER BY code',
-                                                        (subject,), run_last=True))],
+                                                        (subject,), run_last=True))] if read is None else
+                              [{key: row[key] for key in ('code', 'purpose')} for row in read.gates],
                      "work_queue": bool(tx.rows(*run_statement(tx, 'SELECT subject FROM work_queue WHERE subject=? AND run_id=?',
                                             (subject,), run_last=True))),
                      "integration_queue": bool(tx.rows(*run_statement(tx, 'SELECT subject FROM integration_queue WHERE subject=? AND run_id=?',
@@ -2881,7 +3023,7 @@ class Kernel:
                                                           (subject, job["generation"]), run_last=True))],
                      "link": [dict(row) for row in tx.rows(*run_statement(tx, 'SELECT generation,state,effect_id FROM issue_links WHERE subject=? AND run_id=?',
                                                        (subject,), run_last=True))]}
-            requeue = self._pending_requeue(tx, subject)
+            requeue = self._pending_requeue(tx, subject) if read is None else read.requeue
             # This exact current-Action witness is consumed by _advance_requeue
             # before generation replacement; unrelated audit events never count.
             facts["requeue_readback"] = None if requeue is None else [dict(row) for row in tx.rows(*run_statement(tx, "SELECT material_id FROM history WHERE kind='retirement_rechecked' AND identity=? AND run_id=? ORDER BY position DESC LIMIT 1",
@@ -4124,8 +4266,10 @@ class Kernel:
         return tx.rows(*run_statement(tx, 'SELECT * FROM gates WHERE subject=? AND run_id=? ORDER BY code',
                    (subject,), run_last=True))
 
-    def _pause_reason(self, tx: Transaction, subject: str, run: sqlite3.Row) -> str:
-        return "operator_stopped" if run["stopped"] else (run["blocked"] or ",".join(row["code"] for row in self._gates(tx, subject)))
+    def _pause_reason(self, tx: Transaction, subject: str, run: sqlite3.Row, *, read: _SubjectSnapshot | None = None) -> str:
+        if read is not None:
+            read.require(tx, read.job)
+        return "operator_stopped" if run["stopped"] else (run["blocked"] or ",".join(row["code"] for row in (self._gates(tx, subject) if read is None else read.gates)))
 
     def _gate(self, tx: Transaction, subject: str, code: str, *, purpose: str | None = None, evidence: str | None = None) -> None:
         tx.execute(*run_statement(tx, 'INSERT OR IGNORE INTO gates(subject,code,purpose,evidence,run_id) VALUES (?,?,?,?,?)',
@@ -4969,7 +5113,9 @@ class Kernel:
                    (subject,), run_last=True))
         return rows[0] if rows else None
 
-    def _effect_stale(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, row: sqlite3.Row) -> bool:
+    def _effect_stale(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, row: sqlite3.Row, *, read: _SubjectSnapshot | None = None) -> bool:
+        if read is not None:
+            read.require(tx, job)
         if run["source_sequence"] is None:
             return False
         if self._final_closing(tx, run, job) and row["operation"] in {"merge", "completion_comment", "close"}:
@@ -4979,7 +5125,7 @@ class Kernel:
         return bool(row["generation"] != job["generation"] or row["parent_revision"] != run["observed_parent_revision"]
                     or row["graph_revision"] != run["observed_graph_revision"] or job["refresh_revision"] is not None
                     or (job["kind"] == DeliveryKind.TICKET and facts and row["revision"] != facts[0][0])
-                    or any(gate["code"] == "requeue_required" for gate in self._gates(tx, job["id"])))
+                    or any(gate["code"] == "requeue_required" for gate in (self._gates(tx, job["id"]) if read is None else read.gates)))
 
     def _merge_receipt_matches(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, row: sqlite3.Row, result: dict[str, Any]) -> bool:
         pr, commit = result["pr"], result["commit"]

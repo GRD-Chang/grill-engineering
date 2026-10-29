@@ -5,6 +5,7 @@ Subsequent observation, refresh and scheduler operations are existing Core APIs.
 """
 from contextlib import closing, contextmanager
 from dataclasses import asdict, replace
+import sqlite3
 
 import pytest
 
@@ -70,6 +71,125 @@ def _rows(db, run):
     return {name: [tuple(row) for row in db.execute(
         f"SELECT * FROM {name} WHERE {'id' if name == 'runs' else 'run_id'}=? ORDER BY rowid", (run,))]
         for name in names if name != "meta"}
+
+
+def test_next_work_without_choice_reselects_using_one_snapshot(scenario, monkeypatch):
+    db, kernels = scenario
+    kernel = kernels['A']
+    db.execute("UPDATE runs SET blocked='unsupported_scope_change' WHERE id='A'")
+    choice, calls = kernel._operation_choice, []
+
+    def selected(*args, **kwargs):
+        calls.append(True)
+        return choice(*args, **kwargs)
+
+    monkeypatch.setattr(kernel, '_operation_choice', selected)
+    before = len(kernel.owners)
+    assert kernel.next_work(_execution('A')).kind == 'quiescent'
+    assert calls == [True, True] and len(kernel.owners) == before + 1
+    assert kernel.operation_state().disposition == 'quiescent'
+
+
+def test_next_work_reselects_in_same_snapshot_when_read_retry_becomes_due(scenario, monkeypatch):
+    _, kernels = scenario
+    kernel, now = kernels['A'], [100.]
+    kernel.clock = lambda: now[0]
+    request = kernel.begin_observation(SUBJECT, execution=_execution('A'))
+    waiting = kernel._wait_for_read(request.fence, _execution('A'), 'controlled_read', 'Original read unavailable')
+    assert waiting.retry_at == 105.
+    now[0] = 104.999
+    select, calls = kernel._operation_choice, []
+
+    def choice(*args, **kwargs):
+        result = select(*args, **kwargs)
+        calls.append(result)
+        if len(calls) == 1:
+            assert result is None
+            now[0] = 105.
+        return result
+
+    monkeypatch.setattr(kernel, '_operation_choice', choice)
+    before = len(kernel.owners)
+    result = kernel.next_work(_execution('A'))
+    assert result.kind == 'ready' and result.retry_at is None
+    assert len(calls) == 2 and calls[1] is not None
+    assert len(kernel.owners) == before + 1
+
+
+def test_zero_physical_capacity_keeps_passive_readiness_in_same_snapshot(scenario, monkeypatch):
+    db, kernels = scenario
+    kernel = kernels['A']
+    insert(db, 'work_queue', {'run_id': 'A', 'subject': SUBJECT, 'ready': 1})
+    choices, select = [], kernel._operation_choice
+
+    def choice(*args, **kwargs):
+        choices.append(True)
+        return select(*args, **kwargs)
+
+    monkeypatch.setattr(kernel, '_operation_choice', choice)
+    assert kernel.next_work(_execution('A'), agent_capacity=0).kind == 'ready'
+    assert choices == [True, True]
+    assert not db.execute("SELECT scope_id FROM waits WHERE run_id='A'").fetchall()
+
+
+def test_shared_facts_keep_the_original_operation_token(scenario):
+    _, kernels = scenario
+    kernel = kernels['A']
+    with kernel.storage.transaction(write=False) as tx:
+        run, job = kernel._owned(tx, SUBJECT, _execution('A'))
+        snapshot = core._OperationSnapshot(kernel, tx, run)
+        snapshot.subject(SUBJECT, job)
+        assert kernel._operation_token(tx, SUBJECT) == kernel._operation_token(tx, SUBJECT, snapshot=snapshot)
+
+
+@pytest.mark.parametrize('change', ['gate', 'source', 'epoch'])
+def test_snapshot_ends_at_same_transaction_mutation_and_new_snapshot_sees_it(scenario, change):
+    db, kernels = scenario
+    kernel = kernels['A']
+    with kernel.storage.transaction() as tx:
+        run, job = kernel._owned(tx, SUBJECT, _execution('A'))
+        snapshot = core._OperationSnapshot(kernel, tx, run)
+        read = snapshot.subject(SUBJECT, job)
+        assert read.gates == ()
+        if change == 'gate':
+            kernel._gate(tx, SUBJECT, 'human_blocker')
+        elif change == 'source':
+            kernel._refresh(tx, _source('A', 'new snapshot'))
+        else:
+            tx.execute("UPDATE runs SET epoch=epoch+1 WHERE id='A'")
+        with pytest.raises(KernelError, match='operation_snapshot_changed'):
+            kernel._subject_wait(tx, run, job, read=read)
+        current_run = tx.one("SELECT * FROM runs WHERE id='A'")
+        fresh = core._OperationSnapshot(kernel, tx, current_run).subject(SUBJECT)
+        if change == 'gate':
+            assert [gate['code'] for gate in fresh.gates] == ['human_blocker']
+        else:
+            key = 'source_sequence' if change == 'source' else 'epoch'
+            assert current_run[key] > run[key]
+    with kernel.storage.transaction(write=False) as new_tx:
+        with pytest.raises(KernelError, match='operation_snapshot_changed'):
+            snapshot.require(new_tx)
+
+
+def test_snapshot_rejects_closed_or_poisoned_owner(scenario):
+    _, kernels = scenario
+    kernel = kernels['A']
+    with kernel.storage.transaction(write=False) as tx:
+        run, job = kernel._owned(tx, SUBJECT, _execution('A'))
+        snapshot = core._OperationSnapshot(kernel, tx, run)
+        read = snapshot.subject(SUBJECT, job)
+    with pytest.raises(KernelError, match='operation_snapshot_changed'):
+        kernel._subject_wait(tx, run, job, read=read)
+    with pytest.raises(KernelError, match='transaction_aborted'):
+        with kernel.storage.transaction(write=False) as tx:
+            run, job = kernel._owned(tx, SUBJECT, _execution('A'))
+            snapshot = core._OperationSnapshot(kernel, tx, run)
+            try:
+                tx.execute('SELECT absent_column FROM runs')
+            except sqlite3.OperationalError:
+                pass
+            with pytest.raises(KernelError, match='operation_snapshot_changed'):
+                snapshot.require(tx)
 
 
 def test_source_observation_refresh_and_next_work_do_not_read_or_drive_sibling_run(scenario):
@@ -162,6 +282,43 @@ def _once(kernel, run, source, *, facts=None):
         actual = kernel.accept_delivery(observation, DeliveryFacts(BASE, BASE) if facts is None else facts)
         result = kernel.accept_work(result, actual)
     return result
+
+
+def test_reused_facts_do_not_cache_a_clock_dependent_wait(scenario):
+    from support.core_operations import prepare_scripted_agent
+
+    _, kernels = scenario
+    kernel, now = kernels['A'], [100.]
+    kernel.clock = lambda: now[0]
+    call = prepare_scripted_agent(kernel, _once(kernel, 'A', _source('A'))).call
+    assert call is not None
+    with kernel.storage.transaction(write=False) as tx:
+        run, job = kernel._owned(tx, SUBJECT, _execution('A'))
+        read = core._OperationSnapshot(kernel, tx, run).subject(SUBJECT, job)
+        assert read.waiting.reason == 'agent_running'
+        now[0] = call.deadline_at
+        assert read.waiting is None
+
+
+def test_no_choice_reselection_shares_the_same_continuation_facts(scenario, monkeypatch):
+    from support.core_operations import prepare_scripted_agent
+
+    _, kernels = scenario
+    kernel = kernels['A']
+    call = prepare_scripted_agent(kernel, _once(kernel, 'A', _source('A'))).call
+    assert call is not None
+    load, reads = core.load_continuation, []
+
+    def counted(tx, attempt):
+        reads.append((tx, attempt))
+        return load(tx, attempt)
+
+    monkeypatch.setattr(core, 'load_continuation', counted)
+    before = len(kernel.owners)
+    result = kernel.next_work(_execution('A'))
+    assert result.kind == 'waiting'
+    assert len(kernel.owners) == before + 1
+    assert len(reads) == 1 and reads[0][1] == call.attempt_id
 
 
 def test_ticket_frontier_dependencies_and_queues_do_not_take_sibling_closed_state(ticket_scenario):
