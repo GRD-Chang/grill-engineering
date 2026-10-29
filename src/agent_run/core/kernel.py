@@ -3153,9 +3153,11 @@ class Kernel:
             return self._effect_work(tx, work, pending)
         if run["stopped"] or run["blocked"] or self._gates(tx, subject):
             return Step("paused", subject, "cleanup_authority")
-        if world is None:
-            return self._observe_work(tx, work, subject)
         operation = self.CLEANUP[cleanup["stage"]]
+        # A first local intent uses the confirmed close, not fresh Delivery
+        # facts. Fresh Source and all write guards still precede deletion.
+        if world is None and operation not in {"cleanup_worktree", "cleanup_local_ref"}:
+            return self._observe_work(tx, work, subject)
         head = cleanup["workspace_sha"] if operation == "cleanup_worktree" else cleanup["source_sha"]
         if operation == "cleanup_local_ref":
             workspaces = tx.rows(*run_statement(tx, "SELECT * FROM effects WHERE subject=? AND generation=? AND source_ref=? AND operation='workspace' AND status='confirmed' AND run_id=?",
@@ -5451,14 +5453,19 @@ class Kernel:
         raise KernelError("integration_workspace_unproven")
 
     def _prepare_effect(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, work: Work,
-                        world: World, operation: str, *, before: str, after: str | None = None,
+                        world: World | None, operation: str, *, before: str, after: str | None = None,
                         payload: dict[str, Any] | None = None) -> PrepareIO | EffectIO:
         selected = transaction_scope(tx)
         if run['id'] != selected.run_id or job['run_id'] != selected.run_id or work.execution.run_id != selected.run_id:
             raise KernelError("effect_binding")
+        if world is None and (not work.cleanup or operation not in {"cleanup_worktree", "cleanup_local_ref"}):
+            raise KernelError("effect_binding")
         execution = work.execution
         subject, effect_id = job["id"], identity()
-        actor = self._publisher_actor(tx, run, world) if operation in self.REMOTE else None
+        actor = None
+        if operation in self.REMOTE:
+            assert world is not None
+            actor = self._publisher_actor(tx, run, world)
         initial = operation == "run_branch" and job["kind"] == DeliveryKind.TICKET
         if initial:
             target = tx.one(*run_statement(tx, 'SELECT * FROM final_target WHERE run_id=?',
@@ -5474,6 +5481,7 @@ class Kernel:
             source_ref, target_ref = job["source_ref"], job["target_ref"]
             base = Commit(job["base_sha"], job["base_tree"])
         else:
+            assert world is not None
             source_ref, target_ref, base = job["source_ref"], job["target_ref"], self._require_target(world)
         body = dict(payload or {})
         body["intent_token"] = effect_id
@@ -5484,6 +5492,7 @@ class Kernel:
             for key in ("checkout", "owned_root", "common_git_dir"):
                 body.setdefault(key, job[key])
         if operation in {"push", "run_branch"}:
+            assert world is not None
             body["expected_remote_sha"] = None if initial or world.source is None else world.source.sha
         inputs = self._inputs(tx, run)
         if inputs:
