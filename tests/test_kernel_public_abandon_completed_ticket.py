@@ -9,6 +9,7 @@ import time
 from agent_run.runtime.package_lease import default_runner_lock_path, runner_management_lease
 from agent_run.core.kernel import Kernel
 from support.managed_abandon_transport import install_currentness
+from support.host_close_trace import raise_with_trace
 from support.systemd_manager import (
     _managed_failure_note,
     _CODEX, _approval_read_barrier, _control_environment, _diagnostic_tail, _git,
@@ -27,7 +28,7 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
     codex = _CODEX[:_CODEX.index("if prompt.startswith")] + classification + _CODEX[_CODEX.index("thread = "):]
     codex = codex.replace("'managed-entry-' + role)", "'managed-entry-' + role + '-' + os.urandom(16).hex())")
     with _approval_read_barrier() as (address, databases, reached, release):
-        _hold_host_operation_return(tmp_path, monkeypatch)
+        _hold_host_operation_return(tmp_path, monkeypatch, observe_close=True)
         monkeypatch.setenv("ENTRY_APPROVAL_CONTROL", address)
         environment, state = _control_environment(git_repo, tmp_path, monkeypatch, codex=codex, tickets=(2,))
         install_currentness(tmp_path, state)
@@ -92,7 +93,7 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
                         error.add_note('Host stderr: ' + _diagnostic_tail(tmp_path / 'manager' / 'host.stderr'))
                     except BaseException as unavailable:
                         error.add_note('Host stderr unavailable: ' + type(unavailable).__name__)
-                    raise
+                    raise_with_trace(error, tmp_path, children)
                 assert len(children) == len(commands) == 1 and children[0].returncode == 0, output
                 assert trace == ["fdstore", "barrier", "host_exited", "store_closed"]
                 assert kernel.source_status()["abandonment"] == {"action": abandoned["action_id"], "status": "complete"}

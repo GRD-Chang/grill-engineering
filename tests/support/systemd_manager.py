@@ -671,7 +671,8 @@ def _approval_read_barrier(*, boundary=None, released=None):
         assert not serving.is_alive() and not errors, errors
 
 
-def _hold_host_operation_return(directory: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _hold_host_operation_return(directory: Path, monkeypatch: pytest.MonkeyPatch, *,
+                                hold: bool = True, observe_close: bool = False) -> None:
     """Offer committed operation returns to the existing control barrier.
 
     A quiescent approval needs no extra source poll. Instrument only the actual
@@ -680,7 +681,7 @@ def _hold_host_operation_return(directory: Path, monkeypatch: pytest.MonkeyPatch
     """
     hook = directory / "host-return-hook"
     hook.mkdir()
-    (hook / "sitecustomize.py").write_text("""import os, sys
+    source = """import os, sys
 if sys.orig_argv[1:3] == ["-m", 'agent_run.runtime.executor']:
     import socket
     from agent_run.core.operation_runner import OperationRunner
@@ -696,5 +697,14 @@ if sys.orig_argv[1:3] == ["-m", 'agent_run.runtime.executor']:
                 assert channel.recv(1) == b"1"
         return step
     OperationRunner.run_once = observe_return
-""")
+"""
+    if not hold:
+        source = 'import sys\n'
+    if observe_close:
+        source += ("\nif sys.orig_argv[1:3] == ['-m', 'agent_run.runtime.executor']:\n"
+                   f"    sys.path.insert(0, {str(Path(__file__).parent.parent)!r})\n"
+                   "    from pathlib import Path\n"
+                   "    from support.host_close_trace import install\n"
+                   f"    install(Path({str(hook / 'close-trace.jsonl')!r}))\n")
+    (hook / "sitecustomize.py").write_text(source)
     monkeypatch.setenv("PYTHONPATH", str(hook) + os.pathsep + os.environ.get("PYTHONPATH", ""))

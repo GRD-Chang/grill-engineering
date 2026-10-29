@@ -30,6 +30,7 @@ from agent_run.storage.routing import RepositoryRoute
 from support.systemd_manager import controlled_manager
 from support.remote_effects import FAKE_GH
 from support.worker_process_timing import wait_until
+from support.host_close_trace import raise_with_trace
 from support.systemd_manager import _CODEX, _approval_read_barrier, _control_environment, _diagnostic_tail, _executable, _git, _hold_host_operation_return, _local_manager, _managed_diagnostics, _managed_failure_note
 from support.systemd_manager import SidecarStatTrace, _resumed_ticket_completion
 
@@ -1195,7 +1196,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                 "SELECT id FROM leases WHERE subject='ticket:2'")
 
     with _worker_controls(tmp_path) as (worker_address, arrivals), _approval_read_barrier(boundary=current_boundary, released=released) as (address, databases, reached, release):
-        _hold_host_operation_return(tmp_path, monkeypatch)
+        _hold_host_operation_return(tmp_path, monkeypatch, observe_close=True)
         monkeypatch.setenv("ENTRY_WORKER_CONTROL", worker_address)
         monkeypatch.setenv("ENTRY_APPROVAL_CONTROL", address)
         monkeypatch.setenv("ENTRY_REQUEUE_BODY", fresh_body)
@@ -1354,7 +1355,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                 if kernel is not None:
                     _managed_failure_note(error, stage=timing.get('stage', 'requeue'),
                         database=kernel.storage.path, run_id=kernel.storage.run_id, roles=tmp_path / 'roles.jsonl')
-                raise
+                raise_with_trace(error, tmp_path, children)
             finally:
                 release.set()
                 timing.update(total_seconds=time.monotonic() - started,
@@ -1376,6 +1377,7 @@ def test_public_ticket_repair_deletes_an_earlier_candidate_file_without_a_human_
 ) -> None:
     # The fake CLI edits files and returns raw role artifacts. The installed
     # Controller still owns staging, commits, selection, Review and publication.
+    _hold_host_operation_return(tmp_path, monkeypatch, hold=False, observe_close=True)
     classification = """schema = json.loads(Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text())
 role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commit_message' in schema['properties'] else 'development'
 """
@@ -1420,7 +1422,7 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
             _managed_failure_note(error, stage='ticket-repair-before-normal-host-exit',
                 database=RepositoryRoute.for_workspace(ManagedWorkspace.for_repository('example/project')).database,
                 run_id=accepted['run_id'], roles=tmp_path / 'roles.jsonl')
-            raise
+            raise_with_trace(error, tmp_path, children)
         assert len(commands) == len(children) == 1 and children[0].returncode == 0
         assert trace == ["fdstore", "barrier", "host_exited", "store_closed"]
         status = public("status", accepted["run_id"])
