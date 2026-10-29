@@ -742,28 +742,49 @@ class Kernel:
                   observation: _ObservationPass | None = None) -> Step | IORequest:
         if observation is not None and observation.execution != execution:
             raise KernelError("observation_binding")
-        with self.storage.transaction(write=False) as tx:
-            run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
-                      (), run_last=True))
-            try:
-                self._automatic_owned(tx, run, execution)
-            except KernelError as error:
-                if error.code != "executor_fenced":
-                    raise
-                return Step("paused", "", error.code)
-            snapshot = _OperationSnapshot(self, tx, run)
-            choice = self._operation_choice(tx, run, agent_capacity=agent_capacity,
-                                            poll_manual=observation is None, observation=observation, snapshot=snapshot)
-            if choice is None:
-                state = self._operation_state_in(tx, observation, snapshot=snapshot)
-                return Step(state.disposition, "", retry_at=state.wake_at)
-            subject, cleanup, member = choice
-            work = Work(execution, self._operation_token(tx, subject, cleanup, snapshot=snapshot), subject,
-                        cleanup, bool(agent_capacity), observation, member)
-            original = (self._effect(tx, tx.one(*run_statement(tx, 'SELECT * FROM effects WHERE id=? AND run_id=?',
-                                             (member.effect_id,), run_last=True)), execution)
-                        if isinstance(member, _SentRead) else None)
+        observed: ObserveIO | None = None
+        construction_error: ReadWait | ReadUnavailable | KernelError | None = None
         try:
+            with self.storage.transaction(write=False) as tx:
+                run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
+                          (), run_last=True))
+                try:
+                    self._automatic_owned(tx, run, execution)
+                except KernelError as error:
+                    if error.code != "executor_fenced":
+                        raise
+                    return Step("paused", "", error.code)
+                snapshot = _OperationSnapshot(self, tx, run)
+                choice = self._operation_choice(tx, run, agent_capacity=agent_capacity,
+                                                poll_manual=observation is None, observation=observation, snapshot=snapshot)
+                if choice is None:
+                    state = self._operation_state_in(tx, observation, snapshot=snapshot)
+                    return Step(state.disposition, "", retry_at=state.wake_at)
+                subject, cleanup, member = choice
+                work = Work(execution, self._operation_token(tx, subject, cleanup, snapshot=snapshot), subject,
+                            cleanup, bool(agent_capacity), observation, member)
+                original = (self._effect(tx, tx.one(*run_statement(tx, 'SELECT * FROM effects WHERE id=? AND run_id=?',
+                                                 (member.effect_id,), run_last=True)), execution)
+                            if isinstance(member, _SentRead) else None)
+                if subject is not None and not cleanup and member is None and snapshot.abandoned is None:
+                    read = snapshot.subject(subject)
+                    if (read.requeue is None and read.pending is None and read.job['current_attempt'] is None
+                            and self._subject_wait(tx, run, read.job, read=read) is None):
+                        try:
+                            observed = self._observe_work(tx, work, subject)
+                        except (ReadWait, ReadUnavailable, KernelError) as error:
+                            construction_error = error
+                            raise
+        except (ReadWait, ReadUnavailable, KernelError) as error:
+            # Only a construction failure follows the original fail_work path.
+            # Reader admission/closing failures are never retried as a writer.
+            if error is not construction_error:
+                raise
+        try:
+            if construction_error is not None:
+                raise construction_error
+            if observed is not None:
+                return self._complete_work(work, observed)
             if original is not None:
                 waiting = self._guard_automatic_step(work.token, execution, readback=original)
                 if waiting is not None:
@@ -3150,38 +3171,47 @@ class Kernel:
         return None
 
     def _finish_automatic_step(self, token: str, execution: Execution, step: Step) -> Step:
-        """Validate a whole operation's Progress and retire a completed read wait."""
+        """Validate healthy Progress read-only; recheck required changes under the writer."""
         value = self._automatic_token(token)
         scope, subject = value["scope"], value["scope"]["subject"]
-        with self.storage.transaction() as tx:
-            selected = transaction_scope(tx)
-            if scope.get('run') != selected.run_id:
-                raise ObservationSuperseded("automatic_step_superseded")
-            run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
-                      (), run_last=True))
-            self._automatic_owned(tx, run, execution)
-            if subject is not None and step.subject != subject and self._abandon_action(tx) is None:
-                raise KernelError("automatic_step_identity")
-            if step.kind == "progress" and value["progress"] == self._automatic_progress(tx, run, subject, scope["cleanup"]):
-                owner = subject or tx.one(*run_statement(tx, 'SELECT id FROM subjects WHERE run_id=? ORDER BY id LIMIT 1',
-                                       (), run_last=True))[0]
-                evidence = tx.put(owner, "execution_failure", wire_json({"code": "controller_no_progress",
-                    "message": "Controller returned Progress without changing its durable business identity", "scope": scope}))
-                if subject is None:
-                    tx.execute(*run_statement(tx, "UPDATE runs SET blocked='execution_failed' WHERE id=?",
-                        (), run_last=True))
-                    self._event(tx, owner, "paused", "controller_no_progress", evidence)
-                else:
-                    self._gate(tx, subject, "execution_failed", evidence=evidence)
-                self._finish_final_failure(tx, run)
-                return Step("paused", subject or "", "controller_no_progress")
-            checks_unchanged = (scope.get("delivery", {}).get("phase") in {"checks", "merge"}
-                                and scope == self._automatic_scope(tx, run, subject, scope["cleanup"]))
-            if (step.kind not in {"waiting", "observe", "reconcile", "agent", "effect"}
-                    and step.reason != "supervision_timeout" and not checks_unchanged):
-                tx.execute(*run_statement(tx, "DELETE FROM waits WHERE subject IS ? AND kind='github_convergence' AND run_id=?",
-                    (subject,), run_last=True))
-            return step
+        for writable in (False, True):
+            with self.storage.transaction(write=writable) as tx:
+                selected = transaction_scope(tx)
+                if scope.get('run') != selected.run_id:
+                    raise ObservationSuperseded("automatic_step_superseded")
+                run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
+                          (), run_last=True))
+                self._automatic_owned(tx, run, execution)
+                if subject is not None and step.subject != subject and self._abandon_action(tx) is None:
+                    raise KernelError("automatic_step_identity")
+                if step.kind == "progress" and value["progress"] == self._automatic_progress(tx, run, subject, scope["cleanup"]):
+                    if not writable:
+                        continue  # Close normally, then repeat every check under the ordered writer.
+                    owner = subject or tx.one(*run_statement(tx, 'SELECT id FROM subjects WHERE run_id=? ORDER BY id LIMIT 1',
+                                           (), run_last=True))[0]
+                    evidence = tx.put(owner, "execution_failure", wire_json({"code": "controller_no_progress",
+                        "message": "Controller returned Progress without changing its durable business identity", "scope": scope}))
+                    if subject is None:
+                        tx.execute(*run_statement(tx, "UPDATE runs SET blocked='execution_failed' WHERE id=?",
+                            (), run_last=True))
+                        self._event(tx, owner, "paused", "controller_no_progress", evidence)
+                    else:
+                        self._gate(tx, subject, "execution_failed", evidence=evidence)
+                    self._finish_final_failure(tx, run)
+                    return Step("paused", subject or "", "controller_no_progress")
+                checks_unchanged = (scope.get("delivery", {}).get("phase") in {"checks", "merge"}
+                                    and scope == self._automatic_scope(tx, run, subject, scope["cleanup"]))
+                if (step.kind not in {"waiting", "observe", "reconcile", "agent", "effect"}
+                        and step.reason != "supervision_timeout" and not checks_unchanged):
+                    if not writable:
+                        if tx.rows(*run_statement(tx, "SELECT scope_id FROM waits WHERE subject IS ? AND kind='github_convergence' AND run_id=? LIMIT 1",
+                                  (subject,), run_last=True)):
+                            continue
+                    else:
+                        tx.execute(*run_statement(tx, "DELETE FROM waits WHERE subject IS ? AND kind='github_convergence' AND run_id=?",
+                            (subject,), run_last=True))
+                return step
+        raise AssertionError("Automatic step did not settle under its writer")
 
     def _wait_for_read(self, token: str | ReadFence, execution: Execution, code: str, message: str, *, readback: Effect | None = None) -> Step:
         """Persist one original read outage; successful reads alone never renew it."""

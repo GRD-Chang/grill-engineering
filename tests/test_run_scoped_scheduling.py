@@ -12,7 +12,7 @@ import pytest
 from agent_run.core import kernel as core
 from agent_run.core.operation_contract import DeliveryFacts, ObserveIO, ReadUnavailable, Work
 from agent_run.errors import KernelError
-from agent_run.model import Commit, EffectResult, Execution, ParentIssue, Policy, ReadWait, Requirements, World, wire_json
+from agent_run.model import Commit, EffectResult, Execution, ParentIssue, Policy, ReadWait, Requirements, Step, World, wire_json
 from agent_run.storage.run_scope import RunTransaction
 from agent_run.storage.sqlite import Transaction
 from support.offline import fixture_inputs
@@ -648,6 +648,179 @@ def test_read_completion_storage_failure_preserves_original_error_without_writer
         kernel._finish_operation_read(request.fence, execution)
     assert caught.value is failure
     assert writes == [False]
+    assert {run: _rows(db, run) for run in ('A', 'B')} == before
+
+
+def _finish_token(kernel):
+    with kernel.storage.transaction(write=False) as tx:
+        return kernel._operation_token(tx, SUBJECT, False)
+
+
+@pytest.mark.parametrize('cause', ['stalled', 'wait'])
+def test_step_finish_rechecks_required_changes_under_ordered_writer(scenario, monkeypatch, cause):
+    db, kernels = scenario
+    kernel, execution = kernels['A'], _execution('A')
+    token = _finish_token(kernel)
+    step = Step('progress' if cause == 'stalled' else 'quiescent', SUBJECT)
+    if cause == 'wait':
+        kernel._wait_for_read(token, execution, 'controlled_read', 'Original read unavailable')
+    before_b, transaction, records = _rows(db, 'B'), kernel.storage.transaction, []
+
+    @contextmanager
+    def recorded(**options):
+        records.append((options.get('write', True), options.get('ordered', True)))
+        if options.get('write') is False:
+            db.execute('PRAGMA query_only=ON')
+        try:
+            with transaction(**options) as tx:
+                yield tx
+        finally:
+            db.execute('PRAGMA query_only=OFF')
+
+    monkeypatch.setattr(kernel.storage, 'transaction', recorded)
+    result = kernel._finish_automatic_step(token, execution, step)
+    assert records == [(False, True), (True, True)]
+    assert _rows(db, 'B') == before_b
+    if cause == 'stalled':
+        assert (result.kind, result.reason) == ('paused', 'controller_no_progress')
+        assert db.execute("SELECT code FROM gates WHERE run_id='A'").fetchone()[0] == 'execution_failed'
+    else:
+        assert result == step
+        assert not db.execute("SELECT 1 FROM waits WHERE run_id='A'").fetchall()
+
+
+@pytest.mark.parametrize('change', ['stop', 'owner', 'wait_added'])
+def test_step_finish_reader_exit_does_not_carry_permission_or_clear_later_wait(scenario, monkeypatch, change):
+    db, kernels = scenario
+    kernel, execution = kernels['A'], _execution('A')
+    token, step = _finish_token(kernel), Step('quiescent', SUBJECT)
+    if change != 'wait_added':
+        kernel._wait_for_read(token, execution, 'controlled_read', 'Original read unavailable')
+    before_b, transaction, records = _rows(db, 'B'), kernel.storage.transaction, []
+    changed = injecting = False
+
+    @contextmanager
+    def interleaved(**options):
+        nonlocal changed, injecting
+        outer = not injecting
+        if outer:
+            records.append(options.get('write', True))
+        with transaction(**options) as tx:
+            yield tx
+        if outer and not options.get('write', True) and not changed:
+            assert not db.in_transaction
+            changed = injecting = True
+            try:
+                if change == 'stop':
+                    kernel.control('stop', 'stop-before-finish-write')
+                elif change == 'owner':
+                    db.execute("UPDATE runs SET executor='successor',epoch=epoch+1 WHERE id='A'")
+                else:
+                    kernel._wait_for_read(token, execution, 'controlled_read', 'New later read unavailable')
+            finally:
+                injecting = False
+
+    monkeypatch.setattr(kernel.storage, 'transaction', interleaved)
+    if change == 'wait_added':
+        assert kernel._finish_automatic_step(token, execution, step) == step
+        assert records == [False]
+    else:
+        with pytest.raises(KernelError, match='executor_fenced'):
+            kernel._finish_automatic_step(token, execution, step)
+        assert records == [False, True]
+    assert changed and len(db.execute("SELECT 1 FROM waits WHERE run_id='A'").fetchall()) == 1
+    assert _rows(db, 'B') == before_b
+
+
+@pytest.mark.parametrize('failure_at', ['consumer', 'close', 'poison', 'budget'])
+def test_step_finish_read_failure_never_escalates_or_changes_facts(scenario, monkeypatch, failure_at):
+    db, kernels = scenario
+    kernel, execution = kernels['A'], _execution('A')
+    token = _finish_token(kernel)
+    kernel._wait_for_read(token, execution, 'controlled_read', 'Original read unavailable')
+    before = {run: _rows(db, run) for run in ('A', 'B')}
+    transaction, records, failure = kernel.storage.transaction, [], OSError('Original finish read failure')
+    if failure_at == 'consumer':
+        def unavailable(*args):
+            raise failure
+        monkeypatch.setattr(kernel, '_automatic_owned', unavailable)
+
+    @contextmanager
+    def interrupted(**options):
+        records.append(options.get('write', True))
+        with transaction(**options) as tx:
+            if failure_at == 'budget':
+                tx.rows_read = 65536
+            yield tx
+            if failure_at == 'poison':
+                try:
+                    tx.execute('SELECT * FROM missing_finish_fixture_table')
+                except sqlite3.OperationalError:
+                    pass
+        if failure_at == 'close':
+            raise failure
+
+    monkeypatch.setattr(kernel.storage, 'transaction', interrupted)
+    expected = OSError if failure_at in {'consumer', 'close'} else KernelError
+    with pytest.raises(expected) as caught:
+        kernel._finish_automatic_step(token, execution, Step('quiescent', SUBJECT))
+    if expected is OSError:
+        assert caught.value is failure
+    else:
+        assert caught.value.code == ('query_limit' if failure_at == 'budget' else 'transaction_aborted')
+    assert records == [False]
+    assert {run: _rows(db, run) for run in ('A', 'B')} == before
+
+
+@pytest.mark.parametrize('preserved', ['waiting', 'supervision_timeout', 'checks', 'changed_scope'])
+def test_step_finish_keeps_original_wait_retirement_predicate(scenario, monkeypatch, preserved):
+    import json
+
+    db, kernels = scenario
+    kernel, execution = kernels['A'], _execution('A')
+    if preserved in {'checks', 'changed_scope'}:
+        # Fixed phase fact for this consumer contract; this grants no approval.
+        db.execute("UPDATE subjects SET phase='checks' WHERE run_id='A'")
+    token = _finish_token(kernel)
+    kernel._wait_for_read(token, execution, 'controlled_read', 'Original read unavailable')
+    if preserved == 'changed_scope':
+        value = json.loads(token)
+        value['scope']['delivery']['purpose'] = 'previous-purpose'
+        token = wire_json(value).decode()
+    step = (Step('waiting', SUBJECT) if preserved == 'waiting' else
+            Step('paused', SUBJECT, 'supervision_timeout') if preserved == 'supervision_timeout' else
+            Step('quiescent', SUBJECT))
+    before_b, transaction, records = _rows(db, 'B'), kernel.storage.transaction, []
+
+    @contextmanager
+    def recorded(**options):
+        records.append(options.get('write', True))
+        with transaction(**options) as tx:
+            yield tx
+
+    monkeypatch.setattr(kernel.storage, 'transaction', recorded)
+    assert kernel._finish_automatic_step(token, execution, step) == step
+    assert records == ([False, True] if preserved == 'changed_scope' else [False])
+    assert bool(db.execute("SELECT 1 FROM waits WHERE run_id='A'").fetchall()) == (preserved != 'changed_scope')
+    assert _rows(db, 'B') == before_b
+
+
+@pytest.mark.parametrize('binding', ['run', 'step'])
+def test_step_finish_refuses_foreign_run_or_step_without_a_save(scenario, monkeypatch, binding):
+    db, kernels = scenario
+    token = _finish_token(kernels['B' if binding == 'run' else 'A'])
+    before, transaction, records = {run: _rows(db, run) for run in ('A', 'B')}, kernels['A'].storage.transaction, []
+
+    @contextmanager
+    def recorded(**options):
+        records.append(options.get('write', True))
+        with transaction(**options) as tx:
+            yield tx
+
+    monkeypatch.setattr(kernels['A'].storage, 'transaction', recorded)
+    with pytest.raises(KernelError, match='automatic_step_superseded' if binding == 'run' else 'automatic_step_identity'):
+        kernels['A']._finish_automatic_step(token, _execution('A'), Step('quiescent', 'foreign' if binding == 'step' else SUBJECT))
+    assert records == [False]
     assert {run: _rows(db, run) for run in ('A', 'B')} == before
 
 

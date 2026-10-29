@@ -40,6 +40,215 @@ def decision_scenario(tmp_path, monkeypatch, request):
         yield scenario, connections[0]
 
 
+@pytest.mark.parametrize('capacity', [0, 1])
+def test_initial_observation_uses_existing_read_snapshot_without_a_save(decision_scenario, monkeypatch, capacity):
+    s, db = decision_scenario
+    transaction, modes = s.kernel.storage.transaction, []
+
+    @contextmanager
+    def counted(**options):
+        modes.append(options.get('write', True))
+        readonly = options.get('write') is False
+        if readonly:
+            db.execute('PRAGMA query_only=ON')
+        try:
+            with transaction(**options) as tx:
+                yield tx
+        finally:
+            if readonly:
+                db.execute('PRAGMA query_only=OFF')
+
+    monkeypatch.setattr(s.kernel.storage, 'transaction', counted)
+    before = tuple(db.iterdump())
+    request = s.kernel.next_work(s.execution, agent_capacity=capacity)
+    assert isinstance(request, ObserveIO) and request.work.subject == s.delivery.key
+    assert request.work.allow_agent is bool(capacity)
+    assert modes == [False, False], 'Observation must use the selection reader, then fresh supervision'
+    assert tuple(db.iterdump()) == before
+
+
+@pytest.mark.parametrize('change', ['stop', 'epoch', 'source', 'scope', 'deadline'])
+def test_initial_observation_is_rechecked_after_reader_exit(decision_scenario, monkeypatch, change):
+    s, db = decision_scenario
+    kernel, subject = s.kernel, s.delivery.key
+    transaction, observe = kernel.storage.transaction, kernel._observe_work
+    captured, changed = [], []
+
+    def observed(*args, **options):
+        request = observe(*args, **options)
+        captured.append(request)
+        return request
+
+    @contextmanager
+    def interleaved(**options):
+        with transaction(**options) as tx:
+            yield tx
+        if captured and not changed:
+            assert not db.in_transaction
+            changed.append(change)
+            with monkeypatch.context() as mutation:
+                mutation.setattr(kernel.storage, 'transaction', transaction)
+                if change in {'stop', 'epoch'}:
+                    kernel.control('stop', 'stop-after-observation-selection')
+                    if change == 'epoch':
+                        kernel.confirm_executor_exit(s.execution)
+                        kernel.control('resume', 'resume-after-observation-selection')
+                        assert kernel.claim_executor('successor-owner').epoch > s.execution.epoch
+                elif change == 'source':
+                    kernel.refresh(lambda: replace(s.requirements, parent=replace(s.requirements.parent, body='Concurrent requirement')))
+                elif change == 'scope':
+                    # Negative concurrent scope input, not a grant or business producer.
+                    db.execute('UPDATE subjects SET purpose=? WHERE run_id=? AND id=?', ('integration', s.execution.run_id, subject))
+                else:
+                    kernel._wait_for_read(captured[0].request.fence, s.execution, 'controlled_unavailable', 'Original unavailable read')
+                    deadline = db.execute('SELECT deadline FROM waits').fetchone()[0]
+                    kernel.clock = lambda: deadline
+
+    monkeypatch.setattr(kernel, '_observe_work', observed)
+    monkeypatch.setattr(kernel.storage, 'transaction', interleaved)
+    result = kernel.next_work(s.execution)
+    assert changed == [change] and len(captured) == 1
+    assert not isinstance(result, ObserveIO)
+    assert result.reason == ('executor_fenced' if change in {'stop', 'epoch'} else
+                             'supervision_timeout' if change == 'deadline' else 'automatic_step_superseded')
+    assert not db.execute('SELECT id FROM effects').fetchall()
+
+
+@pytest.mark.parametrize('failure', ['budget', 'poison', 'close_io', 'close_kernel'])
+def test_initial_observation_read_failure_never_routes_to_a_writer(decision_scenario, monkeypatch, failure):
+    from agent_run.storage.sqlite import QUERY_LIMIT
+
+    s, db = decision_scenario
+    kernel, transaction, observe = s.kernel, s.kernel.storage.transaction, s.kernel._observe_work
+    modes = []
+    original = OSError('Original selection reader close failure') if failure == 'close_io' else KernelError('original_reader_close')
+    before = tuple(db.iterdump())
+
+    def interrupted(tx, *args, **options):
+        if failure == 'budget':
+            tx.bytes_read = QUERY_LIMIT
+        elif failure == 'poison':
+            with pytest.raises(sqlite3.DatabaseError):
+                tx.execute('SELECT * FROM missing_observation_fixture_relation')
+            assert tx.failed
+        return observe(tx, *args, **options)
+
+    @contextmanager
+    def recorded(**options):
+        modes.append(options.get('write', True))
+        with transaction(**options) as tx:
+            yield tx
+        if len(modes) == 1 and failure.startswith('close'):
+            raise original
+
+    monkeypatch.setattr(kernel, '_observe_work', interrupted)
+    monkeypatch.setattr(kernel.storage, 'transaction', recorded)
+    with pytest.raises(OSError if failure == 'close_io' else KernelError) as caught:
+        kernel.next_work(s.execution)
+    if failure.startswith('close'):
+        assert caught.value is original and modes == [False]
+    else:
+        assert caught.value.code == ('query_limit' if failure == 'budget' else 'transaction_aborted')
+    assert modes and not any(modes) and tuple(db.iterdump()) == before
+
+
+def test_initial_observation_construction_keeps_original_failure_classification(decision_scenario, monkeypatch):
+    from agent_run.errors import ObservationSuperseded
+
+    s, db = decision_scenario
+    failure = ObservationSuperseded('automatic_step_superseded')
+    fail, seen = s.kernel.fail_work, []
+
+    def unavailable(*args, **options):
+        raise failure
+
+    def classified(work, error, **options):
+        assert not db.in_transaction
+        seen.append(error)
+        return fail(work, error, **options)
+
+    monkeypatch.setattr(s.kernel, '_observe_work', unavailable)
+    monkeypatch.setattr(s.kernel, 'fail_work', classified)
+    result = s.kernel.next_work(s.execution)
+    assert seen == [failure] and (result.kind, result.reason) == ('waiting', 'automatic_step_superseded')
+
+
+def test_allocated_deadline_retains_original_mutating_route(decision_scenario, monkeypatch):
+    s, db = decision_scenario
+    call = _hold_development(s, monkeypatch)
+    s.kernel.clock = lambda: call.deadline_at
+
+    def no_io(*args, **options):
+        pytest.fail('Expired allocated invocation must settle before observation I/O')
+
+    monkeypatch.setattr(s.port, 'source', no_io)
+    result = s.runner().run_once(agent_capacity=0)
+    assert (result.kind, result.reason) == ('paused', 'invocation_deadline_exceeded')
+    assert db.execute('SELECT dispatch_state FROM invocation_outputs WHERE invocation=?', (call.invocation_id,)).fetchone()[0] == 'unavailable'
+    assert not db.execute('SELECT id FROM leases').fetchall()
+
+
+@pytest.mark.parametrize('state', ['prepared', 'sent', 'stale_prepared', 'stale_observed'])
+def test_pending_effect_keeps_original_route_and_settlement(decision_scenario, monkeypatch, state):
+    from agent_run.core.operation_contract import EffectIO
+
+    s, db = decision_scenario
+    held = advance_to_effect(s, monkeypatch, 'workspace', sent=state == 'sent')
+    if state == 'stale_observed':
+        assert held.authorize is not None
+        result = s.port.execute(held.effect, held.authorize)
+        request = s.kernel.next_work(s.execution)
+        assert isinstance(request, EffectIO) and request.kind == 'readback'
+        assert s.kernel._reconcile(request, result).kind == 'progress'
+        assert db.execute('SELECT status FROM effects WHERE id=?', (held.effect.effect_id,)).fetchone()[0] == 'observed'
+    if state.startswith('stale_'):
+        s.kernel.refresh(lambda: replace(s.requirements, parent=replace(s.requirements.parent, body='Concurrent requirement')))
+    route, calls = s.kernel._route_work, []
+
+    def routed(*args, **kwargs):
+        calls.append(args[0])
+        return route(*args, **kwargs)
+
+    monkeypatch.setattr(s.kernel, '_route_work', routed)
+    request = s.kernel.next_work(s.execution)
+    assert len(calls) == 1 and calls[0].subject == s.delivery.key
+    if state == 'sent':
+        assert isinstance(request, EffectIO) and request.kind == 'readback'
+    elif state == 'prepared':
+        assert isinstance(request, ObserveIO)
+    else:
+        assert request.kind == 'progress'
+        assert request.reason == ('stale_intent_retired' if state == 'stale_prepared' else 'original_outcome_retained')
+
+
+@pytest.mark.parametrize('control', ['abandon', 'requeue'])
+def test_control_action_keeps_original_mutating_route(decision_scenario, monkeypatch, control):
+    from agent_run.adapters.local_git import LocalEffects
+
+    s, _ = decision_scenario
+    if control == 'abandon':
+        inspections = LocalEffects(s.port.git).inspect_resources(s.kernel.generation_resources())
+        assert s.kernel.control('abandon', 'original-abandon', resource_inspections=inspections) == 'pending'
+    else:
+        assert s.run().kind == 'approval'
+        s.requirements = replace(s.requirements, parent=replace(s.requirements.parent, body='Concurrent requirement'))
+        s.kernel.refresh(lambda: s.requirements)
+        world = s.world()
+        replacement = replace(s.delivery, source_ref=s.delivery.source_ref + '-replacement',
+                              checkout=s.delivery.checkout + '-replacement', base=world.target)
+        assert s.kernel.control('requeue', 'original-requeue', subject=s.delivery.key,
+                                replacement=replacement, world=world) == 'pending'
+    route, calls = s.kernel._route_work, []
+
+    def routed(*args, **kwargs):
+        calls.append(args[0])
+        return route(*args, **kwargs)
+
+    monkeypatch.setattr(s.kernel, '_route_work', routed)
+    s.kernel.next_work(s.execution)
+    assert len(calls) == 1 and calls[0].subject == s.delivery.key
+
+
 @pytest.mark.parametrize('decision_scenario', [DeliveryKind.TICKET, DeliveryKind.PARENT_ONLY], indirect=True)
 def test_pr_activity_time_does_not_revoke_current_checks(decision_scenario, monkeypatch):
     from agent_run.adapters.source import normalize_required_checks
@@ -451,6 +660,103 @@ def test_healthy_guard_and_identical_source_avoid_empty_saves(decision_scenario,
     assert all(counts[name]['transactions'] for name in counts)
     assert all(row[2] == 0 for row in selected)
     assert not [row for row in selected if row[1]], 'Healthy observation paths must not request an ordered save'
+
+
+def test_real_progress_finishes_readonly_without_changing_facts_or_io(decision_scenario, monkeypatch):
+    from collections import Counter
+
+    s, db = decision_scenario
+    kernel, records, physical = s.kernel, [], Counter()
+    transaction, finish, make_ports = kernel.storage.transaction, kernel._finish_automatic_step, s.make_ports
+    finishing = False
+
+    def facts():
+        tables = [row[0] for row in db.execute("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+        return {name: [tuple(row) for row in db.execute(f'SELECT * FROM {name} ORDER BY rowid')] for name in tables}
+
+    @contextmanager
+    def recorded(**options):
+        if finishing:
+            records.append(options.get('write', True))
+        readonly_finish = finishing and options.get('write') is False
+        if readonly_finish:
+            db.execute('PRAGMA query_only=ON')
+        try:
+            with transaction(**options) as tx:
+                yield tx
+        finally:
+            if readonly_finish:
+                db.execute('PRAGMA query_only=OFF')
+
+    def completed(*args):
+        nonlocal finishing
+        before, observed = facts(), physical.copy()
+        finishing = True
+        try:
+            result = finish(*args)
+        finally:
+            finishing = False
+        assert facts() == before and physical == observed
+        return result
+
+    def ports_for(binding):
+        ports = make_ports(binding)
+        for name in ('source', 'delivery', 'inspect', 'reconcile', 'execute'):
+            method = getattr(ports, name)
+            def called(*args, _name=name, _method=method, **kwargs):
+                physical[_name] += 1
+                return _method(*args, **kwargs)
+            monkeypatch.setattr(ports, name, called)
+        return ports
+
+    monkeypatch.setattr(kernel.storage, 'transaction', recorded)
+    monkeypatch.setattr(kernel, '_finish_automatic_step', completed)
+    monkeypatch.setattr(s, 'make_ports', ports_for)
+    for name in ('_dispatch', '_guard_effect'):
+        method = getattr(kernel, name)
+        def guarded(*args, _name=name, _method=method, **kwargs):
+            physical[_name] += 1
+            return _method(*args, **kwargs)
+        monkeypatch.setattr(kernel, name, guarded)
+    step = s.step()
+    assert step.kind == 'progress'
+    print('real progress finish:', records, dict(physical))
+    assert physical == {'source': 2, 'delivery': 2, 'execute': 1, 'reconcile': 1,
+                        '_dispatch': 1, '_guard_effect': 1}
+    assert records == [False], 'A real completed transition with no read wait must not request a save'
+
+
+def test_finish_writer_reobserves_real_progress_after_reader_exit(decision_scenario, monkeypatch):
+    from agent_run.model import Step
+
+    s, db = decision_scenario
+    kernel, subject = s.kernel, s.delivery.key
+    with kernel.storage.transaction(write=False) as tx:
+        token = kernel._operation_token(tx, subject, False)
+    transaction, records, advanced = kernel.storage.transaction, [], []
+    injecting = False
+
+    @contextmanager
+    def interleaved(**options):
+        nonlocal injecting
+        outer = not injecting
+        if outer:
+            records.append(options.get('write', True))
+        with transaction(**options) as tx:
+            yield tx
+        if outer and not options.get('write', True) and not advanced:
+            assert not db.in_transaction
+            injecting = True
+            try:
+                advanced.append(s.step())
+            finally:
+                injecting = False
+
+    monkeypatch.setattr(kernel.storage, 'transaction', interleaved)
+    step = Step('progress', subject)
+    assert kernel._finish_automatic_step(token, s.execution, step) == step
+    assert records == [False, True] and advanced[0].kind == 'progress'
+    assert not db.execute('SELECT 1 FROM gates').fetchall()
 
 
 def test_scheduler_and_advance_load_each_continuation_once_per_unchanged_transaction(decision_scenario, monkeypatch):
