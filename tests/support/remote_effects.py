@@ -27,6 +27,13 @@ from support.offline import Scenario
 from support.core_operations import prepare_scripted_agent, scripted_return
 
 
+def with_ticket_dependencies(program):
+    """Apply the Local failure story's declared Ticket projection variation."""
+    from support.fixture_text import replace_once
+    return replace_once(program, "    def ticket_projection(p):\n        blockers=[]\n",
+        "    def ticket_projection(p):\n        blockers=[{'number':n,'state':graph['issues'][str(n)]['state']} for n in p.get('blocked_by',[])]\n")
+
+
 def fake_gh(*, repository: str = "example/project", actor: str = "publisher") -> str:
     """Bind two independent fields in the one existing synthetic program.
 
@@ -170,20 +177,27 @@ if endpoint=='user': result={'login':d.get('actor','publisher')};save_state=meth
 elif endpoint=='graphql' and method=='GET':
     save_state=False
     fields=dict(value.split('=',1) for index,value in enumerate(args) if index and args[index-1] in ('-F','-f'))
+    if 'DeliveryBasis' in fields.get('query',''):
+        from support.github_delivery import delivery_basis
+        result=delivery_basis(d,fields,git,repository='example/project',actor=d.get('actor','publisher'))
+        if 'pr' in fields:write_text(state,json.dumps(d))
+        print(json.dumps(result));raise SystemExit(0)
     if 'CurrentRequiredChecks' in fields.get('query',''):
         print(json.dumps(current_checks(d, fields)));raise SystemExit(0)
     graph=d.get('source_graph',{'parent':{'number':1,'title':'Parent','body':d.get('source_body','Whole requirement'),'sub_issues':[]},'issues':{}})
+    from support.github_requirements import source_issue, source_response, source_snapshot
+    def ticket_projection(p):
+        blockers=[]
+        return source_issue({**p,
+            'labels':{'nodes':[{'name':name} for name in p['labels']],'pageInfo':{'hasNextPage':False,'endCursor':None}},
+            'blockedBy':{'nodes':blockers,'pageInfo':{'hasNextPage':False,'endCursor':None}}})
     if fields['number']=='1':
         p=graph['parent'];issue={'number':1,'title':p['title'],'body':p['body'],'subIssues':{'nodes':[{'number':n} for n in p['sub_issues']],'pageInfo':{'hasNextPage':False,'endCursor':None}}}
+        issue=source_issue(issue)
     else:
-        p=graph['issues'][fields['number']];issue={**p,'labels':{'nodes':[{'name':name} for name in p['labels']],'pageInfo':{'hasNextPage':False,'endCursor':None}},'blockedBy':{'nodes':[],'pageInfo':{'hasNextPage':False,'endCursor':None}}}
-    from support.github_requirements import source_issue, source_response, source_snapshot
-    issue=source_issue(issue)
+        issue=ticket_projection(graph['issues'][fields['number']])
     if fields['number']=='1' and 'SourceSnapshot' in fields['query'] and 'labels(first:100' in fields['query']:
-        tickets={number:source_issue({**ticket,
-            'labels':{'nodes':[{'name':label} for label in ticket['labels']],'pageInfo':{'hasNextPage':False,'endCursor':None}},
-            'blockedBy':{'nodes':[],'pageInfo':{'hasNextPage':False,'endCursor':None}}})
-            for number,ticket in graph['issues'].items()}
+        tickets={number:ticket_projection(ticket) for number,ticket in graph['issues'].items()}
         issue=source_snapshot(issue,tickets)
     result=source_response(issue)
 elif endpoint=='graphql':

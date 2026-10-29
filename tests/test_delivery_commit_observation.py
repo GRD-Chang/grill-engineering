@@ -8,6 +8,7 @@ import pytest
 from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.core.operation_contract import DeliveryRead, ReadUnavailable
 from agent_run.errors import GitHubReadError
+from agent_run.adapters import github_commands
 from support.remote_effects import _fixture, _publish_pr
 
 
@@ -24,6 +25,24 @@ def _objects(calls):
         if command[:1] == ['api'] and '/git/commits/' in command[1])
 
 
+
+def _basis_objects(calls):
+    return Counter(value.split('=', 1)[1] for command in calls if any('DeliveryBasis' in arg for arg in command)
+                   for value in command if value.startswith(('object0=', 'object1=')))
+
+
+def _damage_basis(monkeypatch, mutation):
+    original = github_commands._run_bounded_command
+    def response(arguments, **options):
+        result = original(arguments, **options)
+        if any('DeliveryBasis' in arg for arg in arguments):
+            body = json.loads(result.stdout)
+            mutation(body)
+            result.stdout = json.dumps(body)
+        return result
+    monkeypatch.setattr(github_commands, '_run_bounded_command', response)
+
+
 def test_one_delivery_reads_each_complete_object_once_but_keeps_live_pr_checks(tmp_path, monkeypatch):
     port, _git, push, _state, calls = _fixture(tmp_path, monkeypatch)
     _original, pr = _publish_pr(port, push)
@@ -32,11 +51,12 @@ def test_one_delivery_reads_each_complete_object_once_but_keeps_live_pr_checks(t
     observed = _reads(calls, start)
     assert facts.source == pr.head and facts.target == pr.base and facts.pr == pr
     assert facts.checks is not None and facts.checks.result == 'none'
-    assert _objects(observed) == {pr.head.sha: 1, pr.base.sha: 1}
-    assert sum(c[:2] == ['api', 'repos/example/project/pulls/17'] for c in observed) == 3
+    assert _basis_objects(observed) == {pr.head.sha: 1, pr.base.sha: 1}
+    assert not _objects(observed)
+    assert sum(c[:2] == ['api', 'repos/example/project/pulls/17'] for c in observed) == 2
     assert sum(c[:2] == ['repo', 'view'] for c in observed) == 1
     assert not any('--method' in command for command in observed)
-    assert len(observed) == 11
+    assert len(observed) == 8
 
 
 def test_merged_pr_retains_its_independent_first_parent_receipt_read(tmp_path, monkeypatch):
@@ -54,7 +74,8 @@ def test_merged_pr_retains_its_independent_first_parent_receipt_read(tmp_path, m
     assert facts.pr.base == push.base and facts.pr.merged == result.commit
     assert facts.checks is None
     observed = _reads(calls, start)
-    assert _objects(observed) == {pr.head.sha: 1, push.base.sha: 2, result.commit.sha: 2}
+    assert _basis_objects(observed) == {pr.head.sha: 1, result.commit.sha: 1}
+    assert _objects(observed) == {push.base.sha: 2, result.commit.sha: 1}
     assert not any('--method' in command for command in observed)
 
 
@@ -75,43 +96,43 @@ def test_next_observation_rereads_objects_refs_pr_and_actor(tmp_path, monkeypatc
     assert first.source == pr.head and first.pr.title == pr.title and first.publisher_actor == 'publisher'
     assert second.source == later and second.pr.head == later and second.pr.title == 'Fresh PR title'
     assert second.publisher_actor == 'fresh-reader'
-    assert _objects(_reads(calls, start)) == {later.sha: 1, pr.base.sha: 1}
+    assert _basis_objects(_reads(calls, start)) == {later.sha: 1, pr.base.sha: 1}
 
 
-@pytest.mark.parametrize('fault', ['foreign-sha', 'missing-sha', 'invalid-tree', 'missing-tree', 'invalid-parent', 'unavailable'])
+@pytest.mark.parametrize('fault', ['foreign-sha', 'missing-sha', 'invalid-tree', 'missing-tree', 'invalid-type', 'unavailable'])
 def test_completed_read_never_hides_a_later_invalid_or_unavailable_object(tmp_path, monkeypatch, fault):
     port, _git, push, _state, calls = _fixture(tmp_path, monkeypatch)
     _original, pr = _publish_pr(port, push)
     request = DeliveryRead(push.source_ref, push.target_ref, pr.number, ())
     assert port.delivery(request).source == pr.head
-    read = port._api
     seen = []
-    def broken(endpoint, *args, **kwargs):
-        data = read(endpoint, *args, **kwargs)
-        if endpoint.endswith('/git/commits/' + pr.head.sha):
-            seen.append(endpoint)
-            if fault == 'foreign-sha':
-                data['sha'] = pr.base.sha
-            elif fault == 'missing-sha':
-                data.pop('sha')
-            elif fault == 'invalid-tree':
-                data['tree']['sha'] = 'HEAD'
-            elif fault == 'missing-tree':
-                data.pop('tree')
-            elif fault == 'invalid-parent':
-                data['parents'] = [{'sha': pr.base.sha[:8]}]
-            else:
-                raise GitHubReadError('github_read_failed', 'controlled unavailable object')
-        return data
+    def broken(body):
+        repo = body['data']['repository']
+        value, = [value for key, value in repo.items() if key.startswith('object') and value['oid'] == pr.head.sha]
+        seen.append(value['oid'])
+        if fault == 'foreign-sha':
+            value['oid'] = pr.base.sha
+        elif fault == 'missing-sha':
+            value.pop('oid')
+        elif fault == 'invalid-tree':
+            value['tree']['oid'] = 'HEAD'
+        elif fault == 'missing-tree':
+            value.pop('tree')
+        elif fault == 'invalid-type':
+            value['__typename'] = 'Tree'
+        else:
+            raise GitHubReadError('github_read_failed', 'controlled unavailable object')
     start = len(_reads(calls))
     with monkeypatch.context() as damaged:
-        damaged.setattr(port, '_api', broken)
+        damaged.setattr('agent_run.adapters.remote.time.sleep', lambda _: None)
+        _damage_basis(damaged, broken)
         with pytest.raises((ValueError, KeyError, ReadUnavailable)):
             port.delivery(request)
-    assert len(seen) == 1 and not any('--method' in c for c in _reads(calls, start))
+    assert len(seen) == (3 if fault == 'unavailable' else 1)
+    assert not any('--method' in c for c in _reads(calls, start))
     start = len(_reads(calls))
     assert port.delivery(request).source == pr.head
-    assert _objects(_reads(calls, start)) == {pr.head.sha: 1, pr.base.sha: 1}
+    assert _basis_objects(_reads(calls, start)) == {pr.head.sha: 1, pr.base.sha: 1}
 
 
 @pytest.mark.parametrize('replacement', ['different-object', 'short-sha', 'ref-name'])
@@ -153,17 +174,15 @@ def test_same_sha_changed_api_tree_cannot_be_hidden_by_reuse(tmp_path, monkeypat
     _original, pr = _publish_pr(port, push)
     selected, wrong = (pr.head, pr.base) if which == 'source' else (pr.base, pr.head)
     assert selected.tree != wrong.tree
-    read, seen = port._api, []
-    def inconsistent(endpoint, *args, **kwargs):
-        data = read(endpoint, *args, **kwargs)
-        if endpoint.endswith('/git/commits/' + selected.sha):
-            seen.append(endpoint)
-            if len(seen) == 1:
-                data['tree']['sha'] = wrong.tree
-        return data
+    seen = []
+    def inconsistent(body):
+        repo = body['data']['repository']
+        value, = [value for key, value in repo.items() if key.startswith('object') and value['oid'] == selected.sha]
+        seen.append(value['oid'])
+        value['tree']['oid'] = wrong.tree
     start = len(_reads(calls))
     with monkeypatch.context() as changed:
-        changed.setattr(port, '_api', inconsistent)
+        _damage_basis(changed, inconsistent)
         with pytest.raises(ReadUnavailable, match='Commit object and API tree do not agree'):
             port.delivery(DeliveryRead(push.source_ref, push.target_ref, pr.number, ()))
     assert len(seen) == 1
@@ -181,7 +200,8 @@ def test_exact_tree_reuse_preserves_a_legal_shallow_commit(tmp_path, monkeypatch
     facts = port.delivery(DeliveryRead(push.source_ref, push.target_ref, None, (), read_pr=False))
     assert facts.source == facts.target == push.candidate
     assert facts.ancestry == ((push.after_sha, push.after_sha),)
-    assert _objects(_reads(calls, start)) == {push.after_sha: 1}
+    assert _basis_objects(_reads(calls, start)) == {push.after_sha: 1}
+    assert not _objects(_reads(calls, start))
     assert (git.root / '.git' / 'shallow').read_text() == push.after_sha + '\n'
 
 

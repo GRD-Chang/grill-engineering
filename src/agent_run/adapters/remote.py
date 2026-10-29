@@ -12,6 +12,8 @@ from functools import wraps
 import json
 from pathlib import Path
 import re
+import random
+import time
 import subprocess
 from tempfile import NamedTemporaryFile
 from typing import Any, NoReturn, ParamSpec, Protocol, TYPE_CHECKING, TypeVar
@@ -21,6 +23,8 @@ from agent_run.contracts.write_authority import WriteAuthority, admit_write
 from agent_run.contracts.status_comment import StatusTarget
 from agent_run.contracts.repository import same_repository
 from agent_run.adapters.github import GhGitHubReader
+from agent_run.adapters import github_commands
+from agent_run.adapters.auth.runner_transport import runner_options
 from agent_run.errors import GitHubReadError
 from agent_run.errors import bounded_error
 from agent_run.contracts.identity import validate_identity_snapshot
@@ -649,6 +653,157 @@ class RemoteEffects:
                                 cancelled=self.cancelled)
         return read_requirements(reader, parent_number)
 
+    def _delivery_basis(self, source_sha: str | None, target_sha: str | None,
+                        pr_number: int | None) -> tuple[dict[str, Commit], dict[str, Any] | None, str | None]:
+        """One fresh bounded projection, never retained beyond this Delivery.
+
+        Capacity alone permits a compact object/actor projection plus the exact
+        original PR endpoint. Both projections share three whole attempts and a
+        90-second maximum; incomplete packets supply no reusable facts.
+        """
+        owner, name = self.repository.split('/', 1)
+        identities = sorted({_sha(sha) for sha in (source_sha, target_sha) if sha is not None})
+        if pr_number is not None:
+            _number(pr_number)
+        host = self.identity['source'] == 'host'
+        deadline = time.monotonic() + github_commands.MAX_READ_ATTEMPTS * github_commands.READ_TIMEOUT_SECONDS
+
+        def remaining() -> float:
+            if self.cancelled is not None and self.cancelled():
+                raise InterruptedError('Delivery read cancelled')
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise GitHubReadError('github_read_failed', 'Delivery basis observation deadline expired')
+            return value
+
+        def before_start() -> None:
+            remaining()
+
+        def cancelled() -> bool:
+            remaining()
+            return False
+
+        def packet(arguments: list[str]) -> dict[str, Any]:
+            try:
+                response = github_commands._run_bounded_command(arguments, cwd=self.root,
+                    timeout=min(github_commands.READ_TIMEOUT_SECONDS, remaining()), complete_stdout=True,
+                    before_start=before_start, cancelled=cancelled, **runner_options(self.identity))
+            except subprocess.TimeoutExpired as error:
+                raise GitHubReadError('github_read_failed', 'Delivery basis command deadline expired') from error
+            remaining()
+            if response.returncode:
+                raise github_commands.read_response_error(response)
+            try:
+                data = json.loads(response.stdout)
+            except (ValueError, RecursionError) as error:
+                raise GitHubReadError('github_invalid_response', 'Delivery basis response is not complete JSON') from error
+            if not isinstance(data, dict):
+                raise GitHubReadError('github_invalid_response', 'Expected a complete Delivery object')
+            return data
+
+        compact = False
+        for attempt in range(github_commands.MAX_READ_ATTEMPTS):
+            remaining()
+            try:
+                declarations = ['$owner:String!', '$name:String!']
+                fields = ['id nameWithOwner']
+                arguments = ['gh', 'api', 'graphql', '-f', 'owner=' + owner, '-f', 'name=' + name]
+                for index, sha in enumerate(identities):
+                    key = 'object' + str(index)
+                    declarations.append('$' + key + ':GitObjectID!')
+                    fields.append(key + ':object(oid:$' + key + ') { __typename oid ... on Commit { tree { oid } } }')
+                    arguments += ['-f', key + '=' + sha]
+                if pr_number is not None and not compact:
+                    declarations.append('$pr:Int!')
+                    fields.append('pullRequest(number:$pr) { number title body state author { login } '
+                        'repository { nameWithOwner } baseRepository { nameWithOwner } headRepository { nameWithOwner } '
+                        'headRefName headRefOid baseRefName baseRefOid mergeCommit { oid } }')
+                    arguments += ['-F', 'pr=' + str(pr_number)]
+                query = ('query DeliveryBasis(' + ','.join(declarations) + ') { '
+                    + ('viewer { login } ' if host else '')
+                    + 'repository(owner:$owner,name:$name) { ' + ' '.join(fields) + ' } }')
+                envelope = packet(arguments + ['-f', 'query=' + query])
+                errors = envelope.get('errors', [])
+                if not isinstance(errors, list):
+                    raise ValueError('invalid GraphQL errors envelope')
+                if errors or 'data' in envelope and envelope['data'] is None:
+                    raise GitHubReadError('github_read_failed', 'Delivery basis is incomplete')
+                data = envelope['data']
+                repository = data['repository']
+                if repository is None:
+                    raise GitHubReadError('github_read_failed', 'Delivery repository is unavailable')
+                if not _text(repository['id']) or not same_repository(_text(repository['nameWithOwner']), self.repository):
+                    raise ValueError('foreign Delivery repository')
+                commits = {}
+                for index, sha in enumerate(identities):
+                    value = repository['object' + str(index)]
+                    if value is None:
+                        raise GitHubReadError('github_read_failed', 'Exact Delivery commit is unavailable')
+                    if value['__typename'] != 'Commit' or _sha(value['oid']) != sha:
+                        raise ValueError('foreign Delivery commit')
+                    commits[sha] = Commit(sha, _sha(value['tree']['oid']))
+                actor = None
+                if host:
+                    if data['viewer'] is None:
+                        raise GitHubReadError('github_read_failed', 'Delivery viewer is unavailable')
+                    actor = _text(data['viewer']['login'])
+                raw_pr = None
+                if pr_number is not None:
+                    if compact:
+                        raw_pr = packet(['gh', 'api', f'repos/{self.repository}/pulls/{pr_number}'])
+                        if (_number(raw_pr['number']) != pr_number or type(raw_pr.get('merged')) is not bool
+                                or raw_pr['state'] not in {'open', 'closed'}):
+                            raise ValueError('foreign or invalid Delivery PR')
+                        _text(raw_pr['title'])
+                        _string(raw_pr['body'])
+                        for side in ('head', 'base'):
+                            _sha(raw_pr[side]['sha'])
+                            _text(raw_pr[side]['ref'])
+                            repo = raw_pr[side].get('repo')
+                            if side == 'base' and repo is None:
+                                raise GitHubReadError('github_read_failed', 'Delivery PR base repository is unavailable')
+                            if repo is not None:
+                                _text(repo['full_name'])
+                        if raw_pr['merged'] and raw_pr.get('merge_commit_sha') is None:
+                            raise GitHubReadError('github_read_failed', 'Delivery merge object is unavailable')
+                    else:
+                        value = repository['pullRequest']
+                        if value is None:
+                            raise GitHubReadError('github_read_failed', 'Known Delivery PR is unavailable')
+                        if value['baseRepository'] is None:
+                            raise GitHubReadError('github_read_failed', 'Delivery PR base repository is unavailable')
+                        if not same_repository(_text(value['repository']['nameWithOwner']), self.repository):
+                            raise ValueError('foreign Delivery PR repository')
+                        state = _text(value['state'])
+                        if _number(value['number']) != pr_number or state not in {'OPEN', 'CLOSED', 'MERGED'}:
+                            raise ValueError('foreign or invalid Delivery PR')
+                        if state == 'MERGED' and value['mergeCommit'] is None:
+                            raise GitHubReadError('github_read_failed', 'Delivery merge object is unavailable')
+                        raw_pr = {'number': pr_number, 'title': _text(value['title']), 'body': _string(value['body']),
+                            'state': 'closed' if state == 'MERGED' else state.lower(), 'user': value['author'],
+                            'head': {'sha': _sha(value['headRefOid']), 'ref': _text(value['headRefName']),
+                                     'repo': None if value['headRepository'] is None else
+                                             {'full_name': _text(value['headRepository']['nameWithOwner'])}},
+                            'base': {'sha': _sha(value['baseRefOid']), 'ref': _text(value['baseRefName']),
+                                     'repo': {'full_name': _text(value['baseRepository']['nameWithOwner'])}},
+                            'merged': state == 'MERGED',
+                            'merge_commit_sha': None if state != 'MERGED' else _sha(value['mergeCommit']['oid'])}
+                remaining()
+                return commits, raw_pr, actor
+            except github_commands.ReadOutputOverflow as error:
+                if compact or pr_number is None:
+                    raise
+                if attempt == github_commands.MAX_READ_ATTEMPTS - 1:
+                    raise GitHubReadError('github_read_failed', 'Delivery basis needs an unread compact projection') from error
+                compact = True
+            except GitHubReadError as error:
+                if error.code != 'github_read_failed' or attempt == github_commands.MAX_READ_ATTEMPTS - 1:
+                    raise
+                time.sleep(min(2 ** attempt + random.uniform(0, .25), remaining()))
+            except (ValueError, KeyError, TypeError, UnicodeError, RecursionError) as error:
+                raise GitHubReadError('github_invalid_response', 'Delivery basis facts are malformed') from error
+        raise AssertionError('Delivery basis exhausted without a result')
+
     @_operation_errors
     def delivery(self, request: DeliveryRead) -> DeliveryFacts:
         """Read exact Core-supplied refs and immutable ancestry anchors."""
@@ -656,6 +811,22 @@ class RemoteEffects:
         if type(request.read_checks) is not bool or not request.read_checks and request.check_head is not None:
             raise ReadUnavailable("checks_request_invalid", "An exact checks head requires a checks observation")
         requested_ancestry(request, None)  # Validate literal demand before I/O.
+        source_sha, target_sha = read_remote_heads(self.root, request.source_ref, request.target_ref,
+                                                  runner_identity=self.identity, remote=self.remote)
+        basis: dict[str, Commit] = {}
+        actor = None
+        if self.api is None:
+            # Preserve exact REST discovery and ambiguity semantics. Once a
+            # number is known, the batch reads that PR afresh, never adopts a
+            # discovery row as current write authority.
+            number = request.pr_number if request.read_pr else None
+            if request.read_pr and number is None:
+                discovered = self._find_pr(request.source_ref, request.target_ref, None)
+                number = None if discovered is None else _number(discovered['number'])
+            basis, raw_pr, actor = self._delivery_basis(source_sha, target_sha, number)
+        else:
+            # PhysicalAPI's existing injected REST interface has no GraphQL port.
+            raw_pr = self._find_pr(request.source_ref, request.target_ref, request.pr_number) if request.read_pr else None
         commits: dict[str, Commit] = {}
         reused: set[str] = set()
         def read_commit(sha: str) -> Commit:
@@ -663,16 +834,13 @@ class RemoteEffects:
             if sha in commits:
                 reused.add(sha)
                 return commits[sha]
-            return self._commit(sha)[0]
-        source_sha, target_sha = read_remote_heads(self.root, request.source_ref, request.target_ref,
-                                                  runner_identity=self.identity, remote=self.remote)
+            return basis[sha] if sha in basis else self._commit(sha)[0]
         source = None if source_sha is None else read_commit(source_sha)
         if source is not None:
             commits[source.sha] = source
         target = None if target_sha is None else read_commit(target_sha)
         if target is not None:
             commits[target.sha] = target
-        raw_pr = self._find_pr(request.source_ref, request.target_ref, request.pr_number) if request.read_pr else None
         pr = None if raw_pr is None else self._pr(raw_pr, read_commit=read_commit)
         checked = requested_ancestry(request, source)
         heads = set(request.anchors) | {head for head in (source_sha, target_sha) if head is not None}
@@ -711,7 +879,7 @@ class RemoteEffects:
         if read_remote_heads(self.root, request.source_ref, request.target_ref,
                 runner_identity=self.identity, remote=self.remote) != (source_sha, target_sha):
             raise GitHubReadError("github_observation_pending", "Remote refs changed during delivery observation")
-        return DeliveryFacts(target, source, pr, checks, ancestry, self.actor(), dict(self.identity), checked,
+        return DeliveryFacts(target, source, pr, checks, ancestry, self.actor() if actor is None else actor, dict(self.identity), checked,
                              request.read_checks)
 
     @_operation_errors

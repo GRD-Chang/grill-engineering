@@ -28,7 +28,7 @@ from agent_run.core.kernel import Kernel
 from agent_run.adapters.workspace import ManagedWorkspace
 from agent_run.storage.routing import RepositoryRoute
 from support.systemd_manager import controlled_manager
-from support.remote_effects import FAKE_GH
+from support.remote_effects import FAKE_GH, with_ticket_dependencies
 from support.worker_process_timing import wait_until
 from support.host_close_trace import raise_with_trace
 from support.systemd_manager import _CODEX, _approval_read_barrier, _control_environment, _diagnostic_tail, _executable, _git, _hold_host_operation_return, _local_manager, _managed_diagnostics, _managed_failure_note
@@ -612,7 +612,11 @@ content = 'Implementation""")
             still_a, current_a = invocation(2, 'publication')
             assert current_a['backend_id'] == event_a['thread'] and still_a['result'] is None
             channel_a.sendall(b'1')
-            output, error = child.communicate(timeout=90)
+            try:
+                output, error = child.communicate(timeout=90)
+            except subprocess.TimeoutExpired as error:
+                note_costs(error, tmp_path, arrivals_ns=arrival_times)
+                raise
             assert child.returncode == 0, (output, error)
             accepted = json.loads(output)
             assert accepted['run_id'] == run_id and accepted['host'] == 'exited'
@@ -1513,14 +1517,7 @@ issue = int(re.search(r'https://github.com/example/project/issues/(\\d+)', promp
         source['source_graph']['issues']['5']['blocked_by'] = [3]
         remote.write_text(json.dumps(source))
         gh = tmp_path / 'control-bin' / 'gh'
-        provider = gh.read_text()
-        empty = "'blockedBy':{'nodes':[]"
-        assert provider.count(empty) == 1
-        provider = provider.replace(empty, "'blockedBy':{'nodes':[{'number':n,'state':graph['issues'][str(n)]['state']} for n in p.get('blocked_by',[])]")
-        # Model read-only GitHub GETs; concurrent identity reads cannot rewrite
-        # an older copy over the local provider's actual mutation receipts.
-        provider = provider.replace('write_text(state,json.dumps(d))', "if method!='GET':write_text(state,json.dumps(d))")
-        gh.write_text(provider)
+        gh.write_text(with_ticket_dependencies(gh.read_text()))
         child, child_fd = processes.enter_context(_control_process(
             [sys.executable, '-m', 'agent_run', 'run', '1', '--foreground', '--no-notifications',
              '--repo', 'example/project', '--json'], cwd=git_repo, env=environment,

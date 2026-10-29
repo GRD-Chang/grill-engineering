@@ -9,6 +9,7 @@ import pytest
 from agent_run.adapters.git_objects import LocalGit
 from agent_run.adapters.github import GhGitHubReader
 from support.systemd_manager import _CODEX, _control_environment
+from support.remote_effects import with_ticket_dependencies
 
 
 def test_managed_fake_gh_uses_only_explicit_stdlib_support(git_repo, tmp_path, monkeypatch):
@@ -16,10 +17,8 @@ def test_managed_fake_gh_uses_only_explicit_stdlib_support(git_repo, tmp_path, m
     binary = tmp_path / 'control-bin'
     assert (binary / 'gh').read_text().splitlines()[0] == '#!' + sys.executable + ' -S'
     assert (binary / 'codex').read_text().splitlines()[0] == '#!' + sys.executable
-    # The local-failure story's existing request-persistence extension retains
-    # its original anchor and must still compile in the generated CLI.
-    ast.parse((binary / 'gh').read_text().replace('write_text(state,json.dumps(d))',
-        "if method!='GET':write_text(state,json.dumps(d))"))
+    # Compile the same declared projection variation used by the Local story.
+    ast.parse(with_ticket_dependencies((binary / 'gh').read_text()))
     reader = GhGitHubReader('example/project', working_directory=git_repo, runner_identity={'source': 'host'})
     original = json.loads(state.read_text())
     requirements = reader.requirements(1)
@@ -107,6 +106,8 @@ def test_fake_commit_parents_match_git_header_boundaries(git_repo, tmp_path, mon
 
 def test_fake_pr_get_still_persists_fresh_live_heads(git_repo, tmp_path, monkeypatch):
     environment, state = _control_environment(git_repo, tmp_path, monkeypatch, codex=_CODEX, tickets=(2,))
+    binary = tmp_path / 'control-bin/gh'
+    binary.write_text(with_ticket_dependencies(binary.read_text()))
     git = LocalGit(git_repo)
     base = git.commit('HEAD')
     remote = str(tmp_path / 'origin.git')

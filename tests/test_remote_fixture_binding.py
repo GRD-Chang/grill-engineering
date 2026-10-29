@@ -76,3 +76,48 @@ def test_remote_fixture_keeps_exact_repository_actor_and_publication_receipt(tmp
     assert stored['issue_url'] == f'https://api.github.com/repos/{repository}/issues/2'
     assert stored['id'] == receipt.raw['close_intent']['comment_id']
     assert stored['body'] == receipt.raw['close_intent']['comment_body']
+
+
+def test_local_failure_generated_source_preserves_dependency_in_both_projections(git_repo, tmp_path, monkeypatch):
+    from agent_run.adapters.github import GhGitHubReader
+    from agent_run.adapters.source import read_requirements
+    from support.remote_effects import with_ticket_dependencies
+    from support.systemd_manager import _CODEX, _control_environment
+
+    environment, state = _control_environment(git_repo, tmp_path, monkeypatch, codex=_CODEX, tickets=(2, 3, 4, 5))
+    document = json.loads(state.read_text())
+    document['source_graph']['issues']['5']['blocked_by'] = [3]
+    state.write_text(json.dumps(document))
+    binary = tmp_path / 'control-bin/gh'
+    binary.write_text(with_ticket_dependencies(binary.read_text()))
+    reader = GhGitHubReader('example/project', working_directory=git_repo, runner_identity={'source': 'host'})
+    before = state.read_bytes()
+    source = read_requirements(reader, 1)
+    dependent, = [issue for issue in source.issues if issue.number == 5]
+    assert [(item.number, item.state) for item in dependent.blocked_by] == [(3, 'OPEN')]
+    assert all(not issue.blocked_by for issue in source.issues if issue.number != 5)
+    assert state.read_bytes() == before  # Source GETs do not rewrite service state.
+
+    document['source_graph']['issues']['3']['state'] = 'CLOSED'
+    state.write_text(json.dumps(document))
+    source = read_requirements(reader, 1)
+    dependent, = [issue for issue in source.issues if issue.number == 5]
+    assert [(item.number, item.state) for item in dependent.blocked_by] == [(3, 'CLOSED')]
+    query = ('query Ticket($owner:String!,$name:String!,$number:Int!) { '
+        'repository(owner:$owner,name:$name) { issue(number:$number) { '
+        'number blockedBy(first:100) { nodes { number state } } } } }')
+    single = subprocess.run([str(binary), 'api', 'graphql', '-f', 'query=' + query,
+        '-f', 'owner=example', '-f', 'name=project', '-F', 'number=5'],
+        cwd=git_repo, env=environment, text=True, capture_output=True, timeout=5)
+    assert single.returncode == 0, single.stderr
+    nodes = json.loads(single.stdout)['data']['repository']['issue']['blockedBy']['nodes']
+    assert [(item['number'], item['state']) for item in nodes] == [(3, 'CLOSED')]
+
+
+@pytest.mark.parametrize('change', ['missing', 'duplicate'])
+def test_local_failure_dependency_transform_requires_one_ticket_projection(change):
+    from support.remote_effects import with_ticket_dependencies
+    anchor = "    def ticket_projection(p):\n        blockers=[]\n"
+    source = FAKE_GH.replace(anchor, '') if change == 'missing' else FAKE_GH + anchor
+    with pytest.raises(ValueError, match='exactly once'):
+        with_ticket_dependencies(source)
