@@ -59,8 +59,15 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
                 kernel = Kernel(Path(command[command.index('--database') + 1]), run_id=next((item.partition('=')[2] for item in command if item.startswith('--run-id='))))
                 databases.append(kernel)
                 environment.pop("ENTRY_APPROVAL_CONTROL")
-                while not reached.wait(0.1):
-                    assert serving.is_alive() and time.monotonic() < deadline, (kernel.source_status(), errors, output)
+                try:
+                    while not reached.wait(0.1):
+                        assert serving.is_alive() and time.monotonic() < deadline, (kernel.source_status(), errors, output)
+                except AssertionError as error:
+                    try:
+                        _managed_failure_note(error, stage='abandon-before-first-final-approval',
+                            database=kernel.storage.path, run_id=kernel.storage.run_id, roles=tmp_path / 'roles.jsonl')
+                    finally:
+                        raise_with_trace(error, tmp_path, children)
                 assert kernel.status("ticket:2")["phase"] == "complete"
                 completions = kernel.source_status()["completions"]
                 assert len(completions) == 1 and completions[0]["subject"] == "ticket:2"

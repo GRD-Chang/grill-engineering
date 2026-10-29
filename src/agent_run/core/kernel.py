@@ -948,6 +948,9 @@ class Kernel:
     def _operation_state_in(self, tx: Transaction, observation: _ObservationPass | None = None, *,
                             snapshot: _OperationSnapshot | None = None) -> OperationState:
         """Read scheduling facts within the caller's existing transaction."""
+        # Keep a retry that becomes due while these facts are selected. A
+        # later clock read must not erase the wake after a no-work decision.
+        observed_at = self.clock()
         snapshot = snapshot or _OperationSnapshot(self, tx, tx.one(*run_statement(tx,
             'SELECT * FROM runs WHERE id=?', (), run_last=True)))
         snapshot.require(tx)
@@ -982,12 +985,12 @@ class Kernel:
                         (), run_last=True))
             and not tx.rows(*run_statement(tx, "SELECT id FROM effects WHERE status IN ('prepared','sent','observed') AND operation!='issue_link' AND run_id=? LIMIT 1",
                         (), run_last=True)))
-        disposition: Literal["ready", "waiting", "quiescent", "complete"] = "ready" if ready else "waiting" if active or preparations or lifetime_wait or any(t > self.clock() for t in deadlines) else "complete" if complete else "quiescent"
+        disposition: Literal["ready", "waiting", "quiescent", "complete"] = "ready" if ready else "waiting" if active or preparations or lifetime_wait or any(t > observed_at for t in deadlines) else "complete" if complete else "quiescent"
         cancel = tuple(row["id"] for row in active if run["stopped"] or run["blocked"] or abandoned is not None or snapshot.subject(row["subject"]).gates or self.clock() >= row["deadline_at"])
         cancel += tuple(p.reservation_id for _, p in preparations if run["stopped"] or run["blocked"] or abandoned is not None
                         or snapshot.subject(p.subject).gates or self.clock() >= p.preparation_deadline)
         return OperationState(run["concurrency"], tuple(row["id"] for row in active), cancel,
-                              min((t for t in deadlines if t > self.clock()), default=None), disposition,
+                              min((t for t in deadlines if t > observed_at), default=None), disposition,
                               tuple(p.reservation_id for _, p in preparations))
 
     @classmethod

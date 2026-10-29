@@ -39,6 +39,34 @@ def decision_scenario(tmp_path, monkeypatch):
         yield scenario, connections[0]
 
 
+@pytest.mark.parametrize('after_selection', [-0.0005, 0.0, 0.0005])
+def test_state_keeps_retry_when_deadline_arrives_after_selection(decision_scenario, monkeypatch, after_selection):
+    s, db = decision_scenario
+    kernel, now = s.kernel, [100.0]
+    kernel.clock = lambda: now[0]
+    request = kernel.begin_observation(s.delivery.key, execution=s.execution)
+    kernel._wait_for_read(request.fence, s.execution, 'controlled_read', 'Original read unavailable')
+    retry_at = db.execute('SELECT next_retry_at FROM waits').fetchone()[0]
+    now[0] = retry_at - 0.001
+    choose, choices = kernel._operation_choice, []
+
+    def crossed(*args, **kwargs):
+        selected = choose(*args, **kwargs)
+        choices.append(selected)
+        now[0] = retry_at + after_selection
+        return selected
+
+    monkeypatch.setattr(kernel, '_operation_choice', crossed)
+    before = tuple(db.iterdump())
+    state = kernel.operation_state()
+    assert choices == [None]
+    assert tuple(db.iterdump()) == before
+    assert state.disposition == 'waiting' and state.wake_at == retry_at, state
+    # The next fresh selector must immediately see the now-due original work.
+    now[0] = retry_at
+    assert kernel.operation_state().disposition == 'ready'
+
+
 def _hold_development(scenario, monkeypatch):
     class Held(Exception):
         pass
