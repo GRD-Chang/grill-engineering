@@ -38,7 +38,6 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
             manager, serving, errors, children, trace, commands, output,
         ):
             deadline = time.monotonic() + 150
-            environment['ENTRY_HOST_SNAPSHOT_AT'] = str(deadline - 3)
             environment["PATH"] = str(Path(manager.systemctl).parent) + os.pathsep + environment["PATH"]
 
             def public(*arguments):

@@ -1,59 +1,8 @@
 """First occurrence of fixed test stages; original Host command/calls stay intact."""
 import json
-import faulthandler
-import math
 import os
 from pathlib import Path
-import re
 import time
-
-
-def arm_snapshot(path: Path, when: str | None) -> int:
-    """One test-only C watchdog dump; no signal handler or execution deadline."""
-    if when is None:
-        return -1
-    try:
-        delay = float(when) - time.monotonic()
-        if not math.isfinite(delay):
-            return -1
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
-    except TimeoutError:
-        raise
-    except (OSError, ValueError):
-        return -1
-    # Keep this private descriptor for the process lifetime, including an arm
-    # failure: a possibly registered C watchdog must never see a reused fd.
-    try:
-        faulthandler.dump_traceback_later(max(0.001, delay), repeat=False, file=descriptor, exit=False)
-    except TimeoutError:
-        raise
-    except (OSError, ValueError):
-        pass
-    return descriptor
-
-
-def snapshot_frames(path: Path) -> dict:
-    """Whitelist frame coordinates only; discard paths, addresses and other text."""
-    with path.open('rb') as stream:
-        raw = stream.read(32769)
-    rows, used, truncated = [], 0, len(raw) > 32768
-    for line in raw[:32768].decode('ascii', errors='replace').splitlines():
-        match = re.fullmatch(r'  File "([^"]+)", line ([0-9]{1,9}) in ([A-Za-z0-9_<>]{1,80})', line)
-        if match:
-            filename = match[1].replace('\\', '/').rsplit('/', 1)[-1]
-            if not re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', filename):
-                filename = '<module>'
-            row = f'{filename}:{match[2]} in {match[3]}'
-        elif line.startswith(('Thread ', 'Current thread ')):
-            row = 'Thread'
-        else:
-            continue
-        used += len(row) + 1
-        if used > 12000:
-            truncated = True
-            break
-        rows.append(row)
-    return {'frames': rows, 'truncated': truncated}
 
 
 def install(path: Path) -> int:
@@ -105,7 +54,6 @@ def install(path: Path) -> int:
         return result
 
     OperationRunner.run_once, NativeNotifications.close = observed_run, observed_close
-    arm_snapshot(path.with_name('stack.txt'), os.environ.get('ENTRY_HOST_SNAPSHOT_AT'))
     return descriptor  # Controlled tests close it explicitly; Host owns its process lifetime.
 
 
@@ -118,10 +66,6 @@ def raise_with_trace(error: BaseException, directory: Path, children) -> None:
                 facts['trace'] = stream.read(4096).decode('utf-8', errors='replace')
         except BaseException as unavailable:
             facts['trace_unavailable'] = type(unavailable).__name__
-        try:
-            facts['stack'] = snapshot_frames(directory / 'host-return-hook' / 'stack.txt')
-        except BaseException as unavailable:
-            facts['stack_unavailable'] = type(unavailable).__name__
         error.add_note('Host close boundary: ' + json.dumps(facts))
     finally:
         raise error

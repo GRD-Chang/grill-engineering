@@ -9,6 +9,53 @@ from support.managed_abandon_transport import install_currentness
 from support.systemd_manager import _CODEX, _control_environment, _git
 
 
+def test_status_writes_change_check_diagnostics_without_changing_delivery_identity(git_repo, tmp_path, monkeypatch):
+    from agent_run.adapters.git_objects import LocalGit
+    from agent_run.adapters.remote import RemoteEffects
+    from agent_run.contracts.write_authority import WriteAuthority
+    from agent_run.contracts.required_checks import same_required_checks
+    from agent_run.core.operation_contract import DeliveryRead
+    from agent_run.model import Effect, Execution
+    from dataclasses import asdict
+
+    environment, state = _control_environment(git_repo, tmp_path, monkeypatch, codex=_CODEX, tickets=(2,))
+    install_currentness(tmp_path, state)
+    git = LocalGit(git_repo)
+    base = git.commit('HEAD')
+    _git(git_repo, 'checkout', '-b', 'candidate')
+    _git(git_repo, 'commit', '--allow-empty', '-m', 'Actual candidate')
+    _git(git_repo, 'push', str(tmp_path / 'origin.git'), 'HEAD:refs/heads/candidate')
+    candidate = git.commit('HEAD')
+    port = RemoteEffects(git_repo, 'example/project', runner_identity={'source': 'host'}, remote=str(tmp_path / 'origin.git'))
+    execution = Execution('run-1', 'worker', 1)
+    effect = Effect('create-pr', 'ticket:2', 'pr_write', 'example/project', 'refs/heads/candidate',
+                    'refs/heads/main', candidate.sha, candidate.sha, None, base, None, 'publisher',
+                    {'title': 'Original', 'body': 'Original', 'prior': None}, execution)
+    created = port.execute(effect, WriteAuthority(lambda: lambda: None))
+    assert created.disposition == 'target' and created.pr is not None
+    query = DeliveryRead(effect.source_ref, effect.target_ref, created.pr.number, ())
+    before = port.delivery(query)
+    source = json.loads(state.read_text())['source_graph']
+    for method, endpoint, body in [
+        ('POST', f'issues/{created.pr.number}/comments', '<!-- agent-run-status:original -->\nBefore'),
+        ('PATCH', 'issues/comments/1', '<!-- agent-run-status:original -->\nAfter'),
+    ]:
+        payload = tmp_path / 'status.json'
+        payload.write_text(json.dumps({'body': body}))
+        command = [str(tmp_path / 'control-bin/gh'), 'api', 'repos/example/project/' + endpoint,
+                   '--method', method, '--input', str(payload)]
+        result = subprocess.run(command, cwd=git_repo, env=environment, text=True, capture_output=True, timeout=5)
+        assert result.returncode == 0, result.stderr
+        after = port.delivery(query)
+        assert (after.pr, after.source, after.target) == (before.pr, before.source, before.target)
+        assert before.checks is not None and after.checks is not None
+        assert (after.checks.pr_number, after.checks.head_sha, after.checks.result, after.checks.details) == (
+            before.checks.pr_number, before.checks.head_sha, before.checks.result, before.checks.details)
+        assert after.checks.logs != before.checks.logs
+        assert same_required_checks(asdict(before.checks), after.checks)
+        assert json.loads(state.read_text())['source_graph'] == source
+
+
 def test_managed_control_github_keeps_parent_and_ticket_rest_facts_separate(
     git_repo: Path, tmp_path: Path, monkeypatch,
 ) -> None:

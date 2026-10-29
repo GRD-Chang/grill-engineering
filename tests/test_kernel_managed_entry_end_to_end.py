@@ -1204,7 +1204,6 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
         with _local_manager(tmp_path / "manager", environment, host_timeout=180) as (manager, serving, errors, children, trace, commands, output):
             started = time.monotonic()
             deadline = started + 180
-            environment['ENTRY_HOST_SNAPSHOT_AT'] = str(deadline - 3)
             timing = {"overall_budget_seconds": 180}
             kernel = None
             environment["PATH"] = str(Path(manager.systemctl).parent) + os.pathsep + environment["PATH"]
@@ -1402,7 +1401,6 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
     origin = tmp_path / "origin.git"
     base = _git(origin, "rev-parse", "refs/heads/main")
     deadline = time.monotonic() + 120
-    environment['ENTRY_HOST_SNAPSHOT_AT'] = str(deadline - 3)
     with _local_manager(tmp_path / "manager", environment, host_timeout=120) as (
         manager, serving, errors, children, trace, commands, output,
     ):

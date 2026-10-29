@@ -25,6 +25,7 @@ from agent_run.contracts.agent_profiles import ProfileOverrides, resolve_profile
 from agent_run.contracts.identity import validate_identity_snapshot
 from agent_run.contracts.pr_observation import pr_target
 from agent_run.contracts.repository import same_repository
+from agent_run.contracts.required_checks import same_required_checks
 from agent_run.contracts.prompt import validate_resources
 from agent_run.contracts.task import TaskKey
 
@@ -4142,7 +4143,7 @@ class Kernel:
                 else:
                     check = tx.one(*run_statement(tx, 'SELECT material_id FROM checks WHERE id=? AND run_id=?',
                                 (job["checks_id"],), run_last=True))
-                    if wire_json(json.loads(tx.get(check[0], subject))) != wire_json(asdict(checks)):
+                    if not same_required_checks(json.loads(tx.get(check[0], subject)), checks):
                         raise KernelError("approval_checks_changed")
                     grant_id = identity()
                     tx.execute(*run_statement(tx, 'INSERT INTO grants(id,subject,action,pr_number,head_sha,base_sha,review_attempt,checks_id,revision,parent_revision,graph_revision,completion_revision,run_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
@@ -6359,10 +6360,8 @@ class Kernel:
             return False
         recorded = tx.one(*run_statement(tx, 'SELECT material_id FROM checks WHERE id=? AND run_id=?',
                        (job["checks_id"],), run_last=True))
-        if json.loads(tx.get(recorded[0], job["id"])) != asdict(checks):
-            # JSON arrays and dataclass tuples are compared canonically.
-            if wire_json(json.loads(tx.get(recorded[0], job["id"]))) != wire_json(asdict(checks)):
-                return False
+        if not same_required_checks(json.loads(tx.get(recorded[0], job["id"])), checks):
+            return False
         if job["kind"] == DeliveryKind.TICKET:
             return job["gate_mode"] in {"review", "deterministic_fallback", "ci_waiver"}
         if not job["grant_id"] or not self._review_current(tx, job, world):
