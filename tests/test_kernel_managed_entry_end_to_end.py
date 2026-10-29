@@ -33,6 +33,8 @@ from support.worker_process_timing import wait_until
 from support.host_close_trace import raise_with_trace
 from support.systemd_manager import _CODEX, _approval_read_barrier, _control_environment, _diagnostic_tail, _executable, _git, _hold_host_operation_return, _local_manager, _managed_diagnostics, _managed_failure_note
 from support.systemd_manager import SidecarStatTrace, _resumed_ticket_completion
+from support.systemd_manager import _measure_host_calls
+from support.host_cost_trace import note_costs, report_costs
 
 
 def test_public_run_reaches_ticket_close_through_managed_host_after_lost_merge_reply(
@@ -477,8 +479,9 @@ def test_control_process_owns_child_before_first_identity_observation(monkeypatc
 
 
 def test_public_parallel_review_and_publication_keep_each_threads_binding(
-    git_repo: Path, tmp_path: Path, monkeypatch,
+    git_repo: Path, tmp_path: Path, monkeypatch, record_property, request,
 ) -> None:
+    _measure_host_calls(tmp_path, monkeypatch, enabled=request.config.getoption('host_loss_io_diagnostics'))
     from agent_run.adapters.foreground import ProcessPin, read_record, record_root, subreaper
     classification = """schema = json.loads(Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text())
 role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commit_message' in schema['properties'] else 'development'
@@ -527,10 +530,15 @@ content = 'Implementation""")
             original, = attempt['invocations']
             return attempt, original
 
+        arrival_times = []
         try:
             try:
-                events = [arrivals.get(timeout=30) for _ in range(2)]
+                events = []
+                for _ in range(2):
+                    events.append(arrivals.get(timeout=30))
+                    arrival_times.append(time.monotonic_ns())
             except Empty as error:
+                note_costs(error, tmp_path, arrivals_ns=arrival_times)
                 available_output = {}
                 for name in ('stdout', 'stderr'):
                     stream = getattr(child, name)
@@ -635,11 +643,13 @@ content = 'Implementation""")
                 (tmp_path / 'parallel-callback-snapshots.json').write_text(json.dumps(snapshots))
             finally:
                 _finish_control_host(child, pins, child_fd=child_fd, stop=stop)
+    report_costs(record_property, tmp_path)
 
 
 def test_public_resume_after_exact_foreground_host_loss_preserves_parallel_work(
     git_repo: Path, tmp_path: Path, monkeypatch, record_property, request,
 ) -> None:
+    _measure_host_calls(tmp_path, monkeypatch, enabled=request.config.getoption('host_loss_io_diagnostics'))
     diagnostic = request.config.getoption('host_loss_io_diagnostics')
     record_property('host_loss_entry', 'diagnostic-presealed' if diagnostic else 'official')
     observed = _foreground_host_loss_story(git_repo, tmp_path, monkeypatch, record_property, diagnostic=diagnostic)
@@ -648,6 +658,7 @@ def test_public_resume_after_exact_foreground_host_loss_preserves_parallel_work(
         traces = read_traces(tmp_path / 'host-io-trace', observed['run'])
         assert traces and all(item.get('measurement_errors') == 0 for item in traces)
         assert all(item['sample_status'] in {'sampled', 'not_due'} for item in traces)
+    report_costs(record_property, tmp_path)
 
 
 def _foreground_host_loss_story(git_repo, tmp_path, monkeypatch, record_property, *, diagnostic):
@@ -718,6 +729,7 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
                         'returncode': continued.returncode, 'stdout': stdout, 'stderr': stderr})
                     return subprocess.CompletedProcess(command, continued.returncode, stdout, stderr)
                 except subprocess.TimeoutExpired as error:
+                    note_costs(error, tmp_path)
                     if diagnostic:
                         from support.host_io_trace import read_traces
                         error.add_note(json.dumps({'host_loss_io_trace': read_traces(trace_root, observations.get('run'))}))
@@ -1463,9 +1475,10 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
 
 
 def test_public_local_worker_failure_preserves_completed_and_independent_tickets(
-    git_repo: Path, tmp_path: Path, monkeypatch, record_property,
+    git_repo: Path, tmp_path: Path, monkeypatch, record_property, request,
 ) -> None:
     """A completes, B fails while C publishes, and B's dependent D never starts."""
+    _measure_host_calls(tmp_path, monkeypatch, enabled=request.config.getoption('host_loss_io_diagnostics'))
     from agent_run.adapters.foreground import read_record, record_root, subreaper
 
     classification = """schema = json.loads(Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text())
@@ -1528,10 +1541,15 @@ issue = int(re.search(r'https://github.com/example/project/issues/(\\d+)', promp
         def subjects(document):
             return {row['subject']: row for row in document['subjects']}
 
+        arrival_times = []
         try:
             try:
-                ready = [arrivals.get(timeout=min(60, remaining())) for _ in range(2)]
+                ready = []
+                for _ in range(2):
+                    ready.append(arrivals.get(timeout=min(60, remaining())))
+                    arrival_times.append(time.monotonic_ns())
             except Empty as error:
+                note_costs(error, tmp_path, arrivals_ns=arrival_times)
                 facts = {'stage': 'initial-workers-before-local-failure', 'cli_returncode': child.poll(),
                     'worker_errors': _diagnostic_tail(tmp_path / 'roles.jsonl.errors')}
                 try:
@@ -1683,6 +1701,7 @@ issue = int(re.search(r'https://github.com/example/project/issues/(\\d+)', promp
                 record_property('mixed_subject_failure', json.dumps(observations))
             finally:
                 _finish_control_host(child, pins, child_fd=child_fd)
+    report_costs(record_property, tmp_path)
 
 
 def test_explicit_fault_host_entry_preserves_native_admission_without_fault(
@@ -1741,7 +1760,7 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
 
 
 def test_controlled_native_commit_failure_reaps_both_workers_before_disarm_and_public_resume(
-    git_repo: Path, tmp_path: Path, monkeypatch, record_property,
+    git_repo: Path, tmp_path: Path, monkeypatch, record_property, request,
 ) -> None:
     """Controlled pre-sealed test Host, not official CLI argv E2E.
 
@@ -1749,6 +1768,7 @@ def test_controlled_native_commit_failure_reaps_both_workers_before_disarm_and_p
     and native Host. The subsequent Resume uses the unmodified public CLI.
     Fault activation is owned by this test and never touches a user database.
     """
+    _measure_host_calls(tmp_path, monkeypatch, enabled=request.config.getoption('host_loss_io_diagnostics'))
     from uuid import uuid4
     from agent_run.adapters.foreground import read_record, record_root, subreaper
     from agent_run.cli.lifecycle import prepare_creation
@@ -1920,6 +1940,7 @@ else:
                     '--foreground', '--repo', 'example/project', '--json'], cwd=git_repo, env=environment,
                     text=True, capture_output=True, timeout=remaining())
             except subprocess.TimeoutExpired as error:
+                note_costs(error, tmp_path)
                 observations['resume_timeout_diagnostics'] = _managed_diagnostics(kernel.storage.path, spec.run_id, tmp_path / 'roles.jsonl')
                 error.add_note('Disarmed original Run Resume: ' + json.dumps(observations['resume_timeout_diagnostics']))
                 raise
@@ -1977,3 +1998,4 @@ else:
                     _finish_control_host(child, pins, child_fd=child_fd)
                 finally:
                     record_property('shared_commit_failure', json.dumps(observations))
+    report_costs(record_property, tmp_path)

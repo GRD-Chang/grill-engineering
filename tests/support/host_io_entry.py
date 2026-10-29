@@ -59,6 +59,8 @@ def main(arguments=None):
                        run_id=parsed.run_id, root=parsed.trace_root, sample_at=parsed.sample_at)
     if request.backend != 'foreground' or request.command != expected or request.run_id != parsed.run_id:
         raise ValueError('Diagnostic command does not match the sealed admission')
+    from support.host_cost_trace import install_from_environment
+    install_from_environment()
     trace = HostIOTrace(parsed.trace_root, parsed.action, parsed.run_id, parsed.sample_at)
     try:
         with pytest.MonkeyPatch.context() as patch:

@@ -666,7 +666,8 @@ def _approval_read_barrier(*, boundary=None, released=None):
 
 
 def _hold_host_operation_return(directory: Path, monkeypatch: pytest.MonkeyPatch, *,
-                                hold: bool = True, observe_close: bool = False) -> None:
+                                hold: bool = True, observe_close: bool = False,
+                                observe_cost: bool = False) -> None:
     """Offer committed operation returns to the existing control barrier.
 
     A quiescent approval needs no extra source poll. Instrument only the actual
@@ -700,5 +701,19 @@ if sys.orig_argv[1:3] == ["-m", 'agent_run.runtime.executor']:
                    "    from pathlib import Path\n"
                    "    from support.host_close_trace import install\n"
                    f"    install(Path({str(hook / 'close-trace.jsonl')!r}))\n")
+    if observe_cost:
+        source += ("\nif sys.orig_argv[1:3] == ['-m', 'agent_run.runtime.executor']:\n"
+                   f"    sys.path.insert(0, {str(Path(__file__).parent.parent)!r})\n"
+                   "    from support.host_cost_trace import install_from_environment\n"
+                   "    install_from_environment()\n")
     (hook / "sitecustomize.py").write_text(source)
     monkeypatch.setenv("PYTHONPATH", str(hook) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+
+
+def _measure_host_calls(directory: Path, monkeypatch: pytest.MonkeyPatch, *, enabled: bool = True) -> None:
+    if not enabled:
+        return
+    root = directory / 'host-costs'
+    root.mkdir(mode=0o700)
+    monkeypatch.setenv('ENTRY_HOST_COST_ROOT', str(root))
+    _hold_host_operation_return(directory, monkeypatch, hold=False, observe_cost=True)

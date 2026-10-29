@@ -47,6 +47,8 @@ def main(arguments=None):
             parsed.database, parsed.action, parsed.runner_lock, os.environ,
             parsed.fault_scope, parsed.fault_digest, run_id=parsed.run_id)):
         raise ValueError('Test Host command does not match the sealed admission')
+    from support.host_cost_trace import install_from_environment
+    install_from_environment()
     with pytest.MonkeyPatch.context() as patch:
         with sqlite_fault(patch, parsed.database, 'commit-interrupt', scope=scope):
             scope.record('factory_loaded')
