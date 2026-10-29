@@ -144,9 +144,10 @@ class Kernel:
         return RequirementsRead(fence, parent)
 
     def accept_requirements(self, request: RequirementsRead, source: Requirements) -> DeliveryObservation:
+        if source is None:
+            raise KernelError("source_not_configured")
         fence = request.fence
-        with self._observation_transaction(fence, write=True) as (tx, _):
-            self._refresh(tx, source)
+        with self._observation_transaction(fence, write=True, source=source) as (tx, _):
             current = replace(self._read_fence(tx, fence.subject, fence.execution, fence.cleanup),
                               local_effect=fence.local_effect)
             if fence.subject is None:
@@ -204,15 +205,16 @@ class Kernel:
                          facts.publisher_actor, facts.publisher_identity), fence
 
     @contextmanager
-    def _observation_transaction(self, fence: ReadFence, *, write: bool) -> Iterator[tuple[Transaction, sqlite3.Row]]:
+    def _observation_transaction(self, fence: ReadFence, *, write: bool,
+                                 source: Requirements | None = None) -> Iterator[tuple[Transaction, sqlite3.Row]]:
         """Validate and consume returned facts in the same transaction.
 
-        Only an expired read window needs a readonly consumer to enter the
-        ordered writer. The consumer runs once, after fresh checks; a timeout
+        An expired read window or changed Source needs the ordered writer.
+        The consumer runs once, after fresh checks; a timeout
         commits before ReadWait leaves this boundary. No row or permission
         from the first snapshot is reused by that writer.
         """
-        for writable in ((True,) if write else (False, True)):
+        for writable in ((True,) if write and source is None else (False, True)):
             with self.storage.transaction(write=writable) as tx:
                 run = self._check_operation(tx, fence, fence.execution)
                 try:
@@ -221,6 +223,8 @@ class Kernel:
                 except _SupervisionWriteRequired:
                     continue  # Close the reader normally; never retry a failed close or consumer.
                 if waiting is None:
+                    if source is not None and not self._refresh(tx, source, readonly=not writable):
+                        continue
                     yield tx, run
                     return
             raise ReadWait(waiting)
@@ -1013,7 +1017,9 @@ class Kernel:
             self._refresh(tx, requirements)
             return self._source_status(tx)
 
-    def _refresh(self, tx: Transaction, source: Requirements, *, initial: bool = False) -> None:
+    def _refresh(self, tx: Transaction, source: Requirements, *, initial: bool = False,
+                 readonly: bool = False) -> bool:
+        """Consume exact source bytes, or report that a readonly probe needs a writer."""
         run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
                   (), run_last=True))
         if source.parent.number != run["parent_issue"]:
@@ -1029,7 +1035,9 @@ class Kernel:
         previous = tx.rows(*run_statement(tx, 'SELECT sequence,body FROM source_observations WHERE run_id=? ORDER BY sequence DESC LIMIT 1',
                        (), run_last=True))
         if previous and previous[0]["body"] == raw:
-            return
+            return True
+        if readonly:
+            return False
         tx.execute(*run_statement(tx, 'INSERT INTO source_observations(parent_revision,graph_revision,body,run_id) VALUES (?,?,?,?)',
             (parent_revision, graph_revision, raw), run_last=True))
         sequence = tx.one("SELECT last_insert_rowid()")[0]
@@ -1120,6 +1128,7 @@ class Kernel:
                 (blocked,), run_last=True))
         owner = jobs[0]["id"]
         self._event(tx, owner, "source_refreshed", str(sequence))
+        return True
 
     def _completion(self, tx: Transaction, job: sqlite3.Row) -> sqlite3.Row | None:
         rows = tx.rows(*run_statement(tx, 'SELECT c.* FROM completions c JOIN runs r ON r.id=c.run_id WHERE c.subject=? AND c.generation=? AND c.revision=? AND c.graph_revision=r.graph_revision AND c.run_id=?',
@@ -2899,25 +2908,30 @@ class Kernel:
         """Recheck exact work and Stop after I/O, without clearing a read wait."""
         value = self._automatic_token(token)
         scope = value["scope"]
-        with self.storage.transaction() as tx:
-            run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
-                      (), run_last=True))
-            self._automatic_owned(tx, run, execution)
-            if scope != self._automatic_scope(tx, run, scope["subject"], scope["cleanup"]):
-                raise ObservationSuperseded("automatic_step_superseded")
-            if run["blocked"] == "supervision_timeout" or (scope["subject"] is not None and any(
-                    gate["code"] == "supervision_timeout" for gate in self._gates(tx, scope["subject"]))):
-                return Step("paused", scope["subject"] or "", "supervision_timeout")
-            if readback is not None:
-                row = tx.one(*run_statement(tx, 'SELECT * FROM effects WHERE id=? AND subject=? AND run_id=?',
-                          (readback.effect_id, scope["subject"]), run_last=True))
-                if row["status"] != "sent" or self._effect(tx, row, execution) != readback:
-                    raise KernelError("effect_binding")
-            if (readback is None and self._abandon_action(tx) is None
-                    and not self._automatic_control_read(tx, run, scope["subject"], scope["cleanup"]) and
-                    (run["stopped"] or run["blocked"] or (scope["subject"] is not None and self._gates(tx, scope["subject"])))):
-                raise KernelError("automatic_step_paused")
-            return self._operation_read_wait(tx, run, scope, after_read=after_read)
+        for writable in (False, True):
+            with self.storage.transaction(write=writable) as tx:
+                run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
+                          (), run_last=True))
+                self._automatic_owned(tx, run, execution)
+                if scope != self._automatic_scope(tx, run, scope["subject"], scope["cleanup"]):
+                    raise ObservationSuperseded("automatic_step_superseded")
+                if run["blocked"] == "supervision_timeout" or (scope["subject"] is not None and any(
+                        gate["code"] == "supervision_timeout" for gate in self._gates(tx, scope["subject"]))):
+                    return Step("paused", scope["subject"] or "", "supervision_timeout")
+                if readback is not None:
+                    row = tx.one(*run_statement(tx, 'SELECT * FROM effects WHERE id=? AND subject=? AND run_id=?',
+                              (readback.effect_id, scope["subject"]), run_last=True))
+                    if row["status"] != "sent" or self._effect(tx, row, execution) != readback:
+                        raise KernelError("effect_binding")
+                if (readback is None and self._abandon_action(tx) is None
+                        and not self._automatic_control_read(tx, run, scope["subject"], scope["cleanup"]) and
+                        (run["stopped"] or run["blocked"] or (scope["subject"] is not None and self._gates(tx, scope["subject"])))):
+                    raise KernelError("automatic_step_paused")
+                try:
+                    return self._operation_read_wait(tx, run, scope, after_read=after_read, write_timeout=writable)
+                except _SupervisionWriteRequired:
+                    continue  # Close the reader before repeating every check under the ordered writer.
+        raise AssertionError("Read supervision did not settle under its writer")
 
     def _finish_operation_read(self, token: str | ReadFence, execution: Execution) -> Step | None:
         """Check healthy reads without saving; expiration rechecks under its writer."""

@@ -560,7 +560,7 @@ def test_observation_consumption_checks_and_uses_one_transaction(scenario, monke
 
     monkeypatch.setattr(kernel.storage, 'transaction', recorded)
     observation = kernel.accept_requirements(request, _source('A'))
-    assert modes == [(True, True)]
+    assert modes == [(False, True)]
     modes.clear()
     world, fence = kernel.accept_delivery(observation, DeliveryFacts(BASE, BASE))
     assert fence == observation.fence and world.source == BASE
