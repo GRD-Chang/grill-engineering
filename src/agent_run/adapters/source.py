@@ -51,7 +51,7 @@ def read_remote_heads(root: Path, source_ref: str, target_ref: str, *,
         if not ref.startswith("refs/heads/") or git.run("check-ref-format", ref, check=False).returncode:
             raise ValueError("Expected an exact refs/heads branch identity")
     response = run_read_command(["git", "ls-remote", "--refs", "--", remote, source_ref, target_ref],
-                                cwd=root, runner_identity=identity)
+                                cwd=root, runner_identity=identity, complete_stdout=True)
     if response.returncode:
         raise GitHubReadError("github_read_failed", response.stderr.strip() or "Remote refs could not be read")
     heads: dict[str, str | None] = {source_ref: None, target_ref: None}
@@ -81,9 +81,11 @@ def _text(value: Any) -> str:
     return value
 
 
-def _read(reader: GhGitHubReader, arguments: list[str], *, allowed: frozenset[int] = frozenset({0})) -> subprocess.CompletedProcess[str]:
+def _read(reader: GhGitHubReader, arguments: list[str], *, allowed: frozenset[int] = frozenset({0}),
+          complete_stdout: bool = True) -> subprocess.CompletedProcess[str]:
     identity = validate_identity_snapshot(reader.runner_identity)
-    response = run_read_command(['gh', *arguments], cwd=reader.working_directory, runner_identity=identity)
+    response = run_read_command(['gh', *arguments], cwd=reader.working_directory, runner_identity=identity,
+                                complete_stdout=complete_stdout)
     if response.returncode not in allowed:
         raise read_response_error(response)
     return response
@@ -156,7 +158,7 @@ def _failed_check_evidence(reader: GhGitHubReader, repository: str, checks: list
                 raise GitHubReadError('github_check_evidence_observation_pending', 'Actions job is not completed at the expected failed head')
             check['job'] = job
             try:
-                logs = _read(reader, ['api', endpoint + '/logs'], allowed=frozenset({0, 1, 403, 404}))
+                logs = _read(reader, ['api', endpoint + '/logs'], allowed=frozenset({0, 1, 403, 404}), complete_stdout=False)
                 if logs.returncode == 0:
                     check['logs'] = logs.stdout[:65536]
                     check['logs_truncated'] = len(logs.stdout) > 65536

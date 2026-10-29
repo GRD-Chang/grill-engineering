@@ -68,32 +68,32 @@ def test_labels_and_blockers_have_independent_complete_cursors_and_each_read_is_
     queries = [dict(value.split('=', 1) for i, value in enumerate(command) if i and command[i - 1] in ('-F', '-f'))
                for command in commands if command[:2] == ['api', 'graphql']]
     ticket_pages = [fields for fields in queries if fields['number'] == '9']
-    assert len(ticket_pages) == 3
-    assert ticket_pages[1]['cursor'] == 'blocker-next' and ticket_pages[1]['labelsCursor'] == 'labels-next'
-    assert 'cursor' not in ticket_pages[2] and ticket_pages[2]['labelsCursor'] == 'labels-last'
-    assert len(commands) == 7  # One metadata read, two Parent pages, three Ticket9 pages, one Ticket3.
+    assert len(ticket_pages) == 2  # The first Ticket page arrived in its Parent page.
+    assert ticket_pages[0]['cursor'] == 'blocker-next' and ticket_pages[0]['labelsCursor'] == 'labels-next'
+    assert 'cursor' not in ticket_pages[1] and ticket_pages[1]['labelsCursor'] == 'labels-last'
+    assert len(commands) == 4  # Two nested Parent pages and two Ticket continuations.
     for key in ('9', 'blocker-next', 'labels-next', 'labels-last'):
         data[key]['body'] = 'A fresh current requirement'
     path.write_text(json.dumps(data))
     second = read_requirements(reader, 1)
     assert second.issues[0].body == 'A fresh current requirement'
     assert first.issues[0].body == 'Same original ticket body'
-    assert len(log.read_text().splitlines()) == 14
+    assert len(log.read_text().splitlines()) == 8
 
 
 def _mutate(data, case):
     parent, next_parent, ticket, next_ticket = (data[key] for key in ('parent', 'parent-next', '9', 'blocker-next'))
     child = parent['subIssues']['nodes'][0]
     if case == 'parent_number': parent['number'] = 2
-    elif case == 'ticket_number': ticket['number'] = 3
-    elif case == 'boolean_number': ticket['number'] = True
-    elif case == 'ticket_node': ticket['id'] = 'another-node'
-    elif case == 'ticket_repository': ticket['repository']['nameWithOwner'] = 'outside/project'
-    elif case == 'case_drift': ticket['repository']['nameWithOwner'] = 'EXAMPLE/PROJECT'
+    elif case == 'ticket_number': child['number'] = ticket['number'] = 3
+    elif case == 'boolean_number': child['number'] = ticket['number'] = True
+    elif case == 'ticket_node': next_ticket['id'] = 'another-node'  # Changed continuation after the nested first page.
+    elif case == 'ticket_repository': child['repository']['nameWithOwner'] = ticket['repository']['nameWithOwner'] = 'outside/project'
+    elif case == 'case_drift': child['repository']['nameWithOwner'] = ticket['repository']['nameWithOwner'] = 'EXAMPLE/PROJECT'
     elif case == 'child_repository': child['repository']['nameWithOwner'] = 'outside/project'
     elif case == 'child_parent': child['parent']['id'] = 'another-parent'
-    elif case == 'ticket_parent': ticket['parent']['number'] = 4
-    elif case == 'null_ticket_parent': ticket['parent'] = None
+    elif case == 'ticket_parent': child['parent']['number'] = ticket['parent']['number'] = 4
+    elif case == 'null_ticket_parent': child['parent'] = ticket['parent'] = None
     elif case == 'null_child': parent['subIssues']['nodes'][0] = None
     elif case == 'missing_issue': data['parent'] = None
     elif case == 'missing_labels': del ticket['labels']
@@ -214,7 +214,7 @@ def test_source_403_is_not_empty_data_or_a_different_read_layout(tmp_path, monke
         read_requirements(reader, 1)
     assert caught.value.code == 'github_read_failed'
     commands = [json.loads(line) for line in log.read_text().splitlines()]
-    assert len(commands) == 4  # One metadata read and the existing three bounded attempts.
+    assert len(commands) == 3  # Three complete Source attempts; no metadata pre-read.
 
 
 @pytest.mark.parametrize('page', ['9', 'blocker-next'])
@@ -245,7 +245,7 @@ def test_global_blocker_identity_preserves_native_completion_and_external_state(
     data['3']['state'] = 'OPEN'
     path.write_text(json.dumps(data))
     source = read_requirements(reader, 1)
-    assert len(log.read_text().splitlines()) == 5  # One metadata read, two Parent pages and two Tickets.
+    assert len(log.read_text().splitlines()) == 2  # Parent pages contain complete first Ticket pages.
     assert [(b.number, b.state) for b in source.issues[0].blocked_by] == [(b['number'], b['state']) for b in blockers]
     scenario = GraphScenario(tmp_path / 'normal-producer', source)
     assert scenario.kernel.source_status()['frontier'] == ['ticket:3']
@@ -288,4 +288,4 @@ def test_internal_blocker_identity_does_not_add_single_page_requests(tmp_path, m
                              'pageInfo': {'hasNextPage': False, 'endCursor': None}}
     path.write_text(json.dumps(data))
     assert [(b.number, b.state) for b in read_requirements(reader, 1).issues[0].blocked_by] == [(3, 'OPEN')]
-    assert len(log.read_text().splitlines()) == 2 + 2  # One metadata read, one Parent page, N Tickets.
+    assert len(log.read_text().splitlines()) == 1  # Complete single-page Source, including blocker identity.

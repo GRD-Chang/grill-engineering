@@ -18,7 +18,7 @@ def test_requirements_do_not_need_an_unconsumed_missing_default_ref(tmp_path, mo
     source = read_requirements(reader, 1)
     assert source.parent.sub_issue_numbers == (9, 3)
     commands = [json.loads(line) for line in log.read_text().splitlines()]
-    assert commands[0] == ['repo', 'view', 'example/project', '--json', 'nameWithOwner']
+    assert commands[0][:2] == ['api', 'graphql'] and 'SourceSnapshot' in commands[0][3]
     assert not any('/git/ref/heads/' in str(command) for command in commands)
 
 
@@ -65,8 +65,8 @@ def test_requirements_identity_is_independent_of_delivery_default_ref_permission
     commands = [json.loads(line) for line in log.read_text().splitlines()]
     assert source.parent.sub_issue_numbers == (9, 3)
     assert source.parent.body == 'Original Parent body\r\n保留原文'
-    assert commands[0] == ['repo', 'view', 'example/project', '--json', 'nameWithOwner']
-    assert len(commands) == 6  # One metadata read, two Parent pages, two Ticket9 pages, one Ticket3.
+    assert commands[0][:2] == ['api', 'graphql'] and 'SourceSnapshot' in commands[0][3]
+    assert len(commands) == 3  # Two nested Parent pages and one Ticket continuation.
     assert not any('/git/ref/heads/' in str(command) for command in commands)
     for read in (reader.repository, lambda: read_required_check_facts(reader, 17, expected_head_sha='2' * 40)):
         before = len(log.read_text().splitlines())
@@ -101,7 +101,7 @@ def test_initial_creation_still_requires_the_exact_default_commit(git_repo, tmp_
     assert not list(workspace.state_root.rglob('*.sqlite3'))
     assert git(workspace.repository_root, 'for-each-ref', '--format=%(refname)', 'refs/heads/agent-run') == ''
     commands = [json.loads(line) for line in log.read_text().splitlines()]
-    assert [c[-1] for c in commands if c[:2] == ['repo', 'view']] == ['nameWithOwner', 'nameWithOwner,defaultBranchRef']
+    assert [c[-1] for c in commands if c[:2] == ['repo', 'view']] == ['nameWithOwner,defaultBranchRef']
     assert any('/git/ref/heads/main' in str(command) for command in commands)
 
 
@@ -126,8 +126,9 @@ def test_metadata_permission_failure_is_not_an_empty_graph_or_another_layout(tmp
     with pytest.raises(GitHubReadError) as caught:
         read_requirements(reader, 1)
     assert caught.value.code == 'github_read_failed' and 'HTTP 403' in caught.value.message
-    assert [json.loads(line) for line in log.read_text().splitlines()] == [
-        ['repo', 'view', 'example/project', '--json', 'nameWithOwner']] * 3
+    commands = [json.loads(line) for line in log.read_text().splitlines()]
+    assert len(commands) == 3 and all(command[:2] == ['api', 'graphql'] and 'SourceSnapshot' in command[3]
+                                      for command in commands)
 
 
 def test_each_read_is_fresh_and_canonical_case_does_not_change_ref_or_sha(tmp_path, monkeypatch):
@@ -151,7 +152,7 @@ def test_each_read_is_fresh_and_canonical_case_does_not_change_ref_or_sha(tmp_pa
     assert reader.repository().default_head_sha == 'c' * 40
     calls = [json.loads(line) for line in log.read_text().splitlines()]
     metadata = [call for call in calls if call[:2] == ['repo', 'view']]
-    assert [call[-1] for call in metadata] == ['nameWithOwner', 'nameWithOwner,defaultBranchRef'] * 2
+    assert [call[-1] for call in metadata] == ['nameWithOwner,defaultBranchRef'] * 2
     assert all(call[2] == 'EXAMPLE/PROJECT' for call in metadata)
     refs = [call for call in calls if '/git/ref/heads/' in str(call)]
     assert refs == [['api', 'repos/Example/Project/git/ref/heads/Feature%2FCase']] * 2

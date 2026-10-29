@@ -684,7 +684,7 @@ def prepare_creation(parent: int, repository: str | None, *, source_directory: P
         if observed.stdout.strip():
             raise KernelError("creation_resource_occupied", ref)
     response = run_read_command(["git", "ls-remote", "--refs", "--", "origin", *refs], cwd=root,
-                                runner_identity=frozen.inputs.runner_identity)
+                                runner_identity=frozen.inputs.runner_identity, complete_stdout=True)
     if response.returncode:
         raise GitHubReadError("github_read_failed", "Creation resource refs cannot be observed")
     if response.stdout.strip():

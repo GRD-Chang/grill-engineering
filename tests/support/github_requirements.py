@@ -31,3 +31,30 @@ def source_issue(value, repository="example/project", parent_number=1, *, totals
 def source_response(issue, repository="example/project"):
     return {"data": {"repository": {"id": "repository-" + repository,
             "nameWithOwner": repository, "issue": issue}}}
+
+
+def source_snapshot(issue, tickets):
+    """Expand selected fields on the existing sub-Issue connection's node identity.
+
+    Membership identity stays exactly as stored. Ticket continuation responses
+    remain independent facts, so a later changed identity is still observable.
+    """
+    result = deepcopy(issue)
+    if not isinstance(result, dict) or not isinstance(result.get('subIssues'), dict):
+        return result
+    nodes = result['subIssues'].get('nodes')
+    if not isinstance(nodes, list):
+        return result
+    for index, member in enumerate(nodes):
+        if not isinstance(member, dict):
+            continue
+        ticket = tickets.get(str(member.get('number')))
+        if not isinstance(ticket, dict):
+            nodes[index] = None
+            continue
+        for field in ('title', 'body', 'state', 'labels', 'blockedBy'):
+            if field in ticket:
+                member[field] = deepcopy(ticket[field])
+            else:
+                member.pop(field, None)
+    return result

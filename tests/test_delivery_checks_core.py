@@ -40,6 +40,44 @@ def decision_scenario(tmp_path, monkeypatch, request):
         yield scenario, connections[0]
 
 
+@pytest.mark.parametrize('failure', ['malformed', 'read_failed', 'pipe_error'])
+def test_complete_read_keeps_source_gate_or_original_wait_window(decision_scenario, monkeypatch, failure):
+    import sys
+    from agent_run.adapters import github_commands
+    from agent_run.adapters.remote import RemoteEffects
+
+    s, db = decision_scenario
+    bounded, calls = github_commands._run_bounded_command, []
+    native = RemoteEffects(s.port.git.root, s.spec.repository, runner_identity={'source': 'host'})
+    code = ("print('{invalid')" if failure == 'malformed' else
+            "import sys;sys.stderr.write('HTTP 403 unavailable');raise SystemExit(1)")
+
+    def returned(arguments, **options):
+        calls.append('read')
+        if failure == 'pipe_error':
+            raise OSError('Controlled incomplete transport')
+        return bounded([sys.executable, '-I', '-c', code], **options)
+
+    monkeypatch.setattr(github_commands, '_run_bounded_command', returned)
+    monkeypatch.setattr(github_commands.time, 'sleep', lambda _: None)
+    monkeypatch.setattr(s.port, 'source', lambda source, parent: native.source(parent))
+    first = s.step()
+    assert db.execute('SELECT count(*) FROM effects').fetchone()[0] == 0
+    if failure == 'malformed':
+        assert first.kind == 'paused' and first.reason == 'github_invalid_response'
+        assert db.execute('SELECT code FROM gates').fetchone()[0] == 'deterministic_contradiction'
+        assert not db.execute('SELECT 1 FROM waits').fetchall() and calls == ['read']
+    else:
+        assert first.kind == 'waiting'
+        original = tuple(db.execute('SELECT started_at,deadline FROM waits').fetchone())
+        assert original == (100., 700.)
+        s.kernel.clock = lambda: 105.25
+        assert s.step().kind == 'waiting'
+        assert tuple(db.execute('SELECT started_at,deadline FROM waits').fetchone()) == original
+        assert not db.execute('SELECT 1 FROM gates').fetchall()
+        assert calls == ['read'] * (2 if failure == 'pipe_error' else 6)
+
+
 @pytest.mark.parametrize('capacity', [0, 1])
 def test_initial_observation_uses_existing_read_snapshot_without_a_save(decision_scenario, monkeypatch, capacity):
     s, db = decision_scenario
@@ -1283,3 +1321,85 @@ def test_local_preparation_still_bounds_its_required_source_and_pr_reads(decisio
             (kernel.storage.run_id, effect.effect_id))) == ('prepared', 0)
         assert tuple(tx.one('SELECT started_at,deadline,retry_count FROM waits WHERE run_id=? AND subject=?',
             (kernel.storage.run_id, effect.subject))) == wait
+
+
+@pytest.mark.parametrize('next_observation', ['complete-contradiction', 'original-deadline'])
+def test_mixed_source_failure_never_commits_or_renews_a_supervision_window(
+    decision_scenario, monkeypatch, tmp_path, next_observation,
+):
+    from agent_run.adapters import github
+    from agent_run.adapters.remote import RemoteEffects
+    from support.remote_effects import _reader
+
+    s, db = decision_scenario
+    directory = tmp_path / 'mixed-source'
+    directory.mkdir()
+    _, log = _reader(directory, monkeypatch)
+    state = directory / 'responses.json'
+    document = json.loads(state.read_text())
+    document['9']['state'] = 'INVALID'
+    document['graphql_errors'] = [{'message': 'Controlled missing required permission'}]
+    state.write_text(json.dumps(document))
+    monkeypatch.setattr(github.time, 'sleep', lambda _: None)
+    native = RemoteEffects(s.port.git.root, s.spec.repository, runner_identity={'source': 'host'})
+    monkeypatch.setattr(s.port, 'source', lambda source, parent: native.source(parent))
+    before = [tuple(row) for row in db.execute('SELECT * FROM source_observations')]
+    assert s.step().kind == 'waiting'
+    original = tuple(db.execute('SELECT started_at,deadline FROM waits').fetchone())
+    assert original == (100., 700.)
+    s.kernel.clock = lambda: 105.25
+    assert s.step().kind == 'waiting'
+    assert tuple(db.execute('SELECT started_at,deadline FROM waits').fetchone()) == original
+    if next_observation == 'complete-contradiction':
+        del document['graphql_errors']
+        state.write_text(json.dumps(document))
+        retry_at = db.execute('SELECT next_retry_at FROM waits').fetchone()[0]
+        assert 105.25 < retry_at < original[1]
+        s.kernel.clock = lambda: retry_at + 0.25
+        result = s.step()
+        assert (result.kind, result.reason) == ('paused', 'github_invalid_response')
+        assert db.execute('SELECT code FROM gates').fetchone()[0] == 'deterministic_contradiction'
+    else:
+        s.kernel.clock = lambda: 700.
+        result = s.step()
+        assert (result.kind, result.reason) == ('paused', 'supervision_timeout')
+    assert [tuple(row) for row in db.execute('SELECT * FROM source_observations')] == before
+    assert not db.execute('SELECT 1 FROM effects').fetchall() and not s.writes()
+    assert all(json.loads(row)[:2] == ['api', 'graphql'] for row in log.read_text().splitlines())
+
+
+def test_final_attempt_overflow_is_incomplete_and_preserves_original_wait(decision_scenario, monkeypatch, tmp_path):
+    from agent_run.adapters.remote import RemoteEffects
+    from test_source_snapshot_observation import _flat
+
+    s, db = decision_scenario
+    directory = tmp_path / 'exhausted-source'
+    directory.mkdir()
+    _, state, log = _flat(directory, monkeypatch)
+    document = json.loads(state.read_text())
+    document['9']['body'] = document['3']['body'] = 'T' * 630000
+    state.write_text(json.dumps(document))
+    program = directory / 'bin/gh'
+    marker = "    if 'CurrentRequiredChecks' in fields['query']:"
+    text = program.read_text()
+    assert marker in text
+    program.write_text(text.replace(marker, '''    if 'SourceSnapshot' in fields['query']:
+        with open(os.environ['SOURCE_TEST_LOG']) as calls: attempt=sum(1 for _ in calls)
+        if attempt%3:
+            print('HTTP 503 controlled temporary failure',file=sys.stderr);raise SystemExit(1)
+''' + marker, 1))
+    native = RemoteEffects(s.port.git.root, s.spec.repository, runner_identity={'source': 'host'})
+    monkeypatch.setattr(s.port, 'source', lambda source, parent: native.source(parent))
+    before = [tuple(row) for row in db.execute('SELECT * FROM source_observations')]
+    assert s.step().kind == 'waiting'
+    assert len(log.read_text().splitlines()) == 3
+    original = tuple(db.execute('SELECT started_at,deadline FROM waits').fetchone())
+    assert original == (100., 700.)
+    assert not db.execute('SELECT 1 FROM gates').fetchall()
+    s.kernel.clock = lambda: 105.25
+    assert s.step().kind == 'waiting'
+    assert len(log.read_text().splitlines()) == 6
+    assert tuple(db.execute('SELECT started_at,deadline FROM waits').fetchone()) == original
+    assert not db.execute('SELECT 1 FROM gates').fetchall()
+    assert [tuple(row) for row in db.execute('SELECT * FROM source_observations')] == before
+    assert not db.execute('SELECT 1 FROM effects').fetchall() and not s.writes()

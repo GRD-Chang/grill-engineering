@@ -257,6 +257,21 @@ def test_failed_check_keeps_exact_job_workflow_step_and_original_logs_without_re
     assert all(args[0] in {'api', 'repo', 'pr'} and '--method' not in args for args in calls)
 
 
+def test_large_job_logs_keep_the_original_diagnostic_tail(tmp_path: Path, monkeypatch) -> None:
+    from agent_run.adapters.github_commands import MAX_COMMAND_OUTPUT_BYTES
+    from agent_run.adapters.source import read_required_check_facts, normalize_required_checks
+    reader, _log = _reader(tmp_path, monkeypatch)
+    _failed_job(tmp_path)
+    path = tmp_path / 'responses.json'
+    data = json.loads(path.read_text())
+    data['job_logs'] = 'discarded-prefix\n' + 'L' * (MAX_COMMAND_OUTPUT_BYTES + 1024) + '\nOriginal end'
+    path.write_text(json.dumps(data))
+    facts = read_required_check_facts(reader, 17, expected_head_sha='2' * 40)
+    check = facts['required_checks'][0]
+    assert check['logs'] == 'L' * 65536 and check['logs_truncated'] is True
+    assert 'logs_unavailable' not in check and normalize_required_checks(facts).result == 'fail'
+
+
 def test_unavailable_job_logs_do_not_erase_an_exact_failure_or_become_empty_logs(tmp_path: Path, monkeypatch) -> None:
     from agent_run.adapters.source import read_required_check_facts, normalize_required_checks
     reader, _log = _reader(tmp_path, monkeypatch)

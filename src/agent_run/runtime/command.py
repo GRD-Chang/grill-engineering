@@ -61,13 +61,29 @@ def capture_command(
                 drain_deadline = time.monotonic() + 0.1
         return drain_deadline is None or time.monotonic() < drain_deadline
 
+    failure: BaseException | None = None
     try:
         pump(process, stdout=stdout, stderr=stderr, check=check, ignore_read_errors=True)
+    except BaseException as error:
+        failure = error
+        raise
     finally:
+        cleanup_failure: BaseException | None = None
         try:
             returncode = terminate()
-        finally:
-            for stream in (process.stdout, process.stderr):
-                if stream is not None:
+        except BaseException as error:
+            cleanup_failure = error
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                try:
                     stream.close()
+                except BaseException as error:
+                    controls = (TimeoutError, InterruptedError, KeyboardInterrupt, SystemExit)
+                    if (cleanup_failure is None or isinstance(error, controls)
+                            and not isinstance(cleanup_failure, controls)):
+                        cleanup_failure = error
+        # A failed capture supplies no ACK. Preserve its original exception;
+        # otherwise propagate cleanup failure, with control errors taking priority.
+        if failure is None and cleanup_failure is not None:
+            raise cleanup_failure
     return CommandCapture(returncode, bytes(stdout.data), bytes(stderr.data), timed_out)

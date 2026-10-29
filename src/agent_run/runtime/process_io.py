@@ -21,10 +21,20 @@ class TailOutput:
         self.data.extend(chunk[-self.limit:] if len(chunk) > self.limit else chunk)
 
 
+class CompleteOutputOverflow(ValueError):
+    """The collector observed more original bytes than its fixed limit."""
+
+
 class CompleteOutput(TailOutput):
-    def finish(self) -> bytes:
+    def __init__(self, limit: int) -> None:
+        super().__init__(limit)
+        self.eof = False
+
+    def finish(self, *, require_eof: bool = False) -> bytes:
         if self.overflow:
-            raise ValueError("Complete process output unavailable: limit exceeded")
+            raise CompleteOutputOverflow("Complete process output unavailable: limit exceeded")
+        if require_eof and not self.eof:
+            raise OSError("Complete process output unavailable: stdout EOF not observed")
         return bytes(self.data)
 
 
@@ -75,11 +85,15 @@ def pump(
                     chunk = os.read(key.fd, 16384)
                 except BlockingIOError:
                     continue
-                except OSError:
-                    if not ignore_read_errors:
+                except OSError as error:
+                    if (not ignore_read_errors or isinstance(key.data, CompleteOutput)
+                            or isinstance(stdout, CompleteOutput) and isinstance(error, (TimeoutError, InterruptedError))):
                         raise
-                    chunk = b""
+                    selector.unregister(key.fileobj)
+                    continue  # A failed read never establishes EOF.
                 if chunk:
                     key.data.feed(chunk)
                 else:
+                    if isinstance(key.data, CompleteOutput):
+                        key.data.eof = True
                     selector.unregister(key.fileobj)

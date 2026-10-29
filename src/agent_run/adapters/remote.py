@@ -645,7 +645,8 @@ class RemoteEffects:
 
     @_operation_errors
     def source(self, parent_number: int) -> Requirements:
-        reader = GhGitHubReader(self.repository, working_directory=self.root, runner_identity=self.identity)
+        reader = GhGitHubReader(self.repository, working_directory=self.root, runner_identity=self.identity,
+                                cancelled=self.cancelled)
         return read_requirements(reader, parent_number)
 
     @_operation_errors
@@ -1068,8 +1069,10 @@ class RemoteEffects:
         return EffectResult("target" if issue["state"] == "closed" else "unknown", raw={"event": event})
 
     def _read(self, command: list[str], before_attempt: Callable[[], None] | None = None) -> subprocess.CompletedProcess[str]:
-        response = (run_read_command(command, cwd=self.root, runner_identity=self.identity) if before_attempt is None and self.cancelled is None else
-                    run_read_command(command, cwd=self.root, runner_identity=self.identity, before_attempt=before_attempt,
+        # API envelopes are structured; fetch output remains diagnostic.
+        complete_stdout = command[:2] == ["gh", "api"]
+        response = (run_read_command(command, cwd=self.root, runner_identity=self.identity, complete_stdout=complete_stdout) if before_attempt is None and self.cancelled is None else
+                    run_read_command(command, cwd=self.root, runner_identity=self.identity, complete_stdout=complete_stdout, before_attempt=before_attempt,
                                      **({"cancelled": self.cancelled} if self.cancelled is not None else {})))
         if response.returncode:
             raise GitHubReadError("remote_read_failed", response.stderr[:4096] or "Remote read failed")

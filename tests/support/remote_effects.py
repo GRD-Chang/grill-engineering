@@ -177,8 +177,15 @@ elif endpoint=='graphql' and method=='GET':
         p=graph['parent'];issue={'number':1,'title':p['title'],'body':p['body'],'subIssues':{'nodes':[{'number':n} for n in p['sub_issues']],'pageInfo':{'hasNextPage':False,'endCursor':None}}}
     else:
         p=graph['issues'][fields['number']];issue={**p,'labels':{'nodes':[{'name':name} for name in p['labels']],'pageInfo':{'hasNextPage':False,'endCursor':None}},'blockedBy':{'nodes':[],'pageInfo':{'hasNextPage':False,'endCursor':None}}}
-    from support.github_requirements import source_issue, source_response
-    result=source_response(source_issue(issue))
+    from support.github_requirements import source_issue, source_response, source_snapshot
+    issue=source_issue(issue)
+    if fields['number']=='1' and 'SourceSnapshot' in fields['query'] and 'labels(first:100' in fields['query']:
+        tickets={number:source_issue({**ticket,
+            'labels':{'nodes':[{'name':label} for label in ticket['labels']],'pageInfo':{'hasNextPage':False,'endCursor':None}},
+            'blockedBy':{'nodes':[],'pageInfo':{'hasNextPage':False,'endCursor':None}}})
+            for number,ticket in graph['issues'].items()}
+        issue=source_snapshot(issue,tickets)
+    result=source_response(issue)
 elif endpoint=='graphql':
     v=body['variables']; assert v['issueId']=='issue-node-2' and head('refs/heads/'+v['name'])==v['oid']
     d.setdefault('links',[]).append({'ref':v['name'],'sha':v['oid']})
@@ -331,8 +338,16 @@ elif args[:2]==['api','graphql']:
     if fields['number']!='1' and issue is not None:
         for field, cursor in [('labels','labelsCursor'),('blockedBy','cursor')]:
             issue[field]=control[fields.get(cursor) or key][field]
-    from support.github_requirements import source_response
+    from support.github_requirements import source_response, source_snapshot
+    if fields['number']=='1' and 'SourceSnapshot' in fields['query']:
+        if control.get('metadata_http'):
+            print('HTTP '+str(control['metadata_http'])+' metadata unavailable',file=sys.stderr)
+            raise SystemExit(1)
+        if 'labels(first:100' in fields['query']:
+            issue=source_snapshot(issue,control)
     result=source_response(issue, control['repository'])
+    if fields['number']=='1' and 'SourceSnapshot' in fields['query']:
+        result['data']['repository']['nameWithOwner']=control.get('metadata_repository',control['repository'])
     with open(os.environ['SOURCE_TEST_RESPONSES']) as f: control=json.load(f)
     if 'graphql_errors' in control: result['errors']=control['graphql_errors']
     print(json.dumps(result))

@@ -46,6 +46,8 @@ _PROBE = """
 import ctypes, os, select, signal, subprocess, sys, threading, selectors
 from pathlib import Path
 from agent_run.adapters.github_commands import _run_bounded_command
+from agent_run.adapters import github_commands
+from agent_run.adapters.github import GhGitHubReader
 from agent_run.runtime.git_command import run_git
 from agent_run.adapters.systemd import HostUnavailable, SystemdHost
 
@@ -79,6 +81,18 @@ if outcome == 'normal':
     os._exit(0)
 signal.pause()
 \"\"\"
+if helper == 'github_read':
+    command = command.replace("print('normal output', flush=True)", "print('{}', flush=True)")
+def structured_read(arguments, sample):
+    bounded = github_commands._run_bounded_command
+    def invoke(_arguments, **options):
+        options['cwd'] = sample
+        return bounded(arguments, **options)
+    github_commands._run_bounded_command = invoke
+    try:
+        return GhGitHubReader('example/project')._gh_json('api', 'graphql')
+    finally:
+        github_commands._run_bounded_command = bounded
 real_popen = subprocess.Popen
 unrelated = real_popen([sys.executable, '-c', 'import signal; signal.pause()'],
                       start_new_session=True)
@@ -139,6 +153,7 @@ try:
                              'holder', str(sample), outcome, 'owned']
             try:
                 result = (run_git(arguments, cwd=sample, timeout=5) if helper == 'git' else
+                          structured_read(arguments, sample) if helper == 'github_read' else
                           _run_bounded_command(arguments, cwd=sample, timeout=0.05 if outcome == 'timeout' else 30)
                           if helper == 'github' else SystemdHost(
                               systemctl='unused-fixture', systemd_run='unused-fixture',
@@ -147,6 +162,9 @@ try:
                 assert helper == 'github' and outcome == 'timeout'
                 assert isinstance(error.stdout, str) and isinstance(error.stderr, str)
                 assert 'normal output' in error.stdout and 'error tail' in error.stderr
+            except OSError as error:
+                assert helper == 'github_read' and escaped and outcome == 'normal'
+                assert 'EOF' in str(error)
             except RuntimeError as error:
                 if isinstance(error, HostUnavailable):
                     assert helper == 'systemd' and outcome == 'timeout'
@@ -156,6 +174,7 @@ try:
                     assert str(error) == ("can't create pipe selector" if outcome == 'capture_setup_failure'
                                           else 'injected poll failure')
             else:
+                assert helper != 'github_read', 'A valid JSON prefix without stdout EOF was accepted'
                 assert outcome not in {'exception', 'capture_setup_failure'}
                 stdout = result.stdout.decode() if helper == 'systemd' else result.stdout
                 stderr = result.stderr.decode() if helper == 'systemd' else result.stderr
@@ -223,6 +242,11 @@ def test_bounded_commands_reap_descendants_and_readers(
 @pytest.mark.skipif(not hasattr(os, 'pidfd_open'), reason='requires Linux pidfd')
 def test_git_reaps_pipe_holders_after_leader_exit(tmp_path: Path) -> None:
     _check_cleanup(tmp_path, 'git', 'normal', 'owned')
+
+
+@pytest.mark.skipif(not hasattr(os, 'pidfd_open'), reason='requires Linux pidfd')
+def test_structured_read_requires_eof_from_an_escaped_pipe_holder(tmp_path: Path) -> None:
+    _check_cleanup(tmp_path, 'github_read', 'normal', 'escaped')
 
 
 def _check_cleanup(tmp_path: Path, helper: str, outcome: str, escape: str) -> None:

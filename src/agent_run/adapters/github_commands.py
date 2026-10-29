@@ -11,12 +11,17 @@ from pathlib import Path
 
 from agent_run.adapters.auth.runner_transport import runner_options
 from agent_run.runtime.command import capture_command
+from agent_run.runtime.process_io import CompleteOutput, CompleteOutputOverflow
 from agent_run.errors import GitHubReadError, redact_transport_output
 
 
 MAX_READ_ATTEMPTS = 3
 READ_TIMEOUT_SECONDS = 30
 MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
+
+
+class ReadOutputOverflow(GitHubReadError):
+    """Explicit successful-read capacity evidence; never inferred from bad JSON."""
 
 
 class _TimedOutRead(subprocess.CompletedProcess[str]):
@@ -52,7 +57,9 @@ def run_read_command(
     before_attempt: Callable[[], None] | None = None,
     runner_identity: Mapping[str, Any] | None = None,
     cancelled: Callable[[], bool] | None = None,
+    complete_stdout: bool = False,
 ) -> subprocess.CompletedProcess[str]:
+    """Retry reads; structured consumers explicitly require complete stdout."""
     last: subprocess.CompletedProcess[str] | None = None
     cancellation: dict[str, Any] = {"cancelled": cancelled} if cancelled is not None else {}
     for attempt in range(MAX_READ_ATTEMPTS):
@@ -63,6 +70,7 @@ def run_read_command(
                 arguments,
                 cwd=cwd,
                 timeout=READ_TIMEOUT_SECONDS,
+                complete_stdout=complete_stdout,
                 **runner_options(runner_identity),
                 **cancellation,
             )
@@ -115,10 +123,11 @@ def _text(value: bytes | str | None) -> str:
 
 
 def _run_bounded_command(
-    arguments: list[str], *, cwd: Path | None, timeout: int,
+    arguments: list[str], *, cwd: Path | None, timeout: float,
     runner_identity: Mapping[str, Any] | None = None,
     before_start: Callable[[], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
+    complete_stdout: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     from agent_run.adapters.auth.runner_transport import (
         runner_environment, runner_git_environment,
@@ -138,8 +147,10 @@ def _run_bounded_command(
         env=environment,
     )
     cancellation: dict[str, Any] = {"cancelled": cancelled} if cancelled is not None else {}
+    output = CompleteOutput(MAX_COMMAND_OUTPUT_BYTES) if complete_stdout else None
     result = capture_command(
         process, timeout=timeout, max_output=MAX_COMMAND_OUTPUT_BYTES,
+        stdout=output,
         **cancellation,
     )
     stdout = redact_transport_output(result.stdout.decode("utf-8", errors="replace"), environment)
@@ -150,6 +161,20 @@ def _run_bounded_command(
         raise subprocess.TimeoutExpired(
             arguments, timeout, output=stdout, stderr=stderr
         )
+    if output is not None:
+        if cancelled is not None and cancelled():
+            raise InterruptedError("GitHub read cancelled")
+        if result.returncode == 0:
+            try:
+                raw = output.finish(require_eof=True)
+                decoded = raw.decode("utf-8")
+            except CompleteOutputOverflow as error:
+                raise ReadOutputOverflow("github_invalid_response",
+                    "GitHub read stdout exceeded its complete output limit") from error
+            except ValueError as error:
+                raise GitHubReadError("github_invalid_response",
+                    "GitHub read stdout is oversized or not valid UTF-8; complete result unavailable") from error
+            stdout = redact_transport_output(decoded, environment)
     return subprocess.CompletedProcess(
         arguments,
         result.returncode,
