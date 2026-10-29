@@ -25,6 +25,43 @@ def test_disabled_notification_substitute_preserves_required_storage_keyword(tmp
     assert not selected.path.exists()
 
 
+def test_busy_host_uses_supervision_without_requesting_an_unused_work_choice(tmp_path, monkeypatch):
+    entered, released, supervised = threading.Event(), threading.Event(), []
+
+    class Runner:
+        def activate_observation(self):
+            pass
+        def state(self):
+            assert not entered.is_set() or released.is_set(), 'Busy Host requested an unused work choice'
+            return OperationState(1, (), (), time.monotonic() + 0.01,
+                                  'quiescent' if released.is_set() else 'ready')
+        def supervise(self):
+            assert entered.wait(5)
+            supervised.append(True)
+            released.set()
+            return SimpleNamespace(cancel=(), wake_at=None)
+        def run_once(self, **options):
+            entered.set()
+            assert released.wait(5), 'Host never read fresh busy supervision'
+            return Step('progress', '')
+
+    class Core:
+        storage = SimpleNamespace(path=tmp_path / 'unopened.sqlite3')
+        clock = staticmethod(time.monotonic)
+        @contextmanager
+        def executor_scope(self, execution):
+            try:
+                yield lambda error: released.set()
+            finally:
+                released.set()
+
+    monkeypatch.setattr(executor, 'OperationRunner', lambda *args: Runner())
+    monkeypatch.setattr('agent_run.notifications.sender.NativeNotifications', _NoNotifications)
+    assert executor.run(Core(), Execution('controlled-host', 'owner', 1), {}) == 0
+    assert entered.is_set() and supervised == [True]
+    assert not any(t.name.startswith('agent-run-io') and t.is_alive() for t in threading.enumerate())
+
+
 @pytest.mark.parametrize("settled", [True, False])
 def test_host_dispatches_call_then_polls_independent_io_and_requires_durable_exit(tmp_path, monkeypatch, settled):
     execution = Execution("host-unit", "owner", 1)
@@ -61,6 +98,9 @@ def test_host_dispatches_call_then_polls_independent_io_and_requires_durable_exi
                                   (call.lease_id,) if read_done.is_set() else (), None,
                                   "quiescent" if read_done.is_set() else "ready",
                                   (preparation.reservation_id,) if not entered.is_set() and not finished else ())
+        def supervise(self):
+            current = self.state()
+            return SimpleNamespace(cancel=current.cancel, wake_at=current.wake_at)
         def authorize_agent(self, selected):
             assert selected == call
             assert threading.current_thread().name.startswith("agent-run_")

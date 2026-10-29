@@ -61,10 +61,12 @@ def comment_request(document, endpoint, method, body, *, repository, actor, slur
             result = None
         elif method == 'PATCH' and status and set(body) == {'body'}:
             result['body'] = body['body']
-            document.setdefault('status_writes', []).append({'method': 'PATCH', 'id': identifier, 'body': body['body']})
         else:
             raise SystemExit('unexpected Status comment object')
         stamp = service_time(document)
+        if method == 'PATCH':
+            document.setdefault('status_writes', []).append({'method': 'PATCH', 'id': identifier,
+                                                             'body': body['body'], 'updated_at': stamp})
     else:
         if document.get('issue_read_error') and method == 'GET':
             print('HTTP 403 Issue unavailable', file=sys.stderr)
@@ -89,7 +91,8 @@ def comment_request(document, endpoint, method, body, *, repository, actor, slur
                   'body': body['body'], 'user': {'login': actor}, 'issue_url': url, 'created_at': stamp}
         document['comments'].append(result)
         if status:
-            document.setdefault('status_writes', []).append({'method': 'POST', 'id': result['id'], 'body': result['body']})
+            document.setdefault('status_writes', []).append({'method': 'POST', 'id': result['id'],
+                                                             'body': result['body'], 'updated_at': stamp})
     if 'operation_clock' in document:
         resource['updated_at'] = stamp
     _mirror(document, issue_prefix)

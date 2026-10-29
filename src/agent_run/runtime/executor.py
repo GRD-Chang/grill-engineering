@@ -127,8 +127,10 @@ def run(kernel: Kernel, execution: Execution, environment: Mapping[str, str]) ->
                         if failure is not None:
                             print(bounded_error(str(failure)), file=sys.stderr)
                         del workers[lease]
-                    state = runner.state()
-                    for lease in state.cancel:
+                    if operation is None:
+                        state = runner.state()
+                    supervision = state if operation is None else runner.supervise()
+                    for lease in supervision.cancel:
                         active = workers.get(lease)
                         if active is not None:
                             active[2].set()
@@ -137,11 +139,11 @@ def run(kernel: Kernel, execution: Execution, environment: Mapping[str, str]) ->
                         drain_notifications = True
                         return 0
                     now = kernel.clock()
-                    ready = (state.disposition == "ready" or state.disposition == "waiting"
+                    ready = operation is None and (state.disposition == "ready" or state.disposition == "waiting"
                              and state.wake_at is not None and state.wake_at <= now)
-                    if operation is None and ready:
+                    if ready:
                         operation = io.submit(runner.run_once, agent_capacity=max(0, state.concurrency-len(workers)))
-                    delay = 1.0 if state.wake_at is None else min(1.0, max(0.01, state.wake_at-now))
+                    delay = 1.0 if supervision.wake_at is None else min(1.0, max(0.01, supervision.wake_at-now))
                     # The heterogeneous collection is used only for readiness;
                     # results are consumed through their typed handles above.
                     pending: list[Future[Any]] = [future for _, future, _ in workers.values()]

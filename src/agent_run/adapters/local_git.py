@@ -67,9 +67,18 @@ class LocalEffects:
         if (not checkout.is_dir() or len(registered) != 1 or "detached" not in registered[0]
                 or any(field.startswith(("locked", "prunable")) for field in registered[0])):
             raise KernelError("foreign_local_checkout")
-        own_common = self.git.run("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=checkout).stdout.strip()
-        top = self.git.run("rev-parse", "--show-toplevel", cwd=checkout).stdout.strip()
-        head = self.git.run("rev-parse", "--verify", "HEAD", cwd=checkout).stdout.strip()
+        if any("\n" in str(path) or "\r" in str(path) for path in (common, checkout)):
+            # rev-parse's path output has no NUL mode. Keep separate reads for
+            # valid paths containing line separators instead of guessing rows.
+            own_common = self.git.run("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=checkout).stdout.strip()
+            top = self.git.run("rev-parse", "--show-toplevel", cwd=checkout).stdout.strip()
+            head = self.git.run("rev-parse", "--verify", "HEAD", cwd=checkout).stdout.strip()
+        else:
+            metadata = self.git.run("rev-parse", "--path-format=absolute", "--git-common-dir",
+                                    "--show-toplevel", "--verify", "HEAD", cwd=checkout).stdout.split("\n")
+            if len(metadata) != 4 or metadata[-1] != "":
+                raise KernelError("foreign_local_checkout")
+            own_common, top, head = (value.strip() for value in metadata[:3])
         symbolic = self.git.run("symbolic-ref", "-q", "HEAD", cwd=checkout, check=False)
         if (Path(own_common).resolve() != common or Path(top).resolve() != checkout
                 or f"HEAD {head}" not in registered[0] or symbolic.returncode != 1):

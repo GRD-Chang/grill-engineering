@@ -43,7 +43,7 @@ from agent_run.core.attempt_continuation import (AttemptContinuationBasis, Conti
 from agent_run.contracts.policy_values import checkpoint_policy
 from agent_run.contracts.policy import AGENT_PREPARATION_SECONDS
 from agent_run.storage.tasks import task_lock, run_is_current
-from agent_run.core.operation_contract import (OperationBinding, OperationState, ReadUnavailable, ReadFence,
+from agent_run.core.operation_contract import (OperationBinding, OperationState, OperationSupervision, ReadUnavailable, ReadFence,
                                  RequirementsRead, LocalCleanupRead, LocalCleanupObservation, DeliveryObservation, DeliveryRead, DeliveryFacts,
                                  _SentRead, _ApprovalRead, _ObservationPass, Work, PrepareIO, EffectIO, ObserveIO, IORequest, IOResult,
                                  requested_ancestry)
@@ -729,6 +729,15 @@ class Kernel:
     def operation_state(self, observation: _ObservationPass | None = None) -> OperationState:
         return self._operation_state(observation)
 
+    def operation_supervision(self) -> OperationSupervision:
+        """Observe every current subject without choosing unused future work."""
+        with self.storage.transaction(write=False) as tx:
+            observed_at = self.clock()
+            snapshot = _OperationSnapshot(self, tx, tx.one(*run_statement(tx,
+                'SELECT * FROM runs WHERE id=?', (), run_last=True)))
+            active, preparations, wake_at, _ = self._operation_supervision_facts(tx, snapshot, observed_at)
+            return self._operation_supervision_in(tx, snapshot, active, preparations, wake_at)
+
     def next_work(self, execution: Execution, *, agent_capacity: int = 1,
                   observation: _ObservationPass | None = None) -> Step | IORequest:
         if observation is not None and observation.execution != execution:
@@ -956,11 +965,36 @@ class Kernel:
             'SELECT * FROM runs WHERE id=?', (), run_last=True)))
         snapshot.require(tx)
         run = snapshot.run
+        active, preparations, wake_at, lifetime_wait = self._operation_supervision_facts(tx, snapshot, observed_at)
+        ready = self._operation_choice(tx, run, observation=observation, snapshot=snapshot) is not None
+        abandoned = snapshot.abandoned
+        complete = (abandoned is not None and abandoned["status"] == "complete" or
+            not tx.rows(*run_statement(tx, "SELECT id FROM subjects WHERE phase!='complete' AND run_id=? LIMIT 1",
+                    (), run_last=True))
+            and not tx.rows(*run_statement(tx, "SELECT id FROM final_target f WHERE id NOT IN (SELECT id FROM subjects s WHERE s.kind='final_run' AND s.run_id=f.run_id) AND f.run_id=?",
+                        (), run_last=True))
+            and not tx.rows(*run_statement(tx, "SELECT subject FROM resource_cleanup WHERE state!='complete' AND run_id=? LIMIT 1",
+                        (), run_last=True))
+            and not tx.rows(*run_statement(tx, "SELECT id FROM effects WHERE status IN ('prepared','sent','observed') AND operation!='issue_link' AND run_id=? LIMIT 1",
+                        (), run_last=True)))
+        # Selection may cross a deadline: preserve its prior wake, but cancel
+        # current Worker/Preparation seats using the clock after selection.
+        supervision = self._operation_supervision_in(tx, snapshot, active, preparations, wake_at)
+        waiting = bool(supervision.active or supervision.preparing or lifetime_wait or supervision.wake_at is not None)
+        disposition: Literal["ready", "waiting", "quiescent", "complete"] = "ready" if ready else "waiting" if waiting else "complete" if complete else "quiescent"
+        return OperationState(supervision.concurrency, supervision.active, supervision.cancel,
+                              supervision.wake_at, disposition, supervision.preparing)
+
+    def _operation_supervision_facts(self, tx: Transaction, snapshot: _OperationSnapshot,
+                                     observed_at: float) -> tuple[list[sqlite3.Row], list[AgentPreparation], float | None, bool]:
+        """Scan current supervision before selection; never cache time decisions."""
+        snapshot.require(tx)
+        run = snapshot.run
         active = tx.all(*run_statement(tx, 'SELECT l.*,i.deadline_at FROM leases l JOIN invocations i ON i.run_id=l.run_id AND i.id=l.invocation WHERE l.run_id=?',
                      (), run_last=True))
-        preparations = [(row, self._preparation(tx, row)[0]) for row in tx.all(*run_statement(tx, "SELECT * FROM waits WHERE kind='agent_preparation' AND run_id=?",
+        preparations = [self._preparation(tx, row)[0] for row in tx.all(*run_statement(tx, "SELECT * FROM waits WHERE kind='agent_preparation' AND run_id=?",
                                                                             (), run_last=True))]
-        deadlines = [float(row["deadline_at"]) for row in active] + [p.preparation_deadline for _, p in preparations]
+        deadlines = [float(row["deadline_at"]) for row in active] + [p.preparation_deadline for p in preparations]
         for row in tx.all(*run_statement(tx, 'SELECT w.*,m.body FROM waits w JOIN material m ON m.run_id=w.run_id AND m.id=w.scope_id WHERE w.run_id=?',
                        (), run_last=True)):
             read = None if row['subject'] is None else snapshot.subject(row['subject'])
@@ -975,24 +1009,20 @@ class Kernel:
             lifetime_wait |= waiting is not None and waiting.reason in {"agent_running", "previous_invocation_exit"}
             if waiting is not None and waiting.retry_at is not None and self._subject_wait(tx, run, job, read=read) == waiting:
                 deadlines.append(waiting.retry_at)
-        ready = self._operation_choice(tx, run, observation=observation, snapshot=snapshot) is not None
+        return active, preparations, min((t for t in deadlines if t > observed_at), default=None), lifetime_wait
+
+    def _operation_supervision_in(self, tx: Transaction, snapshot: _OperationSnapshot,
+                                  active: list[sqlite3.Row], preparations: list[AgentPreparation],
+                                  wake_at: float | None) -> OperationSupervision:
+        """Finish the same snapshot with fresh cancellation after any selection."""
+        snapshot.require(tx)
+        run = snapshot.run
         abandoned = snapshot.abandoned
-        complete = (abandoned is not None and abandoned["status"] == "complete" or
-            not tx.rows(*run_statement(tx, "SELECT id FROM subjects WHERE phase!='complete' AND run_id=? LIMIT 1",
-                    (), run_last=True))
-            and not tx.rows(*run_statement(tx, "SELECT id FROM final_target f WHERE id NOT IN (SELECT id FROM subjects s WHERE s.kind='final_run' AND s.run_id=f.run_id) AND f.run_id=?",
-                        (), run_last=True))
-            and not tx.rows(*run_statement(tx, "SELECT subject FROM resource_cleanup WHERE state!='complete' AND run_id=? LIMIT 1",
-                        (), run_last=True))
-            and not tx.rows(*run_statement(tx, "SELECT id FROM effects WHERE status IN ('prepared','sent','observed') AND operation!='issue_link' AND run_id=? LIMIT 1",
-                        (), run_last=True)))
-        disposition: Literal["ready", "waiting", "quiescent", "complete"] = "ready" if ready else "waiting" if active or preparations or lifetime_wait or any(t > observed_at for t in deadlines) else "complete" if complete else "quiescent"
         cancel = tuple(row["id"] for row in active if run["stopped"] or run["blocked"] or abandoned is not None or snapshot.subject(row["subject"]).gates or self.clock() >= row["deadline_at"])
-        cancel += tuple(p.reservation_id for _, p in preparations if run["stopped"] or run["blocked"] or abandoned is not None
+        cancel += tuple(p.reservation_id for p in preparations if run["stopped"] or run["blocked"] or abandoned is not None
                         or snapshot.subject(p.subject).gates or self.clock() >= p.preparation_deadline)
-        return OperationState(run["concurrency"], tuple(row["id"] for row in active), cancel,
-                              min((t for t in deadlines if t > observed_at), default=None), disposition,
-                              tuple(p.reservation_id for _, p in preparations))
+        return OperationSupervision(run["concurrency"], tuple(row["id"] for row in active), cancel,
+                                    wake_at, tuple(p.reservation_id for p in preparations))
 
     @classmethod
     def create_task(cls, path: Path, spec: RunSpec, *, requirements: Requirements) -> Kernel:

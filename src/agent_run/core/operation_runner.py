@@ -20,7 +20,7 @@ import json
 
 from agent_run.model import AgentCall, AgentPreparation, Effect, EffectResult, Execution, ReadWait, Step, World
 from agent_run.errors import KernelError
-from agent_run.core.operation_contract import (OperationBinding, OperationPorts, OperationState, ReadUnavailable,
+from agent_run.core.operation_contract import (OperationBinding, OperationPorts, OperationState, OperationSupervision, ReadUnavailable,
                                  ReadFence, RequirementsRead, DeliveryRead, DeliveryFacts,
                                  LocalCleanupRead,
                                  LocalCleanupObservation,
@@ -85,6 +85,9 @@ class OperationRunner:
 
     def state(self) -> OperationState:
         return self.kernel.operation_state(self._observation)
+
+    def supervise(self) -> OperationSupervision:
+        return self.kernel.operation_supervision()
 
     def observe(self, subject: str | None) -> World:
         return self._observe(subject)[0]

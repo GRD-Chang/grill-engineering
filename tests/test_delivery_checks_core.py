@@ -134,6 +134,189 @@ def _hold_development(scenario, monkeypatch):
     return captured[0]
 
 
+@pytest.mark.parametrize('after_selection', [-0.0005, 0.0, 0.0005])
+def test_state_keeps_capacity_retry_when_selection_crosses_recovery_ready(decision_scenario, monkeypatch, after_selection):
+    s, db = decision_scenario
+    kernel, now = s.kernel, [100.0]
+    kernel.clock = lambda: now[0]
+    call = _hold_development(s, monkeypatch)
+    kernel.bind_thread(call, 'capacity-retained-thread')
+    assert kernel.dispatch_agent(call)
+    process = dict(pid=23, start_token='capacity-process', pgid=23, host_pid=11, host_start_token='host-start')
+    kernel.agent_started(call, process)
+    kernel.agent_source_ready(call)
+    kernel.agent_exited(call, process, 1, failure_kind='capacity')
+    with kernel.storage.transaction(write=False) as tx:
+        retry_at = tx.one('SELECT recovery_ready_at FROM invocation_outputs WHERE run_id=?', (s.execution.run_id,))[0]
+    assert retry_at == 130.0 and not db.execute('SELECT * FROM waits').fetchall()
+    now[0] = retry_at - 0.001
+    choose, choices = kernel._operation_choice, []
+
+    def crossed(*args, **options):
+        selected = choose(*args, **options)
+        choices.append(selected)
+        now[0] = retry_at + after_selection
+        return selected
+
+    before = tuple(db.iterdump())
+    with monkeypatch.context() as boundary:
+        boundary.setattr(kernel, '_operation_choice', crossed)
+        state = kernel.operation_state()
+    assert choices == [None] and tuple(db.iterdump()) == before
+    assert state.disposition == 'waiting' and state.wake_at == retry_at, state
+    now[0] = retry_at
+    assert kernel.operation_state().disposition == 'ready'
+
+
+def test_busy_supervision_reads_the_same_facts_without_work_selection(decision_scenario, tmp_path, monkeypatch):
+    from collections import Counter
+    from time import perf_counter_ns, thread_time_ns
+    from agent_run.core import kernel as core
+    from agent_run.storage.run_scope import RunTransaction
+    from support.control_scenarios import admit_scenario
+
+    s, db = decision_scenario
+    admit_scenario(s, tmp_path)  # Explicit managed witness; not OS Host proof.
+    call = _hold_development(s, monkeypatch)
+    runner = s.runner()
+    runner.activate_observation()
+    counts, metrics = Counter(), {'state': [], 'supervise': []}
+    selected = [None]
+    choose, load, get = s.kernel._operation_choice, core.load_continuation, RunTransaction.get
+
+    def counted(name, method):
+        def invoke(*args, **options):
+            counts[(selected[0], name)] += 1
+            return method(*args, **options)
+        return invoke
+
+    monkeypatch.setattr(s.kernel, '_operation_choice', counted('choice', choose))
+    monkeypatch.setattr(core, 'load_continuation', counted('continuation', load))
+    monkeypatch.setattr(RunTransaction, 'get', counted('material', get))
+    before = tuple(db.iterdump())
+    for pair in range(7):
+        values = {}
+        for kind in (('state', 'supervise') if pair % 2 == 0 else ('supervise', 'state')):
+            selected[0], sql = kind, []
+            db.set_trace_callback(sql.append)
+            cpu, wall = thread_time_ns(), perf_counter_ns()
+            try:
+                values[kind] = getattr(runner, kind)()
+            finally:
+                cpu, wall = thread_time_ns() - cpu, perf_counter_ns() - wall
+                db.set_trace_callback(None)
+            metrics[kind].append({'sql': len(sql), 'cpu_ns': cpu, 'wall_ns': wall})
+        a, b = values['state'], values['supervise']
+        assert (a.concurrency, a.active, a.cancel, a.wake_at, a.preparing) == (
+            b.concurrency, b.active, b.cancel, b.wake_at, b.preparing)
+        assert b.active == (call.lease_id,) and not hasattr(b, 'disposition')
+    assert tuple(db.iterdump()) == before
+    assert counts['state', 'choice'] == 7 and counts['supervise', 'choice'] == 0
+    assert counts['state', 'continuation'] == counts['supervise', 'continuation'] == 7
+    assert sum(r['sql'] for r in metrics['supervise']) < sum(r['sql'] for r in metrics['state'])
+    print('paired busy supervision', metrics, 'calls', dict(counts))
+
+
+@pytest.mark.parametrize('seat', ['worker', 'preparation'])
+def test_busy_supervision_keeps_sibling_cancellation_and_exact_deadlines(decision_scenario, tmp_path, monkeypatch, seat):
+    from agent_run.model import Policy
+    from support.core_operations import CoreOperations
+    from support.offline import GraphScenario
+    from support.requirements_scenarios import independent_source
+
+    s = GraphScenario(tmp_path / 'siblings', independent_source(), policy=Policy(concurrency=2))
+    now = [100.0]
+    s.kernel.clock = lambda: now[0]
+    operations = CoreOperations(s.kernel, s.execution, s.make_ports, prepare_agents=seat == 'worker')
+    held = []
+    for _ in range(32):
+        step = operations.once(agent_capacity=2 - len(held))
+        value = step.call if seat == 'worker' else step.preparation
+        if value is not None:
+            held.append(value)
+            now[0] += 1.0
+        if len(held) == 2:
+            break
+    assert len(held) == 2 and held[0].subject != held[1].subject
+    deadline = lambda c: c.deadline_at if seat == 'worker' else c.preparation_deadline
+    identity = lambda c: c.lease_id if seat == 'worker' else c.reservation_id
+    first, second = sorted(held, key=deadline)
+    now[0] = deadline(first) - 0.001
+    choose = s.kernel._operation_choice
+
+    def crossed(*args, **options):
+        selected = choose(*args, **options)
+        now[0] = deadline(first)
+        return selected
+
+    with monkeypatch.context() as boundary:
+        boundary.setattr(s.kernel, '_operation_choice', crossed)
+        state = operations.runner.state()
+    assert state.cancel == (identity(first),)
+    assert state.wake_at == deadline(first)
+    now[0] = deadline(first)
+    supervision = operations.runner.supervise()
+    assert supervision.cancel == (identity(first),)
+    assert supervision.wake_at == deadline(second)
+    assert set(supervision.active if seat == 'worker' else supervision.preparing) == {identity(c) for c in held}
+    budget = {c.subject: s.kernel.status(c.subject)['budgets'] for c in held}
+    s.kernel.control('stop', 'stop-siblings')
+    stopped = operations.runner.supervise()
+    assert set(stopped.cancel) == {identity(c) for c in held}
+    assert set(stopped.active if seat == 'worker' else stopped.preparing) == {identity(c) for c in held}
+    assert {c.subject: s.kernel.status(c.subject)['budgets'] for c in held} == budget
+
+
+@pytest.mark.parametrize('kind', ['state', 'supervise'])
+@pytest.mark.parametrize('failure', ['budget', 'poison'])
+def test_supervision_keeps_transaction_budget_and_poison(decision_scenario, monkeypatch, kind, failure):
+    from agent_run.storage.sqlite import QUERY_LIMIT
+
+    s, db = decision_scenario
+    transaction = s.kernel.storage.transaction
+    before = tuple(db.iterdump())
+
+    @contextmanager
+    def exhausted(**options):
+        assert options.get('write') is False
+        with transaction(**options) as tx:
+            if failure == 'budget':
+                tx.bytes_read = QUERY_LIMIT
+            else:
+                with pytest.raises(sqlite3.DatabaseError):
+                    tx.execute('SELECT * FROM intentionally_missing_supervision_relation')
+                assert tx.failed
+            yield tx
+
+    monkeypatch.setattr(s.kernel.storage, 'transaction', exhausted)
+    with pytest.raises(KernelError, match='query_limit' if failure == 'budget' else 'transaction_aborted'):
+        getattr(s.runner(), kind)()
+    assert tuple(db.iterdump()) == before
+
+
+def test_supervision_reloads_epoch_without_granting_old_runner_permission(decision_scenario, monkeypatch):
+    s, db = decision_scenario
+    runner, owners = s.runner(), []
+    supervise = s.kernel._operation_supervision_in
+
+    def observed(tx, snapshot, *facts):
+        owners.append((snapshot.run['executor'], snapshot.run['epoch']))
+        return supervise(tx, snapshot, *facts)
+
+    monkeypatch.setattr(s.kernel, '_operation_supervision_in', observed)
+    runner.supervise()
+    assert owners[-1] == (s.execution.owner, s.execution.epoch)
+    s.kernel.control('stop', 'stop-original-owner')
+    s.kernel.confirm_executor_exit(s.execution)
+    s.kernel.control('resume', 'resume-original-run')
+    successor = s.kernel.claim_executor('successor-owner')
+    runner.supervise()
+    assert owners[-1] == (successor.owner, successor.epoch) and successor.epoch > s.execution.epoch
+    rejected = runner.run_once(agent_capacity=0)
+    assert rejected.kind == 'paused' and rejected.reason == 'executor_fenced'
+    assert not db.execute('SELECT id FROM leases').fetchall()
+
+
 def test_continuation_loader_reads_current_records_once(decision_scenario, monkeypatch):
     from collections import Counter
     from hashlib import sha256
@@ -227,6 +410,11 @@ def test_continuation_loader_does_not_treat_sent_return_as_exit(decision_scenari
     assert facts.prior.exit_code is None and facts.prior.process_identity is None
     assert waiting.reason == 'previous_invocation_exit'
     assert db.execute('SELECT count(*) FROM invocations').fetchone()[0] == 1
+    supervision = s.runner().supervise()
+    state = s.kernel.operation_state()
+    assert state.disposition == 'waiting' and not s.kernel.worker_settled(call)
+    assert (supervision.active, supervision.cancel, supervision.wake_at, supervision.preparing) == (
+        state.active, state.cancel, state.wake_at, state.preparing)
 
 
 def test_healthy_guard_and_identical_source_avoid_empty_saves(decision_scenario, monkeypatch):

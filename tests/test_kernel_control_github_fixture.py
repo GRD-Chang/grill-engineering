@@ -194,7 +194,8 @@ def test_comment_handler_commits_canonical_rows_and_mirrors_without_read_ticks(
     assert changed == {**status, 'body': '<!-- agent-run-status:original -->\nAfter'}
     assert patched['comments'][-1] == changed == patched['comments_by_issue'][str(number)][0]
     assert patched['source_graph'] == before_patch['source_graph']
-    assert patched['status_writes'][-1] == {'method': 'PATCH', 'id': status['id'], 'body': changed['body']}
+    stamp = patched['prs'][0]['updated_at'] if currentness else status['created_at']
+    assert patched['status_writes'][-1] == {'method': 'PATCH', 'id': status['id'], 'body': changed['body'], 'updated_at': stamp}
     if currentness:
         assert patched['operation_clock'] == before_patch['operation_clock'] + 1
         assert patched['prs'][0]['updated_at'] > status['created_at']

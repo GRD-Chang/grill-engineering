@@ -84,6 +84,16 @@ def requested_ancestry(request: DeliveryRead, source: Commit | None) -> tuple[tu
                          for before, after in request.ancestry_pairs}))
 
 @dataclass(frozen=True)
+class OperationSupervision:
+    """Current cancellation and wake facts; never a work or exit decision."""
+    concurrency: int
+    active: tuple[str, ...]
+    cancel: tuple[str, ...]
+    wake_at: float | None
+    preparing: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class OperationState:
     concurrency: int
     active: tuple[str, ...]  # Durable lease identities, never Future completion.

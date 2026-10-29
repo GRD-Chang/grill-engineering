@@ -1,5 +1,6 @@
 """Public Abandon after a real Ticket closes and an unapproved Final PR exists."""
 import json
+import fcntl
 import os
 from pathlib import Path
 import subprocess
@@ -8,7 +9,7 @@ import time
 
 from agent_run.runtime.package_lease import default_runner_lock_path, runner_management_lease
 from agent_run.core.kernel import Kernel
-from support.managed_abandon_transport import install_currentness
+from support.managed_abandon_transport import assert_completed_pr_preserved, install_currentness
 from support.host_close_trace import raise_with_trace
 from support.systemd_manager import (
     _managed_failure_note,
@@ -51,6 +52,20 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
                 return [row for row in (json.loads(line) for line in (tmp_path / "gh-calls.jsonl").read_text().splitlines())
                         if "--method" in row]
 
+            def remote_snapshot():
+                # One read snapshot of the existing fake service and its calls;
+                # hold no Core/notification lock and issue no remote request.
+                with Path(str(state) + '.lock').open('r') as lock:
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        assert remaining > 0, 'Fake service snapshot exceeded the original deadline'
+                        try:
+                            fcntl.flock(lock.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            time.sleep(min(0.01, remaining))
+                    return json.loads(state.read_text()), writes()
+
             try:
                 accepted = public("run", "1", "--no-notifications")
                 assert accepted["result"] == "accepted"
@@ -74,7 +89,7 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
                 assert final is not None and kernel.status(final)["phase"] == "approval"
                 delivery = kernel.delivery(final)
                 run_head = _git(remote, "rev-parse", delivery.source_ref)
-                before = json.loads(state.read_text())
+                before, original_writes = remote_snapshot()
                 assert before["source_graph"]["issues"]["2"]["state"] == "CLOSED"
                 assert len(before["prs"]) == 2
                 ticket_pr = next(pr for pr in before["prs"] if pr["number"] == completions[0]["pr_number"])
@@ -84,7 +99,6 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
                 role_trace = (tmp_path / "roles.jsonl").read_bytes()
                 assert [json.loads(line)["role"] for line in role_trace.splitlines()] == [
                     "development", "review", "publication", "review", "publication"]
-                original_writes = writes()
                 request = kernel.host_request(accepted["action_id"])
                 abandoned = public("abandon", accepted["run_id"])
                 assert abandoned["status"] == "action_pending" and abandoned["host"] == "running", abandoned
@@ -107,10 +121,14 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
                 assert kernel.source_status()["completions"] == completions
                 completed = public("status", accepted["run_id"])
                 assert completed["status"] == "abandoned"
-                document = json.loads(state.read_text())
+                document, current_writes = remote_snapshot()
                 assert document["source_graph"]["issues"]["2"]["state"] == "OPEN"
                 assert document["source_graph"]["parent"].get("state", "OPEN") == "OPEN"
-                assert next(pr for pr in document["prs"] if pr["number"] == ticket_pr["number"]) == ticket_pr
+                from agent_run.queries.status_comment import project_status
+                from agent_run.storage.notification_outbox import read_notifications
+                projection = project_status(kernel.storage.path, 'ticket:2', storage=kernel.storage)
+                journal = read_notifications(kernel.storage.path.parent, accepted['run_id'])
+                assert_completed_pr_preserved(before, document, original_writes, current_writes, projection, journal)
                 retired = next(pr for pr in document["prs"] if pr["number"] == final_pr["number"])
                 assert retired["state"] == "closed" and not retired["merged"]
                 assert _git(remote, "rev-parse", "refs/heads/main") == original_main
@@ -137,6 +155,7 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
                 assert retirement_comments[0]["user"]["login"] == "publisher"
                 assert retirement_comments[0]["body"] == retirement_intent["comment_body"]
                 assert retirement_comments[0]["id"] == retirement_receipt["raw"]["close_intent"]["comment_id"]
+                assert retirement_comments[0]["created_at"] == retirement_receipt["raw"]["close_intent"]["comment_created_at"]
                 marker = "<!-- agent-run-kernel:" + recovered["id"] + " -->"
                 comments = [comment for comment in document["comments_by_issue"]["2"] if marker in comment["body"]]
                 assert len(comments) == 1
@@ -147,8 +166,8 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
                 assert f"PR #{ticket_pr['number']}" in comment["body"] and completions[0]["merge_sha"] in comment["body"]
                 assert "abandon" in comment["body"].lower() and "default branch" in comment["body"].lower()
                 assert receipt["raw"]["comment"]["id"] == comment["id"]
+                assert receipt["raw"]["comment"]["created_at"] == comment["created_at"]
                 assert document["source_graph"]["issues"]["2"]["updated_at"] == comment["created_at"]
-                current_writes = writes()
                 recovery_writes = current_writes[len(original_writes):]
                 reopen = [i for i, row in enumerate(recovery_writes) if row[1] == "repos/example/project/issues/2" and "PATCH" in row]
                 recovery = [i for i, row in enumerate(recovery_writes) if row[1].split("?", 1)[0] == "repos/example/project/issues/2/comments" and "POST" in row]
