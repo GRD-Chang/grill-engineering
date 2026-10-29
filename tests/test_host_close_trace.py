@@ -16,6 +16,7 @@ from support.systemd_manager import _hold_host_operation_return
 
 
 def install(tmp_path, monkeypatch, *, run=None, close=None):
+    monkeypatch.delenv('ENTRY_HOST_SNAPSHOT_AT', raising=False)
     monkeypatch.setattr(OperationRunner, 'run_once', run or (lambda self, *, agent_capacity=1: Step('complete', 'private-subject')))
     monkeypatch.setattr(NativeNotifications, 'close', close or (lambda self, *args, **kwargs: None))
     path = tmp_path / 'trace.jsonl'
@@ -130,6 +131,7 @@ def test_entry_watchdog_still_closes_once_with_original_arguments(tmp_path, monk
 def test_failure_note_keeps_exit_code_and_never_returns(tmp_path, missing):
     hook = tmp_path / 'host-return-hook'
     hook.mkdir()
+    (hook / 'stack.txt').write_text('  File "/private/runtime/executor.py", line 150 in run\n')
     if not missing:
         (hook / 'close-trace.jsonl').write_text('x' * 10000)
     original = AssertionError('original deadline failure')
@@ -138,6 +140,7 @@ def test_failure_note_keeps_exit_code_and_never_returns(tmp_path, missing):
     assert caught.value is original
     facts = json.loads(original.__notes__[-1].partition(': ')[2])
     assert facts['child_poll'] == [0]
+    assert facts['stack'] == {'frames': ['executor.py:150 in run'], 'truncated': False}
     assert (facts.get('trace_unavailable') == 'FileNotFoundError') if missing else len(facts['trace']) == 4096
 
 
@@ -178,3 +181,60 @@ def test_existing_hook_keeps_official_module_argv_and_other_processes_untouched(
     runpy.run_path(str(tmp_path / 'host-return-hook' / 'sitecustomize.py'))
     assert sys.orig_argv == argv
     assert captured == ([tmp_path / 'host-return-hook' / 'close-trace.jsonl'] if host else [])
+
+
+@pytest.mark.parametrize('at,delay', [('108.0', 7.5), ('99.0', 0.001)])
+def test_snapshot_is_one_non_exiting_dump_from_original_absolute_time(tmp_path, monkeypatch, at, delay):
+    monkeypatch.setattr(host_close_trace.time, 'monotonic', lambda: 100.5)
+    calls = []
+    monkeypatch.setattr(host_close_trace.faulthandler, 'dump_traceback_later',
+        lambda *args, **kwargs: calls.append((args, kwargs)))
+    path = tmp_path / 'stack.txt'
+    fd = host_close_trace.arm_snapshot(path, at)
+    try:
+        assert calls == [((delay,), dict(repeat=False, file=fd, exit=False))]
+        assert not os.get_inheritable(fd)
+        assert path.stat().st_mode & 0o777 == 0o600
+    finally:
+        os.close(fd)  # No real timer was installed in this parameter test.
+
+
+@pytest.mark.parametrize('at', [None, 'bad', 'nan', 'inf'])
+def test_missing_or_invalid_snapshot_time_does_not_arm(tmp_path, monkeypatch, at):
+    monkeypatch.setattr(host_close_trace.faulthandler, 'dump_traceback_later',
+        lambda *args, **kwargs: pytest.fail('invalid observation time armed a timer'))
+    assert host_close_trace.arm_snapshot(tmp_path / 'stack.txt', at) == -1
+    assert not (tmp_path / 'stack.txt').exists()
+
+
+def test_snapshot_arm_watchdog_is_same_object_and_descriptor_is_not_reused(tmp_path, monkeypatch):
+    watchdog, descriptors = TimeoutError('original watchdog'), []
+    def fail(*args, **kwargs):
+        descriptors.append(kwargs['file'])
+        raise watchdog
+    monkeypatch.setattr(host_close_trace.faulthandler, 'dump_traceback_later', fail)
+    try:
+        with pytest.raises(TimeoutError) as caught:
+            host_close_trace.arm_snapshot(tmp_path / 'stack.txt', '108.0')
+        assert caught.value is watchdog
+        assert not os.get_inheritable(descriptors[0])
+    finally:
+        for fd in descriptors:
+            os.close(fd)  # The fake armer cannot still own a C watchdog.
+
+
+def test_snapshot_reports_real_c_frame_format_without_paths_or_arbitrary_text(tmp_path):
+    path = tmp_path / 'stack.txt'
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        host_close_trace.faulthandler.dump_traceback(file=fd, all_threads=False)
+    finally:
+        os.close(fd)
+    facts = host_close_trace.snapshot_frames(path)
+    assert any('test_snapshot_reports_real_c_frame_format' in row for row in facts['frames'])
+    assert all('/' not in row and '0x' not in row for row in facts['frames'])
+    path.write_text('Thread 0x123 (most recent call first):\n'
+        '  File "/private/token/remote.py", line 87 in _read\n'
+        'Source body and PRIVATE_TOKEN=value\n' + 'z' * 40000)
+    assert host_close_trace.snapshot_frames(path) == {
+        'frames': ['Thread', 'remote.py:87 in _read'], 'truncated': True}
