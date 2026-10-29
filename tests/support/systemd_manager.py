@@ -80,7 +80,7 @@ def _git(root: Path, *arguments: str) -> str:
                           capture_output=True, timeout=10).stdout.strip()
 
 
-def _executable(path: Path, program: str) -> None:
+def _executable(path: Path, program: str, *, no_site: bool = False) -> None:
     if path.name == 'codex':
         # Preserve the synthetic program and its original exception/exit. The
         # owned trace survives production capture cleanup; never dump env/argv.
@@ -112,7 +112,7 @@ def _fixture_exception_hook(kind, value, trace):
     _original_exception_hook(kind, value, trace)
 _trace_sys.excepthook = _fixture_exception_hook
 ''' + program
-    path.write_text("#!" + sys.executable + "\n" + program)
+    path.write_text("#!" + sys.executable + (" -S" if no_site else "") + "\n" + program)
     path.chmod(0o700)
 
 
@@ -602,7 +602,9 @@ if os.environ.get('ENTRY_APPROVAL_CONTROL') and sys.argv[1:3] == ['api', 'graphq
         d['events'].append(observed);events.append(observed);result={'state':body['state']}
     else:result={'number':number,'node_id':f'issue-node-{number}','state':resource.get('state','OPEN').lower()}
 ''' + gh[issue_end:]
-    _executable(binary / "gh", clone + gh)
+    # This synthetic service imports only stdlib and its explicit support path.
+    # Keep real CLI processes, without loading the Host's site hooks/packages.
+    _executable(binary / "gh", clone + gh, no_site=True)
     _executable(binary / "codex", codex)
     for name, value in {"PATH": str(binary) + os.pathsep + os.environ["PATH"], "REMOTE_TEST_STATE": str(state),
                         "REMOTE_TEST_CALLS": str(calls), "REMOTE_TEST_BARE": str(remote), "ENTRY_ROLE_TRACE": str(roles),

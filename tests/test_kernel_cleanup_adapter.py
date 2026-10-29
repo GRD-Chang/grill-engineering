@@ -182,6 +182,21 @@ def test_worktree_cleanup_is_exact_and_idempotent(git_repo: Path, tmp_path: Path
     assert cleanup_worktree(git, effect).disposition == "target"
 
 
+def test_worktree_cleanup_authorizes_before_locks_and_at_command_start(git_repo: Path, tmp_path: Path) -> None:
+    git = LocalGit(git_repo)
+    checkout, effect = _checkout(git, tmp_path)
+    locks = []
+
+    def authorized():
+        locks.append((checkout / '.git').is_file() and any(
+            path.name == 'HEAD.lock' for path in (git_repo / '.git' / 'worktrees').glob('*/HEAD.lock')))
+
+    git.authorize = authorized
+    assert cleanup_worktree(git, effect).disposition == 'target'
+    assert locks == [False, True]
+    assert not checkout.exists()
+
+
 @pytest.mark.parametrize("foreign", ["owned_root", "common_git_dir", "head", "dirty", "symbolic_branch"])
 def test_worktree_cleanup_preserves_foreign_or_changed_resources(
     git_repo: Path, tmp_path: Path, foreign: str,

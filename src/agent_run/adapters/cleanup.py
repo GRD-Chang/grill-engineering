@@ -349,7 +349,8 @@ def cleanup_worktree(git: LocalGit, effect: Effect) -> EffectResult:
                 return verified
             if "head" in observed.raw and verified.raw.get("head") != expected:
                 return _result("third", "worktree_identity_changed")
-            _authority(git)
+            # LocalGit admits the actual remove after command preparation.
+            # Keep that fresh guard and the separate admission before locks.
             discard = effect.operation == "abandon_worktree" and effect.payload.get("discard_worktree") is True
             options = ("--force",) if effect.operation == "validation_cleanup" or discard else ()
             git.run("worktree", "remove", *options, str(checkout), check=False)

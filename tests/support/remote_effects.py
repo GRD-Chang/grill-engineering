@@ -163,10 +163,12 @@ endpoint=args[1].split('?',1)[0]
 method=args[args.index('--method')+1] if '--method' in args else 'GET'
 body=json.loads(read_text(args[args.index('--input')+1])) if '--input' in args else {}
 status_operation=False
+save_state=True
 if d.get('read_error') and method=='GET':
     print('HTTP 403 forbidden',file=sys.stderr);raise SystemExit(1)
-if endpoint=='user': result={'login':d.get('actor','publisher')}
+if endpoint=='user': result={'login':d.get('actor','publisher')};save_state=method!='GET'
 elif endpoint=='graphql' and method=='GET':
+    save_state=False
     fields=dict(value.split('=',1) for index,value in enumerate(args) if index and args[index-1] in ('-F','-f'))
     if 'CurrentRequiredChecks' in fields.get('query',''):
         print(json.dumps(current_checks(d, fields)));raise SystemExit(0)
@@ -191,13 +193,25 @@ elif endpoint.startswith('repos/example/project/git/ref/heads/'):
     if sha is None:
         print('HTTP 404 ref absent',file=sys.stderr);raise SystemExit(1)
     result={'ref':ref,'object':{'type':'commit','sha':sha}}
+    save_state=method!='GET'
 elif endpoint=='repos/example/project/rulesets': result=[[]]
 elif '/protection/required_status_checks' in endpoint: result={'contexts':[],'checks':[]}
 elif '/git/commits/' in endpoint:
     import subprocess
     sha=endpoint.rsplit('/',1)[1]
     raw=subprocess.run(['git','--git-dir',os.environ['REMOTE_TEST_BARE'],'cat-file','commit',sha],capture_output=True,check=True).stdout.decode('utf-8')
-    result={'sha':sha,'tree':{'sha':git('show','-s','--format=%T',sha)},'parents':[{'sha':x} for x in git('show','-s','--format=%P',sha).split()],'message':raw.partition('\n\n')[2]}
+    headers,separator,message=raw.partition('\n\n')
+    lines=headers.split('\n')
+    tree=lines[0][5:] if lines[0].startswith('tree ') else ''
+    parents=[]
+    for line in lines[1:]:
+        if not line.startswith('parent '):break
+        parents.append(line[7:])
+    if (not separator or any(len(value) not in (40,64) or
+            any(char not in '0123456789abcdef' for char in value) for value in [tree,*parents])):
+        raise SystemExit('invalid commit object')
+    result={'sha':sha,'tree':{'sha':tree},'parents':[{'sha':x} for x in parents],'message':message}
+    save_state=method!='GET'
 elif '/compare/' in endpoint:
     import subprocess
     a,b=endpoint.rsplit('/',1)[1].split('...')
@@ -253,7 +267,8 @@ elif endpoint.startswith('repos/example/project/issues/'):
     else:result={'number':2,'node_id':'issue-node-2','state':d['issue_state']}
 else:raise SystemExit('unexpected endpoint '+endpoint)
 if method!='GET' and not status_operation and d.get('read_error_after_write'):d['read_error']=True
-write_text(state,json.dumps(d))
+if save_state:
+    write_text(state,json.dumps(d))
 print(json.dumps(result))
 if method!='GET' and not status_operation and d.get('lose_operation')==('issue_link' if endpoint=='graphql' else 'merge' if endpoint.endswith('/merge') else 'comment' if endpoint.endswith('/comments') else 'close' if '/issues/' in endpoint else 'pr'):
     print('response lost after actual mutation',file=sys.stderr);raise SystemExit(1)

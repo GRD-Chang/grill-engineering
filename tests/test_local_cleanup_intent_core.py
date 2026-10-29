@@ -86,7 +86,7 @@ def test_first_local_intents_need_no_source_or_delivery_read(cleanup_scenario, m
     monkeypatch.setattr(s, 'make_ports', ports_for)
     assert s.run(approve=True).kind == 'complete'
     assert preparation_reads == []
-    assert physical_reads == [('cleanup_worktree', 'source')] * 3 + [('cleanup_local_ref', 'source')] * 2
+    assert physical_reads == [('cleanup_worktree', 'source')] * 2 + [('cleanup_local_ref', 'source')] * 2
     rows = db.execute("SELECT * FROM effects WHERE operation IN ('cleanup_worktree','cleanup_local_ref') ORDER BY rowid").fetchall()
     assert [row['operation'] for row in rows] == ['cleanup_worktree', 'cleanup_local_ref']
     closed = db.execute("SELECT * FROM effects WHERE operation='close' AND status='confirmed'").fetchone()
@@ -226,6 +226,61 @@ def test_local_ref_race_keeps_marker_cas_and_the_final_resource_guard(pending_lo
     assert s.port.ref_commit(effect.source_ref).sha == replacement
     assert effect_state(s, effect)[:2] == ('sent', 1)
     assert s.kernel.status(effect.subject)['resource_cleanup']['state'] == 'pending'
+
+
+@pytest.mark.parametrize('change', ['stop', 'owner', 'source', 'dirty'])
+def test_worktree_command_preparation_keeps_fresh_core_and_resource_guards(pending_local_cleanup, monkeypatch, change):
+    from agent_run.adapters.git_objects import LocalGit
+    from agent_run.runtime import git_command
+
+    s, db, effect, authority, ports = pending_local_cleanup
+    original_run, probe, popen = LocalGit.run, git_command._require_waitable_children, git_command.subprocess.Popen
+    entered, started = [], []
+
+    def changed_after_probe():
+        probe()  # Preserve the real command capability check.
+        if entered:
+            return
+        entered.append(change)
+        assert effect_state(s, effect)[:2] == ('sent', 1)
+        if change == 'dirty':
+            (Path(s.delivery.checkout) / 'unsaved.txt').write_text('Keep this work')
+        elif change == 'source':
+            source = ports.source
+            def changed(parent):
+                original = source(parent)
+                return replace(original, parent=replace(original.parent, sub_issue_numbers=(2,)),
+                    issues=(Issue(2, 'New ticket', 'New scope', 'OPEN', frozenset({'ready-for-agent'})),))
+            monkeypatch.setattr(ports, 'source', changed)
+        else:
+            s.kernel.control('stop', 'stop-during-remove-preparation')
+            if change == 'owner':
+                s.kernel.confirm_executor_exit(s.execution)
+                s.kernel.control('resume', 'resume-during-remove-preparation')
+                s.kernel.claim_executor('replacement-owner')
+
+    def command(git, *arguments, **options):
+        if arguments[:2] != ('worktree', 'remove'):
+            return original_run(git, *arguments, **options)
+        with monkeypatch.context() as boundary:
+            boundary.setattr(git_command, '_require_waitable_children', changed_after_probe)
+            return original_run(git, *arguments, **options)
+
+    def process(arguments, **options):
+        if 'worktree' in arguments and 'remove' in arguments:
+            started.append(arguments)
+        return popen(arguments, **options)
+
+    monkeypatch.setattr(LocalGit, 'run', command)
+    monkeypatch.setattr(git_command.subprocess, 'Popen', process)
+    with pytest.raises(KernelError):
+        s.port.execute(effect, authority)
+    assert entered == [change] and started == []
+    assert Path(s.delivery.checkout).is_dir()
+    assert s.kernel.status(effect.subject)['resource_cleanup']['state'] == 'pending'
+    assert effect_state(s, effect)[0] != 'confirmed'
+    if change == 'dirty':
+        assert (Path(s.delivery.checkout) / 'unsaved.txt').read_text() == 'Keep this work'
 
 
 @pytest.mark.parametrize('proof', ['close', 'marker'])
