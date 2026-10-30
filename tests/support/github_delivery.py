@@ -34,6 +34,16 @@ def delivery_basis(document, fields, git, *, repository, actor, refresh_head=Non
                 'baseRefName': pr['base']['ref'], 'baseRefOid': pr['base']['sha'],
                 'mergeCommit': None if not pr['merged'] else {'oid': pr['merge_commit_sha']}}
         repo['pullRequest'] = value
+    if 'head' in fields and 'base' in fields:
+        matches = [pr for pr in document['prs'] if pr['head']['ref'] == fields['head']
+                   and pr['base']['ref'] == fields['base']]
+        nodes = []
+        for pr in matches[:100]:
+            head_repo = pr['head'].get('repo')
+            nodes.append({'number': pr['number'], 'headRefName': pr['head']['ref'],
+                'baseRefName': pr['base']['ref'], 'headRepositoryOwner': None if head_repo is None else
+                {'login': head_repo['full_name'].split('/')[0]}})
+        repo['discovery'] = {'nodes': nodes, 'pageInfo': {'hasNextPage': len(matches) > 100}}
     data = {'repository': repo}
     if 'viewer { login }' in fields['query']:
         data['viewer'] = {'login': actor}

@@ -1,5 +1,4 @@
 """Explicit checks demand keeps fresh PR/ref facts and later required reads."""
-from collections import Counter
 from dataclasses import replace
 import json
 
@@ -48,8 +47,13 @@ def test_omitting_checks_saves_only_the_seven_check_reads(published, monkeypatch
     assert complete.checks_requested is True
     assert complete.checks is not None and complete.checks.result == 'none'
     assert complete.pr == pr and complete.pr.state == 'OPEN'
-    assert len(full_calls) == 11
-    assert sum(command[:2] == ['api', 'user'] for command in full_calls) == 1
+    assert len(full_calls) == 8
+    basis = full_calls[0]
+    assert basis[:2] == ['api', 'graphql']
+    assert [arg.split('=', 1)[1] for arg in basis if arg.startswith(('object0=', 'object1='))] == sorted({pr.head.sha, pr.base.sha})
+    assert 'pr=' + str(pr.number) in basis
+    query = next(arg for arg in basis if arg.startswith('query='))
+    assert all(field in query for field in ('DeliveryBasis', 'viewer { login }', 'pullRequest(number:$pr)', 'tree { oid }'))
     assert full_heads == [(pr.head.sha, pr.base.sha)] * 2
 
     heads.clear()
@@ -59,13 +63,8 @@ def test_omitting_checks_saves_only_the_seven_check_reads(published, monkeypatch
     omitted_calls = _calls(calls, start)
     assert omitted == replace(complete, checks=None, checks_requested=False)
     assert heads == full_heads and commands == full_commands
-    assert Counter(tuple(command[:2]) for command in omitted_calls) == {
-        ('api', 'repos/example/project/git/commits/' + pr.head.sha): 1,
-        ('api', 'repos/example/project/git/commits/' + pr.base.sha): 1,
-        ('api', 'repos/example/project/pulls/' + str(pr.number)): 1,
-        ('api', 'user'): 1,
-    }
-    assert len(omitted_calls) == 4
+    assert omitted_calls == [basis]
+    assert len(full_calls) - len(omitted_calls) == 7
     assert not any('--method' in command for command in full_calls + omitted_calls)
 
 
@@ -76,7 +75,8 @@ def test_omitted_checks_outage_does_not_hide_the_next_required_failure(published
     omitted = port.delivery(replace(request, read_checks=False))
     assert omitted.pr == pr and omitted.source == pr.head and omitted.target == pr.base
     assert omitted.checks is None and omitted.checks_requested is False
-    assert len(_calls(calls, start)) == 4
+    observed = _calls(calls, start)
+    assert len(observed) == 1 and any('DeliveryBasis' in arg for arg in observed[0])
 
     start = len(_calls(calls))
     with pytest.raises(ReadUnavailable) as refused:
@@ -140,8 +140,9 @@ def test_omitting_checks_still_rejects_pr_or_remote_ref_drift(published, monkeyp
     if changed == 'remote-ref':
         assert len(reads) == 2
     observed = _calls(calls, start)
-    assert any(command[:2] == ['api', 'repos/example/project/pulls/' + str(pr.number)] for command in observed)
-    assert not any(command[:2] == ['api', 'graphql'] or '--method' in command for command in observed)
+    assert observed[0][:2] == ['api', 'graphql'] and 'pr=' + str(pr.number) in observed[0]
+    assert any('DeliveryBasis' in arg and 'pullRequest(number:$pr)' in arg for arg in observed[0])
+    assert not any('--method' in command or any('CurrentRequiredChecks' in arg for arg in command) for command in observed)
 
 
 @pytest.mark.parametrize('adapter', ['remote', 'offline'])

@@ -654,11 +654,14 @@ class RemoteEffects:
         return read_requirements(reader, parent_number)
 
     def _delivery_basis(self, source_sha: str | None, target_sha: str | None,
-                        pr_number: int | None) -> tuple[dict[str, Commit], dict[str, Any] | None, str | None]:
+                        pr_number: int | None, discovery: tuple[str, str] | None = None,
+                        ) -> tuple[dict[str, Commit], dict[str, Any] | None, str | None]:
         """One fresh bounded projection, never retained beyond this Delivery.
 
-        Capacity alone permits a compact object/actor projection plus the exact
-        original PR endpoint. Both projections share three whole attempts and a
+        PR discovery supplies a number only. Complete ref-name/owner matches
+        share the packet; pagination or an unavailable owner uses the original
+        REST collection. An identified PR is then read afresh. Capacity alone
+        permits compact projection. All work shares three whole attempts and a
         90-second maximum; incomplete packets supply no reusable facts.
         """
         owner, name = self.repository.split('/', 1)
@@ -683,7 +686,7 @@ class RemoteEffects:
             remaining()
             return False
 
-        def packet(arguments: list[str]) -> dict[str, Any]:
+        def packet(arguments: list[str], *, pages: bool = False) -> Any:
             try:
                 response = github_commands._run_bounded_command(arguments, cwd=self.root,
                     timeout=min(github_commands.READ_TIMEOUT_SECONDS, remaining()), complete_stdout=True,
@@ -697,6 +700,13 @@ class RemoteEffects:
                 data = json.loads(response.stdout)
             except (ValueError, RecursionError) as error:
                 raise GitHubReadError('github_invalid_response', 'Delivery basis response is not complete JSON') from error
+            if pages:
+                if not isinstance(data, list) or any(not isinstance(page, list) for page in data):
+                    raise ValueError('Expected paginated PR collection')
+                rows = [row for page in data for row in page]
+                if not all(isinstance(row, dict) for row in rows) or len(json.dumps(rows).encode()) > MATERIAL_LIMIT:
+                    raise ValueError('Invalid or oversized PR collection')
+                return rows
             if not isinstance(data, dict):
                 raise GitHubReadError('github_invalid_response', 'Expected a complete Delivery object')
             return data
@@ -719,6 +729,13 @@ class RemoteEffects:
                         'repository { nameWithOwner } baseRepository { nameWithOwner } headRepository { nameWithOwner } '
                         'headRefName headRefOid baseRefName baseRefOid mergeCommit { oid } }')
                     arguments += ['-F', 'pr=' + str(pr_number)]
+                if discovery is not None and not compact:
+                    declarations += ['$head:String!', '$base:String!']
+                    fields.append('discovery:pullRequests(first:100,headRefName:$head,baseRefName:$base,'
+                        'states:[OPEN,CLOSED,MERGED]) { nodes { number headRefName baseRefName '
+                        'headRepositoryOwner { login } } pageInfo { hasNextPage } }')
+                    arguments += ['-f', 'head=' + discovery[0].removeprefix('refs/heads/'),
+                                  '-f', 'base=' + discovery[1].removeprefix('refs/heads/')]
                 query = ('query DeliveryBasis(' + ','.join(declarations) + ') { '
                     + ('viewer { login } ' if host else '')
                     + 'repository(owner:$owner,name:$name) { ' + ' '.join(fields) + ' } }')
@@ -747,11 +764,38 @@ class RemoteEffects:
                     if data['viewer'] is None:
                         raise GitHubReadError('github_read_failed', 'Delivery viewer is unavailable')
                     actor = _text(data['viewer']['login'])
+                number = pr_number
+                if discovery is not None:
+                    rest = compact
+                    matches = []
+                    if not compact:
+                        connection = repository['discovery']
+                        nodes, more = connection['nodes'], connection['pageInfo']['hasNextPage']
+                        if not isinstance(nodes, list) or len(nodes) > 100 or type(more) is not bool:
+                            raise ValueError('Malformed PR discovery connection')
+                        rest = more
+                        for node in nodes:
+                            candidate = _number(node['number'])
+                            if (_text(node['headRefName']) != discovery[0].removeprefix('refs/heads/')
+                                    or _text(node['baseRefName']) != discovery[1].removeprefix('refs/heads/')):
+                                raise ValueError('Foreign PR discovery refs')
+                            head_owner = node['headRepositoryOwner']
+                            if head_owner is None:
+                                rest = True  # Legal deleted-head identity, not proof of a foreign owner.
+                            elif _text(head_owner['login']).casefold() == owner.casefold():
+                                matches.append(candidate)
+                    if rest:
+                        rows = packet(['gh', 'api', self._pr_discovery_endpoint(*discovery),
+                                       '--paginate', '--slurp'], pages=True)
+                        matches = [_number(row['number']) for row in rows]
+                    if len(matches) > 1:
+                        raise ValueError('ambiguous original PR')
+                    number = matches[0] if matches else None
                 raw_pr = None
-                if pr_number is not None:
-                    if compact:
-                        raw_pr = packet(['gh', 'api', f'repos/{self.repository}/pulls/{pr_number}'])
-                        if (_number(raw_pr['number']) != pr_number or type(raw_pr.get('merged')) is not bool
+                if number is not None:
+                    if compact or discovery is not None:
+                        raw_pr = packet(['gh', 'api', f'repos/{self.repository}/pulls/{number}'])
+                        if (_number(raw_pr['number']) != number or type(raw_pr.get('merged')) is not bool
                                 or raw_pr['state'] not in {'open', 'closed'}):
                             raise ValueError('foreign or invalid Delivery PR')
                         _text(raw_pr['title'])
@@ -775,11 +819,11 @@ class RemoteEffects:
                         if not same_repository(_text(value['repository']['nameWithOwner']), self.repository):
                             raise ValueError('foreign Delivery PR repository')
                         state = _text(value['state'])
-                        if _number(value['number']) != pr_number or state not in {'OPEN', 'CLOSED', 'MERGED'}:
+                        if _number(value['number']) != number or state not in {'OPEN', 'CLOSED', 'MERGED'}:
                             raise ValueError('foreign or invalid Delivery PR')
                         if state == 'MERGED' and value['mergeCommit'] is None:
                             raise GitHubReadError('github_read_failed', 'Delivery merge object is unavailable')
-                        raw_pr = {'number': pr_number, 'title': _text(value['title']), 'body': _string(value['body']),
+                        raw_pr = {'number': number, 'title': _text(value['title']), 'body': _string(value['body']),
                             'state': 'closed' if state == 'MERGED' else state.lower(), 'user': value['author'],
                             'head': {'sha': _sha(value['headRefOid']), 'ref': _text(value['headRefName']),
                                      'repo': None if value['headRepository'] is None else
@@ -791,7 +835,7 @@ class RemoteEffects:
                 remaining()
                 return commits, raw_pr, actor
             except github_commands.ReadOutputOverflow as error:
-                if compact or pr_number is None:
+                if compact or pr_number is None and discovery is None:
                     raise
                 if attempt == github_commands.MAX_READ_ATTEMPTS - 1:
                     raise GitHubReadError('github_read_failed', 'Delivery basis needs an unread compact projection') from error
@@ -816,14 +860,12 @@ class RemoteEffects:
         basis: dict[str, Commit] = {}
         actor = None
         if self.api is None:
-            # Preserve exact REST discovery and ambiguity semantics. Once a
-            # number is known, the batch reads that PR afresh, never adopts a
-            # discovery row as current write authority.
             number = request.pr_number if request.read_pr else None
             if request.read_pr and number is None:
-                discovered = self._find_pr(request.source_ref, request.target_ref, None)
-                number = None if discovered is None else _number(discovered['number'])
-            basis, raw_pr, actor = self._delivery_basis(source_sha, target_sha, number)
+                basis, raw_pr, actor = self._delivery_basis(source_sha, target_sha, None,
+                    (request.source_ref, request.target_ref))
+            else:
+                basis, raw_pr, actor = self._delivery_basis(source_sha, target_sha, number)
         else:
             # PhysicalAPI's existing injected REST interface has no GraphQL port.
             raw_pr = self._find_pr(request.source_ref, request.target_ref, request.pr_number) if request.read_pr else None
@@ -1052,13 +1094,16 @@ class RemoteEffects:
     def _find_pr(self, source_ref: str, target_ref: str, number: int | None) -> dict[str, Any] | None:
         if number is not None:
             return self._api(f"repos/{self.repository}/pulls/{number}")
-        query = urlencode({"state": "all", "head": self.repository.split('/')[0] + ':' +
-                           source_ref.removeprefix("refs/heads/"), "base": target_ref.removeprefix("refs/heads/"),
-                           "per_page": 100})
-        prs = self._pages(f"repos/{self.repository}/pulls?{query}")
+        prs = self._pages(self._pr_discovery_endpoint(source_ref, target_ref))
         if len(prs) > 1:
             raise ValueError("ambiguous original PR")
         return prs[0] if prs else None
+
+    def _pr_discovery_endpoint(self, source_ref: str, target_ref: str) -> str:
+        query = urlencode({"state": "all", "head": self.repository.split('/')[0] + ':' +
+                           source_ref.removeprefix("refs/heads/"), "base": target_ref.removeprefix("refs/heads/"),
+                           "per_page": 100})
+        return f"repos/{self.repository}/pulls?{query}"
 
     def _reconcile_pr(self, effect: Effect) -> EffectResult:
         data = self._find_pr(effect.source_ref, effect.target_ref, effect.pr_number)
