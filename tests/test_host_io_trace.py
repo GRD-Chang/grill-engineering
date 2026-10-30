@@ -185,8 +185,16 @@ def test_sealed_entry_checks_exact_command_before_trace_or_executor(tmp_path, mo
         assert facts['sample_status'] == 'not_due' and facts['measurement_errors'] == 0
 
 
-def test_cli_selects_diagnostic_command_before_public_admission_and_restores_factory(tmp_path, monkeypatch):
+@pytest.mark.parametrize('return_trace', [False, True])
+def test_cli_selects_diagnostic_command_before_public_admission_and_restores_factory(tmp_path, monkeypatch, return_trace):
     from agent_run.cli import main as public
+    from support import host_close_trace
+    installed = []
+    monkeypatch.setattr(host_close_trace, 'install_cli', lambda path: installed.append(path))
+    if return_trace:
+        monkeypatch.setenv('ENTRY_HOST_COST_ROOT', str(tmp_path / 'costs'))
+    else:
+        monkeypatch.delenv('ENTRY_HOST_COST_ROOT', raising=False)
     root, called, now = tmp_path / 'trace', [], time.monotonic() + 60
     original = entry.executor.command
     def admitted(arguments):
@@ -205,6 +213,7 @@ def test_cli_selects_diagnostic_command_before_public_admission_and_restores_fac
                        'resume', '-exact-run', '--foreground']) == 19
     assert called == [['resume', '-exact-run', '--foreground']]
     assert entry.executor.command is original
+    assert installed == ([tmp_path / 'costs' / f'cli-{os.getpid()}.jsonl'] if return_trace else [])
 
 
 @pytest.mark.parametrize('count,diagnostic', [(1, True), (2, True), (4, True), (2, False), (4, False)])

@@ -833,14 +833,18 @@ class NativeNotifications:
 def notify_committed(database: Path, *, timeout_seconds: float = 1.0, storage: Storage) -> None:
     """One finite post-commit opportunity through the existing sender."""
     observer: NativeNotifications | None = None
+    close_returned = False
     options: dict[str, Any] = {"storage": storage}
     try:
         observer = NativeNotifications(database, database.parent, **options)
         observer.close(timeout_seconds=timeout_seconds)
+        close_returned = True
     except Exception:
         print("Notification observation unavailable; business continues", file=sys.stderr)
     finally:
-        if observer is not None and not observer.closed:
+        # A normal close already spent its cleanup allowance and reported any
+        # unproven exit. Only an interrupted close needs the cancellation fallback.
+        if observer is not None and not close_returned and not observer.closed:
             observer.close(drain=False)
 
 

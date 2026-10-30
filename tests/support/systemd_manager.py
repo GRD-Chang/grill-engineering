@@ -713,6 +713,13 @@ if sys.orig_argv[1:3] == ["-m", 'agent_run.runtime.executor']:
                    f"    sys.path.insert(0, {str(Path(__file__).parent.parent)!r})\n"
                    "    from support.host_cost_trace import install_from_environment\n"
                    "    install_from_environment()\n")
+        source += ("\nif (sys.orig_argv[1:3] == ['-m', 'agent_run'] and len(sys.orig_argv) > 3\n"
+                   "        and sys.orig_argv[3] in {'run', 'resume', 'approve'}):\n"
+                   f"    sys.path.insert(0, {str(Path(__file__).parent.parent)!r})\n"
+                   "    import os\n"
+                   "    from pathlib import Path\n"
+                   "    from support.host_close_trace import install_cli\n"
+                   "    install_cli(Path(os.environ['ENTRY_HOST_COST_ROOT']) / ('cli-' + str(os.getpid()) + '.jsonl'))\n")
     (hook / "sitecustomize.py").write_text(source)
     monkeypatch.setenv("PYTHONPATH", str(hook) + os.pathsep + os.environ.get("PYTHONPATH", ""))
 

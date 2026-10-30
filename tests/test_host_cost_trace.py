@@ -403,6 +403,59 @@ def test_reader_prefers_latest_host_and_reports_omissions_and_age(tmp_path):
     assert all(row['snapshot_age_ns'] >= 0 for row in value['hosts'])
 
 
+def test_cli_records_are_bounded_report_omissions_and_precede_slow_failure_reads(tmp_path, monkeypatch):
+    root = tmp_path / 'host-costs'
+    root.mkdir(mode=0o700)
+    for index in range(5):
+        path = root / f'cli-{index}.jsonl'
+        path.write_bytes(b'x' * 9000 if index == 4 else b'{"stage":"cli_return"}\n')
+        path.chmod(0o600)
+        os.utime(path, ns=(index + 1, index + 1))
+    value = costs.read_costs(tmp_path)
+    assert value['hosts'] == [] and value['omitted_cli_returns'] == 1
+    assert [row['file'] for row in value['cli_returns']] == [f'cli-{index}.jsonl' for index in (4, 3, 2, 1)]
+    assert value['cli_returns'][0]['truncated'] and not value['cli_returns'][0]['complete_line']
+    assert len(value['cli_returns'][0]['trace']) == 8192
+    assert all(not row['truncated'] and row['complete_line'] for row in value['cli_returns'][1:])
+    order = []
+    monkeypatch.setenv('ENTRY_HOST_COST_ROOT', str(root))
+    monkeypatch.setattr(costs, 'read_costs', lambda *_: order.append('read') or value)
+    child = SimpleNamespace(pid=123, poll=lambda: order.append('poll') or None)
+    error = TimeoutError('original')
+    costs.note_costs(error, tmp_path, process=child)
+    assert order == ['poll', 'read']
+    assert json.loads(error.__notes__[0].partition(': ')[2])['child_before_diagnostics']['returncode'] is None
+
+
+@pytest.mark.parametrize('command', ['run', 'resume', 'approve', 'status', '--help'])
+def test_cli_return_hook_only_observes_selected_control_commands(tmp_path, monkeypatch, command):
+    from support import host_close_trace
+    _measure_host_calls(tmp_path, monkeypatch)
+    argv = ['python', '-m', 'agent_run', command]
+    monkeypatch.setattr(sys, 'orig_argv', argv[:])
+    monkeypatch.setattr(sys, 'path', sys.path[:])
+    seen = []
+    monkeypatch.setattr(host_close_trace, 'install_cli', lambda path: seen.append(path))
+    runpy.run_path(str(tmp_path / 'host-return-hook' / 'sitecustomize.py'))
+    assert sys.orig_argv == argv
+    assert seen == ([tmp_path / 'host-costs' / f'cli-{os.getpid()}.jsonl']
+                    if command in {'run', 'resume', 'approve'} else [])
+
+
+def test_actual_cli_help_keeps_original_output_with_return_trace(tmp_path, monkeypatch):
+    command = [sys.executable, '-m', 'agent_run', 'resume', '--help']
+    before = subprocess.run(command, capture_output=True, timeout=5)
+    _measure_host_calls(tmp_path, monkeypatch)
+    after = subprocess.run(command, capture_output=True, timeout=5)
+    assert (after.returncode, after.stdout, after.stderr) == (before.returncode, before.stdout, before.stderr)
+    value = costs.read_costs(tmp_path)
+    assert value['hosts'] == []
+    trace, = value['cli_returns']
+    row, = [json.loads(line) for line in trace['trace'].splitlines()]
+    assert row['stage'] == 'cli_return' and row['result'] == 0 and row['pid'] > 0
+    assert not trace['truncated'] and trace['complete_line']
+
+
 def test_oversized_snapshot_replaces_old_data_with_explicit_bounded_marker(trace, tmp_path):
     trace.flush()
     trace.totals['private-invalid-phase-' + 'x' * 20000] = [1, 1, 0, 1, 1]

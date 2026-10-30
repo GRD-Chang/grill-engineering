@@ -278,7 +278,13 @@ def read_costs(directory):
         paths.append(path)
         paths.sort(key=lambda item: int(item.stem), reverse=True)
         del paths[4:]  # At most five names in memory; read only the latest four Hosts.
-    for path in paths:
+    cli_paths, cli_total, cli_rows = [], 0, []
+    for path in root.glob('cli-*.jsonl'):
+        cli_total += 1
+        cli_paths.append((path.stat().st_mtime_ns, path))
+        cli_paths.sort(reverse=True)
+        del cli_paths[4:]
+    for path, cli in [(path, False) for path in paths] + [(path, True) for _, path in cli_paths]:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
         failure = None
         try:
@@ -286,7 +292,13 @@ def read_costs(directory):
             if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid()
                     or info.st_mode & 0o077 or info.st_size > 16384):
                 raise ValueError('Unsafe cost evidence')
-            rows.append(json.loads(os.read(fd, 16385)))
+            if cli:
+                content = os.read(fd, 8193)
+                cli_rows.append({'file': path.name, 'truncated': len(content) > 8192,
+                                 'complete_line': content.endswith(b'\n'),
+                                 'trace': content[:8192].decode('utf-8', errors='replace')})
+            else:
+                rows.append(json.loads(os.read(fd, 16385)))
         except BaseException as error:
             failure = error
             raise
@@ -305,16 +317,21 @@ def read_costs(directory):
         row['snapshot_age_ns'] = read_at - row['snapshot_ns']
     return {'failure_observed_ns': observed, 'snapshot_age_observed_ns': read_at,
             'hosts': rows, 'omitted_hosts': max(0, total - len(paths)),
+            'cli_returns': cli_rows, 'omitted_cli_returns': max(0, cli_total - len(cli_paths)),
             'scope': 'Function-call wall times; inclusive spans overlap, exclusive spans exclude same-thread children; concurrent threads overlap. Active is the last synchronous snapshot. Startup before installation and shutdown after the last flush are unmeasured. Age requires comparable process monotonic clocks; negative age is not comparable.'}
 
 
-def note_costs(error, directory, *, arrivals_ns=()):
+def note_costs(error, directory, *, arrivals_ns=(), process=None):
     # Called at the original failure, before slower DB diagnostics and cleanup.
     try:
         if os.environ.get('ENTRY_HOST_COST_ROOT') != str(directory / 'host-costs'):
             return
+        observed = time.monotonic_ns()
+        child = None if process is None else {'pid': process.pid, 'returncode': process.poll(),
+                                             'observed_ns': observed}
         value = read_costs(directory)
         value['barrier_arrivals_ns'] = list(arrivals_ns)[:2]
+        value['child_before_diagnostics'] = child
         error.add_note('Native Host costs: ' + json.dumps(value, separators=(',', ':')))
     except BaseException:
         pass  # The explicitly supplied original failure remains primary.

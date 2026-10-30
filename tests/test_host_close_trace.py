@@ -11,8 +11,10 @@ from types import SimpleNamespace
 import pytest
 
 from agent_run.core.operation_runner import OperationRunner
+from agent_run.cli import lifecycle, main as cli_main
 from agent_run.model import Step
 from agent_run.notifications.sender import NativeNotifications
+from agent_run.runtime.foreground_host import ForegroundHost
 from support import host_close_trace
 from support.systemd_manager import _hold_host_operation_return
 
@@ -225,13 +227,13 @@ def test_abandon_prefix_note_failure_still_rethrows_original_assertion(tmp_path,
     assert facts['child_poll'] == [0] and facts['trace_unavailable'] == 'FileNotFoundError'
 
 
-@pytest.mark.parametrize('fault', [OSError('trace open'), TimeoutError('original startup watchdog')])
+@pytest.mark.parametrize('fault', [OSError('trace open'), TimeoutError('original startup watchdog'), InterruptedError('startup interrupt')])
 def test_install_io_failure_cannot_hide_startup_watchdog(tmp_path, monkeypatch, fault):
     def fail(*args, **kwargs):
         raise fault
     monkeypatch.setattr(host_close_trace.os, 'open', fail)
-    if isinstance(fault, TimeoutError):
-        with pytest.raises(TimeoutError) as caught:
+    if isinstance(fault, (TimeoutError, InterruptedError)):
+        with pytest.raises(type(fault)) as caught:
             install(tmp_path, monkeypatch)
         assert caught.value is fault
     else:
@@ -252,3 +254,87 @@ def test_existing_hook_keeps_official_module_argv_and_other_processes_untouched(
     runpy.run_path(str(tmp_path / 'host-return-hook' / 'sitecustomize.py'))
     assert sys.orig_argv == argv
     assert captured == ([tmp_path / 'host-return-hook' / 'close-trace.jsonl'] if host else [])
+
+
+def install_cli(tmp_path, monkeypatch, calls, *, fail_at=None, failure=None, result=0):
+    def original(name):
+        def call(*args, **kwargs):
+            calls.append((name, args, kwargs))
+            if name == fail_at:
+                raise failure
+            return result
+        return call
+    monkeypatch.setattr(ForegroundHost, 'launch', original('launch'))
+    monkeypatch.setattr(cli_main, 'main', original('main'))
+    path = tmp_path / 'cli.jsonl'
+    return path, host_close_trace.install_cli(path)
+
+
+@pytest.mark.parametrize('result', [0, 7])
+def test_cli_records_original_calls_identity_and_no_sensitive_arguments(tmp_path, monkeypatch, result):
+    calls, request = [], SimpleNamespace(run_id='run-123', nonce='nonce-456', private='secret-request')
+    notify = lifecycle._notify_committed
+    path, fd = install_cli(tmp_path, monkeypatch, calls, result=result)
+    manager, kernel = object(), object()
+    try:
+        assert not os.get_inheritable(fd)
+        assert lifecycle._notify_committed is notify
+        assert ForegroundHost.launch(manager, kernel, request, lock='secret-lock', lease=kernel) == result
+        assert cli_main.main(['secret-cli'], repository_routes=kernel) == result
+        assert calls[0] == ('launch', (manager, kernel, request), {'lock': 'secret-lock', 'lease': kernel})
+        assert calls[-1] == ('main', (['secret-cli'],), {'repository_routes': kernel})
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        assert [row['stage'] for row in rows] == [
+            'foreground_launch_return', 'cli_return']
+        assert rows[0]['run'] == 'run-123' and rows[0]['nonce'] == 'nonce-456'
+        assert rows[-1]['result'] == result
+        assert all(row['pid'] == os.getpid() and type(row['monotonic_ns']) is int for row in rows)
+        assert [row['monotonic_ns'] for row in rows] == sorted(row['monotonic_ns'] for row in rows)
+        assert 'secret' not in path.read_text() and path.stat().st_size < 8192
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize('where', ['launch', 'main'])
+def test_cli_business_exception_keeps_original_object_with_benign_diagnostic_failure(tmp_path, monkeypatch, where):
+    failure, calls = RuntimeError('secret original failure'), []
+    _, fd = install_cli(tmp_path, monkeypatch, calls, fail_at=where, failure=failure)
+    def diagnostic(*args):
+        raise OSError('diagnostic unavailable')
+    monkeypatch.setattr(host_close_trace.os, 'write', diagnostic)
+    invoke = {
+        'launch': lambda: ForegroundHost.launch(object(), object(), SimpleNamespace(run_id='run', nonce='nonce')),
+        'main': lambda: cli_main.main(['secret']),
+    }[where]
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            invoke()
+        assert caught.value is failure and len(calls) == 1
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize('where,stage', [
+    ('launch', 'foreground_launch_return'),
+    ('main', 'cli_return'),
+])
+@pytest.mark.parametrize('error_type', [TimeoutError, InterruptedError])
+def test_cli_return_diagnostic_control_error_never_retries_original_call(tmp_path, monkeypatch, where, stage, error_type):
+    calls, watchdog = [], error_type('return watchdog')
+    _, fd = install_cli(tmp_path, monkeypatch, calls)
+    write = os.write
+    def diagnostic(descriptor, payload):
+        if json.loads(payload)['stage'] == stage:
+            raise watchdog
+        return write(descriptor, payload)
+    monkeypatch.setattr(host_close_trace.os, 'write', diagnostic)
+    invoke = {
+        'launch': lambda: ForegroundHost.launch(object(), object(), SimpleNamespace(run_id='run', nonce='nonce')),
+        'main': lambda: cli_main.main(['secret']),
+    }[where]
+    try:
+        with pytest.raises(error_type) as caught:
+            invoke()
+        assert caught.value is watchdog and len(calls) == 1
+    finally:
+        os.close(fd)

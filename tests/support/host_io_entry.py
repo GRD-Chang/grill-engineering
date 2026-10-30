@@ -48,6 +48,9 @@ def main(arguments=None):
         cli = arguments[separator + 1:]
         if not cli or cli[0] not in {'resume', 'approve'}:
             raise ValueError('This diagnostic variant only observes original Resume/Approve')
+        if root := os.environ.get('ENTRY_HOST_COST_ROOT'):
+            from support.host_close_trace import install_cli
+            install_cli(Path(root) / ('cli-' + str(os.getpid()) + '.jsonl'))
         from agent_run.cli.main import main as public_main
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(executor, 'command', partial(command, root=parsed.trace_root, sample_at=parsed.sample_at))

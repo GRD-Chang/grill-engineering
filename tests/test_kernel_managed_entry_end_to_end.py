@@ -733,7 +733,7 @@ role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commi
                         'returncode': continued.returncode, 'stdout': stdout, 'stderr': stderr})
                     return subprocess.CompletedProcess(command, continued.returncode, stdout, stderr)
                 except subprocess.TimeoutExpired as error:
-                    note_costs(error, tmp_path)
+                    note_costs(error, tmp_path, process=continued)
                     if diagnostic:
                         from support.host_io_trace import read_traces
                         error.add_note(json.dumps({'host_loss_io_trace': read_traces(trace_root, observations.get('run'))}))
@@ -1627,7 +1627,7 @@ issue = int(re.search(r'https://github.com/example/project/issues/(\\d+)', promp
                 out, err = child.communicate(timeout=remaining())
             except subprocess.TimeoutExpired as error:
                 try:
-                    note_costs(error, tmp_path, arrivals_ns=arrival_times)
+                    note_costs(error, tmp_path, arrivals_ns=arrival_times, process=child)
                     _managed_failure_note(error, stage='local-failure-after-independent-publication-release',
                         database=kernel.storage.path, run_id=before['run_id'], roles=tmp_path / 'roles.jsonl')
                 finally:

@@ -5,30 +5,39 @@ from pathlib import Path
 import time
 
 
-def install(path: Path) -> int:
-    from agent_run.core.operation_runner import OperationRunner
-    from agent_run.notifications.sender import NativeNotifications
-
+def _recorder(path: Path, *, cli=False):
     # One private, non-inheritable descriptor for this test Host's lifetime.
     # The OS closes it on exit; no pipe or transport is retained by this trace.
     try:
         descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
-    except TimeoutError:
+    except (TimeoutError, InterruptedError):
         raise
     except OSError:
         descriptor = -1
     started, seen = time.monotonic(), set()
 
-    def record(stage):
+    def record(stage, **fields):
         if descriptor < 0 or stage in seen:
             return
         seen.add(stage)  # At most one small record per fixed stage, no retry.
         try:
-            os.write(descriptor, (json.dumps({'stage': stage, 'seconds': time.monotonic() - started}) + '\n').encode())
+            row = {'stage': stage, 'seconds': time.monotonic() - started}
+            if cli:
+                row.update(pid=os.getpid(), monotonic_ns=time.monotonic_ns(), **fields)
+            os.write(descriptor, (json.dumps(row) + '\n').encode())
         except BaseException as error:
-            if isinstance(error, OSError) and not isinstance(error, TimeoutError):
+            if isinstance(error, OSError) and not isinstance(error, (TimeoutError, InterruptedError)):
                 return
             raise
+
+    return descriptor, record
+
+
+def install(path: Path) -> int:
+    from agent_run.core.operation_runner import OperationRunner
+    from agent_run.notifications.sender import NativeNotifications
+
+    descriptor, record = _recorder(path)
 
     run_once, close = OperationRunner.run_once, NativeNotifications.close
 
@@ -55,6 +64,30 @@ def install(path: Path) -> int:
 
     OperationRunner.run_once, NativeNotifications.close = observed_run, observed_close
     return descriptor  # Controlled tests close it explicitly; Host owns its process lifetime.
+
+
+def install_cli(path: Path) -> int:
+    """Launch-to-CLI return interval; notification detail remains unobserved."""
+    from agent_run.cli import main as cli_main
+    from agent_run.runtime.foreground_host import ForegroundHost
+
+    descriptor, record = _recorder(path, cli=True)
+    launch = ForegroundHost.launch
+    main = cli_main.main
+
+    def observed_launch(self, kernel, request, *args, **kwargs):
+        result = launch(self, kernel, request, *args, **kwargs)
+        record('foreground_launch_return', run=request.run_id, nonce=request.nonce)
+        return result
+
+    def observed_main(*args, **kwargs):
+        result = main(*args, **kwargs)
+        record('cli_return', result=result if type(result) is int else None)
+        return result
+
+    ForegroundHost.launch = observed_launch
+    cli_main.main = observed_main
+    return descriptor
 
 
 def raise_with_trace(error: BaseException, directory: Path, children) -> None:
