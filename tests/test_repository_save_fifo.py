@@ -7,7 +7,7 @@ from contextlib import closing, contextmanager
 import io
 import json
 import sqlite3
-from threading import Event
+from threading import Event, Thread
 from types import SimpleNamespace
 from threading import get_native_id
 
@@ -217,10 +217,12 @@ def scalar(route, sql, params=()):
 
 def test_normal_selected_owner_one_body_two_commits_and_brother_unchanged(repository, monkeypatch):
     original = storage_module.sqlite3.connect
-    commits = []
+    commits, handles = [], []
     class Recorded(sqlite3.Connection):
         def commit(self):
             commits.append(self.in_transaction and self.execute('PRAGMA query_only').fetchone()[0] == 0)
+            if commits[-1]:
+                handles.append(self)
             return super().commit()
     monkeypatch.setattr(storage_module.sqlite3, 'connect', lambda *a, **kw: original(*a, **kw, factory=Recorded))
     bodies = []
@@ -229,8 +231,106 @@ def test_normal_selected_owner_one_body_two_commits_and_brother_unchanged(reposi
         tx.execute('UPDATE runs SET stopped=1 WHERE id=?', ('A',))
         assert tx.connection.execute('PRAGMA wal_autocheckpoint').fetchone()[0] > 0
     assert bodies == ['A'] and commits.count(True) == 2
+    assert handles[0] is handles[1], 'One confirmed request must not close/reopen WAL between its commits'
+    with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+        handles[0].execute('SELECT 1')
     assert scalar(repository, 'SELECT stopped FROM runs WHERE id=?', ('A',)) == 1
     assert scalar(repository, 'SELECT stopped FROM runs WHERE id=?', ('B',)) == 0
+    assert scalar(repository, 'SELECT count(*) FROM save_admissions') == 0
+
+
+def test_reused_request_handle_carries_no_pre_registration_protocol_permission(repository, monkeypatch):
+    metadata = Storage._save_metadata
+    changed = []
+    def change_after_registration(self, ticket, identity, cancelled, operation, commit=None, **options):
+        handle = metadata(self, ticket, identity, cancelled, operation, commit, **options)
+        if operation == 'register':
+            assert handle is not None and not handle.in_transaction
+            with closing(sqlite3.connect(self.path)) as other:
+                other.execute("UPDATE meta SET protocol='changed-after-registration'")
+                other.commit()
+            changed.append(handle)
+        return handle
+    monkeypatch.setattr(Storage, '_save_metadata', change_after_registration)
+    with pytest.raises(storage_module.UnsupportedState) as caught:
+        with repository.at_run('A').transaction():
+            pytest.fail('Reused handle bypassed fresh protocol admission')
+    assert caught.value.reason == 'unknown_protocol' and len(changed) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match='closed'):
+        changed[0].execute('SELECT 1')
+
+
+def test_confirmed_handle_holds_no_snapshot_or_lock_between_queue_transactions(repository, monkeypatch):
+    # Real concurrent SQLite owners; DecisionClock does not prove native clocks.
+    first_registered, second_registered, release = Event(), Event(), Event()
+    metadata, bodies, errors = Storage._save_metadata, [], []
+    def registered(self, ticket, identity, cancelled, operation, commit=None, **options):
+        handle = metadata(self, ticket, identity, cancelled, operation, commit, **options)
+        if operation == 'register':
+            assert handle is not None and not handle.in_transaction
+            if ticket.run_id == 'A':
+                first_registered.set()
+                assert release.wait(0.7)
+            else:
+                second_registered.set()
+        return handle
+    monkeypatch.setattr(Storage, '_save_metadata', registered)
+    def save(run):
+        try:
+            with repository.at_run(run).transaction() as tx:
+                bodies.append(run)
+                tx.execute('UPDATE runs SET stopped=1 WHERE id=?', (run,))
+        except BaseException as error:
+            errors.append(error)
+    first, second = Thread(target=save, args=('A',)), Thread(target=save, args=('B',))
+    first.start()
+    try:
+        assert first_registered.wait(0.5)
+        second.start()
+        assert second_registered.wait(0.5) and bodies == []
+    finally:
+        release.set()
+        first.join(2)
+        if second.ident is not None:
+            second.join(2)
+    assert not first.is_alive() and not second.is_alive() and errors == []
+    assert bodies == ['A', 'B']
+    assert scalar(repository, 'SELECT count(*) FROM save_admissions') == 0
+
+
+@pytest.mark.parametrize('failure', [None, ValueError('original callback'), TimeoutError('original watchdog')])
+def test_request_handle_close_keeps_confirmed_commit_or_original_body_failure(repository, monkeypatch, capsys, failure):
+    connect = sqlite3.connect
+    closed, bodies = [], []
+    class CloseFailure(sqlite3.Connection):
+        writer = False
+        def execute(self, sql, parameters=()):
+            if sql == 'BEGIN IMMEDIATE':
+                self.writer = True
+            return super().execute(sql, parameters)
+        def close(self):
+            assert self not in closed
+            closed.append(self)
+            super().close()
+            if self.writer:
+                raise OSError('original writer handle close')
+    with monkeypatch.context() as patch:
+        patch.setattr(storage_module.sqlite3, 'connect', lambda *a, **kw: connect(*a, **kw, factory=CloseFailure))
+        def save():
+            with repository.at_run('A').transaction() as tx:
+                bodies.append(tx.run_id)
+                tx.execute('UPDATE runs SET stopped=1 WHERE id=?', ('A',))
+                if failure is not None:
+                    raise failure
+        if failure is None:
+            save()
+            assert 'Storage save cleanup unavailable' in capsys.readouterr().err
+        else:
+            with pytest.raises(type(failure)) as caught:
+                save()
+            assert caught.value is failure
+    assert bodies == ['A']
+    assert scalar(repository, 'SELECT stopped FROM runs WHERE id=?', ('A',)) == (failure is None)
     assert scalar(repository, 'SELECT count(*) FROM save_admissions') == 0
 
 
@@ -279,19 +379,24 @@ def test_only_ended_begin_contention_retries_before_body(repository, monkeypatch
 @pytest.mark.parametrize('after_commit', [False, True])
 def test_registration_commit_unknown_reads_only_original_uuid_and_never_reinserts(repository, monkeypatch, after_commit):
     original = sqlite3.connect
-    fired, inserts, bodies = [], [], []
+    fired, inserts, bodies, closed = [], [], [], []
     class LostReply(sqlite3.Connection):
         def execute(self, sql, parameters=()):
+            if fired and sql.startswith('SELECT position,request,run_id,clock_domain,deadline'):
+                assert self is not fired[0] and fired[0] in closed, 'Unknown handle cannot supply readback facts'
             if sql.startswith('INSERT INTO save_admissions'):
                 inserts.append(parameters[0])
             return super().execute(sql, parameters)
         def commit(self):
             if not fired and self.in_transaction and self.execute('SELECT count(*) FROM save_admissions').fetchone()[0] == 1:
-                fired.append(True)
+                fired.append(self)
                 if after_commit:
                     super().commit()
                 raise OSError('controlled registration COMMIT reply loss')
             return super().commit()
+        def close(self):
+            closed.append(self)
+            return super().close()
     with monkeypatch.context() as patch:
         patch.setattr(storage_module.sqlite3, 'connect', lambda *a, **kw: original(*a, **kw, factory=LostReply))
         if after_commit:
@@ -369,9 +474,9 @@ def test_confirmed_business_commit_does_not_fail_from_expiry_or_cleanup(reposito
             raise OSError('controlled clock close failure after successful commit')
     monkeypatch.setattr(storage_module, 'SaveClock', CloseError)
     metadata = Storage._save_metadata
-    def no_postcommit_discard(self, ticket, identity, cancelled, operation, commit=None):
+    def no_postcommit_discard(self, ticket, identity, cancelled, operation, commit=None, **options):
         assert operation != 'discard', 'Confirmed successful business unexpectedly ran cleanup writer'
-        return metadata(self, ticket, identity, cancelled, operation, commit)
+        return metadata(self, ticket, identity, cancelled, operation, commit, **options)
     monkeypatch.setattr(Storage, '_save_metadata', no_postcommit_discard)
     with monkeypatch.context() as patch:
         with repository.at_run('A').transaction() as tx:

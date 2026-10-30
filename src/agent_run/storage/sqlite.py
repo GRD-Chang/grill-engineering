@@ -7,7 +7,7 @@ rolls back as a whole, including when a nested failure was caught by a caller.
 from __future__ import annotations
 
 
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 import hashlib
 import math
 import mmap
@@ -230,7 +230,8 @@ class Storage:
         remaining(deadline)
 
     def _save_metadata(self, request: RepositorySave, identity: tuple[int, int],
-                       cancelled: Event | None, operation: str, commit: SaveCommit | None = None) -> None:
+                       cancelled: Event | None, operation: str, commit: SaveCommit | None = None,
+                       keep: ExitStack | None = None) -> sqlite3.Connection | None:
         # Never call public transaction recursively or expose this metadata
         # owner to business code. Every retry has ended BEFORE any callback.
         while True:
@@ -238,7 +239,7 @@ class Storage:
             try:
                 with self._transaction(write=True, identity=identity, deadline=request.deadline,
                         cancelled=cancelled, select_run=False, commit=commit, retry_admission=True,
-                        clock=request.clock) as tx:
+                        clock=request.clock, keep=keep) as tx:
                     if operation == 'register':
                         request.register(tx)
                     elif operation == 'reconcile':
@@ -247,7 +248,7 @@ class Storage:
                         request.discard(tx)
                     else:
                         raise ValueError('Unknown save metadata operation')
-                return
+                return tx.connection if keep is not None else None
             except _SaveAdmissionBusy:
                 self._save_pause(request.deadline, cancelled)
 
@@ -264,42 +265,55 @@ class Storage:
         may_be_registered = False
         try:
             request = RepositorySave(clock, self._run_id, deadline)
-            registration = SaveCommit()
-            try:
-                self._save_metadata(request, identity, cancelled, 'register', registration)
-                may_be_registered = True
-            except (OSError, sqlite3.Error, KernelError) as error:
-                may_be_registered = registration.attempted
-                code = getattr(error, 'sqlite_errorcode', None)
-                uncertain_io = (isinstance(error, OSError) and not isinstance(error, InterruptedError)
-                    or isinstance(error, sqlite3.OperationalError) and type(code) is int
-                    and (code & 255) == sqlite3.SQLITE_IOERR)
-                if not registration.attempted or registration.confirmed or not uncertain_io:
-                    raise  # FULL/INTERRUPT/cancel/protocol/capacity retain their original category.
-                # COMMIT began: absence is never rollback. Reconcile only this
-                # original UUID/position/binding; never INSERT it again.
+            # Retain only a confirmed registration's private handle, never its
+            # snapshot or authority. Every BEGIN still verifies the original file,
+            # protocol, queue, clock and deadline. Unknown registration closes its
+            # original handle before exact-UUID readback on a fresh connection.
+            with ExitStack() as connections:
+                connection = None
+                registration = SaveCommit()
                 try:
-                    self._save_metadata(request, identity, cancelled, 'reconcile')
-                except (OSError, sqlite3.Error, KernelError) as unavailable:
-                    failure = KernelError('storage_registration_unknown', 'Original save registration is unproven')
-                    failure.add_note('Registration readback unavailable: ' + type(unavailable).__name__)
-                    raise failure from error
-            while True:
-                try:
-                    with self._transaction(write=True, identity=identity, deadline=deadline,
-                            cancelled=cancelled, request=request, commit=request.commit, retry_admission=True) as tx:
-                        request.body_entered = True
-                        yield tx
-                    return
-                except (_SaveAdmissionBusy, SaveNotHead):
-                    if request.body_entered:
-                        raise  # An application callback is never replayed.
-                    self._save_pause(deadline, cancelled)
-                except (OSError, sqlite3.Error):
-                    if not request.commit.confirmed:
-                        raise
-                    _save_warning()  # Only connection-close I/O remains after acknowledged COMMIT.
-                    return
+                    connection = self._save_metadata(request, identity, cancelled, 'register', registration, keep=connections)
+                    may_be_registered = True
+                except (OSError, sqlite3.Error, KernelError) as error:
+                    may_be_registered = registration.attempted
+                    code = getattr(error, 'sqlite_errorcode', None)
+                    uncertain_io = (isinstance(error, OSError) and not isinstance(error, InterruptedError)
+                        or isinstance(error, sqlite3.OperationalError) and type(code) is int
+                        and (code & 255) == sqlite3.SQLITE_IOERR)
+                    if not registration.attempted or registration.confirmed or not uncertain_io:
+                        raise  # FULL/INTERRUPT/cancel/protocol/capacity retain their original category.
+                    # COMMIT began: absence is never rollback. Reconcile only this
+                    # original UUID/position/binding; never INSERT it again.
+                    try:
+                        self._save_metadata(request, identity, cancelled, 'reconcile')
+                    except (OSError, sqlite3.Error, KernelError) as unavailable:
+                        failure = KernelError('storage_registration_unknown', 'Original save registration is unproven')
+                        failure.add_note('Registration readback unavailable: ' + type(unavailable).__name__)
+                        raise failure from error
+                while True:
+                    try:
+                        with self._transaction(write=True, identity=identity, deadline=deadline,
+                                cancelled=cancelled, request=request, commit=request.commit, retry_admission=True,
+                                connection=connection) as tx:
+                            request.body_entered = True
+                            yield tx
+                        return
+                    except (_SaveAdmissionBusy, SaveNotHead):
+                        if request.body_entered:
+                            raise  # An application callback is never replayed.
+                        self._save_pause(deadline, cancelled)
+                    except (OSError, sqlite3.Error):
+                        if not request.commit.confirmed:
+                            raise
+                        _save_warning()  # Only connection-close I/O remains after acknowledged COMMIT.
+                        return
+        except (OSError, sqlite3.Error) as error:
+            if request is not None and request.commit.confirmed:
+                _save_warning()  # Request handle close after acknowledged COMMIT.
+                return
+            original = error
+            raise
         except BaseException as error:
             original = error
             raise
@@ -329,12 +343,14 @@ class Storage:
     def _transaction(self, *, write: bool, identity: tuple[int, int] | None, deadline: float,
                      cancelled: Event | None, select_run: bool = True, request: RepositorySave | None = None,
                      commit: SaveCommit | None = None, retry_admission: bool = False,
-                     clock: SaveClock | None = None) -> Iterator[Transaction]:
+                     clock: SaveClock | None = None, connection: sqlite3.Connection | None = None,
+                     keep: ExitStack | None = None) -> Iterator[Transaction]:
         if write:
             assert identity is not None
             self._verify_save_database(identity, deadline)
         with ExitStack() as scopes:
-            scope = (_owned_connection(sqlite3.connect(self.path.absolute().as_uri() + "?mode=rw", uri=True,
+            scope = (nullcontext(connection) if connection is not None else
+                     _owned_connection(sqlite3.connect(self.path.absolute().as_uri() + "?mode=rw", uri=True,
                                             isolation_level=None, timeout=remaining(deadline))) if write else read_state(self.path, deadline=deadline))
             connection = scopes.enter_context(scope)
             connection.row_factory = sqlite3.Row
@@ -393,6 +409,8 @@ class Storage:
                 connection.commit()
                 if commit is not None:
                     commit.confirmed = True
+                if keep is not None:
+                    keep.enter_context(scopes.pop_all())
             except BaseException as error:
                 rollback_complete = False
                 try:
