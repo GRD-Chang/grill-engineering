@@ -9,7 +9,6 @@ from agent_run.errors import GitHubReadError
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.model import Step
-from agent_run.adapters.source import read_requirements
 from support.core_operations import CoreOperations
 from support.remote_effects import _change, _fixture, _source_kernel
 
@@ -29,23 +28,22 @@ def source_operations(tmp_path, port, push, monkeypatch):
 
 
 def test_executor_discards_a_source_read_superseded_during_real_external_io(tmp_path, monkeypatch):
-    import agent_run.adapters.remote as external
-
     port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
     operations = source_operations(tmp_path, port, push, monkeypatch)
     kernel, runner = operations.runner.kernel, operations.runner
     before = kernel.source_status()
     reached, release = Event(), Event()
     outcomes, failures = [], []
+    source_observation = port.source_observation
 
-    def delayed(reader, parent):
-        result = read_requirements(reader, parent)
+    def delayed(parent, query):
+        result = source_observation(parent, query)
         if current_thread() is thread:
             reached.set()
             assert release.wait(10), "bounded old read release"
         return result
 
-    monkeypatch.setattr(external, "read_requirements", delayed)
+    monkeypatch.setattr(port, "source_observation", delayed)
 
     def run():
         try:
@@ -74,7 +72,7 @@ def test_executor_discards_a_source_read_superseded_during_real_external_io(tmp_
         assert not tx.rows('SELECT id FROM effects')
     assert current["observed_parent_revision"] != before["observed_parent_revision"]
     assert kernel.source_status() == current
-    monkeypatch.setattr(external, "read_requirements", read_requirements)
+    monkeypatch.setattr(port, "source_observation", source_observation)
     assert runner.observe("parent:1").parent_revision == current["observed_parent_revision"]
     import json
     assert not any("--method" in json.loads(line) for line in calls.read_text().splitlines())
@@ -89,10 +87,11 @@ def test_executor_preserves_unproved_or_upstream_read_errors(tmp_path, monkeypat
     kernel = operations.runner.kernel
     error = GitHubReadError(code, "actual upstream failure") if code == "upstream_unavailable" else KernelError(code)
 
-    def failed(_reader, _parent):
+    def failed(_observation, _parent):
         raise error
 
-    monkeypatch.setattr(external, "read_requirements", failed)
+    # Keep the injected error inside RemoteEffects' original error adapter.
+    monkeypatch.setattr(external._SourceObservation, "read", failed)
     if isinstance(error, GitHubReadError):
         step = operations.once()
         assert step.kind == "waiting" and step.reason == "github_convergence"

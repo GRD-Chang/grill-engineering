@@ -11,6 +11,7 @@ from agent_run.runtime.process_io import CompleteOutput
 
 @pytest.mark.parametrize('mode,failure_kind', [
     ('structured', 'watchdog'), ('structured', 'interrupt'),
+    ('combined', 'watchdog'), ('combined', 'interrupt'),
     ('tail', 'business'), ('write', 'business'),
 ])
 @pytest.mark.parametrize('cleanup', ['wait', 'stdout', 'stderr', 'both-pipes'])
@@ -21,15 +22,53 @@ def test_capture_failure_survives_cleanup_faults_and_closes_both_pipes(monkeypat
     _exercise(monkeypatch, mode, cleanup, original)
 
 
-@pytest.mark.parametrize('mode', ['structured', 'write'])
+@pytest.mark.parametrize('mode', ['structured', 'combined', 'write'])
 @pytest.mark.parametrize('cleanup', ['wait', 'stdout', 'stderr', 'both-pipes'])
 def test_cleanup_failure_cannot_return_read_success_or_write_ack(monkeypatch, mode, cleanup):
     _exercise(monkeypatch, mode, cleanup, None)
 
 
 @pytest.mark.parametrize('control', [TimeoutError('cleanup watchdog'), InterruptedError('cleanup interrupt')])
-def test_cleanup_control_is_not_replaced_by_an_ordinary_cleanup_error(monkeypatch, control):
-    _exercise(monkeypatch, 'structured', 'wait-and-control', None, control=control)
+@pytest.mark.parametrize('mode', ['structured', 'combined'])
+def test_cleanup_control_is_not_replaced_by_an_ordinary_cleanup_error(monkeypatch, control, mode):
+    _exercise(monkeypatch, mode, 'wait-and-control', None, control=control)
+
+
+@pytest.mark.parametrize('boundary', ['start', 'cancel_after_capture'])
+def test_combined_eof_recovery_does_not_replace_start_or_cancellation_failure(monkeypatch, boundary):
+    original = OSError('Cannot start child') if boundary == 'start' else InterruptedError('Read cancelled')
+    popen, capture = subprocess.Popen, github_commands.capture_command
+    children, starts = [], []
+    captured = False
+
+    def process(*args, **options):
+        starts.append(1)
+        if boundary == 'start':
+            raise original
+        child = popen(*args, **options)
+        children.append(child)
+        return child
+
+    def completed(*args, **options):
+        nonlocal captured
+        result = capture(*args, **options)
+        options['stdout'].eof = False
+        captured = True
+        return result
+
+    def cancelled():
+        if captured:
+            raise original
+        return False
+
+    monkeypatch.setattr(github_commands.subprocess, 'Popen', process)
+    monkeypatch.setattr(github_commands, 'capture_command', completed)
+    with pytest.raises(type(original)) as caught:
+        github_commands._run_bounded_command([sys.executable, '-I', '-c', "print('{}',flush=True)"],
+            cwd=None, timeout=30, cancelled=cancelled, complete_stdout=True, complete_nonzero_stdout=True)
+    assert caught.value is original and starts == [1]
+    assert len(children) == (0 if boundary == 'start' else 1)
+    assert all(child.returncode == 0 and child.stdout.closed and child.stderr.closed for child in children)
 
 
 def _exercise(monkeypatch, mode, cleanup, original, *, control=None):
@@ -77,7 +116,7 @@ def _exercise(monkeypatch, mode, cleanup, original, *, control=None):
         if isinstance(stdout, CompleteOutput):
             stdout.eof = True
 
-    if original is not None and mode == 'structured':
+    if original is not None and mode in {'structured', 'combined'}:
         read = process_io.os.read
         def unreadable(fd, count):
             if children and fd == children[0].stdout.fileno():
@@ -93,6 +132,9 @@ def _exercise(monkeypatch, mode, cleanup, original, *, control=None):
         with pytest.raises(type(expected)) as caught:
             if mode == 'write':
                 github_commands.run_write_command(arguments, authorize=lambda: grants.append('authorized'))
+            elif mode == 'combined':
+                github_commands._run_bounded_command(arguments, cwd=None, timeout=30,
+                    complete_stdout=True, complete_nonzero_stdout=True)
             else:
                 github_commands.run_read_command(arguments, complete_stdout=mode == 'structured')
         assert caught.value is expected

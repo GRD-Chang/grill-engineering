@@ -2,15 +2,31 @@
 from copy import deepcopy
 
 
-def delivery_basis(document, fields, git, *, repository, actor, refresh_head=None):
+def delivery_basis(document, fields, git, *, repository, actor, refresh_head=None, read_ref=None):
     repo = {'id': 'repository-' + repository, 'nameWithOwner': repository}
-    for key, sha in fields.items():
-        if not key.startswith('object'):
-            continue
+
+    def commit(sha):
         raw = git('cat-file', 'commit', sha)
         first = raw.split('\n', 1)[0]
         assert first.startswith('tree ')
-        repo[key] = {'__typename': 'Commit', 'oid': sha, 'tree': {'oid': first[5:]}}
+        return {'__typename': 'Commit', 'oid': sha, 'tree': {'oid': first[5:]}}
+
+    for key, sha in fields.items():
+        if not key.startswith('object'):
+            continue
+        repo[key] = commit(sha)
+    resolve_ref = read_ref if read_ref is not None else document.get('refs', {}).get
+    for key in ('sourceRef', 'targetRef'):
+        if key not in fields:
+            continue
+        ref = fields[key]
+        assert ref.startswith('refs/')
+        namespace, separator, name = ref[5:].partition('/')
+        assert namespace and separator and name
+        sha = resolve_ref(ref)
+        repo[key] = None if sha is None else {
+            'name': name, 'prefix': 'refs/' + namespace + '/',
+            'repository': {'nameWithOwner': repository}, 'target': commit(sha)}
     if 'pr' in fields:
         number = int(fields['pr'])
         matches = [pr for pr in document['prs'] if pr['number'] == number]

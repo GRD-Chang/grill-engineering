@@ -179,9 +179,14 @@ elif endpoint=='graphql' and method=='GET':
     fields=dict(value.split('=',1) for index,value in enumerate(args) if index and args[index-1] in ('-F','-f'))
     if 'DeliveryBasis' in fields.get('query',''):
         from support.github_delivery import delivery_basis
+        from functools import partial
+        # Keep the Local fixture's exact refresh_head extension anchor below.
+        delivery_basis=partial(delivery_basis,read_ref=head)
         result=delivery_basis(d,fields,git,repository='example/project',actor=d.get('actor','publisher'))
         if 'pr' in fields:write_text(state,json.dumps(d))
-        print(json.dumps(result));raise SystemExit(0)
+        if 'SourceSnapshotDeliveryBasis' not in fields['query']:
+            print(json.dumps(result));raise SystemExit(0)
+        delivery_data=result['data']
     if 'CurrentRequiredChecks' in fields.get('query',''):
         print(json.dumps(current_checks(d, fields)));raise SystemExit(0)
     graph=d.get('source_graph',{'parent':{'number':1,'title':'Parent','body':d.get('source_body','Whole requirement'),'sub_issues':[]},'issues':{}})
@@ -199,7 +204,10 @@ elif endpoint=='graphql' and method=='GET':
     if fields['number']=='1' and 'SourceSnapshot' in fields['query'] and 'labels(first:100' in fields['query']:
         tickets={number:ticket_projection(ticket) for number,ticket in graph['issues'].items()}
         issue=source_snapshot(issue,tickets)
-    result=source_response(issue)
+    result=source_response(issue, 'example/project')
+    if 'SourceSnapshotDeliveryBasis' in fields['query']:
+        result['data']['delivery']=delivery_data['repository']
+        if 'viewer' in delivery_data:result['data']['viewer']=delivery_data['viewer']
 elif endpoint=='graphql':
     v=body['variables']; assert v['issueId']=='issue-node-2' and head('refs/heads/'+v['name'])==v['oid']
     d.setdefault('links',[]).append({'ref':v['name'],'sha':v['oid']})
@@ -310,7 +318,7 @@ def _reader(root: Path, monkeypatch, *, invalid: bool = False) -> tuple[GhGitHub
                          'base': {'ref': 'main', 'sha': '1' * 40, 'repo': {'full_name': 'example/project'}}},
         'checks': [], 'rulesets': [], 'classic': [],
         'repository': 'example/project', 'default_branch': 'main',
-        'refs': {'refs/heads/main': '1' * 40},
+        'refs': {'refs/heads/main': '1' * 40}, 'objects': {},
         'parent': {'number': 1, 'title': 'Original Parent', 'body': 'Original Parent body\r\n保留原文',
                    'subIssues': None if invalid else page([{'number': 9}], True, 'parent-next')},
         'parent-next': {'number': 1, 'title': 'Original Parent', 'body': 'Original Parent body\r\n保留原文',
@@ -330,6 +338,9 @@ def _reader(root: Path, monkeypatch, *, invalid: bool = False) -> tuple[GhGitHub
     script = binary / 'gh'
     script.write_text('#!' + sys.executable + '\n' + f'import sys\nsys.path.insert(0, {str(Path(__file__).parent.parent)!r})\nfrom support.github_checks import repository_response\n' + CHECK_ROLLUP_FAKE + LATEST_CHECK_FAKE + '''import json, os, sys
 args=sys.argv[1:]
+import fcntl
+server_lock=open(os.environ['SOURCE_TEST_RESPONSES']+'.lock','a+')
+fcntl.flock(server_lock.fileno(),fcntl.LOCK_EX)
 with open(os.environ['SOURCE_TEST_LOG'],'a') as f: f.write(json.dumps(args)+'\\n')
 if args[:2]==['repo','view'] or (args[:1]==['api'] and '/git/ref/heads/' in args[1]):
     with open(os.environ['SOURCE_TEST_RESPONSES']) as f: data=json.load(f)
@@ -362,7 +373,15 @@ elif args[:2]==['api','graphql']:
     result=source_response(issue, control['repository'])
     if fields['number']=='1' and 'SourceSnapshot' in fields['query']:
         result['data']['repository']['nameWithOwner']=control.get('metadata_repository',control['repository'])
-    with open(os.environ['SOURCE_TEST_RESPONSES']) as f: control=json.load(f)
+    if 'SourceSnapshotDeliveryBasis' in fields['query']:
+        from support.github_delivery import delivery_basis
+        def fixture_git(*arguments):
+            assert arguments[:2]==('cat-file','commit')
+            return 'tree '+control['objects'][arguments[2]]
+        delivery_data=delivery_basis({'prs':[control['pull_request']],'refs':control.get('refs',{})},fields,fixture_git,
+            repository=control['repository'],actor=control.get('actor','actual-publisher'))['data']
+        result['data']['delivery']=delivery_data['repository']
+        if 'viewer' in delivery_data:result['data']['viewer']=delivery_data['viewer']
     if 'graphql_errors' in control: result['errors']=control['graphql_errors']
     print(json.dumps(result))
 elif args[:1]==['api'] and '/commits/' in args[1] and args[1].split('?')[0].endswith(('/check-runs','/check-suites','/status')):

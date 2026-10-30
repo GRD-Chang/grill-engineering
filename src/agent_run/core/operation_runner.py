@@ -31,9 +31,12 @@ if TYPE_CHECKING:
 
 
 def _read_observation(kernel: Kernel, ports: OperationPorts, request: RequirementsRead) -> tuple[World, ReadFence]:
-    source = ports.source(request.parent_number)
+    stage = getattr(ports, "source_observation", None)
+    prepared = None if stage is None else stage(request.parent_number, request.query)
+    source = ports.source(request.parent_number) if prepared is None else prepared.source
     delivery = kernel.accept_requirements(request, source)
-    facts = ports.delivery(delivery.query)
+    facts = (ports.delivery(delivery.query) if prepared is None else
+             ports.complete_observation(delivery.query, prepared))
     return kernel.accept_delivery(delivery, facts)
 
 

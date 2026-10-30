@@ -230,6 +230,7 @@ def test_projection_cannot_be_rebound_to_other_effects_or_observation_types(tmp_
     s, effect, authority, ports, execute = pending_cleanup(tmp_path, monkeypatch)
     request = s.kernel.begin_effect_observation(effect)
     assert isinstance(request, LocalCleanupRead)
+    assert request.source.query is None
     source = ports.source(request.source.parent_number)
     observation = s.kernel.accept_local_cleanup_requirements(request, source)
     assert isinstance(observation, LocalCleanupObservation)

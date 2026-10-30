@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from support.remote_effects import FAKE_GH, fake_gh, _fixture, _publish_pr
+from support.remote_effects import FAKE_GH, fake_gh, _fixture, _publish_pr, _reader
 from agent_run.contracts.write_authority import WriteAuthority
 from dataclasses import replace
 
@@ -121,3 +121,95 @@ def test_local_failure_dependency_transform_requires_one_ticket_projection(chang
     source = FAKE_GH.replace(anchor, '') if change == 'missing' else FAKE_GH + anchor
     with pytest.raises(ValueError, match='exactly once'):
         with_ticket_dependencies(source)
+
+
+def _graphql(binary, query, **fields):
+    args = [str(binary), 'api', 'graphql', '-f', 'query=' + query]
+    for key, value in fields.items():
+        args.extend(['-F', f'{key}={value}'])
+    completed = subprocess.run(args, text=True, capture_output=True, timeout=5)
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)['data']
+
+
+@pytest.mark.parametrize('repository,actor', [('example/project', 'publisher'), ('publisher/project', 'bounded-actor')])
+def test_combined_remote_fixture_keeps_both_projections_in_one_cli(tmp_path, monkeypatch, repository, actor):
+    _port, git, _push, state, calls = _fixture(tmp_path, monkeypatch, repository=repository, actor=actor)
+    base = git.commit('main')
+    document = json.loads(state.read_text())
+    document['source_body'] = 'Original requirement\r\n原文'
+    document['prs'] = [{'number': 17, 'state': 'open', 'merged': False, 'merge_commit_sha': None,
+        'title': 'Exact PR', 'body': 'Original narrative\r\n原文', 'user': {'login': actor},
+        'head': {'ref': 'delivery', 'sha': base.sha, 'repo': {'full_name': repository}},
+        'base': {'ref': 'main', 'sha': base.sha, 'repo': {'full_name': repository}}}]
+    state.write_text(json.dumps(document))
+    original = state.read_bytes()
+    binary = tmp_path / 'bin/gh'
+    source_query = 'query SourceSnapshot { repository { issue { number title body subIssues { nodes { labels(first:100) { nodes { name } } } } } } }'
+    delivery_query = 'query DeliveryBasis { repository { pullRequest { number headRefOid } object0 { oid tree { oid } } } viewer { login } }'
+    source = _graphql(binary, source_query, number=1)
+    delivery = _graphql(binary, delivery_query, pr=17, object0=base.sha, head='delivery', base='main',
+        sourceRef='refs/heads/delivery', targetRef='refs/heads/main')
+    before = len(calls.read_text().splitlines())
+    combined = _graphql(binary, source_query[:-1].replace('SourceSnapshot', 'SourceSnapshotDeliveryBasis') +
+        ' delivery:repository { pullRequest { number } } viewer { login } }',
+        number=1, pr=17, object0=base.sha, head='delivery', base='main',
+        sourceRef='refs/heads/delivery', targetRef='refs/heads/main')
+    assert len(calls.read_text().splitlines()) == before + 1
+    assert combined == {'repository': source['repository'], 'delivery': delivery['repository'], 'viewer': delivery['viewer']}
+    assert combined['repository']['nameWithOwner'] == repository
+    assert combined['repository']['issue']['body'] == document['source_body']
+    assert combined['delivery']['object0'] == {'__typename': 'Commit', 'oid': base.sha, 'tree': {'oid': base.tree}}
+    assert combined['delivery']['pullRequest']['body'] == document['prs'][0]['body']
+    assert combined['delivery']['discovery']['nodes'][0]['number'] == 17
+    for key, name in [('sourceRef', 'delivery'), ('targetRef', 'main')]:
+        assert combined['delivery'][key] == {'name': name, 'prefix': 'refs/heads/',
+            'repository': {'nameWithOwner': repository},
+            'target': {'__typename': 'Commit', 'oid': base.sha, 'tree': {'oid': base.tree}}}
+    # The checkout's delivery branch has an unpublished commit; the service
+    # projection must keep reading the remote bare repository's original ref.
+    assert git.commit('delivery').sha != combined['delivery']['sourceRef']['target']['oid']
+    assert combined['viewer'] == {'login': actor}
+    assert state.read_bytes() == original
+
+
+def test_combined_source_reader_fixture_projects_declared_objects_and_original_pr(tmp_path, monkeypatch):
+    _reader(tmp_path, monkeypatch)
+    state = tmp_path / 'responses.json'
+    document = json.loads(state.read_text())
+    document['objects'] = {'1' * 40: 'a' * 40}
+    document['refs']['refs/heads/run/nested'] = '1' * 40
+    state.write_text(json.dumps(document))
+    original = state.read_bytes()
+    result = _graphql(tmp_path / 'bin/gh',
+        'query SourceSnapshotDeliveryBasis { repository { issue { subIssues { nodes { labels(first:100) { nodes { name } } } } } } '
+        'delivery:repository { object0 { oid tree { oid } } pullRequest { number } } viewer { login } }',
+        number=1, pr=17, object0='1' * 40, sourceRef='refs/heads/run/nested', targetRef='refs/heads/missing')
+    assert result['repository']['issue']['body'] == document['parent']['body']
+    assert result['delivery']['object0'] == {'__typename': 'Commit', 'oid': '1' * 40, 'tree': {'oid': 'a' * 40}}
+    assert result['delivery']['pullRequest']['body'] == document['pull_request']['body']
+    assert result['delivery']['pullRequest']['headRepository'] == {'nameWithOwner': 'outside/fork'}
+    assert result['delivery']['sourceRef'] == {'name': 'run/nested', 'prefix': 'refs/heads/',
+        'repository': {'nameWithOwner': 'example/project'},
+        'target': {'__typename': 'Commit', 'oid': '1' * 40, 'tree': {'oid': 'a' * 40}}}
+    assert result['delivery']['targetRef'] is None
+    assert result['viewer'] == {'login': 'actual-publisher'}
+    assert len((tmp_path / 'gh-calls.jsonl').read_text().splitlines()) == 1
+    assert state.read_bytes() == original
+
+
+def test_qualified_remote_refs_do_not_fall_back_to_stale_tracking_refs(tmp_path, monkeypatch):
+    _port, git, _push, state, calls = _fixture(tmp_path, monkeypatch)
+    tracked = git.commit('refs/remotes/origin/delivery')
+    git.run('--git-dir', str(tmp_path / 'origin.git'), 'update-ref', '-d', 'refs/heads/delivery')
+    before = state.read_bytes()
+    result = _graphql(tmp_path / 'bin/gh',
+        'query SourceSnapshotDeliveryBasis { repository { issue { number body } } '
+        'delivery:repository { sourceRef:ref(qualifiedName:$sourceRef) { name } '
+        'targetRef:ref(qualifiedName:$targetRef) { name } } }',
+        number=1, sourceRef='refs/heads/delivery', targetRef='refs/heads/main')
+    assert result['delivery']['sourceRef'] is None
+    assert result['delivery']['targetRef']['target']['oid'] == tracked.sha
+    assert git.commit('refs/remotes/origin/delivery').sha == tracked.sha
+    assert len(calls.read_text().splitlines()) == 1
+    assert state.read_bytes() == before

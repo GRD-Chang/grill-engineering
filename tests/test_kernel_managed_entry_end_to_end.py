@@ -1623,7 +1623,15 @@ issue = int(re.search(r'https://github.com/example/project/issues/(\\d+)', promp
             assert not any(row['pending_attempt'] for name, row in failed_jobs.items() if name == 'ticket:5')
             observations['after_b_failure'] = failed
             channels['ticket-4'][1].sendall(b'1')
-            out, err = child.communicate(timeout=remaining())
+            try:
+                out, err = child.communicate(timeout=remaining())
+            except subprocess.TimeoutExpired as error:
+                try:
+                    note_costs(error, tmp_path, arrivals_ns=arrival_times)
+                    _managed_failure_note(error, stage='local-failure-after-independent-publication-release',
+                        database=kernel.storage.path, run_id=before['run_id'], roles=tmp_path / 'roles.jsonl')
+                finally:
+                    raise error
             assert child.returncode == 0, (out, err)
             accepted = json.loads(out)
             assert accepted['run_id'] == before['run_id'] and accepted['host'] == 'exited'

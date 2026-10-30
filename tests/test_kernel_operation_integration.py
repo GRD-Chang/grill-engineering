@@ -79,16 +79,21 @@ def test_bootstrap_source_outage_keeps_original_call_and_bounded_read_wait(tmp_p
     call = operations.until(lambda step: step.call is not None).call
     assert call is not None and kernel.dispatch_agent(call)
     runner = operations.runner
-    source = port.source
+    source = port.source_observation
     failing = [True]
-    def read_source(parent):
+    def read_source(parent, query):
         if stage == "source":
             _change(state, read_error=failing[0])
-        facts = source(parent)  # Real fake-gh subprocess transport, no fake port exception.
+        # The Delivery case deliberately prepares Source without a prefetch:
+        # its original two-stage real gh outage and durable wait contract then
+        # exercises the supported fallback, even when a combined packet would
+        # otherwise eliminate every later gh read. Combined packet failures
+        # are covered separately by the combined observation tests.
+        facts = source(parent, None if stage == "delivery" else query)
         if stage == "delivery":
             _change(state, read_error=failing[0])
         return facts
-    monkeypatch.setattr(port, "source", read_source)
+    monkeypatch.setattr(port, "source_observation", read_source)
     for instant, expected_retry in ((100.25, 105.25), (110.25, 120.25)):
         now[0] = instant
         if stage == "delivery":

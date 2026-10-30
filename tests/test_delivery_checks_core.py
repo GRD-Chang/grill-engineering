@@ -1170,7 +1170,9 @@ def test_local_preparation_omits_unconsumed_checks_without_reusing_its_permissio
             try:
                 source = kernel.begin_effect_observation(effect)
                 assert source.fence.local_effect == effect
+                assert source.query is not None and source.query.read_checks is False
                 request = kernel.accept_requirements(source, ports.source(source.parent_number))
+                assert request.query == source.query
                 facts = observe(request.query)
                 world, fence = kernel.accept_delivery(request, facts)
                 assert fence.local_effect == effect and world.checks is None and not facts.checks_requested

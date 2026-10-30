@@ -21,7 +21,7 @@ MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
 
 
 class ReadOutputOverflow(GitHubReadError):
-    """Explicit successful-read capacity evidence; never inferred from bad JSON."""
+    """Explicit complete-read capacity evidence; never inferred from bad JSON."""
 
 
 class _TimedOutRead(subprocess.CompletedProcess[str]):
@@ -128,6 +128,7 @@ def _run_bounded_command(
     before_start: Callable[[], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
     complete_stdout: bool = False,
+    complete_nonzero_stdout: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     from agent_run.adapters.auth.runner_transport import (
         runner_environment, runner_git_environment,
@@ -164,7 +165,14 @@ def _run_bounded_command(
     if output is not None:
         if cancelled is not None and cancelled():
             raise InterruptedError("GitHub read cancelled")
-        if result.returncode == 0:
+        # Joint GraphQL reads may consume an independently complete Source
+        # alongside Delivery field errors. Those nonzero responses need the
+        # same original-byte proof; ordinary error diagnostics retain tails.
+        if result.returncode == 0 or complete_nonzero_stdout:
+            # Capture completed normally; a joint packet without EOF cannot
+            # supply Source, but may use its remaining independent attempts.
+            if complete_nonzero_stdout and not output.eof and not output.overflow:
+                raise GitHubReadError("github_read_failed", "Combined response stdout EOF was not observed")
             try:
                 raw = output.finish(require_eof=True)
                 decoded = raw.decode("utf-8")

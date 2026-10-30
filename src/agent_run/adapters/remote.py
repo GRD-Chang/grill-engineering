@@ -6,7 +6,7 @@ This adapter has no local journal, delivery phase or writable Run representation
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import wraps
 import json
@@ -22,7 +22,7 @@ from urllib.parse import urlencode, urlsplit
 from agent_run.contracts.write_authority import WriteAuthority, admit_write
 from agent_run.contracts.status_comment import StatusTarget
 from agent_run.contracts.repository import same_repository
-from agent_run.adapters.github import GhGitHubReader
+from agent_run.adapters.github import GhGitHubReader, _SourceObservation
 from agent_run.adapters import github_commands
 from agent_run.adapters.auth.runner_transport import runner_options
 from agent_run.errors import GitHubReadError
@@ -45,7 +45,7 @@ from agent_run.adapters.source import (read_remote_heads, read_requirements, rea
 from agent_run.storage.sqlite import MATERIAL_LIMIT
 
 if TYPE_CHECKING:
-    from agent_run.core.operation_contract import DeliveryFacts, DeliveryRead
+    from agent_run.core.operation_contract import DeliveryFacts, DeliveryRead, PreparedRequirements
 
 
 class EffectReadError(GitHubReadError):
@@ -92,6 +92,13 @@ class PhysicalGit(Protocol):
     def fetch(self, sha: str) -> None: ...
     def push(self, ref: str, before: str | None, after: str) -> subprocess.CompletedProcess[str]: ...
     def delete(self, ref: str, expected: str) -> subprocess.CompletedProcess[str]: ...
+
+
+@dataclass(frozen=True)
+class _SourceBasis:
+    query: DeliveryRead | None
+    observation: _SourceObservation
+    owner: RemoteEffects
 
 
 class RemoteEffects:
@@ -653,8 +660,233 @@ class RemoteEffects:
                                 cancelled=self.cancelled)
         return read_requirements(reader, parent_number)
 
+    @_operation_errors
+    def source_observation(self, parent_number: int, query: DeliveryRead | None) -> PreparedRequirements:
+        from agent_run.core.operation_contract import PreparedRequirements
+        if type(parent_number) is not int or parent_number < 1:
+            raise ValueError('Parent Issue number must be a positive integer')
+        reader = GhGitHubReader(self.repository, working_directory=self.root, runner_identity=self.identity,
+                                cancelled=self.cancelled)
+        projection = None
+        if query is not None and self.api is None:
+            projection = self._delivery_projection(None, None, query.pr_number if query.read_pr else None,
+                (query.source_ref, query.target_ref) if query.read_pr and query.pr_number is None else None)
+            declarations, fields, _, arguments = projection
+            for key, ref in (('sourceRef', query.source_ref), ('targetRef', query.target_ref)):
+                declarations.append('$' + key + ':String!')
+                fields.append(key + ':ref(qualifiedName:$' + key + ') { name prefix repository { nameWithOwner } '
+                    'target { __typename oid ... on Commit { tree { oid } } } }')
+                arguments += ['-f', key + '=' + ref]
+        observation = _SourceObservation(reader, delivery_projection=projection)
+        return PreparedRequirements(observation.read(parent_number), _SourceBasis(query, observation, self))
+
+    def _projected_refs(self, envelope: Mapping[str, Any], query: DeliveryRead
+                        ) -> tuple[tuple[str | None, str | None], dict[str, Any]] | None:
+        """Validate ref addressing; short-name fallback requests the exact old reader."""
+        if envelope.get('errors'):
+            return None
+        data = envelope['data']
+        repository = data['repository']
+        if repository is None:
+            raise GitHubReadError('github_read_failed', 'Delivery repository is unavailable')
+        if not same_repository(_text(repository['nameWithOwner']), self.repository):
+            raise ValueError('foreign Delivery repository')
+        refs: list[str | None] = []
+        objects: dict[str, Any] = {}
+        for key, expected in (('sourceRef', query.source_ref), ('targetRef', query.target_ref)):
+            ref = repository[key]
+            if ref is None:
+                refs.append(None)
+                continue
+            if not same_repository(_text(ref['repository']['nameWithOwner']), self.repository):
+                raise ValueError('foreign Delivery ref repository')
+            if _text(ref['prefix']) + _text(ref['name']) != expected:
+                return None
+            value = ref['target']
+            if value is None:
+                raise GitHubReadError('github_read_failed', 'Delivery ref target is unavailable')
+            if value['__typename'] != 'Commit':
+                raise ValueError('Delivery ref does not name a commit')
+            sha, tree = _sha(value['oid']), _sha(value['tree']['oid'])
+            if sha in objects and objects[sha]['tree']['oid'] != tree:
+                raise ValueError('Same commit has contradictory trees')
+            objects[sha] = {'__typename': 'Commit', 'oid': sha, 'tree': {'oid': tree}}
+            refs.append(sha)
+        projected = dict(repository)
+        projected.update({'object' + str(index): objects[sha] for index, sha in enumerate(sorted(objects))})
+        return (refs[0], refs[1]), {'data': {**data, 'repository': projected}}
+
+    @_operation_errors
+    def complete_observation(self, query: DeliveryRead, prepared: PreparedRequirements) -> DeliveryFacts:
+        stage = prepared.physical
+        if not isinstance(stage, _SourceBasis) or stage.owner is not self:
+            raise ValueError('Foreign Source observation')
+        from agent_run.core.operation_contract import ReadUnavailable, requested_ancestry
+        if type(query.read_checks) is not bool or not query.read_checks and query.check_head is not None:
+            raise ReadUnavailable("checks_request_invalid", "An exact checks head requires a checks observation")
+        requested_ancestry(query, None)
+        observation = stage.observation
+        if self.api is not None:
+            return self.delivery(query)
+        observation._remaining()
+        projected = None
+        if query == stage.query and observation.delivery_packet is not None:
+            try:
+                projected = self._projected_refs(observation.delivery_packet, query)
+            except (ValueError, KeyError, TypeError) as error:
+                raise GitHubReadError('github_invalid_response', 'Delivery basis facts are malformed') from error
+        # Mismatched demand discards both facts and errors. No failed Source
+        # attempt can retain a packet. This starts a new Delivery attempt.
+        refs = read_remote_heads(self.root, query.source_ref, query.target_ref,
+            runner_identity=self.identity, remote=self.remote, command=observation.command)
+        if projected is not None and refs != projected[0]:
+            raise GitHubReadError('github_observation_pending', 'GraphQL and Git refs changed during observation')
+        basis, raw_pr, actor = self._delivery_basis(*refs, query.pr_number if query.read_pr else None,
+            (query.source_ref, query.target_ref) if query.read_pr and query.pr_number is None else None,
+            deadline=observation.deadline, attempts=int(observation.combined_attempted),
+            initial=None if projected is None else projected[1])
+        return self._finish_delivery(query, refs, basis, raw_pr, actor)
+
+    def _delivery_projection(self, source_sha: str | None, target_sha: str | None,
+                             pr_number: int | None, discovery: tuple[str, str] | None = None,
+                             *, compact: bool = False,
+                             ) -> tuple[list[str], list[str], list[str], list[str]]:
+        """Build the Delivery fields independently of the request that carries them."""
+        owner, name = self.repository.split('/', 1)
+        identities = sorted({_sha(sha) for sha in (source_sha, target_sha) if sha is not None})
+        if pr_number is not None:
+            _number(pr_number)
+        declarations = ['$owner:String!', '$name:String!']
+        fields = ['id nameWithOwner']
+        arguments = ['-f', 'owner=' + owner, '-f', 'name=' + name]
+        for index, sha in enumerate(identities):
+            key = 'object' + str(index)
+            declarations.append('$' + key + ':GitObjectID!')
+            fields.append(key + ':object(oid:$' + key + ') { __typename oid ... on Commit { tree { oid } } }')
+            arguments += ['-f', key + '=' + sha]
+        if pr_number is not None and not compact:
+            declarations.append('$pr:Int!')
+            fields.append('pullRequest(number:$pr) { number title body state author { login } '
+                'repository { nameWithOwner } baseRepository { nameWithOwner } headRepository { nameWithOwner } '
+                'headRefName headRefOid baseRefName baseRefOid mergeCommit { oid } }')
+            arguments += ['-F', 'pr=' + str(pr_number)]
+        if discovery is not None and not compact:
+            declarations += ['$head:String!', '$base:String!']
+            fields.append('discovery:pullRequests(first:100,headRefName:$head,baseRefName:$base,'
+                'states:[OPEN,CLOSED,MERGED]) { nodes { number headRefName baseRefName '
+                'headRepositoryOwner { login } } pageInfo { hasNextPage } }')
+            arguments += ['-f', 'head=' + discovery[0].removeprefix('refs/heads/'),
+                          '-f', 'base=' + discovery[1].removeprefix('refs/heads/')]
+        root_fields = ['viewer { login }'] if self.identity['source'] == 'host' else []
+        return declarations, fields, root_fields, arguments
+
+    def _parse_delivery_basis(self, envelope: Mapping[str, Any],
+                              source_sha: str | None, target_sha: str | None,
+                              pr_number: int | None, discovery: tuple[str, str] | None = None,
+                              *, compact: bool = False, packet: Callable[..., Any],
+                              ) -> tuple[dict[str, Commit], dict[str, Any] | None, str | None]:
+        """Validate a complete basis and finish its exact PR discovery if needed."""
+        owner = self.repository.split('/', 1)[0]
+        identities = sorted({_sha(sha) for sha in (source_sha, target_sha) if sha is not None})
+        host = self.identity['source'] == 'host'
+        errors = envelope.get('errors', [])
+        if not isinstance(errors, list):
+            raise ValueError('invalid GraphQL errors envelope')
+        if errors or 'data' in envelope and envelope['data'] is None:
+            raise GitHubReadError('github_read_failed', 'Delivery basis is incomplete')
+        data = envelope['data']
+        repository = data['repository']
+        if repository is None:
+            raise GitHubReadError('github_read_failed', 'Delivery repository is unavailable')
+        if not _text(repository['id']) or not same_repository(_text(repository['nameWithOwner']), self.repository):
+            raise ValueError('foreign Delivery repository')
+        commits = {}
+        for index, sha in enumerate(identities):
+            value = repository['object' + str(index)]
+            if value is None:
+                raise GitHubReadError('github_read_failed', 'Exact Delivery commit is unavailable')
+            if value['__typename'] != 'Commit' or _sha(value['oid']) != sha:
+                raise ValueError('foreign Delivery commit')
+            commits[sha] = Commit(sha, _sha(value['tree']['oid']))
+        actor = None
+        if host:
+            if data['viewer'] is None:
+                raise GitHubReadError('github_read_failed', 'Delivery viewer is unavailable')
+            actor = _text(data['viewer']['login'])
+        number = pr_number
+        if discovery is not None:
+            rest = compact
+            matches = []
+            if not compact:
+                connection = repository['discovery']
+                nodes, more = connection['nodes'], connection['pageInfo']['hasNextPage']
+                if not isinstance(nodes, list) or len(nodes) > 100 or type(more) is not bool:
+                    raise ValueError('Malformed PR discovery connection')
+                rest = more
+                for node in nodes:
+                    candidate = _number(node['number'])
+                    if (_text(node['headRefName']) != discovery[0].removeprefix('refs/heads/')
+                            or _text(node['baseRefName']) != discovery[1].removeprefix('refs/heads/')):
+                        raise ValueError('Foreign PR discovery refs')
+                    head_owner = node['headRepositoryOwner']
+                    if head_owner is None:
+                        rest = True  # Legal deleted-head identity, not proof of a foreign owner.
+                    elif _text(head_owner['login']).casefold() == owner.casefold():
+                        matches.append(candidate)
+            if rest:
+                rows = packet(['gh', 'api', self._pr_discovery_endpoint(*discovery),
+                               '--paginate', '--slurp'], pages=True)
+                matches = [_number(row['number']) for row in rows]
+            if len(matches) > 1:
+                raise ValueError('ambiguous original PR')
+            number = matches[0] if matches else None
+        raw_pr = None
+        if number is not None:
+            if compact or discovery is not None:
+                raw_pr = packet(['gh', 'api', f'repos/{self.repository}/pulls/{number}'])
+                if (_number(raw_pr['number']) != number or type(raw_pr.get('merged')) is not bool
+                        or raw_pr['state'] not in {'open', 'closed'}):
+                    raise ValueError('foreign or invalid Delivery PR')
+                _text(raw_pr['title'])
+                _string(raw_pr['body'])
+                for side in ('head', 'base'):
+                    _sha(raw_pr[side]['sha'])
+                    _text(raw_pr[side]['ref'])
+                    repo = raw_pr[side].get('repo')
+                    if side == 'base' and repo is None:
+                        raise GitHubReadError('github_read_failed', 'Delivery PR base repository is unavailable')
+                    if repo is not None:
+                        _text(repo['full_name'])
+                if raw_pr['merged'] and raw_pr.get('merge_commit_sha') is None:
+                    raise GitHubReadError('github_read_failed', 'Delivery merge object is unavailable')
+            else:
+                value = repository['pullRequest']
+                if value is None:
+                    raise GitHubReadError('github_read_failed', 'Known Delivery PR is unavailable')
+                if value['baseRepository'] is None:
+                    raise GitHubReadError('github_read_failed', 'Delivery PR base repository is unavailable')
+                if not same_repository(_text(value['repository']['nameWithOwner']), self.repository):
+                    raise ValueError('foreign Delivery PR repository')
+                state = _text(value['state'])
+                if _number(value['number']) != number or state not in {'OPEN', 'CLOSED', 'MERGED'}:
+                    raise ValueError('foreign or invalid Delivery PR')
+                if state == 'MERGED' and value['mergeCommit'] is None:
+                    raise GitHubReadError('github_read_failed', 'Delivery merge object is unavailable')
+                raw_pr = {'number': number, 'title': _text(value['title']), 'body': _string(value['body']),
+                    'state': 'closed' if state == 'MERGED' else state.lower(), 'user': value['author'],
+                    'head': {'sha': _sha(value['headRefOid']), 'ref': _text(value['headRefName']),
+                             'repo': None if value['headRepository'] is None else
+                                     {'full_name': _text(value['headRepository']['nameWithOwner'])}},
+                    'base': {'sha': _sha(value['baseRefOid']), 'ref': _text(value['baseRefName']),
+                             'repo': {'full_name': _text(value['baseRepository']['nameWithOwner'])}},
+                    'merged': state == 'MERGED',
+                    'merge_commit_sha': None if state != 'MERGED' else _sha(value['mergeCommit']['oid'])}
+        return commits, raw_pr, actor
+
     def _delivery_basis(self, source_sha: str | None, target_sha: str | None,
                         pr_number: int | None, discovery: tuple[str, str] | None = None,
+                        *, deadline: float | None = None, attempts: int = 0,
+                        initial: Mapping[str, Any] | None = None,
                         ) -> tuple[dict[str, Commit], dict[str, Any] | None, str | None]:
         """One fresh bounded projection, never retained beyond this Delivery.
 
@@ -664,12 +896,9 @@ class RemoteEffects:
         permits compact projection. All work shares three whole attempts and a
         90-second maximum; incomplete packets supply no reusable facts.
         """
-        owner, name = self.repository.split('/', 1)
-        identities = sorted({_sha(sha) for sha in (source_sha, target_sha) if sha is not None})
-        if pr_number is not None:
-            _number(pr_number)
-        host = self.identity['source'] == 'host'
-        deadline = time.monotonic() + github_commands.MAX_READ_ATTEMPTS * github_commands.READ_TIMEOUT_SECONDS
+        projection = self._delivery_projection(source_sha, target_sha, pr_number, discovery)
+        if deadline is None:
+            deadline = time.monotonic() + github_commands.MAX_READ_ATTEMPTS * github_commands.READ_TIMEOUT_SECONDS
 
         def remaining() -> float:
             if self.cancelled is not None and self.cancelled():
@@ -712,126 +941,19 @@ class RemoteEffects:
             return data
 
         compact = False
-        for attempt in range(github_commands.MAX_READ_ATTEMPTS):
+        if attempts >= github_commands.MAX_READ_ATTEMPTS and initial is None:
+            raise GitHubReadError('github_read_failed', 'Delivery basis observation attempts exhausted')
+        for attempt in range(attempts - int(initial is not None), github_commands.MAX_READ_ATTEMPTS):
             remaining()
             try:
-                declarations = ['$owner:String!', '$name:String!']
-                fields = ['id nameWithOwner']
-                arguments = ['gh', 'api', 'graphql', '-f', 'owner=' + owner, '-f', 'name=' + name]
-                for index, sha in enumerate(identities):
-                    key = 'object' + str(index)
-                    declarations.append('$' + key + ':GitObjectID!')
-                    fields.append(key + ':object(oid:$' + key + ') { __typename oid ... on Commit { tree { oid } } }')
-                    arguments += ['-f', key + '=' + sha]
-                if pr_number is not None and not compact:
-                    declarations.append('$pr:Int!')
-                    fields.append('pullRequest(number:$pr) { number title body state author { login } '
-                        'repository { nameWithOwner } baseRepository { nameWithOwner } headRepository { nameWithOwner } '
-                        'headRefName headRefOid baseRefName baseRefOid mergeCommit { oid } }')
-                    arguments += ['-F', 'pr=' + str(pr_number)]
-                if discovery is not None and not compact:
-                    declarations += ['$head:String!', '$base:String!']
-                    fields.append('discovery:pullRequests(first:100,headRefName:$head,baseRefName:$base,'
-                        'states:[OPEN,CLOSED,MERGED]) { nodes { number headRefName baseRefName '
-                        'headRepositoryOwner { login } } pageInfo { hasNextPage } }')
-                    arguments += ['-f', 'head=' + discovery[0].removeprefix('refs/heads/'),
-                                  '-f', 'base=' + discovery[1].removeprefix('refs/heads/')]
+                declarations, fields, root_fields, arguments = projection
                 query = ('query DeliveryBasis(' + ','.join(declarations) + ') { '
-                    + ('viewer { login } ' if host else '')
+                    + ' '.join(root_fields) + ' '
                     + 'repository(owner:$owner,name:$name) { ' + ' '.join(fields) + ' } }')
-                envelope = packet(arguments + ['-f', 'query=' + query])
-                errors = envelope.get('errors', [])
-                if not isinstance(errors, list):
-                    raise ValueError('invalid GraphQL errors envelope')
-                if errors or 'data' in envelope and envelope['data'] is None:
-                    raise GitHubReadError('github_read_failed', 'Delivery basis is incomplete')
-                data = envelope['data']
-                repository = data['repository']
-                if repository is None:
-                    raise GitHubReadError('github_read_failed', 'Delivery repository is unavailable')
-                if not _text(repository['id']) or not same_repository(_text(repository['nameWithOwner']), self.repository):
-                    raise ValueError('foreign Delivery repository')
-                commits = {}
-                for index, sha in enumerate(identities):
-                    value = repository['object' + str(index)]
-                    if value is None:
-                        raise GitHubReadError('github_read_failed', 'Exact Delivery commit is unavailable')
-                    if value['__typename'] != 'Commit' or _sha(value['oid']) != sha:
-                        raise ValueError('foreign Delivery commit')
-                    commits[sha] = Commit(sha, _sha(value['tree']['oid']))
-                actor = None
-                if host:
-                    if data['viewer'] is None:
-                        raise GitHubReadError('github_read_failed', 'Delivery viewer is unavailable')
-                    actor = _text(data['viewer']['login'])
-                number = pr_number
-                if discovery is not None:
-                    rest = compact
-                    matches = []
-                    if not compact:
-                        connection = repository['discovery']
-                        nodes, more = connection['nodes'], connection['pageInfo']['hasNextPage']
-                        if not isinstance(nodes, list) or len(nodes) > 100 or type(more) is not bool:
-                            raise ValueError('Malformed PR discovery connection')
-                        rest = more
-                        for node in nodes:
-                            candidate = _number(node['number'])
-                            if (_text(node['headRefName']) != discovery[0].removeprefix('refs/heads/')
-                                    or _text(node['baseRefName']) != discovery[1].removeprefix('refs/heads/')):
-                                raise ValueError('Foreign PR discovery refs')
-                            head_owner = node['headRepositoryOwner']
-                            if head_owner is None:
-                                rest = True  # Legal deleted-head identity, not proof of a foreign owner.
-                            elif _text(head_owner['login']).casefold() == owner.casefold():
-                                matches.append(candidate)
-                    if rest:
-                        rows = packet(['gh', 'api', self._pr_discovery_endpoint(*discovery),
-                                       '--paginate', '--slurp'], pages=True)
-                        matches = [_number(row['number']) for row in rows]
-                    if len(matches) > 1:
-                        raise ValueError('ambiguous original PR')
-                    number = matches[0] if matches else None
-                raw_pr = None
-                if number is not None:
-                    if compact or discovery is not None:
-                        raw_pr = packet(['gh', 'api', f'repos/{self.repository}/pulls/{number}'])
-                        if (_number(raw_pr['number']) != number or type(raw_pr.get('merged')) is not bool
-                                or raw_pr['state'] not in {'open', 'closed'}):
-                            raise ValueError('foreign or invalid Delivery PR')
-                        _text(raw_pr['title'])
-                        _string(raw_pr['body'])
-                        for side in ('head', 'base'):
-                            _sha(raw_pr[side]['sha'])
-                            _text(raw_pr[side]['ref'])
-                            repo = raw_pr[side].get('repo')
-                            if side == 'base' and repo is None:
-                                raise GitHubReadError('github_read_failed', 'Delivery PR base repository is unavailable')
-                            if repo is not None:
-                                _text(repo['full_name'])
-                        if raw_pr['merged'] and raw_pr.get('merge_commit_sha') is None:
-                            raise GitHubReadError('github_read_failed', 'Delivery merge object is unavailable')
-                    else:
-                        value = repository['pullRequest']
-                        if value is None:
-                            raise GitHubReadError('github_read_failed', 'Known Delivery PR is unavailable')
-                        if value['baseRepository'] is None:
-                            raise GitHubReadError('github_read_failed', 'Delivery PR base repository is unavailable')
-                        if not same_repository(_text(value['repository']['nameWithOwner']), self.repository):
-                            raise ValueError('foreign Delivery PR repository')
-                        state = _text(value['state'])
-                        if _number(value['number']) != number or state not in {'OPEN', 'CLOSED', 'MERGED'}:
-                            raise ValueError('foreign or invalid Delivery PR')
-                        if state == 'MERGED' and value['mergeCommit'] is None:
-                            raise GitHubReadError('github_read_failed', 'Delivery merge object is unavailable')
-                        raw_pr = {'number': number, 'title': _text(value['title']), 'body': _string(value['body']),
-                            'state': 'closed' if state == 'MERGED' else state.lower(), 'user': value['author'],
-                            'head': {'sha': _sha(value['headRefOid']), 'ref': _text(value['headRefName']),
-                                     'repo': None if value['headRepository'] is None else
-                                             {'full_name': _text(value['headRepository']['nameWithOwner'])}},
-                            'base': {'sha': _sha(value['baseRefOid']), 'ref': _text(value['baseRefName']),
-                                     'repo': {'full_name': _text(value['baseRepository']['nameWithOwner'])}},
-                            'merged': state == 'MERGED',
-                            'merge_commit_sha': None if state != 'MERGED' else _sha(value['mergeCommit']['oid'])}
+                envelope = initial if initial is not None else packet(['gh', 'api', 'graphql', *arguments, '-f', 'query=' + query])
+                initial = None
+                commits, raw_pr, actor = self._parse_delivery_basis(envelope,
+                    source_sha, target_sha, pr_number, discovery, compact=compact, packet=packet)
                 remaining()
                 return commits, raw_pr, actor
             except github_commands.ReadOutputOverflow as error:
@@ -840,6 +962,7 @@ class RemoteEffects:
                 if attempt == github_commands.MAX_READ_ATTEMPTS - 1:
                     raise GitHubReadError('github_read_failed', 'Delivery basis needs an unread compact projection') from error
                 compact = True
+                projection = self._delivery_projection(source_sha, target_sha, pr_number, discovery, compact=True)
             except GitHubReadError as error:
                 if error.code != 'github_read_failed' or attempt == github_commands.MAX_READ_ATTEMPTS - 1:
                     raise
@@ -851,7 +974,7 @@ class RemoteEffects:
     @_operation_errors
     def delivery(self, request: DeliveryRead) -> DeliveryFacts:
         """Read exact Core-supplied refs and immutable ancestry anchors."""
-        from agent_run.core.operation_contract import DeliveryFacts, ReadUnavailable, requested_ancestry
+        from agent_run.core.operation_contract import ReadUnavailable, requested_ancestry
         if type(request.read_checks) is not bool or not request.read_checks and request.check_head is not None:
             raise ReadUnavailable("checks_request_invalid", "An exact checks head requires a checks observation")
         requested_ancestry(request, None)  # Validate literal demand before I/O.
@@ -869,6 +992,14 @@ class RemoteEffects:
         else:
             # PhysicalAPI's existing injected REST interface has no GraphQL port.
             raw_pr = self._find_pr(request.source_ref, request.target_ref, request.pr_number) if request.read_pr else None
+        return self._finish_delivery(request, (source_sha, target_sha), basis, raw_pr, actor)
+
+    def _finish_delivery(self, request: DeliveryRead, refs: tuple[str | None, str | None],
+                         basis: Mapping[str, Commit], raw_pr: Mapping[str, Any] | None,
+                         actor: str | None) -> DeliveryFacts:
+        """Complete exact objects, ancestry, checks and the closing ref boundary."""
+        from agent_run.core.operation_contract import DeliveryFacts, requested_ancestry
+        source_sha, target_sha = refs
         commits: dict[str, Commit] = {}
         reused: set[str] = set()
         def read_commit(sha: str) -> Commit:
@@ -918,10 +1049,11 @@ class RemoteEffects:
                 reader = GhGitHubReader(self.repository, working_directory=self.root, runner_identity=self.identity)
                 checks = normalize_required_checks(read_required_check_facts(
                     reader, pr.number, expected_head_sha=request.check_head or source.sha))
+        actor = self.actor() if actor is None else actor
         if read_remote_heads(self.root, request.source_ref, request.target_ref,
                 runner_identity=self.identity, remote=self.remote) != (source_sha, target_sha):
             raise GitHubReadError("github_observation_pending", "Remote refs changed during delivery observation")
-        return DeliveryFacts(target, source, pr, checks, ancestry, self.actor() if actor is None else actor, dict(self.identity), checked,
+        return DeliveryFacts(target, source, pr, checks, ancestry, actor, dict(self.identity), checked,
                              request.read_checks)
 
     @_operation_errors

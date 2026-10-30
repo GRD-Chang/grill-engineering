@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 import re
 import subprocess
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from agent_run.adapters.github import GhGitHubReader
 from agent_run.errors import GitHubReadError
@@ -35,7 +35,8 @@ def read_requirements(reader: GhGitHubReader, parent_number: int) -> Requirement
 
 
 def read_remote_heads(root: Path, source_ref: str, target_ref: str, *,
-                      runner_identity: Mapping[str, Any], remote: str = "origin") -> tuple[str | None, str | None]:
+                      runner_identity: Mapping[str, Any], remote: str = "origin",
+                      command: Callable[..., subprocess.CompletedProcess[str]] | None = None) -> tuple[str | None, str | None]:
     """Read exact remote refs in one response; never use local tracking refs.
 
     Runner identity must be the explicit frozen reference. A successful empty
@@ -50,7 +51,7 @@ def read_remote_heads(root: Path, source_ref: str, target_ref: str, *,
     for ref in (source_ref, target_ref):
         if not ref.startswith("refs/heads/") or git.run("check-ref-format", ref, check=False).returncode:
             raise ValueError("Expected an exact refs/heads branch identity")
-    response = run_read_command(["git", "ls-remote", "--refs", "--", remote, source_ref, target_ref],
+    response = (command or run_read_command)(["git", "ls-remote", "--refs", "--", remote, source_ref, target_ref],
                                 cwd=root, runner_identity=identity, complete_stdout=True)
     if response.returncode:
         raise GitHubReadError("github_read_failed", response.stderr.strip() or "Remote refs could not be read")

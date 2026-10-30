@@ -14,14 +14,11 @@ from agent_run.errors import KernelError
 from agent_run.core.operation_contract import ReadUnavailable
 from agent_run.runtime.execution import execute
 from agent_run.adapters.remote import RemoteEffects
-from agent_run.adapters.source import read_requirements
 from support.agent_continuation import _allocated_worker, RAW
 
 @pytest.mark.parametrize("window", [1, 2], ids=["before_popen", "before_release"])
 @pytest.mark.parametrize("change", ["labels", "requirement", "upstream"])
 def test_worker_source_callback_preserves_authority_and_exact_process_settlement(tmp_path, monkeypatch, window, change):
-    import agent_run.adapters.remote as external
-
     scenario, operations, state, call = _allocated_worker(tmp_path, monkeypatch)
     kernel = scenario.kernel
     canary = tmp_path / "actual-worker-starts"
@@ -29,17 +26,22 @@ def test_worker_source_callback_preserves_authority_and_exact_process_settlement
     callbacks = 0
     outcomes, failures = [], []
     held_pidfd = None
+    port = operations.runner.ports
+    assert isinstance(port, RemoteEffects)
+    source_observation = port.source_observation
 
-    def read(reader, parent):
-        observed = read_requirements(reader, parent)
+    def read(parent, query):
+        observed = source_observation(parent, query)
         if current_thread() is thread and callbacks == window:
             reached.set()
             assert release.wait(10), "bounded callback release"
             if change == "upstream":
-                return read_requirements(reader, parent)  # actual failed gh read, after the other commit
+                # A new physical observation performs the actual failed gh
+                # read after the other commit; never reuse a spent carrier.
+                return source_observation(parent, query)
         return observed
 
-    monkeypatch.setattr(external, "read_requirements", read)
+    monkeypatch.setattr(port, "source_observation", read)
 
     def authorize_source():
         nonlocal callbacks

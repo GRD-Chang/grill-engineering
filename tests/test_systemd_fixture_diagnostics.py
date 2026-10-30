@@ -22,6 +22,55 @@ from support.sqlite_faults import logical_state
 from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
 
 
+@pytest.mark.parametrize('helper', ['costs', 'snapshot'])
+@pytest.mark.parametrize('failure_type', [OSError, TimeoutError, InterruptedError, KeyboardInterrupt])
+def test_local_story_tail_keeps_original_timeout_when_either_diagnostic_fails(tmp_path, helper, failure_type):
+    import ast
+
+    # Execute the actual story's communicate/handler statements, without
+    # pretending this controlled branch proves native Host lifecycle.
+    path = Path(__file__).with_name('test_kernel_managed_entry_end_to_end.py')
+    module = ast.parse(path.read_text(), filename=str(path))
+    story, = [node for node in module.body if isinstance(node, ast.FunctionDef)
+              and node.name == 'test_public_local_worker_failure_preserves_completed_and_independent_tickets']
+    boundary, = [node for node in ast.walk(story) if isinstance(node, ast.Try)
+                 and len(node.body) == 1 and isinstance(node.body[0], ast.Assign)
+                 and isinstance(node.body[0].value, ast.Call)
+                 and isinstance(node.body[0].value.func, ast.Attribute)
+                 and node.body[0].value.func.attr == 'communicate'
+                 and any(isinstance(item, ast.Constant) and item.value ==
+                         'local-failure-after-independent-publication-release' for item in ast.walk(node))]
+    original = subprocess.TimeoutExpired(['original-foreground-command'], 8.975)
+    secondary = failure_type('Diagnostic unavailable')
+    calls = []
+    def remaining():
+        calls.append('remaining')
+        return original.timeout
+    def communicate(**options):
+        calls.append(('communicate', options))
+        raise original
+    def diagnostic(name):
+        def called(error, *args, **options):
+            assert error is original
+            calls.append(name)
+            if name == helper:
+                raise secondary
+        return called
+    namespace = {'subprocess': subprocess, 'child': SimpleNamespace(communicate=communicate),
+        'remaining': remaining, 'tmp_path': tmp_path, 'arrival_times': [1, 2],
+        'kernel': SimpleNamespace(storage=SimpleNamespace(path=tmp_path / 'unused.sqlite3')),
+        'before': {'run_id': 'original-run'}, 'note_costs': diagnostic('costs'),
+        '_managed_failure_note': diagnostic('snapshot')}
+    caught = None
+    try:
+        exec(compile(ast.Module(body=[boundary], type_ignores=[]), str(path), 'exec'), namespace)
+    except BaseException as error:
+        caught = error
+    assert caught is original
+    assert calls == ['remaining', ('communicate', {'timeout': original.timeout}), 'costs'] + (
+        ['snapshot'] if helper == 'snapshot' else [])
+
+
 @pytest.mark.parametrize('note_failure', [None, TimeoutError('Diagnostic watchdog')])
 def test_stop_story_rejects_target_raw_before_stop_and_preserves_its_failure(tmp_path, monkeypatch, note_failure):
     # Only the actual story's pre-Stop seam runs; this is no Host/Worker proof.

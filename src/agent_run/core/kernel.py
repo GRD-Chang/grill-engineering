@@ -222,6 +222,11 @@ class Kernel:
 
     def begin_observation(self, subject: str | None, *, execution: Execution | None = None,
                           cleanup: bool = False, call: AgentCall | None = None) -> RequirementsRead:
+        return self._begin_observation(subject, execution=execution, cleanup=cleanup, call=call)
+
+    def _begin_observation(self, subject: str | None, *, execution: Execution | None = None,
+                           cleanup: bool = False, call: AgentCall | None = None,
+                           delivery: bool = True, local_effect: Effect | None = None) -> RequirementsRead:
         with self.storage.transaction(write=False) as tx:
             if call is not None:
                 if (call.subject, call.execution) != (subject, execution):
@@ -230,14 +235,39 @@ class Kernel:
             if execution is not None:
                 self._automatic_owned(tx, tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
                                               (), run_last=True)), execution)
-            fence = self._read_fence(tx, subject, execution, cleanup)
+            fence = replace(self._read_fence(tx, subject, execution, cleanup), local_effect=local_effect)
             parent = tx.one(*run_statement(tx, 'SELECT parent_issue FROM runs WHERE id=?',
                          (), run_last=True))[0]
+            query = self._delivery_read(tx, fence) if delivery else None
         if execution is not None:
             waiting = self._guard_automatic_step(fence, execution)
             if waiting is not None:
                 raise ReadWait(waiting)
-        return RequirementsRead(fence, parent)
+        return RequirementsRead(fence, parent, query)
+
+    def _delivery_read(self, tx: Transaction, fence: ReadFence) -> DeliveryRead:
+        """Project complete physical demand from this transaction's facts."""
+        if fence.subject is None:
+            job = tx.one(*run_statement(tx, 'SELECT * FROM final_target WHERE run_id=?',
+                      (), run_last=True))
+            anchors = set(self._final_ancestry_anchors(tx))
+        else:
+            job = self._job(tx, fence.subject)
+            anchors = {job[key] for key in ("base_sha", "source_sha", "candidate_sha", "integrated_sha") if job[key] is not None}
+            for row in tx.rows(*run_statement(tx, 'SELECT source_sha,target_sha FROM integration_snapshots WHERE subject=? AND run_id=? ORDER BY window DESC LIMIT 1',
+                           (fence.subject,), run_last=True)):
+                anchors.update(value for value in row if value is not None)
+            if job["review_attempt"] is not None:
+                review = tx.one(*run_statement(tx, 'SELECT context_id FROM attempts WHERE id=? AND run_id=?',
+                             (job["review_attempt"],), run_last=True))
+                context = json.loads(tx.get(review[0], fence.subject))
+                if "review_context" in context:
+                    anchors.add(context["reviewed_commit"])
+        return DeliveryRead(job["source_ref"], job["target_ref"], job["pr_number"] if fence.subject is not None else None,
+                            tuple(sorted(anchors)), job["source_sha"] if fence.subject is not None and job["phase"] == "checks" else None,
+                            fence.subject is not None,
+                            tuple((sha, "source") for sha in sorted(anchors)) if fence.subject is None else None,
+                            read_checks=fence.local_effect is None)
 
     def accept_requirements(self, request: RequirementsRead, source: Requirements) -> DeliveryObservation:
         if source is None:
@@ -246,27 +276,7 @@ class Kernel:
         with self._observation_transaction(fence, write=True, source=source) as (tx, _):
             current = replace(self._read_fence(tx, fence.subject, fence.execution, fence.cleanup),
                               local_effect=fence.local_effect)
-            if fence.subject is None:
-                job = tx.one(*run_statement(tx, 'SELECT * FROM final_target WHERE run_id=?',
-                          (), run_last=True))
-                anchors = set(self._final_ancestry_anchors(tx))
-            else:
-                job = self._job(tx, fence.subject)
-                anchors = {job[key] for key in ("base_sha", "source_sha", "candidate_sha", "integrated_sha") if job[key] is not None}
-                for row in tx.rows(*run_statement(tx, 'SELECT source_sha,target_sha FROM integration_snapshots WHERE subject=? AND run_id=? ORDER BY window DESC LIMIT 1',
-                               (fence.subject,), run_last=True)):
-                    anchors.update(value for value in row if value is not None)
-                if job["review_attempt"] is not None:
-                    review = tx.one(*run_statement(tx, 'SELECT context_id FROM attempts WHERE id=? AND run_id=?',
-                                 (job["review_attempt"],), run_last=True))
-                    context = json.loads(tx.get(review[0], fence.subject))
-                    if "review_context" in context:
-                        anchors.add(context["reviewed_commit"])
-            query = DeliveryRead(job["source_ref"], job["target_ref"], job["pr_number"] if fence.subject is not None else None,
-                                 tuple(sorted(anchors)), job["source_sha"] if fence.subject is not None and job["phase"] == "checks" else None,
-                                 fence.subject is not None,
-                                 tuple((sha, "source") for sha in sorted(anchors)) if fence.subject is None else None,
-                                 read_checks=fence.local_effect is None)
+            query = self._delivery_read(tx, current)
         return DeliveryObservation(current, query)
 
     def accept_delivery(self, request: DeliveryObservation, facts: DeliveryFacts) -> tuple[World, ReadFence]:
@@ -368,10 +378,9 @@ class Kernel:
             local = row["operation"] in {"cleanup_worktree", "cleanup_local_ref"} and row["control_action"] is None
             if local:
                 self._local_cleanup_effect(tx, effect)
-        source = self.begin_observation(effect.subject, execution=effect.execution)
-        return (LocalCleanupRead(effect, source) if local else
-                replace(source, fence=replace(source.fence, local_effect=effect))
-                if effect.operation in self.LOCAL_PREPARATION else source)
+        source = self._begin_observation(effect.subject, execution=effect.execution, delivery=not local,
+            local_effect=effect if effect.operation in self.LOCAL_PREPARATION else None)
+        return LocalCleanupRead(effect, source) if local else source
 
     def _local_preparation_read(self, tx: Transaction, effect: Effect, fence: ReadFence) -> None:
         """Bind a check-free read to its one already selected local Effect."""
@@ -802,7 +811,7 @@ class Kernel:
         fence = self._read_fence(tx, subject, work.execution, work.cleanup)
         parent = tx.one(*run_statement(tx, 'SELECT parent_issue FROM runs WHERE id=?',
                      (), run_last=True))[0]
-        return ObserveIO(work, RequirementsRead(fence, parent), after, result)
+        return ObserveIO(work, RequirementsRead(fence, parent, self._delivery_read(tx, fence)), after, result)
 
     def _route_work(self, work: Work, world: World | None = None, fence: ReadFence | None = None) -> Step | IORequest:
         if work.subject is None:

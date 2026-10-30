@@ -458,7 +458,6 @@ def test_observe_uses_real_requirements_remote_commits_and_required_ci_facts(tmp
 
 def test_observe_rejects_a_real_old_source_read_when_new_requirements_commit_first(tmp_path, monkeypatch):
     from threading import Event, Thread
-    import agent_run.adapters.remote as external
     from agent_run.adapters.github import GhGitHubReader
     from agent_run.adapters.source import read_requirements
     port, _git, push, state, _calls = _fixture(tmp_path, monkeypatch)
@@ -468,12 +467,13 @@ def test_observe_rejects_a_real_old_source_read_when_new_requirements_commit_fir
     runner = OperationRunner(kernel, execution, lambda binding: port)
     reached, release = Event(), Event()
     failures = []
-    def delayed(reader, parent):
-        result = read_requirements(reader, parent)  # real fake-gh subprocess reads before the barrier
+    source_observation = port.source_observation
+    def delayed(parent, query):
+        result = source_observation(parent, query)  # real fake-gh subprocess reads before the barrier
         reached.set()
         assert release.wait(10), "bounded stale reader release"
         return result
-    monkeypatch.setattr(external, "read_requirements", delayed)
+    monkeypatch.setattr(port, "source_observation", delayed)
     def old_observer():
         try:
             runner.observe("parent:1")

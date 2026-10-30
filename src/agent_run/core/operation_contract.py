@@ -43,6 +43,13 @@ class DeliveryRead:
     read_checks: bool = True
 
 @dataclass(frozen=True)
+class PreparedRequirements:
+    """Source plus opaque facts owned by this physical observation only."""
+    source: Requirements
+    physical: object
+
+
+@dataclass(frozen=True)
 class DeliveryFacts:
     target: Commit | None
     source: Commit | None
@@ -106,6 +113,8 @@ class OperationPorts(Protocol):
     """Physical reads/writes only; no Core SQL, refresh or World construction."""
 
     def source(self, parent_number: int) -> Requirements: ...
+    def source_observation(self, parent_number: int, query: DeliveryRead | None) -> PreparedRequirements: ...
+    def complete_observation(self, query: DeliveryRead, prepared: PreparedRequirements) -> DeliveryFacts: ...
     def delivery(self, request: DeliveryRead) -> DeliveryFacts: ...
     def inspect(self, resources: tuple[ResourceWitness, ...]) -> tuple[ResourceInspection, ...]: ...
     def execute(self, effect: Effect, authorize: WriteAuthority) -> EffectResult: ...
@@ -134,6 +143,9 @@ class ReadFence:
 class RequirementsRead:
     fence: ReadFence
     parent_number: int
+    # Presealed physical demand only; Source acceptance regenerates it before
+    # any prefetched Delivery facts can be consumed.
+    query: DeliveryRead | None = None
 
 
 @dataclass(frozen=True)

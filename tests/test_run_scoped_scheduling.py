@@ -10,7 +10,7 @@ import sqlite3
 import pytest
 
 from agent_run.core import kernel as core
-from agent_run.core.operation_contract import DeliveryFacts, ObserveIO, ReadUnavailable, Work
+from agent_run.core.operation_contract import DeliveryFacts, DeliveryRead, ObserveIO, ReadUnavailable, RequirementsRead, Work
 from agent_run.errors import KernelError
 from agent_run.model import Commit, EffectResult, Execution, ParentIssue, Policy, ReadWait, Requirements, Step, World, wire_json
 from agent_run.storage.run_scope import RunTransaction
@@ -1167,3 +1167,123 @@ def test_delivery_consumption_failure_does_not_retry_the_consumer_or_save(scenar
         assert caught.value is failure
     assert modes == [False]
     assert {run: _rows(db, run) for run in ('A', 'B')} == before
+
+
+def _checks_observation_basis(db, kernel, *, kind='parent_only'):
+    """Fixed current review/integration facts for the observation consumer only."""
+    with kernel.storage.transaction() as tx:
+        run = tx.one("SELECT * FROM runs WHERE id='A'")
+        context = tx.put(SUBJECT, 'role_context', wire_json({
+            'review_context': {}, 'reviewed_commit': '3' * 40}))
+        insert(db, 'attempts', {'run_id': 'A', 'id': 'review', 'subject': SUBJECT,
+            'generation': 1, 'ordinal': 1, 'role': 'review', 'purpose': 'requirements', 'window': 1,
+            'parent_revision': run['parent_revision'], 'graph_revision': run['graph_revision'],
+            'revision': run['parent_revision'], 'base_sha': BASE.sha,
+            'candidate_sha': 'd' * 40, 'candidate_tree': BASE.tree,
+            'completion_revision': 'no-tickets', 'context_id': context, 'status': 'complete'})
+        for window, source, target in ((1, 'f', '9'), (2, '1', '2')):
+            insert(db, 'integration_snapshots', {'run_id': 'A', 'subject': SUBJECT, 'window': window,
+                'allowance_generation': 1, 'source_ref': 'refs/heads/work', 'target_ref': 'refs/heads/main',
+                'source_sha': source * 40, 'target_sha': target * 40, 'open': int(window == 2)})
+        db.execute("UPDATE subjects SET kind=?,phase='checks',pr_number=17,source_sha=?,candidate_sha=?,"
+                   "candidate_tree=?,integrated_sha=?,integrated_tree=?,review_attempt='review' WHERE run_id='A'",
+                   (kind, 'c' * 40, 'd' * 40, BASE.tree, 'e' * 40, BASE.tree))
+
+
+@pytest.mark.parametrize('entry', ['begin', 'work'])
+def test_observation_preseals_complete_delivery_demand_before_source(scenario, entry):
+    db, kernels = scenario
+    kernel = kernels['A']
+    _checks_observation_basis(db, kernel)
+    before = {run: _rows(db, run) for run in ('A', 'B')}
+    if entry == 'begin':
+        request = kernel.begin_observation(SUBJECT, execution=_execution('A'))
+    else:
+        selected = kernel.next_work(_execution('A'))
+        assert isinstance(selected, ObserveIO)
+        request = selected.request
+    expected = DeliveryRead('refs/heads/work', 'refs/heads/main', 17,
+        tuple(value * 40 for value in ('1', '2', '3', 'a', 'c', 'd', 'e')), 'c' * 40)
+    assert request.query == expected
+    accepted = kernel.accept_requirements(request, _source('A'))
+    assert accepted.query == request.query and accepted.fence == request.fence
+    # Compatibility callers still receive the same complete demand at acceptance.
+    assert kernel.accept_requirements(RequirementsRead(request.fence, request.parent_number),
+        _source('A')) == accepted
+    assert {run: _rows(db, run) for run in ('A', 'B')} == before
+
+
+def test_final_activation_preseals_its_exact_sparse_demand(ticket_scenario):
+    db, kernels = ticket_scenario
+    kernel = kernels['A']
+    before = {run: _rows(db, run) for run in ('A', 'B')}
+    request = kernel.begin_observation(None, execution=_execution('A'))
+    assert request.query == DeliveryRead('refs/heads/run', 'refs/heads/main', None, (),
+        read_pr=False, ancestry_pairs=())
+    assert kernel.accept_requirements(request, _ticket_source('A')).query == request.query
+    assert {run: _rows(db, run) for run in ('A', 'B')} == before
+
+
+def test_source_refresh_regenerates_changed_delivery_demand(scenario):
+    db, kernels = scenario
+    kernel = kernels['A']
+    _checks_observation_basis(db, kernel, kind='final_run')
+    request = kernel.begin_observation(SUBJECT, execution=_execution('A'))
+    assert request.query is not None and request.query.check_head == 'c' * 40
+    before_b = _rows(db, 'B')
+    accepted = kernel.accept_requirements(request, _source('A', 'changed parent'))
+    assert db.execute("SELECT phase FROM subjects WHERE run_id='A'").fetchone()[0] == 'refresh_final'
+    assert accepted.query == replace(request.query, check_head=None)
+    assert accepted.query != request.query
+    assert accepted.fence.source_sequence != request.fence.source_sequence
+    assert _rows(db, 'B') == before_b
+
+
+@pytest.mark.parametrize('change', ['stop', 'epoch'])
+@pytest.mark.parametrize('boundary', ['requirements', 'delivery'])
+def test_presealed_demand_cannot_bypass_stop_or_epoch_fencing(scenario, change, boundary):
+    db, kernels = scenario
+    kernel = kernels['A']
+    request = kernel.begin_observation(SUBJECT, execution=_execution('A'))
+    assert request.query is not None
+    if boundary == 'delivery':
+        delivery = kernel.accept_requirements(request, _source('A'))
+        assert delivery.query == request.query
+    if change == 'stop':
+        kernel.control('stop', 'revoke-prefetched-demand')
+    else:
+        db.execute("UPDATE runs SET executor='successor',epoch=epoch+1 WHERE id='A'")
+    before = {run: _rows(db, run) for run in ('A', 'B')}
+    with pytest.raises(KernelError, match='executor_fenced'):
+        if boundary == 'requirements':
+            kernel.accept_requirements(request, _source('A', 'must not commit'))
+        else:
+            kernel.accept_delivery(delivery, DeliveryFacts(BASE, BASE))
+    assert {run: _rows(db, run) for run in ('A', 'B')} == before
+
+
+def test_source_commit_acknowledgement_failure_returns_no_delivery_observation(scenario, monkeypatch):
+    """Scoped post-commit propagation; not native FIFO or storage-fault proof."""
+    db, kernels = scenario
+    kernel = kernels['A']
+    request = kernel.begin_observation(SUBJECT, execution=_execution('A'))
+    before_b = _rows(db, 'B')
+    transaction, modes, returned = kernel.storage.transaction, [], []
+    failure = OSError('Source commit acknowledgement unavailable')
+
+    @contextmanager
+    def lost_acknowledgement(**options):
+        write = options.get('write', True)
+        modes.append(write)
+        with transaction(**options) as tx:
+            yield tx
+        if write:
+            raise failure
+
+    monkeypatch.setattr(kernel.storage, 'transaction', lost_acknowledgement)
+    with pytest.raises(OSError) as caught:
+        returned.append(kernel.accept_requirements(request, _source('A', 'committed parent')))
+    assert caught.value is failure and returned == []
+    assert modes == [False, True]
+    assert db.execute("SELECT source_sequence FROM runs WHERE id='A'").fetchone()[0] != request.fence.source_sequence
+    assert _rows(db, 'B') == before_b

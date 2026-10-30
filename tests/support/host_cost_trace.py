@@ -188,8 +188,9 @@ def observe_host(setattr_, costs):
                 return original(*args, **kwargs)
         setattr_(owner, name, call)
 
-    for name in ('source', 'delivery'):
-        wrap(RemoteEffects, name, name, publish=True)
+    for name, phase in (('source', 'source'), ('delivery', 'delivery'),
+                        ('source_observation', 'source'), ('complete_observation', 'delivery')):
+        wrap(RemoteEffects, name, phase, publish=True)
     wrap(OperationRunner, 'run_once', 'operation', publish=True)
     for name in ('state', 'supervise'):
         wrap(OperationRunner, name, 'core.' + name)

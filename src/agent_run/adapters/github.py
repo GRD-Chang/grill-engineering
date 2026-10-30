@@ -247,8 +247,12 @@ def _minimum_issue_size(value: dict[str, Any], number: int) -> int:
 class _SourceObservation:
     """One fresh Source, with no facts or permission reused across calls.
 
-    Three complete attempts share one absolute 90-second budget. Failed or
-    partial packages supply no facts. Only explicit output overflow switches
+    Three complete Source attempts share one absolute 90-second budget. An
+    optional Delivery projection joins only the first physical request; that
+    request also consumes one of Delivery's own three basis attempts. Failed
+    Source attempts discard all attached Delivery facts. Explicit errors on
+    the separate Delivery root may accompany independently complete Source.
+    Failed or unscoped partial packages supply no facts. Only explicit output overflow switches
     once to compact Parent + individual Tickets; that consumes an attempt.
     GraphQL errors (including mixed/null data) are incomplete and retryable.
     Complete malformed data is contradictory. Core retains its bounded wait
@@ -261,10 +265,31 @@ class _SourceObservation:
     changing totals, duplicate nodes and repeated cursors fail. Failed attempts
     add at most their failed request and never renew the absolute deadline.
     """
-    def __init__(self, reader: GhGitHubReader) -> None:
+    def __init__(self, reader: GhGitHubReader, *,
+                 delivery_projection: tuple[list[str], list[str], list[str], list[str]] | None = None) -> None:
         self.reader = reader
+        self.delivery_projection = delivery_projection
+        self.delivery_packet: dict[str, Any] | None = None
+        self.attempts = 0
+        self.combined_attempted = False
+        self._first_packet = True
         self.deadline = monotonic() + github_commands.MAX_READ_ATTEMPTS * github_commands.READ_TIMEOUT_SECONDS
         self.compact = False
+
+    def command(self, arguments: list[str], *, cwd: Path,
+                runner_identity: Mapping[str, Any], complete_stdout: bool) -> subprocess.CompletedProcess[str]:
+        """One exact-ref command under this observation's original budget."""
+        if (cwd != self.reader.working_directory or runner_identity != self.reader.runner_identity
+                or not complete_stdout):
+            raise ValueError("Ref command belongs to another observation")
+        try:
+            result = github_commands._run_bounded_command(arguments, cwd=self.reader.working_directory,
+                timeout=min(github_commands.READ_TIMEOUT_SECONDS, self._remaining()), complete_stdout=True,
+                **runner_options(self.reader.runner_identity), before_start=self._before_start, cancelled=self._cancelled)
+        except subprocess.TimeoutExpired as error:
+            raise GitHubReadError('github_read_failed', 'Observation command deadline expired') from error
+        self._remaining()
+        return result
 
     def _remaining(self) -> float:
         if self.reader.cancelled is not None and self.reader.cancelled():
@@ -293,6 +318,9 @@ class _SourceObservation:
             except ValueError as error:
                 raise GitHubReadError("github_invalid_response", "Source repository identity is invalid") from error
         for attempt in range(github_commands.MAX_READ_ATTEMPTS):
+            self.attempts = attempt + 1
+            self.delivery_packet = None
+            self._first_packet = True
             self._remaining()
             try:
                 parent, pages = self.reader._read_parent(owner, name, parent_number, self)
@@ -314,7 +342,9 @@ class _SourceObservation:
                 if attempt == github_commands.MAX_READ_ATTEMPTS - 1:
                     raise GitHubReadError("github_read_failed",
                         "Source observation budget ended before its compact projection could be read") from error
-                self.compact = True
+                # A joint overflow says nothing about either individual material.
+                if not (attempt == 0 and self.combined_attempted):
+                    self.compact = True
                 continue
             except (UnicodeError, RecursionError) as error:
                 raise GitHubReadError("github_invalid_response", "Source material is not valid complete text") from error
@@ -327,9 +357,26 @@ class _SourceObservation:
 
     def graphql(self, query: str, owner: str, name: str, number: int, cursor: str | None,
                 *, labels_cursor: str | None = None) -> dict[str, Any]:
+        combined = (self.delivery_projection is not None and self.attempts == 1 and self._first_packet
+                    and not self.compact and "query SourceSnapshot(" in query)
+        self._first_packet = False
+        extra_arguments: list[str] = []
+        if combined:
+            self.combined_attempted = True
+            assert self.delivery_projection is not None
+            declarations, fields, roots, extra_arguments = self.delivery_projection
+            extra = [value for value in declarations if not value.startswith(("$owner:", "$name:"))]
+            query = query.replace("query SourceSnapshot(", "query SourceSnapshotDeliveryBasis(", 1)
+            query = query.replace(") {", ("," + ",".join(extra) if extra else "") + ") {", 1)
+            end = query.rfind("}")
+            query = (query[:end] + " ".join(roots)
+                     + " delivery:repository(owner:$owner,name:$name) { " + " ".join(fields) + " } " + query[end:])
         arguments = ["gh", "api", "graphql", "-f", "query=" + query,
                      "-F" if owner == "{owner}" else "-f", "owner=" + owner,
                      "-F" if name == "{repo}" else "-f", "name=" + name, "-F", f"number={number}"]
+        arguments += [value for index in range(0, len(extra_arguments), 2)
+                      if not extra_arguments[index + 1].startswith(("owner=", "name="))
+                      for value in extra_arguments[index:index + 2]]
         if cursor is not None:
             arguments += ["-f", "cursor=" + cursor]
         if labels_cursor is not None:
@@ -338,28 +385,53 @@ class _SourceObservation:
             response = github_commands._run_bounded_command(arguments, cwd=self.reader.working_directory,
                 timeout=min(github_commands.READ_TIMEOUT_SECONDS, self._remaining()), complete_stdout=True,
                 **runner_options(self.reader.runner_identity),
+                **({"complete_nonzero_stdout": True} if combined else {}),
                 before_start=self._before_start, cancelled=self._cancelled)
         except subprocess.TimeoutExpired as error:
             raise GitHubReadError("github_read_failed", "Source command deadline expired") from error
+        except github_commands.ReadOutputOverflow:
+            raise
+        except GitHubReadError as error:
+            if combined and error.code == "github_invalid_response":
+                raise GitHubReadError("github_read_failed", "Combined response cannot establish Source completeness") from error
+            raise
         self._remaining()
-        if response.returncode:
+        if response.returncode and not combined:
             raise github_commands.read_response_error(response)
         try:
             value = json.loads(response.stdout)
         except (ValueError, RecursionError) as error:
-            raise GitHubReadError("github_invalid_response", "Source response is not complete JSON") from error
+            raise GitHubReadError("github_read_failed" if combined else "github_invalid_response", "Source response is not complete JSON") from error
         if not isinstance(value, dict):
-            raise GitHubReadError("github_invalid_response", "Source response root must be an object")
+            raise GitHubReadError("github_read_failed" if combined else "github_invalid_response", "Source response root must be an object")
         errors = value.get("errors", [])
         if not isinstance(errors, list) or any(not isinstance(error, dict) or not isinstance(error.get("message"), str)
                                                for error in errors):
-            raise GitHubReadError("github_invalid_response", "Source error envelope is malformed")
-        if errors:
+            raise GitHubReadError("github_read_failed" if combined else "github_invalid_response", "Source error envelope is malformed")
+        delivery_roots = {"delivery"}
+        if combined and "viewer { login }" in roots:
+            delivery_roots.add("viewer")
+        delivery_errors = (combined and bool(errors) and response.returncode in (0, 1) and all(
+            isinstance(error.get("path"), list) and error["path"]
+            and all(isinstance(part, str) or type(part) is int for part in error["path"])
+            and error["path"][0] in delivery_roots for error in errors))
+        if response.returncode and not delivery_errors:
+            raise github_commands.read_response_error(response)
+        if errors and not delivery_errors:
             raise GitHubReadError("github_read_failed", "Source response contains incomplete or erroneous data")
         data = value.get("data")
+        if combined and (not isinstance(data, dict) or not isinstance(data.get("repository"), dict)):
+            raise GitHubReadError("github_read_failed", "Combined response cannot establish Source completeness")
         if ("data" in value and data is None or isinstance(data, dict)
                 and "repository" in data and data["repository"] is None):
             raise GitHubReadError("github_read_failed", "Source repository facts are unavailable")
+        if combined:
+            if delivery_errors:
+                self.delivery_packet = {"errors": errors}
+            else:
+                self.delivery_packet = {"data": {
+                    "repository": data.get("delivery") if isinstance(data, dict) else None,
+                    "viewer": data.get("viewer") if isinstance(data, dict) else None}}
         return value
 
 
