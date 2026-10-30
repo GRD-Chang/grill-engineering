@@ -338,6 +338,117 @@ def test_ticket_frontier_dependencies_and_queues_do_not_take_sibling_closed_stat
     assert db.execute('PRAGMA foreign_key_check').fetchone() is None
 
 
+@pytest.mark.parametrize('phase', ['development', 'complete'])
+def test_dependency_eligibility_does_not_read_unrelated_predecessor_work(ticket_scenario, phase):
+    from agent_run.storage.sqlite import QUERY_LIMIT
+
+    db, kernels = ticket_scenario
+    kernel = kernels['A']
+    # A legal current record can have substantial work data unrelated to the
+    # four fields that bind its Completion. Earlier reads share this budget.
+    db.execute("UPDATE subjects SET phase=?,checkout=? WHERE run_id='A' AND id='ticket:2'",
+               (phase, '/fixture/' + 'segment/' * 480))
+    before_b = _rows(db, 'B')
+    with kernel.storage.transaction(write=False) as tx:
+        job = kernel._job(tx, 'ticket:3')
+        tx.bytes_read = QUERY_LIMIT - 3 * 1024
+        assert kernel._eligibility(tx, job) == 'blocked_by_incomplete_tickets'
+        assert tx.bytes_read < QUERY_LIMIT
+    # A complete phase without the original Completion is not authority.
+    assert _rows(db, 'B') == before_b
+
+
+@pytest.mark.parametrize('changed', [None, 'generation', 'revision', 'graph_revision', 'phase', 'checkout_utf8'])
+def test_dependency_projection_keeps_exact_completion_binding(ticket_scenario, changed):
+    # Relational consumer fixture, not evidence of a physical close receipt.
+    db, kernels = ticket_scenario
+    kernel = kernels['A']
+    with kernel.storage.transaction() as tx:
+        run = tx.one("SELECT * FROM runs WHERE id='A'")
+        job = kernel._job(tx, 'ticket:2')
+        payload = tx.put(job['id'], 'controlled_completion_reference', b'{}')
+        insert(db, 'effects', {'run_id': 'A', 'id': 'completion-reference', 'subject': job['id'],
+            'operation': 'close', 'status': 'confirmed', 'parent_revision': run['parent_revision'],
+            'graph_revision': run['graph_revision'], 'revision': job['revision'], 'generation': 1,
+            'source_ref': job['source_ref'], 'target_ref': job['target_ref'], 'before_sha': BASE.sha,
+            'base_sha': BASE.sha, 'base_tree': BASE.tree, 'payload_id': payload})
+        insert(db, 'completions', {'run_id': 'A', 'subject': job['id'], 'generation': 1,
+            'revision': job['revision'], 'parent_revision': run['parent_revision'],
+            'graph_revision': run['graph_revision'], 'source_sha': BASE.sha, 'merge_sha': BASE.sha,
+            'tree': BASE.tree, 'pr_number': 7, 'gate_mode': 'review',
+            'comment_effect': 'completion-reference', 'close_effect': 'completion-reference'})
+        tx.execute("UPDATE subjects SET phase='complete' WHERE run_id='A' AND id='ticket:2'")
+    with kernel.storage.transaction(write=False) as tx:
+        assert kernel._eligibility(tx, kernel._job(tx, 'ticket:3')) is None
+    if changed is not None:
+        if changed == 'checkout_utf8':
+            db.execute("UPDATE subjects SET checkout=CAST(X'80' AS TEXT) WHERE run_id='A' AND id='ticket:2'")
+        elif changed == 'phase':
+            db.execute("UPDATE subjects SET phase='integration' WHERE run_id='A' AND id='ticket:2'")
+        else:
+            value = 2 if changed == 'generation' else 'later-value'
+            db.execute(f"UPDATE completions SET {changed}=? WHERE run_id='A' AND subject='ticket:2'", (value,))
+    with kernel.storage.transaction(write=False) as tx:
+        expected = None if changed in {None, 'checkout_utf8'} else 'blocked_by_incomplete_tickets'
+        assert kernel._eligibility(tx, kernel._job(tx, 'ticket:3')) == expected
+    if changed == 'checkout_utf8':
+        # Intentional difference from SELECT s.*: dependency eligibility proves
+        # Completion, not the validity of an unrelated retained checkout.
+        # A consumer of that checkout still gets the original decoding failure.
+        with pytest.raises(sqlite3.OperationalError):
+            with kernel.storage.transaction(write=False) as tx:
+                kernel._job(tx, 'ticket:2')
+
+
+@pytest.mark.parametrize('column', ['revision', 'phase'])
+def test_dependency_projection_rejects_invalid_required_text(ticket_scenario, column):
+    db, kernels = ticket_scenario
+    kernel = kernels['A']
+    db.execute(f"UPDATE subjects SET {column}=CAST(X'80' AS TEXT) WHERE run_id='A' AND id='ticket:2'")
+    # Required-field decode failures propagate out of the original read scope.
+    with pytest.raises(sqlite3.OperationalError):
+        with kernel.storage.transaction(write=False) as tx:
+            kernel._eligibility(tx, kernel._job(tx, 'ticket:3'))
+
+
+def test_dependency_sql_failure_poisons_original_read_transaction(ticket_scenario):
+    db, kernels = ticket_scenario
+    kernel = kernels['A']
+
+    def deny_dependency_read(action, table, column, database, trigger):
+        return sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_READ and table == 'dependencies' else sqlite3.SQLITE_OK
+
+    with pytest.raises(KernelError, match='transaction_aborted'):
+        with kernel.storage.transaction(write=False) as tx:
+            job = kernel._job(tx, 'ticket:3')
+            db.set_authorizer(deny_dependency_read)
+            try:
+                with pytest.raises(sqlite3.DatabaseError):
+                    kernel._eligibility(tx, job)
+                assert tx.failed
+            finally:
+                db.set_authorizer(None)
+
+
+@pytest.mark.parametrize('failure', ['budget', 'poison'])
+def test_dependency_eligibility_preserves_shared_read_failures(ticket_scenario, failure):
+    from agent_run.storage.sqlite import QUERY_LIMIT
+
+    db, kernels = ticket_scenario
+    kernel = kernels['A']
+    before = {run: _rows(db, run) for run in ('A', 'B')}
+    with pytest.raises(KernelError, match='query_limit' if failure == 'budget' else 'transaction_aborted'):
+        with kernel.storage.transaction(write=False) as tx:
+            job = kernel._job(tx, 'ticket:3')
+            if failure == 'budget':
+                tx.bytes_read = QUERY_LIMIT
+            else:
+                with pytest.raises(sqlite3.OperationalError):
+                    tx.execute('SELECT * FROM missing_dependency_probe_table')
+            kernel._eligibility(tx, job)
+    assert {run: _rows(db, run) for run in ('A', 'B')} == before
+
+
 def test_refresh_of_one_run_during_other_source_read_does_not_supersede_it(scenario):
     db, kernels = scenario
     def read():

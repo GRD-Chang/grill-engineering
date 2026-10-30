@@ -1331,7 +1331,7 @@ class Kernel:
         if job["phase"] == "complete" and self._completion(tx, job) is not None:
             return "completed"
         # Local dependency authority is Completion, never the live CLOSED flag.
-        for predecessor in tx.all(*run_statement(tx, 'SELECT s.* FROM dependencies d JOIN subjects s ON s.run_id=d.run_id AND s.id=d.predecessor WHERE d.subject=? AND d.run_id=?',
+        for predecessor in tx.all(*run_statement(tx, 'SELECT s.id,s.generation,s.revision,s.phase FROM dependencies d JOIN subjects s ON s.run_id=d.run_id AND s.id=d.predecessor WHERE d.subject=? AND d.run_id=?',
                                (job["id"],), run_last=True)):
             if self._completion(tx, predecessor) is None:
                 return "blocked_by_incomplete_tickets"
