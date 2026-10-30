@@ -49,6 +49,14 @@ def delivery_basis(document, fields, git, *, repository, actor, refresh_head=Non
                 'headRefName': pr['head']['ref'], 'headRefOid': pr['head']['sha'],
                 'baseRefName': pr['base']['ref'], 'baseRefOid': pr['base']['sha'],
                 'mergeCommit': None if not pr['merged'] else {'oid': pr['merge_commit_sha']}}
+            if pr['merged'] and 'parents(first:100)' in fields['query']:
+                raw = git('cat-file', 'commit', pr['merge_commit_sha'])
+                parents = []
+                for line in raw.split('\n')[1:]:
+                    if not line.startswith('parent '):
+                        break
+                    parents.append(line[7:])
+                value['mergeCommit']['parents'] = {'nodes': [commit(sha) for sha in parents[:100]]}
         repo['pullRequest'] = value
     if 'head' in fields and 'base' in fields:
         matches = [pr for pr in document['prs'] if pr['head']['ref'] == fields['head']

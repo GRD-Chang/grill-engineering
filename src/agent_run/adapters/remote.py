@@ -768,7 +768,8 @@ class RemoteEffects:
             declarations.append('$pr:Int!')
             fields.append('pullRequest(number:$pr) { number title body state author { login } '
                 'repository { nameWithOwner } baseRepository { nameWithOwner } headRepository { nameWithOwner } '
-                'headRefName headRefOid baseRefName baseRefOid mergeCommit { oid } }')
+                'headRefName headRefOid baseRefName baseRefOid '
+                'mergeCommit { oid parents(first:100) { nodes { oid tree { oid } } } } }')
             arguments += ['-F', 'pr=' + str(pr_number)]
         if discovery is not None and not compact:
             declarations += ['$head:String!', '$base:String!']
@@ -881,6 +882,23 @@ class RemoteEffects:
                              'repo': {'full_name': _text(value['baseRepository']['nameWithOwner'])}},
                     'merged': state == 'MERGED',
                     'merge_commit_sha': None if state != 'MERGED' else _sha(value['mergeCommit']['oid'])}
+                if state == 'MERGED':
+                    # This bounded subset supplies trees by exact OID, not parent
+                    # order. The original merge REST receipt still selects parent 0.
+                    parents = value['mergeCommit']['parents']['nodes']
+                    if not isinstance(parents, list) or len(parents) > 100:
+                        raise ValueError('Malformed merge parent objects')
+                    for parent in parents:
+                        if parent is None:
+                            raise GitHubReadError('github_read_failed', 'Merge parent object is unavailable')
+                        if not isinstance(parent, dict):
+                            raise ValueError('Malformed merge parent object')
+                        if parent['tree'] is None:
+                            raise GitHubReadError('github_read_failed', 'Merge parent tree is unavailable')
+                        parent_commit = Commit(_sha(parent['oid']), _sha(parent['tree']['oid']))
+                        if parent_commit.sha in commits and commits[parent_commit.sha] != parent_commit:
+                            raise ValueError('Same commit has contradictory trees')
+                        commits[parent_commit.sha] = parent_commit
         return commits, raw_pr, actor
 
     def _delivery_basis(self, source_sha: str | None, target_sha: str | None,
@@ -1007,14 +1025,19 @@ class RemoteEffects:
             if sha in commits:
                 reused.add(sha)
                 return commits[sha]
-            return basis[sha] if sha in basis else self._commit(sha)[0]
+            return basis[sha] if sha in (source_sha, target_sha) and sha in basis else self._commit(sha)[0]
         source = None if source_sha is None else read_commit(source_sha)
         if source is not None:
             commits[source.sha] = source
         target = None if target_sha is None else read_commit(target_sha)
         if target is not None:
             commits[target.sha] = target
-        pr = None if raw_pr is None else self._pr(raw_pr, read_commit=read_commit)
+        pr = None if raw_pr is None else self._pr(raw_pr, read_commit=read_commit, merged_parents=basis)
+        if pr is not None and pr.state == 'MERGED' and pr.base.sha in basis:
+            # A consumed parent tree must match the actual exact Git object,
+            # just like the other API facts reused in this observation.
+            commits[pr.base.sha] = pr.base
+            reused.add(pr.base.sha)
         checked = requested_ancestry(request, source)
         heads = set(request.anchors) | {head for head in (source_sha, target_sha) if head is not None}
         if checked is not None:
@@ -1203,13 +1226,14 @@ class RemoteEffects:
                 message if isinstance(message, str) else None)
 
     def _pr(self, data: Mapping[str, Any], *,
-            read_commit: Callable[[str], Commit] | None = None) -> PullRequest:
+            read_commit: Callable[[str], Commit] | None = None,
+            merged_parents: Mapping[str, Commit] | None = None) -> PullRequest:
         commit = (lambda sha: self._commit(sha)[0]) if read_commit is None else read_commit
         head, base = data["head"], data["base"]
         repository = _text(base["repo"]["full_name"])
         head_repository = None if head.get("repo") is None else _text(head["repo"]["full_name"])
         merged = None
-        base_commit = commit(_sha(base["sha"]))
+        base_sha = _sha(base["sha"])
         if data.get("merged"):
             # Parent order is separate receipt evidence; keep its original fresh read.
             merged, parents, _ = self._commit(_sha(data["merge_commit_sha"]))
@@ -1217,7 +1241,11 @@ class RemoteEffects:
                 raise ValueError("merged commit has no original base parent")
             # A merged receipt describes the original Git event, not a later
             # live base-branch pointer. Its actual first parent is that base.
-            base_commit = self._commit(parents[0])[0]
+            base_commit = merged_parents.get(parents[0]) if merged_parents is not None else None
+            if base_commit is None:
+                base_commit = commit(parents[0])
+        else:
+            base_commit = commit(base_sha)
         return PullRequest(_number(data["number"]), repository, "refs/heads/" + _text(head["ref"]),
             "refs/heads/" + _text(base["ref"]), commit(_sha(head["sha"])), base_commit,
             _text(data["title"]), _string(data["body"]), "MERGED" if merged else _text(data["state"]).upper(),

@@ -75,7 +75,9 @@ def test_merged_pr_retains_its_independent_first_parent_receipt_read(tmp_path, m
     assert facts.checks is None
     observed = _reads(calls, start)
     assert _basis_objects(observed) == {pr.head.sha: 1, result.commit.sha: 1}
-    assert _objects(observed) == {push.base.sha: 2, result.commit.sha: 1}
+    # The original merge receipt still determines the parent order; its exact
+    # first-parent tree is now supplied by this observation's GraphQL packet.
+    assert _objects(observed) == {result.commit.sha: 1}
     assert not any('--method' in command for command in observed)
 
 
