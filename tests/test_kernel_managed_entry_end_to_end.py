@@ -973,14 +973,13 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                 with kernel.storage.transaction(write=False) as tx:
                     row = tx.one("SELECT i.id,i.thread,t.backend_id FROM invocations i JOIN threads t ON t.id=i.thread WHERE i.attempt=?", (attempt,))
                     return dict(row) if row["backend_id"] else None
-            original = wait_until(original_thread, timeout=min(10, remaining()))
-            def sibling_running():
+            def worker_running(subject):
                 from agent_run.runtime.process_identity import _process_start_token
                 with kernel.storage.transaction(write=False) as tx:
-                    row = tx.one("SELECT l.id,l.invocation,o.process_identity,o.dispatch_state,o.exit_code FROM leases l "
-                        "JOIN invocation_outputs o ON o.lease=l.id WHERE l.subject='ticket:3'")
-                    assert row["dispatch_state"] == "started" and row["exit_code"] is None
-                    identity = json.loads(tx.get(row["process_identity"], "ticket:3"))
+                    row = tx.one("SELECT l.id,l.invocation,o.process_identity,o.dispatch_state,o.exit_code,o.raw_id FROM leases l "
+                        "JOIN invocation_outputs o ON o.lease=l.id WHERE l.subject=?", (subject,))
+                    assert row["dispatch_state"] == "started" and row["exit_code"] is None and row["raw_id"] is None
+                    identity = json.loads(tx.get(row["process_identity"], subject))
                     assert identity["host_pid"] == children[0].pid
                     assert _process_start_token(identity["pid"]) == identity["start_token"]
                     descriptor = os.pidfd_open(identity["pid"])
@@ -989,37 +988,49 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                     finally:
                         os.close(descriptor)
                     return row["id"], row["invocation"], row["process_identity"]
-            sibling = sibling_running()
-            for event, _channel in initial:
-                number = event["requirement"]["number"]
-                assert event["requirement"]["body"] == f"Original requirement for Ticket {number}."
-                assert f"https://github.com/example/project/issues/{number}" in event["prompt"]
-            stop_started = time.monotonic()
-            code, stopped = public("stop", accepted["run_id"], "--ticket", "2")
-            assert code == 0, stopped
-            # Stop revokes authority; it does not claim a fresh physical Host observation.
-            assert stopped["host"] == "unknown" and kernel.host_request(accepted["action_id"]) == request
-            def settled():
+            stage = 'target-before-stop'
+            try:
+                original = wait_until(original_thread, timeout=min(10, remaining()))
+                sibling = worker_running("ticket:3")
+                for event, _channel in initial:
+                    number = event["requirement"]["number"]
+                    assert event["requirement"]["body"] == f"Original requirement for Ticket {number}."
+                    assert f"https://github.com/example/project/issues/{number}" in event["prompt"]
+                # The target itself must still be held, not merely its sibling.
+                assert worker_running("ticket:2")[1] == original["id"]
+                stage = 'target-stop-request-and-late-return'
+                stop_started = time.monotonic()
+                code, stopped = public("stop", accepted["run_id"], "--ticket", "2")
+                assert code == 0, stopped
+                # Stop revokes authority; it does not claim a fresh physical Host observation.
+                assert stopped["host"] == "unknown" and kernel.host_request(accepted["action_id"]) == request
+                def settled():
+                    with kernel.storage.transaction(write=False) as tx:
+                        row = tx.one("SELECT raw_id,dispatch_state,exit_code FROM invocation_outputs WHERE invocation=?", (original["id"],))
+                        return dict(row) if row["raw_id"] and row["dispatch_state"] == "exited" else None
+                raw = wait_until(settled, timeout=min(10, remaining()))
+                paused = kernel.status("ticket:2")
+                assert "operator_stopped" in paused["gates"] and paused["pending_return"]
+                assert paused["pending_attempt"] == attempt and paused["phase"] == "development"
+                assert paused["budgets"] == before["budgets"]
+                assert worker_running("ticket:3") == sibling
                 with kernel.storage.transaction(write=False) as tx:
-                    row = tx.one("SELECT raw_id,dispatch_state,exit_code FROM invocation_outputs WHERE invocation=?", (original["id"],))
-                    return dict(row) if row["raw_id"] and row["dispatch_state"] == "exited" else None
-            raw = wait_until(settled, timeout=min(10, remaining()))
-            paused = kernel.status("ticket:2")
-            assert "operator_stopped" in paused["gates"] and paused["pending_return"]
-            assert paused["pending_attempt"] == attempt and paused["phase"] == "development"
-            assert paused["budgets"] == before["budgets"]
-            assert sibling_running() == sibling
-            with kernel.storage.transaction(write=False) as tx:
-                assert b"Late original Worker return after Stop." in tx.get(raw["raw_id"], "ticket:2")
-                assert tx.one("SELECT status FROM attempts WHERE id=?", (attempt,))[0] == "returned"
-                assert not tx.rows("SELECT identity FROM history WHERE kind='role_consumed' AND identity=?", (attempt,))
-                stopped_at = tx.one("SELECT position FROM history WHERE kind='control_applied' AND identity=?", (stopped["action_id"],))[0]
-                assert tx.one("SELECT position FROM history WHERE kind='raw_returned' AND identity=?", (original["id"],))[0] > stopped_at
-                assert tx.one("SELECT position FROM history WHERE kind='worker_exited' AND identity=?", (original["id"],))[0] > stopped_at
+                    assert b"Late original Worker return after Stop." in tx.get(raw["raw_id"], "ticket:2")
+                    assert tx.one("SELECT status FROM attempts WHERE id=?", (attempt,))[0] == "returned"
+                    assert not tx.rows("SELECT identity FROM history WHERE kind='role_consumed' AND identity=?", (attempt,))
+                    stopped_at = tx.one("SELECT position FROM history WHERE kind='control_applied' AND identity=?", (stopped["action_id"],))[0]
+                    assert tx.one("SELECT position FROM history WHERE kind='raw_returned' AND identity=?", (original["id"],))[0] > stopped_at
+                    assert tx.one("SELECT position FROM history WHERE kind='worker_exited' AND identity=?", (original["id"],))[0] > stopped_at
+            except BaseException as error:
+                try:
+                    _managed_failure_note(error, stage=stage, database=kernel.storage.path,
+                        run_id=accepted['run_id'], roles=tmp_path / 'roles.jsonl')
+                finally:
+                    raise error
             resume_started = time.monotonic()
             code, resumed = public("resume", accepted["run_id"], "--ticket", "2", "--message", "Continue the exact original Ticket.")
             assert code == 0 and resumed["host"] == "running", resumed
-            assert kernel.host_request(accepted["action_id"]) == request and sibling_running() == sibling
+            assert kernel.host_request(accepted["action_id"]) == request and worker_running("ticket:3") == sibling
             # The sibling has proved the original Host survives until Resume.
             # Stop it normally now rather than supervising unrelated work
             # throughout the target Ticket's complete delivery pipeline.

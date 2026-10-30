@@ -157,11 +157,14 @@ def _managed_diagnostics(database: Path, run_id: str, roles: Path) -> dict:
                 'FROM attempts WHERE run_id=? ORDER BY rowid DESC LIMIT 32', (run_id,))]
             result['outputs'] = [dict(row) for row in tx.rows(
                 'SELECT a.subject,a.role,a.accounted,i.id AS invocation,i.thread,t.backend_id,t.profile_revision,i.deadline_at,o.ordinal,o.dispatch_state,'
-                'o.failure_kind,o.raw_id,o.started_at,o.returned_at,o.exit_code FROM invocation_outputs o '
+                'o.failure_kind,o.raw_id,o.process_identity,o.start_evidence,o.started_at,o.returned_at,o.exit_code FROM invocation_outputs o '
                 'JOIN invocations i ON i.run_id=o.run_id AND i.id=o.invocation '
                 'JOIN attempts a ON a.run_id=i.run_id AND a.id=i.attempt '
                 'LEFT JOIN threads t ON t.run_id=i.run_id AND t.id=i.thread '
                 'WHERE o.run_id=? ORDER BY i.rowid DESC,o.ordinal DESC LIMIT 32', (run_id,))]
+            for row in result['outputs']:
+                if row['start_evidence'] is not None:
+                    row['start_evidence_body'] = json.loads(tx.get(row['start_evidence'], row['subject']))
             result['activity'] = [dict(row) for row in tx.rows(
                 'SELECT invocation,ordinal,identity,active,observed_at FROM worker_activity WHERE run_id=? ORDER BY rowid DESC LIMIT 32', (run_id,))]
             result['effects'] = [dict(row) for row in tx.rows(

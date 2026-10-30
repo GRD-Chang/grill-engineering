@@ -6,6 +6,10 @@ from pathlib import Path
 import socket
 import subprocess
 import sys
+from contextlib import contextmanager, nullcontext
+from queue import Queue
+import runpy
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +20,61 @@ from support.repository_fixture import create_kernel
 from support.offline import fixture_inputs
 from support.sqlite_faults import logical_state
 from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
+
+
+@pytest.mark.parametrize('note_failure', [None, TimeoutError('Diagnostic watchdog')])
+def test_stop_story_rejects_target_raw_before_stop_and_preserves_its_failure(tmp_path, monkeypatch, note_failure):
+    # Only the actual story's pre-Stop seam runs; this is no Host/Worker proof.
+    story = runpy.run_path(str(Path(__file__).with_name('test_kernel_managed_entry_end_to_end.py')))[
+        'test_public_ticket_stop_keeps_late_raw_unconsumed_then_resumes_in_the_original_managed_host']
+    from agent_run.runtime.process_identity import _process_start_token
+    calls, notes, subjects = [], [], []
+    arrivals = Queue()
+    for number in (2, 3):
+        arrivals.put(({'checkout': f'/fixture/ticket-{number}',
+            'requirement': {'number': number, 'body': f'Original requirement for Ticket {number}.'},
+            'prompt': f'https://github.com/example/project/issues/{number}'}, None))
+
+    class Transaction:
+        def one(self, sql, arguments=()):
+            if 'FROM invocations' in sql:
+                return {'id': 'original', 'thread': 'thread', 'backend_id': 'backend'}
+            subject = arguments[0] if arguments else 'ticket:3'
+            subjects.append(subject)
+            return {'id': 'lease', 'invocation': 'original' if subject == 'ticket:2' else 'sibling',
+                'process_identity': 'identity', 'dispatch_state': 'started', 'exit_code': None,
+                'raw_id': 'premature-raw' if subject == 'ticket:2' else None}
+        def get(self, *_args):
+            return json.dumps({'pid': os.getpid(), 'host_pid': os.getpid(),
+                               'start_token': _process_start_token(os.getpid())})
+
+    @contextmanager
+    def transaction(**_options):
+        yield Transaction()
+
+    kernel = SimpleNamespace(storage=SimpleNamespace(path=tmp_path / 'unused', transaction=transaction),
+        host_request=lambda _: {}, status=lambda _: {'pending_attempt': 'attempt'})
+    def public(arguments, **_options):
+        calls.append(arguments)
+        assert arguments[3] == 'run', 'Public Stop reached with target raw already saved'
+        return SimpleNamespace(returncode=0, stdout=json.dumps({'run_id': 'run', 'action_id': 'run-action'}))
+    def note(error, **options):
+        notes.append((error, options['stage']))
+        if note_failure is not None:
+            raise note_failure
+    command = ['--database', str(kernel.storage.path), '--run-id=run']
+    replacements = {'_worker_controls': lambda _: nullcontext(('@unused', arrivals)),
+        '_control_environment': lambda *_a, **_k: ({'PATH': os.defpath}, tmp_path / 'unused-state'),
+        '_local_manager': lambda *_a, **_k: nullcontext((SimpleNamespace(systemctl=tmp_path / 'systemctl'),
+            None, [], [SimpleNamespace(pid=os.getpid())], [], [command], [])),
+        'Kernel': lambda *_a, **_k: kernel, 'subprocess': SimpleNamespace(run=public), '_managed_failure_note': note}
+    for name, value in replacements.items():
+        monkeypatch.setitem(story.__globals__, name, value)
+    with pytest.raises(AssertionError) as caught:
+        story(tmp_path, tmp_path, monkeypatch)
+    assert subjects == ['ticket:3', 'ticket:2']
+    assert len(calls) == 1 and calls[0][3] == 'run'  # No public Stop was issued.
+    assert notes == [(caught.value, 'target-before-stop')]
 
 
 def test_sidecar_trace_returns_exact_original_stat_once_and_bounds_only_exact_database(tmp_path):

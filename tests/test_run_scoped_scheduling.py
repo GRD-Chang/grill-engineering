@@ -542,6 +542,39 @@ def _return(kernel, preparation, result):
     return call
 
 
+def test_managed_snapshot_decodes_original_worker_failure_without_copying_raw_or_cross_run(scenario, tmp_path, monkeypatch):
+    import json
+    from support import systemd_manager
+    from support.core_operations import prepare_scripted_agent
+
+    db, kernels = scenario
+    kernel = kernels['A']
+    call = prepare_scripted_agent(kernel, _once(kernel, 'A', _source('A'))).call
+    assert call is not None and kernel.dispatch_agent(call)
+    kernel.bind_thread(call, 'controlled-backend')
+    process = {'pid': 21, 'pgid': 21, 'start_token': 'synthetic-worker',
+               'host_pid': 10, 'host_start_token': 'synthetic-host'}
+    kernel.agent_started(call, process)
+    kernel.agent_source_ready(call)
+    # Durable failure material is produced by Core, not by diagnostic code.
+    kernel.receive(call, b'{"result_kind":"development","summary":"Late original Worker return after Stop.","human_blockers":null}')
+    kernel.agent_exited(call, process, -15, failure='KernelError', failure_kind='ordinary',
+                        diagnostic={'source': 'controlled-guard', 'error_type': 'KernelError'})
+    before = {run: _rows(db, run) for run in ('A', 'B')}
+    monkeypatch.setattr(systemd_manager, 'Kernel', lambda _path, *, run_id: kernels[run_id])
+    facts = systemd_manager._managed_diagnostics(tmp_path / 'controlled', 'A', tmp_path / 'roles.jsonl')
+    assert 'unavailable' not in facts
+    output, = facts['outputs']
+    assert output['invocation'] == call.invocation_id and output['raw_id'] is not None
+    assert output['dispatch_state'] == 'exited' and output['exit_code'] == -15
+    assert output['failure_kind'] == 'ordinary' and output['process_identity'] is not None
+    assert output['start_evidence_body'] == {'returncode': -15, 'failure': 'KernelError', 'kind': 'ordinary',
+        'diagnostic': {'source': 'controlled-guard', 'error_type': 'KernelError'}}
+    assert 'Late original Worker return after Stop.' not in json.dumps(facts)
+    assert systemd_manager._managed_diagnostics(tmp_path / 'controlled', 'B', tmp_path / 'roles.jsonl')['outputs'] == []
+    assert {run: _rows(db, run) for run in ('A', 'B')} == before
+
+
 def _until_preparation(kernel, run, source, role, candidate, *, facts=None):
     from agent_run.core.operation_contract import EffectIO
     for _ in range(16):
