@@ -177,12 +177,20 @@ if endpoint=='user': result={'login':d.get('actor','publisher')};save_state=meth
 elif endpoint=='graphql' and method=='GET':
     save_state=False
     fields=dict(value.split('=',1) for index,value in enumerate(args) if index and args[index-1] in ('-F','-f'))
-    if 'DeliveryBasis' in fields.get('query',''):
+    if 'StatusCommentObservation' in fields.get('query',''):
+        fields['pr']=fields['number']
+    if 'DeliveryBasis' in fields.get('query','') or 'StatusCommentObservation' in fields.get('query',''):
         from support.github_delivery import delivery_basis
         from functools import partial
         # Keep the Local fixture's exact refresh_head extension anchor below.
         delivery_basis=partial(delivery_basis,read_ref=head)
         result=delivery_basis(d,fields,git,repository='example/project',actor=d.get('actor','publisher'))
+        if 'StatusCommentObservation' in fields['query']:
+            from support.github_comments import status_comment_pages
+            assert '--paginate' in args and '--slurp' in args
+            result=status_comment_pages(d,fields,result['data']['repository']['pullRequest'],
+                repository='example/project',actor=d.get('actor','publisher'))
+            write_text(state,json.dumps(d));print(json.dumps(result));raise SystemExit(0)
         if 'pr' in fields:write_text(state,json.dumps(d))
         if 'SourceSnapshotDeliveryBasis' not in fields['query']:
             print(json.dumps(result));raise SystemExit(0)

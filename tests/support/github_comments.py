@@ -38,6 +38,43 @@ def _mirror(document, issue_prefix):
     document['comments_by_issue'] = mirror
 
 
+def status_comment_pages(document, fields, pull, *, repository, actor):
+    """Project the existing PR/comment objects into complete GraphQL pages."""
+    def author(value):
+        if not isinstance(value, dict):
+            return value
+        login = value.get('login')
+        bot = isinstance(login, str) and login.endswith('[bot]')
+        return {'__typename': 'Bot' if bot else 'User', 'login': login[:-5] if bot else login}
+
+    number = int(fields['number'])
+    if pull is None:
+        pages = [{'data': {'repository': {'nameWithOwner': repository, 'pullRequest': None}}}]
+    else:
+        rows, _ = comment_request(document, f'repos/{repository}/issues/{number}/comments',
+                                  'GET', {}, repository=repository, actor=actor, slurp=False)
+        binding = {key: pull[key] for key in ('number', 'author', 'headRefName', 'baseRefName',
+                                             'headRepository', 'baseRepository')}
+        binding['author'] = author(binding['author'])
+        nodes = [{'fullDatabaseId': str(row['id']) if row.get('id') is not None else None,
+                  'body': row.get('body'),
+                  'author': author(row.get('user')), 'repository': {'nameWithOwner': repository},
+                  'pullRequest': {'number': number, 'repository': {'nameWithOwner': repository}}}
+                 for row in rows]
+        pages = []
+        for offset in range(0, max(1, len(nodes)), 100):
+            selected = nodes[offset:offset + 100]
+            end = offset + len(selected)
+            comments = {'nodes': selected, 'totalCount': len(nodes), 'pageInfo': {
+                'hasNextPage': end < len(nodes), 'endCursor': str(end) if selected else None}}
+            pages.append({'data': {'repository': {'nameWithOwner': repository,
+                'pullRequest': {**binding, 'comments': comments}}}})
+    if 'viewer' in fields['query']:
+        for page in pages:
+            page['data']['viewer'] = {'login': actor}
+    return pages
+
+
 def comment_request(document, endpoint, method, body, *, repository, actor, slurp):
     """Mutate canonical rows, target version and mirror once under the caller's lock."""
     issue_prefix = 'https://api.github.com/repos/' + repository + '/issues/'

@@ -852,11 +852,24 @@ state,calls,blocked=map(Path,sys.argv[1:4]);args=sys.argv[4:]
 assert args[0]=='api'
 endpoint=args[1];method=args[args.index('--method')+1] if '--method' in args else 'GET'
 with calls.open('a') as log:log.write(json.dumps([method,endpoint])+'\\n')
-if endpoint=='user' and not blocked.exists():
+if endpoint in {'user','graphql'} and not blocked.exists():
  temporary=blocked.with_suffix('.new');temporary.write_text(str(os.getpid()));temporary.replace(blocked)
  signal.pause()
 document=json.loads(state.read_text())
-if endpoint=='user':result={'login':'offline-publisher'}
+if endpoint=='graphql':
+ assert '--paginate' in args and '--slurp' in args
+ comments=[{'fullDatabaseId':str(row['id']),'body':row['body'],'author':{'__typename':'User',**row['user']},
+            'repository':{'nameWithOwner':REPO.removeprefix('repos/')},
+            'pullRequest':{'number':NUMBER,'repository':{'nameWithOwner':REPO.removeprefix('repos/')}}}
+           for row in document['comments']]
+ pull={'number':NUMBER,'author':{'__typename':'User',**PR['user']},'headRefName':PR['head']['ref'],'baseRefName':PR['base']['ref'],
+       'headRepository':{'nameWithOwner':PR['head']['repo']['full_name']},
+       'baseRepository':{'nameWithOwner':PR['base']['repo']['full_name']},
+       'comments':{'totalCount':len(comments),'nodes':comments,
+                   'pageInfo':{'hasNextPage':False,'endCursor':'1' if comments else None}}}
+ result=[{'data':{'viewer':{'login':'offline-publisher'},
+          'repository':{'nameWithOwner':REPO.removeprefix('repos/'),'pullRequest':pull}}}]
+elif endpoint=='user':result={'login':'offline-publisher'}
 elif endpoint==REPO+'/pulls/'+str(NUMBER):
  result=PR
 elif endpoint==REPO+'/issues/'+str(NUMBER)+'/comments?per_page=100' and method=='GET':

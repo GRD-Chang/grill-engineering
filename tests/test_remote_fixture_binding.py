@@ -51,6 +51,105 @@ def test_remote_fixture_fields_do_not_rewrite_each_other_or_python(tmp_path, rep
     assert json.loads(state.read_text()) == {"prs":[],"comments":[],"events":[],"issue_state":"open"}
 
 
+@pytest.mark.parametrize(('actor', 'kind', 'graphql_login'), [
+    ('bounded-publisher', 'User', 'bounded-publisher'),
+    ('publisher-app[bot]', 'Bot', 'publisher-app'),
+])
+def test_status_graphql_fixture_preserves_complete_comments_and_literal_identity(tmp_path, actor, kind, graphql_login):
+    repository = 'publisher/true'
+    author = {'__typename': kind, 'login': graphql_login}
+    pull = {'number': 17, 'state': 'open', 'title': 'Title', 'body': 'Body',
+        'user': {'login': actor}, 'merged': False, 'merge_commit_sha': None,
+        'head': {'sha': '1' * 40, 'ref': 'delivery', 'repo': {'full_name': 'foreign/fork'}},
+        'base': {'sha': '2' * 40, 'ref': 'main', 'repo': {'full_name': repository}}}
+    comments = [{'id': 2 ** 53 + number, 'body': f'Exact comment {number}',
+        'user': {'login': actor}, 'issue_url': f'https://api.github.com/repos/{repository}/issues/17'}
+        for number in range(1, 206)]
+    comments[0]['user'] = None  # Deleted authors remain unknown, not the selected publisher.
+    foreign = {**comments[0], 'id': 999, 'issue_url': f'https://api.github.com/repos/{repository}/issues/18'}
+    state, calls = tmp_path / 'state.json', tmp_path / 'calls.jsonl'
+    state.write_text(json.dumps({'prs': [pull], 'comments': [*comments, foreign]}))
+    query = '''query StatusCommentObservation($owner:String!,$name:String!,$number:Int!,$endCursor:String) {
+      VIEWER repository(owner:$owner,name:$name) { nameWithOwner
+        pullRequest(number:$number) { number author { __typename login } headRefName baseRefName
+          headRepository { nameWithOwner } baseRepository { nameWithOwner }
+          comments(first:100,after:$endCursor) { totalCount pageInfo { endCursor hasNextPage }
+            nodes { fullDatabaseId body author { __typename login } repository { nameWithOwner }
+              pullRequest { number repository { nameWithOwner } } } } } } }'''
+    query = query.replace('VIEWER', 'viewer { login }' if kind == 'User' else '')
+    arguments = ['api', 'graphql', '--paginate', '--slurp', '-f', 'query=' + query,
+                 '-f', 'owner=publisher', '-f', 'name=true', '-F', 'number=17']
+    environment = {'HOME': str(tmp_path), 'PATH': os.defpath,
+        'REMOTE_TEST_STATE': str(state), 'REMOTE_TEST_CALLS': str(calls)}
+    # Actual generated CLI and pipes; no Core/story or Git object preparation.
+    completed = subprocess.run([sys.executable, '-S', '-c',
+        fake_gh(repository=repository, actor=actor), *arguments], cwd=tmp_path,
+        env=environment, text=True, capture_output=True, timeout=5)
+    assert completed.returncode == 0, completed.stderr
+    pages = json.loads(completed.stdout)
+    assert len(pages) == 3
+    assert all(page['data'].get('viewer') == ({'login': actor} if kind == 'User' else None) for page in pages)
+    observed = []
+    for index, page in enumerate(pages):
+        repo = page['data']['repository']
+        assert repo['nameWithOwner'] == repository
+        pr = repo['pullRequest']
+        assert (pr['number'], pr['author'], pr['headRefName'], pr['baseRefName']) == (17, author, 'delivery', 'main')
+        assert pr['headRepository'] == {'nameWithOwner': 'foreign/fork'}
+        assert pr['baseRepository'] == {'nameWithOwner': repository}
+        connection = pr['comments']
+        assert connection['totalCount'] == 205
+        assert connection['pageInfo'] == {'hasNextPage': index < 2, 'endCursor': str(min((index + 1) * 100, 205))}
+        assert len(connection['nodes']) == (100 if index < 2 else 5)
+        observed.extend(connection['nodes'])
+    assert [(row['fullDatabaseId'], row['body'], row['author']) for row in observed] == [
+        (str(row['id']), row['body'], author if row['user'] is not None else None) for row in comments]
+    assert all(row['repository'] == {'nameWithOwner': repository} and
+        row['pullRequest'] == {'number': 17, 'repository': {'nameWithOwner': repository}} for row in observed)
+    assert [json.loads(line) for line in calls.read_text().splitlines()] == [arguments]
+    after = json.loads(state.read_text())
+    assert after['prs'] == [pull] and after['comments'] == [*comments, foreign]
+    assert after['comments_by_issue'] == {'17': comments, '18': [foreign]}
+
+
+def test_status_graphql_real_remote_keeps_three_rounds_and_exact_write(tmp_path, monkeypatch):
+    from agent_run.contracts.status_comment import StatusTarget
+
+    port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
+    effect, publication = _publish_pr(port, push)
+    target = StatusTarget(port.repository, 'status-run', 1, effect.subject, 1, 2,
+        publication.number, publication.actor, effect.effect_id, 'confirmed-publication',
+        publication.source_ref, publication.target_ref)
+    marker = f'<!-- agent-run-status:{target.key}:0123456789abcdef0123456789abcdef -->'
+    intent = {'comment_id': None, 'before': None, 'body': marker + '\nExact Status body\n中文'}
+    baseline = len(calls.read_text().splitlines())
+    assert port.read_status_comment(target, marker, intent, lambda: False) == {'disposition': 'prior'}
+    admissions = []
+    observed = port.write_status_comment(target, marker, intent,
+        WriteAuthority(lambda: lambda: admissions.append('admitted')), lambda: False)
+    assert admissions == ['admitted']
+    assert observed == {'disposition': 'target', 'comment_id': 1, 'write_returncode': 0}
+    rows = [json.loads(line) for line in calls.read_text().splitlines()][baseline:]
+    endpoint = f'repos/{port.repository}/issues/{publication.number}/comments'
+    assert [row[:2] for row in rows] == [
+        ['api', 'graphql'], ['api', 'graphql'], ['api', endpoint], ['api', 'graphql']]
+    assert rows[2][rows[2].index('--method') + 1] == 'POST'
+    assert all(any('StatusCommentObservation' in field for field in row)
+               for row in (rows[0], rows[1], rows[3]))
+    document = json.loads(state.read_text())
+    comment, = document['comments']
+    assert (comment['id'], comment['body'], comment['user'], comment['issue_url']) == (
+        observed['comment_id'], intent['body'], {'login': target.actor},
+        f'https://api.github.com/repos/{target.repository}/issues/{target.pr_number}')
+    assert len(document['status_writes']) == 1 and document['status_writes'][0]['method'] == 'POST'
+    document['comments'][0]['body'] += '\nHuman edit'
+    state.write_text(json.dumps(document))
+    assert port.read_status_comment(target, marker, intent, lambda: False)['disposition'] == 'third'
+    fresh = [json.loads(line) for line in calls.read_text().splitlines()][baseline:]
+    assert fresh[:-1] == rows and fresh[-1][:2] == ['api', 'graphql']
+    assert len(json.loads(state.read_text())['status_writes']) == 1
+
+
 def test_remote_fixture_keeps_exact_repository_actor_and_publication_receipt(tmp_path, monkeypatch):
     repository, actor = "publisher/project", "bounded-actor"
     port, _git, push, state, calls = _fixture(tmp_path, monkeypatch, repository=repository, actor=actor)
