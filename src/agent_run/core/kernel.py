@@ -874,18 +874,23 @@ class Kernel:
 
     def accept_work(self, request: IORequest, result: IOResult) -> Step | IORequest:
         work = request.work
-        self._work_run(work, request)
-        if isinstance(request, EffectIO) and isinstance(result, EffectResult):
-            returncode = result.raw.get("write_returncode")
-            if type(returncode) is int and returncode != 0:
-                from agent_run.errors import bounded_error
-                self.observe_effect_failure(request.effect, {"returncode": returncode,
-                    "message": bounded_error(str(result.raw.get("write_diagnostic", "")))})
-            if request.kind == "readback" or request.effect.operation != "issue_link":
-                self._record_readback(request.effect, result)
-        with self.storage.transaction(write=False) as tx:
-            self._automatic_owned(tx, tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
-                                          (), run_last=True)), work.execution)
+        if not isinstance(request, ObserveIO) or request.after is not None:
+            # Finite preparation/readback audit has its own committed boundary.
+            # An ordinary observation has no such intermediate effect: its
+            # selected Run, execution and full fence are checked together in
+            # _route_work's existing transaction before advancing any work.
+            self._work_run(work, request)
+            if isinstance(request, EffectIO) and isinstance(result, EffectResult):
+                returncode = result.raw.get("write_returncode")
+                if type(returncode) is int and returncode != 0:
+                    from agent_run.errors import bounded_error
+                    self.observe_effect_failure(request.effect, {"returncode": returncode,
+                        "message": bounded_error(str(result.raw.get("write_diagnostic", "")))})
+                if request.kind == "readback" or request.effect.operation != "issue_link":
+                    self._record_readback(request.effect, result)
+            with self.storage.transaction(write=False) as tx:
+                self._automatic_owned(tx, tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
+                                              (), run_last=True)), work.execution)
         if isinstance(request, ObserveIO):
             if not isinstance(result, tuple):
                 raise KernelError("observation_binding")

@@ -231,6 +231,120 @@ def test_foreign_work_cannot_commit_audit_before_the_selected_run_binding_is_che
     assert {run: _rows(db, run) for run in ("A", "B")} == before
 
 
+def _returned_observation(kernel, run='A'):
+    request = kernel.next_work(_execution(run))
+    assert isinstance(request, ObserveIO) and request.after is None
+    accepted = kernel.accept_requirements(request.request, _source(run))
+    return request, kernel.accept_delivery(accepted, DeliveryFacts(BASE, BASE))
+
+
+@pytest.mark.parametrize('change', ['stop', 'epoch', 'generation', 'source_sequence'])
+def test_observation_consumption_rechecks_current_facts_in_its_transition(scenario, change):
+    db, kernels = scenario
+    kernel = kernels['A']
+    request, result = _returned_observation(kernel)
+    if change == 'stop':
+        kernel.control('stop', 'stop-before-consumption')
+    elif change == 'generation':
+        db.execute("UPDATE subjects SET generation=generation+1 WHERE run_id='A'")
+    elif change == 'source_sequence':
+        fresh = kernel.begin_observation(SUBJECT, execution=_execution('A'))
+        kernel.accept_requirements(fresh, _source('A', 'changed-before-consumption'))
+    else:
+        db.execute(f"UPDATE runs SET {change}={change}+1 WHERE id='A'")
+    before = {run: _rows(db, run) for run in ('A', 'B')}
+    try:
+        step = kernel.accept_work(request, result)
+    except KernelError as error:
+        assert error.code in {'executor_fenced', 'automatic_step_superseded', 'automatic_step_paused'}
+    else:
+        assert change == 'stop' and step.kind == 'paused'
+    assert {run: _rows(db, run) for run in ('A', 'B')} == before
+
+
+def test_observation_consumption_rejects_foreign_work_before_any_transition(scenario):
+    db, kernels = scenario
+    kernel = kernels['A']
+    request, (world, fence) = _returned_observation(kernel)
+    foreign = replace(request, work=replace(request.work, execution=_execution('B')))
+    before = {run: _rows(db, run) for run in ('A', 'B')}
+    with pytest.raises(KernelError):
+        kernel.accept_work(foreign, (world, replace(fence, execution=_execution('B'))))
+    assert {run: _rows(db, run) for run in ('A', 'B')} == before
+
+
+def test_observation_consumption_keeps_sql_refusal_and_poison_before_transition(scenario):
+    db, kernels = scenario
+    kernel = kernels['A']
+    request, result = _returned_observation(kernel)
+    before = {run: _rows(db, run) for run in ('A', 'B')}
+    def deny(operation, table, column, _database, _source):
+        return sqlite3.SQLITE_DENY if (operation, table, column) == (sqlite3.SQLITE_READ, 'runs', 'policy') else sqlite3.SQLITE_OK
+    db.set_authorizer(deny)
+    try:
+        with pytest.raises(sqlite3.DatabaseError):
+            kernel.accept_work(request, result)
+        assert kernel.owners[-1].failed and not db.in_transaction
+    finally:
+        db.set_authorizer(None)
+    assert {run: _rows(db, run) for run in ('A', 'B')} == before
+
+
+@pytest.mark.parametrize('failure', [OSError('close failed'), InterruptedError('cancelled')])
+def test_observation_transition_exit_failure_does_not_complete_or_retry(scenario, monkeypatch, failure):
+    _db, kernels = scenario
+    kernel = kernels['A']
+    request, result = _returned_observation(kernel)
+    transaction, opened, completed = kernel.storage.transaction, [], []
+    @contextmanager
+    def failing(**options):
+        opened.append(options)
+        with transaction(**options) as tx:
+            yield tx
+        raise failure
+    monkeypatch.setattr(kernel.storage, 'transaction', failing)
+    monkeypatch.setattr(kernel, '_complete_work', lambda *args: completed.append(args))
+    with pytest.raises(type(failure)) as caught:
+        kernel.accept_work(request, result)
+    assert caught.value is failure and len(opened) == 1 and completed == []
+
+
+@pytest.mark.parametrize('encoding', ['UTF-8', 'UTF-16le'])
+@pytest.mark.parametrize('policy_bytes', [8 * 1024 * 1024, 15 * 1024 * 1024])
+def test_observation_consumption_adds_no_reads_to_the_transition_owner(scenario, monkeypatch, encoding, policy_bytes):
+    db, kernels = scenario
+    request, result = _returned_observation(kernels['A'])
+    dump = '\n'.join(db.iterdump())
+    outcomes = []
+    for through_accept in (False, True):
+        with closing(sqlite3.connect(':memory:', isolation_level=None)) as copy:
+            copy.row_factory = sqlite3.Row
+            copy.execute("PRAGMA encoding='" + encoding + "'")
+            copy.executescript(dump)
+            copy.execute('PRAGMA foreign_keys=ON')
+            raw = bytes(copy.execute("SELECT policy FROM runs WHERE id='A'").fetchone()[0])
+            copy.execute("UPDATE runs SET policy=? WHERE id='A'", (raw + b' ' * (policy_bytes - len(raw)),))
+            kernel = ScopedKernel(copy, 'A')
+            serial = iter(range(1, 100))
+            monkeypatch.setattr(core, 'identity', lambda: f'{next(serial):032x}')
+            try:
+                step = (kernel.accept_work(request, result) if through_accept else
+                        kernel._route_work(request.work, *result))
+                outcome = step
+            except KernelError as error:
+                outcome = error.code
+            outcomes.append((outcome, [(owner.rows_read, owner.bytes_read, owner.failed) for owner in kernel.owners],
+                             {run: _rows(copy, run) for run in ('A', 'B')}))
+    # The actual consumer has exactly its original owner(s), including errors,
+    # ordinary SQL byte accounting and repeated material adoption. No allowance
+    # is pooled, reset or returned when the preliminary readers disappear.
+    assert outcomes[0] == outcomes[1]
+    if policy_bytes == 8 * 1024 * 1024:
+        assert isinstance(outcomes[0][0], Step)
+    else:
+        assert outcomes[0][0] == 'query_limit'
+
+
 def _ticket_source(run, *, closed=False, body='original'):
     from agent_run.model import Blocker, Issue
     return Requirements(ParentIssue(1, 'Parent ' + run, 'Frozen background', (2, 3)), (
