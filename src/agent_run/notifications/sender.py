@@ -35,7 +35,7 @@ from agent_run.notifications.event_projection import completion_context, event_s
 from agent_run.queries.resume_facts import resume_facts
 from agent_run.notifications.progress import obsolete_progress
 from agent_run.notifications.status_comment import StatusComments
-from agent_run.queries.status_comment import project_status, status_subjects
+from agent_run.queries.status_comment import status_subjects
 from agent_run.adapters.remote import PhysicalAPI
 from agent_run.adapters.auth.credential_lifecycle import WORKER_CREDENTIAL_PROVIDER_OPERATION_TIMEOUT_SECONDS
 from agent_run.queries.read_facts import material, read_boundaries
@@ -382,13 +382,13 @@ class NativeNotifications:
         for subject in status_subjects(self.database, **self._storage_options):
             if call.cancel.is_set():
                 break
-            projection = project_status(self.database, subject, **self._storage_options)
-            fingerprint = (projection.target.key, hashlib.sha256(projection.body.encode()).hexdigest())
-            if self._status_seen.get(subject) == fingerprint:
-                continue
             # Readback may settle an older sent intent before applying current copy.
-            for _ in range(2):
-                result = self.status.deliver(subject, api=self.status_api, cancelled=call.cancel.is_set)
+            for opportunity in range(2):
+                if opportunity == 0:
+                    result, fingerprint = self.status.deliver_current(subject,
+                        previous=self._status_seen.get(subject), api=self.status_api, cancelled=call.cancel.is_set)
+                else:
+                    result = self.status.deliver(subject, api=self.status_api, cancelled=call.cancel.is_set)
                 if call.cancel.is_set():
                     break  # Preserve the original intent and retry display after important delivery.
                 if result != "confirmed":

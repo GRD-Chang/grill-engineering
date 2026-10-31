@@ -423,13 +423,16 @@ def test_status_state_change_between_staging_and_claim_fences_original_copy(tmp_
     database, subject = scenario.kernel.storage.path, scenario.delivery.key
     sender = StatusComments(database, storage=scenario.kernel.storage)
     api = CommentsAPI(project_status(database, subject, storage=scenario.kernel.storage).target)
-    stage = sender.stage
+    projection = sender._projection
+    changed = []
     def changed_after_stage(owner):
-        original = stage(owner)
-        scenario.kernel.control("stop", "between-status-stage-and-claim", subject=subject)
+        original = projection(owner)
+        if not changed:
+            changed.append(True)
+            scenario.kernel.control("stop", "between-status-stage-and-claim", subject=subject)
         return original
     with monkeypatch.context() as patch:
-        patch.setattr(sender, "stage", changed_after_stage)
+        patch.setattr(sender, "_projection", changed_after_stage)
         assert sender.deliver(subject, api=api) == "unavailable"
     assert api.commands == []
     assert sender.deliver(subject, api=api) == "confirmed"
@@ -444,15 +447,15 @@ def test_concurrent_confirmation_is_no_work_before_claim_and_cancel_releases_cla
     first, second = StatusComments(database, storage=scenario.kernel.storage), StatusComments(database, storage=scenario.kernel.storage)
     api = CommentsAPI(project_status(database, subject, storage=scenario.kernel.storage).target)
     entered, release = Event(), Event()
-    stage = first.stage
+    projection = first._projection
     def staged(owner):
-        value = stage(owner)
+        value = projection(owner)
         entered.set()
         assert release.wait(5)
         return value
     before = database.read_bytes()
     with monkeypatch.context() as patch, ThreadPoolExecutor(max_workers=1) as pool:
-        patch.setattr(first, "stage", staged)
+        patch.setattr(first, "_projection", staged)
         future = pool.submit(first.deliver, subject, api=api)
         try:
             assert entered.wait(5)

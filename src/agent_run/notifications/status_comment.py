@@ -2,6 +2,7 @@
 from copy import deepcopy
 from pathlib import Path
 from collections.abc import Callable
+import hashlib
 import os
 import sqlite3
 import time
@@ -114,31 +115,53 @@ class StatusComments:
 
     def deliver(self, subject: str, *, api: PhysicalAPI | None = None,
                 cancelled: Callable[[], bool] = lambda: False) -> str:
+        """Direct delivery retains its best-effort projection failure result."""
+        deadline = time.monotonic() + outbox.DELIVERY_LIFETIME_SECONDS
+        try:
+            projection = self._projection(subject)
+        except (GitHubCredentialError, OSError, ValueError, KernelError, GitHubReadError, sqlite3.Error):
+            return "unavailable"
+        return self._deliver_projection(subject, projection, deadline, api=api, cancelled=cancelled)
+
+    def deliver_current(self, subject: str, *, previous: tuple[str, str] | None = None,
+                        api: PhysicalAPI | None = None,
+                        cancelled: Callable[[], bool] = lambda: False) -> tuple[str, tuple[str, str]]:
         """One bounded opportunity; the existing sender supplies scheduling/cancellation.
 
         A sent intent is only reconciled, never blindly replayed. No background
         thread, business transition, process grant or second outbox is created.
+        Initial projection failures propagate to the sender, as its former
+        fingerprint read did. The fingerprint suppresses display work only;
+        each later opportunity and final write admission read fresh facts.
         """
-        projection, claim = None, None
         deadline = time.monotonic() + outbox.DELIVERY_LIFETIME_SECONDS
+        projection = self._projection(subject)
+        fingerprint = (projection.target.key, hashlib.sha256(projection.body.encode()).hexdigest())
+        if previous == fingerprint:
+            return "unchanged", fingerprint
+        return self._deliver_projection(subject, projection, deadline, api=api, cancelled=cancelled), fingerprint
+
+    def _deliver_projection(self, subject: str, projection: StatusProjection, deadline: float, *,
+                            api: PhysicalAPI | None, cancelled: Callable[[], bool]) -> str:
+        """Use this entry's just-closed projection; only fresh admit permits a write."""
+        claim = None
         def stopped() -> bool:
             return cancelled() or time.monotonic() >= deadline
         try:
-            intent = self.stage(subject)
-            if intent is None:
-                return "unchanged"
-            projection = self._projection(subject)
             target = projection.target
             with outbox.transaction(self.database.parent, target.run_id) as document:
                 entry = self._entry(document, projection)
-                owner = entry.get("claim")
-                if owner and _process_binding_status(owner["pid"], owner["token"]) != "absent":
-                    return "busy"
                 if entry.get("failure") is not None:
                     raise ValueError("Status delivery paused")
-                current_intent = entry["intent"]
-                if current_intent is None:
-                    current_intent = self._stage_entry(entry, projection)
+                owner = entry.get("claim")
+                if owner:
+                    if _process_binding_status(owner["pid"], owner["token"]) != "absent":
+                        if (entry["intent"] is None
+                                and entry["confirmed_body"] == entry["marker"] + "\n" + projection.body):
+                            return "unchanged"
+                        return "busy"
+                    entry.pop("claim")
+                current_intent = self._stage_entry(entry, projection)
                 if current_intent is None:
                     return "unchanged"
                 claim = {"pid": os.getpid(), "token": _process_start_token(os.getpid()), "id": uuid.uuid4().hex}
