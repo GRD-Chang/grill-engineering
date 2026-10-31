@@ -8,6 +8,7 @@ import pytest
 
 from agent_run.core.kernel import Kernel
 from agent_run.core.operation_runner import OperationRunner
+from agent_run.notifications.sender import NativeNotifications
 from agent_run.storage.run_scope import RunTransaction
 from agent_run.storage.sqlite import Storage, Transaction
 from support import host_cost_trace as costs
@@ -231,16 +232,96 @@ def test_fixed_entry_labels_count_real_calls_and_restore_after_failure(trace, mo
             return sentinel
     sentinel = object()
     monkeypatch.setattr(Storage, 'transaction', transaction)
-    for cls, name in ((Kernel, 'guard_agent'), (OperationRunner, 'run_once'),
+    for cls, name in ((Kernel, 'guard_agent'), (Kernel, 'worker_settled'), (NativeNotifications, '_send_status'), (OperationRunner, 'run_once'),
                       (OperationRunner, 'state'), (OperationRunner, 'supervise')):
         monkeypatch.setattr(cls, name, read)
     costs.observe_host(monkeypatch.setattr, trace)
-    for cls, name in ((Kernel, 'guard_agent'), (OperationRunner, 'run_once'),
+    for cls, name in ((Kernel, 'guard_agent'), (Kernel, 'worker_settled'), (NativeNotifications, '_send_status'), (OperationRunner, 'run_once'),
                       (OperationRunner, 'state'), (OperationRunner, 'supervise')):
         assert getattr(cls, name)(object()) is sentinel
     assert {key: row['calls'] for key, row in trace.reader_totals.items()} == {
-        'guard/preparation': 1, 'operation/accept': 1, 'state/supervise': 2}
+        'guard/preparation': 1, 'worker/lifecycle': 1, 'Status': 1,
+        'operation/accept': 1, 'state/supervise': 2}
     assert trace.guard_calls == 1 and trace.local.category == 'other'
+    assert events == ['enter', 'exit'] * 6
+
+
+@pytest.mark.parametrize('owner,name', [(NativeNotifications, '_send_status'), (Kernel, 'worker_settled')])
+def test_new_marks_add_no_timer_query_or_publish_when_original_does_not_read(trace, monkeypatch, owner, name):
+    sentinel = object()
+    monkeypatch.setattr(owner, name, lambda *args, **kwargs: sentinel)
+    costs.observe_host(monkeypatch.setattr, trace)
+    def forbidden(*args, **kwargs):
+        pytest.fail('An entry label must not sample, query or publish')
+    monkeypatch.setattr(costs, 'thread_time_ns', forbidden)
+    monkeypatch.setattr(trace, 'flush', forbidden)
+    monkeypatch.setattr(Transaction, 'execute', forbidden)
+    assert getattr(owner, name)(object()) is sentinel
+    assert not trace.totals and not trace.reader_totals and trace.local.category == 'other'
+
+
+@pytest.mark.parametrize('target', ['status', 'settled'])
+@pytest.mark.parametrize('failure_type', [RuntimeError, TimeoutError, InterruptedError, KeyboardInterrupt])
+def test_new_entry_failure_keeps_original_when_reader_timer_also_fails(trace, monkeypatch, target, failure_type):
+    original, watchdog = failure_type('original'), TimeoutError('reader timer')
+    calls, failed = [], []
+    timer = costs.thread_time_ns
+    def measured_cpu():
+        if failed:
+            raise watchdog
+        return timer()
+    @contextmanager
+    def transaction(*args, **kwargs):
+        yield Transaction(None)
+    def read(*args, **kwargs):
+        calls.append((args, kwargs))
+        with Storage.transaction(object(), write=False):
+            failed.append(True)
+            raise original
+    owner, name = (NativeNotifications, '_send_status') if target == 'status' else (Kernel, 'worker_settled')
+    monkeypatch.setattr(owner, name, read)
+    monkeypatch.setattr(Storage, 'transaction', transaction)
+    costs.observe_host(monkeypatch.setattr, trace)
+    monkeypatch.setattr(costs, 'thread_time_ns', measured_cpu)
+    sentinel = object()
+    with pytest.raises(failure_type) as caught:
+        getattr(owner, name)(sentinel, 'private', option=sentinel)
+    assert caught.value is original and calls == [((sentinel, 'private'), {'option': sentinel})]
+    assert trace.local.reader is None and trace.local.category == 'other'
+    monkeypatch.setattr(costs, 'thread_time_ns', timer)
+    with Storage.transaction(object(), write=False):
+        pass
+    assert trace.reader_totals.keys() == {'other'} and trace.guard_calls == 0
+
+
+def test_executor_lifecycle_keeps_guard_separate_and_restores_outer_tag(trace, monkeypatch):
+    import sys
+    events = []
+    @contextmanager
+    def transaction(*args, **kwargs):
+        with context(Transaction(None), events) as tx:
+            yield tx
+    def read(*args, **kwargs):
+        with Storage.transaction(object(), write=False):
+            pass
+    class Driver:
+        def agent(self):
+            read()
+            Kernel.guard_agent(object())
+            Kernel.worker_settled(object())
+    module = SimpleNamespace(__spec__=SimpleNamespace(name='agent_run.runtime.executor'), _Executor=Driver, wait=lambda: None)
+    monkeypatch.delitem(sys.modules, 'agent_run.runtime.executor', raising=False)
+    monkeypatch.setitem(sys.modules, '__main__', module)
+    monkeypatch.setattr(Storage, 'transaction', transaction)
+    monkeypatch.setattr(Kernel, 'guard_agent', read)
+    monkeypatch.setattr(Kernel, 'worker_settled', read)
+    costs.observe_host(monkeypatch.setattr, trace)
+    Driver().agent()
+    read()
+    assert {key: row['calls'] for key, row in trace.reader_totals.items()} == {
+        'worker/lifecycle': 2, 'guard/preparation': 1, 'other': 1}
+    assert trace.guard_calls == 1 and trace.local.category == 'other'
+    assert all(row['max_depth'] == 1 for row in trace.reader_totals.values())
     assert events == ['enter', 'exit'] * 4
 
 

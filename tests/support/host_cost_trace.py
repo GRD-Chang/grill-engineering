@@ -153,11 +153,13 @@ class HostCosts:
         return {'runtime': self.runtime, 'guard_calls': self.guard_calls,
                 'coverage': {'guard/preparation': ['Kernel.guard_agent'],
                              'state/supervise': ['OperationRunner.state', 'OperationRunner.supervise'],
-                             'operation/accept': ['OperationRunner.run_once'], 'Status': [], 'other': []},
+                             'operation/accept': ['OperationRunner.run_once'],
+                             'worker/lifecycle': ['_Executor.agent', 'Kernel.worker_settled'],
+                             'Status': ['NativeNotifications._send_status'], 'other': []},
                 'totals': {key: {**value, 'missing': value['missing'].copy()} for key, value in self.reader_totals.items()},
                 'association': {'request': request, 'execution': execution, 'conflict': self.identity_conflict,
                                 'request_matches_execution': associated, 'nonce_handshake_proven': False},
-                'scope': 'Outermost reader only per thread; parallel wall overlaps. Rows/bytes are final cumulative counters of successful owners only; missing is explicit. Tags cover listed entries, not all work. Status is untagged. Trace/profile describe entry only. Host request matching is association, not physical nonce proof.'}
+                'scope': 'Outermost reader only per thread; parallel wall overlaps. Rows/bytes are final cumulative counters of successful owners only; missing is explicit. Tags cover listed entries, not all work; nested labels cannot reclassify an open reader. Status covers the sender call, not every notification path. Trace/profile describe entry only. Host request matching is association, not physical nonce proof.'}
 
     @contextmanager
     def span(self, phase, *, publish=False):
@@ -312,6 +314,7 @@ def observe_host(setattr_, costs):
     from agent_run.storage.sqlite import Storage
     from agent_run.core.kernel import Kernel
     from agent_run.adapters.local_git import LocalEffects
+    from agent_run.notifications.sender import NativeNotifications
 
     def wrap(owner, name, phase, *, publish=False, category=None):
         original = getattr(owner, name)
@@ -329,12 +332,17 @@ def observe_host(setattr_, costs):
     wrap(OperationRunner, 'run_once', 'operation', publish=True, category='operation/accept')
     for name in ('state', 'supervise'):
         wrap(OperationRunner, name, 'core.' + name, category='state/supervise')
-    guard = Kernel.guard_agent
-    @wraps(guard)
-    def guarded(*args, **kwargs):
-        with costs.entry('guard/preparation'):
-            return guard(*args, **kwargs)
-    setattr_(Kernel, 'guard_agent', guarded)
+    def mark(owner, name, category):
+        original = getattr(owner, name)
+        @wraps(original)
+        def call(*args, **kwargs):
+            with costs.entry(category):
+                return original(*args, **kwargs)
+        setattr_(owner, name, call)
+
+    mark(Kernel, 'guard_agent', 'guard/preparation')
+    mark(Kernel, 'worker_settled', 'worker/lifecycle')
+    mark(NativeNotifications, '_send_status', 'Status')
     request = Kernel.host_request
     @wraps(request)
     def requested(self, action_id):
@@ -354,7 +362,7 @@ def observe_host(setattr_, costs):
             if (module is not None and getattr(getattr(module, '__spec__', None), 'name', None)
                     == 'agent_run.runtime.executor' and id(module) not in observed):
                 observed.add(id(module))
-                wrap(module._Executor, 'agent', 'worker', publish=True)
+                wrap(module._Executor, 'agent', 'worker', publish=True, category='worker/lifecycle')
                 wrap(module, 'wait', 'host.future_wait', publish=True)
     init = OperationRunner.__init__
     @wraps(init)
