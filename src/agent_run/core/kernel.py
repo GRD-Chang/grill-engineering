@@ -211,12 +211,16 @@ class Kernel:
             return OperationBinding(Path(run["repository_root"]), run["repository"], run["parent_issue"], inputs,
                                     tuple(paths), tuple(variables))
 
-    def _read_fence(self, tx: Transaction, subject: str | None, execution: Execution | None, cleanup: bool) -> ReadFence:
+    def _read_fence(self, tx: Transaction, subject: str | None, execution: Execution | None, cleanup: bool, *,
+                    run: sqlite3.Row | None = None) -> ReadFence:
         selected = transaction_scope(tx)
         if execution is not None and execution.run_id != selected.run_id:
             raise KernelError("effect_binding")
-        run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
-                  (), run_last=True))
+        if run is None:
+            run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
+                      (), run_last=True))
+        if run['id'] != selected.run_id:
+            raise KernelError("effect_binding")
         return ReadFence(execution, subject, cleanup, wire_json(self._automatic_scope(tx, run, subject, cleanup)),
                          run["source_sequence"], tuple(run[key] for key in ("executor", "epoch", "stopped", "blocked", "final_action")))
 
@@ -227,19 +231,28 @@ class Kernel:
     def _begin_observation(self, subject: str | None, *, execution: Execution | None = None,
                            cleanup: bool = False, call: AgentCall | None = None,
                            delivery: bool = True, local_effect: Effect | None = None) -> RequirementsRead:
+        guard_required = execution is not None
         with self.storage.transaction(write=False) as tx:
             if call is not None:
                 if (call.subject, call.execution) != (subject, execution):
                     raise KernelError("invocation_binding")
                 self._agent_authority(tx, call)
-            if execution is not None:
-                self._automatic_owned(tx, tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
-                                              (), run_last=True)), execution)
-            fence = replace(self._read_fence(tx, subject, execution, cleanup), local_effect=local_effect)
-            parent = tx.one(*run_statement(tx, 'SELECT parent_issue FROM runs WHERE id=?',
-                         (), run_last=True))[0]
+            run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
+                      (), run_last=True))
+            ordinary = execution is not None and self._automatic_owned(tx, run, execution)
+            fence = replace(self._read_fence(tx, subject, execution, cleanup, run=run), local_effect=local_effect)
+            parent = run['parent_issue']
             query = self._delivery_read(tx, fence) if delivery else None
-        if execution is not None:
+            if (ordinary and subject is not None and call is None and not cleanup
+                    and not run['stopped'] and not run['blocked']
+                    and not tx.rows('SELECT 1 FROM gates WHERE run_id=? AND subject=? LIMIT 1', (run['id'], subject))):
+                # Ownership and this exact fence were proved in this snapshot.
+                # No intervening I/O or DML can change their facts. Read the
+                # original clock now; defer backoff/timeout to the original
+                # guard only after this reader has closed normally.
+                window = self._operation_read_window(tx, run, self._automatic_token(fence)['scope'])
+                guard_required = self._read_window_state(window, after_read=False) is not None
+        if guard_required and execution is not None:
             waiting = self._guard_automatic_step(fence, execution)
             if waiting is not None:
                 raise ReadWait(waiting)
@@ -2985,12 +2998,13 @@ class Kernel:
             return self._allocate(tx, run, job, work, world)
         return self._mechanical(tx, run, job, work, world)
 
-    def _automatic_owned(self, tx: Transaction, run: sqlite3.Row, execution: Execution) -> None:
+    def _automatic_owned(self, tx: Transaction, run: sqlite3.Row, execution: Execution) -> bool:
         abandoned = self._abandon_action(tx)
         if abandoned is None:
             self._executor_owned(tx, run, execution)
         else:
             self._abandon_owned(tx, abandoned, execution)
+        return abandoned is None
 
     def _automatic_scope(self, tx: Transaction, run: sqlite3.Row, subject: str | None, cleanup: bool, *,
                          read: _SubjectSnapshot | None = None) -> dict[str, Any]:
@@ -3159,25 +3173,48 @@ class Kernel:
             return self._operation_read_wait(tx, tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?',
                                                      (), run_last=True)), scope, after_read=True)
 
-    def _operation_read_wait(self, tx: Transaction, run: sqlite3.Row, scope: dict[str, Any], *,
-                             after_read: bool, write_timeout: bool = True) -> Step | None:
+    def _operation_read_window(self, tx: Transaction, run: sqlite3.Row,
+                               scope: dict[str, Any]) -> sqlite3.Row | None:
         selected = transaction_scope(tx)
         if run['id'] != selected.run_id or scope.get('run') != selected.run_id:
             raise KernelError("effect_binding")
         owner = scope["subject"] or tx.one(*run_statement(tx, 'SELECT id FROM subjects WHERE run_id=? ORDER BY id LIMIT 1',
                                         (), run_last=True))[0]
-        rows = tx.rows(*run_statement(tx, "SELECT w.* FROM waits w JOIN material m ON m.run_id=w.run_id AND m.id=w.scope_id WHERE m.subject=? AND m.purpose='supervision_scope' AND m.body=? AND w.run_id=? ORDER BY w.deadline LIMIT 1",
-                   (owner, wire_json(scope)), run_last=True))
-        if rows:
-            row = rows[0]
-            if self.clock() >= row["deadline"]:
-                if not write_timeout:
-                    raise _SupervisionWriteRequired
-                seconds = row["deadline"] - row["started_at"]
-                return self._supervised_wait(tx, run, scope["subject"], scope, row["kind"], seconds)
-            if not after_read and row["next_retry_at"] is not None and self.clock() < row["next_retry_at"]:
-                return Step("waiting", scope["subject"] or "", row["kind"], retry_at=row["next_retry_at"])
+        # This is one read operation in one snapshot. The selected scope was
+        # just checked above; both queries bind it explicitly. A healthy read
+        # does not consume the diagnostic kind or any timeout evidence.
+        rows = tx.rows("SELECT w.rowid AS wait_rowid,w.deadline,w.next_retry_at FROM waits w "
+                       "JOIN material m ON m.run_id=w.run_id AND m.id=w.scope_id "
+                       "WHERE m.subject=? AND m.purpose='supervision_scope' AND m.body=? "
+                       "AND w.run_id=? ORDER BY w.deadline LIMIT 1",
+                       (owner, wire_json(scope), selected.run_id))
+        return rows[0] if rows else None
+
+    def _read_window_state(self, row: sqlite3.Row | None, *, after_read: bool) -> Literal['expired', 'retry'] | None:
+        if row is not None:
+            if self.clock() >= row['deadline']:
+                return 'expired'
+            if not after_read and row['next_retry_at'] is not None and self.clock() < row['next_retry_at']:
+                return 'retry'
         return None
+
+    def _operation_read_wait(self, tx: Transaction, run: sqlite3.Row, scope: dict[str, Any], *,
+                             after_read: bool, write_timeout: bool = True) -> Step | None:
+        row = self._operation_read_window(tx, run, scope)
+        state = self._read_window_state(row, after_read=after_read)
+        if state is None:
+            return None
+        assert row is not None
+        if state == 'expired':
+            if not write_timeout:
+                raise _SupervisionWriteRequired
+            detail = tx.one("SELECT started_at,kind FROM waits WHERE run_id=? AND rowid=?",
+                            (run['id'], row['wait_rowid']))
+            seconds = row['deadline'] - detail['started_at']
+            return self._supervised_wait(tx, run, scope['subject'], scope, detail['kind'], seconds)
+        kind = tx.one("SELECT kind FROM waits WHERE run_id=? AND rowid=?",
+                      (run['id'], row['wait_rowid']))[0]
+        return Step('waiting', scope['subject'] or '', kind, retry_at=row['next_retry_at'])
 
     def _finish_automatic_step(self, token: str, execution: Execution, step: Step) -> Step:
         """Validate healthy Progress read-only; recheck required changes under the writer."""
