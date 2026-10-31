@@ -265,6 +265,8 @@ def install_cli(tmp_path, monkeypatch, calls, *, fail_at=None, failure=None, res
             return result
         return call
     monkeypatch.setattr(ForegroundHost, 'launch', original('launch'))
+    monkeypatch.setattr(lifecycle, '_submit', original('submit'))
+    monkeypatch.setattr(lifecycle, '_notify_committed', original('notify'))
     monkeypatch.setattr(cli_main, 'main', original('main'))
     path = tmp_path / 'cli.jsonl'
     return path, host_close_trace.install_cli(path)
@@ -273,19 +275,21 @@ def install_cli(tmp_path, monkeypatch, calls, *, fail_at=None, failure=None, res
 @pytest.mark.parametrize('result', [0, 7])
 def test_cli_records_original_calls_identity_and_no_sensitive_arguments(tmp_path, monkeypatch, result):
     calls, request = [], SimpleNamespace(run_id='run-123', nonce='nonce-456', private='secret-request')
-    notify = lifecycle._notify_committed
     path, fd = install_cli(tmp_path, monkeypatch, calls, result=result)
     manager, kernel = object(), object()
     try:
         assert not os.get_inheritable(fd)
-        assert lifecycle._notify_committed is notify
         assert ForegroundHost.launch(manager, kernel, request, lock='secret-lock', lease=kernel) == result
+        assert lifecycle._submit(kernel, request, manager=manager) == result
+        assert lifecycle._notify_committed(kernel) == result
         assert cli_main.main(['secret-cli'], repository_routes=kernel) == result
         assert calls[0] == ('launch', (manager, kernel, request), {'lock': 'secret-lock', 'lease': kernel})
+        assert calls[1] == ('submit', (kernel, request), {'manager': manager})
+        assert calls[2] == ('notify', (kernel,), {})
         assert calls[-1] == ('main', (['secret-cli'],), {'repository_routes': kernel})
         rows = [json.loads(line) for line in path.read_text().splitlines()]
         assert [row['stage'] for row in rows] == [
-            'foreground_launch_return', 'cli_return']
+            'foreground_launch_return', 'submit_return', 'notify_enter', 'notify_return', 'cli_return']
         assert rows[0]['run'] == 'run-123' and rows[0]['nonce'] == 'nonce-456'
         assert rows[-1]['result'] == result
         assert all(row['pid'] == os.getpid() and type(row['monotonic_ns']) is int for row in rows)
@@ -295,7 +299,7 @@ def test_cli_records_original_calls_identity_and_no_sensitive_arguments(tmp_path
         os.close(fd)
 
 
-@pytest.mark.parametrize('where', ['launch', 'main'])
+@pytest.mark.parametrize('where', ['launch', 'main', 'submit', 'notify'])
 def test_cli_business_exception_keeps_original_object_with_benign_diagnostic_failure(tmp_path, monkeypatch, where):
     failure, calls = RuntimeError('secret original failure'), []
     _, fd = install_cli(tmp_path, monkeypatch, calls, fail_at=where, failure=failure)
@@ -305,6 +309,8 @@ def test_cli_business_exception_keeps_original_object_with_benign_diagnostic_fai
     invoke = {
         'launch': lambda: ForegroundHost.launch(object(), object(), SimpleNamespace(run_id='run', nonce='nonce')),
         'main': lambda: cli_main.main(['secret']),
+        'submit': lambda: lifecycle._submit('secret', private='secret'),
+        'notify': lambda: lifecycle._notify_committed('secret'),
     }[where]
     try:
         with pytest.raises(RuntimeError) as caught:
@@ -317,6 +323,8 @@ def test_cli_business_exception_keeps_original_object_with_benign_diagnostic_fai
 @pytest.mark.parametrize('where,stage', [
     ('launch', 'foreground_launch_return'),
     ('main', 'cli_return'),
+    ('submit', 'submit_return'),
+    ('notify', 'notify_return'),
 ])
 @pytest.mark.parametrize('error_type', [TimeoutError, InterruptedError])
 def test_cli_return_diagnostic_control_error_never_retries_original_call(tmp_path, monkeypatch, where, stage, error_type):
@@ -331,10 +339,98 @@ def test_cli_return_diagnostic_control_error_never_retries_original_call(tmp_pat
     invoke = {
         'launch': lambda: ForegroundHost.launch(object(), object(), SimpleNamespace(run_id='run', nonce='nonce')),
         'main': lambda: cli_main.main(['secret']),
+        'submit': lambda: lifecycle._submit('secret', private='secret'),
+        'notify': lambda: lifecycle._notify_committed('secret'),
     }[where]
     try:
         with pytest.raises(error_type) as caught:
             invoke()
         assert caught.value is watchdog and len(calls) == 1
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize('where', ['submit', 'notify'])
+@pytest.mark.parametrize('error_type', [OSError, TimeoutError, InterruptedError, KeyboardInterrupt])
+def test_new_cli_boundaries_keep_original_call_failure(tmp_path, monkeypatch, where, error_type):
+    calls, failure = [], error_type('original call failure')
+    path, fd = install_cli(tmp_path, monkeypatch, calls, fail_at=where, failure=failure)
+    try:
+        with pytest.raises(error_type) as caught:
+            getattr(lifecycle, '_submit' if where == 'submit' else '_notify_committed')('private')
+        assert caught.value is failure and len(calls) == 1
+        stages = [json.loads(line)['stage'] for line in path.read_text().splitlines()]
+        assert stages == ([] if where == 'submit' else ['notify_enter'])
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize('source', ['write', 'cpu'])
+@pytest.mark.parametrize('error_type', [TimeoutError, InterruptedError])
+@pytest.mark.parametrize('stage', ['notify_enter', 'notify_return', 'submit_return'])
+def test_new_boundary_probe_failure_propagates_without_fallback(
+    tmp_path, monkeypatch, source, error_type, stage,
+):
+    calls, failure = [], error_type('probe watchdog')
+    _, fd = install_cli(tmp_path, monkeypatch, calls)
+    write, snapshot = host_close_trace.os.write, host_close_trace.cpu_snapshot
+    def failed_write(descriptor, payload):
+        if json.loads(payload)['stage'] == stage:
+            raise failure
+        return write(descriptor, payload)
+    def failed_cpu(**kwargs):
+        # notify_enter is the first snapshot; notify_return follows one write.
+        if stage != 'notify_return' or calls:
+            raise failure
+        return snapshot(**kwargs)
+    monkeypatch.setattr(host_close_trace, 'cpu_snapshot', failed_cpu if source == 'cpu' else snapshot)
+    monkeypatch.setattr(host_close_trace.os, 'write', failed_write if source == 'write' else write)
+    try:
+        with pytest.raises(error_type) as caught:
+            getattr(lifecycle, '_submit' if stage == 'submit_return' else '_notify_committed')('private')
+        assert caught.value is failure
+        assert len(calls) == (0 if stage == 'notify_enter' else 1)
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize('where', ['submit', 'notify'])
+@pytest.mark.parametrize('context', ['finally', 'handled-except'])
+@pytest.mark.parametrize('new_failure', [None, TimeoutError, InterruptedError])
+def test_active_exception_completely_bypasses_new_boundary_probes(
+    tmp_path, monkeypatch, where, context, new_failure,
+):
+    calls, original = [], RuntimeError('original business failure')
+    newer = None if new_failure is None else new_failure('new original-call watchdog')
+    path, fd = install_cli(tmp_path, monkeypatch, calls,
+        fail_at=where if newer is not None else None, failure=newer, result=7)
+    probes = []
+    def forbidden(*args, **kwargs):
+        probes.append(True)
+        raise AssertionError('an active exception must bypass all new probes')
+    monkeypatch.setattr(host_close_trace, 'cpu_snapshot', forbidden)
+    monkeypatch.setattr(host_close_trace.os, 'write', forbidden)
+    def invoke():
+        call = getattr(lifecycle, '_submit' if where == 'submit' else '_notify_committed')
+        if context == 'finally':
+            try:
+                raise original
+            finally:
+                call('private', secret='argument')
+        else:
+            try:
+                raise original
+            except RuntimeError:
+                return call('private', secret='argument')
+    try:
+        if newer is not None or context == 'finally':
+            expected = original if newer is None else newer
+            with pytest.raises(type(expected)) as caught:
+                invoke()
+            assert caught.value is expected
+        else:
+            assert invoke() == 7
+        assert len(calls) == 1 and calls[0][1:] == (('private',), {'secret': 'argument'})
+        assert not probes and path.read_bytes() == b''
     finally:
         os.close(fd)

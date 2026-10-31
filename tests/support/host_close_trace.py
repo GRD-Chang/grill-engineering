@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import sys
 import time
 from support.native_cpu_facts import snapshot as cpu_snapshot
 
@@ -70,12 +71,14 @@ def install(path: Path) -> int:
 
 
 def install_cli(path: Path) -> int:
-    """Launch-to-CLI return interval; notification detail remains unobserved."""
+    """Fixed normal-return boundaries; active exceptions bypass new probes."""
     from agent_run.cli import main as cli_main
+    from agent_run.cli import lifecycle
     from agent_run.runtime.foreground_host import ForegroundHost
 
     descriptor, record = _recorder(path, cli=True)
     launch = ForegroundHost.launch
+    submit, notify = lifecycle._submit, lifecycle._notify_committed
     main = cli_main.main
 
     def observed_launch(self, kernel, request, *args, **kwargs):
@@ -88,7 +91,23 @@ def install_cli(path: Path) -> int:
         record('cli_return', result=result if type(result) is int else None)
         return result
 
+    def observed_submit(*args, **kwargs):
+        if sys.exception() is not None:
+            return submit(*args, **kwargs)
+        result = submit(*args, **kwargs)
+        record('submit_return')
+        return result
+
+    def observed_notify(*args, **kwargs):
+        if sys.exception() is not None:
+            return notify(*args, **kwargs)
+        record('notify_enter')
+        result = notify(*args, **kwargs)
+        record('notify_return')
+        return result
+
     ForegroundHost.launch = observed_launch
+    lifecycle._submit, lifecycle._notify_committed = observed_submit, observed_notify
     cli_main.main = observed_main
     return descriptor
 
