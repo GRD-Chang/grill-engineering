@@ -1,10 +1,11 @@
 """One native-test run's synchronous costs; no arguments, bodies or sampling thread."""
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import wraps
 import json
 import os
 from pathlib import Path
 import stat
+import sqlite3
 import sys
 import threading
 import time
@@ -38,6 +39,125 @@ class HostCosts:
         self.totals, self.active, self.cpu_totals = {}, {}, {}
         self.errors = self.flushes = self.flush_ns = 0
         self.skipped_flushes = 0
+        self.reader_totals, self.guard_calls = {}, 0
+        self.request_identity = self.execution_identity = None
+        self.identity_conflict = False
+        self.runtime = {'python': sys.version.split()[0], 'sqlite': sqlite3.sqlite_version}
+
+    @contextmanager
+    def entry(self, category):
+        previous = getattr(self.local, 'category', 'other')
+        self.local.category = category
+        try:
+            if category == 'guard/preparation':
+                with self.lock:
+                    self.guard_calls += 1
+            yield
+        finally:
+            self.local.category = previous
+
+    @staticmethod
+    def _reader_owner(tx):
+        from agent_run.storage.run_scope import RunTransaction
+        from agent_run.storage.sqlite import Transaction
+        while isinstance(tx, RunTransaction):
+            tx = vars(tx)['_transaction']
+        return tx if isinstance(tx, Transaction) else None
+
+    @contextmanager
+    def reader(self, original):
+        """Observe one public read context; no query, scope or budget calls."""
+        frame = getattr(self.local, 'reader', None)
+        outer = frame is None
+        if outer:
+            started, cpu = time.monotonic_ns(), thread_time_ns()
+            frame = {'category': getattr(self.local, 'category', 'other'), 'depth': 0,
+                     'max_depth': 0, 'owners': {}, 'missing': {},
+                     'trace': int(sys.gettrace() is not None), 'profile': int(sys.getprofile() is not None)}
+            self.local.reader = frame
+        frame['depth'] += 1
+        frame['max_depth'] = max(frame['max_depth'], frame['depth'])
+        failed = ended = False
+        try:
+            with original as tx:
+                yield tx
+            ended = True
+            # The original context has exited successfully. Keep each owner only
+            # until the outer observation ends, including shared Run views.
+            owner = self._reader_owner(tx)
+            if owner is None:
+                frame['missing']['owner_unavailable'] = frame['missing'].get('owner_unavailable', 0) + 1
+            else:
+                frame['owners'][id(owner)] = owner
+        except BaseException:
+            failed = True
+            reason = 'observation_failed' if ended else 'context_failed'
+            frame['missing'][reason] = frame['missing'].get(reason, 0) + 1
+            raise
+        finally:
+            frame['depth'] -= 1
+            if outer:
+                self.local.reader = None
+                try:
+                    elapsed, used_cpu = time.monotonic_ns() - started, thread_time_ns() - cpu
+                    rows = size = owners = 0
+                    if not failed:
+                        for owner in frame['owners'].values():
+                            fields = vars(owner)
+                            r, b = fields.get('rows_read'), fields.get('bytes_read')
+                            if type(r) is not int or type(b) is not int or min(r, b) < 0:
+                                frame['missing']['counters_unavailable'] = frame['missing'].get('counters_unavailable', 0) + 1
+                            else:
+                                owners += 1
+                                rows += r
+                                size += b
+                    with self.lock:
+                        total = self.reader_totals.setdefault(frame['category'],
+                            {'calls': 0, 'failed': 0, 'wall_ns': 0, 'thread_ns': 0, 'max_depth': 0,
+                             'owners': 0, 'rows': 0, 'bytes': 0, 'missing': {}, 'trace_entries': 0, 'profile_entries': 0})
+                        for key, value in (('calls', 1), ('failed', int(failed)), ('wall_ns', elapsed),
+                                           ('thread_ns', used_cpu), ('owners', owners), ('rows', rows), ('bytes', size),
+                                           ('trace_entries', frame['trace']), ('profile_entries', frame['profile'])):
+                            total[key] += value
+                        total['max_depth'] = max(total['max_depth'], frame['max_depth'])
+                        for reason, count in frame['missing'].items():
+                            total['missing'][reason] = total['missing'].get(reason, 0) + count
+                except BaseException:
+                    if not failed:
+                        raise
+                finally:
+                    frame['owners'].clear()
+
+    def host_request(self, action, request):
+        identity = (action, request.run_id, request.owner, request.epoch, request.nonce)
+        with self.lock:
+            if self.request_identity is not None and self.request_identity != identity:
+                self.identity_conflict = True
+            if self.request_identity is None:
+                self.request_identity = identity
+
+    def execution(self, execution):
+        identity = (execution.run_id, execution.owner, execution.epoch)
+        with self.lock:
+            if self.execution_identity is not None and self.execution_identity != identity:
+                self.identity_conflict = True
+            if self.execution_identity is None:
+                self.execution_identity = identity
+
+    def _reader_snapshot(self):
+        # Caller holds the existing aggregate lock. Association is not a nonce
+        # handshake proof; missing/conflicting observations never select a winner.
+        request, execution = self.request_identity, self.execution_identity
+        associated = (not self.identity_conflict and request is not None and execution is not None
+                      and request[1:4] == execution)
+        return {'runtime': self.runtime, 'guard_calls': self.guard_calls,
+                'coverage': {'guard/preparation': ['Kernel.guard_agent'],
+                             'state/supervise': ['OperationRunner.state', 'OperationRunner.supervise'],
+                             'operation/accept': ['OperationRunner.run_once'], 'Status': [], 'other': []},
+                'totals': {key: {**value, 'missing': value['missing'].copy()} for key, value in self.reader_totals.items()},
+                'association': {'request': request, 'execution': execution, 'conflict': self.identity_conflict,
+                                'request_matches_execution': associated, 'nonce_handshake_proven': False},
+                'scope': 'Outermost reader only per thread; parallel wall overlaps. Rows/bytes are final cumulative counters of successful owners only; missing is explicit. Tags cover listed entries, not all work. Status is untagged. Trace/profile describe entry only. Host request matching is association, not physical nonce proof.'}
 
     @contextmanager
     def span(self, phase, *, publish=False):
@@ -102,6 +222,7 @@ class HostCosts:
                     'cpu_columns': ['inclusive_thread_ns', 'exclusive_thread_ns'],
                     'cpu_totals': {phase: row.copy() for phase, row in self.cpu_totals.items()},
                     'cpu_start': self.cpu_start, 'cpu_snapshot': cpu_now,
+                    'readers': self._reader_snapshot(),
                     'active': [[{'phase': phase, 'started_ns': begin, 'elapsed_ns': now - begin}
                                 for phase, begin, _, _, _ in stack] for stack in self.active.values()],
                     'measurement_errors': self.errors, 'flushes': self.flushes, 'flush_ns': self.flush_ns,
@@ -192,21 +313,35 @@ def observe_host(setattr_, costs):
     from agent_run.core.kernel import Kernel
     from agent_run.adapters.local_git import LocalEffects
 
-    def wrap(owner, name, phase, *, publish=False):
+    def wrap(owner, name, phase, *, publish=False, category=None):
         original = getattr(owner, name)
         @wraps(original)
         def call(*args, **kwargs):
             label = phase(*args, **kwargs) if callable(phase) else phase
-            with costs.span(label, publish=publish):
-                return original(*args, **kwargs)
+            with costs.entry(category) if category else nullcontext():
+                with costs.span(label, publish=publish):
+                    return original(*args, **kwargs)
         setattr_(owner, name, call)
 
     for name, phase in (('source', 'source'), ('delivery', 'delivery'),
                         ('source_observation', 'source'), ('complete_observation', 'delivery')):
         wrap(RemoteEffects, name, phase, publish=True)
-    wrap(OperationRunner, 'run_once', 'operation', publish=True)
+    wrap(OperationRunner, 'run_once', 'operation', publish=True, category='operation/accept')
     for name in ('state', 'supervise'):
-        wrap(OperationRunner, name, 'core.' + name)
+        wrap(OperationRunner, name, 'core.' + name, category='state/supervise')
+    guard = Kernel.guard_agent
+    @wraps(guard)
+    def guarded(*args, **kwargs):
+        with costs.entry('guard/preparation'):
+            return guard(*args, **kwargs)
+    setattr_(Kernel, 'guard_agent', guarded)
+    request = Kernel.host_request
+    @wraps(request)
+    def requested(self, action_id):
+        result = request(self, action_id)
+        costs.host_request(action_id, result)
+        return result
+    setattr_(Kernel, 'host_request', requested)
     operations = set(LocalEffects.OPERATIONS) | set(Kernel.REMOTE)
     for name in ('execute', 'reconcile'):
         wrap(RemoteEffects, name, lambda self, effect, *_a, _name=name, **_kw:
@@ -225,7 +360,9 @@ def observe_host(setattr_, costs):
     @wraps(init)
     def initialized(*args, **kwargs):
         observe_executor()
-        return init(*args, **kwargs)
+        result = init(*args, **kwargs)
+        costs.execution(args[0].execution)
+        return result
     setattr_(OperationRunner, '__init__', initialized)
     observe_executor()  # The two existing pre-sealed entries already imported it.
     wrap(git_command, '_require_waitable_children', 'git.waitable_probe')
@@ -255,7 +392,9 @@ def observe_host(setattr_, costs):
             if _name == '_transaction':
                 kind = 'metadata' if kwargs.get('select_run') is False else 'business_' + kind
             with costs.span('sqlite.' + kind):
-                with _original(*args, **kwargs) as tx:
+                original_context = _original(*args, **kwargs)
+                observed_context = costs.reader(original_context) if kind == 'reader' else original_context
+                with observed_context as tx:
                     yield tx
         setattr_(Storage, name, transaction)
     wrap(Storage, '_save_metadata', lambda self, request, identity, cancelled, operation, *_a, **_kw:

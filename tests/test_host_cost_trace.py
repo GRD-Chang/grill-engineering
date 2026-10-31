@@ -219,8 +219,9 @@ def test_official_main_globals_are_bound_after_load_once(trace, monkeypatch):
     module = SimpleNamespace(__spec__=SimpleNamespace(name='agent_run.runtime.executor'),
                              _Executor=Driver, wait=wait)
     monkeypatch.setitem(sys.modules, '__main__', module)
-    OperationRunner.__init__(object())
-    OperationRunner.__init__(object())
+    owner = SimpleNamespace(execution=SimpleNamespace(run_id='run', owner='owner', epoch=1))
+    OperationRunner.__init__(owner)
+    OperationRunner.__init__(owner)
     assert module.wait('private-future', timeout=1) is result
     assert module._Executor().agent('private-call', cancelled='private-event') is result
     assert calls == ['init', 'init', (('private-future',), {'timeout': 1}),
