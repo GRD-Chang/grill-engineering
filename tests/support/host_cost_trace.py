@@ -8,10 +8,13 @@ import stat
 import sys
 import threading
 import time
+from support.native_cpu_facts import snapshot as cpu_snapshot
+from time import thread_time_ns
 
 
 class HostCosts:
     def __init__(self, root):
+        self.cpu_start = cpu_snapshot(cgroup=True)
         self.directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
             info = os.fstat(self.directory)
@@ -32,20 +35,22 @@ class HostCosts:
         self.name = str(time.monotonic_ns()) + '.json'
         self.started = time.monotonic_ns()
         self.lock, self.publish_lock, self.local = threading.Lock(), threading.Lock(), threading.local()
-        self.totals, self.active = {}, {}
+        self.totals, self.active, self.cpu_totals = {}, {}, {}
         self.errors = self.flushes = self.flush_ns = 0
         self.skipped_flushes = 0
 
     @contextmanager
     def span(self, phase, *, publish=False):
         started = time.monotonic_ns()
-        row = [phase, started, 0]
+        cpu_started = thread_time_ns()
+        row = [phase, started, 0, cpu_started, 0]
         with self.lock:
             stack = getattr(self.local, 'stack', [])
             stack.append(row)
             self.local.stack = stack
             self.active[threading.get_ident()] = stack
             self.totals.setdefault(phase, [0, 0, 0, 0, 0])[0] += 1
+            self.cpu_totals.setdefault(phase, [0, 0])
         failed = False
         try:
             if publish:
@@ -58,15 +63,19 @@ class HostCosts:
             # An original exception always wins over a diagnostic failure.
             try:
                 elapsed = time.monotonic_ns() - started
+                cpu_elapsed = thread_time_ns() - cpu_started
                 with self.lock:
                     total = self.totals[phase]
                     total[1] += 1
                     total[2] += int(failed)
                     total[3] += elapsed
                     total[4] += max(0, elapsed - row[2])
+                    self.cpu_totals[phase][0] += cpu_elapsed
+                    self.cpu_totals[phase][1] += max(0, cpu_elapsed - row[4])
                     stack.pop()
                     if stack:
                         stack[-1][2] += elapsed
+                        stack[-1][4] += cpu_elapsed
                     else:
                         self.active.pop(threading.get_ident(), None)
                 if publish:
@@ -84,13 +93,17 @@ class HostCosts:
         errors = 0
         failure = None
         try:
+            cpu_now = cpu_snapshot()
             with self.lock:
                 now = time.monotonic_ns()
                 snapshot = {'started_ns': self.started, 'snapshot_ns': now, 'status': 'snapshot',
                     'columns': ['started', 'completed', 'raised', 'inclusive_ns', 'exclusive_ns'],
                     'totals': {phase: row.copy() for phase, row in self.totals.items()},
+                    'cpu_columns': ['inclusive_thread_ns', 'exclusive_thread_ns'],
+                    'cpu_totals': {phase: row.copy() for phase, row in self.cpu_totals.items()},
+                    'cpu_start': self.cpu_start, 'cpu_snapshot': cpu_now,
                     'active': [[{'phase': phase, 'started_ns': begin, 'elapsed_ns': now - begin}
-                                for phase, begin, _ in stack] for stack in self.active.values()],
+                                for phase, begin, _, _, _ in stack] for stack in self.active.values()],
                     'measurement_errors': self.errors, 'flushes': self.flushes, 'flush_ns': self.flush_ns,
                     'skipped_flushes': self.skipped_flushes}
             # Serialization and every file operation are outside the aggregate
@@ -317,8 +330,9 @@ def read_costs(directory):
         row['snapshot_age_ns'] = read_at - row['snapshot_ns']
     return {'failure_observed_ns': observed, 'snapshot_age_observed_ns': read_at,
             'hosts': rows, 'omitted_hosts': max(0, total - len(paths)),
+            'reader_cpu': cpu_snapshot(cgroup=True),
             'cli_returns': cli_rows, 'omitted_cli_returns': max(0, cli_total - len(cli_paths)),
-            'scope': 'Function-call wall times; inclusive spans overlap, exclusive spans exclude same-thread children; concurrent threads overlap. Active is the last synchronous snapshot. Startup before installation and shutdown after the last flush are unmeasured. Age requires comparable process monotonic clocks; negative age is not comparable.'}
+            'scope': 'CPU totals count only the calling thread, not child processes. Process CPU spans all Host threads; waited_children counts only reaped children. Fixed /sys/fs/cgroup paths expose mount-root counters; they do not establish current-process or job scope. Matching file identity supports differences for the same object only; do not assign those differences to a story. Thread schedstat is sampled only on the publishing thread. Function-call wall times; inclusive spans overlap, exclusive spans exclude same-thread children; concurrent threads overlap. Active is the last synchronous snapshot. Startup before installation and shutdown after the last flush are unmeasured. Age requires comparable process monotonic clocks; negative age is not comparable.'}
 
 
 def note_costs(error, directory, *, arrivals_ns=(), process=None):

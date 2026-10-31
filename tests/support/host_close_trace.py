@@ -3,11 +3,13 @@ import json
 import os
 from pathlib import Path
 import time
+from support.native_cpu_facts import snapshot as cpu_snapshot
 
 
 def _recorder(path: Path, *, cli=False):
     # One private, non-inheritable descriptor for this test Host's lifetime.
     # The OS closes it on exit; no pipe or transport is retained by this trace.
+    cpu_start = cpu_snapshot(cgroup=True) if cli else None
     try:
         descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
     except (TimeoutError, InterruptedError):
@@ -23,7 +25,8 @@ def _recorder(path: Path, *, cli=False):
         try:
             row = {'stage': stage, 'seconds': time.monotonic() - started}
             if cli:
-                row.update(pid=os.getpid(), monotonic_ns=time.monotonic_ns(), **fields)
+                row.update(pid=os.getpid(), monotonic_ns=time.monotonic_ns(),
+                           cpu_start=cpu_start, cpu_snapshot=cpu_snapshot(), **fields)
             os.write(descriptor, (json.dumps(row) + '\n').encode())
         except BaseException as error:
             if isinstance(error, OSError) and not isinstance(error, (TimeoutError, InterruptedError)):
