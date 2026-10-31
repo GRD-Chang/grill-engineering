@@ -6,6 +6,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 
 import pytest
 
@@ -212,7 +213,7 @@ def test_queue_wait_and_sqlite_busy_share_one_second(tmp_path, monkeypatch):
     kernel, _, _, step, _ = agent_preparation_fixture(tmp_path)
     clients = [Storage(kernel.storage.path, run_id=kernel.storage.run_id), Storage(kernel.storage.path, run_id=kernel.storage.run_id)]
     entered = [threading.Event(), threading.Event()]
-    results, ran = {}, []
+    results, ran, barriers = {}, [], {}
     release = threading.Event()
     code = Storage._transaction.__wrapped__.__code__
     lines, start = inspect.getsourcelines(Storage._transaction.__wrapped__)
@@ -221,6 +222,11 @@ def test_queue_wait_and_sqlite_busy_share_one_second(tmp_path, monkeypatch):
         def trace(frame, event, arg):
             if (frame.f_code is code and event == 'line' and frame.f_lineno == before_begin
                     and frame.f_locals.get('request') is not None):
+                if index not in barriers:
+                    observed = time.monotonic()
+                    deadline = frame.f_locals['request'].deadline
+                    barriers[index] = {'deadline': deadline, 'observed_at': observed,
+                                       'remaining': deadline - observed}
                 entered[index].set()
                 assert release.wait(2), 'business BEGIN barrier was not released'
             return trace
@@ -247,9 +253,23 @@ def test_queue_wait_and_sqlite_busy_share_one_second(tmp_path, monkeypatch):
             thread.join(1.5)
         assert all(not thread.is_alive() for thread in threads) and not ran
         assert set(results) == {0, 1}
+        def failure_details():
+            def fields(error):
+                return None if error is None else {
+                    'class': type(error).__name__, 'code': getattr(error, 'code', None),
+                    'reason': getattr(error, 'reason', None), 'protocol': getattr(error, 'protocol', None),
+                    'errno': getattr(error, 'errno', None), 'sqlite_errorcode': getattr(error, 'sqlite_errorcode', None)}
+            return {index: {'elapsed': elapsed, 'before_begin': barriers.get(index),
+                           'exception': fields(error), 'cause': fields(error.__cause__),
+                           'trace': [(os.path.basename(frame.f_code.co_filename), frame.f_code.co_name, line)
+                                     for frame, line in traceback.walk_tb(error.__traceback__)],
+                           'cause_trace': [(os.path.basename(frame.f_code.co_filename), frame.f_code.co_name, line)
+                                          for frame, line in traceback.walk_tb(error.__cause__.__traceback__)]
+                                          if error.__cause__ is not None else []}
+                    for index, (elapsed, error) in results.items()}
         for elapsed, error in results.values():
-            assert isinstance(error, KernelError) and error.code == 'storage_busy'
-            assert 0.8 <= elapsed < 1.3, elapsed
+            assert isinstance(error, KernelError) and error.code == 'storage_busy', failure_details()
+            assert 0.8 <= elapsed < 1.3, failure_details()
     finally:
         release.set()
         external.rollback()

@@ -47,6 +47,14 @@ class UnsupportedState(KernelError):
                 "protocol": self.protocol, "recovery_hint": self.recovery_hint}
 
 
+class _ReadBudgetExpired(UnsupportedState):
+    """Trusted monotonic allowance exhausted, not an observed identity failure."""
+
+    def __init__(self, path: Path, deadline: float) -> None:
+        super().__init__(path, 'uncertain_state')
+        self.deadline = deadline
+
+
 class _ReadBudget:
     """One local observation allowance, never a persisted save clock authority."""
 
@@ -64,8 +72,10 @@ class _ReadBudget:
                 if type(deadline) not in (int, float) or not math.isfinite(deadline):
                     raise ValueError('Finite observation deadline required')
                 self.deadline = min(self.deadline, deadline)
-            if not math.isfinite(self.deadline) or self.deadline <= self.last:
-                raise ValueError('Observation allowance expired')
+            if not math.isfinite(self.deadline):
+                raise ValueError('Finite observation deadline required')
+            if self.deadline <= self.last:
+                raise _ReadBudgetExpired(path, self.deadline)
         except (OSError, TypeError, ValueError, OverflowError) as error:
             raise UnsupportedState(path, 'uncertain_state') from error
 
@@ -83,8 +93,10 @@ class _ReadBudget:
 
     def remaining(self) -> float:
         now = self._now()
-        if now < self.last or now >= self.deadline:
+        if now < self.last:
             raise UnsupportedState(self.path, 'uncertain_state')
+        if now >= self.deadline:
+            raise _ReadBudgetExpired(self.path, self.deadline)
         self.last = now
         return self.deadline - now
 

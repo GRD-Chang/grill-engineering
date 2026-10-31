@@ -21,7 +21,8 @@ from typing import Any, Iterator, Sequence
 from agent_run.storage.sqlite_runtime import require_wal_runtime
 
 from agent_run.errors import KernelError
-from agent_run.storage.preflight import UnsupportedState, read_state, require_supported_connection, require_supported_state
+from agent_run.storage.preflight import (_ReadBudgetExpired, UnsupportedState, read_state,
+                                        require_supported_connection, require_supported_state)
 from agent_run.storage.save_order import (WRITE_CONTENTION_SECONDS, MAX_PENDING_WRITES, RepositorySave, SaveClock, SaveCommit,
     SaveNotHead, check_cancelled, database_identity, remaining, write_owner)
 
@@ -197,7 +198,12 @@ class Storage:
                 # clears inherited ownership after fork. Control bypass remains explicit.
                 identity = scopes.enter_context(write_owner(self.path,
                     deadline=deadline, cancelled=cancelled))
-                require_supported_state(self.path, timeout=remaining(deadline), deadline=deadline)
+                try:
+                    require_supported_state(self.path, timeout=remaining(deadline), deadline=deadline)
+                except _ReadBudgetExpired as error:
+                    if error.deadline != deadline:
+                        raise
+                    raise KernelError('storage_busy', 'SQLite save contention deadline expired; retry the command') from error
                 if database_identity(self.path) != identity:
                     raise UnsupportedState(self.path, "uncertain_state")
             if write and ordered:
@@ -211,10 +217,15 @@ class Storage:
     def _verify_save_database(self, identity: tuple[int, int], deadline: float) -> None:
         if database_identity(self.path) != identity:
             raise UnsupportedState(self.path, "uncertain_state")
-        with read_state(self.path, timeout=remaining(deadline), deadline=deadline) as connection:
-            connection.row_factory = sqlite3.Row
-            require_supported_connection(connection, self.path)
-            self._require_namespace(Transaction(connection))
+        try:
+            with read_state(self.path, timeout=remaining(deadline), deadline=deadline) as connection:
+                connection.row_factory = sqlite3.Row
+                require_supported_connection(connection, self.path)
+                self._require_namespace(Transaction(connection))
+        except _ReadBudgetExpired as error:
+            if error.deadline != deadline:
+                raise
+            raise KernelError('storage_busy', 'SQLite save contention deadline expired; retry the command') from error
         if database_identity(self.path) != identity:
             raise UnsupportedState(self.path, "uncertain_state")
 
