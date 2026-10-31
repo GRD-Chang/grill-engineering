@@ -127,10 +127,27 @@ def test_stopped_epoch_can_settle_its_exact_late_process_return_without_advancin
 
 
 @pytest.mark.parametrize("committed", [False, True], ids=["precommit", "committed_reply_loss"])
-def test_raw_persistence_failure_still_records_exact_process_exit(tmp_path: Path, committed: bool) -> None:
-    path, kernel, call, ports = allocated(tmp_path)
+def test_raw_persistence_failure_still_records_exact_process_exit(tmp_path: Path, git_repo: Path, committed: bool) -> None:
+    path, kernel, call, ports = allocated(git_repo)
     starts = tmp_path / "actual-agent-pids"
     persistence_error = OSError("The raw persistence operation did not return successfully")
+    tracked, untracked = git_repo / 'README.md', git_repo / 'unfinished.txt'
+    original = tracked.read_bytes()
+    original_head = subprocess.run(['git', 'rev-parse', '--verify', 'HEAD'], cwd=git_repo,
+        check=True, capture_output=True, text=True).stdout.strip()
+    tracked_work, untracked_work = b'Tracked unfinished work\n', b'Untracked unfinished work\n'
+
+    def retained_work():
+        assert tracked.read_bytes() == tracked_work
+        assert untracked.read_bytes() == untracked_work
+        assert subprocess.run(['git', 'rev-parse', '--verify', 'HEAD'], cwd=git_repo,
+            check=True, capture_output=True, text=True).stdout.strip() == original_head
+        assert subprocess.run(['git', 'show', 'HEAD:README.md'], cwd=git_repo,
+            check=True, capture_output=True).stdout == original
+        assert subprocess.run(['git', 'diff', '--name-only'], cwd=git_repo,
+            check=True, capture_output=True, text=True).stdout.splitlines() == ['README.md']
+        assert 'unfinished.txt' in subprocess.run(['git', 'ls-files', '--others', '--exclude-standard'],
+            cwd=git_repo, check=True, capture_output=True, text=True).stdout.splitlines()
 
     class FailedRawPersistence(Kernel):
         def receive(self, exact_call: AgentCall, raw: bytes) -> None:
@@ -140,13 +157,25 @@ def test_raw_persistence_failure_still_records_exact_process_exit(tmp_path: Path
 
     arguments = [sys.executable, "-I", "-c", (
         f"from pathlib import Path; import os, sys; "
+        f"Path('README.md').write_bytes({tracked_work!r}); "
+        f"Path('unfinished.txt').write_bytes({untracked_work!r}); "
+        f"Path({str(starts)!r}).open('a').write(str(os.getpid()) + '\\n'); "
+        f"sys.stdout.buffer.write({RAW!r})"
+    )]
+    resume_arguments = [sys.executable, '-I', '-c', (
+        'from pathlib import Path; import os, subprocess, sys; '
+        f"assert Path('README.md').read_bytes() == {tracked_work!r}; "
+        f"assert Path('unfinished.txt').read_bytes() == {untracked_work!r}; "
+        f"assert subprocess.run(['git', 'rev-parse', '--verify', 'HEAD'], check=True, "
+        f"capture_output=True, text=True).stdout.strip() == {original_head!r}; "
         f"Path({str(starts)!r}).open('a').write(str(os.getpid()) + '\\n'); "
         f"sys.stdout.buffer.write({RAW!r})"
     )]
     with pytest.raises(OSError) as caught:
-        execute(FailedRawPersistence(path, run_id=call.execution.run_id), call, arguments=arguments, cwd=tmp_path, prompt="",
+        execute(FailedRawPersistence(path, run_id=call.execution.run_id), call, arguments=arguments, cwd=git_repo, prompt="",
                 environment={"PATH": os.defpath}, timeout=5)
     assert caught.value is persistence_error
+    retained_work()
     first_start = starts.read_text()
     with pytest.raises(ChildProcessError):
         os.waitpid(int(first_start), os.WNOHANG)
@@ -159,9 +188,22 @@ def test_raw_persistence_failure_still_records_exact_process_exit(tmp_path: Path
     assert status["pending_return"] is committed
     assert status["gates"] == ([] if committed else ["execution_failed"])
     assert status["budgets"]["requirements"]["developments_used"] == 1
-    assert execute(reopened, call, arguments=arguments, cwd=tmp_path, prompt="",
+    with reopened.storage.transaction(write=False) as tx:
+        output = tx.one('SELECT raw_id FROM invocation_outputs WHERE invocation=? AND ordinal=?',
+            (call.invocation_id, call.output_ordinal))
+        attempt = tx.one('SELECT status,result_id FROM attempts WHERE id=?', (call.attempt_id,))
+        invocation = tx.one('SELECT status FROM invocations WHERE id=?', (call.invocation_id,))
+        if committed:
+            assert output['raw_id'] == attempt['result_id'] and output['raw_id'] is not None
+            assert attempt['status'] == invocation['status'] == 'returned'
+            assert tx.get(output['raw_id'], call.subject) == RAW
+        else:
+            assert output['raw_id'] is attempt['result_id'] is None
+            assert attempt['status'] == 'running' and invocation['status'] == 'interrupted'
+    assert execute(reopened, call, arguments=arguments, cwd=git_repo, prompt="",
                    environment={"PATH": os.defpath}, timeout=5) is None
     assert starts.read_text() == first_start
+    retained_work()
     if committed:
         assert CoreOperations(reopened, call.execution, lambda binding: ports).once(agent_capacity=0).kind == "progress"
     else:
@@ -169,10 +211,12 @@ def test_raw_persistence_failure_still_records_exact_process_exit(tmp_path: Path
         resumed = CoreOperations(reopened, call.execution, lambda binding: ports).until(lambda step: step.call is not None).call
         assert resumed is not None and resumed.attempt_id == call.attempt_id
         assert resumed.thread_id == call.thread_id and resumed.invocation_id != call.invocation_id
-        result = execute(reopened, resumed, arguments=arguments, cwd=tmp_path, prompt="",
+        retained_work()
+        result = execute(reopened, resumed, arguments=resume_arguments, cwd=git_repo, prompt="",
                          environment={"PATH": os.defpath}, timeout=5)
         assert result is not None and result.returncode == 0 and result.raw == RAW
         assert len(starts.read_text().splitlines()) == 2
+    retained_work()
     assert reopened.status(call.subject)["budgets"]["requirements"]["developments_used"] == 1
 
 

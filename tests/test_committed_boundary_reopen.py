@@ -2,10 +2,12 @@
 
 Normal Task/Run producers and the existing ScopedKernel transaction seam keep
 these decision tests independent of native save admission and physical Hosts.
-External workspace/ref results are explicit inputs, never seeded completion.
+Matrix workspace/ref results are explicit inputs, never seeded completion.
+The separate branch-intent test uses real local Git through the same Core seam.
 """
 from contextlib import closing, contextmanager
 from dataclasses import replace
+from pathlib import Path
 import sqlite3
 
 import pytest
@@ -81,6 +83,8 @@ def arm_fault(monkeypatch, kernel, db, boundary):
         'admit': "SELECT id FROM invocations WHERE run_id='A'",
         'receipt': "SELECT receipt_id FROM effects WHERE run_id='A' AND status='observed'",
         'consumed': "SELECT identity FROM history WHERE run_id='A' AND kind='effect_consumed'",
+        'intent': "SELECT id FROM effects WHERE run_id='A' AND status='prepared'",
+        'charge': "SELECT id FROM attempts WHERE run_id='A' AND accounted=1",
     }
     original, committed = kernel.storage.transaction, []
 
@@ -93,7 +97,8 @@ def arm_fault(monkeypatch, kernel, db, boundary):
         # Original transaction owner has really COMMITted; no rollback fault.
         if changed:
             assert not db.in_transaction
-            committed.append(snapshot(db, 'A'))
+            with closing(sqlite3.connect(kernel.storage.path)) as witness:
+                committed.append(snapshot(witness, 'A'))
             raise CommittedReplyLost(boundary)
 
     monkeypatch.setattr(kernel.storage, 'transaction', transaction)
@@ -125,8 +130,10 @@ def allocate_again(kernel, runner, *, allow_agent=True):
     ('refresh', 'workspace'), ('ready', 'workspace'),
     ('preparation', 'workspace'), ('admit', 'workspace'),
     ('receipt', 'workspace'), ('consumed', 'workspace'), ('consumed', 'run_branch'),
+    ('charge', 'workspace'),
 ], ids=['refresh', 'ready-queue', 'preparation-reservation', 'admit-agent',
-        'effect-receipt', 'effect-consumed-workspace', 'effect-consumed-run-branch'])
+        'effect-receipt', 'effect-consumed-workspace', 'effect-consumed-run-branch',
+        'release-charge'])
 def test_committed_boundary_reopens_original_work(tmp_path, monkeypatch, boundary, operation):
     from agent_run.model import Issue, ParentIssue, Requirements
     from support.offline import fixture_inputs
@@ -154,7 +161,17 @@ def test_committed_boundary_reopens_original_work(tmp_path, monkeypatch, boundar
         if boundary in {'refresh', 'ready', 'preparation', 'admit'}:
             assert runner.run_once().kind == 'progress'  # workspace receipt
             assert runner.run_once().kind == 'progress'  # workspace consumed
-        preparation = until_preparation(runner) if boundary in {'refresh', 'admit'} else None
+        preparation = until_preparation(runner) if boundary in {'refresh', 'admit', 'charge'} else None
+        if boundary == 'charge':
+            call = kernel.admit_agent(preparation).call
+            assert call is not None
+            assert kernel.dispatch_agent(call)
+            # Explicit external input for this Core/commit test, never OS exit proof.
+            process = {'pid': 4242, 'start_token': 'synthetic', 'pgid': 4242,
+                'host_pid': 4241, 'host_start_token': 'synthetic-host'}
+            kernel.agent_started(call, process)
+            runner.authorize_agent(call)
+            original_leases = rows(db, 'leases')
         if boundary == 'refresh':
             # A later real observation must retain work and gate changed scope.
             source = replace(source, issues=(replace(source.issues[0], body='Changed ticket'),))
@@ -169,6 +186,8 @@ def test_committed_boundary_reopens_original_work(tmp_path, monkeypatch, boundar
                     kernel.refresh(lambda: source)
                 elif boundary == 'admit':
                     kernel.admit_agent(preparation)
+                elif boundary == 'charge':
+                    kernel.agent_source_ready(call)
                 else:
                     runner.run_once(agent_capacity=0 if boundary == 'ready' else 1)
             assert len(committed) == 1
@@ -185,10 +204,52 @@ def test_committed_boundary_reopens_original_work(tmp_path, monkeypatch, boundar
         assert reopened is not db
         assert snapshot(reopened, 'A') == committed[0]
         assert rows(reopened, 'task_runs') == binding
-        assert rows(reopened, 'budgets') == budgets
+        if boundary != 'charge':
+            assert rows(reopened, 'budgets') == budgets
         runner = OperationRunner(kernel, execution, lambda _: ports)
         status = kernel.status(SUBJECT)
-        if boundary == 'refresh':
+        if boundary == 'charge':
+            assert observed_call(kernel, preparation) == call
+            assert status['budgets']['requirements']['developments_used'] == 1
+            assert reopened.execute("SELECT accounted FROM attempts WHERE run_id='A'").fetchone()[0] == 1
+            output = reopened.execute("SELECT dispatch_state,raw_id FROM invocation_outputs WHERE run_id='A'").fetchone()
+            assert output[:] == ('started', None)
+            assert rows(reopened, 'leases') == original_leases
+            before = snapshot(reopened, 'A')
+            assert kernel.dispatch_agent(call) is False
+            assert allocate_again(kernel, runner).reason == 'previous_invocation_exit'
+            assert snapshot(reopened, 'A') == before
+            # Even an explicit resume cannot discard a still-unsettled original Worker.
+            with pytest.raises(KernelError, match='worker_exit_unproven'):
+                kernel.control('resume', 'cannot-replay-unknown-release', subject=SUBJECT)
+            kernel.agent_exited(call, process, -15, failure='release_acknowledgement_unknown')
+            assert kernel.worker_settled(call)
+            assert kernel.status(SUBJECT)['gates'] == []
+            paused = runner.run_once()
+            assert (paused.kind, paused.reason) == ('paused', 'execution_recovery_unavailable')
+            kernel.control('resume', 'resume-after-controlled-exit', subject=SUBJECT)
+            resumed = until_preparation(runner)
+            assert (resumed.attempt_id, resumed.thread_id) == (call.attempt_id, call.thread_id)
+            resumed_call = kernel.admit_agent(resumed).call
+            assert resumed_call.invocation_id != call.invocation_id
+            assert kernel.dispatch_agent(resumed_call)
+            kernel.agent_started(resumed_call, process)
+            runner.authorize_agent(resumed_call)
+            kernel.agent_source_ready(resumed_call)
+            kernel.agent_source_ready(resumed_call)
+            kernel.receive(resumed_call,
+                b'{"result_kind":"development","summary":"controlled return","human_blockers":null}')
+            kernel.agent_exited(resumed_call, process, 0)
+            assert kernel.worker_settled(resumed_call)
+            assert kernel.status(SUBJECT)['budgets']['requirements']['developments_used'] == 1
+            assert len(rows(reopened, 'attempts')) == 1 and len(rows(reopened, 'invocations')) == 2
+            assert not rows(reopened, 'leases')
+            assert snapshot(reopened, 'other-run') == sibling
+            assert tuple(ports.dispatched) == dispatched_before
+            assert reopened.execute('PRAGMA foreign_key_check').fetchall() == []
+            assert reopened.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+            return
+        elif boundary == 'refresh':
             assert status['gates'] == ['requeue_required']
             assert reopened.execute("SELECT current_attempt FROM subjects WHERE run_id='A' AND id=?",
                 (SUBJECT,)).fetchone()[0] == preparation.attempt_id
@@ -269,3 +330,74 @@ def test_committed_boundary_reopens_original_work(tmp_path, monkeypatch, boundar
             assert tuple(ports.dispatched) == dispatched_before
         assert [item.operation for item in ports.dispatched] == (
             ['run_branch', 'workspace'] if operation == 'run_branch' else ['workspace'])
+
+
+def test_branch_intent_reopens_before_any_physical_git_write(tmp_path, monkeypatch):
+    """Real local Git; Core transaction seam, not native save/Host evidence."""
+    from agent_run.model import Issue, ParentIssue, Requirements
+    from support.offline import OfflinePort
+
+    port = OfflinePort.create(tmp_path / 'external')
+    spec, delivery = port.prepare(DeliveryKind.TICKET)
+    port.git.run('update-ref', '-d', delivery.source_ref, delivery.base.sha)
+    source = Requirements(ParentIssue(1, 'Parent', 'Original requirement', (2,)), (
+        Issue(2, 'Ticket', 'Original ticket', 'OPEN', frozenset({'ready-for-agent'})),))
+    final = Delivery('final:1', DeliveryKind.FINAL_RUN, 1, 'unobserved', delivery.base,
+        delivery.target_ref, 'refs/heads/main')
+    spec = replace(spec, run_id='A', deliveries=(delivery, final))
+    path = tmp_path / 'repository.sqlite3'
+    create_kernel(path, spec, requirements=source)
+    physical_calls = []
+
+    class ActualWorkspace(ReadOnlyPorts):
+        def delivery(self, request):
+            return port.delivery(request, ('none',), [],
+                publisher_identity=spec.inputs.runner_identity)
+
+        def execute(self, effect, authorize):
+            assert effect.operation == 'workspace'
+            physical_calls.append(effect)
+            return port.execute(effect, authorize)
+
+        def reconcile(self, effect):
+            return port.reconcile(effect)
+
+        def inspect(self, resources):
+            return port.inspect_resources(resources)
+
+    ports = ActualWorkspace(source, delivery.source_ref, delivery.target_ref,
+        DeliveryFacts(None, delivery.base))
+    with opened(path) as (db, kernel):
+        execution = kernel.claim_executor('branch-owner')
+        runner = OperationRunner(kernel, execution, lambda _: ports)
+        with monkeypatch.context() as fault:
+            committed = arm_fault(fault, kernel, db, 'intent')
+            with pytest.raises(CommittedReplyLost, match='intent'):
+                runner.run_once()
+        assert len(committed) == 1
+        original = dict(db.execute("SELECT * FROM effects WHERE run_id='A'").fetchone())
+        assert original['operation'] == 'workspace' and original['status'] == 'prepared'
+        assert original['attempts'] == 0 and original['receipt_id'] is None
+        assert physical_calls == [] and port.writes() == []
+        assert not port.git.run('for-each-ref', '--format=%(refname)', delivery.source_ref).stdout
+        assert not Path(delivery.checkout).exists()
+
+    with opened(path) as (db, kernel):
+        assert snapshot(db, 'A') == committed[0]
+        runner = OperationRunner(kernel, execution, lambda _: ports)
+        assert runner.run_once().kind == 'progress'
+        assert len(physical_calls) == 1
+        effect = physical_calls[0]
+        assert (effect.effect_id, effect.before_sha, effect.source_ref, effect.target_ref) == (
+            original['id'], original['before_sha'], original['source_ref'], original['target_ref'])
+        assert port.git.commit(effect.source_ref) == effect.base
+        assert port.git.run('rev-parse', 'HEAD', cwd=Path(delivery.checkout)).stdout.strip() == effect.base.sha
+        assert runner.run_once().kind == 'progress'
+        until_preparation(runner)
+        after = db.execute("SELECT * FROM effects WHERE run_id='A' AND id=?", (effect.effect_id,)).fetchone()
+        assert after['status'] == 'confirmed' and after['attempts'] == 1
+        assert after['payload_id'] == original['payload_id'] and after['receipt_id'] is not None
+        assert len(physical_calls) == 1
+        for kind in ('effect_prepared', 'effect_dispatched', 'effect_observed', 'effect_consumed'):
+            assert db.execute("SELECT count(*) FROM history WHERE run_id='A' AND kind=? AND identity=?",
+                (kind, effect.effect_id)).fetchone()[0] == 1

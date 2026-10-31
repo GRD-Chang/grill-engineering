@@ -8,6 +8,7 @@ import sys
 import pytest
 
 from agent_run.core.operation_runner import OperationRunner
+from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.model import Commit, Delivery, DeliveryKind, Policy, RunSpec
 from agent_run.runtime.execution import execute
@@ -142,6 +143,76 @@ def test_failed_spawn_does_not_charge_and_requires_explicit_same_attempt_resume(
     resumed = runner.run_once().preparation
     assert resumed is not None and resumed.attempt_id == request.attempt_id
     assert resumed.thread_id == request.thread_id
+
+
+def test_release_charge_reply_loss_keeps_original_attempt_without_running_argv(tmp_path: Path, monkeypatch) -> None:
+    """The real bootstrap is still gated when the charging COMMIT loses its reply."""
+    kernel, runner, ports, step, clock = preparation(tmp_path)
+    request = step.preparation
+    assert request is not None
+    call = kernel.admit_agent(request).call
+    assert call is not None
+    marker = tmp_path / 'released-worker'
+    raw = b'{"result_kind":"development","summary":"resumed work","human_blockers":null}'
+    command = [sys.executable, '-I', '-c',
+        f"from pathlib import Path; import sys; Path({str(marker)!r}).open('a').write('ran\\n'); "
+        f"sys.stdout.buffer.write({raw!r})"]
+    charge = kernel.agent_source_ready
+    exact = OSError('charging committed but its response was lost')
+    committed = []
+
+    def lost_charge(exact_call):
+        assert exact_call == call and not marker.exists()
+        charge(exact_call)
+        witness = Kernel(kernel.storage.path, run_id=call.execution.run_id)
+        assert witness.status(call.subject)['budgets']['requirements']['developments_used'] == 1
+        with witness.storage.transaction(write=False) as tx:
+            output = dict(tx.one('SELECT * FROM invocation_outputs WHERE invocation=?', (call.invocation_id,)))
+            assert output['dispatch_state'] == 'started' and output['raw_id'] is None
+            assert tx.one('SELECT accounted FROM attempts WHERE id=?', (call.attempt_id,))[0] == 1
+            committed.append(output)
+        raise exact
+
+    with monkeypatch.context() as fault:
+        fault.setattr(kernel, 'agent_source_ready', lost_charge)
+        with pytest.raises(OSError) as caught:
+            execute(kernel, call, arguments=command, cwd=tmp_path, prompt='',
+                environment={'PATH': os.defpath}, timeout=5, authorize_source=lambda: runner.authorize_agent(call))
+        assert caught.value is exact
+    assert len(committed) == 1 and not marker.exists()
+    reopened = Kernel(kernel.storage.path, run_id=call.execution.run_id)
+    reopened.clock = lambda: clock[0]
+    assert reopened.worker_settled(call)
+    assert counts(reopened) == (1, 1, 1, 0)
+    assert reopened.status(call.subject)['budgets']['requirements']['developments_used'] == 1
+    with reopened.storage.transaction(write=False) as tx:
+        output = tx.one('SELECT * FROM invocation_outputs WHERE invocation=?', (call.invocation_id,))
+        assert output['process_identity'] == committed[0]['process_identity']
+        assert output['dispatch_state'] == 'exited' and output['exit_code'] is not None
+        assert output['raw_id'] is None and output['failure_kind'] == 'ordinary'
+        process = json.loads(tx.get(output['process_identity'], call.subject))
+    with pytest.raises(ChildProcessError):
+        os.waitpid(process['pid'], os.WNOHANG)
+    assert execute(reopened, call, arguments=command, cwd=tmp_path, prompt='',
+        environment={'PATH': os.defpath}, timeout=5) is None
+    assert not marker.exists()
+    assert reopened.status(call.subject)['gates'] == []
+    resumed_runner = OperationRunner(reopened, call.execution, lambda _: ports)
+    paused = resumed_runner.run_once()
+    assert (paused.kind, paused.reason) == ('paused', 'execution_recovery_unavailable')
+    reopened.control('resume', 'resume-committed-charge', subject=call.subject)
+    resumed = resumed_runner.run_once().preparation
+    assert resumed is not None
+    assert (resumed.attempt_id, resumed.thread_id) == (call.attempt_id, call.thread_id)
+    resumed_call = reopened.admit_agent(resumed).call
+    assert resumed_call is not None
+    assert resumed_call.invocation_id != call.invocation_id
+    result = execute(reopened, resumed_call, arguments=command, cwd=tmp_path, prompt='',
+        environment={'PATH': os.defpath}, timeout=5, authorize_source=lambda: resumed_runner.authorize_agent(resumed_call))
+    assert result is not None and result.returncode == 0 and result.raw == raw
+    assert marker.read_text() == 'ran\n'
+    assert counts(reopened) == (1, 2, 2, 0)
+    assert reopened.status(call.subject)['budgets']['requirements']['developments_used'] == 1
 
 
 @pytest.fixture
