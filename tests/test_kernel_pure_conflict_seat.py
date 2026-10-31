@@ -7,11 +7,12 @@ import sys
 import pytest
 
 from agent_run.model import Issue, ParentIssue, Policy, Requirements, Role, wire_json
+from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.queries.run import read
 from agent_run.runtime.execution import execute
 from support.core_operations import CoreOperations, scripted_return
-from support.offline import GraphScenario
+from support.offline import GraphScenario, review_result
 
 
 def _source():
@@ -21,7 +22,7 @@ def _source():
     ))
 
 
-def _conflict_with_waiter(tmp_path, *, lose_reply=False):
+def _conflict_with_waiter(tmp_path, *, lose_reply=False, fallback=False):
     scenario = GraphScenario(tmp_path / "graph", _source(), policy=Policy(concurrency=2))
     kernel = scenario.kernel
     operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
@@ -32,9 +33,16 @@ def _conflict_with_waiter(tmp_path, *, lose_reply=False):
 
     def agent(call):
         if call.role == Role.DEVELOPMENT:
-            scenario.edits = ({"README.md": "A and external content resolved\n" if call.purpose == "integration"
-                              else "A candidate content\n"},) if call.subject == "ticket:2" else ({"b.txt": "B content\n"},)
-        return scenario.agent(call)
+            ordinal = 1 + sum(item['subject'] == call.subject and item['role'] == 'development'
+                and item['purpose'] == 'requirements' for item in scenario.role_calls)
+            content = f'A candidate content {ordinal}\n' if fallback else 'A candidate content\n'
+            if call.purpose == 'integration':
+                content = 'A and external content resolved\n'
+            scenario.edits = ({'README.md': content},) if call.subject == 'ticket:2' else ({'b.txt': 'B content\n'},)
+        raw = scenario.agent(call)
+        if fallback and call.subject == 'ticket:2' and call.role == Role.REVIEW:
+            return wire_json(review_result('fail'))
+        return raw
 
     reviews = {}
     for _ in range(100):
@@ -49,6 +57,31 @@ def _conflict_with_waiter(tmp_path, *, lose_reply=False):
     else:
         raise AssertionError("Both normal initial Reviews were not reserved")
     scripted_return(kernel, operations.runner, reviews["ticket:2"], agent)
+    if fallback:
+        # B keeps its original Review lease while A spends its existing D4/R3 window.
+        for _ in range(100):
+            step = operations.once()
+            if step.call is not None:
+                assert step.call.subject == 'ticket:2'
+                scripted_return(kernel, operations.runner, step.call, agent)
+            state = kernel.status('ticket:2')
+            if state['phase'] == 'integration' and state['gate_mode'] == 'deterministic_fallback':
+                break
+        else:
+            raise AssertionError('The original D4/R3 window did not reach fallback')
+        requirement_budget = state['budgets']['requirements']
+        assert (requirement_budget['window'], requirement_budget['development_limit'],
+            requirement_budget['review_limit'], requirement_budget['developments_used'],
+            requirement_budget['reviews_used']) == (1, 4, 3, 4, 3)
+        assert operations.runner.state().active == (reviews['ticket:3'].lease_id,)
+        assert kernel.status('ticket:3')['pending_attempt'] == reviews['ticket:3'].attempt_id
+        with kernel.storage.transaction(write=False) as tx:
+            original = dict(tx.one("SELECT candidate_sha,candidate_tree,repair_source,review_attempt,generation FROM subjects WHERE id='ticket:2'"))
+            assert original['repair_source'] == 'acceptance'
+            last_review = tx.one("SELECT candidate_sha,status,outcome FROM attempts WHERE subject='ticket:2' AND role='review' ORDER BY ordinal DESC LIMIT 1")
+            assert (last_review['status'], last_review['outcome']) == ('consumed', 'fail')
+            assert last_review['candidate_sha'] != original['candidate_sha']
+            assert not tx.rows("SELECT id FROM attempts WHERE subject='ticket:2' AND role='review' AND outcome='pass'")
     target = scenario.port.external_append("refs/heads/run", {"README.md": "External content\n"}, "conflicting-target")
     for _ in range(30):
         step = operations.once()
@@ -66,6 +99,17 @@ def _conflict_with_waiter(tmp_path, *, lose_reply=False):
         failure = tx.one("SELECT last_failure FROM subjects WHERE id='ticket:2'")[0]
         receipt = json.loads(tx.get(failure, "ticket:2"))
         assert receipt["disposition"] == "failure" and receipt["raw"]["merge_head"] == target.sha
+        if fallback:
+            current = tx.one("SELECT candidate_sha,candidate_tree,repair_source,gate_mode,review_attempt,generation FROM subjects WHERE id='ticket:2'")
+            assert (current['candidate_sha'], current['candidate_tree']) == (original['candidate_sha'], original['candidate_tree'])
+            assert (current['review_attempt'], current['generation']) == (original['review_attempt'], original['generation'])
+            assert current['repair_source'] == 'integration' and current['gate_mode'] == 'deterministic_fallback'
+    if fallback:
+        assert kernel.status('ticket:2')['budgets']['requirements'] == requirement_budget
+        # Reopen durable conflict facts under the same owner; no Host-exit claim.
+        scenario.kernel = kernel = Kernel(kernel.storage.path, run_id=scenario.execution.run_id)
+        operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
+        assert kernel.status('ticket:2')['budgets']['requirements'] == requirement_budget
     scripted_return(kernel, operations.runner, reviews["ticket:3"], agent)
     repair = None
     for _ in range(30):
@@ -81,9 +125,10 @@ def _conflict_with_waiter(tmp_path, *, lose_reply=False):
     return scenario, operations, agent, repair, receipt
 
 
-@pytest.mark.parametrize("lose_reply", [False, True])
-def test_pure_conflict_keeps_the_original_seat_while_the_other_ticket_waits(tmp_path, lose_reply):
-    scenario, operations, agent, repair, receipt = _conflict_with_waiter(tmp_path, lose_reply=lose_reply)
+@pytest.mark.parametrize('lose_reply,fallback', [(False, False), (True, False), (False, True)],
+    ids=['False', 'True', 'fallback-D4-R3'])
+def test_pure_conflict_keeps_the_original_seat_while_the_other_ticket_waits(tmp_path, lose_reply, fallback):
+    scenario, operations, agent, repair, receipt = _conflict_with_waiter(tmp_path, lose_reply=lose_reply, fallback=fallback)
     kernel = scenario.kernel
     assert kernel.status("ticket:2")["holds_integration"]
     assert not kernel.status("ticket:3")["holds_integration"]
@@ -92,10 +137,21 @@ def test_pure_conflict_keeps_the_original_seat_while_the_other_ticket_waits(tmp_
     deadline = repair.deadline_at
     assert operations.runner.state().active == (repair.lease_id,)
     assert repair.context["integration_evidence"]["raw"] == receipt["raw"]
+    requirements = kernel.status('ticket:2')['budgets']['requirements']
+    if fallback:
+        assert repair.role == Role.DEVELOPMENT and repair.purpose == 'integration'
+        assert repair.context['repair_source'] == 'integration'
+        assert 'acceptance_artifact' not in repair.context and 'ci_evidence' not in repair.context
+        assert (requirements['developments_used'], requirements['reviews_used']) == (4, 3)
+        assert repair.context['candidate_sha'] == kernel.status('ticket:2')['candidate']
     with kernel.storage.transaction(write=False) as tx:
         assert tx.one("SELECT deadline_at FROM invocations WHERE id=?", (repair.invocation_id,))[0] == deadline
+        if fallback:
+            attempts = [dict(row) for row in tx.all("SELECT * FROM attempts WHERE subject='ticket:2' AND purpose='requirements' ORDER BY ordinal")]
     scripted_return(kernel, operations.runner, repair, agent)
     assert kernel.status("ticket:2")["budgets"]["integration"]["developments_used"] == 1
+    if fallback:
+        assert kernel.status('ticket:2')['budgets']['requirements'] == requirements
     for _ in range(50):
         if kernel.status("ticket:2")["phase"] == "complete":
             break
@@ -131,6 +187,13 @@ def test_pure_conflict_keeps_the_original_seat_while_the_other_ticket_waits(tmp_
         if kernel.status("ticket:3")["holds_integration"]:
             break
     assert kernel.status("ticket:3")["holds_integration"]
+    if fallback:
+        assert kernel.status('ticket:2')['budgets']['requirements'] == requirements
+        assert kernel.status('ticket:2')['budgets']['integration']['developments_used'] == 1
+        with kernel.storage.transaction(write=False) as tx:
+            assert [dict(row) for row in tx.all("SELECT * FROM attempts WHERE subject='ticket:2' AND purpose='requirements' ORDER BY ordinal")] == attempts
+        assert not any(item['role'] == 'review' and item['purpose'] == 'integration'
+            for item in scenario.role_calls if item['subject'] == 'ticket:2')
 
 
 def _waiter_gets_seat(scenario, operations):

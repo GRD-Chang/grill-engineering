@@ -11,7 +11,8 @@ from typing import Any
 
 import pytest
 
-from agent_run.model import AgentCall, AgentPreparation, Commit, Delivery, DeliveryKind, Policy, Profile, RunSpec
+from agent_run.model import AgentCall, AgentPreparation, Commit, Delivery, DeliveryKind, EffectResult, Policy, Profile, RunSpec
+from agent_run.adapters.git_objects import LocalGit
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.runtime.codex import execute_codex
@@ -24,12 +25,14 @@ from support.native_runtime import local_codex
 RAW = b'{"result_kind":"development","summary":"Implemented by the local CLI process.","human_blockers":null}'
 
 
-def allocated_codex(tmp_path: Path) -> tuple[Kernel, AgentPreparation, ReadOnlyPorts]:
-    checkout = tmp_path / "checkout"
-    checkout.mkdir()
+def allocated_codex(tmp_path: Path, *, prior_developments: int = 0,
+                    checkout: Path | None = None) -> tuple[Kernel, AgentPreparation, ReadOnlyPorts]:
+    if checkout is None:
+        checkout = tmp_path / "checkout"
+        checkout.mkdir()
     state = tmp_path / "runner-state"
     state.mkdir()
-    base = Commit("base", "tree")
+    base = Commit("base", "tree") if prior_developments == 0 else LocalGit(checkout).commit('HEAD')
     spec = RunSpec("codex-boundaries", "example/repository", 1, "parent-v1", "graph-v1", (
         Delivery("ticket:2", DeliveryKind.TICKET, 2, "ticket-v1", base,
                  "refs/heads/ticket", "refs/heads/run", checkout=str(checkout)),
@@ -41,10 +44,30 @@ def allocated_codex(tmp_path: Path) -> tuple[Kernel, AgentPreparation, ReadOnlyP
         "review_model": "bound-review-model", "review_effort": "high",
         "publication_model": "bound-publication-model", "publication_effort": "high"}))
     kernel, ports = native_agent_fixture(state / "kernel.sqlite3", replace(spec, inputs=inputs))
+    if prior_developments:
+        class CandidateFailures(ReadOnlyPorts):
+            """Explicit external failure input; never a physical candidate proof."""
+            def execute(self, effect, authorize):
+                assert effect.operation == 'candidate'
+                authorize.prepare()()
+                return EffectResult('failure', base, raw={'head': base.sha, 'reason': 'candidate_integrity'})
+        ports = CandidateFailures(ports.requirements, ports.source_ref, ports.target_ref,
+            replace(ports.facts, target=base))
     execution = kernel.claim_executor("local-cli-executor")
-    call = CoreOperations(kernel, execution, lambda binding: ports, prepare_agents=False).until(lambda step: step.preparation is not None).preparation
-    assert call is not None
-    return kernel, call, ports
+    operations = CoreOperations(kernel, execution, lambda binding: ports, prepare_agents=False)
+    for ordinal in range(prior_developments + 1):
+        call = operations.until(lambda step: step.preparation is not None).preparation
+        assert call is not None
+        if ordinal == prior_developments:
+            return kernel, call, ports
+        # The backend binding comes from the real CLI event parser, not bind_thread().
+        result = local_codex(kernel, call, tmp_path, f"""\
+print(json.dumps({{'type': 'thread.started', 'thread_id': 'original-thread'}}), flush=True)
+Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_bytes({RAW!r})
+""")
+        assert result is not None and result.returncode == 0 and result.raw == RAW
+        assert kernel.status(call.subject)['budgets']['requirements']['developments_used'] == ordinal + 1
+    raise AssertionError('No allocated Development after bounded completed prefix')
 
 
 @pytest.mark.parametrize("raw", [RAW, b'{"result_kind":"development","summary":42}'], ids=["valid", "invalid"])
@@ -81,33 +104,82 @@ raise SystemExit(7)
             assert tx.one("SELECT count(*) FROM invocations")[0] == 1  # Credentials not ready yet.
 
 
-@pytest.mark.parametrize("events", [
-    ("original-thread",), ("different-thread",), ("original-thread", "different-thread"),
-], ids=["same-thread", "drift", "two-ids"])
+@pytest.mark.parametrize("events,prior_developments", [
+    (("original-thread",), 0), (("different-thread",), 0), (("original-thread", "different-thread"), 0),
+    (("original-thread",), 3),
+], ids=["same-thread", "drift", "two-ids", "last-budgeted-attempt-retains-dirty-work"])
 def test_real_resume_preserves_original_thread_and_rejects_changed_events(
-    tmp_path: Path, events: tuple[str, ...],
+    tmp_path: Path, request: pytest.FixtureRequest, events: tuple[str, ...], prior_developments: int,
 ) -> None:
-    kernel, first, ports = allocated_codex(tmp_path)
-    failed = local_codex(kernel, first, tmp_path, """\
-assert sys.argv[1:3] == ['exec', '--json']
-print(json.dumps({'type': 'thread.started', 'thread_id': 'original-thread'}), flush=True)
+    checkout = None
+    if prior_developments:
+        git_repo = request.getfixturevalue('git_repo')
+        checkout = tmp_path / 'checkout'
+        git = LocalGit(git_repo)
+        git.run('worktree', 'add', '-b', 'ticket', str(checkout), 'HEAD')
+        git.run('update-ref', 'refs/heads/run', git.commit('HEAD').sha)
+    kernel, first, ports = allocated_codex(tmp_path, prior_developments=prior_developments,
+        checkout=checkout)
+    original_head = None if checkout is None else LocalGit(checkout).commit('HEAD').sha
+    original_index = None if checkout is None else LocalGit(checkout).run('ls-files', '--stage', '-z').stdout
+    tracked, untracked = b'Fourth Development tracked work\n', b'Fourth Development untracked work\n'
+    work = (f"Path('README.md').write_bytes({tracked!r}); Path('unfinished.txt').write_bytes({untracked!r})\n"
+        if prior_developments else '')
+    before = kernel.status(first.subject)['budgets']['requirements']
+    prior_exits = [event['identity'] for event in kernel.history(first.subject) if event['kind'] == 'worker_exited']
+    if prior_developments:
+        assert (before['window'], before['development_limit'], before['developments_used']) == (1, 4, 3)
+        with kernel.storage.transaction(write=False) as tx:
+            attempts = tx.all("SELECT id,ordinal,status,accounted FROM attempts WHERE subject=? AND role='development' ORDER BY ordinal",
+                (first.subject,))
+        assert [(row['ordinal'], row['status'], row['accounted']) for row in attempts] == [
+            (1, 'consumed', 1), (2, 'consumed', 1), (3, 'consumed', 1), (4, 'allocated', 0)]
+        assert attempts[-1]['id'] == first.attempt_id and len(prior_exits) == 3
+
+    def retained_work():
+        if prior_developments:
+            assert (checkout / 'README.md').read_bytes() == tracked
+            assert (checkout / 'unfinished.txt').read_bytes() == untracked
+            git = LocalGit(checkout)
+            assert git.commit('HEAD').sha == original_head
+            assert git.commit('refs/heads/ticket').sha == original_head
+            assert git.run('ls-files', '--stage', '-z').stdout == original_index
+            assert git.run('diff', '--name-only').stdout.splitlines() == ['README.md']
+            assert 'unfinished.txt' in git.run('ls-files', '--others', '--exclude-standard').stdout.splitlines()
+            assert f'worktree {checkout}' in git.run('worktree', 'list', '--porcelain', '-z').stdout.split('\0')
+
+    failed = local_codex(kernel, first, tmp_path, f"""\
+assert sys.argv[1:{4 if prior_developments else 3}] == {['exec', 'resume', '--json'] if prior_developments else ['exec', '--json']!r}
+{work}\
+print(json.dumps({{'type': 'thread.started', 'thread_id': 'original-thread'}}), flush=True)
 raise SystemExit(1)
 """)
     assert failed is not None and failed.returncode == 1 and failed.raw == b""
+    retained_work()
     reopened = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     assert reopened.status(first.subject)["gates"] == []
     assert reopened.operation_state().active == ()
+    charged = {**before, 'developments_used': prior_developments + 1}
+    assert reopened.status(first.subject)['budgets']['requirements'] == charged
     resumed = CoreOperations(reopened, first.execution, lambda binding: ports, prepare_agents=False).until(lambda step: step.preparation is not None).preparation
     assert resumed is not None and resumed.mode == "resume"
     assert resumed.reported_thread == "original-thread" and resumed.thread_id == first.thread_id
     assert resumed.attempt_id == first.attempt_id and resumed.reservation_id != first.reservation_id
     assert resumed.profile == first.profile
+    retained_work()
+    preservation = (f"""\
+import subprocess
+assert Path('README.md').read_bytes() == {tracked!r}
+assert Path('unfinished.txt').read_bytes() == {untracked!r}
+assert subprocess.run(['git', 'rev-parse', '--verify', 'HEAD'], check=True, capture_output=True, text=True).stdout.strip() == {original_head!r}
+""" if prior_developments else '')
     program = f"""\
 assert sys.argv[1:4] == ['exec', 'resume', '--json']
 assert sys.argv[5] == 'original-thread'
 assert sys.argv[sys.argv.index('--model') + 1] == 'bound-model'
 assert sys.argv[sys.argv.index('--config') + 1] == 'model_reasoning_effort="high"'
 assert sys.stdin.read() == 'Continue the allocated task.'
+{preservation}\
 Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_bytes({RAW!r})
 for thread in {events!r}:
     print(json.dumps({{"type": "thread.started", "thread_id": thread}}), flush=True)
@@ -118,18 +190,36 @@ for thread in {events!r}:
     else:
         with pytest.raises(ValueError, match="different Thread ID"):
             local_codex(reopened, resumed, tmp_path, program)
-    assert observed_call(kernel, resumed).invocation_id != observed_call(kernel, first).invocation_id
+    original_call, resumed_call = observed_call(kernel, first), observed_call(kernel, resumed)
+    assert resumed_call.invocation_id != original_call.invocation_id
+    assert resumed_call.deadline_at == original_call.deadline_at
     after = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     status = after.status(first.subject)
     assert status["pending_return"] is (events == ("original-thread",))
     assert status["gates"] == ([] if events == ("original-thread",) else ["execution_failed"])
-    assert status["budgets"]["requirements"]["developments_used"] == 1
+    assert status['budgets']['requirements'] == charged
     assert after.operation_state().active == ()
     exits = [event["identity"] for event in after.history(first.subject) if event["kind"] == "worker_exited"]
-    assert exits == [observed_call(kernel, first).invocation_id, observed_call(kernel, resumed).invocation_id]
-    after.bind_thread(observed_call(kernel, resumed), "original-thread")
+    assert exits == [*prior_exits, original_call.invocation_id, resumed_call.invocation_id]
+    after.bind_thread(resumed_call, "original-thread")
     with pytest.raises(KernelError, match="thread_identity_changed"):
-        after.bind_thread(observed_call(kernel, resumed), "different-thread")
+        after.bind_thread(resumed_call, "different-thread")
+    retained_work()
+    if prior_developments:
+        operations = CoreOperations(after, first.execution, lambda binding: ports, prepare_agents=False)
+        for _ in range(8):
+            step = operations.once()
+            assert step.preparation is None and step.call is None
+            if step.kind == 'paused':
+                break
+        else:
+            raise AssertionError('No original budget boundary after the fourth returned Development')
+        assert 'modification_budget_exhausted' in after.status(first.subject)['gates']
+        assert after.status(first.subject)['budgets']['requirements'] == charged
+        with after.storage.transaction(write=False) as tx:
+            assert tx.one("SELECT count(*) FROM attempts WHERE subject=? AND role='development'", (first.subject,))[0] == 4
+            assert not tx.rows("SELECT id FROM effects WHERE subject=? AND operation IN ('cleanup_worktree','cleanup_local_ref','cleanup_remote_ref')", (first.subject,))
+        retained_work()
 
 
 @pytest.mark.parametrize("replacement", ["missing", "symlink"])
