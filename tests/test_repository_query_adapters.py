@@ -262,6 +262,9 @@ def test_real_current_database_uncheckpointed_wal_materials_and_budget_survive_n
     spec, source = proposal(root, 'old-current')
     database = state / spec.run_id / 'kernel.sqlite3'
     old = create_kernel(database, spec, requirements=source)
+    # Idle Stop creates no Action or WAL frames. Keep a real executor to revoke
+    # so this test pins an actual committed, uncheckpointed Stop transaction.
+    old.claim_executor('old-current-owner')
     raw = database.parent / 'raw.bin'
     raw.write_bytes(b'Exact old raw bytes\0\xff')
     with closing(sqlite3.connect(database, isolation_level=None)) as keeper:
@@ -270,7 +273,7 @@ def test_real_current_database_uncheckpointed_wal_materials_and_budget_survive_n
         keeper.execute('BEGIN')
         assert keeper.execute('SELECT id FROM runs').fetchall() == [(spec.run_id,)]
         assert keeper.in_transaction
-        old.stop_task('old-stop')
+        assert old.stop_task('old-stop') == 'applied'
         wal = database.with_name(database.name + '-wal')
         assert wal.is_file() and wal.stat().st_size > 0
         before = {path: path.read_bytes() for path in (database, wal, raw)}

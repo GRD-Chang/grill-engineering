@@ -423,6 +423,9 @@ class Kernel:
 
     def authorize_effect_observation(self, effect: Effect, world: World | LocalCleanupObservation, fence: ReadFence, *,
                                      prepared: bool, inspections: tuple[ResourceInspection, ...] | None) -> None:
+        if not isinstance(fence, ReadFence):
+            raise KernelError("local_cleanup_observation_binding" if isinstance(world, LocalCleanupObservation)
+                              else "effect_observation_binding")
         if fence.local_effect is not None and (
                 fence.local_effect != effect or not isinstance(world, World) or world.checks is not None):
             raise KernelError("local_preparation_observation_binding")

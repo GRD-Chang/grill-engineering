@@ -196,6 +196,9 @@ def test_stop_receipt_uses_frozen_language_and_keeps_internal_identity_only_in_j
                                    repository_root=str(root)), store)
     kernel = Kernel.create_task(workspace.state_root / "kernel.sqlite3", spec,
                                requirements=Requirements(ParentIssue(12, "Original Parent", "Original requirement"), ()))
+    # An idle whole-Run Stop is read-only. This receipt represents revocation
+    # of an existing owner; it must not claim that the owner has exited.
+    execution = kernel.claim_executor("receipt-owner")
     store.configure(language="en" if language == "zh" else "zh")
     assert main(["stop", spec.run_id if exact else "12", "--repo", workspace.repository,
                  *(["--state-dir", str(kernel.storage.path)] if exact else []),
@@ -205,6 +208,7 @@ def test_stop_receipt_uses_frozen_language_and_keeps_internal_identity_only_in_j
     with kernel.storage.transaction(write=False) as tx:
         action = dict(tx.one("SELECT id,status FROM actions WHERE kind='stop'"))
         assert tx.one("SELECT stopped FROM runs")[0] == 1
+        assert tx.one("SELECT executor,epoch FROM runs")[:] == (execution.owner, execution.epoch)
         assert tx.one("SELECT count(*) FROM hosts")[0] == 0
     if as_json:
         assert json.loads(output.out) == {"result": "accepted", "status": "action_applied", "run_id": spec.run_id,

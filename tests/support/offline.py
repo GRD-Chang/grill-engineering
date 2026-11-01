@@ -266,10 +266,10 @@ class OfflinePort:
 
 
     def _remote(self, repository: str, written: Callable[..., None] | None = None) -> RemoteEffects:
-        api = SyntheticGitHub(self.git, self.database, repository, physical=self.physical,
+        physical = self.physical
+        api = SyntheticGitHub(self.git, self.database, repository, physical=physical,
                               written=written or (lambda *args: None), read_faults=self.read_faults)
-        git_writes = OfflineGit(self.root, environment=self.git.env, written=api.record_git_write,
-            managed_workspace=self._managed_workspace)
+        git_writes = physical._with_written(api.record_git_write)
         return RemoteEffects(self.git.root, repository, runner_identity={"source": "host"},
                              remote=self.remote_name, api=api, git_writes=git_writes)
 

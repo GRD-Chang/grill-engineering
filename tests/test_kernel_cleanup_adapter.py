@@ -182,19 +182,42 @@ def test_worktree_cleanup_is_exact_and_idempotent(git_repo: Path, tmp_path: Path
     assert cleanup_worktree(git, effect).disposition == "target"
 
 
-def test_worktree_cleanup_authorizes_before_locks_and_at_command_start(git_repo: Path, tmp_path: Path) -> None:
+@pytest.mark.parametrize('revoked_at_command', [False, True], ids=['current', 'revoked'])
+def test_worktree_cleanup_authorizes_before_locks_and_at_command_start(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, revoked_at_command: bool,
+) -> None:
+    import subprocess
     git = LocalGit(git_repo)
     checkout, effect = _checkout(git, tmp_path)
-    locks = []
+    locks, spawned = [], []
+    original_spawn = subprocess.Popen
+    refusal = KernelError('executor_fenced')
+
+    def spawn(command, *arguments, **options):
+        if any(list(command[index:index + 2]) == ['worktree', 'remove'] for index in range(len(command) - 1)):
+            spawned.append(command)
+        return original_spawn(command, *arguments, **options)
 
     def authorized():
         locks.append((checkout / '.git').is_file() and any(
             path.name == 'HEAD.lock' for path in (git_repo / '.git' / 'worktrees').glob('*/HEAD.lock')))
+        if revoked_at_command and locks[-1]:
+            raise refusal
 
     git.authorize = authorized
-    assert cleanup_worktree(git, effect).disposition == 'target'
+    monkeypatch.setattr(subprocess, 'Popen', spawn)
+    if revoked_at_command:
+        with pytest.raises(KernelError) as caught:
+            cleanup_worktree(git, effect)
+        assert caught.value is refusal
+        assert spawned == []
+        assert checkout.exists() and inspect_worktree(git, effect).disposition == 'prior'
+        assert git.commit(REF).sha == effect.before_sha
+    else:
+        assert cleanup_worktree(git, effect).disposition == 'target'
+        assert len(spawned) == 1
+        assert not checkout.exists()
     assert locks == [False, True]
-    assert not checkout.exists()
 
 
 @pytest.mark.parametrize("foreign", ["owned_root", "common_git_dir", "head", "dirty", "symbolic_branch"])

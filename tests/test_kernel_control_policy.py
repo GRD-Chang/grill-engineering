@@ -1,6 +1,7 @@
 """Explicit checkpoint policy and stopped-Run feedback keep their real owners."""
 
 from pathlib import Path
+from dataclasses import replace
 import json
 
 import pytest
@@ -34,7 +35,8 @@ def tickets(root: Path, *, new_thread_per_development: bool = False) -> tuple[Ke
         def delivery(self, request):
             assert request.source_ref in {item.source_ref for item in jobs}
             assert request.target_ref == 'refs/heads/run'
-            return self.facts
+            return replace(self.facts, checks=self.facts.checks if request.read_checks else None,
+                           checks_requested=request.read_checks)
 
         def execute(self, effect, authorize):
             assert effect.operation == 'candidate'

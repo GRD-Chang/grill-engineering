@@ -167,17 +167,36 @@ def test_exit_invalidated_after_claim_is_recorded_unsent_not_unknown(tmp_path: P
 
 def test_temporary_unsent_claim_does_not_label_later_success_unsent(tmp_path: Path, monkeypatch):
     import agent_run.queries.host_exit as facts
+    from threading import local
     with _killed_host(tmp_path) as (kernel, notice):
         original_current = facts.host_exit_current
+        original_send = NativeNotifications._send_one
+        sending = local()
+        physical_attempts = []
         interrupted = False
+
+        def send(observer, event, deadline_at, cancel):
+            # Owner-side validity scans can also see a sending journal entry.
+            # Inject only the actual call's preflight, not a scheduling scan.
+            sending.active = True
+            physical_attempts.append(event['id'])
+            try:
+                return original_send(observer, event, deadline_at, cancel)
+            finally:
+                sending.active = False
+
         def current(database, evidence, *, storage):
             nonlocal interrupted
-            document = outbox.read_notifications(tmp_path, "run-native")
-            if not interrupted and any(item["outcome"] == "sending" for item in document.get("pending", [])):
+            if not interrupted and getattr(sending, 'active', False):
+                document = outbox.read_notifications(tmp_path, "run-native")
+                assert any(item['event']['id'] == physical_attempts[-1]
+                           and item['outcome'] == 'sending' and item['attempts'] == 1
+                           for item in document['pending'])
                 interrupted = True
                 return False  # This one physical preflight cannot verify its original Host.
             return original_current(database, evidence, storage=storage)
         monkeypatch.setattr(facts, "host_exit_current", current)
+        monkeypatch.setattr(NativeNotifications, '_send_one', send)
         calls = []
         def transport(_config, _card, identity, *_args, **kwargs):
             assert kwargs["is_current"]()
@@ -189,6 +208,7 @@ def test_temporary_unsent_claim_does_not_label_later_success_unsent(tmp_path: Pa
         document = outbox.read_notifications(tmp_path, "run-native")
         assert document["pending"] == [] and len(document["records"]) == 1
         record = document["records"][0]
+        assert physical_attempts == [record['event']['id'], record['event']['id']]
         assert record["outcome"] == "success" and record["attempts"] == 2
         assert "not_sent" not in record
         assert record["attempt_history"][0]["not_sent"]

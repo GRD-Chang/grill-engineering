@@ -11,7 +11,7 @@ import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
-from test_scope import BOUNDARY_TESTS, CONTRACT_TESTS, NATIVE_CONTRACT_TESTS
+from test_scope import BOUNDARY_TESTS, CONTRACT_TESTS, NATIVE_CONTRACT_TESTS, FIXED_REPAIR_REGRESSION_TESTS
 
 PRODUCT_ROOT = Path(__file__).resolve().parents[2]
 DEPENDENCY_FILES = ("pyproject.toml", "tests/dev-requirements.txt", "tests/build-requirements.txt")
@@ -118,6 +118,19 @@ def check_native_contracts(folder: Path) -> int:
     expected = {junit_key(node) for node in nodes}
     if len(expected) != len(nodes) or junit_cases(folder) != expected:
         raise ValueError('Incomplete or unexpected native contract coverage')
+    return len(expected)
+
+
+def check_fixed_repair_regression(folder: Path) -> int:
+    """Require the fixed 24 actual parameters, without producing a full receipt."""
+    report = read_environment(folder)
+    if report.get('ci_identity') != identity():
+        raise ValueError('Fixed repair environment belongs to another CI run identity')
+    expected = {junit_key(node) for node in FIXED_REPAIR_REGRESSION_TESTS}
+    if len(FIXED_REPAIR_REGRESSION_TESTS) != 24 or len(expected) != 24:
+        raise ValueError('Invalid fixed repair regression selection')
+    if junit_cases(folder) != expected:
+        raise ValueError('Incomplete or unexpected fixed repair regression coverage')
     return len(expected)
 
 
@@ -261,6 +274,8 @@ def main() -> None:
     boundary.add_argument('--results', type=Path, required=True)
     native = commands.add_parser('check-native-contracts')
     native.add_argument('--results', type=Path, required=True)
+    repair = commands.add_parser('check-fixed-repair-regression')
+    repair.add_argument('--results', type=Path, required=True)
     args = parser.parse_args()
     try:
         if args.command == "record":
@@ -270,6 +285,9 @@ def main() -> None:
             print(f'Boundary regression verified: {check_boundary(args.results)} passed; not full acceptance')
         elif args.command == 'check-native-contracts':
             print(f'Native contracts verified: {check_native_contracts(args.results)} passed; not full acceptance')
+        elif args.command == 'check-fixed-repair-regression':
+            print(f'Fixed repair regression verified: {check_fixed_repair_regression(args.results)} passed; '
+                  'original 19/14/full UNRUN; complete_product_pass=false')
         else:
             total = verify(
                 args.results, selected=os.environ["CHECKS_SELECTED"], product=os.environ["PRODUCT_SELECTED"],

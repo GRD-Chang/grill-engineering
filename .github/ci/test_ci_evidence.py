@@ -93,6 +93,18 @@ class CurrentCollectionTests(unittest.TestCase):
         self.assertIn('tests/test_repository_save_fifo.py::test_native_nonleader_thread_clock_uses_its_own_top_level_offsets', targets)
         self.assertEqual(len(scope.BOUNDARY_TESTS), 14)
 
+    def test_fixed_repair_scope_is_the_exact_24_current_parameters_not_the_full_inventory(self):
+        targets = scope.selection('fixed-repair-regression')
+        self.assertEqual(targets, scope.FIXED_REPAIR_REGRESSION_TESTS)
+        self.assertEqual(len(targets), 24)
+        self.assertEqual(len(set(targets)), 24)
+        self.assertEqual(evidence.collect_nodeids(targets), sorted(targets))
+        self.assertTrue(set(targets) < set(self.nodes))
+        self.assertEqual(len(scope.BOUNDARY_TESTS), 14)
+        native_nodes = [node for node in self.nodes if any(node == target or node.startswith(target + '[')
+                        for target in scope.NATIVE_CONTRACT_TESTS)]
+        self.assertEqual(len(native_nodes), 19)
+
     def test_local_contract_entry_stops_before_pytest_when_capability_check_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -133,6 +145,45 @@ class CurrentCollectionTests(unittest.TestCase):
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_fixed_repair_requires_exact_passed_nodes_and_current_sha_run_without_full_receipt(self):
+        folder = self.root / 'fixed-repair-regression'
+        folder.mkdir()
+        report = dict(deepcopy(self.report), ci_identity=evidence.identity())
+        (folder / 'environment.json').write_text(json.dumps(report))
+        nodes = scope.FIXED_REPAIR_REGRESSION_TESTS
+        self.junit(folder, nodes)
+        self.assertEqual(evidence.check_fixed_repair_regression(folder), 24)
+        for changed in (nodes[:-1], (*nodes, nodes[0]), (*nodes, 'tests/test_extra.py::test_extra')):
+            self.junit(folder, changed)
+            with self.subTest(nodes=changed), self.assertRaises(ValueError):
+                evidence.check_fixed_repair_regression(folder)
+        for outcome in ('skipped', 'failure', 'error'):
+            self.junit(folder, nodes)
+            tree = ET.parse(folder / 'junit.xml')
+            suite = tree.getroot().find('testsuite')
+            suite.set({'skipped': 'skipped', 'failure': 'failures', 'error': 'errors'}[outcome], '1')
+            ET.SubElement(suite.find('testcase'), outcome)
+            tree.write(folder / 'junit.xml')
+            with self.subTest(outcome=outcome), self.assertRaises(ValueError):
+                evidence.check_fixed_repair_regression(folder)
+        self.junit(folder, nodes)
+        for field in ('GITHUB_SHA', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT'):
+            wrong = deepcopy(report)
+            wrong['ci_identity'][field] = 'another-identity'
+            (folder / 'environment.json').write_text(json.dumps(wrong))
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'CI run identity'):
+                evidence.check_fixed_repair_regression(folder)
+        wrong = deepcopy(report)
+        wrong['commit']['stdout'] = 'b' * 40
+        (folder / 'environment.json').write_text(json.dumps(wrong))
+        with self.assertRaisesRegex(ValueError, 'candidate identity'):
+            evidence.check_fixed_repair_regression(folder)
+        (folder / 'environment.json').write_text(json.dumps(report))
+        with patch.object(evidence, 'FIXED_REPAIR_REGRESSION_TESTS', (*nodes[:-1], nodes[0])):
+            with self.assertRaisesRegex(ValueError, 'Invalid fixed'):
+                evidence.check_fixed_repair_regression(folder)
+        self.assertFalse((folder / 'evidence.json').exists())
+
     def test_native_contracts_require_current_exact_junit_without_full_receipt(self):
         folder = self.root / 'native-contracts'
         folder.mkdir()

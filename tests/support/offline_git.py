@@ -7,6 +7,7 @@ never advance the Scenario's local branch refs.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from copy import copy
 import os
 from pathlib import Path
 import re
@@ -48,6 +49,14 @@ class OfflineGit:
             GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
             GIT_OPTIONAL_LOCKS="0", GIT_NO_REPLACE_OBJECTS="1", GIT_TERMINAL_PROMPT="0")
         self._owned()
+
+    def _with_written(self, written: Callable[[str, Mapping[str, Any], subprocess.CompletedProcess[str]], None]) -> OfflineGit:
+        # Configuration only: every physical operation still calls _owned().
+        # Keep the read backend and other requests' callbacks/environment apart.
+        backend = copy(self)
+        backend.environment = dict(self.environment)
+        backend.written = written
+        return backend
 
     def _command(self, directory: Path, *args: str) -> list[str]:
         return ["git", "-c", "core.hooksPath=" + os.devnull,

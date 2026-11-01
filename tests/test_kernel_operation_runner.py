@@ -18,6 +18,25 @@ from agent_run.queries.run import read
 from support.requirements_scenarios import independent_source
 
 
+@pytest.mark.parametrize('local_cleanup', [False, True], ids=['ordinary', 'local-cleanup'])
+@pytest.mark.parametrize('fence', [None, 'old-token', {}], ids=['missing', 'string', 'mapping'])
+def test_malformed_effect_fence_is_rejected_before_storage(local_cleanup, fence):
+    from agent_run.core.operation_contract import LocalCleanupObservation
+    from agent_run.model import Effect, Execution, World
+
+    base = Commit('a' * 40, 'b' * 40)
+    effect = Effect('cleanup', 'ticket:2', 'cleanup_worktree', 'example/project',
+                    'refs/heads/task', 'refs/heads/run', base.sha, None, None,
+                    base, None, None, {}, Execution('run', 'owner', 1))
+    world = LocalCleanupObservation(effect, fence) if local_cleanup else World('p', 'g', 'r', base)
+    # No storage exists on this instance: malformed authority cannot reach SQL,
+    # dispatch, inspection or a final mutation guard.
+    kernel = Kernel.__new__(Kernel)
+    code = 'local_cleanup_observation_binding' if local_cleanup else 'effect_observation_binding'
+    with pytest.raises(KernelError, match=code):
+        kernel.authorize_effect_observation(effect, world, fence, prepared=True, inspections=None)
+
+
 @pytest.mark.parametrize("ready", [True, False])
 def test_readonly_selection_pages_130_tickets_without_allocating(tmp_path: Path, ready):
     numbers = tuple(range(2, 132))

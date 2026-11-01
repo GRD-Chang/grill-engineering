@@ -152,6 +152,9 @@ def test_public_stop_reports_real_commit_interruption_without_partial_action(
     kernel = Kernel.create_task(workspace.state_root / 'kernel.sqlite3',
         RunSpec('sqlite-fault-run', 'example/project', 1, 'unobserved', 'graph', (delivery,),
             inputs=fixture_inputs(), language='en', repository_root=str(workspace.repository_root)), requirements=source)
+    # Exercise the committing revocation path, rather than idle Stop's lawful
+    # read-only not_running result.
+    execution = kernel.claim_executor('sqlite-fault-owner')
     before = logical_state(kernel.storage.path)
     arguments = ['stop', 'sqlite-fault-run', '--repo', 'example/project', '--json']
     with sqlite_fault(monkeypatch, kernel.storage.path, 'commit-interrupt') as failures:
@@ -165,5 +168,7 @@ def test_public_stop_reports_real_commit_interruption_without_partial_action(
     receipt = json.loads(capsys.readouterr().out)
     assert receipt['run_id'] == 'sqlite-fault-run' and receipt['action'] == 'stop'
     assert kernel.source_status()['stopped']
+    with kernel.storage.transaction(write=False) as tx:
+        assert tx.one('SELECT executor,epoch FROM runs')[:] == (execution.owner, execution.epoch)
     assert sum(event['kind'] == 'control_applied' and event['identity'] == receipt['action_id']
                for event in kernel.history(delivery.key)) == 1
