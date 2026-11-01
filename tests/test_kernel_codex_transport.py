@@ -1,11 +1,13 @@
 """Controlled real CLI processes exercise the Codex transport, never a service."""
 
 from dataclasses import replace
+from contextlib import closing
 import json
 import os
 from collections.abc import Mapping
 from pathlib import Path
 import sys
+import sqlite3
 import time
 from typing import Any
 
@@ -120,6 +122,8 @@ def test_real_resume_preserves_original_thread_and_rejects_changed_events(
         git.run('update-ref', 'refs/heads/run', git.commit('HEAD').sha)
     kernel, first, ports = allocated_codex(tmp_path, prior_developments=prior_developments,
         checkout=checkout)
+    now = [kernel.clock()]
+    kernel.clock = lambda: now[0]
     original_head = None if checkout is None else LocalGit(checkout).commit('HEAD').sha
     original_index = None if checkout is None else LocalGit(checkout).run('ls-files', '--stage', '-z').stdout
     tracked, untracked = b'Fourth Development tracked work\n', b'Fourth Development untracked work\n'
@@ -148,6 +152,7 @@ def test_real_resume_preserves_original_thread_and_rejects_changed_events(
             assert 'unfinished.txt' in git.run('ls-files', '--others', '--exclude-standard').stdout.splitlines()
             assert f'worktree {checkout}' in git.run('worktree', 'list', '--porcelain', '-z').stdout.split('\0')
 
+    first_admitted_at = now[0]
     failed = local_codex(kernel, first, tmp_path, f"""\
 assert sys.argv[1:{4 if prior_developments else 3}] == {['exec', 'resume', '--json'] if prior_developments else ['exec', '--json']!r}
 {work}\
@@ -157,10 +162,12 @@ raise SystemExit(1)
     assert failed is not None and failed.returncode == 1 and failed.raw == b""
     retained_work()
     reopened = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
+    reopened.clock = lambda: now[0]
     assert reopened.status(first.subject)["gates"] == []
     assert reopened.operation_state().active == ()
     charged = {**before, 'developments_used': prior_developments + 1}
     assert reopened.status(first.subject)['budgets']['requirements'] == charged
+    now[0] += 1.25
     resumed = CoreOperations(reopened, first.execution, lambda binding: ports, prepare_agents=False).until(lambda step: step.preparation is not None).preparation
     assert resumed is not None and resumed.mode == "resume"
     assert resumed.reported_thread == "original-thread" and resumed.thread_id == first.thread_id
@@ -184,6 +191,8 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_bytes({RAW!r})
 for thread in {events!r}:
     print(json.dumps({{"type": "thread.started", "thread_id": thread}}), flush=True)
 """
+    now[0] += .5  # Ordinary recovery starts its period at admission, not preparation.
+    resumed_admitted_at = now[0]
     if events == ("original-thread",):
         result = local_codex(reopened, resumed, tmp_path, program)
         assert result is not None and result.returncode == 0 and result.raw == RAW
@@ -192,8 +201,12 @@ for thread in {events!r}:
             local_codex(reopened, resumed, tmp_path, program)
     original_call, resumed_call = observed_call(kernel, first), observed_call(kernel, resumed)
     assert resumed_call.invocation_id != original_call.invocation_id
-    assert resumed_call.deadline_at == original_call.deadline_at
+    assert original_call.deadline_at == first_admitted_at + original_call.deadline_seconds
+    assert resumed_call.deadline_seconds == original_call.deadline_seconds == resumed.deadline_seconds
+    assert resumed_call.deadline_at == resumed_admitted_at + original_call.deadline_seconds
+    assert resumed_call.deadline_at > original_call.deadline_at
     after = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
+    after.clock = lambda: now[0]
     status = after.status(first.subject)
     assert status["pending_return"] is (events == ("original-thread",))
     assert status["gates"] == ([] if events == ("original-thread",) else ["execution_failed"])
@@ -299,7 +312,10 @@ output.write_bytes({raw!r})
     assert scenario.kernel.operation_state().active == ()
 
 
-def test_codex_jsonl_binds_real_thread_and_only_owned_final_file_is_the_return(tmp_path: Path) -> None:
+@pytest.mark.parametrize('binding_reply_lost', [False, True], ids=['normal', 'binding-reply-lost'])
+def test_codex_jsonl_binds_real_thread_and_only_owned_final_file_is_the_return(
+    tmp_path: Path, binding_reply_lost: bool,
+) -> None:
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     state = tmp_path / "runner-state"
@@ -380,9 +396,26 @@ output.write_bytes({RAW!r})
 """)
     executable.chmod(0o700)
 
+    now = [created.clock()]
+    created.clock = lambda: now[0]
+    binding_error = OSError('The backend Thread commit reply was lost')
+    bound_calls = []
+
     class ObserveDurableThread(Kernel):
         def bind_thread(self, exact_call: AgentCall, reported_thread: str) -> None:
             super().bind_thread(exact_call, reported_thread)
+            bound_calls.append(exact_call)
+            # Read the committed Thread independently, before auxiliary failure
+            # settlement or letting the child create its final output file.
+            with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as db:
+                assert db.execute('SELECT backend_id FROM threads WHERE run_id=? AND id=?',
+                    (exact_call.execution.run_id, exact_call.thread_id)).fetchone() == ('local-cli-thread',)
+                assert db.execute('SELECT dispatch_state,raw_id,exit_code FROM invocation_outputs '
+                    'WHERE run_id=? AND invocation=? AND ordinal=?',
+                    (exact_call.execution.run_id, exact_call.invocation_id, exact_call.output_ordinal)).fetchone() == (
+                        'started', None, None)
+            if binding_reply_lost:
+                raise binding_error
             bound.write_text("The original Kernel accepted this exact Thread.")
 
     checks = 0
@@ -392,23 +425,72 @@ output.write_bytes({RAW!r})
         checks += 1
         assert not started.exists()
 
-    result = execute_codex(
-        ObserveDurableThread(path, run_id=call.execution.run_id), call, executable=str(executable),
-        prompt="Perform this one allocated development task.",
-        environment={"PATH": os.defpath, "HOME": str(tmp_path), "CODEX_HOME": str(home),
-                     "GH_TOKEN": "Wrong-inherited-identity", "GITHUB_TOKEN": "Wrong-fallback",
-                     "CUSTOM_RUNNER_PAT": "Runner-private-token", "AGENT_RUN_INTERNAL_CONTROL_TOKEN": "Runner-control"},
-        credential_file=credential, hidden_paths=(runner,), hidden_environment=("CUSTOM_RUNNER_PAT",),
-        timeout=5, authorize_source=lambda admitted: authorize_source(),
-    )
-    assert result is not None and result.returncode == 0 and result.raw == RAW
+    original_budget = created.status(call.subject)['budgets']['requirements']
+
+    def run():
+        worker_kernel = ObserveDurableThread(path, run_id=call.execution.run_id)
+        worker_kernel.clock = lambda: now[0]
+        return execute_codex(
+            worker_kernel, call, executable=str(executable),
+            prompt="Perform this one allocated development task.",
+            environment={"PATH": os.defpath, "HOME": str(tmp_path), "CODEX_HOME": str(home),
+                         "GH_TOKEN": "Wrong-inherited-identity", "GITHUB_TOKEN": "Wrong-fallback",
+                         "CUSTOM_RUNNER_PAT": "Runner-private-token", "AGENT_RUN_INTERNAL_CONTROL_TOKEN": "Runner-control"},
+            credential_file=credential, hidden_paths=(runner,), hidden_environment=("CUSTOM_RUNNER_PAT",),
+            timeout=5, authorize_source=lambda admitted: authorize_source(),
+        )
+
+    if binding_reply_lost:
+        with pytest.raises(OSError) as caught:
+            run()
+        assert caught.value is binding_error and not bound.exists()
+    else:
+        result = run()
+        assert result is not None and result.returncode == 0 and result.raw == RAW
     assert checks == 2 and int(started.read_text()) != os.getpid()
+    assert len(bound_calls) == 1
     reopened = Kernel(path, run_id=call.execution.run_id)
-    assert reopened.status(call.subject)["pending_return"] is True
-    assert reopened.status(call.subject)["budgets"]["requirements"]["developments_used"] == 1
+    reopened.clock = lambda: now[0]
+    assert reopened.status(call.subject)["pending_return"] is (not binding_reply_lost)
+    charged_budget = {**original_budget, 'developments_used': 1}
+    assert reopened.status(call.subject)['budgets']['requirements'] == charged_budget
     assert reopened.operation_state().active == ()
     with pytest.raises(KernelError, match="thread_identity_changed"):
         reopened.bind_thread(observed_call(created, call), "another-thread")
+    if binding_reply_lost:
+        original = bound_calls[0]
+        assert [event['identity'] for event in reopened.history(call.subject)
+                if event['kind'] == 'worker_exited'] == [original.invocation_id]
+        with reopened.storage.transaction(write=False) as tx:
+            output = tx.one('SELECT dispatch_state,raw_id,exit_code FROM invocation_outputs '
+                'WHERE invocation=? AND ordinal=?', (original.invocation_id, original.output_ordinal))
+            assert output['dispatch_state'] == 'exited' and output['raw_id'] is None
+            assert output['exit_code'] is not None
+        now[0] += 1.25
+        reopened.control('resume', 'resume-after-backend-binding-reply-loss', subject=call.subject)
+        resumed = CoreOperations(reopened, execution, lambda binding: ports, prepare_agents=False).until(
+            lambda step: step.preparation is not None).preparation
+        assert resumed is not None and resumed.mode == 'resume'
+        assert (resumed.attempt_id, resumed.thread_id, resumed.reported_thread) == (
+            call.attempt_id, call.thread_id, 'local-cli-thread')
+        now[0] += .5
+        resumed_admitted_at = now[0]
+        result = local_codex(reopened, resumed, tmp_path, f"""\
+assert sys.argv[1:4] == ['exec', 'resume', '--json']
+assert sys.argv[5] == 'local-cli-thread'
+assert sys.stdin.read() == 'Continue the allocated task.'
+print(json.dumps({{'type': 'thread.started', 'thread_id': 'local-cli-thread'}}), flush=True)
+Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_bytes({RAW!r})
+""")
+        assert result is not None and result.returncode == 0 and result.raw == RAW
+        resumed_call = observed_call(reopened, resumed)
+        assert resumed_call.invocation_id != original.invocation_id
+        assert resumed_call.deadline_seconds == original.deadline_seconds == resumed.deadline_seconds
+        assert resumed_call.deadline_at == resumed_admitted_at + original.deadline_seconds
+        assert resumed_call.deadline_at > original.deadline_at
+        assert reopened.status(call.subject)['pending_return'] is True
+        assert reopened.status(call.subject)['budgets']['requirements'] == charged_budget
+        assert reopened.operation_state().active == ()
     assert CoreOperations(reopened, call.execution, lambda binding: ports, prepare_agents=False).once(agent_capacity=0).kind == "progress"
 
 

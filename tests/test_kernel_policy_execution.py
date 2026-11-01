@@ -205,9 +205,12 @@ def test_ordinary_recovery_keeps_attempt_thread_and_uses_one_new_deadline(tmp_pa
     kernel.agent_source_ready(second)
     kernel.agent_exited(second, next_process, 1)
     assert operations.once().kind == "paused"
+    now[0] = 105.75
     kernel.control("resume", "manual-thread-replacement", subject=delivery.key, new_thread=True)
     third = operations.once().call
     assert third is not None and third.attempt_id == first.attempt_id and third.thread_id != first.thread_id
+    assert third.deadline_seconds == first.deadline_seconds == 7.0
+    assert third.deadline_at == now[0] + 7.0 == 112.75
     assert kernel.dispatch_agent(third)
     kernel.bind_thread(third, "replacement-backend-thread")
     third_process = {**process, "pid": 25, "pgid": 25, "start_token": "third-start"}

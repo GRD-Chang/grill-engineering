@@ -389,7 +389,7 @@ class EvidenceTests(unittest.TestCase):
             evidence.record(self.folder(index), index, contract=True)
 
     def test_failed_cancelled_skipped_unknown_and_missing_jobs_are_rejected(self):
-        for result in ("failure", "cancelled", "skipped", "unknown", ""):
+        for result in ("failure", "cancelled", "timed_out", "skipped", "unknown", ""):
             with self.subTest(result=result), self.assertRaises(ValueError):
                 evidence.verify(self.results, selected="true", product="true", contract="true", result=result)
 

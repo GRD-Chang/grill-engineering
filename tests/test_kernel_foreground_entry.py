@@ -16,6 +16,7 @@ from agent_run.adapters.foreground import ProcessPin, read_record, subreaper
 from agent_run.core.kernel import Kernel
 from agent_run.runtime.package_lease import default_runner_lock_path, runner_management_lease
 from support.systemd_manager import _CODEX, _control_environment, _git
+from support.sqlite_faults import logical_state
 from agent_run.adapters.workspace import ManagedWorkspace
 
 
@@ -102,6 +103,30 @@ def test_installed_foreground_parent_only_public_lifecycle(git_repo, tmp_path, m
             assert document['source_graph']['parent']['state'] == 'CLOSED'
             assert _git(tmp_path / 'origin.git', 'show', 'refs/heads/main:managed-delivery.txt') == 'Implementation from the managed native Worker.'
             assert not list((lock.parent / 'foreground-hosts').iterdir())
+            if not stop_first:
+                # Reuse the completed public story: a new Resume is no grant
+                # to repeat its returned Agent work or completed mutations.
+                durable = logical_state(kernel.storage.path)
+                refs = {str(root): _git(root, 'for-each-ref', '--format=%(refname) %(objectname)')
+                    for root in (git_repo, tmp_path / 'origin.git')}
+                def mutations():
+                    calls = [json.loads(line) for line in (tmp_path / 'gh-calls.jsonl').read_text().splitlines()]
+                    return [args for args in calls if any(
+                        flag in args and args[args.index(flag) + 1] in {'POST', 'PATCH', 'PUT', 'DELETE'}
+                        for flag in ('--method', '-X')) or any('mutation ' in arg for arg in args)]
+                written = mutations()
+                child = start('resume', original['run_id'], '--foreground')
+                out, err = child.communicate(timeout=90)
+                assert child.returncode == 2, (out, err)
+                rejected = json.loads(out)
+                assert rejected['status'] == 'command_failed'
+                assert rejected['diagnostics'][0]['code'] == 'control_subject_ambiguous'
+                assert logical_state(kernel.storage.path) == durable
+                assert kernel.status('parent:1') == after
+                assert mutations() == written
+                assert {str(root): _git(root, 'for-each-ref', '--format=%(refname) %(objectname)')
+                    for root in (git_repo, tmp_path / 'origin.git')} == refs
+                assert not list((lock.parent / 'foreground-hosts').iterdir())
         finally:
             # Retain only identities from this test's private launch records.
             root = lock.parent / 'foreground-hosts'
