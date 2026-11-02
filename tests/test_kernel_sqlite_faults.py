@@ -169,6 +169,8 @@ def test_public_stop_reports_real_commit_interruption_without_partial_action(
     assert receipt['run_id'] == 'sqlite-fault-run' and receipt['action'] == 'stop'
     assert kernel.source_status()['stopped']
     with kernel.storage.transaction(write=False) as tx:
-        assert tx.one('SELECT executor,epoch FROM runs')[:] == (execution.owner, execution.epoch)
+        assert tx.one('SELECT executor,epoch FROM runs')[:] == (execution.owner, execution.epoch + 1)
+        assert tx.one('SELECT owner,epoch,status FROM retired_executors')[:] == (
+            execution.owner, execution.epoch, 'pending')
     assert sum(event['kind'] == 'control_applied' and event['identity'] == receipt['action_id']
                for event in kernel.history(delivery.key)) == 1

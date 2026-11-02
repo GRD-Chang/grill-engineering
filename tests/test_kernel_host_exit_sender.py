@@ -1,5 +1,6 @@
 """Exit hooks share the native sender, original evidence and delivery budget."""
 from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -172,14 +173,14 @@ def test_temporary_unsent_claim_does_not_label_later_success_unsent(tmp_path: Pa
         original_current = facts.host_exit_current
         original_send = NativeNotifications._send_one
         sending = local()
-        physical_attempts = []
+        preflight_attempts = []
         interrupted = False
 
         def send(observer, event, deadline_at, cancel):
             # Owner-side validity scans can also see a sending journal entry.
             # Inject only the actual call's preflight, not a scheduling scan.
             sending.active = True
-            physical_attempts.append(event['id'])
+            preflight_attempts.append(event['id'])
             try:
                 return original_send(observer, event, deadline_at, cancel)
             finally:
@@ -189,7 +190,7 @@ def test_temporary_unsent_claim_does_not_label_later_success_unsent(tmp_path: Pa
             nonlocal interrupted
             if not interrupted and getattr(sending, 'active', False):
                 document = outbox.read_notifications(tmp_path, "run-native")
-                assert any(item['event']['id'] == physical_attempts[-1]
+                assert any(item['event']['id'] == preflight_attempts[-1]
                            and item['outcome'] == 'sending' and item['attempts'] == 1
                            for item in document['pending'])
                 interrupted = True
@@ -208,13 +209,52 @@ def test_temporary_unsent_claim_does_not_label_later_success_unsent(tmp_path: Pa
         document = outbox.read_notifications(tmp_path, "run-native")
         assert document["pending"] == [] and len(document["records"]) == 1
         record = document["records"][0]
-        assert physical_attempts == [record['event']['id'], record['event']['id']]
+        assert preflight_attempts == [record['id'], record['id']]
+        assert calls == [hashlib.sha256(record['id'].encode()).hexdigest()[:32]]
+        assert record['kind'] == 'executor_exit' and record['exit_evidence'] == notice
         assert record["outcome"] == "success" and record["attempts"] == 2
         assert "not_sent" not in record
         assert record["attempt_history"][0]["not_sent"]
         assert record["attempt_history"][0]["outcome"] == "failed"
         assert record["attempt_history"][1]["outcome"] == "success"
         assert "not_sent" not in record["attempt_history"][1]
+
+
+def test_unsent_attempt_then_success_archives_flat_identity_without_renewing_budget(tmp_path, monkeypatch):
+    """Real journal/result accounting only; no Host, sender thread or transport proof."""
+    observer = object.__new__(NativeNotifications)
+    observer.state_root, observer.run_id, observer.owner = tmp_path, 'journal-run', {'fixture': 'claim-owner'}
+    now = [100.0]
+    monkeypatch.setattr('agent_run.notifications.sender.time.time', lambda: now[0])
+    evidence = {'fixture': 'original-exit-payload'}
+    event = {'id': 'original-exit-event', 'kind': 'executor_exit', 'exit_evidence': evidence}
+    with outbox.transaction(tmp_path, observer.run_id) as document:
+        outbox.enqueue(document, event, now[0])
+    for number, result in enumerate(({'outcome': 'failed', 'not_sent': True}, {'outcome': 'success'}), 1):
+        with outbox.transaction(tmp_path, observer.run_id) as document:
+            item, = document['pending']
+            assert item['event'] == event and item['deadline_at'] == 160.0
+            item.update(owner=observer.owner, outcome='sending', attempts=number)
+            item['attempt_history'].append({'number': number, 'started_at': now[0], 'outcome': 'sending'})
+        before = outbox.read_notifications(tmp_path, observer.run_id)
+        observer._finish_result((event['id'], number + 1), {'outcome': 'success'}, now[0])
+        assert outbox.read_notifications(tmp_path, observer.run_id) == before
+        observer._finish_result((event['id'], number), result, now[0])
+        if number == 1:
+            item, = outbox.read_notifications(tmp_path, observer.run_id)['pending']
+            assert item['outcome'] == 'failed' and 'not_sent' not in item
+            assert item['attempt_history'][0]['not_sent'] is True
+            now[0] = item['next_attempt_at']
+    document = outbox.read_notifications(tmp_path, observer.run_id)
+    assert document['pending'] == []
+    record, = document['records']
+    assert record['id'] == event['id'] and 'event' not in record and 'owner' not in record
+    assert record['kind'] == event['kind'] and record['exit_evidence'] == evidence
+    assert record['deadline_at'] == 160.0 and record['outcome'] == 'success' and record['attempts'] == 2
+    assert 'not_sent' not in record
+    first, second = record['attempt_history']
+    assert first['number'] == 1 and first['outcome'] == 'failed' and first['not_sent'] is True
+    assert second['number'] == 2 and second['outcome'] == 'success' and 'not_sent' not in second
 
 
 def test_exit_identity_read_fault_before_submit_keeps_original_unsent_attempt(tmp_path, monkeypatch):

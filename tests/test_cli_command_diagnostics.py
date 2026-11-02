@@ -208,7 +208,9 @@ def test_stop_receipt_uses_frozen_language_and_keeps_internal_identity_only_in_j
     with kernel.storage.transaction(write=False) as tx:
         action = dict(tx.one("SELECT id,status FROM actions WHERE kind='stop'"))
         assert tx.one("SELECT stopped FROM runs")[0] == 1
-        assert tx.one("SELECT executor,epoch FROM runs")[:] == (execution.owner, execution.epoch)
+        assert tx.one("SELECT executor,epoch FROM runs")[:] == (execution.owner, execution.epoch + 1)
+        assert tx.one("SELECT owner,epoch,status FROM retired_executors")[:] == (
+            execution.owner, execution.epoch, "pending")
         assert tx.one("SELECT count(*) FROM hosts")[0] == 0
     if as_json:
         assert json.loads(output.out) == {"result": "accepted", "status": "action_applied", "run_id": spec.run_id,

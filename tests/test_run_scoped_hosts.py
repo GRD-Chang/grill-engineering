@@ -262,6 +262,30 @@ def test_explicit_unmanaged_exit_checks_exact_invocation_set_and_never_releases_
     assert rows(db, 'B') == before_b
 
 
+def test_whole_run_stop_retires_exact_epoch_without_releasing_worker_or_reusing_authority(scenario):
+    db, kernels, requests = scenario
+    db.execute('BEGIN IMMEDIATE')
+    for run in ('A', 'B'):
+        worker(db, run, requests[run])
+    db.commit()
+    before_b = rows(db, 'B')
+    lease = tuple(db.execute("SELECT * FROM leases WHERE run_id='A'").fetchone())
+    output = tuple(db.execute("SELECT * FROM invocation_outputs WHERE run_id='A'").fetchone())
+    assert kernels['A'].control('stop', 'stop-with-worker') == 'applied'
+    assert db.execute("SELECT executor,epoch,stopped FROM runs WHERE id='A'").fetchone()[:] == ('same-owner', 2, 1)
+    assert db.execute("SELECT owner,epoch,status FROM retired_executors WHERE run_id='A'").fetchone()[:] == (
+        'same-owner', 1, 'pending')
+    assert tuple(db.execute("SELECT * FROM leases WHERE run_id='A'").fetchone()) == lease
+    assert tuple(db.execute("SELECT * FROM invocation_outputs WHERE run_id='A'").fetchone()) == output
+    stopped = rows(db, 'A')
+    step = kernels['A'].next_work(Execution('A', 'same-owner', 1))
+    assert (step.kind, step.reason, step.call) == ('paused', 'executor_fenced', None)
+    with pytest.raises(KernelError, match='executor_exit_unproven'):
+        kernels['A'].control('resume', 'premature-resume')
+    assert kernels['A'].control('stop', 'stop-with-worker') == 'applied'
+    assert rows(db, 'A') == stopped and rows(db, 'B') == before_b
+
+
 def test_failed_executor_revocation_does_not_release_leases_or_duplicate_audit(scenario):
     db, kernels, requests = scenario
     db.execute('BEGIN IMMEDIATE')
