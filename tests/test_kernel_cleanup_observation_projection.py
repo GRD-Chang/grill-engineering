@@ -16,6 +16,7 @@ from support.cleanup_scenarios import _native_scenario
 
 def test_local_cleanup_does_not_read_delivery_inside_write_authority(tmp_path, monkeypatch):
     s = _native_scenario(tmp_path / "scenario", DeliveryKind.TICKET)
+    s.record_checkpoints = False
     make_ports, execute = s.make_ports, s.port.execute
     active = [False]
     source_reads, calls, mutations = [], [], []
@@ -79,9 +80,10 @@ def pending_cleanup(tmp_path, monkeypatch, operation="cleanup_worktree", *, sibl
     if sibling:
         from support.offline import GraphScenario
         from support.requirements_scenarios import independent_source
-        s = GraphScenario(tmp_path / "scenario", independent_source())
+        s = GraphScenario(tmp_path / "scenario", independent_source(), record_checkpoints=False)
     else:
         s = _native_scenario(tmp_path / "scenario", DeliveryKind.TICKET)
+        s.record_checkpoints = False
     make_ports, execute = s.make_ports, s.port.execute
     captured = []
     physical_ports = []

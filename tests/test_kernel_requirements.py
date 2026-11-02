@@ -49,7 +49,7 @@ def test_closed_local_dependency_without_completion_never_unblocks_or_creates_fi
 
 def test_real_ticket_close_receipts_create_completion_before_dependency_and_final(tmp_path: Path) -> None:
     source = Requirements.from_wire(native_input()["initial_requirements"])
-    scenario = GraphScenario(tmp_path / "graph", source)
+    scenario = GraphScenario(tmp_path / "graph", source, record_checkpoints=False)
     assert scenario.kernel.source_status()["final_subject"] is None
     assert scenario.run().kind == "complete"
     completed = scenario.kernel.source_status()["completions"]
@@ -107,7 +107,7 @@ def demand_world(kernel: Kernel, subject: str) -> World:
 
 def test_requirement_requeue_is_explicit_idempotent_and_retains_sibling_return(tmp_path: Path) -> None:
     source = independent_source()
-    scenario = GraphScenario(tmp_path / "requeue", source, policy=Policy(concurrency=2))
+    scenario = GraphScenario(tmp_path / "requeue", source, policy=Policy(concurrency=2), record_checkpoints=False)
     kernel = scenario.kernel
     operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
     first = operations.until(lambda step: step.call is not None).call
@@ -143,7 +143,7 @@ def test_requirement_requeue_is_explicit_idempotent_and_retains_sibling_return(t
 
 @pytest.mark.parametrize("retirement_race", ["none", "foreign_author", "target_append_after_receipt", "target_append_after_lost_ack", "requirements_after_receipt", "requirements_then_foreign_close"])
 def test_managed_requeue_reconciles_the_original_pr_before_replacing_its_generation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retirement_race: str) -> None:
-    scenario = GraphScenario(tmp_path / "managed-requeue", independent_source(), policy=Policy(concurrency=2))
+    scenario = GraphScenario(tmp_path / "managed-requeue", independent_source(), policy=Policy(concurrency=2), record_checkpoints=False)
     kernel, subject = scenario.kernel, scenario.delivery.key
     kernel.control("stop", "retire-fixture")
     kernel.confirm_executor_exit(scenario.execution)
@@ -284,7 +284,7 @@ def test_managed_requeue_reconciles_the_original_pr_before_replacing_its_generat
 
 def test_graph_refresh_cannot_reopen_stop_and_late_siblings_settle_without_authority(tmp_path: Path) -> None:
     source = independent_source()
-    scenario = GraphScenario(tmp_path / "scope", source, policy=Policy(concurrency=2))
+    scenario = GraphScenario(tmp_path / "scope", source, policy=Policy(concurrency=2), record_checkpoints=False)
     kernel, token = scenario.kernel, scenario.execution
     operations = CoreOperations(kernel, token, scenario.make_ports)
     calls = [operations.until(lambda step: step.call is not None).call for _ in range(2)]
@@ -324,7 +324,7 @@ def test_graph_refresh_cannot_reopen_stop_and_late_siblings_settle_without_autho
 def test_final_parent_drift_retires_old_work_and_restarts_full_review_without_refund(tmp_path: Path, dirty_repair: bool) -> None:
     original = Requirements.from_wire(native_input()["initial_requirements"])
     source = replace(original, parent=replace(original.parent, sub_issue_numbers=(3,)), issues=(original.issues[0],))
-    scenario = GraphScenario(tmp_path / "graph", source, reviews=("pass", "fail", "pass") if dirty_repair else ("pass",))
+    scenario = GraphScenario(tmp_path / "graph", source, reviews=("pass", "fail", "pass") if dirty_repair else ("pass",), record_checkpoints=False)
     assert scenario.run().kind == "complete"
     activation = prepare_scripted_agent(scenario.kernel, scenario.runner().run_once())
     assert activation.reason == "final_activated"
@@ -376,7 +376,7 @@ def test_final_parent_drift_retires_old_work_and_restarts_full_review_without_re
 def test_original_final_approval_reconciles_before_parent_requirement_refresh(tmp_path: Path, outcome: str) -> None:
     original = Requirements.from_wire(native_input()["initial_requirements"])
     source = replace(original, parent=replace(original.parent, sub_issue_numbers=(3,)), issues=(original.issues[0],))
-    scenario = GraphScenario(tmp_path / "graph", source)
+    scenario = GraphScenario(tmp_path / "graph", source, record_checkpoints=False)
     scenario.kernel.clock = lambda: 100
     assert scenario.run().kind == "complete"
     activation = scenario.runner().run_once()
@@ -450,7 +450,7 @@ def final_merge_in_flight(path: Path) -> tuple[GraphScenario, Effect]:
     """Real Ticket Completion, full Review and human approval precede the fault."""
     original = Requirements.from_wire(native_input()["initial_requirements"])
     source = replace(original, parent=replace(original.parent, sub_issue_numbers=(3,)), issues=(original.issues[0],))
-    scenario = GraphScenario(path, source)
+    scenario = GraphScenario(path, source, record_checkpoints=False)
     assert scenario.run().kind == "complete"
     activation = scenario.runner().run_once()
     assert activation.reason == "final_activated"
@@ -536,7 +536,7 @@ def test_original_final_merge_keeps_closeout_after_uncertain_read_and_parent_dri
 def test_final_requirement_refresh_never_reuses_old_generation_human_response(tmp_path: Path) -> None:
     original = Requirements.from_wire(native_input()["initial_requirements"])
     source = replace(original, parent=replace(original.parent, sub_issue_numbers=(3,)), issues=(original.issues[0],))
-    scenario = GraphScenario(tmp_path / "graph", source, reviews=("pass", "blocked", "pass"))
+    scenario = GraphScenario(tmp_path / "graph", source, reviews=("pass", "blocked", "pass"), record_checkpoints=False)
     assert scenario.run().kind == "complete"
     activation = prepare_scripted_agent(scenario.kernel, scenario.runner().run_once())
     assert activation.reason == "final_activated"

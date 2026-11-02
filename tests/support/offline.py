@@ -431,7 +431,8 @@ class Scenario:
 
     def __init__(self, root: Path, kind: DeliveryKind, *, reviews: Sequence[str] = ("pass",),
                  checks: Sequence[str] = ("none",), policy: Policy | None = None,
-                 edits: Sequence[Mapping[str, str]] | None = None, neutral_script: Mapping[str, Any] | None = None) -> None:
+                 edits: Sequence[Mapping[str, str]] | None = None, neutral_script: Mapping[str, Any] | None = None,
+                 record_checkpoints: bool = True) -> None:
         self.script = neutral_script
         if neutral_script is not None:
             declared = {"ticket": DeliveryKind.TICKET, "parent_only": DeliveryKind.PARENT_ONLY, "full_parent": DeliveryKind.FINAL_RUN}[neutral_script.get("delivery_kind", "ticket")]
@@ -497,6 +498,7 @@ class Scenario:
         self.check_heads: dict[str, list[str]] = {}
         self.role_calls: list[dict[str, Any]] = []
         self.checkpoints: list[dict[str, Any]] = []
+        self.record_checkpoints = record_checkpoints
         self.edits = edits
         self.reviewed_heads: list[str] = []
 
@@ -602,7 +604,8 @@ class Scenario:
         if step.call is not None:
             runner.authorize_agent(step.call)
             self.kernel.receive(step.call, self.agent(step.call))
-        self.checkpoints.append(self.kernel.status(self.delivery.key))
+        if self.record_checkpoints:
+            self.checkpoints.append(self.kernel.status(self.delivery.key))
         return step
 
     def run(self, *, approve: bool = False, max_steps: int = 200, cut: str = "complete") -> Step:
@@ -824,7 +827,8 @@ class GraphScenario(Scenario):
     """Native source reader plus the same one-request driver, using real Git."""
 
     def __init__(self, root: Path, requirements: Requirements, *, policy: Policy | None = None,
-                 reviews: Sequence[str] = ("pass",), initial_git: Mapping[str, Any] | None = None) -> None:
+                 reviews: Sequence[str] = ("pass",), initial_git: Mapping[str, Any] | None = None,
+                 record_checkpoints: bool = True) -> None:
         self.requirements = requirements
         self.script = None
         self.port = OfflinePort.create(root, initial_git)
@@ -865,6 +869,7 @@ class GraphScenario(Scenario):
         self.check_heads: dict[str, list[str]] = {}
         self.role_calls: list[dict[str, Any]] = []
         self.checkpoints: list[dict[str, Any]] = []
+        self.record_checkpoints = record_checkpoints
         self.edits = None
         self.reviewed_heads: list[str] = []
 

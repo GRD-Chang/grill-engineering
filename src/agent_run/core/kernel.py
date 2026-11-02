@@ -4940,10 +4940,14 @@ class Kernel:
         inputs = self._inputs(tx, run)
         if inputs:
             context.update(_prompt_resources=inputs["prompt_resources"], github_identity=inputs["worker_identity"])
+        ci_failure_body = None
         if job["purpose"] == Purpose.CI:
             context["work_source"] = "ci"
             if job["ci_failure"]:
-                context["ci_evidence"] = json.loads(tx.get(job["ci_failure"], job["id"]))
+                ci_failure_body = tx.get(job["ci_failure"], job["id"])
+                context["ci_evidence"] = json.loads(ci_failure_body)
+                if role != Role.PUBLICATION:
+                    ci_failure_body = None
         revisions = tx.rows(*run_statement(tx, "SELECT material_id FROM history WHERE subject=? AND generation=? AND kind='revision_requested' AND run_id=? ORDER BY position DESC LIMIT 1",
                         (job["id"], job["generation"]), run_last=True))
         if revisions:
@@ -4952,7 +4956,8 @@ class Kernel:
             field = {"acceptance": "acceptance_artifact", "integration": "integration_evidence",
                      "git_integrity": "git_integrity_evidence", "required_checks": "ci_evidence"}[job["repair_source"]]
             material = job["ci_failure"] if job["repair_source"] == "required_checks" else job["last_failure"]
-            context[field] = json.loads(tx.get(material, job["id"]))
+            if field != "ci_evidence" or field not in context:
+                context[field] = json.loads(tx.get(material, job["id"]))
         integration_failure = (self._integration_failure(tx, job) if job["purpose"] == Purpose.INTEGRATION
                                and (role == Role.REVIEW or role == Role.DEVELOPMENT and job["repair_source"] == "git_integrity") else None)
         if (role == Role.DEVELOPMENT and integration_failure is not None
@@ -5082,7 +5087,8 @@ class Kernel:
                                              last_review_artifact=previous_artifact)
                     context["fallback_publication_context"] = publication_facts
                 else:
-                    publication_facts.update(failed_required_checks=json.loads(tx.get(job["ci_failure"], job["id"])),
+                    publication_facts.update(failed_required_checks=json.loads(
+                        ci_failure_body if ci_failure_body is not None else tx.get(job["ci_failure"], job["id"])),
                                              previous_published_head=job["publication_sha"])
                     context["ci_repair_publication_context"] = publication_facts
             else:
