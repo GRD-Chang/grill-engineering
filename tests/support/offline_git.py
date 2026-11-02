@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import selectors
+import stat
 import subprocess
 from tempfile import TemporaryDirectory
 from time import monotonic
@@ -19,6 +20,19 @@ from typing import Any
 
 from agent_run.errors import GitError
 from agent_run.runtime.git_command import MAX_GIT_ERROR_BYTES, _kill_group, run_git
+
+
+# Exact files produced by this fixture's Git init/config commands. Other Git
+# spellings, object formats and legal extra keys still use Git's own parser.
+_CANONICAL_CONFIG = {
+    False: (b"[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n"
+            b"\tbare = false\n\tlogallrefupdates = true\n"
+            b"[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n"),
+    True: (b"[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n"),
+}
+_PRIVATE_GIT_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_SYSTEM": os.devnull, "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_NO_REPLACE_OBJECTS": "1", "GIT_TERMINAL_PROMPT": "0"}
 
 
 class OfflineGit:
@@ -45,9 +59,7 @@ class OfflineGit:
         self.environment = {key: value for key, value in environment.items()
                             if key in {"PATH", "TMPDIR", "LANG", "LC_ALL"}
                             or key.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_"))}
-        self.environment.update(HOME=str(self.root), GIT_CONFIG_NOSYSTEM="1",
-            GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
-            GIT_OPTIONAL_LOCKS="0", GIT_NO_REPLACE_OBJECTS="1", GIT_TERMINAL_PROMPT="0")
+        self.environment.update(HOME=str(self.root), **_PRIVATE_GIT_ENV)
         self._owned()
 
     def _with_written(self, written: Callable[[str, Mapping[str, Any], subprocess.CompletedProcess[str]], None]) -> OfflineGit:
@@ -78,6 +90,43 @@ class OfflineGit:
         self._owned_repository(self.repository, bare=False)
         if self.remote.exists() or self.remote.is_symlink():
             self._owned_repository(self.remote, bare=True)
+
+    def _canonical_config(self, path: Path, *, bare: bool) -> bool:
+        # Recheck the mutable environment; command/config redirects use the
+        # original parser, even when the file itself has canonical bytes.
+        if (any(self.environment.get(key) != value for key, value in _PRIVATE_GIT_ENV.items())
+                or any(key.startswith("GIT_") and key not in _PRIVATE_GIT_ENV
+                       and not key.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_"))
+                       for key in self.environment)):
+            return False
+        expected = _CANONICAL_CONFIG[bare]
+        def identity(value):
+            return (value.st_dev, value.st_ino, value.st_mode, value.st_size,
+                    value.st_mtime_ns, value.st_ctime_ns)
+        original = path.stat(follow_symlinks=False)
+        if not stat.S_ISREG(original.st_mode):
+            return False
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            opened = os.fstat(descriptor)
+            if identity(original) != identity(opened):
+                raise ValueError("offline Git configuration changed while reading")
+            body = os.read(descriptor, len(expected) + 1)
+            if (identity(opened) != identity(os.fstat(descriptor))
+                    or identity(opened) != identity(path.stat(follow_symlinks=False))):
+                raise ValueError("offline Git configuration changed while reading")
+        except BaseException as error:
+            try:
+                os.close(descriptor)
+            except BaseException:
+                try:
+                    error.add_note("Offline Git config descriptor close failed; original exception preserved")
+                except BaseException:
+                    pass  # Even a failing diagnostic must not replace the original exception.
+            raise
+        else:
+            os.close(descriptor)
+        return body == expected and opened.st_size == len(expected)
 
     def _owned_repository(self, repository: Path, *, bare: bool) -> None:
         directory = repository if bare else repository / ".git"
@@ -110,14 +159,15 @@ class OfflineGit:
             allowed.update({"remote.origin.url": {document["remote_url"]},
                 "remote.origin.fetch": {"+refs/heads/*:refs/remotes/origin/*"},
                 "branch.main.remote": {"origin"}, "branch.main.merge": {"refs/heads/main"}})
-        config = self._run(self.root, "config", "--no-includes", "--file", str(directory / "config"), "--null", "--list")
-        for item in config.stdout.split("\0"):
-            if not item:
-                continue
-            key, _, value = item.partition("\n")
-            permitted = allowed.get(key)
-            if key not in allowed or permitted is not None and value not in permitted:
-                raise ValueError("unsupported offline Git configuration: " + key)
+        if not self._canonical_config(directory / "config", bare=bare):
+            config = self._run(self.root, "config", "--no-includes", "--file", str(directory / "config"), "--null", "--list")
+            for item in config.stdout.split("\0"):
+                if not item:
+                    continue
+                key, _, value = item.partition("\n")
+                permitted = allowed.get(key)
+                if key not in allowed or permitted is not None and value not in permitted:
+                    raise ValueError("unsupported offline Git configuration: " + key)
         actual = self._run(repository, "rev-parse", "--path-format=absolute", "--git-common-dir", "--git-path", "refs").stdout.splitlines()
         if actual != [str(directory), str(directory / "refs")]:
             raise ValueError("offline Git common directory or refs redirected")

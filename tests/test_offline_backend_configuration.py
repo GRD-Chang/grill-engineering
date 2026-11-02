@@ -236,6 +236,6 @@ def test_same_read_workload_keeps_facts_and_removes_only_duplicate_construction(
                         'reaped_child_cpu_seconds': end_children.ru_utime + end_children.ru_stime - children.ru_utime - children.ru_stime,
                         **counts})
         assert counts == {'owned': 16 if name == 'legacy' else 12,
-                          'commands': 72 if name == 'legacy' else 56}
+                          'commands': 40 if name == 'legacy' else 32}
         assert durable_snapshot(port.root) == before
     record_property('backend_configuration_cost', json.dumps(batches, sort_keys=True))
