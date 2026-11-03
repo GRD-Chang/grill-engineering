@@ -15,7 +15,8 @@ pytest_plugins = ("support.sharding",)
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.getgroup('test diagnostics').addoption('--host-loss-io-diagnostics',
-        action='store_true', default=False, help='Select the pre-sealed diagnostic entry only in the Host-loss story')
+        action='store_true', default=False,
+        help='Measure four managed stories and select the pre-sealed Host-loss diagnostic entry; not acceptance')
 
 
 def pytest_configure(config: pytest.Config) -> None:

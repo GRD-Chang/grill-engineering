@@ -104,6 +104,14 @@ def check_boundary(folder: Path) -> int:
         raise ValueError('Invalid trusted boundary selection')
     if junit_cases(folder) != expected:
         raise ValueError('Incomplete or unexpected boundary coverage')
+    host_loss = junit_key(
+        'tests/test_kernel_managed_entry_end_to_end.py::'
+        'test_public_resume_after_exact_foreground_host_loss_preserves_parallel_work')
+    entries = [entry for case in ET.parse(folder / 'junit.xml').getroot().iter('testcase')
+               if (case.get('classname'), case.get('name')) == host_loss
+               for entry in case.findall('./properties/property[@name="host_loss_entry"]')]
+    if len(entries) != 1 or entries[0].get('value') != 'official':
+        raise ValueError('Boundary requires the official Host-loss entry')
     return len(expected)
 
 

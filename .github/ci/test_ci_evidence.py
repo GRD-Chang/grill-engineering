@@ -225,15 +225,15 @@ class EvidenceTests(unittest.TestCase):
         folder.mkdir()
         (folder / 'environment.json').write_text(json.dumps(self.report))
         nodes = list(scope.BOUNDARY_TESTS)
-        self.junit(folder, nodes)
+        self.boundary_junit(folder, nodes)
         self.assertEqual(evidence.check_boundary(folder), len(nodes))
         self.assertFalse((folder / 'evidence.json').exists())
         for changed in (nodes[:-1], nodes + [nodes[0]], nodes + ['tests/test_extra.py::test_extra']):
-            self.junit(folder, changed)
+            self.boundary_junit(folder, changed)
             with self.subTest(nodes=changed), self.assertRaises(ValueError):
                 evidence.check_boundary(folder)
         for outcome in ('skipped', 'failure', 'error'):
-            self.junit(folder, nodes)
+            self.boundary_junit(folder, nodes)
             tree = ET.parse(folder / 'junit.xml')
             suite = tree.getroot().find('testsuite')
             suite.set({'skipped': 'skipped', 'failure': 'failures', 'error': 'errors'}[outcome], '1')
@@ -241,12 +241,57 @@ class EvidenceTests(unittest.TestCase):
             tree.write(folder / 'junit.xml')
             with self.subTest(outcome=outcome), self.assertRaises(ValueError):
                 evidence.check_boundary(folder)
-        self.junit(folder, nodes)
+        self.boundary_junit(folder, nodes)
         report = deepcopy(self.report)
         report['commit']['stdout'] = 'b' * 40
         (folder / 'environment.json').write_text(json.dumps(report))
         with self.assertRaisesRegex(ValueError, 'candidate identity'):
             evidence.check_boundary(folder)
+        self.assertFalse((folder / 'evidence.json').exists())
+
+    def test_boundary_requires_one_official_property_on_the_exact_host_loss_case(self):
+        folder = self.root / 'boundary-profile'
+        folder.mkdir()
+        (folder / 'environment.json').write_text(json.dumps(self.report))
+        # An informational stage label cannot substitute for the test's property.
+        (folder / 'boundary-stage.json').write_text(json.dumps({'host_loss_entry': 'official'}))
+        for values in ((), ('diagnostic-presealed',), ('',), ('Official',),
+                       ('official', 'official'), ('official', 'diagnostic-presealed')):
+            tree = self.boundary_junit(folder, scope.BOUNDARY_TESTS)
+            properties = tree.find('.//testcase/properties')
+            properties.clear()
+            for value in values:
+                ET.SubElement(properties, 'property', name='host_loss_entry', value=value)
+            tree.write(folder / 'junit.xml')
+            with self.subTest(values=values), self.assertRaisesRegex(ValueError, 'official Host-loss'):
+                evidence.check_boundary(folder)
+        for location in ('suite', 'another-case'):
+            tree = self.boundary_junit(folder, scope.BOUNDARY_TESTS)
+            host = next(case for case in tree.iter('testcase') if case.find('properties') is not None)
+            host.remove(host.find('properties'))
+            target = (tree.find('testsuite') if location == 'suite' else
+                      next(case for case in tree.iter('testcase') if case is not host))
+            properties = ET.SubElement(target, 'properties')
+            ET.SubElement(properties, 'property', name='host_loss_entry', value='official')
+            tree.write(folder / 'junit.xml')
+            with self.subTest(location=location), self.assertRaisesRegex(ValueError, 'official Host-loss'):
+                evidence.check_boundary(folder)
+        self.assertFalse((folder / 'evidence.json').exists())
+
+    def test_official_property_written_before_the_story_cannot_hide_its_failure(self):
+        folder = self.root / 'boundary-failed-host'
+        folder.mkdir()
+        (folder / 'environment.json').write_text(json.dumps(self.report))
+        for outcome in ('skipped', 'failure', 'error'):
+            for reported in ('0', '1'):
+                tree = self.boundary_junit(folder, scope.BOUNDARY_TESTS)
+                host = next(case for case in tree.iter('testcase') if case.find('properties') is not None)
+                ET.SubElement(host, outcome)
+                tree.find('testsuite').set(
+                    {'skipped': 'skipped', 'failure': 'failures', 'error': 'errors'}[outcome], reported)
+                tree.write(folder / 'junit.xml')
+                with self.subTest(outcome=outcome, reported=reported), self.assertRaises(ValueError):
+                    evidence.check_boundary(folder)
         self.assertFalse((folder / 'evidence.json').exists())
 
     def setUp(self):
@@ -308,6 +353,19 @@ class EvidenceTests(unittest.TestCase):
             if outcome:
                 ET.SubElement(case, outcome)
         ET.ElementTree(root).write(folder / "junit.xml", encoding="utf-8")
+
+    def boundary_junit(self, folder, nodes):
+        self.junit(folder, nodes)
+        host_loss = evidence.junit_key(
+            'tests/test_kernel_managed_entry_end_to_end.py::'
+            'test_public_resume_after_exact_foreground_host_loss_preserves_parallel_work')
+        tree = ET.parse(folder / 'junit.xml')
+        for case in tree.iter('testcase'):
+            if (case.get('classname'), case.get('name')) == host_loss:
+                properties = ET.SubElement(case, 'properties')
+                ET.SubElement(properties, 'property', name='host_loss_entry', value='official')
+        tree.write(folder / 'junit.xml', encoding='utf-8')
+        return tree
 
     def verify(self):
         return evidence.verify(self.results, selected="true", product="true", contract="true", result="success")
