@@ -34,6 +34,7 @@ from support.host_close_trace import raise_with_trace
 from support.systemd_manager import _CODEX, _approval_read_barrier, _control_environment, _diagnostic_tail, _executable, _git, _hold_host_operation_return, _local_manager, _managed_diagnostics, _managed_failure_note
 from support.systemd_manager import SidecarStatTrace, _resumed_ticket_completion
 from support.systemd_manager import _measure_host_calls
+from support.systemd_manager import _commit_resume_timeline_note
 from support.host_cost_trace import note_costs, report_costs
 
 
@@ -1956,9 +1957,16 @@ else:
                     '--foreground', '--repo', 'example/project', '--json'], cwd=git_repo, env=environment,
                     text=True, capture_output=True, timeout=remaining())
             except subprocess.TimeoutExpired as error:
-                note_costs(error, tmp_path)
-                observations['resume_timeout_diagnostics'] = _managed_diagnostics(kernel.storage.path, spec.run_id, tmp_path / 'roles.jsonl')
-                error.add_note('Disarmed original Run Resume: ' + json.dumps(observations['resume_timeout_diagnostics']))
+                try:
+                    note_costs(error, tmp_path)
+                except BaseException:
+                    pass  # Failure-only observation cannot replace the original timeout.
+                try:
+                    observations['resume_timeout_diagnostics'] = _managed_diagnostics(kernel.storage.path, spec.run_id, tmp_path / 'roles.jsonl')
+                    error.add_note('Disarmed original Run Resume: ' + json.dumps(observations['resume_timeout_diagnostics']))
+                except BaseException:
+                    pass  # Continue to the independent bounded timeline, without retry.
+                _commit_resume_timeline_note(error, kernel.storage.path, spec.run_id)
                 raise
             assert resumed.returncode == 0, (resumed.stdout, resumed.stderr)
             receipt = json.loads(resumed.stdout)

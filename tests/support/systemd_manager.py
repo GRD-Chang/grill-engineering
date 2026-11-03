@@ -188,6 +188,89 @@ def _managed_diagnostics(database: Path, run_id: str, roles: Path) -> dict:
 MANAGED_NOTE_BYTES = 24 * 1024
 
 
+def _commit_resume_timeline_note(error: BaseException, database: Path, run_id: str) -> None:
+    """Only after the fixed Commit story fails; no authority or live sampling.
+
+    Like the existing failure-note contract, a secondary diagnostic interruption
+    cannot replace the supplied failure. Even add_note is attempted only once.
+    """
+    try:
+        try:
+            import math
+            import re
+            identifier = lambda value: isinstance(value, str) and re.fullmatch('[0-9a-f]{32}', value)
+            finite = lambda value: type(value) in (int, float) and math.isfinite(value)
+            if not identifier(run_id):
+                raise ValueError('Invalid timeline Run')
+            with Kernel(database, run_id=run_id).storage.transaction(write=False) as tx:
+                anchors = [dict(row) for row in tx.rows(
+                    'SELECT a.subject,a.role,a.id AS attempt,i.id AS invocation,o.started_at,o.returned_at '
+                    'FROM attempts a JOIN invocations i ON i.run_id=a.run_id AND i.attempt=a.id '
+                    'JOIN invocation_outputs o ON o.run_id=i.run_id AND o.invocation=i.id '
+                    "WHERE a.run_id=? AND o.ordinal=0 AND ((a.subject='ticket:3' AND a.role IN ('review','publication')) "
+                    "OR (a.subject='final:1' AND a.role='review')) ORDER BY a.subject,a.role LIMIT 4",
+                    (run_id,), limit=4)]
+                keyed = {(row['subject'], row['role']): row for row in anchors}
+                if len(anchors) == 4 or len(keyed) != len(anchors):
+                    raise ValueError('Ambiguous or truncated timeline anchors')
+                for row in anchors:
+                    if (not all(identifier(row[key]) for key in ('attempt', 'invocation'))
+                            or any(row[key] is not None and not finite(row[key])
+                                   for key in ('started_at', 'returned_at'))):
+                        raise ValueError('Unproven timeline anchor')
+                review, publication, final = (keyed.get(key, {}) for key in
+                    (('ticket:3', 'review'), ('ticket:3', 'publication'), ('final:1', 'review')))
+                windows = [(review.get('returned_at'), publication.get('started_at')),
+                           (publication.get('returned_at'), final.get('started_at'))]
+                window_unavailable = []
+                for index, (start, end) in enumerate(windows):
+                    reason = ('missing_endpoint' if start is None or end is None else
+                              'incomparable_endpoints' if start > end else None)
+                    window_unavailable.append(reason)
+                    if reason is not None:
+                        windows[index] = None
+                bounds = [value for window in windows for value in (window or (None, None))]
+                rows = [list(row) for row in tx.rows(
+                    'SELECT h.position,h.created_at,h.subject,h.kind,h.identity,h.phase,e.operation '
+                    'FROM history h LEFT JOIN effects e ON e.run_id=h.run_id AND e.id=h.identity '
+                    'AND e.subject=h.subject AND e.generation=h.generation '
+                    "AND h.kind!='role_consumed' "
+                    "WHERE h.run_id=? AND h.subject IN ('ticket:2','ticket:3','final:1') "
+                    "AND h.kind IN ('effect_prepared','effect_dispatched','effect_observed','effect_consumed','role_consumed') "
+                    'AND ((h.created_at BETWEEN ? AND ?) OR (h.created_at BETWEEN ? AND ?)) '
+                    'ORDER BY h.position LIMIT 128', (run_id, *bounds), limit=128)]
+                stages = {'workspace', 'development', 'candidate', 'review', 'integration', 'ready_publication',
+                          'publish', 'publication_commit', 'push', 'pr', 'checks', 'approval', 'merge',
+                          'completion_comment', 'close', 'complete'}
+                operations = {'workspace', 'run_branch', 'candidate', 'integrate', 'validation_checkout',
+                              'validation_cleanup', 'publication_commit', 'push', 'pr_write', 'issue_link',
+                              'merge', 'completion_comment', 'close', 'cleanup_worktree', 'cleanup_local_ref', 'cleanup_remote_ref'}
+                for position, at, subject, kind, identity, phase, operation in rows:
+                    if (type(position) is not int or position < 1 or not finite(at) or not identifier(identity)
+                            or phase is not None and phase not in stages
+                            or kind != 'role_consumed' and operation not in operations):
+                        raise ValueError('Unsafe timeline value or missing Effect mapping')
+            # A failed normal reader close prevents publication of partial facts.
+            facts = {'run_id': run_id, 'observation': 'post-failure SQLite snapshot',
+                     'clock': 'persisted wall time; not CPU or monotonic deadline evidence',
+                     'scope': 'Effect prepared/dispatched/observed/consumed and role_consumed only; not full history or exit proof',
+                     'anchors': anchors, 'windows': windows, 'row_limit': 128,
+                     'window_labels': ['review_return_to_publication_start', 'publication_return_to_final_review_start'],
+                     'window_unavailable': window_unavailable,
+                     'partial_at_row_limit': len(rows) == 128,
+                     'columns': ['position', 'created_at', 'subject', 'kind', 'identity', 'phase', 'operation'],
+                     'rows': rows}
+        except BaseException as unavailable:
+            facts = {'unavailable': type(unavailable).__name__}
+        prefix = 'Commit Resume stage timeline: '
+        payload = json.dumps(facts, ensure_ascii=True, separators=(',', ':'))
+        if len((prefix + payload).encode('utf-8')) > MANAGED_NOTE_BYTES:
+            payload = '{"unavailable":"note_byte_limit"}'
+        error.add_note(prefix + payload)
+    except BaseException:
+        pass  # Never retry the export or shadow the already supplied failure.
+
+
 def _resumed_ticket_completion(kernel, subject, resume_action, *, deadline, child, errors, output, on_phase):
     """Sample one resumed Ticket; durable pauses cannot hide between samples."""
     next_read = None
