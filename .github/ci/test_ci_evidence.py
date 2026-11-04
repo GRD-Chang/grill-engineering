@@ -81,6 +81,33 @@ class CurrentCollectionTests(unittest.TestCase):
         # inventory. Existing receipt verification requires the entire set.
         self.assertTrue(set(targets) < set(self.nodes))
 
+    def test_actual_official_partition_and_four_remainders_are_the_unchanged_full_collection(self):
+        completed = scope.completed_boundary_nodes(self.nodes)
+        self.assertEqual(len(completed), 33)
+        self.assertEqual(completed, evidence.collect_nodeids((*scope.NATIVE_CONTRACT_TESTS, *scope.BOUNDARY_TESTS)))
+        observed = set(completed)
+        for index in range(4):
+            result = subprocess.run([sys.executable, '-m', 'pytest', '--collect-only', '-q', '-n', '0',
+                '-o', 'addopts=', '--test-completed-boundary', '--test-shard-count=4', f'--test-shard-index={index}'],
+                cwd=evidence.PRODUCT_ROOT, env=dict(os.environ, PYTEST_ADDOPTS=''),
+                capture_output=True, text=True, timeout=120, check=True)
+            nodes = [line for line in result.stdout.splitlines() if line.startswith('tests/') and '::' in line]
+            self.assertEqual(len(nodes), len(set(nodes)))
+            self.assertFalse(observed & set(nodes))
+            expected = [node for node in self.nodes if node not in set(completed)][index::4]
+            self.assertEqual(set(nodes), set(expected))
+            observed.update(nodes)
+        self.assertEqual(observed, set(self.nodes))
+
+    def test_two_boundary_phases_expand_to_exactly_the_original_fourteen(self):
+        other = evidence.collect_nodeids(scope.selection('boundary-other'))
+        commit = evidence.collect_nodeids(scope.selection('boundary-commit'))
+        self.assertEqual(len(other), 13)
+        self.assertEqual(len(commit), 1)
+        self.assertFalse(set(other) & set(commit))
+        self.assertEqual(sorted(other + commit), evidence.collect_nodeids(scope.BOUNDARY_TESTS))
+        self.assertEqual(scope.selection('boundary'), scope.BOUNDARY_TESTS)
+
     def test_native_contracts_are_exact_current_subsets_and_keep_boundary_unchanged(self):
         targets = scope.selection('native-contract')
         self.assertEqual(targets, scope.NATIVE_CONTRACT_TESTS)
@@ -385,6 +412,297 @@ class EvidenceTests(unittest.TestCase):
             self.junit(folder, sorted(self.nodes)[index::count])
             evidence.record(folder, index, contract=True, shard_count=count)
 
+    def completed_partition(self):
+        expansions = {
+            'test_registration_commit_unknown_reads_only_original_uuid_and_never_reinserts': ('False', 'True'),
+            'test_registration_commit_known_failure_keeps_category_and_never_registers_again': ('13-storage_limit', '9-transaction_aborted'),
+        }
+        native = [target + '[' + value + ']' if values else target
+                  for target in scope.NATIVE_CONTRACT_TESTS
+                  for values in (expansions.get(target.split('::')[-1]),)
+                  for value in (values or (None,))]
+        self.nodes = sorted([*self.nodes, *native, *scope.BOUNDARY_TESTS])
+        evidence.collect_nodeids.return_value = self.nodes
+        self.enterContext(patch.object(evidence, 'tree_sha', return_value='b' * 40))
+        self.report['ci_identity'] = dict(self.identity)
+        self.report['user_namespace'] = {'unprivileged_userns_clone': '1', 'max_user_namespaces': '100',
+                                         'bubblewrap_probe': {'returncode': 0, 'stdout': '', 'stderr': ''}}
+        self.completed = self.root / 'completed-boundary'
+        contracts = self.completed / 'native-contracts'
+        contracts.mkdir(parents=True)
+        (self.completed / 'commit').mkdir()
+        for folder, nodes in ((contracts, native), (self.completed, scope.BOUNDARY_OTHER_TESTS),
+                              (self.completed / 'commit', scope.BOUNDARY_COMMIT_TESTS)):
+            (folder / 'environment.json').write_text(json.dumps(self.report))
+            self.boundary_junit(folder, nodes)
+            self.add_profile(folder)
+        (self.completed / 'native-capabilities.json').write_text(json.dumps({
+            'stage': 'native-capabilities', 'status': 'supported', 'complete_product_pass': False,
+            'commit': self.report['commit'], 'ci_identity': self.identity,
+            'checks': {name: {'available': True} for name in ('memfd', 'pidfd', 'save_clock', 'user_namespace')}}))
+        (self.completed / 'boundary-stage.json').write_text(json.dumps({
+            'stage': 'native-boundary-regression', 'complete_product_pass': False,
+            'host_loss_entry': 'official', 'sha': self.identity['GITHUB_SHA']}))
+        evidence.record_completed_boundary(self.completed)
+        self.results = self.root / 'partition-shards'
+        remaining = [n for n in self.nodes if n not in set(scope.completed_boundary_nodes(self.nodes))]
+        for index in range(4):
+            folder = self.folder(index)
+            folder.mkdir(parents=True)
+            (folder / 'environment.json').write_text(json.dumps(self.report))
+            self.junit(folder, remaining[index::4])
+            self.add_profile(folder)
+            (folder / 'native-capabilities.json').write_bytes((self.completed / 'native-capabilities.json').read_bytes())
+            evidence.record(folder, index, contract=True, shard_count=4, completed_boundary=self.completed)
+
+    def add_profile(self, folder, profile=None):
+        tree = ET.parse(folder / 'junit.xml')
+        suite = next(tree.iter('testsuite'))
+        properties = suite.find('properties')
+        if properties is None:
+            properties = ET.SubElement(suite, 'properties')
+        ET.SubElement(properties, 'property', name=evidence.EXECUTION_PROFILE_PROPERTY,
+                      value=json.dumps(evidence.OFFICIAL_PROFILE if profile is None else profile))
+        tree.write(folder / 'junit.xml', encoding='utf-8')
+
+    def verify_completed(self):
+        return evidence.verify(self.results, selected='true', product='true', contract='true', result='success',
+                               shard_count=4, completed_boundary=self.completed)
+
+    def refresh_boundary_hashes(self):
+        path = self.completed / 'completed-boundary.json'
+        receipt = json.loads(path.read_text())
+        receipt['files_sha256'] = {name: evidence.file_digest(self.completed / name) for name in evidence.BOUNDARY_FILES}
+        path.write_text(json.dumps(receipt))
+
+    def test_completed_boundary_and_four_shards_prove_the_exact_full_set(self):
+        self.completed_partition()
+        self.assertEqual(self.verify_completed(), len(self.nodes))
+        receipt = evidence.read_completed_boundary(self.completed)
+        self.assertIs(receipt['complete_product_pass'], False)
+        self.assertEqual(len(receipt['completed_nodeids']), 33)
+        self.assertEqual(sum(len(evidence.junit_cases(self.folder(i))) for i in range(4)) + 33, len(self.nodes))
+
+    def test_split_boundary_requires_both_original_partitions_before_a_receipt(self):
+        self.completed_partition()
+        self.assertEqual(evidence.check_boundary(self.completed, split_commit=True), 14)
+        output = StringIO()
+        with patch.object(sys, 'argv', ['ci_evidence.py', 'check-boundary', '--results', str(self.completed),
+                                       '--split-commit']), redirect_stdout(output):
+            evidence.main()
+        self.assertIn('14 passed; not full acceptance', output.getvalue())
+        receipt = self.completed / 'completed-boundary.json'
+        for folder, targets in ((self.completed, scope.BOUNDARY_OTHER_TESTS),
+                                (self.completed / 'commit', scope.BOUNDARY_COMMIT_TESTS)):
+            file = folder / 'junit.xml'
+            original = file.read_bytes()
+            for mode in ('missing-file', 'failure', 'error', 'skipped', 'missing', 'duplicate', 'extra', 'swapped'):
+                receipt.unlink(missing_ok=True)
+                if mode == 'missing-file':
+                    file.unlink()
+                else:
+                    nodes = list(targets)
+                    if mode == 'missing': nodes.pop()
+                    elif mode == 'duplicate': nodes.append(nodes[0])
+                    elif mode == 'extra': nodes.append('tests/test_foreign.py::test_extra')
+                    elif mode == 'swapped': nodes = list(scope.BOUNDARY_COMMIT_TESTS if folder == self.completed else scope.BOUNDARY_OTHER_TESTS)
+                    self.boundary_junit(folder, nodes); self.add_profile(folder)
+                    if mode in ('failure', 'error', 'skipped'):
+                        tree = ET.parse(file)
+                        ET.SubElement(next(tree.iter('testcase')), mode)
+                        tree.write(file)
+                with self.subTest(folder=folder.name, mode=mode), self.assertRaises((ValueError, OSError)):
+                    evidence.record_completed_boundary(self.completed)
+                self.assertFalse(receipt.exists())
+                file.write_bytes(original)
+
+    def test_commit_phase_environment_identity_and_official_profile_are_checked(self):
+        self.completed_partition()
+        folder = self.completed / 'commit'
+        file = folder / 'environment.json'
+        original = file.read_bytes()
+        for mode in ('sha', 'run', 'attempt', 'environment'):
+            report = json.loads(original)
+            if mode == 'sha': report['commit']['stdout'] = 'foreign'
+            elif mode == 'run': report['ci_identity']['GITHUB_RUN_ID'] = 'foreign'
+            elif mode == 'attempt': report['ci_identity']['GITHUB_RUN_ATTEMPT'] = '2'
+            else: report['sqlite']['version'] = 'different'
+            file.write_text(json.dumps(report))
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                evidence.check_boundary(self.completed, split_commit=True)
+            file.write_bytes(original)
+        file = folder / 'junit.xml'
+        tree = ET.parse(file)
+        prop = tree.find(f'.//property[@name="{evidence.EXECUTION_PROFILE_PROPERTY}"]')
+        prop.set('value', json.dumps(evidence.OFFICIAL_PROFILE | {'workers': 1}))
+        tree.write(file)
+        with self.assertRaises(ValueError): evidence.check_boundary(self.completed, split_commit=True)
+
+    def test_boundary_identity_tree_and_inventory_must_match(self):
+        self.completed_partition()
+        path = self.completed / 'completed-boundary.json'
+        original = path.read_text()
+        for field in evidence.IDENTITY_FIELDS:
+            changed = json.loads(original)
+            changed['identity'][field] = '999' if field == 'GITHUB_RUN_ATTEMPT' else 'foreign'
+            path.write_text(json.dumps(changed))
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.verify_completed()
+        for field, value in (('tree_sha', 'c' * 40), ('complete_product_pass', True),
+                             ('completed_nodeids', []), ('stage', 'fixed-repair-regression')):
+            changed = json.loads(original)
+            changed[field] = value
+            path.write_text(json.dumps(changed))
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.verify_completed()
+        path.write_text(original)
+
+    def test_failed_skipped_duplicate_missing_and_extra_boundary_cases_never_complete(self):
+        self.completed_partition()
+        receipt = self.completed / 'completed-boundary.json'
+        original = receipt.read_text()
+        native = [n for n in scope.completed_boundary_nodes(self.nodes) if n not in scope.BOUNDARY_TESTS]
+        for folder, nodes in ((self.completed, scope.BOUNDARY_OTHER_TESTS),
+                              (self.completed / 'commit', scope.BOUNDARY_COMMIT_TESTS),
+                              (self.completed / 'native-contracts', native)):
+            original_junit = (folder / 'junit.xml').read_bytes()
+            for mode in ('failure', 'error', 'skipped', 'duplicate', 'missing', 'extra'):
+                receipt.unlink(missing_ok=True)
+                selected = list(nodes)
+                if mode == 'duplicate': selected.append(nodes[0])
+                elif mode == 'missing': selected.pop()
+                elif mode == 'extra': selected.append('tests/test_unexpected.py::test_extra')
+                self.boundary_junit(folder, selected)
+                self.add_profile(folder)
+                if mode in ('failure', 'error', 'skipped'):
+                    tree = ET.parse(folder / 'junit.xml')
+                    suite = next(tree.iter('testsuite'))
+                    suite.set({'failure': 'failures', 'error': 'errors', 'skipped': 'skipped'}[mode], '1')
+                    ET.SubElement(next(tree.iter('testcase')), mode)
+                    tree.write(folder / 'junit.xml')
+                with self.subTest(folder=folder.name, mode=mode), self.assertRaises(ValueError):
+                    evidence.record_completed_boundary(self.completed)
+                self.assertFalse(receipt.exists())
+            (folder / 'junit.xml').write_bytes(original_junit)
+        receipt.write_text(original)
+
+    def test_profile_capabilities_and_cross_job_environment_are_not_labels_only(self):
+        self.completed_partition()
+        for filename in evidence.BOUNDARY_FILES:
+            file = self.completed / filename
+            original = file.read_bytes()
+            file.write_bytes(original + b' ')
+            with self.subTest(tamper=filename), self.assertRaises(ValueError):
+                self.verify_completed()
+            file.write_bytes(original)
+        for kind in ('diagnostic', 'workers', 'dist', 'namespace', 'capabilities', 'host_loss_property'):
+            originals = {name: (self.completed / name).read_bytes() for name in evidence.BOUNDARY_FILES}
+            if kind in ('diagnostic', 'workers', 'dist'):
+                tree = ET.parse(self.completed / 'junit.xml')
+                prop = tree.find(f'.//property[@name="{evidence.EXECUTION_PROFILE_PROPERTY}"]')
+                profile = dict(evidence.OFFICIAL_PROFILE)
+                profile[{'diagnostic': 'host_loss_io_diagnostics', 'workers': 'workers', 'dist': 'dist'}[kind]] = {'diagnostic': True, 'workers': 1, 'dist': 'load'}[kind]
+                prop.set('value', json.dumps(profile)); tree.write(self.completed / 'junit.xml')
+            elif kind == 'host_loss_property':
+                tree = ET.parse(self.completed / 'junit.xml')
+                tree.find('.//property[@name="host_loss_entry"]').set('value', 'diagnostic-presealed')
+                tree.write(self.completed / 'junit.xml')
+            else:
+                name = 'native-capabilities.json' if kind == 'capabilities' else 'environment.json'
+                value = json.loads((self.completed / name).read_text())
+                if kind == 'capabilities': value['checks']['save_clock']['available'] = False
+                else: value['user_namespace']['bubblewrap_probe']['returncode'] = 1
+                (self.completed / name).write_text(json.dumps(value))
+            self.refresh_boundary_hashes()
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                self.verify_completed()
+            for name, raw in originals.items(): (self.completed / name).write_bytes(raw)
+            self.refresh_boundary_hashes()
+
+    def test_remainder_rejects_overlap_omission_extra_nodes_and_changed_collection(self):
+        self.completed_partition()
+        folder = self.folder(0)
+        original = (folder / 'junit.xml').read_bytes()
+        remaining = [n for n in self.nodes if n not in set(scope.completed_boundary_nodes(self.nodes))][::4]
+        for nodes in (remaining[:-1], [*remaining, scope.BOUNDARY_TESTS[0]],
+                      [*remaining[:-1], 'tests/test_unexpected.py::test_extra']):
+            self.junit(folder, nodes); self.add_profile(folder)
+            with self.subTest(nodes=nodes), self.assertRaises(ValueError):
+                evidence.record(folder, 0, contract=True, shard_count=4, completed_boundary=self.completed)
+        (folder / 'junit.xml').write_bytes(original)
+        evidence.collect_nodeids.return_value = sorted([*self.nodes, 'tests/test_new.py::test_added'])
+        with self.assertRaisesRegex(ValueError, 'collections differ'):
+            evidence.record(folder, 0, contract=True, shard_count=4, completed_boundary=self.completed)
+        with self.assertRaises(ValueError):
+            evidence.verify(self.results, selected='true', product='true', contract='true', result='success', shard_count=4)
+
+    def test_suite_profile_cannot_be_forged_on_a_case_or_with_wrong_value_types(self):
+        self.completed_partition()
+        file = self.completed / 'junit.xml'
+        original = file.read_bytes()
+        for changed in ('case-only', 'duplicate', 'integer-flag', 'float-workers'):
+            tree = ET.fromstring(original)
+            properties = tree.find('./testsuite/properties')
+            prop = properties.find(f'property[@name="{evidence.EXECUTION_PROFILE_PROPERTY}"]')
+            if changed == 'case-only':
+                properties.remove(prop)
+                ET.SubElement(next(tree.iter('testcase')), 'properties').append(prop)
+            elif changed == 'duplicate':
+                ET.SubElement(properties, 'property', **prop.attrib)
+            else:
+                profile = dict(evidence.OFFICIAL_PROFILE)
+                profile['host_loss_io_diagnostics' if changed == 'integer-flag' else 'workers'] = 0 if changed == 'integer-flag' else 2.0
+                prop.set('value', json.dumps(profile))
+            ET.ElementTree(tree).write(file)
+            self.refresh_boundary_hashes()
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                self.verify_completed()
+        file.write_bytes(original)
+        self.refresh_boundary_hashes()
+
+    def test_cross_job_environment_and_shard_tree_are_rechecked(self):
+        self.completed_partition()
+        folder = self.folder(0)
+        file = folder / 'environment.json'
+        original = file.read_text()
+        for kind in ('namespace', 'sqlite', 'identity'):
+            report = json.loads(original)
+            if kind == 'namespace': report['user_namespace']['max_user_namespaces'] = 'changed'
+            elif kind == 'sqlite': report['sqlite']['version'] = 'different'
+            else: report['ci_identity']['GITHUB_RUN_ID'] = 'another-run'
+            file.write_text(json.dumps(report))
+            self.change_receipt(0, environment_sha256=evidence.file_digest(file))
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                self.verify_completed()
+        file.write_text(original)
+        self.change_receipt(0, environment_sha256=evidence.file_digest(file), tree_sha='c' * 40)
+        with self.assertRaises(ValueError): self.verify_completed()
+
+    def test_same_run_prior_success_can_be_kept_but_changed_boundary_cannot_be_mixed(self):
+        self.completed_partition()
+        os.environ['GITHUB_RUN_ATTEMPT'] = '2'
+        self.assertEqual(self.verify_completed(), len(self.nodes))
+        path = self.completed / 'completed-boundary.json'
+        value = json.loads(path.read_text()); value['unused'] = 'changed artifact identity'
+        path.write_text(json.dumps(value))
+        with self.assertRaises(ValueError): self.verify_completed()
+
+    def test_each_remainder_requires_its_own_supported_capability_artifact(self):
+        self.completed_partition()
+        folder = self.folder(0)
+        file = folder / 'native-capabilities.json'
+        original = file.read_bytes()
+        file.unlink()
+        with self.assertRaises(OSError): self.verify_completed()
+        for kind in ('status', 'save_clock', 'identity'):
+            caps = json.loads(original)
+            if kind == 'status': caps['status'] = 'unsupported'
+            elif kind == 'save_clock': caps['checks']['save_clock']['available'] = False
+            else: caps['ci_identity']['GITHUB_RUN_ID'] = 'foreign'
+            file.write_text(json.dumps(caps))
+            self.change_receipt(0, native_capabilities_sha256=evidence.file_digest(file))
+            with self.subTest(kind=kind), self.assertRaises(ValueError): self.verify_completed()
+
     def verify_declared(self, count):
         return evidence.verify(self.results, selected="true", product="true", contract="true", result="success",
                                shard_count=count)
@@ -483,6 +801,7 @@ class EvidenceTests(unittest.TestCase):
                 result = self.run_pytest(folder, '--test-shard-count=4', f'--test-shard-index={index}',
                                          '-n', '2', '--dist', 'worksteal')
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                evidence._official_profile(folder)  # Actual controller-emitted JUnit, not a fixture property.
                 evidence.record(folder, index, contract=False, shard_count=4)
         self.assertEqual(evidence.verify(self.results, selected='true', product='true', contract='false',
                                          result='success', shard_count=4), 8)

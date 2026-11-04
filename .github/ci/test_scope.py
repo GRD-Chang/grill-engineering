@@ -14,7 +14,7 @@ CONTRACT_TESTS = (
     "tests/test_kernel_query_cli.py::test_history_keeps_raw_feedback_and_pages_without_losing_events",
 )
 PROMPT_CONTRACT_TESTS = ("tests/test_prompt_settings.py", "tests/test_show_prompts_catalog.py")
-# Small component contracts precede long lifecycle stories; all remain in full.
+# Small component contracts precede long lifecycle stories; all remain in full coverage.
 # DecisionClock fault tests are storage decisions, not native clock evidence.
 NATIVE_CONTRACT_TESTS = (
     'tests/test_repository_save_fifo.py::test_native_calling_task_clock_uses_linux_top_level_offsets',
@@ -35,7 +35,7 @@ NATIVE_CONTRACT_TESTS = (
     'tests/test_kernel_control_github_fixture.py::test_comment_handler_commits_canonical_rows_and_mirrors_without_read_ticks[False]',
     'tests/test_kernel_control_github_fixture.py::test_comment_handler_commits_canonical_rows_and_mirrors_without_read_ticks[True]',
 )
-# Fail early on unresolved native boundaries; these remain in the full suite.
+# Fail early on unresolved native boundaries; these remain in full coverage.
 # A successful boundary stage is not complete product acceptance.
 BOUNDARY_TESTS = (
     'tests/test_kernel_cleanup_prepare_timeout.py::test_cleanup_prepare_timeout_preserves_complete_delivery_and_reenters',
@@ -54,6 +54,31 @@ BOUNDARY_TESTS = (
     'tests/test_kernel_operation_integration.py::test_real_core_n1_ci_poll_advances_during_independent_long_agent',
     'tests/test_kernel_notification_sender_facts.py::test_sender_compresses_real_development_to_review_and_preserves_gate_budget_and_return_order',
 )
+BOUNDARY_COMMIT_TESTS = (
+    'tests/test_kernel_managed_entry_end_to_end.py::'
+    'test_controlled_native_commit_failure_reaps_both_workers_before_disarm_and_public_resume',
+)
+BOUNDARY_OTHER_TESTS = tuple(node for node in BOUNDARY_TESTS if node not in BOUNDARY_COMMIT_TESTS)
+
+
+def completed_boundary_nodes(nodes: list[str]) -> list[str]:
+    """Expand only the fixed 19/14 against this checkout's real collection."""
+    if len(nodes) != len(set(nodes)):
+        raise ValueError('Duplicate complete collection')
+    completed: set[str] = set()
+    for targets, count in ((NATIVE_CONTRACT_TESTS, 19), (BOUNDARY_TESTS, 14)):
+        selected: set[str] = set()
+        for target in targets:
+            matches = {node for node in nodes if node == target or '[' not in target and node.startswith(target + '[')}
+            if not matches or selected & matches:
+                raise ValueError('Missing or overlapping fixed boundary target')
+            selected.update(matches)
+        if len(selected) != count or completed & selected:
+            raise ValueError('Unexpected expanded fixed boundary collection')
+        completed.update(selected)
+    return sorted(completed)
+
+
 FIXED_REPAIR_REGRESSION_TESTS = (
     'tests/test_cli_command_diagnostics.py::test_stop_receipt_uses_frozen_language_and_keeps_internal_identity_only_in_json[parent-human-zh]',
     'tests/test_cli_command_diagnostics.py::test_stop_receipt_uses_frozen_language_and_keeps_internal_identity_only_in_json[parent-human-en]',
@@ -85,6 +110,8 @@ TEST_GROUPS = {
     'fixed-repair-regression': FIXED_REPAIR_REGRESSION_TESTS,
     'native-contract': NATIVE_CONTRACT_TESTS,
     'boundary': BOUNDARY_TESTS,
+    'boundary-other': BOUNDARY_OTHER_TESTS,
+    'boundary-commit': BOUNDARY_COMMIT_TESTS,
     "policy": ("tests/test_delivery_policy.py", "tests/test_kernel_policy_values.py"),
     "state": ("tests/test_kernel_state_preflight.py", "tests/test_kernel_task_admission.py",
               "tests/test_error_safety.py"),

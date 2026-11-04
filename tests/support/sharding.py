@@ -1,8 +1,11 @@
-"""将完整收集结果分成互斥且均衡的 CI 分片，默认仍运行全部用例。"""
+"""将完整收集的待执行部分按数量分成互斥 CI 分片，默认仍运行全部用例。"""
 from __future__ import annotations
 
 import pytest
 import sys
+import json
+from pathlib import Path
+from runpy import run_path
 from _pytest.junitxml import LogXML, xml_key
 from _pytest.subtests import SubtestReport
 from _pytest.terminal import TerminalReporter
@@ -11,13 +14,15 @@ from _pytest.terminal import TerminalReporter
 PASSED_SUBTESTS_PROPERTY = "agent-run-pytest-passed-subtests-v1"
 FAILURE_TRACEBACK_CHARACTERS = 64 * 1024
 SLOW_PHASE_LOG_SECONDS = 5.0
+EXECUTION_PROFILE_PROPERTY = 'agent-run-execution-profile-v1'
 
 
 class _Reports:
-    def __init__(self, xml: LogXML | None, terminal: TerminalReporter | None) -> None:
+    def __init__(self, xml: LogXML | None, terminal: TerminalReporter | None, profile: dict | None = None) -> None:
         self.xml = xml
         self.terminal = terminal
         self.passed = 0
+        self.profile = profile
 
     @pytest.hookimpl(trylast=True)
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
@@ -53,13 +58,19 @@ class _Reports:
         # pytest 9 把成功 subtest 计入 tests，但复用父 testcase；不改写原生计数。
         if self.xml is not None:
             self.xml.add_global_property(PASSED_SUBTESTS_PROPERTY, self.passed)
+            if self.profile is not None:
+                self.xml.add_global_property(EXECUTION_PROFILE_PROPERTY, json.dumps(self.profile, sort_keys=True))
 
 
-def select_shard(nodeids: list[str], count: int, index: int) -> set[str]:
+def select_shard(nodeids: list[str], count: int, index: int, *, completed_boundary: bool = False) -> set[str]:
     if count < 1 or not 0 <= index < count:
         raise ValueError("Test shard requires count >= 1 and 0 <= index < count")
     if len(set(nodeids)) != len(nodeids):
         raise ValueError("Test sharding requires unique collected node IDs")
+    if completed_boundary:
+        scope = run_path(str(Path(__file__).resolve().parents[2] / '.github/ci/test_scope.py'))
+        completed = set(scope['completed_boundary_nodes'](nodeids))
+        nodeids = [node for node in nodeids if node not in completed]
     selected = set(sorted(nodeids)[index::count])
     if not selected:
         raise ValueError("Test shard has no collected tests")
@@ -70,6 +81,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     group = parser.getgroup("CI sharding")
     group.addoption("--test-shard-count", type=int, default=1)
     group.addoption("--test-shard-index", type=int, default=0)
+    group.addoption('--test-completed-boundary', action='store_true', default=False,
+                    help='Partition after the fixed official 19/14; CI still requires their validated receipt')
 
 
 @pytest.hookimpl(trylast=True)
@@ -81,15 +94,18 @@ def pytest_configure(config: pytest.Config) -> None:
         # Workers send their original reports; only the controller emits live
         # diagnostics and counts passed subtests, including without JUnit.
         config.pluginmanager.register(_Reports(config.stash.get(xml_key, None),
-            config.pluginmanager.get_plugin("terminalreporter")))
+            config.pluginmanager.get_plugin("terminalreporter"),
+            {'host_loss_io_diagnostics': config.getoption('host_loss_io_diagnostics', default=False),
+             'workers': config.getoption('numprocesses', default=0), 'dist': config.getoption('dist', default='no')}))
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     count, index = config.getoption("test_shard_count"), config.getoption("test_shard_index")
-    if count == 1:
+    completed = config.getoption('test_completed_boundary')
+    if count == 1 and not completed:
         return
     try:
-        selected = select_shard([item.nodeid for item in items], count, index)
+        selected = select_shard([item.nodeid for item in items], count, index, completed_boundary=completed)
     except ValueError as error:
         raise pytest.UsageError(str(error)) from error
     deselected = [item for item in items if item.nodeid not in selected]

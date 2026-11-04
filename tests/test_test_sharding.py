@@ -25,6 +25,48 @@ def test_shards_are_disjoint_complete_balanced_and_order_independent(count: int)
     assert shards == [select_shard(list(reversed(nodes)), count, index) for index in range(count)]
 
 
+def test_completed_boundary_selector_only_removes_the_exact_expanded_fixed_partition():
+    from runpy import run_path
+    scope = run_path(str(Path(__file__).resolve().parents[1] / '.github/ci/test_scope.py'))
+    targets = scope['NATIVE_CONTRACT_TESTS']
+    expanded = []
+    for target in targets:
+        if target.endswith('test_registration_commit_unknown_reads_only_original_uuid_and_never_reinserts'):
+            expanded.extend(target + '[' + p + ']' for p in ('False', 'True'))
+        elif target.endswith('test_registration_commit_known_failure_keeps_category_and_never_registers_again'):
+            expanded.extend(target + '[' + p + ']' for p in ('13-storage_limit', '9-transaction_aborted'))
+        else:
+            expanded.append(target)
+    completed = set(expanded) | set(scope['BOUNDARY_TESTS'])
+    rest = [f'tests/test_other.py::test_value[{i}]' for i in range(21)]
+    nodes = [*completed, *rest]
+    shards = [select_shard(nodes, 4, i, completed_boundary=True) for i in range(4)]
+    assert set.union(*shards) == set(rest) and sum(map(len, shards)) == len(rest)
+    assert not set.union(*shards) & completed
+    assert set.union(*(select_shard(nodes, 4, i) for i in range(4))) == set(nodes)
+    for damaged in (nodes[:-1] + [nodes[0]], [n for n in nodes if n != expanded[0]],
+                    [*nodes, expanded[0].partition('[')[0] + '[extra]']):
+        with pytest.raises(ValueError):
+            select_shard(damaged, 4, 0, completed_boundary=True)
+
+
+@pytest.mark.parametrize('diagnostic,workers', [(False, 2), (True, 2), (False, 1), (False, 0)])
+def test_report_profile_comes_from_actual_controller_options(diagnostic, workers):
+    registered, properties = [], []
+    options = {'test_shard_count': 4, 'test_shard_index': 0,
+               'host_loss_io_diagnostics': diagnostic, 'numprocesses': workers, 'dist': 'worksteal'}
+    config = SimpleNamespace(getoption=lambda key, default=None: options.get(key, default),
+        stash={}, pluginmanager=SimpleNamespace(register=registered.append, get_plugin=lambda name: None))
+    pytest_configure(config)
+    report, = registered
+    report.xml = SimpleNamespace(add_global_property=lambda key, value: properties.append((key, value)))
+    report.pytest_sessionfinish()
+    import json
+    from support.sharding import EXECUTION_PROFILE_PROPERTY
+    value, = [value for key, value in properties if key == EXECUTION_PROFILE_PROPERTY]
+    assert json.loads(value) == {'host_loss_io_diagnostics': diagnostic, 'workers': workers, 'dist': 'worksteal'}
+
+
 @pytest.mark.parametrize("count,index,nodes", [
     (0, 0, ["a"]), (2, -1, ["a"]), (2, 2, ["a"]),
     (2, 1, ["a"]), (2, 0, []), (2, 0, ["a", "a"]),
@@ -103,7 +145,7 @@ def test_nonfailure_reports_do_not_emit_live_failure_diagnostics(outcome, durati
 @pytest.mark.parametrize('worker', [False, True])
 def test_only_controller_registers_live_reporting(worker, capsys):
     registered = []
-    config = SimpleNamespace(getoption=lambda key: {'test_shard_count': 1, 'test_shard_index': 0}[key],
+    config = SimpleNamespace(getoption=lambda key, default=None: {'test_shard_count': 1, 'test_shard_index': 0}.get(key, default),
         stash={}, pluginmanager=SimpleNamespace(register=registered.append, get_plugin=lambda name: None))
     if worker:
         config.workerinput = {}
