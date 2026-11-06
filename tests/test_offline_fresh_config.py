@@ -22,17 +22,6 @@ def commands(monkeypatch):
     return calls
 
 
-def test_canonical_files_are_validated_without_reparsing(world, monkeypatch):
-    backend = world.physical
-    before = durable_snapshot(world.root)
-    calls = commands(monkeypatch)
-    assert backend.refs() == {'refs/heads/main': world.git.commit('HEAD').sha}
-    assert sum(row[:1] == ('config',) for row in calls) == 0
-    assert sum(row[:1] == ('rev-parse',) for row in calls) == 2
-    assert sum(row[:1] == ('for-each-ref',) for row in calls) == 1
-    assert durable_snapshot(world.root) == before
-
-
 @pytest.mark.parametrize('bare', [False, True])
 @pytest.mark.parametrize('change', ['comment', 'large-comment', 'user', 'filemode', 'duplicate', 'continuation'])
 def test_legal_noncanonical_files_still_use_git(world, monkeypatch, bare, change):
@@ -53,7 +42,6 @@ def test_legal_noncanonical_files_still_use_git(world, monkeypatch, bare, change
     calls = commands(monkeypatch)
     backend._owned()
     assert any(row[:4] == ('config', '--no-includes', '--file', str(path)) for row in calls)
-    assert sum(row[:1] == ('rev-parse',) for row in calls) == 2
     assert durable_snapshot(world.root) == before
 
 
@@ -68,7 +56,6 @@ def test_sha256_repositories_keep_the_original_parser(world, tmp_path, monkeypat
     calls = commands(monkeypatch)
     sha256._owned()
     assert sum(row[:1] == ('config',) for row in calls) == 2
-    assert sum(row[:1] == ('rev-parse',) for row in calls) == 2
     assert durable_snapshot(root) == before
 
 
@@ -139,15 +126,13 @@ def test_layout_and_object_checks_remain_fresh(world, tmp_path, monkeypatch, fau
     {'GIT_NAMESPACE': 'other'}, {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'user.name', 'GIT_CONFIG_VALUE_0': 'other'},
     {'GIT_CONFIG_PARAMETERS': "'user.name=other'"}, {'GIT_CONFIG_GLOBAL': 'unread'},
 ])
-def test_mutable_redirect_environment_uses_original_parser(world, monkeypatch, redirect):
+def test_mutable_redirect_environment_refuses_before_dispatch(world, monkeypatch, redirect):
     backend = world.physical
     backend.environment.update(redirect)
     calls = commands(monkeypatch)
-    try:
-        backend._owned()
-    except (ValueError, OSError):
-        pass  # Original Git decides whether this environment is acceptable.
-    assert calls[0][:3] == ('config', '--no-includes', '--file')
+    with pytest.raises(ValueError, match='environment must not redirect'):
+        backend.refs()
+    assert calls == []
 
 
 @pytest.mark.parametrize('fault', ['replace', 'modify', 'read-error', 'close-error'])

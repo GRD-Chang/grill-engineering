@@ -74,8 +74,10 @@ class ExternalObjects:
 
     def pulls(self) -> list[dict[str, Any]]:
         with self._connect() as db:
-            numbers = [row[0] for row in db.execute('SELECT number FROM prs ORDER BY number')]
-        return [value for number in numbers if (value := self.pr(number)) is not None]
+            values = [json.loads(row[0]) for row in db.execute('SELECT body FROM prs ORDER BY number')]
+        if not all(isinstance(value, dict) for value in values):
+            raise GitHubReadError('offline_object_invalid', 'Expected an original PR object')
+        return values
 
     def put_pr(self, value: Mapping[str, Any]) -> None:
         with sqlite3.connect(self.database) as db:
@@ -206,7 +208,10 @@ class SyntheticGitHub:
         value = self.objects.pr(number)
         if value is None:
             raise GitHubReadError('remote_read_failed', 'HTTP 404 PR absent')
-        refs = self.physical.refs()
+        return self._with_refs(value, self.physical.refs())
+
+    @staticmethod
+    def _with_refs(value: dict[str, Any], refs: Mapping[str, str]) -> dict[str, Any]:
         for field in ('head', 'base'):
             branch = value[field]
             branch['sha'] = refs.get('refs/heads/' + branch['ref'], branch['sha'])
@@ -235,10 +240,12 @@ class SyntheticGitHub:
         self._read(endpoint); path = urlsplit(endpoint); tail = path.path.removeprefix('repos/' + self.repository + '/')
         if tail == 'pulls':
             query = parse_qs(path.query)
-            result = [self._pr(p['number']) for p in self.objects.pulls()]
-            result = [p for p in result if p['head']['ref'] == query['head'][0].split(':', 1)[-1]
+            result = [p for p in self.objects.pulls() if p['head']['ref'] == query['head'][0].split(':', 1)[-1]
                       and p['base']['ref'] == query['base'][0]
                       and p['base']['repo']['full_name'].casefold() == self.repository.casefold()]
+            if result:
+                refs = self.physical.refs()
+                result = [self._with_refs(p, refs) for p in result]
         elif tail.endswith('/comments'):
             result = self.objects.comments(int(tail.split('/')[1]))
         elif tail.endswith('/events'):

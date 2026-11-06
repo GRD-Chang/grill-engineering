@@ -194,12 +194,17 @@ class OfflinePort:
             details = () if checks_result == "none" else (("required", checks_result),)
             checks = Checks(pr.number, pr.head.sha, checks_result, details,
                             "Raw synthetic failed job log" if checks_result == "fail" else "")
-        # Share preparation only for this observation. Each refs/fetch method
-        # still revalidates ownership in the original order; no World or write
-        # authority is cached, and the next observation prepares anew.
+        # Source and target belong to one physical ref sample. Re-read on the
+        # next observation; object transfer still checks current ownership.
         physical = self.physical
-        source = self.remote_commit(request.source_ref, physical=physical)
-        target = self.remote_commit(request.target_ref, physical=physical)
+        refs = physical.refs()
+        commits = {}
+        for ref in (request.source_ref, request.target_ref):
+            head = refs.get(ref)
+            if head is not None and head not in commits:
+                physical.fetch(head)
+                commits[head] = self.git.commit(head)
+        source, target = (commits.get(refs.get(ref)) for ref in (request.source_ref, request.target_ref))
         checked = requested_ancestry(request, source)
         ancestry_heads = set(request.anchors) | {head.sha for head in (source, target) if head is not None}
         if checked is not None:
@@ -236,11 +241,12 @@ class OfflinePort:
     def remote_refs(self) -> dict[str, str]:
         return self.physical.refs()
 
-    def remote_commit(self, ref: str, *, physical: OfflineGit | None = None) -> Commit | None:
-        head = (self.remote_refs() if physical is None else physical.refs()).get(ref)
+    def remote_commit(self, ref: str) -> Commit | None:
+        physical = self.physical
+        head = physical.refs().get(ref)
         if head is None:
             return None
-        (self.physical if physical is None else physical).fetch(head)
+        physical.fetch(head)
         return self.git.commit(head)
 
 

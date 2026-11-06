@@ -60,7 +60,6 @@ class OfflineGit:
                             if key in {"PATH", "TMPDIR", "LANG", "LC_ALL"}
                             or key.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_"))}
         self.environment.update(HOME=str(self.root), **_PRIVATE_GIT_ENV)
-        self._owned()
 
     def _with_written(self, written: Callable[[str, Mapping[str, Any], subprocess.CompletedProcess[str]], None]) -> OfflineGit:
         # Configuration only: every physical operation still calls _owned().
@@ -87,18 +86,16 @@ class OfflineGit:
         return result
 
     def _owned(self) -> None:
+        if (any(self.environment.get(key) != value for key, value in _PRIVATE_GIT_ENV.items())
+                or any(key.startswith("GIT_") and key not in _PRIVATE_GIT_ENV
+                       and not key.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_"))
+                       for key in self.environment)):
+            raise ValueError("offline Git environment must not redirect repositories or configuration")
         self._owned_repository(self.repository, bare=False)
         if self.remote.exists() or self.remote.is_symlink():
             self._owned_repository(self.remote, bare=True)
 
     def _canonical_config(self, path: Path, *, bare: bool) -> bool:
-        # Recheck the mutable environment; command/config redirects use the
-        # original parser, even when the file itself has canonical bytes.
-        if (any(self.environment.get(key) != value for key, value in _PRIVATE_GIT_ENV.items())
-                or any(key.startswith("GIT_") and key not in _PRIVATE_GIT_ENV
-                       and not key.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_"))
-                       for key in self.environment)):
-            return False
         expected = _CANONICAL_CONFIG[bare]
         def identity(value):
             return (value.st_dev, value.st_ino, value.st_mode, value.st_size,
@@ -173,9 +170,17 @@ class OfflineGit:
                 permitted = allowed.get(key)
                 if key not in allowed or permitted is not None and value not in permitted:
                     raise ValueError("unsupported offline Git configuration: " + key)
-        actual = self._run(repository, "rev-parse", "--path-format=absolute", "--git-common-dir", "--git-path", "refs").stdout.splitlines()
-        if actual != [str(directory), str(directory / "refs")]:
-            raise ValueError("offline Git common directory or refs redirected")
+        # The fixture's ordinary layout is already fixed by the fresh path,
+        # config and environment checks. Other valid HEAD spellings still use
+        # Git's parser; damaged layouts must never discover an ancestor repo.
+        descriptor = os.open(directory / "HEAD", os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            head = stream.read(32)
+        if (head not in (b"ref: refs/heads/main\n", b"ref: refs/heads/master\n")
+                or not (directory / "refs").is_dir() or not (directory / "objects").is_dir()):
+            actual = self._run(repository, "rev-parse", "--path-format=absolute", "--git-common-dir", "--git-path", "refs").stdout.splitlines()
+            if actual != [str(directory), str(directory / "refs")]:
+                raise ValueError("offline Git common directory or refs redirected")
         self._owned_objects(directory / "objects")
 
     def _owned_objects(self, objects: Path) -> None:
@@ -263,6 +268,7 @@ class OfflineGit:
 
     def merge(self, base_ref: str, head_ref: str, *, sha: str, merge_method: str,
               commit_title: str, commit_message: str) -> str:
+        self._owned()
         base_ref, head_ref = self._ref(base_ref), self._ref(head_ref)
         refs = self.refs()
         base, head = refs[base_ref], refs[head_ref]

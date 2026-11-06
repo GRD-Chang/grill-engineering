@@ -72,15 +72,15 @@ def test_core_pr_identity_rejects_foreign_bindings(observed_pr, receipt, changes
 
 @pytest.fixture
 def github_repository_spelling(monkeypatch):
-    read_pr = SyntheticGitHub._pr
+    read_pr = SyntheticGitHub._with_refs
 
-    def github_spelling(api, number):
-        value = read_pr(api, number)
+    def github_spelling(value, refs):
+        value = read_pr(value, refs)
         for side in ("base", "head"):
             value[side]["repo"]["full_name"] = "Example/Repository"
         return value
 
-    monkeypatch.setattr(SyntheticGitHub, "_pr", github_spelling)
+    monkeypatch.setattr(SyntheticGitHub, "_with_refs", staticmethod(github_spelling))
 
 
 def test_case_equivalent_pr_survives_publication_retirement_and_merge_receipts(

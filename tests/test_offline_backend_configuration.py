@@ -56,12 +56,12 @@ def test_derived_writer_rechecks_tampered_world_before_push_or_delete(world, tmp
         assert called == []
 
 
-def test_initial_invalid_configuration_still_refuses_during_first_construction(world, tmp_path):
+def test_invalid_configuration_refuses_before_first_physical_operation(world, tmp_path):
     port, _, _ = world
     corrupt(port, tmp_path, 'bare', 'include')
     before, objects = durable_snapshot(port.root), port.objects.snapshot()
     with pytest.raises(ValueError, match='unsupported offline Git configuration'):
-        port._remote('example/project', lambda *_: pytest.fail('No callback before a valid backend'))
+        port._remote('example/project', lambda *_: pytest.fail('No callback before a valid backend')).git_writes.refs()
     assert durable_snapshot(port.root) == before and port.objects.snapshot() == objects
 
 

@@ -1,12 +1,8 @@
-"""One observation reuses preparation, never refs, ownership or write authority."""
+"""One ref sample per observation; later reads and write authority stay fresh."""
 from dataclasses import replace
-import json
-import resource
-import time
 
 import pytest
 
-from agent_run.adapters import git_objects
 from agent_run.core.operation_contract import DeliveryRead
 from agent_run.errors import KernelError
 from support.offline import OfflinePort
@@ -28,45 +24,15 @@ def world(tmp_path):
 
 
 @pytest.mark.parametrize('shared_head', [False, True])
-def test_observation_reuses_one_adapter_but_keeps_each_physical_read(world, monkeypatch, record_property, shared_head):
+def test_observation_returns_original_commits_and_ancestry(world, shared_head):
     port, commits, request = world
     if shared_head:
         assert port.physical.push(request.target_ref, commits[-2].sha, commits[-1].sha).returncode == 0
-    original_refs, original_fetch = offline_git.OfflineGit.refs, offline_git.OfflineGit.fetch
-    order, adapters, commands = [], [], []
-    def refs(adapter):
-        adapters.append(adapter)
-        order.append(('refs', None))
-        return original_refs(adapter)
-    def fetch(adapter, sha):
-        adapters.append(adapter)
-        order.append(('fetch', sha))
-        return original_fetch(adapter, sha)
-    def count(original):
-        def run(arguments, **kwargs):
-            commands.append(tuple(arguments))
-            return original(arguments, **kwargs)
-        return run
-    monkeypatch.setattr(offline_git.OfflineGit, 'refs', refs)
-    monkeypatch.setattr(offline_git.OfflineGit, 'fetch', fetch)
-    monkeypatch.setattr(offline_git, 'run_git', count(offline_git.run_git))
-    monkeypatch.setattr(git_objects, 'run_git', count(git_objects.run_git))
-    start, cpu = time.perf_counter(), time.process_time()
-    children = resource.getrusage(resource.RUSAGE_CHILDREN)
     observed = port.delivery(request, ('pass',), [])
-    metrics = {'git_commands': len(commands), 'wall_seconds': time.perf_counter() - start,
-        'parent_cpu_seconds': time.process_time() - cpu}
-    after = resource.getrusage(resource.RUSAGE_CHILDREN)
-    metrics['reaped_child_cpu_seconds'] = after.ru_utime + after.ru_stime - children.ru_utime - children.ru_stime
-    record_property('observation_cost', json.dumps(metrics, sort_keys=True))
     target = commits[-1] if shared_head else commits[-2]
     assert observed.source == commits[-1] and observed.target == target
     assert set(observed.ancestry) == {(before.sha, after.sha)
         for i, before in enumerate(commits) for after in commits[i:]}
-    assert order == [('refs', None), ('fetch', commits[-1].sha), ('refs', None), ('fetch', target.sha)]
-    # Reusing preparation is the cost contract; every original physical call
-    # still runs and revalidates ownership. Even an equal head is fetched twice.
-    assert len({id(adapter) for adapter in adapters}) == 1
 
 
 def test_later_observations_keep_fresh_refs_and_pr_facts(world, monkeypatch):
@@ -88,7 +54,7 @@ def test_later_observations_keep_fresh_refs_and_pr_facts(world, monkeypatch):
     assert first.checks.result == 'fail' and second.checks.result == 'pass'
 
 
-def test_second_ref_read_still_observes_an_independent_append_after_first_fetch(world, monkeypatch):
+def test_observation_samples_both_refs_before_transfer_and_rereads_next_time(world, monkeypatch):
     port, commits, request = world
     original = offline_git.OfflineGit.fetch
     calls = []
@@ -99,8 +65,8 @@ def test_second_ref_read_still_observes_an_independent_append_after_first_fetch(
             assert port.physical.push(request.target_ref, commits[-2].sha, commits[-1].sha).returncode == 0
     monkeypatch.setattr(offline_git.OfflineGit, 'fetch', fetch)
     facts = port.delivery(request, ('pass',), [])
-    assert facts.source == facts.target == commits[-1]
-    assert calls == [commits[-1].sha, commits[-1].sha]
+    assert facts.source == commits[-1] and facts.target == commits[-2]
+    assert port.delivery(request, ('pass',), []).target == commits[-1]
 
 
 @pytest.mark.parametrize('fault', ['include', 'rewrite', 'symlink', 'alternates'])
