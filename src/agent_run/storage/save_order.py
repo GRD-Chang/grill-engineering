@@ -6,6 +6,7 @@ the original transaction once, revalidating authority after its turn arrives.
 """
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import cache
 import json
 import ctypes
 import math
@@ -97,18 +98,24 @@ _SAVE_CLOCK_PROTOCOL = 'native-linux-local-wal-save/2'
 _MONOTONIC_PROVIDER = 'clock_gettime(CLOCK_MONOTONIC)'
 
 
-def _filesystem_type(descriptor: int) -> int:
-    # Linux statfs begins with native __fsword_t f_type. Use aligned bounded
-    # storage large enough for the supported Linux32/64 ABI's remaining fields;
-    # no platform-dependent tail is interpreted as an identity claim.
+@cache
+def _native_fstatfs() -> Any:
+    # Only the immutable function binding is shared; every observation below
+    # still uses a fresh buffer and the caller's current descriptor/errno.
     library = ctypes.CDLL(None, use_errno=True)
     function = getattr(library, 'fstatfs', None)
     if function is None or ctypes.sizeof(ctypes.c_long) not in {4, 8}:
         raise ValueError('Native Linux filesystem observation is unavailable')
     function.argtypes = [ctypes.c_int, ctypes.c_void_p]
     function.restype = ctypes.c_int
+    return function
+
+
+def _filesystem_type(descriptor: int) -> int:
+    # Linux statfs begins with native __fsword_t f_type. The aligned bounded
+    # storage covers Linux32/64; no platform-dependent tail is interpreted.
     words = (ctypes.c_long * 64)()
-    if function(descriptor, ctypes.byref(words)) != 0:
+    if _native_fstatfs()(descriptor, ctypes.byref(words)) != 0:
         raise OSError(ctypes.get_errno(), 'Native filesystem observation failed')
     return int(words[0])
 

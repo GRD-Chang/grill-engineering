@@ -1006,6 +1006,27 @@ def test_old_boot_retirement_and_original_uuid_survive_unknown_registration_comm
         assert scalar(repository, 'SELECT request FROM save_admissions') == old.request
 
 
+
+def test_filesystem_observation_rechecks_each_descriptor_after_binding():
+    import errno
+    import os
+
+    proc = os.open('/proc/self/stat', os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        assert save_order._filesystem_type(proc) == save_order._PROCFS_MAGIC
+        namespace = os.open('/proc/thread-self/ns/time', os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            assert save_order._filesystem_type(namespace) == save_order._NSFS_MAGIC
+        finally:
+            os.close(namespace)
+        with pytest.raises(OSError) as failure:
+            save_order._filesystem_type(namespace)
+        assert failure.value.errno == errno.EBADF
+        assert save_order._filesystem_type(proc) == save_order._PROCFS_MAGIC
+    finally:
+        os.close(proc)
+
+
 @pytest.fixture
 def native_task_observation(monkeypatch):
     """Controlled syscall observations, never setns/unshare or real namespace proof."""
