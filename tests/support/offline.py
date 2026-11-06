@@ -198,12 +198,11 @@ class OfflinePort:
         # next observation; object transfer still checks current ownership.
         physical = self.physical
         refs = physical.refs()
-        commits = {}
-        for ref in (request.source_ref, request.target_ref):
-            head = refs.get(ref)
-            if head is not None and head not in commits:
-                physical.fetch(head)
-                commits[head] = self.git.commit(head)
+        sampled_heads = tuple(dict.fromkeys(refs[ref] for ref in (request.source_ref, request.target_ref)
+                                            if ref in refs))
+        for head in sampled_heads:
+            physical.fetch(head)
+        commits = physical.read_commits(sampled_heads)
         source, target = (commits.get(refs.get(ref)) for ref in (request.source_ref, request.target_ref))
         checked = requested_ancestry(request, source)
         ancestry_heads = set(request.anchors) | {head.sha for head in (source, target) if head is not None}

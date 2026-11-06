@@ -118,3 +118,36 @@ def test_missing_remote_object_is_transferred_without_moving_local_refs(world):
     assert port.git.commit(sha).tree == commits[0].tree
     assert port.git.run('show-ref').stdout == original_refs
     assert physical.commit(sha)['message'] == 'Remote-only commit\n'
+
+
+@pytest.mark.parametrize("object_kind", ["missing", "tree", "blob"])
+def test_commit_batch_rejects_missing_or_non_commit_objects(world, object_kind):
+    port, commits, _ = world
+    head = ("f" * 40 if object_kind == "missing" else commits[0].tree if object_kind == "tree"
+            else port.git.run("rev-parse", commits[0].sha + ":README.md").stdout.strip())
+    with pytest.raises(KernelError, match="git_operation_failed"):
+        port.physical.read_commits((head,))
+
+
+@pytest.mark.parametrize("fault", ["truncated", "extra", "identity", "tree"])
+def test_commit_batch_rejects_malformed_output(world, monkeypatch, fault):
+    port, commits, _ = world
+    physical = port.physical
+    original = physical._run
+    def malformed(directory, *args, **kwargs):
+        result = original(directory, *args, **kwargs)
+        if args[:2] == ("cat-file", "--batch-check=%(objectname) %(objecttype)"):
+            lines = result.stdout.splitlines()
+            if fault == "truncated":
+                lines.pop()
+            elif fault == "extra":
+                lines.append(lines[0])
+            elif fault == "identity":
+                lines[0] = commits[1].sha + " commit"
+            else:
+                lines[1] = "not-an-oid tree"
+            result.stdout = "\n".join(lines) + "\n"
+        return result
+    monkeypatch.setattr(physical, "_run", malformed)
+    with pytest.raises(KernelError, match="git_operation_failed"):
+        physical.read_commits((commits[0].sha,))

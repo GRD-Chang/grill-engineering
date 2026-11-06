@@ -18,7 +18,8 @@ from tempfile import TemporaryDirectory
 from time import monotonic
 from typing import Any
 
-from agent_run.errors import GitError
+from agent_run.errors import GitError, KernelError
+from agent_run.model import Commit
 from agent_run.runtime.git_command import MAX_GIT_ERROR_BYTES, _kill_group, run_git
 
 
@@ -237,6 +238,27 @@ class OfflineGit:
         fields = [line.split(" ", 1) for line in header.splitlines()]
         return {"sha": sha, "tree": {"sha": next(value for key, value in fields if key == "tree")},
                 "parents": [{"sha": value} for key, value in fields if key == "parent"], "message": message}
+
+    def read_commits(self, heads: tuple[str, ...]) -> dict[str, Commit]:
+        """Read only this observation's transferred heads in one Git process."""
+        self._owned()
+        heads = tuple(dict.fromkeys(self._oid(head) for head in heads))
+        if not heads:
+            return {}
+        queries = "".join(head + "\n" + head + "^{tree}\n" for head in heads)
+        result = self._run(self.repository, "cat-file", "--batch-check=%(objectname) %(objecttype)",
+            input=queries, check=False)
+        rows = [line.split() for line in result.stdout.splitlines()]
+        if result.returncode or len(rows) != 2 * len(heads):
+            raise KernelError("git_operation_failed", "Invalid offline commit observation")
+        commits = {}
+        for index, head in enumerate(heads):
+            commit, tree = rows[2 * index:2 * index + 2]
+            if (commit != [head, "commit"] or len(tree) != 2 or tree[1] != "tree"
+                    or len(tree[0]) != len(head) or re.fullmatch(r"[0-9a-f]+", tree[0]) is None):
+                raise KernelError("git_operation_failed", "Invalid offline commit observation")
+            commits[head] = Commit(head, tree[0])
+        return commits
 
     def compare(self, base: str, head: str) -> dict[str, Any]:
         self._owned()
