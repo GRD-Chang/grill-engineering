@@ -355,5 +355,5 @@ def test_managed_scenario_adapter_keeps_canonical_workspace_and_git_config_guard
     assert not foreign.root.exists()
     port.git.run('config', '--local', 'core.hooksPath', str(tmp_path / 'unexecuted-hooks'))
     with pytest.raises(ValueError, match='unsupported offline Git configuration: core.hookspath'):
-        port.physical
+        port.physical.refs()
     assert _snapshot(port.root / 'remote.git') == before

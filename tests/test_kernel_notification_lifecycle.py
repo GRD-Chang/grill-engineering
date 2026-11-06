@@ -167,17 +167,17 @@ def test_healthy_final_pr_and_approval_in_one_observation_share_only_the_approva
     from support.offline_api import SyntheticGitHub
 
     if uppercase_repository:
-        original_pr = SyntheticGitHub._pr
+        original_pr = SyntheticGitHub._with_refs
 
-        def canonical_pr(api, number):
+        def canonical_pr(value, refs):
             # A normal HTTP-shaped provider read returns GitHub's canonical
             # spelling; all Core/Remote identity checks and receipts stay real.
-            response = original_pr(api, number)
+            response = original_pr(value, refs)
             for field in ("head", "base"):
                 response[field]["repo"]["full_name"] = response[field]["repo"]["full_name"].upper()
             return response
 
-        monkeypatch.setattr(SyntheticGitHub, "_pr", canonical_pr)
+        monkeypatch.setattr(SyntheticGitHub, "_with_refs", staticmethod(canonical_pr))
     scenario = _enabled_scenario(tmp_path, monkeypatch, DeliveryKind.PARENT_ONLY, mode=mode)
     if approval:
         assert scenario.run().kind == "approval"
