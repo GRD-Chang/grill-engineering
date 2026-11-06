@@ -25,7 +25,6 @@ from agent_run.notifications.envelope import event_envelope
 from agent_run.notifications.event_projection import event_state, project_event
 from agent_run.notifications.progress import _source, obsolete_progress
 from agent_run.notifications.sender import NativeNotifications
-from agent_run.notifications.status_comment import StatusComments
 from agent_run.queries.host_exit import host_exit_current
 from agent_run.queries.status_comment import status_subjects
 from agent_run.runtime import executor
@@ -322,7 +321,9 @@ def test_notification_pages_and_progress_rechecks_keep_same_id_siblings_outside_
     events, more, cursor = observer._page(0)
     assert events == [] and not more and cursor == rows_a[-1]['position']
     assert projected_rows and all(row['run_id'] == 'A' for row in projected_rows)
-    context = StatusComments(repository.database, storage=a.storage)
-    assert context._kernel().storage is a.storage
+    from support.status_comments import core_status_comments
+    context = core_status_comments(a)
+    assert context._read_binding().parent_number == 1
+    assert b.operation_binding().parent_number == 2
     assert status_subjects(repository.database, storage=a.storage) == []
     assert host_exit_current(repository.database, {'run_id': 'B'}, storage=a.storage) is False

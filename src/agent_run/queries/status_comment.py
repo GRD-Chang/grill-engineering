@@ -1,5 +1,6 @@
 """Concise Status from current committed facts and original publication proof."""
 import json
+from collections.abc import Sequence
 from pathlib import Path
 import re
 import sqlite3
@@ -28,6 +29,22 @@ def status_subjects(database: Path, *, storage: Storage) -> list[str]:
     with open_run(database, storage=storage).transaction(write=False) as tx:
         _run(tx, database.absolute())
         return [str(row[0]) for row in tx.all(*run_statement(tx, 'SELECT id FROM subjects WHERE run_id=? AND pr_number IS NOT NULL ORDER BY id', ()))]
+
+
+def render_status_body(target: StatusTarget, kind: str, details: Sequence[str], actions: Sequence[str]) -> str:
+    """Render already-observed facts without interpreting or granting actions."""
+    literal_run = json.dumps(target.run_id, ensure_ascii=False)
+    delimiter = "`" * (1 + max((len(part) for part in re.findall(r"`+", literal_run)), default=0))
+    lines = ["## Agent Run Status", f"Run: {delimiter} {literal_run} {delimiter} / {kind} #{target.issue}", *details]
+    lines.append("Next action:" if actions else "Next action: automatic / none")
+    for action in dict.fromkeys(actions):
+        # Inline code would remove legal backticks from the displayed selector.
+        fence = "`" * max(3, 1 + max((len(part) for part in re.findall(r"`+", action)), default=0))
+        lines.extend(("", fence, action, fence))
+    body = "\n".join(lines)
+    if len(body.encode()) > 8192:
+        raise ValueError("Status projection exceeds limit")
+    return body
 
 
 def project_status(database: Path, subject: str, *, storage: Storage) -> StatusProjection:
@@ -77,10 +94,7 @@ def project_status(database: Path, subject: str, *, storage: Storage) -> StatusP
                     and not tx.rows(*run_statement(tx, "SELECT owner FROM retired_executors WHERE run_id=? AND status!='exited' LIMIT 1", ()))):
                 host = "exited"
         cleanup = boundary["delivery_cleanup"]
-        literal_run = json.dumps(run["id"], ensure_ascii=False)
-        delimiter = "`" * (1 + max((len(part) for part in re.findall(r"`+", literal_run)), default=0))
-        lines = ["## Agent Run Status", f"Run: {delimiter} {literal_run} {delimiter} / {job['kind']} #{job['issue']}",
-                 f"Delivery: {job['phase']}; Run: {boundaries['status']}; gates: {gates}",
+        lines = [f"Delivery: {job['phase']}; Run: {boundaries['status']}; gates: {gates}",
                  f"Candidate: `{job['candidate_sha'] or 'not_recorded'}`",
                  f"Recorded PR head: `{pr['head']['sha']}`; base: `{pr['base']['sha']}`",
                  f"Recorded Review: {recorded_review(tx, dict(run), dict(job))} (recorded candidate/base/scope; not a live remote check)",
@@ -91,13 +105,4 @@ def project_status(database: Path, subject: str, *, storage: Storage) -> StatusP
         if remaining is not None:
             actions.extend(item["recovery_action"] for item in remaining["items"]
                            if item["kind"] == job["kind"] and item["branch"] == target.source_ref)
-        lines.append("Next action:" if actions else "Next action: automatic / none")
-        for action in dict.fromkeys(actions):
-            # Render the authoritative command literally. Markdown inline code
-            # otherwise removes legal backticks from the displayed selector.
-            fence = "`" * max(3, 1 + max((len(part) for part in re.findall(r"`+", action)), default=0))
-            lines.extend(("", fence, action, fence))
-        body = "\n".join(lines)
-        if len(body.encode()) > 8192:
-            raise ValueError("Status projection exceeds limit")
-        return StatusProjection(target, body)
+        return StatusProjection(target, render_status_body(target, job["kind"], lines, actions))

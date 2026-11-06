@@ -1,7 +1,7 @@
 """Post-commit native notification observer using the existing durable outbox.
 
-This observer reads committed kernel facts. It neither calls Kernel nor infers a
-new business state from a displayed Status document.
+This observer reads committed kernel facts and frozen operation bindings. It
+never advances Core or infers business state from a displayed Status document.
 """
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from time import monotonic
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal
 
@@ -35,7 +36,8 @@ from agent_run.notifications.event_projection import completion_context, event_s
 from agent_run.queries.resume_facts import resume_facts
 from agent_run.notifications.progress import obsolete_progress
 from agent_run.notifications.status_comment import StatusComments
-from agent_run.queries.status_comment import status_subjects
+from agent_run.queries.status_comment import project_status, status_subjects
+from agent_run.core.kernel import Kernel
 from agent_run.adapters.remote import PhysicalAPI
 from agent_run.adapters.auth.credential_lifecycle import WORKER_CREDENTIAL_PROVIDER_OPERATION_TIMEOUT_SECONDS
 from agent_run.queries.read_facts import material, read_boundaries
@@ -89,7 +91,9 @@ class NativeNotifications:
         with self.storage.transaction(write=False) as tx:
             self.run_id, self.binding, self.config, self.state = self._run(tx)
         self.feishu_enabled = self.config.get("enabled") is True
-        self.status = StatusComments(database, **self._storage_options)
+        self.status = StatusComments(state_root,
+            read_projection=partial(project_status, database, storage=self.storage),
+            read_binding=Kernel._from_storage(self.storage).operation_binding)
         self.status_api = status_api
         self.status_failure_reason: str | None = None
         self._status_seen: dict[str, tuple[str, str]] = {}

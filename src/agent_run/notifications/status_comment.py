@@ -12,27 +12,21 @@ import uuid
 
 from agent_run.contracts.status_comment import StatusProjection
 from agent_run.contracts.write_authority import WriteAuthority
-from agent_run.core.kernel import Kernel
+from agent_run.core.operation_contract import OperationBinding
 from agent_run.adapters.remote import EffectReadError, PhysicalAPI, RemoteEffects
 from agent_run.adapters.auth.app import GitHubCredentialError
 from agent_run.errors import GitHubReadError, KernelError
 from agent_run.runtime.process_identity import _process_binding_status, _process_start_token
-from agent_run.queries.status_comment import project_status
 from agent_run.storage import notification_outbox as outbox
-from agent_run.storage.routing import open_run
-from agent_run.storage.sqlite import Storage
 
 
 class StatusComments:
-    def __init__(self, database: Path, *, storage: Storage) -> None:
-        self.database = database.absolute()
-        self._storage = open_run(self.database, storage=storage)
-
-    def _projection(self, subject: str) -> StatusProjection:
-        return project_status(self.database, subject, storage=self._storage)
-
-    def _kernel(self) -> Kernel:
-        return Kernel._from_storage(self._storage)
+    """Own durable comment delivery; callers supply fresh, read-only Run facts."""
+    def __init__(self, state_root: Path, *, read_projection: Callable[[str], StatusProjection],
+                 read_binding: Callable[[], OperationBinding]) -> None:
+        self.state_root = state_root.absolute()
+        self._projection = read_projection
+        self._read_binding = read_binding
 
     @staticmethod
     def _entry(document: dict[str, Any], projection: StatusProjection) -> dict[str, Any]:
@@ -83,7 +77,7 @@ class StatusComments:
 
     def stage(self, subject: str) -> dict[str, Any] | None:
         projection = self._projection(subject)
-        with outbox.transaction(self.database.parent, projection.target.run_id) as document:
+        with outbox.transaction(self.state_root, projection.target.run_id) as document:
             entry = self._entry(document, projection)
             if entry.get("failure") is not None:
                 raise ValueError("Status delivery paused")
@@ -149,7 +143,7 @@ class StatusComments:
             return cancelled() or time.monotonic() >= deadline
         try:
             target = projection.target
-            with outbox.transaction(self.database.parent, target.run_id) as document:
+            with outbox.transaction(self.state_root, target.run_id) as document:
                 entry = self._entry(document, projection)
                 if entry.get("failure") is not None:
                     raise ValueError("Status delivery paused")
@@ -168,7 +162,7 @@ class StatusComments:
                 entry["claim"] = claim
                 intent = deepcopy(current_intent)
                 marker = entry["marker"]
-            binding = self._kernel().operation_binding()
+            binding = self._read_binding()
             remote = RemoteEffects(binding.repository_root, binding.repository,
                                    runner_identity=binding.inputs.runner_identity, api=api, cancelled=stopped)
             def admit() -> None:
@@ -176,9 +170,9 @@ class StatusComments:
                 # already finished. No remote I/O follows this final check.
                 current = self._projection(subject)
                 if (stopped() or current != projection or intent["body"] != marker + "\n" + current.body
-                        or self._kernel().operation_binding() != binding):
+                        or self._read_binding() != binding):
                     raise ValueError("Status authority changed")
-                with outbox.transaction(self.database.parent, target.run_id) as document:
+                with outbox.transaction(self.state_root, target.run_id) as document:
                     active = self._entry(document, current)
                     if active.get("claim") != claim or active["intent"] != intent or intent["sent"]:
                         raise ValueError("Status intent changed")
@@ -189,7 +183,7 @@ class StatusComments:
                     observed = remote.write_status_comment(target, marker, intent, WriteAuthority(lambda: admit), stopped)
                 except EffectReadError as error:
                     observed = {"disposition": "unknown", "write_returncode": error.write_returncode}
-            with outbox.transaction(self.database.parent, target.run_id) as document:
+            with outbox.transaction(self.state_root, target.run_id) as document:
                 entry = self._entry(document, projection)
                 if entry.get("claim") != claim or entry["intent"]["id"] != intent["id"]:
                     raise ValueError("Status claim changed")
@@ -208,7 +202,7 @@ class StatusComments:
         except GitHubCredentialError as error:
             if projection is not None:
                 try:
-                    with outbox.transaction(self.database.parent, projection.target.run_id) as document:
+                    with outbox.transaction(self.state_root, projection.target.run_id) as document:
                         entry = self._entry(document, projection)
                         entry["diagnostic"] = {"code": "github_credential_unavailable", "http_status": error.http_status}
                 except (OSError, ValueError, KernelError):
@@ -221,7 +215,7 @@ class StatusComments:
         finally:
             if projection is not None and claim is not None:
                 try:
-                    with outbox.transaction(self.database.parent, projection.target.run_id) as document:
+                    with outbox.transaction(self.state_root, projection.target.run_id) as document:
                         entry = self._entry(document, projection)
                         if entry.get("claim") == claim:
                             entry.pop("claim")

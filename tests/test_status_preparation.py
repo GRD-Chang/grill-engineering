@@ -7,29 +7,23 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_run.contracts.status_comment import StatusProjection, StatusTarget
 from agent_run.errors import KernelError
 from agent_run.notifications import sender as native, status_comment as status
 from agent_run.storage import notification_outbox as outbox
 from agent_run.runtime.process_identity import _process_start_token
-from support.status_comments import CommentsAPI
+from support.status_comments import CommentsAPI, display_inputs
 
 
 @pytest.fixture
-def prepared(tmp_path, monkeypatch):
-    target = StatusTarget('example/project', 'frozen-run', 1, 'parent:1', 1, 1, 7,
-        'offline-publisher', 'publication', 'receipt', 'refs/heads/work', 'refs/heads/main')
-    current, reads = [StatusProjection(target, 'original')], []
-    database = tmp_path / 'kernel.sqlite3'
-    owner = status.StatusComments(database, storage=SimpleNamespace(path=database, run_id=target.run_id))
+def prepared(tmp_path):
+    initial, initial_binding = display_inputs(tmp_path)
+    target = initial.target
+    current, reads, binding = [initial], [], [initial_binding]
     def projection(subject):
         assert subject == target.subject
         reads.append(current[0])
         return current[0]
-    binding = [SimpleNamespace(repository_root=tmp_path, repository=target.repository,
-        inputs=SimpleNamespace(runner_identity={'source': 'host'}))]
-    monkeypatch.setattr(owner, '_projection', projection)
-    monkeypatch.setattr(owner, '_kernel', lambda: SimpleNamespace(operation_binding=lambda: binding[0]))
+    owner = status.StatusComments(tmp_path, read_projection=projection, read_binding=lambda: binding[0])
     return SimpleNamespace(owner=owner, current=current, reads=reads, binding=binding,
         api=CommentsAPI(target), target=target, root=tmp_path, subject=target.subject)
 
@@ -68,7 +62,7 @@ def test_changes_after_projection_close_before_claim_cannot_dispatch(prepared, m
         result = projection(subject)
         if len(f.reads) == 1:
             if change == 'binding':
-                f.binding[0] = SimpleNamespace(**vars(f.binding[0]))
+                f.binding[0] = replace(f.binding[0])
                 # Alter only after the initial binding has been captured.
             elif change == 'body':
                 f.current[0] = replace(result, body='operator stopped')
@@ -81,7 +75,7 @@ def test_changes_after_projection_close_before_claim_cannot_dispatch(prepared, m
         original = f.api.object
         def read(endpoint):
             result = original(endpoint)
-            f.binding[0] = SimpleNamespace(**{**vars(f.binding[0]), 'changed': True})
+            f.binding[0] = replace(f.binding[0], parent_number=2)
             return result
         monkeypatch.setattr(f.api, 'object', read)
     assert f.owner.deliver_current(f.subject, api=f.api)[0] == 'unavailable'
