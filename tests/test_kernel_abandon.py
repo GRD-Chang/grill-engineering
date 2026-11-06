@@ -8,7 +8,7 @@ import pytest
 
 from agent_run.errors import KernelError
 from agent_run.model import DeliveryKind, Execution, HostObservation, ResourceInspection
-from support.offline import Scenario
+from support.run_scoped_kernel import domain_scenario
 from support.api_observation import api_writes, lose_api_reply, pr_author_read
 from support.requirements_scenarios import independent_source, source_run
 from support.core_operations import CoreOperations, scripted_return
@@ -37,9 +37,9 @@ def _merge_response_lost(scenario, monkeypatch: pytest.MonkeyPatch):
 
 
 def test_parent_only_default_merge_cannot_be_abandoned(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, domain_scenario,
 ) -> None:
-    scenario = Scenario(tmp_path / "parent-only", DeliveryKind.PARENT_ONLY)
+    scenario = domain_scenario(tmp_path / "parent-only", DeliveryKind.PARENT_ONLY)
     kernel, subject = scenario.kernel, scenario.delivery.key
     operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
     assert scenario.run().kind == "approval"

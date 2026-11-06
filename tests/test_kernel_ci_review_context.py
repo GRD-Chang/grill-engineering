@@ -6,15 +6,16 @@ from pathlib import Path
 from agent_run.core.prompts.role import render_role_prompt
 from agent_run.model import DeliveryKind, Policy, Role, wire_json
 from support.core_operations import CoreOperations, scripted_return
-from support.offline import Scenario, review_result
+from support.offline import review_result
+from support.run_scoped_kernel import domain_scenario
 from support.core_operations import next_call, budgets
 
 
 FINDING = 'LATEST_CI_REVIEW_FINDING_7e281: repair the newly reviewed CI behavior.'
 
 
-def test_ci_review_findings_reach_next_development_with_original_ci_and_budget(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / 'scenario', DeliveryKind.TICKET,
+def test_ci_review_findings_reach_next_development_with_original_ci_and_budget(tmp_path: Path, domain_scenario) -> None:
+    scenario = domain_scenario(tmp_path / 'scenario', DeliveryKind.TICKET,
                         checks=('fail', 'none'), reviews=('pass', 'fail', 'pass'),
                         policy=Policy(ticket_ci_review=True, ticket_ci_developments=3))
     kernel, subject = scenario.kernel, scenario.delivery.key
@@ -77,8 +78,8 @@ def test_ci_review_findings_reach_next_development_with_original_ci_and_budget(t
     raise AssertionError('No second CI Development in the normal bounded workflow')
 
 
-def test_non_ci_review_failure_keeps_acceptance_input_and_requirement_budget(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / 'scenario', DeliveryKind.TICKET, reviews=('fail', 'pass'))
+def test_non_ci_review_failure_keeps_acceptance_input_and_requirement_budget(tmp_path: Path, domain_scenario) -> None:
+    scenario = domain_scenario(tmp_path / 'scenario', DeliveryKind.TICKET, reviews=('fail', 'pass'))
     kernel = scenario.kernel
     operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
     development = next_call(scenario, Role.DEVELOPMENT)
@@ -106,8 +107,8 @@ def test_non_ci_review_failure_keeps_acceptance_input_and_requirement_budget(tmp
     assert after['requirements']['reviews_used'] == before['requirements']['reviews_used'] + 1 == 1
 
 
-def test_passing_ci_review_publishes_without_an_extra_repair_or_new_window(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / 'scenario', DeliveryKind.TICKET, checks=('fail', 'none'),
+def test_passing_ci_review_publishes_without_an_extra_repair_or_new_window(tmp_path: Path, domain_scenario) -> None:
+    scenario = domain_scenario(tmp_path / 'scenario', DeliveryKind.TICKET, checks=('fail', 'none'),
                         reviews=('pass',), policy=Policy(ticket_ci_review=True, ticket_ci_developments=3))
     assert scenario.run().kind == 'complete'
     calls = [call for call in scenario.role_calls if call['purpose'] == 'ci']

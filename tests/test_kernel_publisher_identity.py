@@ -16,6 +16,7 @@ from agent_run.core.operation_contract import ReadUnavailable
 from agent_run.config.creation import freeze_creation
 from agent_run.model import Effect, EffectResult
 from support.offline import Scenario
+from support.run_scoped_kernel import domain_kernel
 from support.offline_api import SyntheticGitHub
 from support.effect_boundary import EffectBoundary, effect_boundary
 
@@ -41,6 +42,13 @@ def publisher_scenario(path: Path, monkeypatch: pytest.MonkeyPatch) -> Scenario:
 
     monkeypatch.setattr(scenario, "make_ports", selected)
     return scenario
+
+
+@pytest.fixture
+def domain_publisher(tmp_path, monkeypatch):
+    scenario = publisher_scenario(tmp_path / "scenario", monkeypatch)
+    with domain_kernel(scenario.kernel) as scenario.kernel:
+        yield scenario
 
 
 def reach_phase(scenario: Scenario, phase: str) -> None:
@@ -118,8 +126,9 @@ def test_unconfigured_run_cannot_publish_with_two_missing_identity_selections(tm
 @pytest.mark.parametrize("changed", ["missing-actor", "missing-selection", "other-selection"])
 def test_remote_intent_requires_the_observed_frozen_runner_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: str,
+    domain_publisher,
 ) -> None:
-    scenario = publisher_scenario(tmp_path / "scenario", monkeypatch)
+    scenario = domain_publisher
     reach_phase(scenario, "push")
     if changed == "missing-actor":
         scenario.publisher["actor"] = None
@@ -135,8 +144,9 @@ def test_remote_intent_requires_the_observed_frozen_runner_identity(
 
 def test_actual_publisher_is_frozen_and_rechecked_before_each_remote_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    domain_publisher,
 ) -> None:
-    scenario = publisher_scenario(tmp_path / "scenario", monkeypatch)
+    scenario = domain_publisher
     reach_phase(scenario, "push")
     boundary = capture_effect(scenario, monkeypatch, "push")
     effect = boundary.effect
@@ -207,8 +217,9 @@ def test_close_inherits_only_the_confirmed_original_comment_receipt(
 
 def test_same_actor_close_seen_before_first_dispatch_is_not_adopted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    domain_publisher,
 ) -> None:
-    scenario = publisher_scenario(tmp_path / "scenario", monkeypatch)
+    scenario = domain_publisher
     comment = prepare_comment(scenario, monkeypatch)
     assert scenario.runner().run_once().kind == "progress"
     assert scenario.runner().run_once().kind == "progress"
@@ -227,8 +238,9 @@ def test_same_actor_close_seen_before_first_dispatch_is_not_adopted(
 
 def test_rearmed_close_settles_the_original_late_write_without_dispatching_again(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    domain_publisher,
 ) -> None:
-    scenario = publisher_scenario(tmp_path / "scenario", monkeypatch)
+    scenario = domain_publisher
     comment = prepare_comment(scenario, monkeypatch)
     assert scenario.runner().run_once().kind == "progress"
     assert scenario.runner().run_once().kind == "progress"
