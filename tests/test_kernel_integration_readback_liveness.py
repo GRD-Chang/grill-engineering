@@ -58,6 +58,13 @@ def test_retry_and_stop_do_not_grant_the_waiter_or_repeat_a_write(tmp_path):
     assert state.disposition == 'waiting' and state.wake_at == retry
     scenario.step()
     assert scenario.port.writes() == before
+    pending = scenario.kernel.status('ticket:3')['pending_write']
+    assert scenario.kernel.control('stop', 'stop-unknown-merge', subject='ticket:3') == 'applied'
+    stopped = scenario.kernel.status('ticket:3')
+    assert 'operator_stopped' in stopped['gates'] and stopped['holds_integration']
+    assert stopped['pending_write'] == pending
+    assert not scenario.kernel.status('ticket:4')['holds_integration']
+    assert scenario.port.writes() == before
     scenario.kernel.control('stop', 'stop-original-readback')
     now[0] = retry + 0.01
     step = runner.run_once(agent_capacity=0)

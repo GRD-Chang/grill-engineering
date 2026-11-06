@@ -9,9 +9,10 @@ from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.adapters.git_objects import LocalGit
 from agent_run.contracts.write_authority import FinalAdmission, WriteAuthority
-from agent_run.model import Role
+from agent_run.model import Issue, ParentIssue, Requirements, Role
 from support.core_operations import CoreOperations, scripted_return
 from support.effect_boundary import workspace_intent
+from support.offline import GraphScenario
 
 
 def first_development(scenario):
@@ -19,25 +20,6 @@ def first_development(scenario):
         lambda step: step.call is not None, limit=8)
     assert step.call.role == Role.DEVELOPMENT
     return step
-
-
-def test_dependent_ticket_first_development_sees_delivered_dependency_code(tmp_path: Path, monkeypatch) -> None:
-    scenario, head = dependent_ticket(tmp_path)
-    kernel, subject = scenario.kernel, scenario.delivery.key
-    prepared = workspace_intent(scenario, monkeypatch).effect
-    assert prepared.operation == "workspace"
-    assert prepared.before_sha == head.sha and prepared.base == head
-    assert kernel.delivery(subject).base == head
-    assert kernel.status(subject)["source_sha"] == head.sha
-    scenario.kernel = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
-    assert workspace_intent(scenario, monkeypatch).effect == prepared
-    assert prepare_scripted_agent(kernel, scenario.runner().run_once()).kind == "progress"
-    development = first_development(scenario)
-    assert development.call.context["base_sha"] == head.sha
-    checkout = Path(development.call.context["checkout"])
-    assert scenario.port.git.run("rev-parse", "HEAD", cwd=checkout).stdout.strip() == head.sha
-    assert (checkout / "development-1.txt").read_text() == "Change 1\n"
-    scripted_return(scenario.kernel, scenario.runner(), development.call, scenario.agent)
 
 
 @pytest.mark.parametrize("dispatched", [False, True], ids=["prepared", "sent"])
@@ -60,7 +42,9 @@ def test_workspace_intent_keeps_allocated_base_after_run_branch_moves(tmp_path: 
     assert prepare_scripted_agent(kernel, scenario.runner().run_once()).kind == "progress"
     development = first_development(scenario)
     assert development.call.context["base_sha"] == allocated.sha
-    assert (Path(development.call.context["checkout"]) / "development-1.txt").exists()
+    checkout = Path(development.call.context["checkout"])
+    assert scenario.port.git.run("rev-parse", "HEAD", cwd=checkout).stdout.strip() == allocated.sha
+    assert (checkout / "development-1.txt").read_text() == "Change 1\n"
     assert not (Path(development.call.context["checkout"]) / "later-run.txt").exists()
     with kernel.storage.transaction(write=False) as tx:
         workspaces = tx.rows("SELECT before_sha,attempts FROM effects WHERE subject=? AND operation='workspace'", (subject,))
@@ -69,7 +53,13 @@ def test_workspace_intent_keeps_allocated_base_after_run_branch_moves(tmp_path: 
 
 
 def test_new_workspace_never_resets_a_foreign_preexisting_ticket_ref(tmp_path: Path, monkeypatch) -> None:
-    scenario, head = dependent_ticket(tmp_path)
+    # Foreign-ref protection consumes the current target; a dependency delivery
+    # is established by the prepared/sent workspace stories above.
+    scenario = GraphScenario(tmp_path / "scenario", Requirements(
+        ParentIssue(1, "Parent", "Scope", (2,)),
+        (Issue(2, "Ticket", "Scope", "OPEN", frozenset({"ready-for-agent"})),)))
+    head = scenario.port.external_remote_append(scenario.delivery.target_ref,
+        {"current.txt": "Current target\n"}, "current-target")
     kernel, subject = scenario.kernel, scenario.delivery.key
     scenario.port.git.run("update-ref", scenario.delivery.source_ref, scenario.initial.sha, "0" * len(scenario.initial.sha))
     effect = workspace_intent(scenario, monkeypatch).effect

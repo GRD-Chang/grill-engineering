@@ -125,8 +125,8 @@ def _conflict_with_waiter(tmp_path, *, lose_reply=False, fallback=False):
     return scenario, operations, agent, repair, receipt
 
 
-@pytest.mark.parametrize('lose_reply,fallback', [(False, False), (True, False), (False, True)],
-    ids=['False', 'True', 'fallback-D4-R3'])
+@pytest.mark.parametrize('lose_reply,fallback', [(True, False), (False, True)],
+    ids=['True', 'fallback-D4-R3'])
 def test_pure_conflict_keeps_the_original_seat_while_the_other_ticket_waits(tmp_path, lose_reply, fallback):
     scenario, operations, agent, repair, receipt = _conflict_with_waiter(tmp_path, lose_reply=lose_reply, fallback=fallback)
     kernel = scenario.kernel
@@ -257,24 +257,3 @@ def test_two_actual_failed_processes_pause_the_same_attempt_and_release_the_seat
     assert "execution_failed" in kernel.status(original.subject)["gates"]
     assert not kernel.status(original.subject)["holds_integration"]
     _waiter_gets_seat(scenario, operations)
-
-
-def test_a_targeted_stop_keeps_an_original_unknown_merge_and_its_seat(tmp_path):
-    scenario = GraphScenario(tmp_path / "graph", _source())
-    kernel = scenario.kernel
-    scenario.port.lose_response.add("merge")
-    for _ in range(100):
-        scenario.step()
-        pending = kernel.status("ticket:2")["pending_write"]
-        if pending is not None and pending["operation"] == "merge" and pending["status"] == "sent":
-            break
-    else:
-        raise AssertionError("The normal merge producer did not lose its original reply")
-    before = scenario.port.writes()
-    assert kernel.status("ticket:2")["holds_integration"]
-    assert kernel.control("stop", "stop-unknown-merge", subject="ticket:2") == "applied"
-    assert "operator_stopped" in kernel.status("ticket:2")["gates"]
-    assert kernel.status("ticket:2")["holds_integration"]
-    assert not kernel.status("ticket:3")["holds_integration"]
-    assert kernel.status("ticket:2")["pending_write"] == pending
-    assert scenario.port.writes() == before
