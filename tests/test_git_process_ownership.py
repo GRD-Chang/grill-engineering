@@ -132,6 +132,11 @@ def sigchld_policy_library(tmp_path_factory: pytest.TempPathFactory) -> Path:
     library = directory / "policy.so"
     source.write_text(
         "#include <signal.h>\n"
+        "#include <stddef.h>\n"
+        "int action_size(void) { return sizeof(struct sigaction); }\n"
+        "int flags_offset(void) { return offsetof(struct sigaction, sa_flags); }\n"
+        "int mask_offset(void) { return offsetof(struct sigaction, sa_mask); }\n"
+        "int no_cldwait(void) { return SA_NOCLDWAIT; }\n"
         "static void handler(int signo) {}\n"
         "int set_policy(int caught) {\n"
         " struct sigaction action = {0};\n"
@@ -163,7 +168,8 @@ def test_git_rejects_non_waitable_sigchld_policy_before_git_spawn(
 import ctypes, signal, subprocess, sys
 from pathlib import Path
 from agent_run.errors import GitError
-from agent_run.runtime.git_command import run_git
+from agent_run.runtime.git_command import run_git, _require_waitable_children
+_require_waitable_children()  # Warm the ABI binding before the C/Python policy change.
 policy, library, root = sys.argv[1:]
 if policy == 'ignored':
     signal.signal(signal.SIGCHLD, signal.SIG_IGN)
@@ -192,6 +198,120 @@ else:
         capture_output=True, text=True, timeout=10,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_native_signal_layout_matches_platform_headers(sigchld_policy_library: Path) -> None:
+    import ctypes
+    from agent_run.runtime import native_child_policy as policy
+
+    if policy._libc() is None:
+        assert policy.require_native_waitable_children() is False
+        return
+    compiled = ctypes.CDLL(str(sigchld_policy_library))
+    assert ctypes.sizeof(policy._Sigaction) == compiled.action_size()
+    assert policy._Sigaction.flags.offset == compiled.flags_offset()
+    assert policy._Sigaction.mask.offset == compiled.mask_offset()
+    assert compiled.no_cldwait() == 2
+
+
+@pytest.mark.parametrize("failure", ["open", "wait", "return", "close", "wait_and_close"])
+def test_native_capability_failure_prevents_git_and_closes_self_pidfd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    import errno
+    from agent_run.runtime import native_child_policy as policy
+
+    if policy._libc() is None:
+        assert policy.require_native_waitable_children() is False
+        return
+    opened, closed = [], []
+    real_open, real_close = os.pidfd_open, os.close
+
+    def acquire(pid):
+        assert pid == os.getpid()
+        if failure == "open":
+            raise OSError(errno.EPERM, "pidfd denied")
+        descriptor = real_open(pid)
+        opened.append(descriptor)
+        return descriptor
+
+    def wait(kind, descriptor, options):
+        assert kind == os.P_PIDFD and descriptor == opened[0]
+        assert options == os.WEXITED | os.WNOWAIT | os.WNOHANG
+        if failure == "return":
+            return None
+        code = errno.EPERM if failure in {"wait", "wait_and_close"} else errno.ECHILD
+        raise OSError(code, "wait result")
+
+    def close(descriptor):
+        closed.append(descriptor)
+        real_close(descriptor)
+        if failure in {"close", "wait_and_close"}:
+            raise OSError(errno.EIO, "uncertain close")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("capability failure must not start a child")
+
+    monkeypatch.setattr(os, "pidfd_open", acquire)
+    monkeypatch.setattr(os, "waitid", wait)
+    monkeypatch.setattr(os, "close", close)
+    monkeypatch.setattr(os, "posix_spawn", forbidden)
+    monkeypatch.setattr(git_command.subprocess, "Popen", forbidden)
+    with pytest.raises(GitError, match="waitable children") as raised:
+        git_command.run_git(["git", "--version"], cwd=tmp_path)
+    assert closed == opened  # Exactly one close, including uncertain close.
+    for descriptor in opened:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    if failure == "wait_and_close":
+        assert raised.value.__cause__.errno == errno.EPERM
+        assert raised.value.__cause__.__cause__.errno == errno.EIO
+
+
+def test_native_admission_checks_each_call_without_spawning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_run.runtime import native_child_policy as policy
+
+    if policy._libc() is None:
+        assert policy.require_native_waitable_children() is False
+        return
+    checked = []
+    real_wait = os.waitid
+
+    def wait(*args):
+        checked.append(args)
+        return real_wait(*args)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("native admission created a process")
+
+    monkeypatch.setattr(os, "waitid", wait)
+    monkeypatch.setattr(os, "posix_spawn", forbidden)
+    git_command._require_waitable_children()
+    git_command._require_waitable_children()
+    assert len(checked) == 2
+
+
+def test_native_signal_query_error_does_not_fall_back_or_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ctypes
+    import errno
+    from agent_run.runtime import native_child_policy as policy
+
+    def query(*args):
+        ctypes.set_errno(errno.EPERM)
+        return -1
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("unknown live signal policy must not create a child")
+
+    monkeypatch.setattr(policy, "_libc", lambda: SimpleNamespace(sigaction=query))
+    monkeypatch.setattr(os, "posix_spawn", forbidden)
+    monkeypatch.setattr(git_command.subprocess, "Popen", forbidden)
+    with pytest.raises(GitError, match="waitable children"):
+        git_command.run_git(["git", "--version"], cwd=tmp_path)
 
 
 def test_two_concurrent_git_calls_own_reaping_without_poll(
@@ -491,6 +611,7 @@ def test_real_popen_wait_error_uses_stable_identity_and_disables_automatic_reap(
 def test_probe_uncertain_reap_retries_same_pidfd_without_starting_git(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, consume_first: bool,
 ) -> None:
+    monkeypatch.setattr(git_command, "require_native_waitable_children", lambda: False)
     real_wait = os.waitid
     waits = []
     injected = False
@@ -555,6 +676,7 @@ def test_local_git_mutations_recheck_authority_after_preparation(
 def test_pidfd_acquisition_failure_reaps_pinned_child_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
 ) -> None:
+    monkeypatch.setattr(git_command, "require_native_waitable_children", lambda: False)
     import subprocess
 
     processes, probes, numeric_reaps, signals = [], [], [], []
@@ -611,6 +733,7 @@ def test_pidfd_acquisition_failure_reaps_pinned_child_once(
 def test_probe_observation_error_still_reaps_by_pidfd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(git_command, "require_native_waitable_children", lambda: False)
     real_wait = os.waitid
     waits = []
 

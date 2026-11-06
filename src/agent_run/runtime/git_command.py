@@ -11,6 +11,7 @@ from pathlib import Path
 
 from agent_run.errors import GitError
 from agent_run.runtime.process_io import CompleteOutput, TailOutput, pump
+from agent_run.runtime.native_child_policy import require_native_waitable_children
 from agent_run.errors import redact_transport_output
 
 
@@ -72,13 +73,15 @@ def _reap_child(kind: int, identity: int) -> int:
 def _require_waitable_children() -> None:
     """Linux admission, without changing the host's SIGCHLD disposition.
 
-    The kernel masks catch C handlers invisible to Python's signal cache. A
-    short probe also detects SIG_DFL with hidden SA_NOCLDWAIT. The
-    caller must retain this policy and exclusive ownership during run_git.
+    The known glibc ABI reads sigaction and validates pidfd/waitid on self.
+    Other ABIs retain a real child probe for hidden SA_NOCLDWAIT. The caller
+    must retain this policy and exclusive ownership during run_git.
     """
     try:
         if not all(hasattr(os, name) for name in ("WNOWAIT", "P_PIDFD", "pidfd_open")):
             raise ValueError("Linux pidfd/WNOWAIT support is unavailable")
+        if require_native_waitable_children():
+            return
         masks = dict(
             line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines()
             if line.startswith(("SigIgn:", "SigCgt:"))

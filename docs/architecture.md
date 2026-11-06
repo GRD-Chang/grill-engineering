@@ -88,6 +88,12 @@ Task 可先独立持久化为 idle；完整冻结的 Run、必要关系/材料�
 每次真实外部写入前仍经过 Core 的当下授权检查，未知结果沿同一 intent 读回，
 数据库提交、展示状态和 Agent 报告均不能代替真实外部结果或进程退出证据。
 
+Git 子进程由调用方独占回收，宿主在调用期间须保持默认 SIGCHLD 且无竞争收割者。
+每次启动前验证当前信号策略与 pidfd/waitid 能力：已知 glibc Linux x86_64 LP64 ABI
+直接读取 sigaction，并以 self pidfd 的 ECHILD 验证系统调用；其他 ABI 保留真实短子进程探针。
+仅缓存 ABI 绑定，不缓存策略或授权。该检查依赖正常 Linux errno 语义，不支持伪造系统调用结果的宿主。
+实际 Git 仍使用 pidfd、WNOWAIT 与准确进程组清理；写授权在准备之后、启动之前重新核验。
+
 故障 Host 在 Worker drain 前先封闭原执行代次的准入；无法持久撤销时将已持有的 Task 锁留至进程退出，
 不在业务事务中等待物理清理。guardian 创建者负责事务外 wait/reap；其他观察者只用匹配的 pidfd 证明准确退出，
 后台继续核验 Host/cgroup/FD-store；前台候选核验原 observer、namespace 和准确进程退出。原启动期限不续期，3秒仅为回收宽限，未知退出不等于可重新准入。
