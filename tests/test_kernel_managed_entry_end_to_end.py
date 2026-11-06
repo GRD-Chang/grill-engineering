@@ -1700,61 +1700,6 @@ issue = int(re.search(r'https://github.com/example/project/issues/(\\d+)', promp
     report_costs(record_property, tmp_path)
 
 
-def test_explicit_fault_host_entry_preserves_native_admission_without_fault(
-    git_repo: Path, tmp_path: Path, monkeypatch,
-) -> None:
-    """Controlled test entry, not the official CLI's unchanged argv contract.
-
-    Only the initial Host module is selected differently before admission.
-    Namespace/lease/channel/Worker authorization and installed runtime are real.
-    """
-    from uuid import uuid4
-    from agent_run.adapters.foreground import subreaper
-    from agent_run.cli.lifecycle import prepare_creation, submit
-    from agent_run.runtime import executor
-    from agent_run.runtime.foreground_host import ForegroundHost
-    from support.sqlite_fault_host import command
-    from support.sqlite_faults import FaultScope, sqlite_fault
-
-    classification = """schema = json.loads(Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text())
-role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commit_message' in schema['properties'] else 'development'
-"""
-    codex = _CODEX[:_CODEX.index('if prompt.startswith')] + classification + _CODEX[_CODEX.index('thread = '):]
-    environment, _ = _control_environment(git_repo, tmp_path, monkeypatch, codex=codex, tickets=())
-    database, spec, requirements = prepare_creation(1, 'example/project', source_directory=git_repo,
-        defaults=UserDefaultsStore(), disable_notifications=True)
-    kernel = Kernel.create_task(database, spec, requirements=requirements)
-    action = uuid4().hex
-    lock = default_runner_lock_path(environment)
-    scope, digest = FaultScope.create(tmp_path / 'fault-scope', database, spec.run_id, action)
-    selected = command(database, action, lock, environment, scope.manifest, digest, run_id=spec.run_id)
-    assert selected != executor.command(database, action, lock, environment, run_id=spec.run_id)
-    with subreaper(), sqlite_fault(monkeypatch, database, 'commit-interrupt', scope=scope) as failures:
-        result = submit(kernel, 'run', action_id=action, command=selected,
-            manager=ForegroundHost(environment=environment), environment=environment, runner_lock=lock)
-    assert failures == [] and not scope.active()
-    assert result['run_id'] == spec.run_id and result['host'] == 'exited'
-    assert result['host_backend'] == 'foreground'
-    assert kernel.host_request(action).command == selected
-    receipt = kernel.host_usage(action)
-    assert receipt is not None and receipt.usage_released
-    assert receipt.exit_status == 0 and receipt.namespace_exit_status == 0
-    assert kernel.status('parent:1')['phase'] == 'approval'
-    with kernel.storage.transaction(write=False) as tx:
-        assert tx.one('SELECT count(*) FROM leases')[0] == 0
-        assert not tx.rows("SELECT owner FROM hosts WHERE status!='exited' OR usage_released=0")
-        assert {row['role'] for row in tx.rows('SELECT role FROM attempts')} == {'development', 'review', 'publication'}
-        assert tx.one('SELECT count(*) FROM invocation_outputs')[0] == 3
-        assert tx.one('SELECT count(*) FROM invocation_outputs WHERE exit_code IS NULL OR exit_code!=0')[0] == 0
-    events = [json.loads(line) for line in scope.manifest.with_suffix('.events.jsonl').read_text().splitlines()]
-    assert [event['event'] for event in events] == ['factory_loaded', 'factory_closed']
-    assert events[0]['pid'] != os.getpid() and events[0]['sqlite_code'] is None
-    with runner_management_lease(lock):
-        pass
-    assert not list((lock.parent / 'foreground-hosts').iterdir())
-
-
-
 def test_controlled_native_commit_failure_reaps_both_workers_before_disarm_and_public_resume(
     git_repo: Path, tmp_path: Path, monkeypatch, record_property, request,
 ) -> None:

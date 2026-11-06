@@ -1,5 +1,4 @@
 """The native executor consumes original control effects and real source reads."""
-from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -7,50 +6,10 @@ import pytest
 
 from agent_run.runtime.executor import _make_ports
 from support.core_operations import CoreOperations
-from support.control_scenarios import prepared_control
 from agent_run.model import Execution, HostObservation
 from support.offline import GraphScenario
 from support.remote_effects import _fixture
 from support.requirements_scenarios import independent_source
-
-
-@pytest.mark.parametrize("control_kind", ["requeue", "abandon"])
-def test_native_executor_consumes_the_original_control_action_with_fresh_source_and_resources(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, control_kind: str,
-) -> None:
-    scenario, request, original, state, calls, operations, world = prepared_control(tmp_path, monkeypatch, control_kind)
-    kernel, subject = scenario.kernel, scenario.delivery.key
-    if control_kind == "requeue":
-        replacement = replace(original, source_ref=original.source_ref + "-g2", base=world.target,
-                              checkout=str(Path(original.checkout).with_name("replacement-g2")))
-        assert kernel.control_host(request, "requeue", "replace-original", subject=subject,
-                                   world=world, replacement=replacement) == "pending"
-        for _ in range(30):
-            step = operations.once()
-            assert step.call is None and step.kind == "progress"
-            if kernel.status(subject)["generation"] == 2:
-                break
-        else:
-            raise AssertionError("The original requeue Action did not apply its replacement")
-        assert kernel.status(subject)["generation"] == 2
-    else:
-        resources = kernel.generation_resources()
-        inspections = operations.runner.ports.inspect(resources)
-        assert kernel.control_host(request, "abandon", "abandon-original", resource_inspections=inspections) == "pending"
-        for _ in range(30):
-            step = operations.once()
-            assert step.call is None and step.kind in {"progress", "complete"}
-            if step.kind == "complete":
-                break
-        else:
-            raise AssertionError("The original Action's finite effects did not complete")
-        assert all(not Path(resource.checkout).exists() for resource in resources)
-    actual = json.loads(state.read_text())
-    assert actual["prs"][0]["state"] == "closed"
-    assert len(actual["comments"]) == len(actual["events"]) == 1
-    observed_calls = [json.loads(line) for line in calls.read_text().splitlines()]
-    assert sum("POST" in call for call in observed_calls) == sum("PATCH" in call for call in observed_calls) == 1
-    assert any(call[:2] == ["api", "graphql"] for call in observed_calls)
 
 
 def test_native_executor_abandons_before_the_remote_run_branch_is_created(

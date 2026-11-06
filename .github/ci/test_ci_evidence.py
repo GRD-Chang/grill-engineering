@@ -58,7 +58,7 @@ class CurrentCollectionTests(unittest.TestCase):
 
     def test_consumed_cli_behaviors_are_in_the_actual_product_collection(self):
         expected = {
-            "tests/test_kernel_installed_parent_only.py::test_installed_public_parent_only_reaches_approval_close_cleanup_and_normal_host_exit",
+            "tests/test_kernel_foreground_entry.py::test_installed_foreground_parent_only_public_lifecycle",
             "tests/test_kernel_query_cli.py::test_parent_selector_works_in_a_repo_and_across_directories",
             "tests/test_doctor_readiness.py::test_doctor_cli_separates_installation_and_execution_readiness",
             "tests/test_kernel_query_cli.py::test_history_keeps_raw_feedback_and_pages_without_losing_events",

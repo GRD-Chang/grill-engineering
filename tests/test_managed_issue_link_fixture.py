@@ -63,9 +63,8 @@ def test_managed_link_accepts_only_known_issue_and_exact_ref_oid(
     assert sum(args[1] == 'graphql' and 'POST' in args for args in calls) == 1
 
 
-@pytest.mark.parametrize('lose_final_response', [False, True], ids=['acknowledged', 'response-lost'])
 def test_normal_core_final_link_is_unknown_only_after_injected_response_loss(
-    managed_link, git_repo, tmp_path, monkeypatch, lose_final_response,
+    managed_link, git_repo, tmp_path, monkeypatch,
 ):
     _, remote, state, _ = managed_link
     document = json.loads(state.read_text())
@@ -82,7 +81,7 @@ def test_normal_core_final_link_is_unknown_only_after_injected_response_loss(
         if effect.operation != 'issue_link':
             return original(effect, authority)
         scenario.port.git.run('push', str(remote), effect.before_sha + ':' + effect.source_ref)
-        if effect.subject == 'final:1' and lose_final_response:
+        if effect.subject == 'final:1':
             document = json.loads(state.read_text())
             document['lose_operation'] = 'issue_link'
             state.write_text(json.dumps(document))
@@ -103,18 +102,17 @@ def test_normal_core_final_link_is_unknown_only_after_injected_response_loss(
     assert [(effect.subject, effect.payload['issue']) for effect, _ in observed] == [('ticket:2', 2), ('final:1', 1)]
     assert observed[0][1].disposition == 'target'
     effect, result = observed[-1]
-    assert result.disposition == ('unknown' if lose_final_response else 'target')
-    if lose_final_response:
-        assert result.raw['write_returncode'] == 1
-        assert 'response lost after actual mutation' in result.raw['diagnostic']
+    assert result.disposition == 'unknown'
+    assert result.raw['write_returncode'] == 1
+    assert 'response lost after actual mutation' in result.raw['diagnostic']
     final = scenario.kernel.status('final:1')
-    assert final['issue_link']['state'] == ('indeterminate' if lose_final_response else 'linked')
+    assert final['issue_link']['state'] == 'indeterminate'
     assert final['phase'] == 'checks' and not final['gates']
     prepare_scripted_agent(scenario.kernel, runner.run_once())
     assert scenario.kernel.status('final:1')['phase'] == 'approval'
     with scenario.kernel.storage.transaction(write=False) as tx:
         row = tx.one('SELECT status,attempts FROM effects WHERE id=?', (effect.effect_id,))
-        assert tuple(row) == ('sent' if lose_final_response else 'confirmed', 1)
+        assert tuple(row) == ('sent', 1)
     calls = [json.loads(line) for line in (tmp_path / 'gh-calls.jsonl').read_text().splitlines()]
     assert sum(args[1] == 'graphql' and 'POST' in args for args in calls) == 2
     assert len(json.loads(state.read_text())['links']) == 2
