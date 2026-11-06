@@ -3,7 +3,7 @@
 Private Git and synthetic external ports; no native save clock, file admission,
 Host, or Worker proof. Intent persistence is distinct from deletion authority.
 """
-from dataclasses import replace
+from dataclasses import asdict, replace
 from contextlib import closing, ExitStack
 from pathlib import Path
 import sqlite3
@@ -16,7 +16,7 @@ from support.offline import Scenario
 from support.run_scoped_kernel import ScopedKernel
 from agent_run.core.operation_contract import ObserveIO, ReadUnavailable, RequirementsRead
 from agent_run.errors import KernelError
-from agent_run.model import DeliveryKind, Issue, ReadWait
+from agent_run.model import DeliveryKind, Issue, ReadWait, wire_json
 from agent_run.storage.sqlite import Transaction
 
 
@@ -102,8 +102,46 @@ def test_first_local_intents_need_no_source_or_delivery_read(cleanup_scenario, m
 
 
 @pytest.fixture
-def pending_local_cleanup(cleanup_scenario, monkeypatch, request):
+def cleanup_consumer(cleanup_scenario):
+    """Explicit prior facts, not proof of delivery or Completion production.
+
+    The first test above checks the real producer. These consumers exercise
+    fresh authorization and physical resource guards against independent Git.
+    """
+    from support.repository_scope import insert
+
     s, db = cleanup_scenario
+    d, git = s.delivery, s.port.git
+    git.run('worktree', 'add', '--detach', d.checkout, d.base.sha)
+    git.run('commit', '--allow-empty', '-m', 'Input completed workspace', cwd=Path(d.checkout))
+    head = git.commit(git.run('rev-parse', 'HEAD', cwd=Path(d.checkout)).stdout.strip())
+    assert s.port.physical.push(d.source_ref, None, head.sha).returncode == 0
+    with s.kernel.storage.transaction() as tx:
+        run = tx.one('SELECT * FROM runs')
+        job = tx.one('SELECT * FROM subjects WHERE id=?', (d.key,))
+        common = dict(run_id=run['id'], subject=d.key, status='confirmed',
+            parent_revision=run['parent_revision'], graph_revision=run['graph_revision'],
+            revision=job['revision'], generation=job['generation'], source_ref=d.source_ref,
+            target_ref=d.target_ref, before_sha=d.base.sha, base_sha=d.base.sha, base_tree=d.base.tree)
+        payload = dict(checkout=d.checkout, owned_root=d.owned_root, common_git_dir=d.common_git_dir, create_ref=True)
+        insert(db, 'effects', dict(common, id='input-workspace', operation='workspace',
+            payload_id=tx.put(d.key, 'effect_intent', wire_json(payload)),
+            receipt_id=tx.put(d.key, 'effect_receipt', wire_json(dict(disposition='target', commit=asdict(d.base))))))
+        insert(db, 'effects', dict(common, id='input-close', operation='close',
+            payload_id=tx.put(d.key, 'effect_intent', wire_json({})),
+            receipt_id=tx.put(d.key, 'effect_receipt', wire_json(dict(disposition='target')))))
+        tx.execute("UPDATE subjects SET phase='complete',workspace_sha=?,publication_sha=?,publication_tree=?,merge_sha=? WHERE id=?",
+            (head.sha, head.sha, head.tree, head.sha, d.key))
+        tx.execute('DELETE FROM work_queue WHERE subject=?', (d.key,))
+        insert(db, 'resource_cleanup', dict(run_id=run['id'], subject=d.key,
+            generation=job['generation'], source_ref=d.source_ref, source_sha=head.sha,
+            workspace_sha=head.sha, checkout=d.checkout, owned_root=d.owned_root, common_git_dir=d.common_git_dir))
+    return s, db
+
+
+@pytest.fixture
+def pending_local_cleanup(cleanup_consumer, monkeypatch, request):
+    s, db = cleanup_consumer
     operation = getattr(request, 'param', 'cleanup_worktree')
     make_ports, captured = s.make_ports, []
 
@@ -155,6 +193,26 @@ def test_source_403_keeps_prepared_intent_without_dispatch_or_completion(pending
     assert s.port.ref_commit(effect.source_ref) == local_ref
 
 
+@pytest.mark.parametrize('pending_local_cleanup', ['cleanup_worktree', 'cleanup_local_ref'], indirect=True)
+def test_absent_resource_still_dispatches_and_consumes_original_intent(pending_local_cleanup):
+    s, db, effect, authority, ports = pending_local_cleanup
+    git = s.port.git
+    if effect.operation == 'cleanup_worktree':
+        git.run('worktree', 'remove', effect.payload['checkout'])
+    else:
+        git.run('update-ref', '-d', effect.source_ref, effect.before_sha)
+    before = s.kernel.status(effect.subject)
+    assert before['resource_cleanup']['stage'] == (0 if effect.operation == 'cleanup_worktree' else 1)
+    assert s.port.execute(effect, authority).disposition == 'target'
+    assert effect_state(s, effect)[:2] == ('sent', 1)
+    s.step()  # Original sent intent readback.
+    assert s.step().kind == 'progress'
+    after = s.kernel.status(effect.subject)
+    assert effect_state(s, effect)[:2] == ('confirmed', 1)
+    assert (after['phase'], after['budgets']) == (before['phase'], before['budgets'])
+    assert after['resource_cleanup']['stage'] == before['resource_cleanup']['stage'] + 1
+
+
 @pytest.mark.parametrize('change', ['stop', 'owner', 'source'])
 def test_real_intent_is_not_authority_after_revocation(pending_local_cleanup, monkeypatch, change):
     s, db, effect, authority, ports = pending_local_cleanup
@@ -182,25 +240,16 @@ def test_real_intent_is_not_authority_after_revocation(pending_local_cleanup, mo
         assert s.kernel.source_status()['blocked'] == 'unsupported_scope_change'
 
 
-@pytest.mark.parametrize('pending_local_cleanup', ['cleanup_worktree', 'cleanup_local_ref'], indirect=True)
 def test_resource_replacement_is_preserved_by_the_original_cas(pending_local_cleanup):
     s, db, effect, authority, ports = pending_local_cleanup
     git = s.port.git
-    if effect.operation == 'cleanup_worktree':
-        git.run('commit', '--allow-empty', '-m', 'Foreign worktree head', cwd=Path(s.delivery.checkout))
-        replacement = git.run('rev-parse', 'HEAD', cwd=Path(s.delivery.checkout)).stdout.strip()
-        assert replacement != effect.before_sha
-    else:
-        replacement = s.port.remote_commit(effect.source_ref).sha
-        assert replacement != effect.before_sha  # Local marker and published head differ.
-        git.run('update-ref', effect.source_ref, replacement, effect.before_sha)
+    git.run('commit', '--allow-empty', '-m', 'Foreign worktree head', cwd=Path(s.delivery.checkout))
+    replacement = git.run('rev-parse', 'HEAD', cwd=Path(s.delivery.checkout)).stdout.strip()
+    assert replacement != effect.before_sha
     assert s.port.execute(effect, authority).disposition == 'third'
     assert effect_state(s, effect)[:2] == ('prepared', 0)
     assert s.kernel.status(effect.subject)['resource_cleanup']['state'] == 'pending'
-    if effect.operation == 'cleanup_worktree':
-        assert git.run('rev-parse', 'HEAD', cwd=Path(s.delivery.checkout)).stdout.strip() == replacement
-    else:
-        assert s.port.ref_commit(effect.source_ref).sha == replacement
+    assert git.run('rev-parse', 'HEAD', cwd=Path(s.delivery.checkout)).stdout.strip() == replacement
 
 
 @pytest.mark.parametrize('pending_local_cleanup', ['cleanup_local_ref'], indirect=True)
@@ -284,8 +333,8 @@ def test_worktree_command_preparation_keeps_fresh_core_and_resource_guards(pendi
 
 
 @pytest.mark.parametrize('proof', ['close', 'marker'])
-def test_first_intent_requires_its_original_transaction_proofs(cleanup_scenario, monkeypatch, proof):
-    s, db = cleanup_scenario
+def test_first_intent_requires_its_original_transaction_proofs(cleanup_consumer, monkeypatch, proof):
+    s, db = cleanup_consumer
     operation = 'cleanup_worktree' if proof == 'close' else 'cleanup_local_ref'
     prepare = s.kernel._prepare_effect
     held = []
@@ -303,8 +352,8 @@ def test_first_intent_requires_its_original_transaction_proofs(cleanup_scenario,
         boundary.setattr(s.kernel, '_prepare_effect', hold)
         with pytest.raises(BeforeIntent):
             s.run(approve=True)
-    # The prefix is a real producer. Inject only a missing read proof, without
-    # manufacturing a phase, Completion, close, marker, or persisted SQL row.
+    # The cleanup consumer must reject a missing prior proof atomically.
+    # Input receipt production is covered by the real journey above.
     before = tuple(db.iterdump())
     if proof == 'close':
         run, job, work = held

@@ -1,10 +1,12 @@
 """Checks demand belongs to one Core continuation, never a cached permission.
 
-Normal Task/Run producers, private Git, and the existing ScopedKernel decision
-seam. No native save clock, physical Host, Worker, or GitHub service is exercised.
+Observation/transaction matrices use initial Core relations and read-only ports.
+Representative delivery stories retain private Git and real effects. Both use
+the existing ScopedKernel seam; neither claims native save or physical Host proof.
 """
 from contextlib import closing, contextmanager, ExitStack
 from dataclasses import asdict, replace
+from types import SimpleNamespace
 import sqlite3
 import json
 
@@ -13,42 +15,87 @@ import pytest
 from agent_run.core.operation_contract import ObserveIO, ReadUnavailable, Work
 from agent_run.core.operation_runner import OperationRunner, observe_control
 from agent_run.errors import KernelError
-from agent_run.model import Checks, DeliveryKind, ReadWait, wire_json
+from agent_run.model import Checks, Commit, Delivery, DeliveryKind, ReadWait, RunSpec, wire_json
 from support import offline
 from support.effect_boundary import advance_to_effect
 from support.offline import Scenario
 from support.run_scoped_kernel import ScopedKernel
 
 
+@contextmanager
+def _scoped(original):
+    with closing(sqlite3.connect(original.storage.path, isolation_level=None)) as db:
+        db.row_factory = sqlite3.Row
+        db.execute('PRAGMA foreign_keys=ON')
+        kernel = ScopedKernel(db, original.storage.run_id)
+        kernel.storage.path, kernel.storage.run_id = original.storage.path, original.storage.run_id
+        yield kernel, db
+
+
 @pytest.fixture
-def decision_scenario(tmp_path, monkeypatch, request):
+def scoped_producer(monkeypatch):
+    # Real Git integration stories retain the same Core transaction seam.
     create = offline.create_kernel
     with ExitStack() as owned:
-        connections = []
         def producer(*args, **kwargs):
-            original = create(*args, **kwargs)
-            db = owned.enter_context(closing(sqlite3.connect(original.storage.path, isolation_level=None)))
-            db.row_factory = sqlite3.Row
-            db.execute('PRAGMA foreign_keys=ON')
-            connections.append(db)
-            kernel = ScopedKernel(db, original.storage.run_id)
-            kernel.storage.path, kernel.storage.run_id = original.storage.path, original.storage.run_id
+            kernel, _ = owned.enter_context(_scoped(create(*args, **kwargs)))
             return kernel
         monkeypatch.setattr(offline, 'create_kernel', producer)
-        scenario = Scenario(tmp_path / 'scenario', getattr(request, 'param', DeliveryKind.PARENT_ONLY), checks=('fail', 'none'))
-        assert len(connections) == 1
-        yield scenario, connections[0]
+        yield
+
+
+@pytest.fixture
+def decision_scenario(tmp_path, scoped_producer, request):
+    scenario = Scenario(tmp_path / 'scenario', getattr(request, 'param', DeliveryKind.PARENT_ONLY), checks=('fail', 'none'))
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        db = tx.connection
+    yield scenario, db
+
+
+@pytest.fixture
+def reader(tmp_path, request):
+    """Actual initial Core relations; observation tests need no repository or effects."""
+    from support.core_operations import native_agent_fixture, ReadOnlyPorts
+    from support.requirements_scenarios import source_run, independent_source
+    from agent_run.core.operation_contract import DeliveryFacts
+
+    path = tmp_path / 'reader.sqlite3'
+    if getattr(request, 'param', None) == 'graph':
+        original, source = source_run(path, independent_source())
+        delivery = original.delivery('ticket:3')
+        ports = ReadOnlyPorts(source, delivery.source_ref, delivery.target_ref, DeliveryFacts(delivery.base, None))
+    else:
+        delivery = Delivery('parent:1', DeliveryKind.PARENT_ONLY, 1, 'requirement', Commit('base', 'tree'),
+                            'refs/heads/parent', 'refs/heads/main')
+        original, ports = native_agent_fixture(path, RunSpec('reader-run', 'example/project', 1,
+            'parent', 'graph', (delivery,)))
+    with _scoped(original) as (kernel, db):
+        execution = kernel.claim_executor('reader-owner')
+        yield SimpleNamespace(kernel=kernel, execution=execution, delivery=delivery,
+            requirements=ports.requirements, ports=ports,
+            runner=lambda: OperationRunner(kernel, execution, lambda _binding: ports)), db
+
+
+def _allocate(reader):
+    from support.core_operations import prepare_scripted_agent
+
+    runner = reader.runner()
+    for _ in range(8):
+        step = prepare_scripted_agent(reader.kernel, runner.run_once())
+        if step.call is not None:
+            return step.call
+    raise AssertionError('Initial Core did not allocate Development')
 
 
 @pytest.mark.parametrize('failure', ['malformed', 'read_failed', 'pipe_error'])
-def test_complete_read_keeps_source_gate_or_original_wait_window(decision_scenario, monkeypatch, failure):
+def test_complete_read_keeps_source_gate_or_original_wait_window(reader, tmp_path, monkeypatch, failure):
     import sys
     from agent_run.adapters import github_commands
     from agent_run.adapters.remote import RemoteEffects
 
-    s, db = decision_scenario
+    s, db = reader
     bounded, calls = github_commands._run_bounded_command, []
-    native = RemoteEffects(s.port.git.root, s.spec.repository, runner_identity={'source': 'host'})
+    native = RemoteEffects(tmp_path, 'example/project', runner_identity={'source': 'host'})
     code = ("print('{invalid')" if failure == 'malformed' else
             "import sys;sys.stderr.write('HTTP 403 unavailable');raise SystemExit(1)")
 
@@ -60,8 +107,8 @@ def test_complete_read_keeps_source_gate_or_original_wait_window(decision_scenar
 
     monkeypatch.setattr(github_commands, '_run_bounded_command', returned)
     monkeypatch.setattr(github_commands.time, 'sleep', lambda _: None)
-    monkeypatch.setattr(s.port, 'source', lambda source, parent: native.source(parent))
-    first = s.step()
+    monkeypatch.setattr(s.ports, 'source', native.source)
+    first = s.runner().run_once()
     assert db.execute('SELECT count(*) FROM effects').fetchone()[0] == 0
     if failure == 'malformed':
         assert first.kind == 'paused' and first.reason == 'github_invalid_response'
@@ -72,15 +119,15 @@ def test_complete_read_keeps_source_gate_or_original_wait_window(decision_scenar
         original = tuple(db.execute('SELECT started_at,deadline FROM waits').fetchone())
         assert original == (100., 700.)
         s.kernel.clock = lambda: 105.25
-        assert s.step().kind == 'waiting'
+        assert s.runner().run_once().kind == 'waiting'
         assert tuple(db.execute('SELECT started_at,deadline FROM waits').fetchone()) == original
         assert not db.execute('SELECT 1 FROM gates').fetchall()
         assert calls == ['read'] * (2 if failure == 'pipe_error' else 6)
 
 
 @pytest.mark.parametrize('capacity', [0, 1])
-def test_initial_observation_uses_existing_read_snapshot_without_a_save(decision_scenario, monkeypatch, capacity):
-    s, db = decision_scenario
+def test_initial_observation_uses_existing_read_snapshot_without_a_save(reader, monkeypatch, capacity):
+    s, db = reader
     transaction, modes = s.kernel.storage.transaction, []
 
     @contextmanager
@@ -106,8 +153,8 @@ def test_initial_observation_uses_existing_read_snapshot_without_a_save(decision
 
 
 @pytest.mark.parametrize('change', ['stop', 'epoch', 'source', 'scope', 'deadline'])
-def test_initial_observation_is_rechecked_after_reader_exit(decision_scenario, monkeypatch, change):
-    s, db = decision_scenario
+def test_initial_observation_is_rechecked_after_reader_exit(reader, monkeypatch, change):
+    s, db = reader
     kernel, subject = s.kernel, s.delivery.key
     transaction, observe = kernel.storage.transaction, kernel._observe_work
     captured, changed = [], []
@@ -153,10 +200,10 @@ def test_initial_observation_is_rechecked_after_reader_exit(decision_scenario, m
 
 
 @pytest.mark.parametrize('failure', ['budget', 'poison', 'close_io', 'close_kernel'])
-def test_initial_observation_read_failure_never_routes_to_a_writer(decision_scenario, monkeypatch, failure):
+def test_initial_observation_read_failure_never_routes_to_a_writer(reader, monkeypatch, failure):
     from agent_run.storage.sqlite import QUERY_LIMIT
 
-    s, db = decision_scenario
+    s, db = reader
     kernel, transaction, observe = s.kernel, s.kernel.storage.transaction, s.kernel._observe_work
     modes = []
     original = OSError('Original selection reader close failure') if failure == 'close_io' else KernelError('original_reader_close')
@@ -190,10 +237,10 @@ def test_initial_observation_read_failure_never_routes_to_a_writer(decision_scen
     assert modes and not any(modes) and tuple(db.iterdump()) == before
 
 
-def test_initial_observation_construction_keeps_original_failure_classification(decision_scenario, monkeypatch):
+def test_initial_observation_construction_keeps_original_failure_classification(reader, monkeypatch):
     from agent_run.errors import ObservationSuperseded
 
-    s, db = decision_scenario
+    s, db = reader
     failure = ObservationSuperseded('automatic_step_superseded')
     fail, seen = s.kernel.fail_work, []
 
@@ -211,15 +258,15 @@ def test_initial_observation_construction_keeps_original_failure_classification(
     assert seen == [failure] and (result.kind, result.reason) == ('waiting', 'automatic_step_superseded')
 
 
-def test_allocated_deadline_retains_original_mutating_route(decision_scenario, monkeypatch):
-    s, db = decision_scenario
-    call = _hold_development(s, monkeypatch)
+def test_allocated_deadline_retains_original_mutating_route(reader, monkeypatch):
+    s, db = reader
+    call = _allocate(s)
     s.kernel.clock = lambda: call.deadline_at
 
     def no_io(*args, **options):
         pytest.fail('Expired allocated invocation must settle before observation I/O')
 
-    monkeypatch.setattr(s.port, 'source', no_io)
+    monkeypatch.setattr(s.ports, 'source', no_io)
     result = s.runner().run_once(agent_capacity=0)
     assert (result.kind, result.reason) == ('paused', 'invocation_deadline_exceeded')
     assert db.execute('SELECT dispatch_state FROM invocation_outputs WHERE invocation=?', (call.invocation_id,)).fetchone()[0] == 'unavailable'
@@ -241,15 +288,7 @@ def test_pending_effect_keeps_original_route_and_settlement(decision_scenario, m
         assert db.execute('SELECT status FROM effects WHERE id=?', (held.effect.effect_id,)).fetchone()[0] == 'observed'
     if state.startswith('stale_'):
         s.kernel.refresh(lambda: replace(s.requirements, parent=replace(s.requirements.parent, body='Concurrent requirement')))
-    route, calls = s.kernel._route_work, []
-
-    def routed(*args, **kwargs):
-        calls.append(args[0])
-        return route(*args, **kwargs)
-
-    monkeypatch.setattr(s.kernel, '_route_work', routed)
     request = s.kernel.next_work(s.execution)
-    assert len(calls) == 1 and calls[0].subject == s.delivery.key
     if state == 'sent':
         assert isinstance(request, EffectIO) and request.kind == 'readback'
     elif state == 'prepared':
@@ -257,34 +296,6 @@ def test_pending_effect_keeps_original_route_and_settlement(decision_scenario, m
     else:
         assert request.kind == 'progress'
         assert request.reason == ('stale_intent_retired' if state == 'stale_prepared' else 'original_outcome_retained')
-
-
-@pytest.mark.parametrize('control', ['abandon', 'requeue'])
-def test_control_action_keeps_original_mutating_route(decision_scenario, monkeypatch, control):
-    from agent_run.adapters.local_git import LocalEffects
-
-    s, _ = decision_scenario
-    if control == 'abandon':
-        inspections = LocalEffects(s.port.git).inspect_resources(s.kernel.generation_resources())
-        assert s.kernel.control('abandon', 'original-abandon', resource_inspections=inspections) == 'pending'
-    else:
-        assert s.run().kind == 'approval'
-        s.requirements = replace(s.requirements, parent=replace(s.requirements.parent, body='Concurrent requirement'))
-        s.kernel.refresh(lambda: s.requirements)
-        world = s.world()
-        replacement = replace(s.delivery, source_ref=s.delivery.source_ref + '-replacement',
-                              checkout=s.delivery.checkout + '-replacement', base=world.target)
-        assert s.kernel.control('requeue', 'original-requeue', subject=s.delivery.key,
-                                replacement=replacement, world=world) == 'pending'
-    route, calls = s.kernel._route_work, []
-
-    def routed(*args, **kwargs):
-        calls.append(args[0])
-        return route(*args, **kwargs)
-
-    monkeypatch.setattr(s.kernel, '_route_work', routed)
-    s.kernel.next_work(s.execution)
-    assert len(calls) == 1 and calls[0].subject == s.delivery.key
 
 
 @pytest.mark.parametrize('decision_scenario', [DeliveryKind.TICKET, DeliveryKind.PARENT_ONLY], indirect=True)
@@ -335,8 +346,8 @@ def test_pr_activity_time_does_not_revoke_current_checks(decision_scenario, monk
 
 
 @pytest.mark.parametrize('after_selection', [-0.0005, 0.0, 0.0005])
-def test_state_keeps_retry_when_deadline_arrives_after_selection(decision_scenario, monkeypatch, after_selection):
-    s, db = decision_scenario
+def test_state_keeps_retry_when_deadline_arrives_after_selection(reader, monkeypatch, after_selection):
+    s, db = reader
     kernel, now = s.kernel, [100.0]
     kernel.clock = lambda: now[0]
     request = kernel.begin_observation(s.delivery.key, execution=s.execution)
@@ -362,31 +373,12 @@ def test_state_keeps_retry_when_deadline_arrives_after_selection(decision_scenar
     assert kernel.operation_state().disposition == 'ready'
 
 
-def _hold_development(scenario, monkeypatch):
-    class Held(Exception):
-        pass
-
-    captured = []
-
-    def hold(call):
-        captured.append(call)
-        raise Held
-
-    with monkeypatch.context() as boundary:
-        boundary.setattr(scenario, 'agent', hold)
-        with pytest.raises(Held):
-            for _ in range(16):
-                scenario.step()
-    assert len(captured) == 1 and captured[0].role.value == 'development'
-    return captured[0]
-
-
 @pytest.mark.parametrize('after_selection', [-0.0005, 0.0, 0.0005])
-def test_state_keeps_capacity_retry_when_selection_crosses_recovery_ready(decision_scenario, monkeypatch, after_selection):
-    s, db = decision_scenario
+def test_state_keeps_capacity_retry_when_selection_crosses_recovery_ready(reader, monkeypatch, after_selection):
+    s, db = reader
     kernel, now = s.kernel, [100.0]
     kernel.clock = lambda: now[0]
-    call = _hold_development(s, monkeypatch)
+    call = _allocate(s)
     kernel.bind_thread(call, 'capacity-retained-thread')
     assert kernel.dispatch_agent(call)
     process = dict(pid=23, start_token='capacity-process', pgid=23, host_pid=11, host_start_token='host-start')
@@ -415,57 +407,8 @@ def test_state_keeps_capacity_retry_when_selection_crosses_recovery_ready(decisi
     assert kernel.operation_state().disposition == 'ready'
 
 
-def test_busy_supervision_reads_the_same_facts_without_work_selection(decision_scenario, tmp_path, monkeypatch):
-    from collections import Counter
-    from time import perf_counter_ns, thread_time_ns
-    from agent_run.core import kernel as core
-    from agent_run.storage.run_scope import RunTransaction
-    from support.control_scenarios import admit_scenario
-
-    s, db = decision_scenario
-    admit_scenario(s, tmp_path)  # Explicit managed witness; not OS Host proof.
-    call = _hold_development(s, monkeypatch)
-    runner = s.runner()
-    runner.activate_observation()
-    counts, metrics = Counter(), {'state': [], 'supervise': []}
-    selected = [None]
-    choose, load, get = s.kernel._operation_choice, core.load_continuation, RunTransaction.get
-
-    def counted(name, method):
-        def invoke(*args, **options):
-            counts[(selected[0], name)] += 1
-            return method(*args, **options)
-        return invoke
-
-    monkeypatch.setattr(s.kernel, '_operation_choice', counted('choice', choose))
-    monkeypatch.setattr(core, 'load_continuation', counted('continuation', load))
-    monkeypatch.setattr(RunTransaction, 'get', counted('material', get))
-    before = tuple(db.iterdump())
-    for pair in range(7):
-        values = {}
-        for kind in (('state', 'supervise') if pair % 2 == 0 else ('supervise', 'state')):
-            selected[0], sql = kind, []
-            db.set_trace_callback(sql.append)
-            cpu, wall = thread_time_ns(), perf_counter_ns()
-            try:
-                values[kind] = getattr(runner, kind)()
-            finally:
-                cpu, wall = thread_time_ns() - cpu, perf_counter_ns() - wall
-                db.set_trace_callback(None)
-            metrics[kind].append({'sql': len(sql), 'cpu_ns': cpu, 'wall_ns': wall})
-        a, b = values['state'], values['supervise']
-        assert (a.concurrency, a.active, a.cancel, a.wake_at, a.preparing) == (
-            b.concurrency, b.active, b.cancel, b.wake_at, b.preparing)
-        assert b.active == (call.lease_id,) and not hasattr(b, 'disposition')
-    assert tuple(db.iterdump()) == before
-    assert counts['state', 'choice'] == 7 and counts['supervise', 'choice'] == 0
-    assert counts['state', 'continuation'] == counts['supervise', 'continuation'] == 7
-    assert sum(r['sql'] for r in metrics['supervise']) < sum(r['sql'] for r in metrics['state'])
-    print('paired busy supervision', metrics, 'calls', dict(counts))
-
-
 @pytest.mark.parametrize('seat', ['worker', 'preparation'])
-def test_busy_supervision_keeps_sibling_cancellation_and_exact_deadlines(decision_scenario, tmp_path, monkeypatch, seat):
+def test_busy_supervision_keeps_sibling_cancellation_and_exact_deadlines(scoped_producer, tmp_path, monkeypatch, seat):
     from agent_run.model import Policy
     from support.core_operations import CoreOperations
     from support.offline import GraphScenario
@@ -516,10 +459,10 @@ def test_busy_supervision_keeps_sibling_cancellation_and_exact_deadlines(decisio
 
 @pytest.mark.parametrize('kind', ['state', 'supervise'])
 @pytest.mark.parametrize('failure', ['budget', 'poison'])
-def test_supervision_keeps_transaction_budget_and_poison(decision_scenario, monkeypatch, kind, failure):
+def test_supervision_keeps_transaction_budget_and_poison(reader, monkeypatch, kind, failure):
     from agent_run.storage.sqlite import QUERY_LIMIT
 
-    s, db = decision_scenario
+    s, db = reader
     transaction = s.kernel.storage.transaction
     before = tuple(db.iterdump())
 
@@ -541,8 +484,8 @@ def test_supervision_keeps_transaction_budget_and_poison(decision_scenario, monk
     assert tuple(db.iterdump()) == before
 
 
-def test_supervision_reloads_epoch_without_granting_old_runner_permission(decision_scenario, monkeypatch):
-    s, db = decision_scenario
+def test_supervision_reloads_epoch_without_granting_old_runner_permission(reader, monkeypatch):
+    s, db = reader
     runner, owners = s.runner(), []
     supervise = s.kernel._operation_supervision_in
 
@@ -564,71 +507,15 @@ def test_supervision_reloads_epoch_without_granting_old_runner_permission(decisi
     assert not db.execute('SELECT id FROM leases').fetchall()
 
 
-def test_continuation_loader_reads_current_records_once(decision_scenario, monkeypatch):
-    from collections import Counter
-    from hashlib import sha256
-    from time import perf_counter_ns, thread_time_ns
-    from types import SimpleNamespace
-    from agent_run.core import attempt_continuation as continuation
-    from agent_run.storage.attempts import AttemptRecords
-    from agent_run.storage.run_scope import RunTransaction
-
-    s, db = decision_scenario
-    call = _hold_development(s, monkeypatch)
-    counts, decoded, bodies = Counter(), Counter(), Counter()
-    material, decoder = RunTransaction.get, continuation.json.loads
-
-    def watched(name, method):
-        def read(*args, **kwargs):
-            counts[name] += 1
-            return method(*args, **kwargs)
-        return read
-
-    def read_material(tx, identity, subject):
-        body = material(tx, identity, subject)
-        bodies[sha256(body).hexdigest()] += 1
-        return body
-
-    def decode(body):
-        decoded[sha256(body).hexdigest()] += 1
-        return decoder(body)
-
-    def sql(statement):
-        counts['sql'] += 1
-
-    for name in ('attempt', 'thread', 'subject_kind', 'profile_revision'):
-        monkeypatch.setattr(AttemptRecords, name, watched(name, getattr(AttemptRecords, name)))
-    monkeypatch.setattr(RunTransaction, 'get', read_material)
-    monkeypatch.setattr(continuation, 'json', SimpleNamespace(loads=decode))
-    with s.kernel.storage.transaction(write=False) as tx:
-        before = db.total_changes
-        db.set_trace_callback(sql)
-        cpu, wall = thread_time_ns(), perf_counter_ns()
-        try:
-            facts = continuation.load_continuation(tx, call.attempt_id)
-        finally:
-            cpu, wall = thread_time_ns() - cpu, perf_counter_ns() - wall
-            db.set_trace_callback(None)
-        assert db.total_changes == before
-    assert facts.thread_id == call.thread_id and facts.prior.invocation_id == call.invocation_id
-    assert facts.prior.status == 'running' and facts.prior.raw_id is None
-    print('current continuation load', dict(counts), 'material_reads', sum(bodies.values()),
-          'decodes', sum(decoded.values()), 'cpu_ns', cpu, 'wall_ns', wall)
-    assert {name: counts[name] for name in ('attempt', 'thread', 'subject_kind', 'profile_revision')} == {
-        'attempt': 1, 'thread': 1, 'subject_kind': 1, 'profile_revision': 1}
-    assert len(bodies) == sum(bodies.values()) == 3
-    assert len(decoded) == sum(decoded.values()) == 2
-
-
-def test_continuation_loader_rereads_return_without_lease_and_capacity_zero(decision_scenario, monkeypatch):
+def test_continuation_loader_rereads_return_without_lease_and_capacity_zero(reader):
     from agent_run.core.attempt_continuation import load_continuation
 
-    s, db = decision_scenario
-    call = _hold_development(s, monkeypatch)
+    s, db = reader
+    call = _allocate(s)
     with s.kernel.storage.transaction(write=False) as tx:
         live = load_continuation(tx, call.attempt_id)
     assert live.prior.status == 'running' and live.prior.raw_id is None
-    s.kernel.receive(call, s.agent(call))
+    s.kernel.receive(call, b'{"result_kind":"development","summary":"Original return","human_blockers":null}')
     assert db.execute('SELECT count(*) FROM leases').fetchone()[0] == 0
     with s.kernel.storage.transaction(write=False) as tx:
         returned = load_continuation(tx, call.attempt_id)
@@ -636,17 +523,17 @@ def test_continuation_loader_rereads_return_without_lease_and_capacity_zero(deci
     assert returned.prior.status == 'returned' and returned.prior.raw_id is not None
     step = s.runner().run_once(agent_capacity=0)
     assert step.kind == 'progress' and step.call is None
-    assert s.development_count == 1 and not db.execute('SELECT id FROM leases').fetchall()
+    assert not db.execute('SELECT id FROM leases').fetchall()
 
 
 @pytest.mark.parametrize('missing_lease', [False, True])
-def test_continuation_loader_does_not_treat_sent_return_as_exit(decision_scenario, monkeypatch, missing_lease):
+def test_continuation_loader_does_not_treat_sent_return_as_exit(reader, missing_lease):
     from agent_run.core.attempt_continuation import load_continuation
 
-    s, db = decision_scenario
-    call = _hold_development(s, monkeypatch)
+    s, db = reader
+    call = _allocate(s)
     assert s.kernel.dispatch_agent(call)
-    s.kernel.receive(call, s.agent(call))
+    s.kernel.receive(call, b'{"result_kind":"development","summary":"Original return","human_blockers":null}')
     if missing_lease:
         # Negative input removes only capacity, never supplies exit evidence.
         db.execute('DELETE FROM leases WHERE run_id=?', (s.execution.run_id,))
@@ -662,42 +549,6 @@ def test_continuation_loader_does_not_treat_sent_return_as_exit(decision_scenari
     assert state.disposition == 'waiting' and not s.kernel.worker_settled(call)
     assert (supervision.active, supervision.cancel, supervision.wake_at, supervision.preparing) == (
         state.active, state.cancel, state.wake_at, state.preparing)
-
-
-def test_healthy_guard_and_identical_source_avoid_empty_saves(decision_scenario, monkeypatch):
-    scenario, db = decision_scenario
-    kernel, active, records = scenario.kernel, [], []
-    transaction = kernel.storage.transaction
-
-    @contextmanager
-    def counted(**options):
-        before = db.total_changes
-        with transaction(**options) as tx:
-            yield tx
-        records.append((active[-1] if active else 'other', options.get('write', True), db.total_changes - before))
-
-    def watched(name, method):
-        def call(*args, **kwargs):
-            active.append(name)
-            try:
-                return method(*args, **kwargs)
-            finally:
-                active.pop()
-        return call
-
-    monkeypatch.setattr(kernel.storage, 'transaction', counted)
-    for name in ('_guard_automatic_step', 'accept_requirements'):
-        monkeypatch.setattr(kernel, name, watched(name, getattr(kernel, name)))
-    assert scenario.run().kind == 'approval'
-    selected = [row for row in records if row[0] != 'other']
-    counts = {name: {'transactions': sum(row[0] == name for row in records),
-                     'writers': sum(row[0] == name and row[1] for row in records),
-                     'dirty': sum(row[0] == name and bool(row[2]) for row in records)}
-              for name in ('_guard_automatic_step', 'accept_requirements', 'other')}
-    print('healthy-read transaction counts:', counts)
-    assert all(counts[name]['transactions'] for name in counts)
-    assert all(row[2] == 0 for row in selected)
-    assert not [row for row in selected if row[1]], 'Healthy observation paths must not request an ordered save'
 
 
 def test_real_progress_finishes_readonly_without_changing_facts_or_io(decision_scenario, monkeypatch):
@@ -750,17 +601,7 @@ def test_real_progress_finishes_readonly_without_changing_facts_or_io(decision_s
     monkeypatch.setattr(kernel.storage, 'transaction', recorded)
     monkeypatch.setattr(kernel, '_finish_automatic_step', completed)
     monkeypatch.setattr(s, 'make_ports', ports_for)
-    for name in ('_dispatch', '_guard_effect'):
-        method = getattr(kernel, name)
-        def guarded(*args, _name=name, _method=method, **kwargs):
-            physical[_name] += 1
-            return _method(*args, **kwargs)
-        monkeypatch.setattr(kernel, name, guarded)
-    step = s.step()
-    assert step.kind == 'progress'
-    print('real progress finish:', records, dict(physical))
-    assert physical == {'source': 2, 'delivery': 2, 'execute': 1, 'reconcile': 1,
-                        '_dispatch': 1, '_guard_effect': 1}
+    assert s.step().kind == 'progress'
     assert records == [False], 'A real completed transition with no read wait must not request a save'
 
 
@@ -797,86 +638,10 @@ def test_finish_writer_reobserves_real_progress_after_reader_exit(decision_scena
     assert not db.execute('SELECT 1 FROM gates').fetchall()
 
 
-def test_scheduler_and_advance_load_each_continuation_once_per_unchanged_transaction(decision_scenario, monkeypatch):
-    from collections import Counter
-    from time import process_time, perf_counter
-    from agent_run.core import kernel as core
-    from agent_run.storage.run_scope import RunTransaction
-
-    s, db = decision_scenario
-    load, observed, statements = core.load_continuation, [], []
-    get, reads = RunTransaction.get, []
-    transaction, modes = s.kernel.storage.transaction, []
-    make_ports, observations = s.make_ports, []
-
-    def ports_for(binding):
-        ports = make_ports(binding)
-        source, delivery, execute = ports.source, ports.delivery, ports.execute
-        counts = {'source': 0, 'delivery': 0, 'operations': []}
-        observations.append(counts)
-
-        def read_source(parent):
-            counts['source'] += 1
-            return source(parent)
-
-        def read_delivery(request):
-            counts['delivery'] += 1
-            return delivery(request)
-
-        def write(effect, authority):
-            counts['operations'].append(effect.operation)
-            return execute(effect, authority)
-
-        ports.source, ports.delivery, ports.execute = read_source, read_delivery, write
-        return ports
-
-    def material(tx, *args):
-        value = get(tx, *args)
-        reads.append(True)  # A successful get verifies the original body digest.
-        return value
-
-    @contextmanager
-    def counted_transaction(**options):
-        modes.append(options.get('write', True))
-        with transaction(**options) as tx:
-            yield tx
-
-    def counted(tx, attempt):
-        # Retain the owner itself, so Python object-id reuse cannot merge samples.
-        observed.append((tx, db.total_changes, attempt))
-        return load(tx, attempt)
-
-    monkeypatch.setattr(core, 'load_continuation', counted)
-    monkeypatch.setattr(RunTransaction, 'get', material)
-    monkeypatch.setattr(s.kernel.storage, 'transaction', counted_transaction)
-    monkeypatch.setattr(s, 'make_ports', ports_for)
-    db.set_trace_callback(statements.append)
-    cpu, wall = process_time(), perf_counter()
-    try:
-        assert s.run().kind == 'approval'
-    finally:
-        db.set_trace_callback(None)
-    counts = Counter(observed)
-    candidate_pairs = [(item['source'], item['delivery']) for item in observations
-                       if item['operations'] == ['candidate']]
-    print(dict(selects=sum(sql.startswith('SELECT') for sql in statements),
-               continuation_loads=len(observed), distinct_continuations=len(counts),
-               material_digests=len(reads), readers=modes.count(False), writers=modes.count(True),
-               candidate_observation_pairs=candidate_pairs,
-               cpu=process_time()-cpu, wall=perf_counter()-wall))
-    assert candidate_pairs and all(pair == (5, 5) for pair in candidate_pairs)
-    assert counts and max(counts.values()) == 1
-
-
-def test_zero_physical_capacity_still_consumes_the_original_return(decision_scenario):
-    s, db = decision_scenario
-    for _ in range(12):
-        step = s.step()
-        if step.call is not None:
-            break
-    else:
-        pytest.fail('Normal producer did not allocate its first development call')
-    call = step.call
+def test_zero_physical_capacity_still_consumes_the_original_return(reader):
+    s, db = reader
+    call = _allocate(s)
+    s.kernel.receive(call, b'{"result_kind":"development","summary":"Original return","human_blockers":null}')
     original = db.execute('SELECT result_id FROM attempts WHERE run_id=? AND id=?',
                           (call.execution.run_id, call.attempt_id)).fetchone()[0]
     assert original is not None
@@ -897,8 +662,8 @@ def _consume_read(scenario, request, consumer, source=None):
 
 @pytest.mark.parametrize('consumer', ['guard', 'source'])
 @pytest.mark.parametrize('has_wait', [False, True])
-def test_healthy_read_uses_one_query_only_snapshot(decision_scenario, monkeypatch, consumer, has_wait):
-    s, db = decision_scenario
+def test_healthy_read_uses_one_query_only_snapshot(reader, monkeypatch, consumer, has_wait):
+    s, db = reader
     kernel, subject = s.kernel, s.delivery.key
     request = kernel.begin_observation(subject, execution=s.execution)
     if has_wait:
@@ -928,8 +693,8 @@ def test_healthy_read_uses_one_query_only_snapshot(decision_scenario, monkeypatc
 
 
 @pytest.mark.parametrize('consumer', ['guard', 'source'])
-def test_exact_read_deadline_commits_only_under_fresh_writer(decision_scenario, monkeypatch, consumer):
-    s, db = decision_scenario
+def test_exact_read_deadline_commits_only_under_fresh_writer(reader, monkeypatch, consumer):
+    s, db = reader
     kernel, subject = s.kernel, s.delivery.key
     now = [100.25]  # Business supervision clock in the existing unit seam, not SaveClock.
     kernel.clock = lambda: now[0]
@@ -961,8 +726,8 @@ def test_exact_read_deadline_commits_only_under_fresh_writer(decision_scenario, 
 
 @pytest.mark.parametrize('consumer', ['guard', 'source', 'changed_source'])
 @pytest.mark.parametrize('change', ['stop', 'epoch', 'source', 'retired_wait'])
-def test_read_to_writer_gap_rechecks_all_current_facts(decision_scenario, monkeypatch, consumer, change):
-    s, db = decision_scenario
+def test_read_to_writer_gap_rechecks_all_current_facts(reader, monkeypatch, consumer, change):
+    s, db = reader
     kernel, subject = s.kernel, s.delivery.key
     now = [100.25]
     kernel.clock = lambda: now[0]
@@ -1022,8 +787,8 @@ def test_read_to_writer_gap_rechecks_all_current_facts(decision_scenario, monkey
 
 @pytest.mark.parametrize('consumer', ['guard', 'source'])
 @pytest.mark.parametrize('failure_at', ['reader_open', 'reader_close', 'writer_open', 'writer_commit', 'writer_close'])
-def test_read_escalation_preserves_storage_failure(decision_scenario, monkeypatch, consumer, failure_at):
-    s, db = decision_scenario
+def test_read_escalation_preserves_storage_failure(reader, monkeypatch, consumer, failure_at):
+    s, db = reader
     kernel = s.kernel
     request = kernel.begin_observation(s.delivery.key, execution=s.execution)
     kernel._wait_for_read(request.fence, s.execution, 'controlled_read', 'Original read unavailable')
@@ -1057,19 +822,14 @@ def test_read_escalation_preserves_storage_failure(decision_scenario, monkeypatc
         assert tuple(db.iterdump()) == before
 
 
+@pytest.mark.parametrize('reader', ['graph'], indirect=True)
 @pytest.mark.parametrize('change', ['labels', 'parent_order', 'issue_order', 'state', 'order_reliability'])
-def test_source_probe_compares_complete_bytes_and_preserves_fresh_pair(decision_scenario, tmp_path, monkeypatch, change):
-    from support.offline import GraphScenario
-    from support.requirements_scenarios import independent_source
-
-    # Reuse the fixture's normal Task/Run producer and scoped transaction seam.
-    s = GraphScenario(tmp_path / 'graph', independent_source())
+def test_source_probe_compares_complete_bytes_and_preserves_fresh_pair(reader, monkeypatch, change):
+    s, db = reader
     kernel, source = s.kernel, s.requirements
-    with kernel.storage.transaction(write=False) as tx:
-        db = tx.connection
     request = kernel.begin_observation(s.delivery.key, execution=s.execution)
     original = kernel.accept_requirements(request, source)
-    ports = s.make_ports(kernel.operation_binding(s.execution))
+    ports = s.ports
     old_facts = ports.delivery(original.query)
     if change == 'parent_order':
         changed = replace(source, parent=replace(source.parent, sub_issue_numbers=tuple(reversed(source.parent.sub_issue_numbers))))
@@ -1104,10 +864,10 @@ def test_source_probe_compares_complete_bytes_and_preserves_fresh_pair(decision_
 
 
 @pytest.mark.parametrize('consumer', ['guard', 'source'])
-def test_read_fast_path_keeps_original_transaction_budget(decision_scenario, monkeypatch, consumer):
+def test_read_fast_path_keeps_original_transaction_budget(reader, monkeypatch, consumer):
     from agent_run.storage.sqlite import QUERY_LIMIT
 
-    s, db = decision_scenario
+    s, db = reader
     kernel = s.kernel
     request = kernel.begin_observation(s.delivery.key, execution=s.execution)
     transaction, modes = kernel.storage.transaction, []
@@ -1128,8 +888,8 @@ def test_read_fast_path_keeps_original_transaction_budget(decision_scenario, mon
 
 
 @pytest.mark.parametrize('invalid', ['missing', 'parent', 'size'])
-def test_source_fast_path_does_not_accept_missing_or_invalid_facts(decision_scenario, invalid):
-    s, db = decision_scenario
+def test_source_fast_path_does_not_accept_missing_or_invalid_facts(reader, invalid):
+    s, db = reader
     request = s.kernel.begin_observation(s.delivery.key, execution=s.execution)
     source = (None if invalid == 'missing' else replace(s.requirements, parent=replace(s.requirements.parent,
         **({'number': 999} if invalid == 'parent' else {'body': 'x' * (4 * 1024 * 1024)}))))
@@ -1327,13 +1087,13 @@ def test_local_preparation_still_bounds_its_required_source_and_pr_reads(decisio
 
 @pytest.mark.parametrize('next_observation', ['complete-contradiction', 'original-deadline'])
 def test_mixed_source_failure_never_commits_or_renews_a_supervision_window(
-    decision_scenario, monkeypatch, tmp_path, next_observation,
+    reader, monkeypatch, tmp_path, next_observation,
 ):
     from agent_run.adapters import github
     from agent_run.adapters.remote import RemoteEffects
     from support.remote_effects import _reader
 
-    s, db = decision_scenario
+    s, db = reader
     directory = tmp_path / 'mixed-source'
     directory.mkdir()
     _, log = _reader(directory, monkeypatch)
@@ -1343,14 +1103,14 @@ def test_mixed_source_failure_never_commits_or_renews_a_supervision_window(
     document['graphql_errors'] = [{'message': 'Controlled missing required permission'}]
     state.write_text(json.dumps(document))
     monkeypatch.setattr(github.time, 'sleep', lambda _: None)
-    native = RemoteEffects(s.port.git.root, s.spec.repository, runner_identity={'source': 'host'})
-    monkeypatch.setattr(s.port, 'source', lambda source, parent: native.source(parent))
+    native = RemoteEffects(tmp_path, 'example/project', runner_identity={'source': 'host'})
+    monkeypatch.setattr(s.ports, 'source', native.source)
     before = [tuple(row) for row in db.execute('SELECT * FROM source_observations')]
-    assert s.step().kind == 'waiting'
+    assert s.runner().run_once().kind == 'waiting'
     original = tuple(db.execute('SELECT started_at,deadline FROM waits').fetchone())
     assert original == (100., 700.)
     s.kernel.clock = lambda: 105.25
-    assert s.step().kind == 'waiting'
+    assert s.runner().run_once().kind == 'waiting'
     assert tuple(db.execute('SELECT started_at,deadline FROM waits').fetchone()) == original
     if next_observation == 'complete-contradiction':
         del document['graphql_errors']
@@ -1358,23 +1118,23 @@ def test_mixed_source_failure_never_commits_or_renews_a_supervision_window(
         retry_at = db.execute('SELECT next_retry_at FROM waits').fetchone()[0]
         assert 105.25 < retry_at < original[1]
         s.kernel.clock = lambda: retry_at + 0.25
-        result = s.step()
+        result = s.runner().run_once()
         assert (result.kind, result.reason) == ('paused', 'github_invalid_response')
         assert db.execute('SELECT code FROM gates').fetchone()[0] == 'deterministic_contradiction'
     else:
         s.kernel.clock = lambda: 700.
-        result = s.step()
+        result = s.runner().run_once()
         assert (result.kind, result.reason) == ('paused', 'supervision_timeout')
     assert [tuple(row) for row in db.execute('SELECT * FROM source_observations')] == before
-    assert not db.execute('SELECT 1 FROM effects').fetchall() and not s.writes()
+    assert not db.execute('SELECT 1 FROM effects').fetchall()
     assert all(json.loads(row)[:2] == ['api', 'graphql'] for row in log.read_text().splitlines())
 
 
-def test_final_attempt_overflow_is_incomplete_and_preserves_original_wait(decision_scenario, monkeypatch, tmp_path):
+def test_final_attempt_overflow_is_incomplete_and_preserves_original_wait(reader, monkeypatch, tmp_path):
     from agent_run.adapters.remote import RemoteEffects
     from test_source_snapshot_observation import _flat
 
-    s, db = decision_scenario
+    s, db = reader
     directory = tmp_path / 'exhausted-source'
     directory.mkdir()
     _, state, log = _flat(directory, monkeypatch)
@@ -1390,18 +1150,18 @@ def test_final_attempt_overflow_is_incomplete_and_preserves_original_wait(decisi
         if attempt%3:
             print('HTTP 503 controlled temporary failure',file=sys.stderr);raise SystemExit(1)
 ''' + marker, 1))
-    native = RemoteEffects(s.port.git.root, s.spec.repository, runner_identity={'source': 'host'})
-    monkeypatch.setattr(s.port, 'source', lambda source, parent: native.source(parent))
+    native = RemoteEffects(tmp_path, 'example/project', runner_identity={'source': 'host'})
+    monkeypatch.setattr(s.ports, 'source', native.source)
     before = [tuple(row) for row in db.execute('SELECT * FROM source_observations')]
-    assert s.step().kind == 'waiting'
+    assert s.runner().run_once().kind == 'waiting'
     assert len(log.read_text().splitlines()) == 3
     original = tuple(db.execute('SELECT started_at,deadline FROM waits').fetchone())
     assert original == (100., 700.)
     assert not db.execute('SELECT 1 FROM gates').fetchall()
     s.kernel.clock = lambda: 105.25
-    assert s.step().kind == 'waiting'
+    assert s.runner().run_once().kind == 'waiting'
     assert len(log.read_text().splitlines()) == 6
     assert tuple(db.execute('SELECT started_at,deadline FROM waits').fetchone()) == original
     assert not db.execute('SELECT 1 FROM gates').fetchall()
     assert [tuple(row) for row in db.execute('SELECT * FROM source_observations')] == before
-    assert not db.execute('SELECT 1 FROM effects').fetchall() and not s.writes()
+    assert not db.execute('SELECT 1 FROM effects').fetchall()

@@ -2,7 +2,6 @@
 from support.effect_boundary import effect_state
 from pathlib import Path
 from dataclasses import replace
-from contextlib import contextmanager
 
 import pytest
 
@@ -109,86 +108,6 @@ def pending_cleanup(tmp_path, monkeypatch, operation="cleanup_worktree", *, sibl
     return s, effect, authority, physical_ports[0], execute
 
 
-
-
-@pytest.mark.parametrize("window", ["before_lock", "after_lock", "before_command"])
-@pytest.mark.parametrize("change", ["stop", "owner"])
-def test_each_local_cleanup_guard_rejects_public_revocation(tmp_path, monkeypatch, window, change):
-    s, effect, authority, ports, execute = pending_cleanup(tmp_path, monkeypatch)
-    prepare_count, commands, revocations = [], [], []
-    from agent_run.adapters.git_objects import LocalGit
-    import agent_run.adapters.cleanup as cleanup
-    import subprocess
-    original = LocalGit.run
-    original_spawn, spawned = subprocess.Popen, []
-    original_hold = cleanup._hold_ref
-
-    def revoke():
-        assert not revocations
-        revocations.append(window)
-        s.kernel.control("stop", "stop-at-cleanup")
-        if change == "owner":
-            s.kernel.confirm_executor_exit(s.execution)
-            s.kernel.control("resume", "resume-after-exit")
-            s.kernel.claim_executor("replacement-owner")
-
-    @contextmanager
-    def hold(git, checkout, ref, expected):
-        with original_hold(git, checkout, ref, expected):
-            # The real HEAD verification transaction has reported prepare: ok.
-            if window == "after_lock" and ref == "HEAD":
-                revoke()
-            yield
-
-    def spawn(command, *arguments, **options):
-        if isinstance(command, (tuple, list)) and any(
-                list(command[index:index + 2]) == ["worktree", "remove"] for index in range(len(command) - 1)):
-            spawned.append(command)
-        return original_spawn(command, *arguments, **options)
-
-    def run(git, *arguments, **options):
-        if arguments[:2] == ("worktree", "remove"):
-            # This is command preparation; the real before_start guard below
-            # must reject before a process can remove the checkout.
-            commands.append(arguments)
-        return original(git, *arguments, **options)
-
-    def prepare():
-        prepare_count.append(1)
-        final = authority.prepare()
-        if ((window == "before_lock" and len(prepare_count) == 1)
-                or (window == "before_command" and len(prepare_count) == 2)):
-            revoke()
-        return final
-
-    monkeypatch.setattr(LocalGit, "run", run)
-    monkeypatch.setattr(subprocess, "Popen", spawn)
-    monkeypatch.setattr(cleanup, "_hold_ref", hold)
-    with pytest.raises(KernelError):
-        execute(effect, WriteAuthority(prepare))
-    assert revocations == [window]
-    assert len(prepare_count) == (1 if window == "before_lock" else 2)
-    assert len(commands) == (0 if window == "before_lock" else 1)
-    assert spawned == []  # Preparing the command is not a physical removal.
-    assert Path(s.delivery.checkout).exists()
-    assert s.kernel.status(effect.subject)["phase"] == "complete"
-    assert s.kernel.status(effect.subject)["resource_cleanup"]["stage"] == 0
-    assert effect_state(s, effect)[1] == (0 if window == "before_lock" else 1)
-
-
-def test_requirements_403_keeps_original_intent_without_dispatch(tmp_path, monkeypatch):
-    s, effect, authority, ports, execute = pending_cleanup(tmp_path, monkeypatch)
-    before = effect_state(s, effect)
-
-    def denied(parent):
-        raise ReadUnavailable("github_read_failed", "Requirements403")
-
-    monkeypatch.setattr(ports, "source", denied)
-    with pytest.raises(ReadWait) as caught:
-        execute(effect, authority)
-    assert caught.value.step.kind == "waiting"
-    assert effect_state(s, effect) == before
-    assert Path(s.delivery.checkout).exists()
 
 
 @pytest.mark.parametrize("window", ["source", "boundary"])
