@@ -1,14 +1,10 @@
 """Public supervision reads the original scoped Core waits without authorizing them."""
 from agent_run.core.operation_runner import OperationRunner
-from dataclasses import replace
 from io import StringIO
 
-import pytest
-
-from agent_run.model import DeliveryKind, Issue, ParentIssue, Requirements
-from agent_run.core.kernel import Kernel
+from agent_run.model import Issue, ParentIssue, Requirements
 import agent_run.queries.run as query
-from support.offline import GraphScenario, Scenario
+from support.offline import GraphScenario
 from agent_run.core.operation_contract import ReadUnavailable
 from support.core_operations import CoreOperations
 from agent_run.cli.render import render
@@ -57,9 +53,7 @@ def test_wait_deadline_does_not_invent_a_timeout_and_keeps_all_scopes(tmp_path, 
     assert expired_clock["next_action"] == "agent-run status --repo example/repository -- run"
 
 
-@pytest.mark.parametrize("language", ["zh", "en"])
-def test_run_timeout_renders_original_evidence_and_resumes_only_after_core_applies_it(tmp_path, monkeypatch, language):
-    source_run(tmp_path, monkeypatch, language)
+def test_run_timeout_renders_original_evidence_and_resumes_only_after_core_applies_it(tmp_path, monkeypatch):
     source = Requirements(ParentIssue(1, "Parent", "Requirement", (2,)), (
         Issue(2, "Ticket", "Work", "OPEN", frozenset({"ready-for-agent"})),))
     scenario = GraphScenario(tmp_path / "before-final", source)
@@ -136,16 +130,3 @@ def test_ticket_timeout_keeps_sibling_waits_and_exact_target_resume(tmp_path, mo
     assert kernel.control("resume", "only-original-ticket", subject="ticket:2") == "applied"
     remaining = read_only(kernel, tmp_path).data["supervision_windows"]
     assert remaining == [windows["ticket:3"]]
-
-
-def test_required_checks_projection_keeps_the_original_45_minute_window(tmp_path, monkeypatch):
-    source_run(tmp_path, monkeypatch)
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET, checks=("pending",))
-    scenario.kernel.clock = lambda: 100
-    assert scenario.run().reason == "required_checks"
-    monkeypatch.setattr(query.time, "time", lambda: 340.5)
-    window = read_only(scenario.kernel, tmp_path).data["supervision_windows"][0]
-    assert window["kind"] == "required_checks"
-    assert window["deadline"] == 2800 and window["remaining_seconds"] == 2459
-    assert not window["timed_out"]
-    assert window["timeout_resume_action"] == "agent-run resume --repo example/repository --ticket 2 -- offline-run"

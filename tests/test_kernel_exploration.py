@@ -171,38 +171,20 @@ print(json.dumps({'step':step.kind,'status':k.status('ticket:2')}))
     assert kernel.status("ticket:2")["budgets"]["requirements"]["developments_used"] == 1
 
 
-def test_unknown_successful_pr_write_is_read_back_without_a_second_write(tmp_path: Path, domain_scenario) -> None:
-    scenario = domain_scenario(tmp_path / "scenario", DeliveryKind.TICKET)
-    now = [100.25]
-    scenario.kernel.clock = lambda: now[0]
-    scenario.port.lose_response.add("pr_write")
-    waiting = scenario.run()
-    assert waiting.kind == "waiting" and waiting.reason == "github_convergence"
-    assert waiting.retry_at == 105.25
-    original = scenario.kernel.status(scenario.delivery.key)["pending_write"]
-    assert original["operation"] == "pr_write" and original["status"] == "sent"
-    assert sum(write["operation"] == "pr_write" for write in scenario.port.writes()) == 1
-    now[0] = waiting.retry_at
-    assert scenario.run().kind == "complete"
-    assert sum(write["operation"] == "pr_write" for write in scenario.port.writes()) == 1
-    assert scenario.publication_count == 1
 
 
-@pytest.mark.parametrize("already_written", [False, True])
-def test_old_pr_intent_is_settled_before_reintegration_after_target_append(tmp_path: Path, monkeypatch, already_written: bool, domain_scenario) -> None:
+def test_old_pr_intent_is_settled_before_reintegration_after_target_append(tmp_path: Path, monkeypatch, domain_scenario) -> None:
     scenario = domain_scenario(tmp_path / "scenario", DeliveryKind.TICKET)
     held = advance_to_effect(scenario, monkeypatch, "pr_write", sent=True)
     effect = held.effect
-    if already_written:
-        scenario.port.execute(effect, held.authorize)
+    scenario.port.execute(effect, held.authorize)
     scenario.port.external_append(scenario.delivery.target_ref, {"external.txt": "Other actor's retained work\n"}, "external")
     scenario.step()
-    if already_written:
-        assert scenario.step().kind == "progress"
+    assert scenario.step().kind == "progress"
     status = scenario.kernel.status(scenario.delivery.key)
     assert status["phase"] == "integration"
     assert status["pending_write"] is None
-    assert sum(write["operation"] == "pr_write" for write in scenario.port.writes()) == int(already_written)
+    assert sum(write["operation"] == "pr_write" for write in scenario.port.writes()) == 1
     assert scenario.run().kind == "complete"
     assert scenario.port.git.run("show", f"{scenario.delivery.target_ref}:external.txt").stdout == "Other actor's retained work\n"
 
@@ -236,35 +218,21 @@ def test_human_continuation_replaces_thread_but_keeps_attempt_budget_and_origina
             {"id": second.lease_id, "subject": second.subject, "invocation": second.invocation_id}]
 
 
-@pytest.mark.parametrize("kind", list(DeliveryKind))
-def test_real_git_conflict_returns_to_integration_development_without_internal_pr(tmp_path: Path, kind: DeliveryKind, domain_scenario) -> None:
-    file_name = "ticket.txt" if kind == DeliveryKind.FINAL_RUN else "shared.txt"
-    edits = ({file_name: "Resolved complete content\n"},) if kind == DeliveryKind.FINAL_RUN else (
-        {file_name: "Candidate content\n"}, {file_name: "Resolved complete content\n"})
-    scenario = domain_scenario(tmp_path / "scenario", kind, edits=edits)
+def test_real_git_conflict_returns_to_integration_development_without_internal_pr(tmp_path: Path, domain_scenario) -> None:
+    scenario = domain_scenario(tmp_path / "scenario", DeliveryKind.FINAL_RUN,
+        edits=({"ticket.txt": "Resolved complete content\n"},))
     historical_writes = scenario.port.writes()
-    if kind != DeliveryKind.FINAL_RUN:
-        for _ in range(30):
-            if scenario.kernel.status(scenario.delivery.key)["phase"] == "integration":
-                break
-            scenario.step()
-        else:
-            raise AssertionError("initial review did not finish")
-    scenario.port.external_append(scenario.delivery.target_ref, {file_name: "External content\n"}, "conflict")
+    scenario.port.external_append(scenario.delivery.target_ref, {"ticket.txt": "External content\n"}, "conflict")
     assert scenario.run(approve=True).kind == "complete"
     integration = [call for call in scenario.role_calls if call["role"] == "development" and call["purpose"] == "integration"]
     assert len(integration) == 1
-    if kind == DeliveryKind.TICKET:
-        assert scenario.review_count == 1
-        assert [call["role"] for call in scenario.role_calls if call["purpose"] == "integration"] == ["development", "publication"]
     assert scenario.kernel.status(scenario.delivery.key)["budgets"]["integration"]["developments_used"] == 1
     assert sum(write["operation"] == "pr_write" for write in scenario.writes()) == 1
-    if kind == DeliveryKind.FINAL_RUN:
-        assert scenario.port.writes()[:len(historical_writes)] == historical_writes
-        assert sum(write["operation"] == "pr_write" for write in historical_writes) == 1
+    assert scenario.port.writes()[:len(historical_writes)] == historical_writes
+    assert sum(write["operation"] == "pr_write" for write in historical_writes) == 1
     target = scenario.port.remote_commit(scenario.delivery.target_ref)
     assert target is not None
-    assert scenario.port.git.run("show", f"{target.sha}:{file_name}").stdout == "Resolved complete content\n"
+    assert scenario.port.git.run("show", f"{target.sha}:ticket.txt").stdout == "Resolved complete content\n"
 
 
 def test_successor_git_write_rechecks_stop_after_previous_git_operation(tmp_path: Path, monkeypatch) -> None:

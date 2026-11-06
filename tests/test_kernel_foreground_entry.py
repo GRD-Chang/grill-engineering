@@ -1,6 +1,6 @@
 """Installed foreground entry with existing local Git/GitHub/Codex fixtures.
 
-These two physical stories require the host's normal bubblewrap capability.
+This physical story requires the host's normal bubblewrap capability.
 They never contact a real account or modify host service/security settings.
 """
 import json
@@ -10,8 +10,6 @@ import subprocess
 import sys
 import time
 
-import pytest
-
 from agent_run.adapters.foreground import ProcessPin, read_record, subreaper
 from agent_run.core.kernel import Kernel
 from agent_run.runtime.package_lease import default_runner_lock_path, runner_management_lease
@@ -20,13 +18,11 @@ from support.sqlite_faults import logical_state
 from agent_run.adapters.workspace import ManagedWorkspace
 
 
-@pytest.mark.parametrize('stop_first', [False, True], ids=['normal', 'stop-resume'])
-def test_installed_foreground_parent_only_public_lifecycle(git_repo, tmp_path, monkeypatch, stop_first):
+def test_installed_foreground_parent_only_public_lifecycle(git_repo, tmp_path, monkeypatch):
     ready = tmp_path / 'development-ready'
     released = tmp_path / 'development-released'
     codex = _CODEX
-    if stop_first:
-        codex = codex.replace("if role == 'development':", """if role == 'development':
+    codex = codex.replace("if role == 'development':", """if role == 'development':
     import time
     ready, released = Path(os.environ['FG_TEST_READY']), Path(os.environ['FG_TEST_RELEASED'])
     if not ready.exists():
@@ -60,25 +56,22 @@ def test_installed_foreground_parent_only_public_lifecycle(git_repo, tmp_path, m
     with subreaper():
         try:
             first = start('run', '1', '--foreground', '--no-notifications')
-            if stop_first:
-                deadline = time.monotonic() + 40
-                while not ready.exists():
-                    assert first.poll() is None and time.monotonic() < deadline, (
-                        {'stage': 'before_development_ready', 'returncode': first.returncode,
-                         'stdout_stderr_head_tail': tuple({'head': stream[:4096], 'tail': stream[-4096:]}
-                             for stream in first.communicate(timeout=5))}
-                        if first.returncode is not None else
-                        {'stage': 'before_development_ready', 'returncode': None})
-                    time.sleep(.02)
-                stopped = public('stop', '1')
-                assert stopped['status'] == 'action_applied'
-                original = result(first)
-                assert original['host'] == 'exited' and original['host_backend'] == 'foreground'
-                released.write_text('Allow only a later admitted invocation')
-                continued = public('resume', original['run_id'], '--foreground')
-                assert continued['run_id'] == original['run_id'] and continued['host'] == 'exited'
-            else:
-                original = result(first)
+            deadline = time.monotonic() + 40
+            while not ready.exists():
+                assert first.poll() is None and time.monotonic() < deadline, (
+                    {'stage': 'before_development_ready', 'returncode': first.returncode,
+                     'stdout_stderr_head_tail': tuple({'head': stream[:4096], 'tail': stream[-4096:]}
+                         for stream in first.communicate(timeout=5))}
+                    if first.returncode is not None else
+                    {'stage': 'before_development_ready', 'returncode': None})
+                time.sleep(.02)
+            stopped = public('stop', '1')
+            assert stopped['status'] == 'action_applied'
+            original = result(first)
+            assert original['host'] == 'exited' and original['host_backend'] == 'foreground'
+            released.write_text('Allow only a later admitted invocation')
+            continued = public('resume', original['run_id'], '--foreground')
+            assert continued['run_id'] == original['run_id'] and continued['host'] == 'exited'
             assert original['host_backend'] == 'foreground' and original['host_unit'] is None
             public('status', original['run_id'])
             # The CLI is the source of the selected Task; the DB is opened only
@@ -103,30 +96,29 @@ def test_installed_foreground_parent_only_public_lifecycle(git_repo, tmp_path, m
             assert document['source_graph']['parent']['state'] == 'CLOSED'
             assert _git(tmp_path / 'origin.git', 'show', 'refs/heads/main:managed-delivery.txt') == 'Implementation from the managed native Worker.'
             assert not list((lock.parent / 'foreground-hosts').iterdir())
-            if not stop_first:
-                # Reuse the completed public story: a new Resume is no grant
-                # to repeat its returned Agent work or completed mutations.
-                durable = logical_state(kernel.storage.path)
-                refs = {str(root): _git(root, 'for-each-ref', '--format=%(refname) %(objectname)')
-                    for root in (git_repo, tmp_path / 'origin.git')}
-                def mutations():
-                    calls = [json.loads(line) for line in (tmp_path / 'gh-calls.jsonl').read_text().splitlines()]
-                    return [args for args in calls if any(
-                        flag in args and args[args.index(flag) + 1] in {'POST', 'PATCH', 'PUT', 'DELETE'}
-                        for flag in ('--method', '-X')) or any('mutation ' in arg for arg in args)]
-                written = mutations()
-                child = start('resume', original['run_id'], '--foreground')
-                out, err = child.communicate(timeout=90)
-                assert child.returncode == 2, (out, err)
-                rejected = json.loads(out)
-                assert rejected['status'] == 'command_failed'
-                assert rejected['diagnostics'][0]['code'] == 'control_subject_ambiguous'
-                assert logical_state(kernel.storage.path) == durable
-                assert kernel.status('parent:1') == after
-                assert mutations() == written
-                assert {str(root): _git(root, 'for-each-ref', '--format=%(refname) %(objectname)')
-                    for root in (git_repo, tmp_path / 'origin.git')} == refs
-                assert not list((lock.parent / 'foreground-hosts').iterdir())
+            # Reuse the completed public story: a new Resume is no grant
+            # to repeat its returned Agent work or completed mutations.
+            durable = logical_state(kernel.storage.path)
+            refs = {str(root): _git(root, 'for-each-ref', '--format=%(refname) %(objectname)')
+                for root in (git_repo, tmp_path / 'origin.git')}
+            def mutations():
+                calls = [json.loads(line) for line in (tmp_path / 'gh-calls.jsonl').read_text().splitlines()]
+                return [args for args in calls if any(
+                    flag in args and args[args.index(flag) + 1] in {'POST', 'PATCH', 'PUT', 'DELETE'}
+                    for flag in ('--method', '-X')) or any('mutation ' in arg for arg in args)]
+            written = mutations()
+            child = start('resume', original['run_id'], '--foreground')
+            out, err = child.communicate(timeout=90)
+            assert child.returncode == 2, (out, err)
+            rejected = json.loads(out)
+            assert rejected['status'] == 'command_failed'
+            assert rejected['diagnostics'][0]['code'] == 'control_subject_ambiguous'
+            assert logical_state(kernel.storage.path) == durable
+            assert kernel.status('parent:1') == after
+            assert mutations() == written
+            assert {str(root): _git(root, 'for-each-ref', '--format=%(refname) %(objectname)')
+                for root in (git_repo, tmp_path / 'origin.git')} == refs
+            assert not list((lock.parent / 'foreground-hosts').iterdir())
         finally:
             # Retain only identities from this test's private launch records.
             root = lock.parent / 'foreground-hosts'

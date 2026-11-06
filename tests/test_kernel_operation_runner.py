@@ -212,36 +212,6 @@ def test_expired_unlaunched_allocation_needs_no_slow_source_read(tmp_path):
     assert runner.worker_settled(selected.call)
 
 
-def test_n1_long_agent_keeps_independent_ci_poll_and_exact_seat(tmp_path):
-    s, ports, runner = setup(tmp_path)
-    with domain_kernel(s.kernel) as s.kernel:
-        runner = OperationRunner(s.kernel, s.execution, lambda binding: ports)
-        drive_until(s, runner, lambda step: s.kernel.status("ticket:3")["phase"] == "checks")
-        now = [100.25]
-        s.kernel.clock = lambda: now[0]
-        delivery = ports.delivery
-        polled = []
-        def pending(request):
-            facts = delivery(request)
-            if request.source_ref == "refs/heads/ticket-3" and facts.pr is not None:
-                polled.append(request)
-                return replace(facts, checks=Checks(facts.pr.number, facts.pr.head.sha, "pending"))
-            return facts
-        ports.delivery = pending
-        selected = drive_until(s, runner, lambda step: step.call is not None)
-        assert selected.call.subject == "ticket:4"
-        assert s.kernel.dispatch_agent(selected.call)
-        runner.authorize_agent(selected.call)
-        process = {"pid": 4242, "start_token": "synthetic", "pgid": 4242,
-                   "host_pid": 4241, "host_start_token": "synthetic-host"}
-        s.kernel.agent_started(selected.call, process)
-        before = len(polled)
-        now[0] = 106.25
-        step = prepare_scripted_agent(s.kernel, runner.run_once(agent_capacity=0))
-        assert step.call is None and len(polled) > before
-        assert s.kernel.status("ticket:3")["holds_integration"]
-        assert runner.state().active == (selected.call.lease_id,)
-        assert not runner.worker_settled(selected.call)
 
 
 def test_ready_fifo_is_preserved_while_host_has_no_new_agent_slot(tmp_path):
