@@ -18,6 +18,7 @@ from agent_run.model import wire_json
 from support.core_operations import CoreOperations, native_agent_fixture, scripted_return
 from support.agent_continuation import ticket_spec
 from support.effect_boundary import advance_to_effect
+from support.run_scoped_kernel import domain_scenario
 
 
 def test_return_is_durable_before_consumption_and_resume_does_not_charge_twice(tmp_path: Path) -> None:
@@ -49,9 +50,9 @@ def test_return_is_durable_before_consumption_and_resume_does_not_charge_twice(t
     (DeliveryKind.FINAL_RUN, ["review", "development", "review", "publication"], "integration"),
 ])
 def test_three_deliveries_complete_with_required_review_and_exact_git_history(
-    tmp_path: Path, kind: DeliveryKind, expected_roles: list[str], development_purpose: str,
+    tmp_path: Path, kind: DeliveryKind, expected_roles: list[str], development_purpose: str, domain_scenario,
 ) -> None:
-    scenario = Scenario(tmp_path / "scenario", kind, reviews=("fail", "pass"))
+    scenario = domain_scenario(tmp_path / "scenario", kind, reviews=("fail", "pass"))
     original_target = scenario.port.remote_commit(scenario.delivery.target_ref)
     assert original_target is not None
     boundary = scenario.run()
@@ -218,11 +219,11 @@ def test_human_continuation_replaces_thread_but_keeps_attempt_budget_and_origina
 
 
 @pytest.mark.parametrize("kind", list(DeliveryKind))
-def test_real_git_conflict_returns_to_integration_development_without_internal_pr(tmp_path: Path, kind: DeliveryKind) -> None:
+def test_real_git_conflict_returns_to_integration_development_without_internal_pr(tmp_path: Path, kind: DeliveryKind, domain_scenario) -> None:
     file_name = "ticket.txt" if kind == DeliveryKind.FINAL_RUN else "shared.txt"
     edits = ({file_name: "Resolved complete content\n"},) if kind == DeliveryKind.FINAL_RUN else (
         {file_name: "Candidate content\n"}, {file_name: "Resolved complete content\n"})
-    scenario = Scenario(tmp_path / "scenario", kind, edits=edits)
+    scenario = domain_scenario(tmp_path / "scenario", kind, edits=edits)
     historical_writes = scenario.port.writes()
     if kind != DeliveryKind.FINAL_RUN:
         for _ in range(30):

@@ -42,6 +42,15 @@ parents/tree、需求和 Generation 保持一致。场景之间不共享可变 K
 验证前置格式与实际记录一致；验证 Completion 产生、持久化或物理退出时必须运行真实生产者。
 夹具只声明输入，不选择下一状态、不解释业务规则，不建立通用 completed 工厂。
 
+单线程业务与 Git 消费者可显式选择 `run_scoped_kernel.domain_scenario`：
+先由正常 `RepositoryRoute` 创建原库，再把同一库交给真实 `Transaction` / `RunTransaction`。
+Core、OperationRunner、Git 和每次业务提交仍实际执行；事务保留外键、只读拒写、
+材料摘要/预算和错误回滚，fixture 退出关闭连接，不复制完成状态或跨用例共享连接。
+这层负责业务组合，文件准入、保存排序与 OS 资源保护由原生 Storage 测试负责。
+涉及重开库、并发 owner、线程/进程、文件损坏、容量、存储截止时间或公共运行入口的用例
+必须使用默认原生路径，不能批量替换整个模块。Final 的历史 Ticket 在当前 fixture 内
+仍使用原生初始化；测量须包括这部分成本。
+
 `remote_effects._fixture` 每次创建独立 bare Git、工作仓库、gh 可执行文件及 JSON/调用日志。
 `fake_gh` 只绑定该脚本声明的仓库、actor、endpoint 与邮件字符串字段；不串联全局
 替换，不再次搜索已插入的值，不改标识符或无关文案。默认程序字节保持，受控扩展
