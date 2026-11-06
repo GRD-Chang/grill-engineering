@@ -430,6 +430,33 @@ def test_base_advance_returns_only_selected_approval_to_existing_integration(sce
     assert db.execute('SELECT count(*) FROM grants').fetchone()[0] == 0
 
 
+@pytest.mark.parametrize("damage", ["missing", "pending", "unknown", "wrong-head", "ancestry", "pr", "revision"])
+def test_approval_recovery_rejects_inapplicable_facts_atomically(scenario, damage):
+    db, kernels = scenario
+    world = approval(db, 'A')
+    expected = 'approval_checks'
+    if damage in {'missing', 'pending', 'unknown', 'wrong-head'}:
+        checks = None if damage == 'missing' else replace(world.checks,
+            result='fail' if damage == 'wrong-head' else damage,
+            details=(('quality', 'fail'),) if damage == 'wrong-head' else world.checks.details,
+            head_sha='wrong-head' if damage == 'wrong-head' else world.pr.head.sha)
+        world = replace(world, checks=checks)
+    else:
+        target = Commit('c' * 40, 'd' * 40)
+        world = replace(world, target=target, ancestry=((BASE.sha, target.sha),))
+        if damage == 'ancestry':
+            world = replace(world, ancestry=())
+        elif damage == 'pr':
+            world = replace(world, pr=replace(world.pr, number=world.pr.number + 1))
+        else:
+            world = replace(world, revision='different-requirement')
+        expected = 'approval_currentness'
+    before = {run: rows(db, run) for run in ('A', 'B')}
+    with pytest.raises(KernelError, match=expected):
+        kernels['A'].control('approve', 'invalid-recovery', subject=SUBJECT, world=world)
+    assert {run: rows(db, run) for run in ('A', 'B')} == before
+
+
 def test_revise_final_only_renews_its_own_cycle_and_retains_original_review(scenario):
     db, kernels = scenario
     world = approval(db, 'A', final=True)

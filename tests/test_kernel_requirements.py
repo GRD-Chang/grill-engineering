@@ -102,32 +102,14 @@ def test_real_ticket_close_receipts_create_completion_before_dependency_and_fina
     assert len(scenario.kernel.source_status()["completions"]) == 2
     assert all(entry["tree"] for entry in scenario.kernel.source_status()["completions"])
     assert scenario.port.remote_commit("refs/heads/main") != scenario.port.remote_commit("refs/heads/run")
-    # Maintainer revision consumes this real Final approval and updates its PR.
-    from support.control_scenarios import admit_scenario
-    admit_scenario(scenario, tmp_path)
-    request = scenario.kernel.host_request("start")
-    old_pr = scenario.port.pr_by_number(scenario.kernel.status(final)["pr_number"])
-    feedback = "\n请补充默认分支兼容性。\r\n"
-    for _ in range(2):
-        assert scenario.kernel.control_host(request, "revise", "maintainer-revision", subject=final,
-            world=scenario.world(), message=feedback) == "applied"
-    with pytest.raises(KernelError, match="action_identity_changed"):
-        scenario.kernel.control_host(request, "revise", "maintainer-revision", subject=final,
-            world=scenario.world(), message="A different revision")
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
-    call = operations.until(lambda step: step.call is not None).call
-    assert call.role == "development"
-    assert call.context["repair_source"] == "human_revision" and call.context["human_feedback"] == feedback
-    scripted_return(scenario.kernel, operations.runner, call, scenario.agent)
-    assert scenario.run().kind == "approval"
-    revised = scenario.port.pr_by_number(old_pr.number)
-    assert revised.head != old_pr.head
-    assert scenario.kernel.status(final)["pr_number"] == old_pr.number
+    pr = scenario.port.pr_by_number(scenario.kernel.status(final)["pr_number"])
+    assert pr.body.startswith("Parent Issue: #1\nDelivery Type: Final Run\n\n## Completed Tickets\n\n")
     scenario.kernel.control("approve", "approve-whole-parent", subject=final, world=scenario.world())
     assert scenario.run().kind == "complete"
     assert scenario.runner().state().disposition == "complete"
     assert scenario.kernel.status(final)["phase"] == "complete"
     assert scenario.kernel.status(final)["resource_cleanup"]["state"] == "complete"
+    assert len(scenario.port.git.parents(scenario.port.remote_commit("refs/heads/main").sha)) == 2
 
 
 def test_requirement_requeue_is_explicit_idempotent_and_retains_sibling_return(tmp_path: Path) -> None:

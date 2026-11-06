@@ -18,6 +18,7 @@ from agent_run.cli.main import _parser
 from support.ticket_process import isolated_ticket_test
 from support.process_scope import guardian_timeout_owners
 from support.core_operations import setup
+from support.remote_effects import _change
 
 
 def test_control_observation_never_claims_executor_or_allocates_work(tmp_path, monkeypatch):
@@ -82,7 +83,9 @@ def test_control_read_failure_is_a_cli_error_without_a_work_wait_or_claim(tmp_pa
 def test_managed_control_observes_without_replacing_a_running_host(tmp_path, monkeypatch):
     kernel, runner, physical, state, calls, request, subject, source = managed_approval(
         tmp_path, monkeypatch, tickets=())
-    before = kernel.status(subject)
+    # Current failed checks request ordinary recovery, never a stale merge.
+    _change(state, checks=[{"name": "required", "workflow": "CI", "bucket": "fail",
+        "state": "FAILURE", "link": "https://ci.example.invalid/failure", "description": "Original failure"}])
     with kernel.storage.transaction(write=False) as tx:
         owner = tuple(tx.one("SELECT executor,epoch FROM runs"))
         counts = tuple(tx.one("SELECT (SELECT count(*) FROM attempts),(SELECT count(*) FROM leases)"))
@@ -92,7 +95,7 @@ def test_managed_control_observes_without_replacing_a_running_host(tmp_path, mon
     result = lifecycle_cli.execute(_parser("en").parse_args(arguments), language="en")
     assert result["result"] == "accepted" and result["host"] == "running"
     assert result["action"] == "approve"
-    assert result["status"] == "action_pending"
+    assert result["status"] == "action_updating"
     assert kernel.host_request("original-host") == request
     assert [line for line in calls.read_text().splitlines() if "--method" in json.loads(line)] == writes
     with kernel.storage.transaction(write=False) as tx:
@@ -100,8 +103,9 @@ def test_managed_control_observes_without_replacing_a_running_host(tmp_path, mon
         assert tuple(tx.one("SELECT (SELECT count(*) FROM attempts),(SELECT count(*) FROM leases)")) == counts
         action = tx.one("SELECT kind,subject FROM actions WHERE id=?", (result["action_id"],))
         assert tuple(action) == ("approve", subject)
-        grant = tx.one("SELECT action,head_sha,pr_number FROM grants WHERE subject=?", (subject,))
-        assert tuple(grant) == (result["action_id"], before["source_sha"], before["pr_number"])
+        assert not tx.rows("SELECT id FROM grants")
+        assert tx.one("SELECT final_action FROM runs")[0] is None
+        assert tx.one("SELECT phase FROM subjects WHERE id=?", (subject,))[0] == "checks"
 
 
 @pytest.mark.parametrize("proof", ["released", "fdstore", "populated", "foreign"])

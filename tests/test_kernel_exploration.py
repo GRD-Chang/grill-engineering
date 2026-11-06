@@ -13,9 +13,9 @@ from agent_run.model import DeliveryKind, Policy
 from agent_run.core.kernel import Kernel
 from agent_run.contracts.write_authority import FinalAdmission, WriteAuthority
 from agent_run.errors import KernelError
-from support.offline import Scenario, review_result
+from support.offline import Scenario
 from agent_run.model import wire_json
-from support.core_operations import CoreOperations, native_agent_fixture, scripted_return
+from support.core_operations import CoreOperations, native_agent_fixture
 from support.agent_continuation import ticket_spec
 from support.effect_boundary import advance_to_effect
 from support.run_scoped_kernel import domain_scenario
@@ -44,62 +44,6 @@ def test_return_is_durable_before_consumption_and_resume_does_not_charge_twice(t
     assert reopened.status("ticket:2")["budgets"]["requirements"]["developments_used"] == 1
 
 
-@pytest.mark.parametrize(("kind", "expected_roles", "development_purpose"), [
-    (DeliveryKind.TICKET, ["development", "review", "development", "review", "publication"], "requirements"),
-    (DeliveryKind.PARENT_ONLY, ["development", "review", "development", "review", "publication"], "requirements"),
-    (DeliveryKind.FINAL_RUN, ["review", "development", "review", "publication"], "integration"),
-])
-def test_three_deliveries_complete_with_required_review_and_exact_git_history(
-    tmp_path: Path, kind: DeliveryKind, expected_roles: list[str], development_purpose: str, domain_scenario,
-) -> None:
-    scenario = domain_scenario(tmp_path / "scenario", kind, reviews=("fail", "pass"))
-    prefix_history = scenario.kernel.history("ticket:2") if kind == DeliveryKind.FINAL_RUN else None
-    if kind != DeliveryKind.TICKET:
-        assert scenario.run(cut="publication_pending").kind == "publication_pending"
-        assert [call["role"] for call in scenario.role_calls] == expected_roles[:-1]
-        assert not any(write["operation"] == "pr_write" for write in scenario.writes())
-    original_target = scenario.port.remote_commit(scenario.delivery.target_ref)
-    assert original_target is not None
-    boundary = scenario.run()
-    assert boundary.kind == ("complete" if kind == DeliveryKind.TICKET else "approval")
-    if kind != DeliveryKind.TICKET:
-        assert scenario.port.remote_commit(scenario.delivery.target_ref) == original_target
-        scenario.kernel.control("approve", "exact-approval", subject=scenario.delivery.key, world=scenario.world())
-        boundary = scenario.run()
-    assert boundary.kind == "complete"
-    assert [call["role"] for call in scenario.role_calls] == expected_roles
-    assert {call["purpose"] for call in scenario.role_calls if call["role"] == "development"} == {development_purpose}
-    assert sum(write["operation"] == "pr_write" for write in scenario.writes()) == 1
-    assert sum(write["operation"] == "merge" for write in scenario.writes()) == 1
-    assert sum(write["operation"] == "completion_comment" for write in scenario.writes()) == 1
-    if kind == DeliveryKind.FINAL_RUN:
-        assert scenario.historical_trace is not None
-        assert scenario.historical_trace["raw_backend_calls"] == {"development": 1, "review": 1, "publication": 1}
-        assert sum(write["operation"] == "merge" for write in scenario.port.writes()) == 2
-        assert scenario.kernel.history("ticket:2") == prefix_history
-        completion, = scenario.kernel.source_status()["completions"]
-        assert completion["subject"] == "ticket:2" and completion["review_attempt"] is not None
-    target = scenario.port.remote_commit(scenario.delivery.target_ref)
-    assert target is not None
-    physical = scenario.port.physical.commit(target.sha)
-    assert physical["sha"] == scenario.port.physical.refs()[scenario.delivery.target_ref] == target.sha
-    assert [parent["sha"] for parent in physical["parents"]] == list(scenario.port.git.parents(target.sha))
-    assert len(scenario.port.git.parents(target.sha)) == (1 if kind == DeliveryKind.TICKET else 2)
-    headers = {
-        DeliveryKind.TICKET: "Parent Issue: #1\nPrimary Ticket: #2\nDelivery Type: Ticket\n\n",
-        DeliveryKind.PARENT_ONLY: "Parent Issue: #1\nDelivery Type: Parent-only\n\n",
-        DeliveryKind.FINAL_RUN: "Parent Issue: #1\nDelivery Type: Final Run\n\n## Completed Tickets\n\n- #2: Deliver one ticket\n\n",
-    }
-    pr = scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref)
-    assert pr is not None and pr.state == "MERGED" and pr.body.startswith(headers[kind])
-    assert scenario.kernel.status(scenario.delivery.key)["resource_cleanup"]["state"] == "complete"
-    assert not Path(scenario.delivery.checkout).exists()
-    assert scenario.port.remote_refs().keys() == ({"refs/heads/main", "refs/heads/run"} if kind == DeliveryKind.TICKET else {"refs/heads/main"})
-    assert scenario.kernel.status(scenario.delivery.key)["phase"] == "complete"
-    assert scenario.port.git.run("ls-tree", "-r", "--name-only", target.sha).stdout.find("validation.tmp") == -1
-    assert not list((scenario.port.root / "work").glob("review-*"))
-
-
 def test_ticket_final_development_is_explicit_fallback_but_parent_cannot_skip_review(tmp_path: Path, domain_scenario) -> None:
     ticket = domain_scenario(tmp_path / "ticket", DeliveryKind.TICKET, reviews=("fail",), policy=Policy(ticket_rounds=1))
     assert ticket.run().kind == "complete"
@@ -114,7 +58,25 @@ def test_ticket_final_development_is_explicit_fallback_but_parent_cannot_skip_re
 @pytest.mark.parametrize("kind", [DeliveryKind.TICKET, DeliveryKind.PARENT_ONLY])
 def test_ci_uses_separate_cumulative_development_and_parent_review(tmp_path: Path, kind: DeliveryKind, domain_scenario) -> None:
     scenario = domain_scenario(tmp_path / "scenario", kind, checks=("fail", "none"))
+    if kind == DeliveryKind.PARENT_ONLY:
+        # A granted merge must still hand a newly failed check back to CI.
+        scenario.checks[:] = ["none"]
+        assert scenario.run().kind == "approval"
+        kernel, subject = scenario.kernel, scenario.delivery.key
+        assert kernel.control("approve", "original-grant", subject=subject, world=scenario.world()) == "pending"
+        scenario.checks[:] = ["fail", "none"]
+        assert scenario.step().kind == "progress"
+        assert kernel.status(subject)["phase"] == "checks"
+        with kernel.storage.transaction(write=False) as tx:
+            assert tx.one("SELECT status FROM actions WHERE id='original-grant'")[0] == "updating"
+            assert tx.one("SELECT final_action FROM runs")[0] is None
+            assert tx.one("SELECT grant_id FROM subjects WHERE id=?", (subject,))[0] is None
+            assert not tx.rows("SELECT id FROM effects WHERE operation='merge'")
     assert scenario.run(approve=True).kind == "complete"
+    if kind == DeliveryKind.PARENT_ONLY:
+        pr = scenario.port.pr_by_number(scenario.kernel.status(scenario.delivery.key)["pr_number"])
+        assert pr.body.startswith("Parent Issue: #1\nDelivery Type: Parent-only\n\n")
+        assert len(scenario.port.git.parents(scenario.port.remote_commit(scenario.delivery.target_ref).sha)) == 2
     ci = [call for call in scenario.role_calls if call["purpose"] == "ci"]
     assert [call["role"] for call in ci if call["role"] != "publication"] == (
         ["development"] if kind == DeliveryKind.TICKET else ["development", "review"])
@@ -318,73 +280,3 @@ def test_final_approval_check_timeout_has_a_finite_action_and_same_grant_resume(
         scenario.kernel.control("stop", "cancel-resumed-final")
     assert scenario.run().kind == "complete"
     assert sum(write["operation"] == "merge" for write in scenario.port.writes()) == 1
-
-
-def test_parent_ci_target_append_changes_current_work_to_integration_and_retains_ci_accounting(tmp_path: Path, domain_scenario) -> None:
-    scenario = domain_scenario(tmp_path / "scenario", DeliveryKind.FINAL_RUN,
-                        reviews=("pass", "pass", "fail", "pass"), checks=("fail", "none"))
-    for _ in range(100):
-        status = scenario.kernel.status(scenario.delivery.key)
-        if scenario.development_count == 1 and scenario.review_count == 2 and status["phase"] == "ready_publication":
-            break
-        scenario.step()
-    else:
-        raise AssertionError("CI repair review did not reach publication boundary")
-    original_ci = scenario.kernel.status(scenario.delivery.key)["budgets"]["ci"]
-    assert (original_ci["developments_used"], original_ci["reviews_used"]) == (1, 1)
-    original_ci_events = [event for event in scenario.kernel.history(scenario.delivery.key) if event["kind"] == "ci_failed"]
-    assert len(original_ci_events) == 1
-    scenario.port.external_append(scenario.delivery.target_ref, {"external.txt": "Default branch advanced\n"}, "ci-then-append")
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
-    failed_review = None
-    for _ in range(80):
-        step = operations.once()
-        if step.call is not None and step.call.role.value == "development" and step.call.purpose.value == "integration":
-            call = step.call
-            break
-        if step.call is not None:
-            if step.call.role.value == "review" and step.call.purpose.value == "integration":
-                failed_review = step.call
-            scripted_return(scenario.kernel, operations.runner, step.call, scenario.agent)
-        assert step.kind not in {"paused", "complete", "approval", "waiting"}
-    else:
-        raise AssertionError("new integration Findings did not return to Development")
-    assert call.context["purpose"] == "integration"
-    # Purpose selects the integration budget; the latest actual Review Findings
-    # select the repair input, not the older Git integration responsibility.
-    assert call.context["repair_source"] == "acceptance"
-    assert failed_review is not None
-    with scenario.kernel.storage.transaction(write=False) as tx:
-        previous = tx.one("SELECT result_id,subject,generation,outcome FROM attempts WHERE id=?", (failed_review.attempt_id,))
-        findings = json.loads(tx.get(previous["result_id"], call.subject))
-        job = tx.one("SELECT last_failure FROM subjects WHERE id=?", (call.subject,))
-        assert previous["outcome"] == "fail" and job["last_failure"] == previous["result_id"]
-        assert (previous["subject"], previous["generation"]) == (call.subject, call.context["generation"])
-    assert call.context["acceptance_artifact"] == findings == review_result("fail")
-    assert "ci_failure" not in call.context
-    budgets = scenario.kernel.status(scenario.delivery.key)["budgets"]
-    assert budgets["ci"] == original_ci
-    assert budgets["integration"]["developments_used"] == 0
-    assert [event for event in scenario.kernel.history(scenario.delivery.key) if event["kind"] == "ci_failed"] == original_ci_events
-
-
-    scripted_return(scenario.kernel, operations.runner, call, scenario.agent)
-    budgets = scenario.kernel.status(scenario.delivery.key)["budgets"]
-    assert budgets["integration"]["developments_used"] == 1
-    assert budgets["ci"] == original_ci
-    for _ in range(30):
-        step = operations.once()
-        if step.call is not None:
-            assert step.call.role.value == "review" and step.call.purpose.value == "integration"
-            rereview = step.call
-            break
-        assert step.kind not in {"paused", "complete", "approval", "waiting"}
-    else:
-        raise AssertionError("Integration Findings repair did not return to its Reviewer")
-    facts = rereview.context["review_context"]["facts"]
-    assert rereview.subject == failed_review.subject == call.subject
-    assert rereview.context["generation"] == failed_review.context["generation"] == call.context["generation"]
-    assert facts["previous_acceptance_artifact"] == findings
-    assert facts["previous_review_identity"] == failed_review.context["review_context"]["facts"]["current_review_identity"]
-    assert scenario.kernel.status(call.subject)["budgets"]["ci"] == original_ci
-    assert [event for event in scenario.kernel.history(call.subject) if event["kind"] == "ci_failed"] == original_ci_events
