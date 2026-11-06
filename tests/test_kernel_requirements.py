@@ -101,6 +101,27 @@ def test_real_ticket_close_receipts_create_completion_before_dependency_and_fina
     assert len(scenario.kernel.source_status()["completions"]) == 2
     assert all(entry["tree"] for entry in scenario.kernel.source_status()["completions"])
     assert scenario.port.remote_commit("refs/heads/main") != scenario.port.remote_commit("refs/heads/run")
+    # Maintainer revision consumes this real Final approval and updates its PR.
+    from support.control_scenarios import admit_scenario
+    admit_scenario(scenario, tmp_path)
+    request = scenario.kernel.host_request("start")
+    old_pr = scenario.port.pr_by_number(scenario.kernel.status(final)["pr_number"])
+    feedback = "\n请补充默认分支兼容性。\r\n"
+    for _ in range(2):
+        assert scenario.kernel.control_host(request, "revise", "maintainer-revision", subject=final,
+            world=scenario.world(), message=feedback) == "applied"
+    with pytest.raises(KernelError, match="action_identity_changed"):
+        scenario.kernel.control_host(request, "revise", "maintainer-revision", subject=final,
+            world=scenario.world(), message="A different revision")
+    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+    call = operations.until(lambda step: step.call is not None).call
+    assert call.role == "development"
+    assert call.context["repair_source"] == "human_revision" and call.context["human_feedback"] == feedback
+    scripted_return(scenario.kernel, operations.runner, call, scenario.agent)
+    assert scenario.run().kind == "approval"
+    revised = scenario.port.pr_by_number(old_pr.number)
+    assert revised.head != old_pr.head
+    assert scenario.kernel.status(final)["pr_number"] == old_pr.number
     scenario.kernel.control("approve", "approve-whole-parent", subject=final, world=scenario.world())
     assert scenario.run().kind == "complete"
     assert scenario.runner().state().disposition == "complete"
@@ -427,6 +448,10 @@ def test_original_final_merge_keeps_closeout_after_uncertain_reads_target_append
         assert paused.kind == "paused"
         assert scenario.kernel.status(effect.subject)["pending_write"]["id"] == effect.effect_id
         assert not [write for write in scenario.port.writes() if write["subject"] == effect.subject and write["operation"] == "close"]
+        with pytest.raises(KernelError, match="final_merge_unsettled"):
+            scenario.kernel.control("abandon", "cannot-abandon-default-merge",
+                resource_inspections=scenario.port.inspect_resources(scenario.kernel.generation_resources()))
+        assert scenario.kernel.source_status()["abandonment"] is None
         restore_read()
     pr = scenario.port.pr_by_number(effect.pr_number)
     assert pr is not None and pr.merged is not None
@@ -451,6 +476,7 @@ def test_original_final_merge_keeps_closeout_after_uncertain_reads_target_append
     writes = [write for write in scenario.port.writes() if write["subject"] == effect.subject]
     assert len([write for write in writes if write["operation"] == "merge"]) == 1
     assert len([write for write in writes if write["operation"] == "close"]) == 1
+    assert not [write for write in scenario.port.writes() if write["operation"] == "reopen_ticket"]
 
 
 def test_final_requirement_refresh_never_reuses_old_generation_human_response(tmp_path: Path) -> None:

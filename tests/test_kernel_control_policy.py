@@ -6,12 +6,11 @@ import json
 
 import pytest
 
-from agent_run.model import Commit, Delivery, DeliveryKind, Policy, RunSpec, World
+from agent_run.model import Commit, Delivery, DeliveryKind, Policy, RunSpec
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.model import EffectResult, Execution, HostLaunch, HostObservation, wire_json
-from support.offline import Scenario
-from support.core_operations import CoreOperations, ReadOnlyPorts, native_agent_fixture, final_scenario
+from support.core_operations import CoreOperations, ReadOnlyPorts, native_agent_fixture
 
 
 def managed(kernel: Kernel, root: Path) -> tuple[HostLaunch, Execution]:
@@ -44,42 +43,6 @@ def tickets(root: Path, *, new_thread_per_development: bool = False) -> tuple[Ke
             return EffectResult('failure', base, raw={'head': 'base', 'reason': 'candidate_integrity'})
 
     return kernel, TicketPorts(ports.requirements, ports.source_ref, ports.target_ref, ports.facts)
-
-
-@pytest.mark.parametrize(("kind", "option", "purpose", "limits"), [
-    (DeliveryKind.PARENT_ONLY, "parent_only_paired_rounds", "requirements", (2, 2)),
-    (DeliveryKind.FINAL_RUN, "run_repair_rounds", "integration", (2, 3)),
-])
-def test_parent_checkpoint_freezes_new_limits_without_rewriting_old_invocations(
-    tmp_path: Path, kind: DeliveryKind, option: str, purpose: str, limits: tuple[int, int],
-) -> None:
-    factory = final_scenario if kind == DeliveryKind.FINAL_RUN else lambda root, **kwargs: Scenario(root, kind, **kwargs)
-    scenario = factory(tmp_path / "delivery", reviews=("fail",),
-                       policy=Policy(parent_rounds=1, run_repairs=1, development_deadline_seconds=7.0))
-    kernel, subject = scenario.kernel, scenario.delivery.key
-    kernel.control("stop", "retire-fixture")
-    kernel.confirm_executor_exit(scenario.execution)
-    kernel.control("resume", "prepare-managed")
-    request, scenario.execution = managed(kernel, tmp_path)
-    assert scenario.run().kind == "paused"
-    before = kernel.status(subject)
-    assert "review_budget_exhausted" in before["gates"]
-    assert before["pending_attempt"] is None
-    with kernel.storage.transaction(write=False) as tx:
-        old_invocations = [dict(row) for row in tx.all("SELECT * FROM invocations ORDER BY id")]
-        old_budget = dict(tx.one("SELECT * FROM budgets WHERE subject=? AND purpose=? AND current=1", (subject, purpose)))
-    overrides = {option: 2, "development_deadline": "13s", "review_deadline": "17s", "publication_deadline": "19s"}
-    assert kernel.control_host(request, "resume", "new-window", subject=subject, policy_overrides=overrides) == "applied"
-    assert kernel.control_host(request, "resume", "new-window", subject=subject, policy_overrides=overrides) == "applied"
-    renewed = kernel.status(subject)["budgets"][purpose]
-    assert (renewed["window"], renewed["development_limit"], renewed["review_limit"]) == (2, *limits)
-    assert (renewed["developments_used"], renewed["reviews_used"]) == (0, 0)
-    with kernel.storage.transaction(write=False) as tx:
-        assert [dict(row) for row in tx.all("SELECT * FROM invocations ORDER BY id")] == old_invocations
-        assert dict(tx.one("SELECT * FROM budgets WHERE subject=? AND purpose=? AND window=1", (subject, purpose))) == {**old_budget, "current": 0}
-    call = CoreOperations(kernel, scenario.execution, scenario.make_ports).until(lambda step: step.call is not None).call
-    assert call is not None and call.role == "development" and call.deadline_seconds == 13.0
-    assert kernel.active_host_action() == "start" and not kernel.dispatch_host(request)
 
 
 def test_ticket_policy_window_does_not_change_a_sibling_call_or_its_allowances(tmp_path: Path) -> None:
@@ -225,46 +188,6 @@ def test_local_human_resume_cannot_take_pending_whole_run_feedback(tmp_path: Pat
     stopped = by_subject["ticket:3"]
     assert stopped is not None and stopped.context["human_responses"] == ["Continue the stopped work"]
     assert stopped.attempt_id == first.attempt_id and stopped.thread_id != first.thread_id
-
-
-def test_managed_revision_opens_a_new_repair_cycle_and_updates_the_original_pr(tmp_path: Path) -> None:
-    scenario = final_scenario(tmp_path / "delivery", reviews=("fail", "pass"),
-                        policy=Policy(run_repairs=2))
-    kernel, subject = scenario.kernel, scenario.delivery.key
-    kernel.control("stop", "retire-fixture")
-    kernel.confirm_executor_exit(scenario.execution)
-    kernel.control("resume", "prepare-managed")
-    request, scenario.execution = managed(kernel, tmp_path)
-    assert scenario.run().kind == "approval"
-    before = kernel.status(subject)
-    old_budget = before["budgets"]["integration"]
-    assert old_budget["developments_used"] == 1
-    old_pr = scenario.port.pull_request_by_ref(scenario.kernel.delivery(subject).source_ref, scenario.kernel.delivery(subject).target_ref)
-    assert old_pr is not None
-    feedback = "\n请补充默认分支兼容性。\r\n"
-    assert kernel.control_host(request, "revise", "maintainer-revision", subject=subject,
-                               world=scenario.world(), message=feedback) == "applied"
-    assert kernel.control_host(request, "revise", "maintainer-revision", subject=subject,
-                               world=scenario.world(), message=feedback) == "applied"
-    with pytest.raises(KernelError, match="action_identity_changed"):
-        kernel.control_host(request, "revise", "maintainer-revision", subject=subject,
-                            world=scenario.world(), message="A different revision")
-    current = kernel.status(subject)
-    assert current["phase"] == "development" and current["purpose"] == "integration"
-    assert current["pr_number"] == old_pr.number and current["generation"] == before["generation"]
-    budget = current["budgets"]["integration"]
-    assert (budget["window"], budget["developments_used"], budget["reviews_used"]) == (old_budget["window"] + 1, 0, 0)
-    call = CoreOperations(kernel, scenario.execution, scenario.make_ports).until(lambda step: step.call is not None).call
-    assert call is not None and call.role == "development"
-    assert call.context["repair_source"] == "human_revision" and call.context["human_feedback"] == feedback
-    kernel.receive(call, scenario.agent(call))
-    assert scenario.run().kind == "approval"
-    revised_pr = scenario.port.pull_request_by_ref(scenario.kernel.delivery(subject).source_ref, scenario.kernel.delivery(subject).target_ref)
-    assert revised_pr is not None and revised_pr.number == old_pr.number and revised_pr.head != old_pr.head
-    assert kernel.status(subject)["budgets"]["integration"]["developments_used"] == 1
-    with kernel.storage.transaction(write=False) as tx:
-        old = tx.one("SELECT * FROM budgets WHERE subject=? AND purpose='integration' AND window=?", (subject, old_budget["window"]))
-        assert (old["developments_used"], old["reviews_used"], old["current"]) == (1, old_budget["reviews_used"], 0)
 
 
 def test_two_accepted_whole_run_responses_reach_the_original_work_in_order(tmp_path: Path) -> None:

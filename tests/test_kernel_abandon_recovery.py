@@ -1,20 +1,21 @@
 """The original Abandon Action owns two finite, separately settled effects."""
 
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
 
 from agent_run.errors import KernelError
-from agent_run.model import Effect, EffectResult, Execution, HostObservation
+from agent_run.model import EffectResult, Execution, HostObservation, World, wire_json
 from agent_run.queries.run import read
-from agent_run.core.operation_contract import EffectIO
+from agent_run.core.operation_contract import EffectIO, Work
 from support.control_scenarios import managed_abandon_scenario
 from support.core_operations import CoreOperations
+from support.requirements_scenarios import independent_source, source_run
 
 
-def recovery_effect(tmp_path: Path, operation: str, monkeypatch: pytest.MonkeyPatch, response=None):
+def recovery_effect(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Reach a real recovery effect; interrupt or script only the physical port."""
     scenario, request = managed_abandon_scenario(tmp_path)
     assert scenario.run().kind == "complete"
@@ -28,30 +29,24 @@ def recovery_effect(tmp_path: Path, operation: str, monkeypatch: pytest.MonkeyPa
     sent = []
 
     def interrupt(effect, authorize):
-        if effect.operation == operation:
+        if effect.operation == "recovery_comment":
             authorize.prepare()()
             sent.append(effect)
-            if response is not None:
-                return response(effect, authorize, execute)
             raise OSError("Original recovery call interrupted before its physical write")
         return execute(effect, authorize)
 
     with monkeypatch.context() as patch:
         patch.setattr(ports, "execute", interrupt)
         boundary = operations.until(lambda step: bool(sent))
-    if response is None:
-        assert boundary.reason == "original_write_readback_required"
-    else:
-        assert boundary.kind == "progress"
+    assert boundary.reason == "original_write_readback_required"
     effect, = sent
     return scenario, effect, operations
 
 
-@pytest.mark.parametrize("operation", ["reopen_ticket", "recovery_comment"])
 def test_unproven_sent_recovery_never_replays_and_uses_original_read_window(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str, subtests: pytest.Subtests,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, subtests: pytest.Subtests,
 ) -> None:
-    scenario, effect, operations = recovery_effect(tmp_path, operation, monkeypatch)
+    scenario, effect, operations = recovery_effect(tmp_path, monkeypatch)
     kernel = scenario.kernel
     now = [1000.25]
     kernel.clock = lambda: now[0]
@@ -132,58 +127,66 @@ def test_unproven_sent_recovery_never_replays_and_uses_original_read_window(
     assert scenario.port.writes() == original_writes
 
 
+def managed_read_kernel(tmp_path):
+    """Fresh source plus explicit Host observations; no workspace or completion."""
+    kernel, _ = source_run(tmp_path / "kernel.sqlite3", independent_source())
+    request = kernel.admit_host("start", kind="run", command=("native-host",),
+        environment_carrier=tmp_path / "carrier", preflight=lambda: None)
+    assert kernel.dispatch_host(request)
+    assert kernel.observe_host(request, HostObservation("running", request.unit_name, "original", "/host", "boot",
+        42, "start", usage_ready=True)) == "running"
+    return kernel, request, Execution(request.run_id, request.owner, request.epoch)
+
+
 def test_abandon_read_wait_preserves_action_scope_without_bypassing_ordinary_stop(tmp_path: Path) -> None:
     """Core read-request consumer: superseded scope, stop and guard semantics.
 
     The public runner recovery/physical-port integration is exercised above;
     this test deliberately inspects its internal read-wait protocol only.
     """
-    scenario, request = managed_abandon_scenario(tmp_path)
-    assert scenario.run().kind == "complete"
-    kernel = scenario.kernel
-    before_abandon = kernel.begin_observation(scenario.delivery.key, execution=scenario.execution).fence
-    kernel.control("stop", "retain-subject-stop", subject=scenario.delivery.key)
+    kernel, request, execution = managed_read_kernel(tmp_path)
+    before_abandon = kernel.begin_observation("ticket:3", execution=execution).fence
+    kernel.control("stop", "retain-subject-stop", subject="ticket:3")
     assert kernel.control_host(request, "abandon", "original-abandon",
-        resource_inspections=scenario.port.inspect_resources(kernel.generation_resources())) == "pending"
-    assert kernel._wait_for_read(before_abandon, scenario.execution,
+        resource_inspections=()) == "pending"
+    assert kernel._wait_for_read(before_abandon, execution,
         "github_recovery_observation_pending", "Previous business scope").reason == "observation_superseded"
     with kernel.storage.transaction(write=False) as tx:
         assert not tx.rows("SELECT * FROM waits")
-    token = kernel.begin_observation(scenario.delivery.key, execution=scenario.execution).fence
+    token = kernel.begin_observation("ticket:3", execution=execution).fence
     assert kernel.source_status()["abandonment"] == {"action": "original-abandon", "status": "pending"}
-    assert kernel.status(scenario.delivery.key)["gates"] == ["operator_stopped"]
+    assert kernel.status("ticket:3")["gates"] == ["operator_stopped"]
     assert read(kernel.storage.path, 'status', storage=kernel.storage).data["status"] == "abandonment_pending"
     with pytest.raises(KernelError, match="run_abandoned"):
         kernel.control_host(request, "resume", "cannot-resume-business")
-    waiting = kernel._wait_for_read(token, scenario.execution, "github_recovery_observation_pending", "Timeline is not current")
+    waiting = kernel._wait_for_read(token, execution, "github_recovery_observation_pending", "Timeline is not current")
     assert waiting.kind == "waiting" and waiting.retry_at is not None
-    assert kernel._guard_automatic_step(token, scenario.execution).kind == "waiting"
-    assert kernel._guard_automatic_step(token, scenario.execution, after_read=True) is None
+    assert kernel._guard_automatic_step(token, execution).kind == "waiting"
+    assert kernel._guard_automatic_step(token, execution, after_read=True) is None
     with pytest.raises(KernelError, match="executor_fenced"):
-        kernel._wait_for_read(token, replace(scenario.execution, epoch=scenario.execution.epoch + 1),
+        kernel._wait_for_read(token, replace(execution, epoch=execution.epoch + 1),
                              "github_recovery_observation_pending", "Foreign Executor")
-    ordinary, _ = managed_abandon_scenario(tmp_path / "ordinary")
-    before_stop = ordinary.kernel.begin_observation(ordinary.delivery.key, execution=ordinary.execution).fence
-    ordinary.kernel.control("stop", "ordinary-local-stop", subject=ordinary.delivery.key)
-    assert ordinary.kernel._wait_for_read(before_stop, ordinary.execution,
+    ordinary, _, ordinary_execution = managed_read_kernel(tmp_path / "ordinary")
+    before_stop = ordinary.begin_observation("ticket:3", execution=ordinary_execution).fence
+    ordinary.control("stop", "ordinary-local-stop", subject="ticket:3")
+    assert ordinary._wait_for_read(before_stop, ordinary_execution,
         "github_recovery_observation_pending", "Ordinary Stop").kind == "paused"
-    with ordinary.kernel.storage.transaction(write=False) as tx:
+    with ordinary.storage.transaction(write=False) as tx:
         assert not tx.rows("SELECT * FROM waits")
 
 
 def test_explicit_abandon_continuation_clears_only_its_run_scoped_timeout(tmp_path: Path) -> None:
     """Internal run-scope wait consumer; Host lifecycle is explicit fixture evidence."""
-    scenario, request = managed_abandon_scenario(tmp_path)
-    kernel = scenario.kernel
+    kernel, request, execution = managed_read_kernel(tmp_path)
     kernel.control("stop", "retain-sibling-gate", subject="ticket:4")
     kernel.control_host(request, "abandon", "original-abandon",
-                        resource_inspections=scenario.port.inspect_resources(kernel.generation_resources()))
+                        resource_inspections=())
     now = [1000.25]
     kernel.clock = lambda: now[0]
-    token = kernel.begin_observation(None, execution=scenario.execution).fence
-    assert kernel._wait_for_read(token, scenario.execution, "github_recovery_observation_pending", "Run read").kind == "waiting"
+    token = kernel.begin_observation(None, execution=execution).fence
+    assert kernel._wait_for_read(token, execution, "github_recovery_observation_pending", "Run read").kind == "waiting"
     now[0] = 1600.25
-    assert kernel._wait_for_read(token, scenario.execution, "github_recovery_observation_pending", "Run read").reason == "supervision_timeout"
+    assert kernel._wait_for_read(token, execution, "github_recovery_observation_pending", "Run read").reason == "supervision_timeout"
     assert kernel.source_status()["blocked"] == "supervision_timeout"
     assert kernel.observe_host(request, HostObservation("exited", request.unit_name, "original", "/host", "boot", 42, "start",
         exit_status=0, ended_at=now[0], usage_released=True)) == "exited"
@@ -201,55 +204,98 @@ def test_explicit_abandon_continuation_clears_only_its_run_scoped_timeout(tmp_pa
     assert kernel._wait_for_read(token, execution, "github_recovery_observation_pending", "Original Run read").retry_at == 1605.25
 
 
+def advance_recovery(kernel, work, world):
+    with kernel.storage.transaction() as tx:
+        return kernel._advance_abandon(tx, tx.one("SELECT * FROM runs"),
+            kernel._abandon_action(tx), work.subject, work, world)
+
+
+@pytest.fixture
+def recorded_recovery(tmp_path):
+    """Recorded close + Completion are inputs to recovery, not lifecycle proof.
+
+    The main abandonment journey produces these through real Git/API calls.
+    Here Core creates the Action, inspection and recovery intent itself.
+    """
+    kernel, _ = source_run(tmp_path / "recorded.sqlite3", independent_source())
+    execution = kernel.claim_executor("recovery-reader")
+    subject = "ticket:3"
+    delivery = kernel.delivery(subject)
+    event = {"id": 11, "event": "closed", "actor": "publisher"}
+    with kernel.storage.transaction() as tx:
+        run = tx.one("SELECT * FROM runs")
+        payload = tx.put(subject, "original_close_intent", wire_json({"close_intent": {"actor": "publisher"}}))
+        receipt = tx.put(subject, "original_close_receipt", wire_json(asdict(EffectResult("target", raw={"event": event}))))
+        for operation in ("completion_comment", "close"):
+            tx.execute("INSERT INTO effects(run_id,id,subject,operation,status,parent_revision,graph_revision,revision,"
+                "generation,source_ref,target_ref,before_sha,base_sha,base_tree,actor,payload_id,receipt_id) "
+                "VALUES (?,?,?,?,'confirmed',?,?,?,1,?,?,?,?,?,'publisher',?,?)",
+                (run["id"], operation, subject, operation, run["parent_revision"], run["graph_revision"], delivery.revision,
+                 delivery.source_ref, delivery.target_ref, delivery.base.sha, delivery.base.sha, delivery.base.tree, payload, receipt))
+        tx.execute("INSERT INTO completions(run_id,subject,generation,revision,parent_revision,graph_revision,source_sha,"
+            "merge_sha,tree,pr_number,gate_mode,comment_effect,close_effect) VALUES (?,?,1,?,?,?,?,?,?,11,'ci_waiver','completion_comment','close')",
+            (run["id"], subject, delivery.revision, run["parent_revision"], run["graph_revision"],
+             delivery.base.sha, delivery.base.sha, delivery.base.tree))
+        tx.execute("UPDATE subjects SET phase='complete',merge_sha=? WHERE id=?", (delivery.base.sha, subject))
+        identity = kernel._inputs(tx, run)["runner_identity"]
+        world = World(run["parent_revision"], run["graph_revision"], delivery.revision,
+            delivery.base, delivery.base, publisher_actor="publisher", publisher_identity=identity)
+    assert kernel.control("abandon", "original-abandon", resource_inspections=()) == "pending"
+    work = Work(execution, "abandon", subject, False, True, None, None)
+    inspection = advance_recovery(kernel, work, world)
+    assert inspection.effect.operation == "inspect_resources"
+    assert kernel._dispatch(inspection.effect, execution, world, token=inspection.token)
+    assert kernel._reconcile(inspection, EffectResult("target", raw={"resources": []})).kind == "progress"
+    assert advance_recovery(kernel, work, world).kind == "progress"
+    request = advance_recovery(kernel, work, world)
+    assert request.effect.operation == "reopen_ticket"
+    assert kernel._dispatch(request.effect, execution, world, token=request.token, resource_inspections=())
+    return kernel, request, world
+
+
+def test_unproven_reopen_keeps_one_read_window_without_replay(recorded_recovery):
+    kernel, request, world = recorded_recovery
+    kernel.clock = lambda: 100.25
+    for disposition in ("prior", "unknown"):
+        waiting = kernel._reconcile(request, EffectResult(disposition))
+        assert (waiting.kind, waiting.retry_at) == ("waiting", 105.25)
+    with kernel.storage.transaction(write=False) as tx:
+        assert tuple(tx.one("SELECT started_at,deadline FROM waits")) == (100.25, 700.25)
+        assert tuple(tx.one("SELECT status,attempts FROM effects WHERE operation='reopen_ticket'")) == ("sent", 1)
+    kernel.clock = lambda: 700.25
+    assert kernel._reconcile(request, EffectResult("prior")).reason == "supervision_timeout"
+    assert advance_recovery(kernel, request.work, world).reason == "abandon_outcome_unproven"
+    with kernel.storage.transaction(write=False) as tx:
+        assert tuple(tx.one("SELECT status,attempts FROM effects WHERE operation='reopen_ticket'")) == ("sent", 1)
+
+
 @pytest.mark.parametrize("invalid_event", [None, {"id": 999999, "event": "reopened", "actor": "foreign"}])
-def test_recovery_comment_requires_original_confirmed_own_reopen(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid_event,
-) -> None:
-    def invalid_receipt(effect, authorize, execute):
-        result = execute(effect, authorize)
-        assert result.disposition == "target"
-        return replace(result, raw={**result.raw, "already_open": True, "reopened_event": invalid_event})
-
-    scenario, effect, operations = recovery_effect(tmp_path, "reopen_ticket", monkeypatch, invalid_receipt)
-    kernel = scenario.kernel
+def test_recovery_comment_requires_original_confirmed_own_reopen(recorded_recovery, invalid_event):
+    kernel, request, world = recorded_recovery
+    original = request.effect.payload["close_receipt"]["raw"]["event"]
+    receipt = EffectResult("target", raw={"issue": 3, "state": "OPEN", "prior_close": original,
+        "already_open": True, "reopened_event": invalid_event})
+    assert kernel._reconcile(request, receipt).kind == "progress"
     with pytest.raises(KernelError, match="foreign_ticket_recovery_receipt"):
-        operations.once()
+        advance_recovery(kernel, request.work, world)
     with kernel.storage.transaction(write=False) as tx:
         assert not tx.rows("SELECT id FROM effects WHERE operation='recovery_comment'")
-        original = tx.one("SELECT * FROM effects WHERE id=?", (effect.effect_id,))
-        assert json.loads(tx.get(original["receipt_id"], effect.subject))["raw"]["reopened_event"] == invalid_event
+        row = tx.one("SELECT * FROM effects WHERE id=?", (request.effect.effect_id,))
+        assert row["status"] == "observed"
+        assert json.loads(tx.get(row["receipt_id"], request.effect.subject))["raw"]["reopened_event"] == invalid_event
 
 
-def test_later_close_ends_original_recovery_ownership_even_after_another_own_reopen(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    responses = []
-
-    def later_close(effect, authorize, execute):
-        original = effect.payload["close_receipt"]["raw"]["event"]
-        latest_close = {**original, "id": original["id"] + 1}
-        latest_reopen = {**original, "id": original["id"] + 2, "event": "reopened"}
-        result = EffectResult("third", raw={"issue": effect.payload["issue"], "state": "OPEN", "prior_close": original,
-            "latest_close": latest_close, "latest_reopen": latest_reopen, "reason": "not_owned"})
-        responses.append(result)
-        return result
-
-    scenario, effect, operations = recovery_effect(tmp_path, "reopen_ticket", monkeypatch, later_close)
-    kernel = scenario.kernel
-    assert operations.once().kind == "progress"
-    executed = []
-    execute = operations.runner.ports.execute
-
-    def recorded(effect, authorize):
-        executed.append(effect)
-        return execute(effect, authorize)
-
-    monkeypatch.setattr(operations.runner.ports, "execute", recorded)
-    assert operations.once().kind == "progress"
-    assert executed[0].operation == "abandon_worktree"
+def test_later_close_ends_original_recovery_ownership_even_after_another_own_reopen(recorded_recovery):
+    kernel, request, world = recorded_recovery
+    original = request.effect.payload["close_receipt"]["raw"]["event"]
+    receipt = EffectResult("third", raw={"issue": 3, "state": "OPEN", "prior_close": original,
+        "latest_close": {**original, "id": original["id"] + 1},
+        "latest_reopen": {**original, "id": original["id"] + 2, "event": "reopened"}, "reason": "not_owned"})
+    assert kernel._reconcile(request, receipt).kind == "progress"
+    assert advance_recovery(kernel, request.work, world).kind == "progress"
+    assert advance_recovery(kernel, request.work, world).kind == "complete"
     with kernel.storage.transaction(write=False) as tx:
         assert not tx.rows("SELECT id FROM effects WHERE operation='recovery_comment'")
-        receipt = tx.one("SELECT receipt_id,status FROM effects WHERE id=?", (effect.effect_id,))
-        assert receipt["status"] == "confirmed"
-        assert json.loads(tx.get(receipt["receipt_id"], effect.subject))["raw"] == responses[0].raw
-    assert not [write for write in scenario.port.writes() if write["operation"] in {"reopen_ticket", "recovery_comment"}]
+        row = tx.one("SELECT status,receipt_id FROM effects WHERE id=?", (request.effect.effect_id,))
+        assert row["status"] == "confirmed"
+        assert json.loads(tx.get(row["receipt_id"], request.effect.subject))["raw"] == receipt.raw

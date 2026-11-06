@@ -188,6 +188,30 @@ def checks_timeout(db, kernel, run, *, kind='required_checks', deadline=90.):
     return scope_id, timeout
 
 
+def test_final_checkpoint_renews_limits_without_rewriting_original_attempt(scenario):
+    db, kernels = scenario
+    kernel = kernels['A']
+    attempt(db, 'A', role='review', purpose='integration')
+    db.execute("UPDATE attempts SET status='consumed',outcome='fail',accounted=1 WHERE run_id='A'")
+    db.execute("UPDATE subjects SET kind='final_run',phase='development',purpose='integration' WHERE run_id='A'")
+    db.execute("UPDATE budgets SET developments_used=1,reviews_used=2,development_limit=1,review_limit=2 WHERE run_id='A' AND purpose='integration'")
+    insert(db, 'gates', {'run_id': 'A', 'subject': SUBJECT, 'code': 'review_budget_exhausted', 'purpose': 'integration'})
+    old = dict(db.execute("SELECT * FROM budgets WHERE run_id='A' AND purpose='integration'").fetchone())
+    original = list(db.execute("SELECT * FROM attempts WHERE run_id='A'"))
+    before_b = rows(db, 'B')
+    overrides = {'run_repair_rounds': 2, 'development_deadline': '13s',
+        'review_deadline': '17s', 'publication_deadline': '19s'}
+    for _ in range(2):
+        assert kernel.control('resume', 'new-window', subject=SUBJECT, policy_overrides=overrides) == 'applied'
+    assert rows(db, 'B') == before_b
+    assert list(db.execute("SELECT * FROM attempts WHERE run_id='A'")) == original
+    assert dict(db.execute("SELECT * FROM budgets WHERE run_id='A' AND purpose='integration' AND window=1").fetchone()) == {**old, 'current': 0}
+    assert db.execute("SELECT window,development_limit,review_limit,developments_used,reviews_used FROM budgets WHERE run_id='A' AND purpose='integration' AND current=1").fetchone()[:] == (2, 2, 3, 0, 0)
+    with kernel.storage.transaction(write=False) as tx:
+        policy = kernel._subject_policy(tx, kernel._job(tx, SUBJECT))
+        assert (policy.development_deadline_seconds, policy.review_deadline_seconds, policy.publication_deadline_seconds) == (13., 17., 19.)
+
+
 def test_explicit_checks_policy_checkpoint_preserves_old_scope_evidence_and_other_budgets(scenario):
     db, kernels = scenario
     db.execute("UPDATE subjects SET phase='checks',purpose='ci'")
@@ -408,12 +432,16 @@ def test_base_advance_returns_only_selected_approval_to_existing_integration(sce
 def test_revise_final_only_renews_its_own_cycle_and_retains_original_review(scenario):
     db, kernels = scenario
     world = approval(db, 'A', final=True)
+    db.execute("UPDATE budgets SET developments_used=1,reviews_used=2 WHERE run_id='A' AND purpose='integration'")
+    old = dict(db.execute("SELECT * FROM budgets WHERE run_id='A' AND purpose='integration'").fetchone())
     before_b = rows(db, 'B')
     assert kernels['A'].control('revise', 'revise-A', subject=SUBJECT, world=world, message='One explicit revision') == 'applied'
     assert rows(db, 'B') == before_b
     assert db.execute("SELECT phase,purpose,repair_source FROM subjects WHERE run_id='A'").fetchone()[:] == ('development', 'integration', 'human_revision')
     assert db.execute("SELECT window FROM budgets WHERE run_id='A' AND purpose='integration' AND current=1").fetchone()[0] == 2
     assert db.execute("SELECT outcome FROM attempts WHERE run_id='A'").fetchone()[0] == 'pass'
+    assert dict(db.execute("SELECT * FROM budgets WHERE run_id='A' AND purpose='integration' AND window=1").fetchone()) == {**old, 'current': 0}
+    assert db.execute("SELECT developments_used,reviews_used FROM budgets WHERE run_id='A' AND purpose='integration' AND current=1").fetchone()[:] == (0, 0)
 
 
 def test_requeue_generation_and_source_revision_do_not_clear_sibling_gates(scenario):

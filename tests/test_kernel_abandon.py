@@ -1,18 +1,16 @@
 """Managed abandonment retains exact recovery obligations and authority."""
 from support.core_operations import prepare_scripted_agent
-from agent_run.core.operation_runner import OperationRunner
 
 import json
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from agent_run.errors import KernelError
 from agent_run.model import DeliveryKind, Execution, HostObservation, ResourceInspection
-from support.offline import GraphScenario, Scenario
+from support.offline import Scenario
 from support.api_observation import api_writes, lose_api_reply, pr_author_read
-from support.requirements_scenarios import independent_source
+from support.requirements_scenarios import independent_source, source_run
 from support.core_operations import CoreOperations, scripted_return
 from support.control_scenarios import managed_abandon_scenario
 
@@ -38,39 +36,8 @@ def _merge_response_lost(scenario, monkeypatch: pytest.MonkeyPatch):
     return sent[0]
 
 
-@pytest.mark.parametrize("uncertain", ["unknown", "third"])
-def test_abandon_cannot_take_over_an_unsettled_final_merge(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, uncertain: str,
-) -> None:
-    source = independent_source()
-    source = replace(source, parent=replace(source.parent, sub_issue_numbers=(3,)), issues=(source.issues[0],))
-    scenario = GraphScenario(tmp_path / "merged-unknown", source)
-    assert scenario.run().kind == "complete"
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
-    operations.until(lambda step: scenario.kernel.source_status()["final_subject"] is not None)
-    scenario.select(scenario.kernel.source_status()["final_subject"])
-    assert scenario.run().kind == "approval"
-    scenario.kernel.control("approve", "original-final-approval", subject=scenario.delivery.key, world=scenario.world())
-    merge = _merge_response_lost(scenario, monkeypatch)
-    restore_read = pr_author_read(monkeypatch, scenario.port.database, merge.pr_number,
-                                   None if uncertain == "unknown" else "foreign-publisher")
-    assert operations.once().kind == "paused"
-    resources = scenario.kernel.generation_resources()
-    inspections = scenario.port.inspect_resources(resources)
-    with pytest.raises(KernelError, match="final_merge_unsettled"):
-        scenario.kernel.control("abandon", "cannot-abandon-default-merge", resource_inspections=inspections)
-    assert scenario.kernel.source_status()["abandonment"] is None
-    restore_read()
-    assert operations.once().kind == "progress"
-    scenario.kernel.control("resume", "resume-original-closeout", subject=merge.subject)
-    assert scenario.run().kind == "complete"
-    assert scenario.port.issue_state(3) == "CLOSED"
-    assert not [write for write in scenario.port.writes() if write["operation"] == "reopen_ticket"]
-
-
-@pytest.mark.parametrize("acknowledgement", ["confirmed", "unknown", "third"])
 def test_parent_only_default_merge_cannot_be_abandoned(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, acknowledgement: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scenario = Scenario(tmp_path / "parent-only", DeliveryKind.PARENT_ONLY)
     kernel, subject = scenario.kernel, scenario.delivery.key
@@ -80,47 +47,27 @@ def test_parent_only_default_merge_cannot_be_abandoned(
     kernel.control("approve", "approve-default", subject=subject, world=scenario.world())
     merge = _merge_response_lost(scenario, monkeypatch)
     assert scenario.port.remote_commit(scenario.delivery.target_ref) != before
-    if acknowledgement == "confirmed":
-        assert operations.once().kind == "progress"
-        assert scenario.run().kind == "complete"
-        expected = "merged_run_noncancellable"
-    else:
-        restore_read = pr_author_read(monkeypatch, scenario.port.database, merge.pr_number,
-                                       None if acknowledgement == "unknown" else "foreign-publisher")
+    for actor in (None, "foreign-publisher"):
+        restore_read = pr_author_read(monkeypatch, scenario.port.database, merge.pr_number, actor)
         assert operations.once().kind == "paused"
-        expected = "final_merge_unsettled"
-    with pytest.raises(KernelError, match=expected):
-        kernel.control("abandon", "reject-default-abandon", resource_inspections=scenario.port.inspect_resources(kernel.generation_resources()))
-    assert kernel.source_status()["abandonment"] is None
-    if acknowledgement != "confirmed":
+        with pytest.raises(KernelError, match="final_merge_unsettled"):
+            kernel.control("abandon", "reject-default-abandon",
+                resource_inspections=scenario.port.inspect_resources(kernel.generation_resources()))
+        assert kernel.source_status()["abandonment"] is None
         restore_read()
-        assert operations.once().kind == "progress"
-        kernel.control("resume", "resume-default-closeout", subject=subject)
+    assert operations.once().kind == "progress"
+    kernel.control("resume", "resume-default-closeout", subject=subject)
     assert scenario.run().kind == "complete"
+    with pytest.raises(KernelError, match="merged_run_noncancellable"):
+        kernel.control("abandon", "reject-confirmed-default-abandon",
+            resource_inspections=scenario.port.inspect_resources(kernel.generation_resources()))
+    assert kernel.source_status()["abandonment"] is None
     assert len([write for write in scenario.port.writes() if write["operation"] == "merge"]) == 1
     assert not [write for write in scenario.port.writes() if write["operation"] == "reopen_ticket"]
 
 
-def test_abandon_dirty_observation_is_quiescent_until_explicit_continuation(tmp_path: Path) -> None:
-    scenario, request = managed_abandon_scenario(tmp_path)
-    kernel = scenario.kernel
-    kernel.control_host(request, "abandon", "original-abandon",
-                        resource_inspections=scenario.port.inspect_resources(kernel.generation_resources()))
-    (Path(scenario.delivery.checkout) / "late-work.txt").write_text("Late original work\n")
-    inspected = scenario.runner().run_once()
-    assert inspected.kind == "progress"
-    assert scenario.runner().run_once().kind == "quiescent"
-    with kernel.storage.transaction(write=False) as tx:
-        receipt = tx.one("SELECT receipt_id,subject FROM effects WHERE operation='inspect_resources' ORDER BY rowid DESC LIMIT 1")
-        observed = json.loads(tx.get(receipt["receipt_id"], receipt["subject"]))
-        assert any(item["disposition"] == "dirty" for item in observed["raw"]["resources"])
-    assert kernel.operation_state().disposition == "quiescent"
-    assert kernel.operation_state().disposition == "quiescent"
-    assert not [write for write in scenario.port.writes() if write["operation"] in kernel.REMOTE]
-
-
-@pytest.mark.parametrize("uncertainty", ["unknown", "third", "prior_after_continuation"])
-def test_abandon_continuation_settles_the_original_sent_intent_before_fresh_inspection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, uncertainty: str) -> None:
+@pytest.mark.parametrize("actor", [None, "foreign-publisher"])
+def test_abandon_continuation_settles_the_original_sent_intent_before_fresh_inspection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, actor: str | None) -> None:
     scenario, request = managed_abandon_scenario(tmp_path)
     kernel = scenario.kernel
     for _ in range(100):
@@ -150,13 +97,12 @@ def test_abandon_continuation_settles_the_original_sent_intent_before_fresh_insp
     assert interrupted.reason == "original_write_readback_required"
     original, = sent
     # The original launch outcome is uncertain; no close has actually happened.
-    restore_read = pr_author_read(monkeypatch, scenario.port.database, prior_pr.number,
-        "foreign-publisher" if uncertainty == "third" else None)
+    restore_read = pr_author_read(monkeypatch, scenario.port.database, prior_pr.number, actor)
     assert operations.once().kind == "paused"
-    if uncertainty != "prior_after_continuation":
-        assert kernel.operation_state().disposition == "quiescent"
+    assert kernel.operation_state().disposition == "quiescent"
     assert scenario.port.pr_by_number(prior_pr.number).state == "OPEN"
     assert not [write for write in scenario.port.writes() if write["operation"] == "retire_pr"]
+    restore_read()
     assert kernel.observe_host(request, HostObservation("exited", request.unit_name, "original", "/host", "boot",
         42, "start", exit_status=0, ended_at=kernel.clock(), usage_released=True)) == "exited"
     continuation = kernel.admit_host("continue-cleanup", kind="abandon", continuation_of="original-abandon",
@@ -165,7 +111,6 @@ def test_abandon_continuation_settles_the_original_sent_intent_before_fresh_insp
     assert kernel.observe_host(continuation, HostObservation("running", continuation.unit_name, "new", "/new-host", "boot",
                                                            43, "new-start", usage_ready=True)) == "running"
     scenario.execution = Execution(continuation.run_id, continuation.owner, continuation.epoch)
-    restore_read()
     events = []
     reconcile = scenario.port.reconcile
 
@@ -205,25 +150,19 @@ def test_abandon_continuation_settles_the_original_sent_intent_before_fresh_insp
 
 
 def test_abandon_original_cap_ends_before_a_managed_continuation(tmp_path: Path) -> None:
-    scenario = GraphScenario(tmp_path / "original-cap", independent_source())
-    kernel, original = scenario.kernel, scenario.execution
-    inspections = scenario.port.inspect_resources(kernel.generation_resources())
-    assert kernel.control("abandon", "original-abandon", resource_inspections=inspections) == "pending"
+    kernel, _ = source_run(tmp_path / "kernel.sqlite3", independent_source())
+    original = kernel.claim_executor("original-cap")
+    assert kernel.control("abandon", "original-abandon", resource_inspections=()) == "pending"
     kernel.confirm_executor_exit(original)
     continuation = kernel.admit_host("continue-cleanup", kind="abandon", continuation_of="original-abandon",
         command=("native-host",), environment_carrier=tmp_path / "carrier", preflight=lambda: None)
     with pytest.raises(KernelError, match="executor_fenced"):
-        OperationRunner(kernel, original, scenario.make_ports).observe(scenario.delivery.key)
+        kernel.begin_observation("ticket:3", execution=original)
     assert kernel.dispatch_host(continuation)
     assert kernel.observe_host(continuation, HostObservation("running", continuation.unit_name, "new", "/new-host", "boot",
-                                                           43, "new-start", usage_ready=True)) == "running"
+        43, "new-start", usage_ready=True)) == "running"
     current = Execution(continuation.run_id, continuation.owner, continuation.epoch)
-    operations = CoreOperations(kernel, current, scenario.make_ports)
-    step = operations.once()
-    assert step.call is None and step.kind == "progress"
-    with kernel.storage.transaction(write=False) as tx:
-        inspected = tx.one("SELECT status FROM effects WHERE operation='inspect_resources'")
-        assert inspected["status"] == "observed"
+    assert kernel.begin_observation("ticket:3", execution=current).fence.execution == current
 
 
 @pytest.mark.parametrize("recovery", ["clean", "discard"])

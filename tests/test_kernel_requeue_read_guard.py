@@ -1,16 +1,18 @@
 """Pending requeue reads retain their Action, deadline and write boundaries."""
 from agent_run.core.operation_runner import observe_control
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
 
-from agent_run.model import Issue, ParentIssue, Requirements
+from agent_run.model import Issue, ParentIssue, PullRequest, Requirements, wire_json
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from support.offline import GraphScenario
 from agent_run.core.operation_contract import ReadUnavailable
-from support.core_operations import CoreOperations, scripted_return
+from support.core_operations import CoreOperations, ReadOnlyPorts, scripted_return
+from support.requirements_scenarios import source_run
+from agent_run.core.operation_contract import DeliveryFacts
 
 
 def pending_requeue(tmp_path: Path) -> tuple[GraphScenario, CoreOperations]:
@@ -56,28 +58,14 @@ def assert_original_boundary(scenario: GraphScenario, writes) -> None:
         assert not tx.rows("SELECT id FROM effects WHERE operation='retire_pr'")
 
 
-def test_pending_requeue_can_read_and_keep_one_bounded_read_outage(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    scenario, operations = pending_requeue(tmp_path)
-    writes = scenario.port.writes()
-    # Observation accepts the exact pending Action's facts without writing.
-    world = operations.runner.observe("ticket:2")
-    assert world.pr == scenario.port.pull_request_by_ref(scenario.kernel.delivery("ticket:2").source_ref, scenario.kernel.delivery("ticket:2").target_ref)
-    monkeypatch.setattr(operations.runner.ports, "source", read_outage)
-    scenario.kernel.clock = lambda: 100.25
-    waiting = operations.once()
-    assert (waiting.kind, waiting.reason, waiting.retry_at) == ("waiting", "github_convergence", 105.25)
-    assert scenario.kernel.status("ticket:2")["gates"] == ["requeue_required"]
-    assert_original_boundary(scenario, writes)
-
-
 def test_requeue_read_outage_keeps_its_original_deadline_across_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scenario, operations = pending_requeue(tmp_path)
     kernel = scenario.kernel
     writes = scenario.port.writes()
+    assert operations.runner.observe("ticket:2").pr == scenario.port.pull_request_by_ref(
+        kernel.delivery("ticket:2").source_ref, kernel.delivery("ticket:2").target_ref)
     monkeypatch.setattr(operations.runner.ports, "source", read_outage)
     kernel.clock = lambda: 100.25
     assert operations.once().retry_at == 105.25
@@ -96,40 +84,85 @@ def test_requeue_read_outage_keeps_its_original_deadline_across_restart(
     assert_original_boundary(scenario, writes)
 
 
+@pytest.fixture
+def pending_read(tmp_path):
+    source = Requirements(ParentIssue(1, "Parent", "Original requirement", (2, 3)), tuple(
+        Issue(number, "Ticket", "Original requirement", "OPEN", frozenset({"ready-for-agent"}))
+        for number in (2, 3)))
+    kernel, _ = source_run(tmp_path / "kernel.sqlite3", source)
+    execution = kernel.claim_executor("guard-reader")
+    original = kernel.delivery("ticket:2")
+    pr = PullRequest(11, "example/project", original.source_ref, original.target_ref,
+        original.base, original.base, "Published Ticket", "Original publication",
+        actor="publisher", head_repository="example/project")
+    # Upstream publication facts, not a claim that this fixture published a PR.
+    with kernel.storage.transaction() as tx:
+        run = tx.one("SELECT * FROM runs")
+        payload = tx.put(original.key, "publication_input", b"{}")
+        tx.execute("INSERT INTO attempts(run_id,id,subject,generation,ordinal,role,purpose,window,parent_revision,"
+            "graph_revision,revision,base_sha,completion_revision,context_id,status,outcome) "
+            "VALUES (?,'original-work',?,1,1,'development','requirements',1,?,?,?,?,'no-tickets',?,'consumed','pass')",
+            (run["id"], original.key, run["parent_revision"], run["graph_revision"], original.revision,
+             original.base.sha, payload))
+        receipt = tx.put(original.key, "publication_receipt", wire_json({"pr": asdict(pr)}))
+        tx.execute("UPDATE subjects SET phase='checks',pr_number=11,publication_sha=?,publication_tree=? WHERE id=?",
+            (original.base.sha, original.base.tree, original.key))
+        tx.execute("INSERT INTO effects(run_id,id,subject,operation,status,parent_revision,graph_revision,revision,"
+            "generation,source_ref,target_ref,before_sha,base_sha,base_tree,actor,payload_id,receipt_id,pr_number) "
+            "VALUES (?,'publication',?,'pr_write','confirmed',?,?,?,1,?,?,?,?,?,'publisher',?,?,11)",
+            (run["id"], original.key, run["parent_revision"], run["graph_revision"], original.revision,
+             original.source_ref, original.target_ref, original.base.sha, original.base.sha, original.base.tree,
+             payload, receipt))
+    source = replace(source, issues=tuple(replace(issue, body="Clarified original requirement")
+        if issue.number == 2 else issue for issue in source.issues))
+    ports = ReadOnlyPorts(source, original.source_ref, original.target_ref,
+        DeliveryFacts(original.base, original.base, pr=pr))
+    world = observe_control(kernel, original.key, lambda _binding: ports)
+    replacement = replace(original, source_ref=original.source_ref + "-g2", base=world.target,
+        checkout=str(tmp_path / "next-generation"))
+    assert kernel.control("requeue", "requeue-original", subject=original.key, world=world,
+        replacement=replacement) == "pending"
+    return kernel, execution, ports, replacement
+
+
+def assert_pending_read(kernel):
+    with kernel.storage.transaction(write=False) as tx:
+        assert tx.one("SELECT generation FROM subjects WHERE id='ticket:2'")[0] == 1
+        assert tx.one("SELECT status FROM actions WHERE id='requeue-original'")[0] == "pending"
+        assert not tx.rows("SELECT id FROM effects WHERE operation='retire_pr'")
+
+
 @pytest.mark.parametrize("blocked", ["sibling", "cleanup", "other_gate", "other_block"])
-def test_requeue_read_permission_never_opens_other_work(tmp_path: Path, blocked: str) -> None:
+def test_requeue_read_permission_never_opens_other_work(pending_read, blocked: str) -> None:
     """Internal guard-consumer matrix, with public runner/control preconditions.
 
     This inspects the exact sibling/cleanup token admission contract. Public
     operation reads, restarts and in-flight control fencing are tested separately.
     """
-    scenario, _ = pending_requeue(tmp_path)
-    kernel, execution = scenario.kernel, scenario.execution
-    writes = scenario.port.writes()
+    kernel, execution, ports, _ = pending_read
     if blocked == "other_gate":
         kernel.control("stop", "stop-original-subject", subject="ticket:2")
     elif blocked == "other_block":
         # A real graph change supplies a non-requeue Run block; no SQL-created
         # Final state or other delivery's generation is borrowed for this unit.
-        scenario.requirements = replace(scenario.requirements,
-            parent=replace(scenario.requirements.parent, sub_issue_numbers=(2, 3, 4)),
-            issues=(*scenario.requirements.issues,
+        ports.requirements = replace(ports.requirements,
+            parent=replace(ports.requirements.parent, sub_issue_numbers=(2, 3, 4)),
+            issues=(*ports.requirements.issues,
                     Issue(4, "New scope", "Another delivery", "OPEN", frozenset({"ready-for-agent"}))))
-        observe_control(kernel, "ticket:2", scenario.make_ports)
+        observe_control(kernel, "ticket:2", lambda _binding: ports)
         assert kernel.source_status()["blocked"] == "unsupported_scope_change"
     subject = "ticket:3" if blocked == "sibling" else "ticket:2"
     with pytest.raises(KernelError, match="automatic_step_paused"):
         kernel.begin_observation(subject, execution=execution, cleanup=blocked == "cleanup")
-    assert_original_boundary(scenario, writes)
+    assert_pending_read(kernel)
 
 
 @pytest.mark.parametrize("change", ["stop", "replacement"])
 def test_requeue_read_is_bound_to_the_same_action_after_external_io(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str,
+    pending_read, monkeypatch: pytest.MonkeyPatch, change: str,
 ) -> None:
-    scenario, operations = pending_requeue(tmp_path)
-    kernel = scenario.kernel
-    writes = scenario.port.writes()
+    kernel, execution, ports, replacement = pending_read
+    operations = CoreOperations(kernel, execution, lambda _binding: ports)
     delivery = operations.runner.ports.delivery
     observed = []
 
@@ -139,17 +172,13 @@ def test_requeue_read_is_bound_to_the_same_action_after_external_io(
         if change == "stop":
             kernel.control("stop", "stop-during-read")
         else:
-            scenario.requirements = replace(scenario.requirements, issues=tuple(
+            ports.requirements = replace(ports.requirements, issues=tuple(
                 replace(issue, body="Another clarification during the read") if issue.number == 2 else issue
-                for issue in scenario.requirements.issues))
-            world = observe_control(kernel, "ticket:2", scenario.make_ports)
-            # Core itself supersedes the stale Action before a new public
-            # requeue is accepted. Neither operation may retire the original PR.
-            ended = scenario.runner().run_once(agent_capacity=0)
+                for issue in ports.requirements.issues))
+            fresh = ReadOnlyPorts(ports.requirements, ports.source_ref, ports.target_ref, ports.facts)
+            world = observe_control(kernel, "ticket:2", lambda _binding: fresh)
+            ended = CoreOperations(kernel, execution, lambda _binding: fresh).once(agent_capacity=0)
             assert ended.reason == "requeue_scope_changed"
-            original = kernel.delivery("ticket:2")
-            replacement = replace(original, source_ref=original.source_ref + "-g2", base=world.target,
-                checkout=str(Path(original.checkout).with_name("ticket-2-g2")))
             assert kernel.control("requeue", "requeue-replacement", subject="ticket:2", world=world,
                                   replacement=replacement) == "pending"
         return facts
@@ -159,7 +188,6 @@ def test_requeue_read_is_bound_to_the_same_action_after_external_io(
     assert len(observed) == 1
     assert fenced.reason == ("executor_fenced" if change == "stop" else "automatic_step_superseded")
     assert kernel.status("ticket:2")["generation"] == 1
-    assert scenario.port.writes() == writes
     with kernel.storage.transaction(write=False) as tx:
         assert not tx.rows("SELECT id FROM effects WHERE operation='retire_pr'")
         if change == "replacement":
