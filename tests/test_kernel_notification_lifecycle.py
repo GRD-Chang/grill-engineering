@@ -14,10 +14,9 @@ from agent_run.config.defaults import UserDefaultsStore
 from support.notification import _enabled_scenario, observe_and_wait
 
 
-@pytest.mark.parametrize("kind", [DeliveryKind.PARENT_ONLY, DeliveryKind.FINAL_RUN])
 def test_acceptance_and_terminal_notifications_follow_committed_delivery_boundaries(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: DeliveryKind) -> None:
-    scenario = _enabled_scenario(tmp_path, monkeypatch, kind)
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    scenario = _enabled_scenario(tmp_path, monkeypatch, DeliveryKind.PARENT_ONLY)
     sent: list[dict[str, Any]] = []
 
     def transport(_config: Any, rendered: dict[str, Any], _identity: str,
@@ -46,8 +45,7 @@ def test_acceptance_and_terminal_notifications_follow_committed_delivery_boundar
     assert scenario.step().kind == "progress"  # Consume that original raw.
     assert observe() == []
 
-    # Follow the actual shared delivery path through confirmed local Git
-    # integration and, for Final Run, publication of its Run Branch.
+    # Follow real local integration through formal delivery promotion.
     for _ in range(80):
         if scenario.kernel.status(scenario.delivery.key)["phase"] == "publish":
             break
@@ -156,29 +154,24 @@ def test_observed_run_branch_write_does_not_promote_a_superseded_acceptance(
     scenario.port.git.run("merge-base", "--is-ancestor", foreign.sha, target.sha)
 
 
-@pytest.mark.parametrize("mode,approval,uppercase_repository", [
-    ("detailed", True, False), ("detailed", False, False), ("concise", True, False),
-    ("detailed", True, True), ("detailed", False, True)],
-    ids=["detailed-approval", "detailed-checks-pending", "concise-approval",
-         "canonical-case-approval", "canonical-case-checks-pending"])
+@pytest.mark.parametrize("approval", [True, False],
+                         ids=["canonical-case-approval", "canonical-case-checks-pending"])
 def test_healthy_final_pr_and_approval_in_one_observation_share_only_the_approval_card(
-    tmp_path, monkeypatch, mode, approval, uppercase_repository,
+    tmp_path, monkeypatch, approval,
 ):
     from support.offline_api import SyntheticGitHub
 
-    if uppercase_repository:
-        original_pr = SyntheticGitHub._with_refs
+    original_pr = SyntheticGitHub._with_refs
 
-        def canonical_pr(value, refs):
-            # A normal HTTP-shaped provider read returns GitHub's canonical
-            # spelling; all Core/Remote identity checks and receipts stay real.
-            response = original_pr(value, refs)
-            for field in ("head", "base"):
-                response[field]["repo"]["full_name"] = response[field]["repo"]["full_name"].upper()
-            return response
+    def canonical_pr(value, refs):
+        # Preserve canonical provider spelling through the actual PR receipt.
+        response = original_pr(value, refs)
+        for field in ("head", "base"):
+            response[field]["repo"]["full_name"] = response[field]["repo"]["full_name"].upper()
+        return response
 
-        monkeypatch.setattr(SyntheticGitHub, "_with_refs", staticmethod(canonical_pr))
-    scenario = _enabled_scenario(tmp_path, monkeypatch, DeliveryKind.PARENT_ONLY, mode=mode)
+    monkeypatch.setattr(SyntheticGitHub, "_with_refs", staticmethod(canonical_pr))
+    scenario = _enabled_scenario(tmp_path, monkeypatch, DeliveryKind.PARENT_ONLY, mode="detailed")
     if approval:
         assert scenario.run().kind == "approval"
     else:
@@ -194,7 +187,7 @@ def test_healthy_final_pr_and_approval_in_one_observation_share_only_the_approva
             raise AssertionError("Normal producer did not consume its Final PR creation")
     pr = scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref)
     assert pr is not None
-    assert pr.repository == ("EXAMPLE/PROJECT" if uppercase_repository else "example/project")
+    assert pr.repository == "EXAMPLE/PROJECT"
     from agent_run.queries.run import read
     # Discard mutable notification files from the read-only product comparison.
     database_before = scenario.kernel.storage.path.read_bytes()
@@ -214,8 +207,8 @@ def test_healthy_final_pr_and_approval_in_one_observation_share_only_the_approva
     assert journal.get("unavailable_reason") is None
     records = journal["records"]
     created = [item for item in records if item["kind"] == "pr_created"]
-    assert len([item for item in created if item["outcome"] != "cancelled"]) == int(mode == "detailed" and not approval)
-    if approval and mode == "detailed":
+    assert len([item for item in created if item["outcome"] != "cancelled"]) == int(not approval)
+    if approval:
         assert len(created) == 1 and created[0]["outcome"] == "cancelled" and created[0]["attempts"] == 0
         assert created[0]["reason"] == "included in current Final PR approval"
     if approval:

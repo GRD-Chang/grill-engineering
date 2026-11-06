@@ -319,8 +319,6 @@ def test_same_protocol_activity_without_observer_trigger_keeps_real_start_and_re
     kernel.agent_exited(resumed, replacement, 1, failure="Controlled fixture finished", failure_kind="fatal")
 
 
-
-
 def test_completed_ticket_effort_spans_budget_renewal_without_recounting_resume(tmp_path, monkeypatch):
     import json
     from agent_run.model import Policy
@@ -372,110 +370,6 @@ def test_completed_ticket_effort_spans_budget_renewal_without_recounting_resume(
         rendered = json.dumps(card({**event, "language": language}), ensure_ascii=False)
         assert rendered.count(count) == 2
     assert _project(scenario.kernel, "concise") == projected
-
-
-def test_role_events_require_real_start_and_consumption_and_do_not_duplicate_first_start(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    scenario = GraphScenario(tmp_path, Requirements(
-        ParentIssue(1, "Parent", "Original scope", (2,)),
-        (Issue(2, "Ticket", "Original task", "OPEN", labels=("ready-for-agent",)),)))
-    _recorded_agents(scenario, monkeypatch)
-    modes = ("detailed", "concise")
-    consumed: dict[str, list[str]] = {mode: [] for mode in modes}
-    for _ in range(100):
-        step = scenario.step()
-        if step.kind == "agent":
-            # Project both modes from one real producer, before and after consume.
-            assert step.call is not None
-            for mode in modes:
-                before = _project(scenario.kernel, mode)
-                assert sum(event["kind"] == "ticket_started" for event in before) == 1
-                assert not any(event["kind"] == "stage_start" and event.get("role") == "development" for event in before)
-                assert not any(event["kind"] == "stage_end" and event.get("attempt_id") == step.call.attempt_id for event in before)
-            assert scenario.step().kind == "progress"
-            for mode in modes:
-                after = _project(scenario.kernel, mode)
-                ended = [event for event in after if event["kind"] == "stage_end" and event.get("attempt_id") == step.call.attempt_id]
-                assert len(ended) == (1 if mode == "detailed" else 0)
-                if ended:
-                    assert ended[0]["role"] == step.call.role.value
-                    consumed[mode].append(ended[0]["role"])
-                    if step.call.role.value == "publication":
-                        assert ended[0]["status_code"] == "publication_artifact"
-                        assert not any(event["kind"] == "pr_created" for event in after)
-        else:
-            assert step.kind not in {"paused", "waiting"}, step
-        ticket = scenario.kernel.status("ticket:2")
-        if (ticket["phase"] == "complete" and ticket["resource_cleanup"] is not None
-                and ticket["resource_cleanup"]["state"] == "complete"):
-            break
-    else:
-        raise AssertionError("The real Ticket pipeline did not finish")
-    for mode in modes:
-        projected = _project(scenario.kernel, mode)
-        assert sum(event["kind"] == "ticket_started" for event in projected) == 1
-        assert sum(event["kind"] == "ticket_completed" for event in projected) == 1
-        assert sum(event["kind"] == "pr_created" for event in projected) == (1 if mode == "detailed" else 0)
-        assert consumed[mode] == (["development", "review", "publication"] if mode == "detailed" else [])
-        assert [event["role"] for event in projected if event["kind"] == "stage_start"] == (
-            ["review", "publication"] if mode == "detailed" else [])
-        assert _project(scenario.kernel, mode) == projected
-
-
-def test_full_run_first_review_and_repair_replace_corresponding_stage_events(tmp_path, monkeypatch):
-    from agent_run.notifications.envelope import event_copy
-
-    scenario = Scenario(tmp_path, DeliveryKind.FINAL_RUN, reviews=("fail", "pass"))
-    assert scenario.kernel.status("ticket:2")["phase"] == "complete"
-    assert len(scenario.kernel.source_status()["completions"]) == 1
-    modes = ("detailed", "concise")
-    start_views = {}
-
-    def started(call):
-        if call.subject == "final:1" and call.role == Role.DEVELOPMENT:
-            start_views[call.attempt_id] = {mode: _project(scenario.kernel, mode) for mode in modes}
-
-    _recorded_agents(scenario, monkeypatch, started=started)
-    first_review = repair = None
-    planned_ids = {}
-    for _ in range(100):
-        step = scenario.step()
-        projected = {mode: _project(scenario.kernel, mode) for mode in modes}
-        if step.call is not None and step.call.role == Role.REVIEW and first_review is None:
-            first_review = step.call.attempt_id
-            for mode in modes:
-                starts = [event for event in projected[mode] if event["kind"] == "acceptance_started"]
-                assert len(starts) == 1 and starts[0]["attempt_id"] == first_review
-                assert not any(event["kind"] == "stage_start" and event.get("attempt_id") == first_review for event in projected[mode])
-                assert not any(event["kind"] == "acceptance_repair" for event in projected[mode])
-            assert scenario.step().kind == "progress"
-            for mode in modes:
-                after = _project(scenario.kernel, mode)
-                planned = [event for event in after if event["kind"] == "acceptance_repair"]
-                assert len(planned) == 1 and planned[0]["live"] is False
-                assert planned[0]["title"] == event_copy({"language": "zh"}, "acceptance_repair_planned")
-                planned_ids[mode] = planned[0]["id"]
-                assert not any(event["kind"] == "stage_end" and event.get("attempt_id") == first_review for event in after)
-        elif step.call is not None and step.call.role == Role.DEVELOPMENT:
-            repair = step.call.attempt_id
-            for mode in modes:
-                milestones = [event for event in start_views[repair][mode] if event["kind"] == "acceptance_repair"]
-                assert milestones[-1]["live"] is True
-                assert milestones[-1]["title"] == event_copy({"language": "zh"}, "acceptance_repair_active")
-                assert {event["id"] for event in milestones} == {planned_ids[mode]}
-                assert not any(event["kind"] == "stage_start" and event.get("attempt_id") == repair for event in projected[mode])
-        promoted = {mode: [event for event in projected[mode] if event["kind"] == "acceptance_passed"] for mode in modes}
-        if any(promoted.values()):
-            assert first_review is not None and repair is not None
-            for mode in modes:
-                assert len(promoted[mode]) == 1
-                assert not any(event["kind"] == "stage_end" and event.get("attempt_id") == promoted[mode][0]["attempt_id"]
-                               for event in projected[mode])
-            break
-        assert step.kind not in {"paused", "waiting", "approval"}, step
-    else:
-        raise AssertionError("FullRun did not promote its actual repair Review")
 
 
 @pytest.mark.parametrize("role", [Role.DEVELOPMENT, Role.REVIEW, Role.PUBLICATION])

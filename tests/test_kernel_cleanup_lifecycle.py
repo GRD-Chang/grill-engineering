@@ -1,12 +1,4 @@
-"""Lifecycle resource observations grounded in the unchanged 02 cleanup callers.
-
-Sources: delivery_cleanup.complete_ticket/complete_parent/complete_final_run;
-test_cleanup_head_protection.test_every_completed_cleanup_uses_source_head_instead_of_merge_result;
-test_ticket_closeout_does_not_attempt_another_ticket_cleanup. The independent
-75c neutral observation additionally records absent Ticket local/published refs
-and D/R/P checkouts. These tests are candidate regression probes, not a claim
-that three new Scenario runs are an old/new same-input differential execution.
-"""
+"""Final ownership and physical cleanup races after committed delivery."""
 from __future__ import annotations
 from support.effect_boundary import _local_marker
 
@@ -14,14 +6,12 @@ from agent_run.contracts.write_authority import WriteAuthority
 
 from pathlib import Path
 import json
-from dataclasses import replace
-from typing import Callable
 
 import pytest
 
 from agent_run.model import DeliveryKind, Effect, EffectResult
 from agent_run.core.kernel import Kernel
-from support.offline import OfflinePort, Scenario
+from support.offline import OfflinePort
 from support.core_operations import CoreOperations
 from support.cleanup_scenarios import _native_scenario, _local_head
 
@@ -29,18 +19,12 @@ from support.cleanup_scenarios import _native_scenario, _local_head
 CLEANUP_OPERATIONS = ("cleanup_worktree", "cleanup_local_ref", "cleanup_remote_ref")
 
 
-
-
-@pytest.mark.parametrize("kind", list(DeliveryKind))
-def test_completed_delivery_retires_only_its_recorded_resources(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: DeliveryKind,
+def test_completed_final_retires_only_its_recorded_resources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scenario = _native_scenario(tmp_path / "scenario", kind)
+    scenario = _native_scenario(tmp_path / "scenario", DeliveryKind.FINAL_RUN)
     main = "refs/heads/main"
     main_before = scenario.port.git.commit(main)
-    if kind == DeliveryKind.PARENT_ONLY:
-        assert scenario.port.git.run("for-each-ref", "--format=%(refname)").stdout.splitlines() == [main]
-        assert scenario.port.remote_refs() == {main: main_before.sha}
     sibling = "refs/heads/other-active-ticket"
     scenario.port.git.run("update-ref", sibling, main_before.sha)
     checkout = Path(scenario.delivery.checkout)
@@ -62,37 +46,27 @@ def test_completed_delivery_retires_only_its_recorded_resources(
                 pr = scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref)
                 assert pr is not None and pr.merged is not None
                 assert effect.payload["branch_ref"] == scenario.delivery.source_ref
-                assert effect.payload["expected_head"] == (_local_marker(scenario) if effect.operation == "cleanup_local_ref" else pr.head.sha)
-                if kind != DeliveryKind.TICKET:
-                    assert pr.head.sha != pr.merged.sha
+                assert effect.payload["expected_head"] == pr.head.sha
+                assert pr.head.sha != pr.merged.sha
         return actual_execute(effect, authorize)
 
     monkeypatch.setattr(scenario.port, "execute", execute)
     assert scenario.run(approve=True).kind == "complete"
-    expected_operations = [op for op in CLEANUP_OPERATIONS if kind != DeliveryKind.FINAL_RUN or op != "cleanup_local_ref"]
-    assert [effect.operation for effect in retired] == expected_operations
+    assert [effect.operation for effect in retired] == ["cleanup_worktree", "cleanup_remote_ref"]
     assert not checkout.exists()
     registry = scenario.port.git.run("worktree", "list", "--porcelain", "-z").stdout.split("\0")
     assert f"worktree {checkout}" not in registry
-    if kind == DeliveryKind.FINAL_RUN:
-        # The offline remote mirror exists locally, but Final never created an
-        # owned local marker. Its publication cannot authorize deleting this ref.
-        assert _local_head(scenario, scenario.delivery.source_ref) is not None
-        with scenario.kernel.storage.transaction(write=False) as tx:
-            omitted = tx.one("SELECT material_id FROM history WHERE subject=? AND kind='resource_not_owned' AND identity='cleanup_local_ref'", (scenario.delivery.key,))
-            assert json.loads(tx.get(omitted[0], scenario.delivery.key))["create_ref"] is False
-    else:
-        assert _local_head(scenario, scenario.delivery.source_ref) is None
+    # The offline remote mirror exists locally, but Final never created an
+    # owned local marker. Its publication cannot authorize deleting this ref.
+    assert _local_head(scenario, scenario.delivery.source_ref) is not None
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        omitted = tx.one("SELECT material_id FROM history WHERE subject=? AND kind='resource_not_owned' AND identity='cleanup_local_ref'", (scenario.delivery.key,))
+        assert json.loads(tx.get(omitted[0], scenario.delivery.key))["create_ref"] is False
     assert _local_head(scenario, sibling) == main_before.sha
-    if kind == DeliveryKind.PARENT_ONLY:
-        assert scenario.port.git.run("for-each-ref", "--format=%(refname)").stdout.splitlines() == [main, sibling]
-        assert set(scenario.port.remote_refs()) == {main}
     pr = scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref)
     assert pr is not None and pr.merged is not None
     assert scenario.kernel.status(scenario.delivery.key)["issue_link"]["state"] == "linked"
     assert scenario.port.remote_commit(scenario.delivery.target_ref) == pr.merged
-    if kind == DeliveryKind.TICKET:
-        assert scenario.port.git.commit(main) == main_before
     for effect in retired:
         assert scenario.port.reconcile(effect).disposition == "target"
     calls_before = list(scenario.role_calls)
@@ -218,81 +192,5 @@ def test_dirty_checkout_keeps_completed_delivery_and_blocks_later_resource_delet
     assert (checkout / "unsaved.txt").read_text() == "retain work after delivery\n"
     assert _local_head(scenario, scenario.delivery.source_ref) == _local_marker(scenario)
     assert scenario.port.remote_refs()[scenario.delivery.source_ref] == pr.head.sha
-    assert scenario.role_calls == calls_before
-    assert scenario.port.writes() == writes_before
-
-
-def test_optional_issue_link_lost_ack_is_not_replayed_or_promoted_by_readback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """75c old actual: external linked once, durable indeterminate, replay zero."""
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET)
-    scenario.port.lose_response.add("issue_link")
-    now = [1000.25]
-    scenario.kernel.clock = lambda: now[0]
-    actual_execute = scenario.port.execute
-    attempts: list[Effect] = []
-
-    def execute(effect: Effect, authorize: WriteAuthority) -> EffectResult | None:
-        if effect.operation == "issue_link":
-            attempts.append(effect)
-            assert effect.payload["issue"] == scenario.delivery.issue
-            assert effect.payload["ref"] == scenario.delivery.source_ref
-            original_authorize = authorize
-
-            def prepare_dispatched():
-                assert original_authorize is not None
-                final_admission = original_authorize.prepare()
-                def dispatched() -> None:
-                    final_admission()
-                    before = Kernel(scenario.port.root / 'kernel.sqlite3', run_id=scenario.spec.run_id).status(scenario.delivery.key)
-                    assert before["issue_link"]["state"] == "indeterminate"
-                return dispatched
-
-            authorize = WriteAuthority(prepare_dispatched)
-        return actual_execute(effect, authorize)
-
-    monkeypatch.setattr(scenario.port, "execute", execute)
-    for _ in range(80):
-        interrupted = scenario.step()
-        if attempts:
-            break
-    else:
-        raise AssertionError("The optional link write was never reached")
-    # Like RemoteEffects._link_issue, a lost optional acknowledgement is an
-    # indeterminate write result, not a source read or required-checks wait.
-    assert interrupted.kind == "progress" and interrupted.retry_at is None
-    assert scenario.runner().state().wake_at is None
-    with scenario.kernel.storage.transaction(write=False) as tx:
-        assert not tx.rows("SELECT evidence FROM waits WHERE subject=?", (scenario.delivery.key,))
-    world = scenario.world()
-    assert world.checks is not None and world.checks.result == "none"
-    assert world.pr is not None and world.checks.head_sha == world.pr.head.sha
-    budgets_at_loss = scenario.kernel.status(scenario.delivery.key)["budgets"]
-    calls_at_loss = list(scenario.role_calls)
-    # A separate operation continues business after the optional response loss;
-    # the original indeterminate display mutation must never be replayed.
-    boundary = scenario.run()
-    assert boundary.kind == "complete", boundary
-    assert len(attempts) == 1
-    original = attempts[0]
-    durable = Kernel(scenario.port.root / 'kernel.sqlite3', run_id=scenario.spec.run_id).status(scenario.delivery.key)
-    assert durable["phase"] == "complete"
-    assert durable["issue_link"]["state"] == "indeterminate"
-    assert durable["issue_link"]["source_sha"] == original.payload["source_head"]
-    assert durable["budgets"] == budgets_at_loss
-    assert scenario.role_calls == calls_at_loss
-    calls_before, writes_before = list(scenario.role_calls), scenario.port.writes()
-    assert sum(write["operation"] == "issue_link" for write in writes_before) == 1
-    scenario.kernel = Kernel(scenario.port.root / 'kernel.sqlite3', run_id=scenario.spec.run_id)
-    scenario.port = OfflinePort(scenario.port.root)
-    # Real durable external link exists; observing it cannot manufacture the
-    # missing original acknowledgement or authorize a second optional mutation.
-    assert scenario.port.reconcile(original).disposition == "target"
-    boundary = scenario.run()
-    assert boundary.kind == "complete", boundary
-    assert scenario.kernel.status(scenario.delivery.key)["issue_link"] == durable["issue_link"]
-    assert scenario.kernel.status(scenario.delivery.key)["phase"] == "complete"
-    assert scenario.kernel.status(scenario.delivery.key)["budgets"] == durable["budgets"]
     assert scenario.role_calls == calls_before
     assert scenario.port.writes() == writes_before

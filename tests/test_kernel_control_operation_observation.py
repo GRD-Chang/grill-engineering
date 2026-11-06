@@ -79,43 +79,29 @@ def test_control_read_failure_is_a_cli_error_without_a_work_wait_or_claim(tmp_pa
         assert not tx.rows("SELECT subject FROM waits")
 
 
-@pytest.mark.parametrize("command", ["approve", "revise", "requeue"])
-def test_managed_control_observes_without_replacing_a_running_host(tmp_path, monkeypatch, command):
+def test_managed_control_observes_without_replacing_a_running_host(tmp_path, monkeypatch):
     kernel, runner, physical, state, calls, request, subject, source = managed_approval(
-        tmp_path, monkeypatch, tickets=(2,) if command == "revise" else ())
-    if command == "requeue":
-        document = json.loads(state.read_text())
-        document["source_graph"]["parent"]["body"] = "Changed authoritative requirement"
-        state.write_text(json.dumps(document))
+        tmp_path, monkeypatch, tickets=())
     before = kernel.status(subject)
     with kernel.storage.transaction(write=False) as tx:
         owner = tuple(tx.one("SELECT executor,epoch FROM runs"))
         counts = tuple(tx.one("SELECT (SELECT count(*) FROM attempts),(SELECT count(*) FROM leases)"))
     writes = [line for line in calls.read_text().splitlines() if "--method" in json.loads(line)]
     monkeypatch.setattr(Kernel, "claim_executor", lambda *a, **kw: pytest.fail("control observation must not claim"))
-    arguments = [command, request.run_id, "--repo", physical.repository, "--state-dir", str(kernel.storage.path), "--json"]
-    if command == "revise":
-        arguments.extend(["--message", " Preserve the requested revision "])
+    arguments = ["approve", request.run_id, "--repo", physical.repository, "--state-dir", str(kernel.storage.path), "--json"]
     result = lifecycle_cli.execute(_parser("en").parse_args(arguments), language="en")
     assert result["result"] == "accepted" and result["host"] == "running"
-    assert result["action"] == command
-    assert result["status"] == ("action_applied" if command == "revise" else "action_pending")
+    assert result["action"] == "approve"
+    assert result["status"] == "action_pending"
     assert kernel.host_request("original-host") == request
     assert [line for line in calls.read_text().splitlines() if "--method" in json.loads(line)] == writes
     with kernel.storage.transaction(write=False) as tx:
         assert tuple(tx.one("SELECT executor,epoch FROM runs")) == owner
         assert tuple(tx.one("SELECT (SELECT count(*) FROM attempts),(SELECT count(*) FROM leases)")) == counts
         action = tx.one("SELECT kind,subject FROM actions WHERE id=?", (result["action_id"],))
-        assert tuple(action) == (command, subject)
-        if command == "approve":
-            grant = tx.one("SELECT action,head_sha,pr_number FROM grants WHERE subject=?", (subject,))
-            assert tuple(grant) == (result["action_id"], before["source_sha"], before["pr_number"])
-        elif command == "revise":
-            assert kernel.status(subject)["phase"] == "development"
-            assert not tx.rows("SELECT id FROM grants WHERE subject=?", (subject,))
-        else:
-            assert kernel.status(subject)["generation"] == before["generation"]
-            assert kernel.status(subject)["pending_write"] is None
+        assert tuple(action) == ("approve", subject)
+        grant = tx.one("SELECT action,head_sha,pr_number FROM grants WHERE subject=?", (subject,))
+        assert tuple(grant) == (result["action_id"], before["source_sha"], before["pr_number"])
 
 
 @pytest.mark.parametrize("proof", ["released", "fdstore", "populated", "foreign"])

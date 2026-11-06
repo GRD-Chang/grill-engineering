@@ -19,13 +19,9 @@ from support.control_scenarios import managed_parent
 from support.remote_effects import _change
 
 
-# Cover both recovery triggers and delivery shapes through the public CLI.
-# The target/Parent case also keeps the real stop, exit fence and reclaim path.
-@pytest.mark.parametrize("change,tickets", [("target", ()), ("ci", (2,))],
-                         ids=["target-parent", "ci-final"])
-def test_idle_public_approve_starts_existing_recovery_without_a_merge_grant(tmp_path, monkeypatch, change, tickets):
+def test_public_approve_recovers_target_then_ci_on_the_same_pr_without_a_merge_grant(tmp_path, monkeypatch):
     kernel, _old_runner, physical, state, calls, original, subject, _source = managed_approval(
-        tmp_path, monkeypatch, tickets=tickets)
+        tmp_path, monkeypatch, tickets=())
     fake = tmp_path / "transport" / "bin" / "gh"
     # GitHub moves an open PR's head after a real push. This older transport
     # fixture otherwise leaves the creation-time SHA frozen indefinitely.
@@ -40,19 +36,15 @@ def test_idle_public_approve_starts_existing_recovery_without_a_merge_grant(tmp_
     assert kernel.observe_host(original, replace(observed, disposition="exited", exit_status=0,
         ended_at=111.0, usage_ready=False, usage_released=True)) == "exited"
     assert kernel.active_host_action() is None and kernel.operation_state().active == ()
-    if change == "target":
-        external = tmp_path / "external"
-        physical.git.run("clone", "--branch", "main", str(tmp_path / "transport" / "origin.git"), str(external))
-        git = LocalGit(external)
-        git.run("config", "user.name", "Independent contributor")
-        git.run("config", "user.email", "independent@example.invalid")
-        (external / "target-append.txt").write_text("Independent target change\n")
-        git.run("add", "target-append.txt")
-        git.run("commit", "-m", "Advance the legitimate target")
-        git.run("push", "origin", "HEAD:refs/heads/main")
-    else:
-        _change(state, checks=[{"name": "required", "workflow": "CI", "bucket": "fail",
-            "state": "FAILURE", "link": "https://ci.example.invalid/failure", "description": "Original failure"}])
+    external = tmp_path / "external"
+    physical.git.run("clone", "--branch", "main", str(tmp_path / "transport" / "origin.git"), str(external))
+    git = LocalGit(external)
+    git.run("config", "user.name", "Independent contributor")
+    git.run("config", "user.email", "independent@example.invalid")
+    (external / "target-append.txt").write_text("Independent target change\n")
+    git.run("add", "target-append.txt")
+    git.run("commit", "-m", "Advance the legitimate target")
+    git.run("push", "origin", "HEAD:refs/heads/main")
     requests = []
 
     original_admit = lifecycle._admit_submit
@@ -95,20 +87,19 @@ def test_idle_public_approve_starts_existing_recovery_without_a_merge_grant(tmp_
     assert kernel.dispatch_host(request) and not kernel.dispatch_host(request)
     running = replace(observed, unit_name=request.unit_name, invocation_id="recovery-" + request.nonce)
     assert kernel.observe_host(request, running) == "running"
-    if change == "target" and not tickets:
-        assert kernel.stop_task("stop-the-update") == "applied"
-        assert kernel.source_status()["stopped"] is True
-        with pytest.raises(KernelError, match="executor_exit_unproven"):
-            kernel.admit_host("premature-resume", kind="resume", command=("host",),
-                environment_carrier=tmp_path / "premature", preflight=lambda: None)
-        assert kernel.observe_host(request, replace(running, disposition="exited", exit_status=0,
-            ended_at=112.0, usage_ready=False, usage_released=True)) == "exited"
-        resumed = lifecycle.execute(_parser("en").parse_args(["resume", *arguments[1:]]), language="en")
-        assert resumed["status"] == "action_applied"
-        request = requests[-1]
-        assert kernel.dispatch_host(request)
-        assert kernel.observe_host(request, replace(running, unit_name=request.unit_name,
-            invocation_id="resumed-" + request.nonce)) == "running"
+    assert kernel.stop_task("stop-the-update") == "applied"
+    assert kernel.source_status()["stopped"] is True
+    with pytest.raises(KernelError, match="executor_exit_unproven"):
+        kernel.admit_host("premature-resume", kind="resume", command=("host",),
+            environment_carrier=tmp_path / "premature", preflight=lambda: None)
+    assert kernel.observe_host(request, replace(running, disposition="exited", exit_status=0,
+        ended_at=112.0, usage_ready=False, usage_released=True)) == "exited"
+    resumed = lifecycle.execute(_parser("en").parse_args(["resume", *arguments[1:]]), language="en")
+    assert resumed["status"] == "action_applied"
+    request = requests[-1]
+    assert kernel.dispatch_host(request)
+    assert kernel.observe_host(request, replace(running, unit_name=request.unit_name,
+        invocation_id=request.nonce)) == "running"
     execution = Execution(request.run_id, request.owner, request.epoch)
     runner = OperationRunner(kernel, execution, lambda binding: physical)
     runner.activate_observation()
@@ -117,33 +108,66 @@ def test_idle_public_approve_starts_existing_recovery_without_a_merge_grant(tmp_
                       edits=({"recovery.txt": "Actual controlled repair\n"},))
     agents.kernel, agents.port.git = kernel, physical.git
     ci_calls = []
-    for _ in range(180):
-        step = prepare_scripted_agent(kernel, runner.run_once())
-        assert step.kind not in {"paused", "waiting", "complete"}, step
-        if step.call is not None:
-            assert step.call.subject == subject
-            runner.authorize_agent(step.call)
-            if step.call.role == "development" and step.call.purpose == "ci":
-                ci_calls.append(step.call)
-                assert step.call.context["ci_evidence"]["result"] == "fail"
-                _change(state, checks=[])
-            kernel.receive(step.call, agents.agent(step.call))
-        if kernel.status(subject)["phase"] == "approval":
-            assert runner.state().disposition == "quiescent"
-            break
-    else:
-        raise AssertionError("Ordinary recovery never returned to fresh approval")
+
+    def recover_to_approval():
+        for _ in range(180):
+            step = prepare_scripted_agent(kernel, runner.run_once())
+            assert step.kind not in {"paused", "waiting", "complete"}, step
+            if step.call is not None:
+                assert step.call.subject == subject
+                runner.authorize_agent(step.call)
+                if step.call.role == "development" and step.call.purpose == "ci":
+                    ci_calls.append(step.call)
+                    assert step.call.context["ci_evidence"]["result"] == "fail"
+                    _change(state, checks=[])
+                kernel.receive(step.call, agents.agent(step.call))
+            if kernel.status(subject)["phase"] == "approval":
+                assert runner.state().disposition == "quiescent"
+                break
+        else:
+            raise AssertionError("Ordinary recovery never returned to fresh approval")
+
+    recover_to_approval()
     after = kernel.status(subject)
     assert kernel.source_status()["completions"] == completions
     assert after["generation"] == before["generation"] and after["pr_number"] == before["pr_number"]
     assert after["phase"] == "approval" and after["budgets"]["requirements"] == before["budgets"]["requirements"]
     assert agents.review_count >= 1
-    assert len(ci_calls) == (1 if change == "ci" else 0)
+    assert ci_calls == []
     with kernel.storage.transaction(write=False) as tx:
         assert not tx.rows("SELECT id FROM grants WHERE subject=?", (subject,))
         assert not tx.rows("SELECT id FROM effects WHERE subject=? AND operation='merge'", (subject,))
-    if change == "ci":
-        assert after["budgets"]["ci"]["developments_used"] == before["budgets"]["ci"]["developments_used"] + 1
+
+    # Reuse the genuine current approval for the other public recovery path.
+    # The Host remains live; this request must update work, never grant merge.
+    _change(state, checks=[{"name": "required", "workflow": "CI", "bucket": "fail",
+        "state": "FAILURE", "link": "https://ci.example.invalid/failure", "description": "Original failure"}])
+    # The controlled manager now reports the resumed Host, not the exited one.
+    manager_response = tmp_path / "manager" / "manager-response.json"
+    manager_state = json.loads(manager_response.read_text())
+    manager_state["fields"].update(Id=request.unit_name, Description=request.description,
+                                   InvocationID=request.nonce)
+    manager_response.write_text(json.dumps(manager_state))
+    writes = calls.read_text().splitlines()
+    host_requests = list(requests)
+    result = lifecycle.execute(_parser("en").parse_args(arguments), language="en")
+    assert result["status"] == "action_updating" and result["host"] == "running"
+    assert requests == host_requests
+    assert not [line for line in calls.read_text().splitlines()[len(writes):] if "--method" in json.loads(line)]
+    with kernel.storage.transaction(write=False) as tx:
+        assert tx.one("SELECT status FROM actions WHERE id=?", (result["action_id"],))[0] == "updating"
+        assert not tx.rows("SELECT id FROM grants WHERE subject=?", (subject,))
+        assert tx.one("SELECT final_action FROM runs")[0] is None
+    recover_to_approval()
+    repaired = kernel.status(subject)
+    assert len(ci_calls) == 1 and repaired["phase"] == "approval"
+    assert (repaired["generation"], repaired["pr_number"]) == (before["generation"], before["pr_number"])
+    assert repaired["budgets"]["requirements"] == after["budgets"]["requirements"]
+    assert repaired["budgets"]["ci"]["developments_used"] == after["budgets"]["ci"]["developments_used"] + 1
+    assert kernel.source_status()["completions"] == completions
+    with kernel.storage.transaction(write=False) as tx:
+        assert not tx.rows("SELECT id FROM grants WHERE subject=?", (subject,))
+        assert not tx.rows("SELECT id FROM effects WHERE subject=? AND operation='merge'", (subject,))
 
 
 def test_approval_recovery_rejects_inapplicable_facts_without_an_action_or_grant(tmp_path):

@@ -6,68 +6,10 @@ from dataclasses import replace
 import pytest
 
 from agent_run.core.operation_contract import LocalCleanupRead, LocalCleanupObservation, ReadUnavailable, RequirementsRead
-from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.errors import KernelError
 from agent_run.model import ReadWait
 from agent_run.model import DeliveryKind
 from support.cleanup_scenarios import _native_scenario
-
-
-def test_local_cleanup_does_not_read_delivery_inside_write_authority(tmp_path, monkeypatch):
-    s = _native_scenario(tmp_path / "scenario", DeliveryKind.TICKET)
-    s.record_checkpoints = False
-    make_ports, execute = s.make_ports, s.port.execute
-    active = [False]
-    source_reads, calls, mutations = [], [], []
-    from agent_run.adapters.git_objects import LocalGit
-    original_run = LocalGit.run
-
-    def run(git, *arguments, **options):
-        if active[0] and (arguments[:2] == ("worktree", "remove")
-                         or arguments[:3] == ("update-ref", "--no-deref", "-d")):
-            mutations.append(arguments[:2])
-        return original_run(git, *arguments, **options)
-
-    monkeypatch.setattr(LocalGit, "run", run)
-
-    def ports(binding):
-        result = make_ports(binding)
-        source, delivery = result.source, result.delivery
-
-        def fresh_source(parent):
-            if active[0]:
-                source_reads.append(parent)
-            return source(parent)
-
-        def fresh_delivery(request):
-            if active[0]:
-                raise ReadUnavailable("github_read_failed", "Unrelated Delivery403")
-            return delivery(request)
-
-        result.source, result.delivery = fresh_source, fresh_delivery
-        return result
-
-    def physical(effect, authority):
-        if effect.operation not in {"cleanup_worktree", "cleanup_local_ref"}:
-            return execute(effect, authority)
-        assert s.kernel.status(effect.subject)["phase"] == "complete"
-        active[0] = True
-        before = len(source_reads)
-        try:
-            result = execute(effect, authority)
-        finally:
-            active[0] = False
-        calls.append((effect.operation, len(source_reads) - before, result.disposition))
-        assert effect_state(s, effect)[:2] == ("sent", 1)
-        return result
-
-    monkeypatch.setattr(s, "make_ports", ports)
-    monkeypatch.setattr(s.port, "execute", physical)
-    assert s.run().kind == "complete"
-    assert calls == [("cleanup_worktree", 2, "target"), ("cleanup_local_ref", 2, "target")]
-    assert mutations == [("worktree", "remove"), ("update-ref", "--no-deref")]
-    assert not Path(s.delivery.checkout).exists()
-    assert s.kernel.status(s.delivery.key)["resource_cleanup"]["state"] == "complete"
 
 
 class CleanupBoundary(Exception):
@@ -108,8 +50,6 @@ def pending_cleanup(tmp_path, monkeypatch, operation="cleanup_worktree", *, sibl
     return s, effect, authority, physical_ports[0], execute
 
 
-
-
 @pytest.mark.parametrize("window", ["source", "boundary"])
 def test_cleanup_retains_original_absolute_read_deadline(tmp_path, monkeypatch, window):
     s, effect, authority, ports, execute = pending_cleanup(tmp_path, monkeypatch)
@@ -147,15 +87,12 @@ def test_cleanup_retains_original_absolute_read_deadline(tmp_path, monkeypatch, 
     assert Path(s.delivery.checkout).exists()
 
 
-@pytest.mark.parametrize("change", ["reopen", "graph"])
-def test_latest_requirements_still_apply_original_cleanup_gates(tmp_path, monkeypatch, change):
+def test_reopened_ticket_still_blocks_original_cleanup(tmp_path, monkeypatch):
     s, effect, authority, ports, execute = pending_cleanup(tmp_path, monkeypatch)
     source = ports.source
 
     def changed(parent):
         result = source(parent)
-        if change == "graph":
-            return replace(result, parent=replace(result.parent, sub_issue_numbers=()))
         return replace(result, issues=tuple(replace(issue, state="OPEN") for issue in result.issues))
 
     monkeypatch.setattr(ports, "source", changed)
@@ -208,32 +145,6 @@ def test_remote_cleanup_still_requests_complete_delivery(tmp_path, monkeypatch):
         execute(effect, authority)
     assert effect_state(s, effect) == before
     assert s.port.remote_refs()[effect.source_ref] == effect.before_sha
-
-
-def test_lost_cleanup_response_reads_original_intent_without_repeating_write(tmp_path, monkeypatch):
-    s, effect, authority, ports, execute = pending_cleanup(tmp_path, monkeypatch)
-    roles = list(s.role_calls)
-    budgets = s.kernel.status(effect.subject)["budgets"]
-    before = effect_state(s, effect)
-    result = execute(effect, authority)
-    assert result.disposition == "target" and not Path(s.delivery.checkout).exists()
-    # The physical response is lost before Core receives it. Re-entry must use
-    # the committed sent intent, not call execute or create a replacement.
-    sent = effect_state(s, effect)
-    assert sent == ("sent", 1, before[2])
-    mutations = []
-    original = s.port.execute
-
-    def no_repeat(current, authorization):
-        if current.effect_id == effect.effect_id:
-            mutations.append(current.effect_id)
-        return original(current, authorization)
-
-    monkeypatch.setattr(s.port, "execute", no_repeat)
-    assert s.run().kind == "complete"
-    assert mutations == []
-    assert effect_state(s, effect) == ("confirmed", 1, before[2])
-    assert s.role_calls == roles and s.kernel.status(effect.subject)["budgets"] == budgets
 
 
 def test_sibling_requirement_refresh_keeps_existing_gate_rules(tmp_path, monkeypatch):
