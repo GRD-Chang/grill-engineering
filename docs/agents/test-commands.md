@@ -8,7 +8,7 @@
 pytest 不自动联网补包，缺少或损坏时明确失败并提示准备命令。wheel 默认缓存在 `.test-wheels/`，
 不提交 Git；更新构建依赖时同步 pins/hash 并重新准备，可清理旧缓存。
 自定义目录用 `make test-prepare TEST_WHEELHOUSE=/专用目录`，全量使用同一 `TEST_WHEELHOUSE`；
-直接运行 pytest 时通过 `AGENT_RUN_TEST_WHEELHOUSE` 指定该目录。准备耗时单列，不计入本地全量五分钟预算。
+直接运行 pytest 时通过 `AGENT_RUN_TEST_WHEELHOUSE` 指定该目录。准备耗时单列，不计入本地全量 600 秒上限（争取 300 秒），计入 CI 整条流程 1200 秒上限。
 
 下列入口是相关测试的起点；
 不能仅凭改动文件名判断已经覆盖所有影响。单个用例仍可直接运行

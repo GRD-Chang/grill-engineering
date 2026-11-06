@@ -50,6 +50,8 @@ Core、OperationRunner、Git 和每次业务提交仍实际执行；事务保留
 涉及重开库、并发 owner、线程/进程、文件损坏、容量、存储截止时间或公共运行入口的用例
 必须使用默认原生路径，不能批量替换整个模块。Final 的历史 Ticket 在当前 fixture 内
 仍使用原生初始化；测量须包括这部分成本。
+只读查询用例可以用业务事务生成前置，但被测查询必须保留原生 Storage；
+磁盘快照前后比较覆盖实际查询。该前置不作为 SaveClock 或写入故障的证明。
 
 `remote_effects._fixture` 每次创建独立 bare Git、工作仓库、gh 可执行文件及 JSON/调用日志。
 `fake_gh` 只绑定该脚本声明的仓库、actor、endpoint 与邮件字符串字段；不串联全局
