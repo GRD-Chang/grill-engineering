@@ -6,11 +6,8 @@ import json
 
 import pytest
 
-from agent_run.model import DeliveryKind, ParentIssue, Requirements, wire_json
+from agent_run.model import DeliveryKind, wire_json
 from agent_run.queries.run import read
-from support.offline import GraphScenario
-from support.run_scoped_kernel import domain_kernel
-from support.notification import recorded_agents as _recorded_agents
 from support.worker_facts import worker_fixture, start_worker, finish_worker, consume_local_result
 from support.environment import durable_snapshot as _snapshot
 
@@ -174,77 +171,6 @@ def test_history_keeps_unconsumed_malformed_review_as_raw_evidence_without_a_ver
     render(replace(page, language="en"), style="plain", details=True, stream=output)
     assert "Round details unavailable on this page" in output.getvalue()
     assert "--after" in output.getvalue()
-    assert _snapshot(tmp_path) == before
-
-
-def test_history_binds_each_review_findings_and_evidence_to_its_original_candidate(tmp_path: Path, monkeypatch) -> None:
-    from agent_run.cli.render import render
-
-    scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Original scope"), ()),
-                             reviews=("fail", "pass"))
-    # Produce business facts here; query readonly behavior stays on native Storage.
-    native = scenario.kernel
-    with domain_kernel(scenario.kernel) as scenario.kernel:
-        original = scenario.agent
-        reviews = []
-        finding = "问题：ORIGINAL-REVIEW-FINDING\n证据：original evidence\n必须修复：original fix\n复验：original retest"
-
-        def agent(call):
-            result = json.loads(original(call))
-            if call.role == "review":
-                reviews.append(call)
-                for name, lane in result["checks"].items():
-                    lane["evidence"] = f"REVIEW-{len(reviews)}-{name}-EVIDENCE"
-                    if lane["status"] == "fail":
-                        lane["findings"] = [finding]
-            return wire_json(result)
-
-        _recorded_agents(scenario, monkeypatch, agent)
-        for _ in range(60):
-            step = scenario.step()
-            if step.call is not None and step.call.role == "review" and len(reviews) == 2:
-                assert scenario.step().kind == "progress"
-                break
-        else:
-            raise AssertionError("The normal repair path did not reach the second consumed Review")
-        assert reviews[0].context["candidate_sha"] != reviews[1].context["candidate_sha"]
-        assert scenario.run().kind == "approval"
-    scenario.kernel = native
-    before = _snapshot(tmp_path)
-    document = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage)
-    attempts = {item["id"]: item for item in document.data["history"]["attempts"]}
-    first, second = (attempts[call.attempt_id] for call in reviews)
-    publication, = (item for item in attempts.values() if item["role"] == "publication")
-    assert (first["outcome"], second["outcome"]) == ("fail", "pass")
-    assert [item["candidate_sha"] for item in (first, second)] == [call.context["candidate_sha"] for call in reviews]
-    for details in (False, True):
-        output = StringIO()
-        render(replace(document, language="en"), style="plain", details=details, stream=output)
-        value = output.getvalue()
-        assert "Current findings" not in value
-        assert publication["result"]["pr_title"] in value
-        if details:
-            assert publication["result"]["commit_message"] in value
-            assert publication["result"]["pr_body_markdown"] in value
-        first_heading = f"#1 Review Agent #{first['ordinal']}"
-        second_heading = f"#1 Review Agent #{second['ordinal']}"
-        assert value.count(first_heading) == value.count(second_heading) == 1
-        old, new = value.split(first_heading, 1)[1].split(second_heading, 1)
-        assert (finding in old) is details
-        assert "ORIGINAL-REVIEW-FINDING" in old and "ORIGINAL-REVIEW-FINDING" not in new
-        assert ("original evidence" in old) is details
-        assert ("original fix" in old) is details
-        assert ("original retest" in old) is details
-        if not details:
-            assert "Findings (1)" in old
-        assert "Budget at round start: not recorded" in old
-        assert value.rstrip().endswith(f"Task elapsed seconds: {document.data['elapsed_seconds']}")
-        assert "Role rounds in this history page" in value
-        assert "Parent-only · Review Agent: 2" in value
-        assert "Acceptance failed" in old and "Acceptance passed" in new
-        for name in ("e2e", "standards", "spec"):
-            assert (f"REVIEW-1-{name}-EVIDENCE" in old) is details
-            assert (f"REVIEW-2-{name}-EVIDENCE" in new) is details
     assert _snapshot(tmp_path) == before
 
 

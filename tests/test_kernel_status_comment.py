@@ -864,6 +864,12 @@ def test_repeated_wakes_during_projection_keep_new_important_card_ahead_of_statu
 
 
 def test_existing_pr_status_tracks_current_review_failure_repair_and_pass(tmp_path, monkeypatch):
+    from io import StringIO
+    import json
+    from agent_run.cli.render import render
+    from agent_run.queries.run import read
+    from support.environment import durable_snapshot
+
     scenario = published(tmp_path, monkeypatch)
     kernel, subject = scenario.kernel, scenario.delivery.key
     sender = core_status_comments(kernel)
@@ -872,14 +878,32 @@ def test_existing_pr_status_tracks_current_review_failure_repair_and_pass(tmp_pa
     comment_id = api.comments[0]["id"]
     scenario.reviews = ["pass", "fail", "pass"]
     original_agent = scenario.agent
+    reviews = []
+    finding = "问题：ORIGINAL-REVIEW-FINDING\n证据：original evidence\n必须修复：original fix\n复验：original retest"
+    with kernel.storage.transaction(write=False) as tx:
+        history_after = tx.one("SELECT MAX(position) FROM history")[0]
+
+    def local_status(state):
+        before = durable_snapshot(kernel.storage.path.parent)
+        document = read(kernel.storage.path, "status", storage=kernel.storage)
+        job = next(row for row in document.data["subjects"] if row["subject"] == subject)
+        assert job["review_state"] == state
+        if state in {"pending", "pass"}:
+            output = StringIO()
+            render(replace(document, language="en"), style="plain", details=False, stream=output)
+            assert "ORIGINAL-REVIEW-FINDING" not in output.getvalue()
+        assert durable_snapshot(kernel.storage.path.parent) == before
+        return job
 
     def agent(call):
         raw = original_agent(call)
         if call.role == "review":
-            import json
+            reviews.append(call)
             value = json.loads(raw)
-            for check in value["checks"].values():
-                check["evidence"] = "private-artifact-<script>\n```" * 1000
+            for name, check in value["checks"].items():
+                check["evidence"] = f"REVIEW-{len(reviews)}-{name}-EVIDENCE " + "private-artifact-<script>\n```" * 1000
+                if check["status"] == "fail":
+                    check["findings"] = [finding]
             return json.dumps(value).encode()
         return raw
 
@@ -903,6 +927,7 @@ def test_existing_pr_status_tracks_current_review_failure_repair_and_pass(tmp_pa
     assert "Recorded Review: request_changes" in projection.body
     assert review["candidate_sha"] in projection.body
     assert kernel.storage.path.read_bytes() == before
+    failed = local_status("request_changes")["review"]
     assert sender.deliver(subject, api=api) == "confirmed"
     assert api.comments[0]["id"] == comment_id and "Recorded Review: request_changes" in api.comments[0]["body"]
     # Observe the real next Review before credentials/Invocation admission.
@@ -922,6 +947,7 @@ def test_existing_pr_status_tracks_current_review_failure_repair_and_pass(tmp_pa
     pending = project_status(kernel.storage.path, subject, storage=kernel.storage)
     assert "Recorded Review: pending" in pending.body
     assert "Recorded Review: request_changes" not in pending.body and "Recorded Review: pass" not in pending.body
+    assert local_status("pending")["review"] == failed
     call_step = prepare_scripted_agent(kernel, step)
     assert call_step.call is not None
     runner.authorize_agent(call_step.call)
@@ -935,6 +961,27 @@ def test_existing_pr_status_tracks_current_review_failure_repair_and_pass(tmp_pa
     assert sender.deliver(subject, api=api) == "confirmed"
     assert len(api.comments) == 1 and api.comments[0]["id"] == comment_id
     assert [command[1] for command in api.commands] == ["POST", "PATCH", "PATCH"]
+    assert local_status("pass")["review"]["attempt_id"] != failed["attempt_id"]
+    before = durable_snapshot(kernel.storage.path.parent)
+    history = read(kernel.storage.path, "history", after=history_after, storage=kernel.storage)
+    attempts = {item["id"]: item for item in history.data["history"]["attempts"]}
+    first, second = (attempts[call.attempt_id] for call in reviews)
+    assert (first["outcome"], second["outcome"]) == ("fail", "pass")
+    assert [item["candidate_sha"] for item in (first, second)] == [call.context["candidate_sha"] for call in reviews]
+    assert first["result"] == failed["artifact"]
+    for details in (False, True):
+        output = StringIO()
+        render(replace(history, language="en"), style="plain", details=details, stream=output)
+        value = output.getvalue()
+        first_heading, second_heading = (f"#1 Review Agent #{item['ordinal']}" for item in (first, second))
+        old, new = value.split(first_heading, 1)[1].split(second_heading, 1)
+        assert "ORIGINAL-REVIEW-FINDING" in old and "ORIGINAL-REVIEW-FINDING" not in new
+        assert (finding in old) is details
+        assert "Acceptance failed" in old and "Acceptance passed" in new
+        for name in ("e2e", "standards", "spec"):
+            assert (f"REVIEW-1-{name}-EVIDENCE" in old) is details
+            assert (f"REVIEW-2-{name}-EVIDENCE" in new) is details
+    assert durable_snapshot(kernel.storage.path.parent) == before
     # A foreign display edit pauses only this comment; actual delivery can finish.
     kernel.control("stop", "display-only-local-stop", subject=subject)
     original_body = api.comments[0]["body"]

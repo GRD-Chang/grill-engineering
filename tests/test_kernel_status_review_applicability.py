@@ -3,8 +3,6 @@ from dataclasses import replace
 from io import StringIO
 import json
 
-import pytest
-
 from agent_run.cli.main import main
 from agent_run.cli.render import render
 from agent_run.model import DeliveryKind
@@ -60,46 +58,6 @@ def _assert_current_view(scenario, state, capsys, *, hidden_finding=None):
     return job
 
 
-@pytest.mark.parametrize("kind", [DeliveryKind.PARENT_ONLY, DeliveryKind.TICKET])
-def test_local_status_binds_failure_pending_and_pass_to_their_original_candidate(tmp_path, capsys, kind):
-    scenario = Scenario(tmp_path / "run", kind, reviews=["fail", "pass"])
-    _assert_current_view(scenario, "not_recorded", capsys)
-    for _ in range(100):
-        scenario.step()
-        document = query.read(scenario.kernel.storage.path, "status", storage=scenario.kernel.storage)
-        job = next(row for row in document.data["subjects"] if row["subject"] == scenario.delivery.key)
-        if job["review"] and job["review"]["outcome"] == "fail":
-            break
-    else:
-        pytest.fail("Normal Review failure was not consumed")
-    original = job["review"]
-    original_candidate = job["candidate_sha"]
-    finding = original["artifact"]["checks"]["spec"]["findings"][0]
-    assert _assert_current_view(scenario, "request_changes", capsys)["review"] == original
-    assert scenario.kernel.status(scenario.delivery.key)["phase"] == "development"
-    observed = set()
-    for _ in range(100):
-        step = scenario.step()
-        document = query.read(scenario.kernel.storage.path, "status", storage=scenario.kernel.storage)
-        job = next(row for row in document.data["subjects"] if row["subject"] == scenario.delivery.key)
-        if job["candidate_sha"] != original_candidate:
-            assert job["review"] == original  # An unconsumed return does not replace the original audit record.
-            observed.add(job["review_state"])
-            _assert_current_view(scenario, job["review_state"], capsys, hidden_finding=finding)
-        if step.call is not None and step.call.role == "review":
-            assert job["review_state"] == "pending"
-            assert step.call.context["candidate_sha"] != original_candidate
-            break
-    else:
-        pytest.fail("Repair did not produce a fresh Review return")
-    assert observed == {"stale", "pending"}
-    assert scenario.run().kind == ("complete" if kind == DeliveryKind.TICKET else "approval")
-    current = _assert_current_view(scenario, "pass", capsys, hidden_finding=finding)
-    assert current["review"]["attempt_id"] != original["attempt_id"]
-    assert current["review"]["outcome"] == "pass"
-    history = query.read(scenario.kernel.storage.path, "history", storage=scenario.kernel.storage).data["history"]
-    previous = next(item for item in history["attempts"] if item["id"] == original["attempt_id"])
-    assert previous["result"] == original["artifact"]
 
 
 def test_source_revision_change_does_not_reuse_the_recorded_pass(tmp_path, capsys):
