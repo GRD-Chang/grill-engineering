@@ -51,7 +51,8 @@ def test_standalone_final_repair_reopen_approval_and_close_preserve_the_original
 
 def test_original_neutral_final_script_keeps_its_final_wire_and_literal_suffix_expectations(tmp_path: Path) -> None:
     script = json.loads((Path(__file__).parent / 'data/kernel/normal-final-v1.json').read_text())
-    scenario = Scenario(tmp_path / 'neutral-final', DeliveryKind.FINAL_RUN, neutral_script=script)
+    scenario = Scenario(tmp_path / 'neutral-final', DeliveryKind.FINAL_RUN, neutral_script=script,
+                        record_checkpoints=True)
     assert scenario.historical_trace is not None
     assert scenario.historical_trace['raw_backend_calls'] == {'development': 1, 'review': 1, 'publication': 1}
     assert scenario.historical_trace['final']['budgets']['requirements']['developments_used'] == 1

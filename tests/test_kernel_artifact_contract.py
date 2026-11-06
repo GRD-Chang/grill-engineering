@@ -83,11 +83,10 @@ def returned(scenario, call, raw):
     kernel.agent_exited(call, process, 0)
 
 
-@pytest.mark.parametrize("value", [publication("Fixes #2"), publication("Parent Issue: #1"),
-                                  human(["x"] * 9), human(["x" * 2001]),
-                                  publication(message="Title\nBody without a blank line")],
-                         ids=["closing", "publisher-facts", "blocker-count", "blocker-length", "multiline-title"])
-def test_native_publication_rejects_contract_drift_and_repairs_same_attempt(tmp_path: Path, value):
+def test_native_publication_rejects_contract_drift_and_repairs_same_attempt(tmp_path: Path):
+    # Text/count/length variants belong to test_artifacts; one rejection proves
+    # the real Attempt keeps its original raw and repairs without a new budget.
+    value = publication("Fixes #2")
     scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Deliver change"), ()))
     operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
     first = next_call(scenario, Role.PUBLICATION)
@@ -186,9 +185,10 @@ def test_invalid_repair_is_gated_and_both_original_outputs_remain(tmp_path):
         assert not tx.rows("SELECT id FROM effects WHERE operation='publication_commit'")
 
 
-@pytest.mark.parametrize("language", ["zh", "en"])
-@pytest.mark.parametrize("role", [Role.DEVELOPMENT, Role.REVIEW, Role.PUBLICATION])
-def test_frozen_run_accepts_complete_artifacts_in_the_other_language(tmp_path, language, role):
+def test_frozen_run_accepts_publication_in_the_other_language(tmp_path):
+    # Artifact parsing takes only role and bytes, never the frozen UI language.
+    # Exercise that connection once after real development/review preparation.
+    language, role = "zh", Role.PUBLICATION
     scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Deliver change"), ()))
     assert scenario.spec.inputs is not None
     resources = resolve_resources(language)
@@ -198,16 +198,9 @@ def test_frozen_run_accepts_complete_artifacts_in_the_other_language(tmp_path, l
     scenario.execution = scenario.kernel.claim_executor("configured-language")
     call = next_call(scenario, role)
     assert call.context["language"] == language and call.context["_prompt_resources"] == resources
-    prose = "Keep this English evidence / API unchanged." if language == "zh" else "保留这段中文证据 / API unchanged。"
-    if role == Role.DEVELOPMENT:
-        value = dict(result_kind="development", summary=prose, human_blockers=None)
-    elif role == Role.REVIEW:
-        value = {"checks": {lane: {"status": "fail" if lane == "spec" else "pass",
-                  "evidence": prose, "findings": [prose] if lane == "spec" else []}
-                  for lane in ("e2e", "standards", "spec")}}
-    else:
-        value = publication(prose, message="feat: " + prose)
-        value["pr_title"] = prose
+    prose = "Keep this English evidence / API unchanged."
+    value = publication(prose, message="feat: " + prose)
+    value["pr_title"] = prose
     raw = b"\n" + wire_json(value) + b"\n"
     returned(scenario, call, raw)
     step = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports).once(agent_capacity=0)
