@@ -37,7 +37,7 @@ def _cli_history(kernel):
     return output
 
 
-def test_completed_graph_history_preserves_run_wide_action_material_owners(tmp_path):
+def test_final_activation_preserves_run_wide_action_material_owners(tmp_path):
     scenario = _graph(tmp_path/'graph')
     kernel = scenario.kernel
     assert kernel.source_status()['final_subject'] is None
@@ -65,9 +65,8 @@ def test_completed_graph_history_preserves_run_wide_action_material_owners(tmp_p
         scenario.step()
     else:
         raise AssertionError('Real completed Tickets did not activate Final')
-    # Creation and completion of the real Final, without synthetic DB insertion.
-    scenario.select('final:1')
-    assert scenario.run(approve=True).kind == 'complete'
+    # Activation alone changes the first subject; no Final delivery is needed
+    # to prove that immutable Action materials retain their original owner.
     kernel = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     with kernel.storage.transaction(write=False) as tx:
         assert tx.one('SELECT id FROM subjects ORDER BY id LIMIT 1')[0] == 'final:1'

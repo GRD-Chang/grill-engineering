@@ -105,6 +105,7 @@ def test_parent_only_status_keeps_recorded_pass_evidence_and_hides_completed_all
     # Both languages render the same canonical facts; no new Run or translated
     # Agent evidence is manufactured to exercise a different display channel.
     assert scenario.run().kind == "approval"
+    _assert_approval_query(scenario, tmp_path)
     document = query.read(scenario.kernel.storage.path, "status", storage=scenario.kernel.storage)
     before = _snapshot(tmp_path)
     for language, progress, passed in (("zh", "无子任务，直接推进需求", "已记录验收结论: 通过"),
@@ -119,6 +120,7 @@ def test_parent_only_status_keeps_recorded_pass_evidence_and_hides_completed_all
             assert "当前问题" not in value and "Current findings" not in value
     assert _snapshot(tmp_path) == before
     assert scenario.run(approve=True).kind == "complete"
+    _assert_completed_delivery_query(scenario, tmp_path, DeliveryKind.PARENT_ONLY, "completed")
     before = _snapshot(tmp_path)
     assert main(["status", scenario.spec.run_id, "--state-dir", str(scenario.kernel.storage.path), "--plain"]) == 0
     output = capsys.readouterr().out
@@ -670,55 +672,20 @@ def test_public_cli_process_uses_only_native_readers_and_preserves_state(tmp_pat
     assert _snapshot(tmp_path) == before
 
 
-@pytest.mark.parametrize("kind,completed_phase", [(DeliveryKind.TICKET, "run_acceptance_pending"),
-    (DeliveryKind.PARENT_ONLY, "completed"), (DeliveryKind.FINAL_RUN, "merged")])
-def test_public_delivery_boundaries_match_observed_02_meanings(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: DeliveryKind, completed_phase: str,
-) -> None:
-    from agent_run.model import Issue, ParentIssue, Requirements
-    from support.offline import GraphScenario
+def _assert_approval_query(scenario, tmp_path):
+    before = _snapshot(tmp_path)
+    approval = query.read(scenario.kernel.storage.path, "status", storage=scenario.kernel.storage).data
+    assert approval["phase"] == "ready_for_approval"
+    assert approval["next_action"] == f"agent-run approve --repo {scenario.spec.repository} -- {scenario.spec.run_id}"
+    focused = next(job for job in approval["subjects"] if job["subject"] == approval["focus_subject"])
+    assert focused["kind"] != "ticket"
+    assert any(budget["current"] and budget["purpose"] ==
+               ("integration" if focused["kind"] == "final_run" else "requirements")
+               for budget in focused["budgets"])
+    assert _snapshot(tmp_path) == before
 
-    # The former isolated Scenario had no original workspace ownership effect;
-    # its three cleanup-pending failures remain in the 742c evidence. Use actual
-    # source/workspace/Completion callers here. A completed Ticket in a full
-    # Parent awaits Run Acceptance (02 controller.py), unlike an isolated Ticket
-    # Run. This changed input is not an old/new same-input comparison.
-    from support import offline
-    original_create = offline.create_kernel
 
-    def configured_create(path, spec, **kwargs):
-        return original_create(path, replace(spec, language="en", repository="example/repository",
-                                             repository_root=spec.repository_root), **kwargs)
-
-    monkeypatch.setattr(offline, "create_kernel", configured_create)
-    tickets = () if kind == DeliveryKind.PARENT_ONLY else (2,)
-    source = Requirements(ParentIssue(1, "Full Parent", "Original requirements", tickets),
-                          () if not tickets else (Issue(2, "Ticket", "Original task", "OPEN",
-                                                        frozenset({"ready-for-agent"})),))
-    scenario = GraphScenario(tmp_path / "scenario", source)
-    scenario.spec = replace(scenario.spec, language="en", repository="example/repository")
-    if kind == DeliveryKind.FINAL_RUN:
-        assert scenario.run().kind == "complete"
-        for _ in range(40):
-            scenario.step()
-            if scenario.kernel.source_status()["final_subject"] is not None:
-                break
-        else:
-            raise AssertionError("Real Ticket Completion did not admit Final")
-        scenario.select("final:1")
-    if kind != DeliveryKind.TICKET:
-        assert scenario.run().kind == "approval"
-        before = _snapshot(tmp_path)
-        approval = query.read(scenario.kernel.storage.path, "status", storage=scenario.kernel.storage).data
-        assert approval["phase"] == "ready_for_approval"
-        assert approval["next_action"] == "agent-run approve --repo example/repository -- offline-run"
-        focused = next(job for job in approval["subjects"] if job["subject"] == approval["focus_subject"])
-        assert focused["kind"] != "ticket"
-        assert any(budget["current"] and budget["purpose"] ==
-                   ("integration" if focused["kind"] == "final_run" else "requirements")
-                   for budget in focused["budgets"])
-        assert _snapshot(tmp_path) == before
-    assert scenario.run(approve=True).kind == "complete"
+def _assert_completed_delivery_query(scenario, tmp_path, kind, completed_phase):
     before = _snapshot(tmp_path)
     document = query.read(scenario.kernel.storage.path, "status", storage=scenario.kernel.storage).data
     assert document["phase"] == completed_phase
@@ -726,14 +693,13 @@ def test_public_delivery_boundaries_match_observed_02_meanings(
     assert focused is None or focused["kind"] != "ticket"
     assert (focused is not None and any(budget["current"] and budget["purpose"] == "integration"
             for budget in focused["budgets"])) == (kind == DeliveryKind.FINAL_RUN)
-    assert document["next_action"] == ("agent-run status --repo example/repository -- offline-run"
+    assert document["next_action"] == (f"agent-run status --repo {scenario.spec.repository} -- {scenario.spec.run_id}"
                                        if kind == DeliveryKind.TICKET else "无")
     assert document["delivery_cleanup"]["status"] == "completed"
     assert all(subject["phase"] == "complete" for subject in document["subjects"])
     if kind != DeliveryKind.PARENT_ONLY:
         assert [record["subject"] for record in scenario.kernel.source_status()["completions"]] == ["ticket:2"]
     assert "progress" not in document
-    assert document["phase"] == completed_phase
     history = query.read(scenario.kernel.storage.path, "history", storage=scenario.kernel.storage).data
     prefix = {DeliveryKind.TICKET: "ticket", DeliveryKind.PARENT_ONLY: "parent", DeliveryKind.FINAL_RUN: "run"}[kind]
     assert history["history"]["rounds"][prefix + "_publication"] == 1
@@ -742,3 +708,37 @@ def test_public_delivery_boundaries_match_observed_02_meanings(
     assert history["executor_control"]["live_status"] == "unknown"
     assert all(invocation["live_status"] != "running" for attempt in history["history"]["attempts"] for invocation in attempt["invocations"])
     assert _snapshot(tmp_path) == before
+
+
+def test_public_ticket_completion_then_final_delivery_keep_distinct_query_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_run.model import Issue, ParentIssue, Requirements
+    from support.offline import GraphScenario
+
+    # One original Ticket Completion becomes the input to Final activation.
+    from support import offline
+    original_create = offline.create_kernel
+
+    def configured_create(path, spec, **kwargs):
+        return original_create(path, replace(spec, language="en", repository="example/repository",
+                                             repository_root=spec.repository_root), **kwargs)
+
+    monkeypatch.setattr(offline, "create_kernel", configured_create)
+    source = Requirements(ParentIssue(1, "Full Parent", "Original requirements", (2,)),
+                          (Issue(2, "Ticket", "Original task", "OPEN", frozenset({"ready-for-agent"})),))
+    scenario = GraphScenario(tmp_path / "scenario", source)
+    scenario.spec = replace(scenario.spec, language="en", repository="example/repository")
+    assert scenario.run().kind == "complete"
+    _assert_completed_delivery_query(scenario, tmp_path, DeliveryKind.TICKET, "run_acceptance_pending")
+    for _ in range(40):
+        scenario.step()
+        if scenario.kernel.source_status()["final_subject"] is not None:
+            break
+    else:
+        raise AssertionError("Real Ticket Completion did not admit Final")
+    scenario.select("final:1")
+    assert scenario.run().kind == "approval"
+    _assert_approval_query(scenario, tmp_path)
+    assert scenario.run(approve=True).kind == "complete"
+    _assert_completed_delivery_query(scenario, tmp_path, DeliveryKind.FINAL_RUN, "merged")

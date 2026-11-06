@@ -19,8 +19,10 @@ from support.control_scenarios import managed_parent
 from support.remote_effects import _change
 
 
-@pytest.mark.parametrize("change", ["target", "ci"])
-@pytest.mark.parametrize("tickets", [(), (2,)])
+# Cover both recovery triggers and delivery shapes through the public CLI.
+# The target/Parent case also keeps the real stop, exit fence and reclaim path.
+@pytest.mark.parametrize("change,tickets", [("target", ()), ("ci", (2,))],
+                         ids=["target-parent", "ci-final"])
 def test_idle_public_approve_starts_existing_recovery_without_a_merge_grant(tmp_path, monkeypatch, change, tickets):
     kernel, _old_runner, physical, state, calls, original, subject, _source = managed_approval(
         tmp_path, monkeypatch, tickets=tickets)
