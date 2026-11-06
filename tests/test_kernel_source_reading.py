@@ -196,8 +196,11 @@ def test_check_normalizer_uses_original_required_status_not_cli_exit_or_incident
 
 @pytest.mark.parametrize('http_status', [404, 403], ids=['classic-absent-does-not-erase-ruleset', 'permission-error-is-not-absence'])
 def test_classic_protection_absence_and_permission_failure_have_distinct_meanings(tmp_path: Path, monkeypatch, http_status: int) -> None:
+    from agent_run.adapters import github_commands
     from agent_run.adapters.source import read_required_check_facts, normalize_required_checks
-    reader, _log = _reader(tmp_path, monkeypatch)
+    reader, log = _reader(tmp_path, monkeypatch)
+    delays = []
+    monkeypatch.setattr(github_commands.time, 'sleep', delays.append)
     responses = tmp_path / 'responses.json'
     data = json.loads(responses.read_text())
     data['classic_http'] = http_status
@@ -219,6 +222,13 @@ def test_classic_protection_absence_and_permission_failure_have_distinct_meaning
         uncertain = normalize_required_checks(read_required_check_facts(reader, 17, expected_head_sha='2' * 40))
         assert uncertain.result == 'unknown' and uncertain.details == (('still-required', 'unknown'),)
         assert json.loads(uncertain.logs)['observation']['classic_protection_absent'] is True
+    observations = 2 if http_status == 404 else 1
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert sum(call[:2] == ['api', 'repos/example/project/branches/main/protection/required_status_checks']
+               for call in calls) == 3 * observations
+    assert len(delays) == 2 * observations
+    assert all(1 <= delay <= 1.25 for delay in delays[::2])
+    assert all(2 <= delay <= 2.25 for delay in delays[1::2])
 
 
 def _failed_job(root: Path, *, logs_http: int = 0) -> None:
@@ -273,14 +283,20 @@ def test_large_job_logs_keep_the_original_diagnostic_tail(tmp_path: Path, monkey
 
 
 def test_unavailable_job_logs_do_not_erase_an_exact_failure_or_become_empty_logs(tmp_path: Path, monkeypatch) -> None:
+    from agent_run.adapters import github_commands
     from agent_run.adapters.source import read_required_check_facts, normalize_required_checks
-    reader, _log = _reader(tmp_path, monkeypatch)
+    reader, log = _reader(tmp_path, monkeypatch)
+    delays = []
+    monkeypatch.setattr(github_commands.time, 'sleep', delays.append)
     _failed_job(tmp_path, logs_http=403)
     facts = read_required_check_facts(reader, 17, expected_head_sha='2' * 40)
     check = facts['required_checks'][0]
     assert check['job']['head_sha'] == '2' * 40 and 'logs' not in check
     assert 'HTTP 403' in check['logs_unavailable']
     assert normalize_required_checks(facts).result == 'fail'
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert sum(call[:2] == ['api', 'repos/example/project/actions/jobs/33/logs'] for call in calls) == 3
+    assert len(delays) == 2 and 1 <= delays[0] <= 1.25 and 2 <= delays[1] <= 2.25
 
 
 @pytest.mark.parametrize('damage', ['head', 'job-id', 'not-completed'])
@@ -705,7 +721,10 @@ def test_repository_fixture_reads_only_the_exact_declared_default_ref(tmp_path, 
 
 @pytest.mark.parametrize('status', [404, 403, 503])
 def test_repository_fixture_preserves_absence_and_ref_read_failures(tmp_path, monkeypatch, status):
+    from agent_run.adapters import github_commands
     reader, log = _reader(tmp_path, monkeypatch)
+    delays = []
+    monkeypatch.setattr(github_commands.time, 'sleep', delays.append)
     responses = tmp_path / 'responses.json'
     data = json.loads(responses.read_text())
     if status == 404:
@@ -720,6 +739,7 @@ def test_repository_fixture_preserves_absence_and_ref_read_failures(tmp_path, mo
     commands = [json.loads(line) for line in log.read_text().splitlines()]
     assert commands[1:] == [['api', 'repos/example/project/git/ref/heads/main']] * 3
     assert not any('graphql' in command for command in commands)
+    assert len(delays) == 2 and 1 <= delays[0] <= 1.25 and 2 <= delays[1] <= 2.25
 
 
 @pytest.mark.parametrize('endpoint', [

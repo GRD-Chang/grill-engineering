@@ -42,11 +42,18 @@ def raw_source(monkeypatch):
 
 
 @pytest.mark.parametrize('errors', [[{'message': 'Resource not accessible', 'path': ['repository', 'issue']}], None, {}, False])
-def test_graphql_partial_data_and_errors_is_not_a_requirement_snapshot(raw_source, errors):
-    reader, data, _ = raw_source
+def test_graphql_partial_data_and_errors_is_not_a_requirement_snapshot(raw_source, monkeypatch, errors):
+    reader, data, calls = raw_source
+    delays = []
+    monkeypatch.setattr(github_commands.time, 'sleep', delays.append)
     data['graphql_errors'] = errors
     with pytest.raises(GitHubReadError):
         read_requirements(reader, 1)
+    if errors:
+        assert len(calls) == 3
+        assert len(delays) == 2 and 1 <= delays[0] <= 1.25 and 2 <= delays[1] <= 2.25
+    else:
+        assert len(calls) == 1 and delays == []
 
 
 def test_partial_source_cannot_be_committed_by_the_normal_kernel_refresh(tmp_path, monkeypatch):
