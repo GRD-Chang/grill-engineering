@@ -22,7 +22,7 @@ CHECKS = {
     "Run E2E harness tests", "Run type checks", "Verify independent checks",
     "Test private-only CI selection rules", "Run private-only sync tests",
     "Run private-only E2E harness tests", "Verify private-only checks",
-    "Record complete test shard",
+    "Record complete test evidence",
 }
 
 
@@ -42,10 +42,8 @@ def step_phase(job: str, step: str) -> str:
         return "cold_start"
     if step in DEPENDENCIES:
         return "dependencies"
-    if job == 'native-boundary-regression (not full acceptance)' and step == 'Run fixed native boundary regression':
-        return 'tests'
     if step == "Run tests":
-        return "tests" if job.startswith("product-tests (") else "checks"
+        return "tests" if job == "product-tests" else "checks"
     return "checks" if step in CHECKS else "other"
 
 
@@ -67,12 +65,10 @@ def summarize(run: dict, jobs: list[dict], observed_at: str) -> dict:
                 "started_at": step.get("started_at"), "completed_at": step.get("completed_at"),
             })
         required = {"Set up job"}
-        if job["name"].startswith("product-tests ("):
+        if job["name"] == "product-tests":
             required |= {"Set up Python", "Install system dependencies", "Prepare verified SQLite runtime",
-                         "Install product and development tools", "Run tests", "Record complete test shard"}
-        elif job['name'] == 'native-boundary-regression (not full acceptance)':
-            required |= {'Set up Python', 'Prepare verified SQLite runtime',
-                         'Install product and development tools', 'Run fixed native boundary regression'}
+                         "Install product and development tools", "Run tests",
+                         "Record complete test evidence"}
         elif job["name"] == "quality":
             required |= {"Verify selection", "Run tests"}
         for name in sorted(required - {step["name"] for step in steps}):
@@ -149,11 +145,11 @@ def markdown(report: dict) -> str:
         "关键路径从本 attempt 起点到 quality 的 Run tests 完成，包含依赖准备和所有必要检查；失败耗时不代表验证通过。",
         "runner 用量为各 job 运行秒数之和，包含准备、诊断和清理，不是账单分钟；仅统计本 attempt，不累计此前重跑。",
         "重跑沿用的较早 attempt 成功作业不计入本轮成本；较早证据仍由现有 quality 门禁按原身份核验。",
-        "取消/跳过/缺失步骤保留原结论；未产出的 JUnit、resources.txt 或完整分片证据不能由本表补足。",
-        "测试 CPU/RSS 等仍读取 test-diagnostics-shard-* 中的 test-report；并行步骤用时之和不等于关键路径。",
+        "取消/跳过/缺失步骤保留原结论；未产出的 JUnit、resources.txt 或完整测试证据不能由本表补足。",
+        "测试 CPU/RSS 等仍读取 test-diagnostics 中的 test-report；并行步骤用时之和不等于关键路径。",
         "quality 自身尚在运行时只能观测部分成本；run 结束后可用同一助手只读刷新最终值。",
         "若 workflow 整体取消使本汇总未运行，成本附件也可能缺失；不能把缺失报告解释为零成本。",
-        "CI 不套用本地 300 秒预算，也不增加耗时门禁。", "",
+        "产品 job 使用 20 分钟 timeout；本报告另记完整 workflow 墙钟，不以缺失报告推定达标。", "",
     ]
     return "\n".join(lines)
 

@@ -27,21 +27,23 @@ def job(name, start, end, *, steps=(), conclusion="success", created=0, runner=1
 
 
 class CostTests(unittest.TestCase):
-    def test_boundary_cost_is_visible_separately_from_full_test_shards(self):
-        name = 'native-boundary-regression (not full acceptance)'
-        jobs = [job(name, 0, 30, conclusion='failure', steps=(
-            ('Run fixed native boundary regression', 10, 25, 'failure'),))]
-        self.run['conclusion'] = 'failure'
-        report = summarize(self.run, jobs, stamp(35))
-        step, = [item for item in report['jobs'][0]['steps'] if item['name'] == 'Run fixed native boundary regression']
-        self.assertEqual((step['phase'], step['seconds'], step['conclusion']), ('tests', 15, 'failure'))
-        self.assertIn(name + ' / Run fixed native boundary regression', markdown(report))
-        self.assertIsNone(report['necessary_checks_seconds'])
-        self.assertIsNone(report['necessary_checks_conclusion'])
+    def test_single_product_job_has_full_test_and_preparation_costs(self):
+        self.assertEqual(step_phase('product-tests', 'Run tests'), 'tests')
+        jobs = [job('product-tests', 5, 90, steps=(
+            ('Install product and development tools', 10, 25, 'success'),
+            ('Run tests', 25, 80, 'success'),
+            ('Record complete test evidence', 80, 85, 'success'),))]
+        report = summarize(self.run, jobs, stamp(95))
+        phases = {item['name']: item for item in report['jobs'][0]['steps']}
+        self.assertEqual(phases['Run tests']['seconds'], 55)
+        self.assertEqual(phases['Install product and development tools']['phase'], 'dependencies')
+        self.assertEqual(phases['Record complete test evidence']['status'], 'completed')
+        self.assertEqual(report['wall_seconds'], 90)
+
 
     def test_product_package_setup_and_validation_have_separate_cost_phases(self):
         self.assertEqual(step_phase("quality", "Prepare product package test dependencies"), "dependencies")
-        self.assertEqual(step_phase("product-tests (1)", "Run sync tests"), "checks")
+        self.assertEqual(step_phase("product-tests", "Run sync tests"), "checks")
         self.assertEqual(step_phase("quality", "Run private-only sync tests"), "checks")
 
     def setUp(self):
@@ -50,10 +52,10 @@ class CostTests(unittest.TestCase):
 
     def test_parallel_runner_total_differs_from_complete_check_path(self):
         jobs = [
-            job("product-tests (0)", 5, 90, steps=(
+            job("product-tests", 5, 90, steps=(
                 ("Set up job", 7, 10, "success"), ("Set up Python", 10, 20, "success"),
                 ("Run tests", 30, 85, "success"))),
-            job("product-tests (1)", 6, 95, steps=(("Run type checks", 25, 30, "success"),)),
+            job("diagnostic", 6, 95, steps=(("Run diagnostic probe", 25, 30, "success"),)),
             job("quality", 100, 110, created=96, steps=(("Run tests", 104, 108, "success"),)),
         ]
         report = summarize(self.run, jobs, stamp(120))
@@ -70,13 +72,13 @@ class CostTests(unittest.TestCase):
 
     def test_cancelled_tests_keep_elapsed_but_missing_evidence_is_not_zero(self):
         self.run["conclusion"] = "failure"
-        jobs = [job("product-tests (1)", 5, 50, conclusion="cancelled", steps=(
-            ("Run tests", 20, 48, "cancelled"), ("Record complete test shard", 48, 48, "skipped")))]
+        jobs = [job("product-tests", 5, 50, conclusion="cancelled", steps=(
+            ("Run tests", 20, 48, "cancelled"), ("Record complete test evidence", 48, 48, "skipped")))]
         report = summarize(self.run, jobs, stamp(100))
         phases = {step["name"]: step for step in report["jobs"][0]["steps"]}
         self.assertEqual(phases["Run tests"]["seconds"], 28)
         self.assertEqual(phases["Run tests"]["conclusion"], "cancelled")
-        self.assertIsNone(phases["Record complete test shard"]["seconds"])
+        self.assertIsNone(phases["Record complete test evidence"]["seconds"])
         self.assertEqual(phases["Set up Python"]["status"], "missing")
         self.assertIsNone(report["necessary_checks_seconds"])
         self.assertIn("取消/跳过/缺失", markdown(report))

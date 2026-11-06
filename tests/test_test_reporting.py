@@ -1,4 +1,4 @@
-"""分片完整性、真实 pytest 收集与错误参数的回归。"""
+"""真实 pytest 即时诊断、JUnit 与执行参数的回归。"""
 from __future__ import annotations
 
 import os
@@ -12,49 +12,13 @@ import xml.etree.ElementTree as ET
 
 import pytest
 
-from support.sharding import FAILURE_TRACEBACK_CHARACTERS, PASSED_SUBTESTS_PROPERTY, _Reports, pytest_configure, select_shard
-
-
-@pytest.mark.parametrize("count", [1, 2, 3, 7])
-def test_shards_are_disjoint_complete_balanced_and_order_independent(count: int) -> None:
-    nodes = [f"tests/test_sample.py::test_case[{i}]" for i in range(101)]
-    shards = [select_shard(nodes, count, index) for index in range(count)]
-    assert set.union(*shards) == set(nodes)
-    assert sum(map(len, shards)) == len(nodes)
-    assert max(map(len, shards)) - min(map(len, shards)) <= 1
-    assert shards == [select_shard(list(reversed(nodes)), count, index) for index in range(count)]
-
-
-def test_completed_boundary_selector_only_removes_the_exact_expanded_fixed_partition():
-    from runpy import run_path
-    scope = run_path(str(Path(__file__).resolve().parents[1] / '.github/ci/test_scope.py'))
-    targets = scope['NATIVE_CONTRACT_TESTS']
-    expanded = []
-    for target in targets:
-        if target.endswith('test_registration_commit_unknown_reads_only_original_uuid_and_never_reinserts'):
-            expanded.extend(target + '[' + p + ']' for p in ('False', 'True'))
-        elif target.endswith('test_registration_commit_known_failure_keeps_category_and_never_registers_again'):
-            expanded.extend(target + '[' + p + ']' for p in ('13-storage_limit', '9-transaction_aborted'))
-        else:
-            expanded.append(target)
-    completed = set(expanded) | set(scope['BOUNDARY_TESTS'])
-    rest = [f'tests/test_other.py::test_value[{i}]' for i in range(21)]
-    nodes = [*completed, *rest]
-    shards = [select_shard(nodes, 4, i, completed_boundary=True) for i in range(4)]
-    assert set.union(*shards) == set(rest) and sum(map(len, shards)) == len(rest)
-    assert not set.union(*shards) & completed
-    assert set.union(*(select_shard(nodes, 4, i) for i in range(4))) == set(nodes)
-    for damaged in (nodes[:-1] + [nodes[0]], [n for n in nodes if n != expanded[0]],
-                    [*nodes, expanded[0].partition('[')[0] + '[extra]']):
-        with pytest.raises(ValueError):
-            select_shard(damaged, 4, 0, completed_boundary=True)
+from support.reporting import FAILURE_TRACEBACK_CHARACTERS, PASSED_SUBTESTS_PROPERTY, _Reports, pytest_configure
 
 
 @pytest.mark.parametrize('diagnostic,workers', [(False, 2), (True, 2), (False, 1), (False, 0)])
 def test_report_profile_comes_from_actual_controller_options(diagnostic, workers):
     registered, properties = [], []
-    options = {'test_shard_count': 4, 'test_shard_index': 0,
-               'host_loss_io_diagnostics': diagnostic, 'numprocesses': workers, 'dist': 'worksteal'}
+    options = {'host_loss_io_diagnostics': diagnostic, 'numprocesses': workers, 'dist': 'worksteal'}
     config = SimpleNamespace(getoption=lambda key, default=None: options.get(key, default),
         stash={}, pluginmanager=SimpleNamespace(register=registered.append, get_plugin=lambda name: None))
     pytest_configure(config)
@@ -62,40 +26,9 @@ def test_report_profile_comes_from_actual_controller_options(diagnostic, workers
     report.xml = SimpleNamespace(add_global_property=lambda key, value: properties.append((key, value)))
     report.pytest_sessionfinish()
     import json
-    from support.sharding import EXECUTION_PROFILE_PROPERTY
+    from support.reporting import EXECUTION_PROFILE_PROPERTY
     value, = [value for key, value in properties if key == EXECUTION_PROFILE_PROPERTY]
     assert json.loads(value) == {'host_loss_io_diagnostics': diagnostic, 'workers': workers, 'dist': 'worksteal'}
-
-
-@pytest.mark.parametrize("count,index,nodes", [
-    (0, 0, ["a"]), (2, -1, ["a"]), (2, 2, ["a"]),
-    (2, 1, ["a"]), (2, 0, []), (2, 0, ["a", "a"]),
-])
-def test_invalid_or_empty_shards_cannot_report_success(count: int, index: int, nodes: list[str]) -> None:
-    with pytest.raises(ValueError):
-        select_shard(nodes, count, index)
-
-
-def test_real_pytest_shards_cover_the_unfiltered_collection(tmp_path: Path) -> None:
-    sample = tmp_path / "test_sample.py"
-    sample.write_text("import pytest\n@pytest.mark.parametrize('value',range(7))\ndef test_case(value):\n    assert value >= 0\n")
-    command = [sys.executable, "-m", "pytest", "--noconftest", "-p", "support.sharding", "--collect-only", "-q", str(sample)]
-    env = {**os.environ, "PYTHONPATH": str(Path(__file__).parent), "PYTHONDONTWRITEBYTECODE": "1"}
-
-    def collect(*args: str) -> set[str]:
-        result = subprocess.run([*command, *args], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=15)
-        assert result.returncode == 0, result.stdout + result.stderr
-        return {line for line in result.stdout.splitlines() if "::test_case[" in line}
-
-    complete = collect()
-    shards = [collect("--test-shard-count=2", f"--test-shard-index={index}") for index in range(2)]
-    assert len(complete) == 7
-    assert set.union(*shards) == complete
-    assert shards[0].isdisjoint(shards[1])
-    invalid = subprocess.run([*command, "--test-shard-count=2", "--test-shard-index=2"], cwd=tmp_path, env=env,
-                             capture_output=True, text=True, timeout=15)
-    assert invalid.returncode == 4
-    assert "0 <= index < count" in invalid.stderr
 
 
 @pytest.mark.parametrize('phase', ['setup', 'call', 'teardown'])
@@ -145,7 +78,7 @@ def test_nonfailure_reports_do_not_emit_live_failure_diagnostics(outcome, durati
 @pytest.mark.parametrize('worker', [False, True])
 def test_only_controller_registers_live_reporting(worker, capsys):
     registered = []
-    config = SimpleNamespace(getoption=lambda key, default=None: {'test_shard_count': 1, 'test_shard_index': 0}.get(key, default),
+    config = SimpleNamespace(getoption=lambda key, default=None: default,
         stash={}, pluginmanager=SimpleNamespace(register=registered.append, get_plugin=lambda name: None))
     if worker:
         config.workerinput = {}
@@ -207,7 +140,7 @@ def test_subtests(subtests):
         assert False, 'original subtest failure'
 ''')
     junit = tmp_path / 'failures.xml'
-    command = [sys.executable, '-m', 'pytest', '--noconftest', '-p', 'support.sharding',
+    command = [sys.executable, '-m', 'pytest', '--noconftest', '-p', 'support.reporting',
                '-q', str(sample), '--junitxml=' + str(junit)]
     if workers:
         command += ['-p', 'xdist.plugin', '-n', str(workers)]
@@ -242,7 +175,7 @@ def test_b_hold_for_owner():
     print('held-for-controlled-cancellation', flush=True)
     sys.stdin.read(1)
 ''')
-    command = [sys.executable, '-m', 'pytest', '--noconftest', '-p', 'support.sharding', '-q', '-s', str(sample)]
+    command = [sys.executable, '-m', 'pytest', '--noconftest', '-p', 'support.reporting', '-q', '-s', str(sample)]
     environment = {**os.environ, 'PYTHONPATH': str(Path(__file__).parent),
                    'PYTEST_DISABLE_PLUGIN_AUTOLOAD': '1', 'PYTHONDONTWRITEBYTECODE': '1'}
     # This direct child has no xdist/Host/Worker or child-launching test. Kill

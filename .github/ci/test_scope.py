@@ -35,50 +35,6 @@ NATIVE_CONTRACT_TESTS = (
     'tests/test_kernel_control_github_fixture.py::test_comment_handler_commits_canonical_rows_and_mirrors_without_read_ticks[False]',
     'tests/test_kernel_control_github_fixture.py::test_comment_handler_commits_canonical_rows_and_mirrors_without_read_ticks[True]',
 )
-# Fail early on unresolved native boundaries; these remain in full coverage.
-# A successful boundary stage is not complete product acceptance.
-BOUNDARY_TESTS = (
-    'tests/test_kernel_cleanup_prepare_timeout.py::test_cleanup_prepare_timeout_preserves_complete_delivery_and_reenters',
-    'tests/test_kernel_public_abandon_completed_ticket.py::test_public_abandon_recovers_its_completed_ticket_and_closes_unapproved_final_pr',
-    *(f'tests/test_kernel_managed_entry_end_to_end.py::{name}' for name in (
-        'test_public_run_reaches_ticket_close_through_managed_host_after_lost_merge_reply',
-        'test_public_parallel_review_and_publication_keep_each_threads_binding',
-        'test_public_resume_after_exact_foreground_host_loss_preserves_parallel_work',
-        'test_public_ticket_stop_keeps_late_raw_unconsumed_then_resumes_in_the_original_managed_host',
-        'test_public_revise_repairs_the_real_final_pr_from_original_feedback_in_the_same_managed_host',
-        'test_public_requeue_delivers_fresh_ticket_and_final_generations_in_the_original_managed_host',
-        'test_public_ticket_repair_deletes_an_earlier_candidate_file_without_a_human_blocker',
-        'test_public_local_worker_failure_preserves_completed_and_independent_tickets',
-        'test_controlled_native_commit_failure_reaps_both_workers_before_disarm_and_public_resume')),
-    'tests/test_kernel_control_operation_observation.py::test_public_resume_timeout_reaps_exact_guardian_without_touching_unrelated_child',
-    'tests/test_kernel_operation_integration.py::test_real_core_n1_ci_poll_advances_during_independent_long_agent',
-    'tests/test_kernel_notification_sender_facts.py::test_sender_compresses_real_development_to_review_and_preserves_gate_budget_and_return_order',
-)
-BOUNDARY_COMMIT_TESTS = (
-    'tests/test_kernel_managed_entry_end_to_end.py::'
-    'test_controlled_native_commit_failure_reaps_both_workers_before_disarm_and_public_resume',
-)
-BOUNDARY_OTHER_TESTS = tuple(node for node in BOUNDARY_TESTS if node not in BOUNDARY_COMMIT_TESTS)
-
-
-def completed_boundary_nodes(nodes: list[str]) -> list[str]:
-    """Expand only the fixed 19/14 against this checkout's real collection."""
-    if len(nodes) != len(set(nodes)):
-        raise ValueError('Duplicate complete collection')
-    completed: set[str] = set()
-    for targets, count in ((NATIVE_CONTRACT_TESTS, 19), (BOUNDARY_TESTS, 14)):
-        selected: set[str] = set()
-        for target in targets:
-            matches = {node for node in nodes if node == target or '[' not in target and node.startswith(target + '[')}
-            if not matches or selected & matches:
-                raise ValueError('Missing or overlapping fixed boundary target')
-            selected.update(matches)
-        if len(selected) != count or completed & selected:
-            raise ValueError('Unexpected expanded fixed boundary collection')
-        completed.update(selected)
-    return sorted(completed)
-
-
 FIXED_REPAIR_REGRESSION_TESTS = (
     'tests/test_cli_command_diagnostics.py::test_stop_receipt_uses_frozen_language_and_keeps_internal_identity_only_in_json[parent-human-zh]',
     'tests/test_cli_command_diagnostics.py::test_stop_receipt_uses_frozen_language_and_keeps_internal_identity_only_in_json[parent-human-en]',
@@ -90,12 +46,11 @@ FIXED_REPAIR_REGRESSION_TESTS = (
     'tests/test_cli_command_diagnostics.py::test_stop_receipt_uses_frozen_language_and_keeps_internal_identity_only_in_json[exact-run-json-en]',
     'tests/test_kernel_sqlite_faults.py::test_public_stop_reports_real_commit_interruption_without_partial_action',
     'tests/test_kernel_cleanup_observation_projection.py::test_local_cleanup_does_not_read_delivery_inside_write_authority',
-    'tests/test_kernel_cleanup_observation_projection.py::test_each_local_cleanup_guard_rejects_public_revocation[stop-before_lock]',
-    'tests/test_kernel_cleanup_observation_projection.py::test_each_local_cleanup_guard_rejects_public_revocation[stop-after_lock]',
-    'tests/test_kernel_cleanup_observation_projection.py::test_each_local_cleanup_guard_rejects_public_revocation[stop-before_command]',
-    'tests/test_kernel_cleanup_observation_projection.py::test_each_local_cleanup_guard_rejects_public_revocation[owner-before_lock]',
-    'tests/test_kernel_cleanup_observation_projection.py::test_each_local_cleanup_guard_rejects_public_revocation[owner-after_lock]',
-    'tests/test_kernel_cleanup_observation_projection.py::test_each_local_cleanup_guard_rejects_public_revocation[owner-before_command]',
+    'tests/test_local_cleanup_intent_core.py::test_real_intent_is_not_authority_after_revocation[stop]',
+    'tests/test_local_cleanup_intent_core.py::test_real_intent_is_not_authority_after_revocation[owner]',
+    'tests/test_local_cleanup_intent_core.py::test_worktree_command_preparation_keeps_fresh_core_and_resource_guards[stop]',
+    'tests/test_local_cleanup_intent_core.py::test_worktree_command_preparation_keeps_fresh_core_and_resource_guards[owner]',
+    'tests/test_kernel_cleanup_adapter.py::test_worktree_cleanup_authorizes_before_locks_and_at_command_start[revoked]',
     'tests/test_kernel_cleanup_observation_projection.py::test_projection_cannot_be_rebound_to_other_effects_or_observation_types',
     'tests/test_kernel_control_policy.py::test_ticket_policy_window_does_not_change_a_sibling_call_or_its_allowances',
     'tests/test_kernel_control_policy.py::test_checkpoint_thread_policy_is_creation_frozen_and_legal_exceptions_stay_independent[control-False-new-per-attempt]',
@@ -109,10 +64,7 @@ FIXED_REPAIR_REGRESSION_TESTS = (
 TEST_GROUPS = {
     'fixed-repair-regression': FIXED_REPAIR_REGRESSION_TESTS,
     'native-contract': NATIVE_CONTRACT_TESTS,
-    'boundary': BOUNDARY_TESTS,
-    'boundary-other': BOUNDARY_OTHER_TESTS,
-    'boundary-commit': BOUNDARY_COMMIT_TESTS,
-    "policy": ("tests/test_delivery_policy.py", "tests/test_kernel_policy_values.py"),
+    "policy": ("tests/test_delivery_policy.py", "tests/test_kernel_policy_values.py", "tests/test_budget_policy.py"),
     "state": ("tests/test_kernel_state_preflight.py", "tests/test_kernel_task_admission.py",
               "tests/test_error_safety.py"),
     "prompts": (*PROMPT_CONTRACT_TESTS, "tests/test_kernel_prompt_facts.py"),

@@ -10,7 +10,7 @@ import pytest
 from support.environment import _apply_test_environment, _inherited_git_override, _user_environment
 from support.installed_runtime import require_current_installation
 
-pytest_plugins = ("support.sharding",)
+pytest_plugins = ("support.reporting",)
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -20,8 +20,6 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    if config.getoption('host_loss_io_diagnostics') and config.getoption('test_shard_count') != 1:
-        raise pytest.UsageError('The diagnostic Host-loss entry cannot produce full CI shard evidence')
     require_current_installation()
 
 

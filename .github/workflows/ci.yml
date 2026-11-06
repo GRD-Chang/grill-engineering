@@ -59,14 +59,8 @@ jobs:
   product-tests:
     needs: selection
     if: needs.selection.outputs.product == 'true'
-    # 复用原有两个 runner/每台两个 worker；分片 1 先完成独立检查。
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      max-parallel: 2
-      matrix:
-        shard: [0, 1]
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -89,21 +83,18 @@ jobs:
 
       - name: Test CI evidence rules
         id: rules
-        if: matrix.shard == 1
         run: PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s .github/ci -p 'test_*.py' -q
 
       - name: Smoke test installed CLI
         id: smoke
-        if: matrix.shard == 1
         run: agent-run --help
 
       - name: Run type checks
         id: types
-        if: matrix.shard == 1
         run: make typecheck
 
       - name: Verify independent checks
-        if: always() && matrix.shard == 1
+        if: always()
         env:
           RULES_RESULT: ${{ steps.rules.outcome }}
           SMOKE_RESULT: ${{ steps.smoke.outcome }}
@@ -113,17 +104,22 @@ jobs:
           test "$SMOKE_RESULT" = success
           test "$TYPE_RESULT" = success
 
-      - name: Run tests
-        run: make test-report TEST_WORKERS=2 PYTEST_ARGS='-v --test-shard-count=2 --test-shard-index=${{ matrix.shard }}'
+      - name: Require native environment capabilities
+        run: |
+          mkdir -p .test-results
+          python tests/support/report_environment.py --require-native > .test-results/native-capabilities.json
 
-      - name: Record complete test shard
-        run: python -B .github/ci/ci_evidence.py record --results .test-results --shard ${{ matrix.shard }}
+      - name: Run tests
+        run: make test-report TEST_WORKERS=2 PYTEST_ARGS='-v'
+
+      - name: Record complete test evidence
+        run: python -B .github/ci/ci_evidence.py record --results .test-results
 
       - name: Upload test diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: test-diagnostics-shard-${{ matrix.shard }}
+          name: test-diagnostics
           path: .test-results/
           include-hidden-files: true
           overwrite: true
@@ -159,7 +155,7 @@ jobs:
         if: needs.selection.outputs.product == 'true' && needs.product-tests.result == 'success'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: test-diagnostics-shard-*
+          name: test-diagnostics
           path: ${{ runner.temp }}/test-diagnostics
 
       - name: Run tests
