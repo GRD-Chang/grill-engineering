@@ -11,6 +11,7 @@ from agent_run.model import Policy, Requirements
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from support.offline import GraphScenario
+from support.run_scoped_kernel import domain_kernel
 from agent_run.model import Effect, Execution, HostObservation
 from support.core_operations import CoreOperations, scripted_return
 from support.api_observation import api_writes, lose_api_reply, pr_author_read
@@ -435,34 +436,35 @@ def test_final_requirement_refresh_never_reuses_old_generation_human_response(tm
     original = Requirements.from_wire(native_input()["initial_requirements"])
     source = replace(original, parent=replace(original.parent, sub_issue_numbers=(3,)), issues=(original.issues[0],))
     scenario = GraphScenario(tmp_path / "graph", source, reviews=("pass", "blocked", "pass"), record_checkpoints=False)
-    assert scenario.run().kind == "complete"
-    activation = prepare_scripted_agent(scenario.kernel, scenario.runner().run_once())
-    assert activation.reason == "final_activated"
-    scenario.select(activation.subject)
-    assert scenario.run().reason == "human_blocker"
-    final = scenario.delivery.key
-    scenario.kernel.control("resume", "answer-old-generation", subject=final, message="Decision for original Parent requirements only.")
-    scenario.requirements = replace(source, parent=replace(source.parent, body="New Parent requirements retire the old response."))
-    fresh = scenario.world()
-    before = scenario.kernel.status(final)
-    calls_before, writes_before = len(scenario.role_calls), len(scenario.port.writes())
-    blocked = prepare_scripted_agent(scenario.kernel, scenario.runner().run_once())
-    assert blocked.kind in {"paused", "quiescent"}
-    assert scenario.kernel.status(final) == before
-    assert len(scenario.role_calls) == calls_before
-    assert len(scenario.port.writes()) == writes_before
-    assert scenario.kernel.control("requeue", "accept-new-parent-without-old-response", subject=final, world=fresh) == "applied"
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
-    step = operations.once()
-    assert step.kind != "paused", step
-    call = step.call or operations.until(lambda step: step.call is not None).call
-    assert call is not None
-    assert call.context["generation"] == 2
-    assert not call.context.get("human_responses")
-    assert scenario.kernel.dispatch_agent(call)
-    scenario.kernel.agent_unavailable(call, "worker_credentials_unavailable", "Synthetic prelaunch credential absence")
-    scenario.kernel.control("resume", "continue-current-generation", subject=final)
-    continuation = operations.until(lambda step: step.call is not None).call
-    assert continuation is not None and continuation.attempt_id == call.attempt_id
-    assert continuation.context["generation"] == 2
-    assert not continuation.context.get("human_responses")
+    with domain_kernel(scenario.kernel) as scenario.kernel:
+        assert scenario.run().kind == "complete"
+        activation = prepare_scripted_agent(scenario.kernel, scenario.runner().run_once())
+        assert activation.reason == "final_activated"
+        scenario.select(activation.subject)
+        assert scenario.run().reason == "human_blocker"
+        final = scenario.delivery.key
+        scenario.kernel.control("resume", "answer-old-generation", subject=final, message="Decision for original Parent requirements only.")
+        scenario.requirements = replace(source, parent=replace(source.parent, body="New Parent requirements retire the old response."))
+        fresh = scenario.world()
+        before = scenario.kernel.status(final)
+        calls_before, writes_before = len(scenario.role_calls), len(scenario.port.writes())
+        blocked = prepare_scripted_agent(scenario.kernel, scenario.runner().run_once())
+        assert blocked.kind in {"paused", "quiescent"}
+        assert scenario.kernel.status(final) == before
+        assert len(scenario.role_calls) == calls_before
+        assert len(scenario.port.writes()) == writes_before
+        assert scenario.kernel.control("requeue", "accept-new-parent-without-old-response", subject=final, world=fresh) == "applied"
+        operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+        step = operations.once()
+        assert step.kind != "paused", step
+        call = step.call or operations.until(lambda step: step.call is not None).call
+        assert call is not None
+        assert call.context["generation"] == 2
+        assert not call.context.get("human_responses")
+        assert scenario.kernel.dispatch_agent(call)
+        scenario.kernel.agent_unavailable(call, "worker_credentials_unavailable", "Synthetic prelaunch credential absence")
+        scenario.kernel.control("resume", "continue-current-generation", subject=final)
+        continuation = operations.until(lambda step: step.call is not None).call
+        assert continuation is not None and continuation.attempt_id == call.attempt_id
+        assert continuation.context["generation"] == 2
+        assert not continuation.context.get("human_responses")

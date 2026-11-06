@@ -13,6 +13,7 @@ from agent_run.core.kernel import Kernel
 from agent_run.core.prompts.role import render_role_prompt
 from agent_run.errors import KernelError
 from support.offline import Scenario, review_result
+from support.run_scoped_kernel import domain_kernel, domain_scenario
 
 
 def next_call(scenario: Scenario, role: Role) -> AgentCall:
@@ -26,8 +27,8 @@ def next_call(scenario: Scenario, role: Role) -> AgentCall:
     raise AssertionError(f"No {role} call")
 
 
-def test_same_thread_new_repair_and_human_continuation_keep_distinct_responsibilities(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / "ticket", DeliveryKind.TICKET, reviews=("fail", "pass"))
+def test_same_thread_new_repair_and_human_continuation_keep_distinct_responsibilities(tmp_path: Path, domain_scenario) -> None:
+    scenario = domain_scenario(tmp_path / "ticket", DeliveryKind.TICKET, reviews=("fail", "pass"))
     operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
     first = next_call(scenario, Role.DEVELOPMENT)
     assert first.context.get("semantic_continuation") is False
@@ -74,26 +75,27 @@ def test_same_thread_new_repair_and_human_continuation_keep_distinct_responsibil
 def test_parent_publication_gets_the_actual_accepted_artifact(tmp_path: Path, kind: DeliveryKind, capsys) -> None:
     scenario = (final_scenario(tmp_path / kind.value) if kind == DeliveryKind.FINAL_RUN
                 else Scenario(tmp_path / kind.value, kind))
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
-    publication = next_call(scenario, Role.PUBLICATION)
-    assert publication.context.get("acceptance_artifact") == review_result("pass")
-    assert "fallback_publication_context" not in publication.context
-    assert "ci_repair_publication_context" not in publication.context
-    from agent_run.cli.main import main
-    from agent_run.contracts.artifact import role_schema
-    request = tmp_path / 'actual-publication-request.json'
-    request.write_text(json.dumps({**publication.context, 'thread_id': publication.reported_thread,
-                                   '_invocation_mode': 'new-thread' if publication.mode == 'fresh' else 'new-attempt'}))
-    role = 'final-publication' if kind == DeliveryKind.FINAL_RUN else 'publication'
-    assert main(['prompts', 'preview', '--role', role, '--request', str(request), '--json']) == 0
-    preview = json.loads(capsys.readouterr().out)
-    assert preview['prompt'] == render_role_prompt(publication)
-    assert preview['schema'] == role_schema('publication')
-    assert json.dumps(publication.context['acceptance_artifact'], ensure_ascii=False, indent=2, sort_keys=True) in preview['prompt']
+    with domain_kernel(scenario.kernel) as scenario.kernel:
+        operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+        publication = next_call(scenario, Role.PUBLICATION)
+        assert publication.context.get("acceptance_artifact") == review_result("pass")
+        assert "fallback_publication_context" not in publication.context
+        assert "ci_repair_publication_context" not in publication.context
+        from agent_run.cli.main import main
+        from agent_run.contracts.artifact import role_schema
+        request = tmp_path / 'actual-publication-request.json'
+        request.write_text(json.dumps({**publication.context, 'thread_id': publication.reported_thread,
+                                       '_invocation_mode': 'new-thread' if publication.mode == 'fresh' else 'new-attempt'}))
+        role = 'final-publication' if kind == DeliveryKind.FINAL_RUN else 'publication'
+        assert main(['prompts', 'preview', '--role', role, '--request', str(request), '--json']) == 0
+        preview = json.loads(capsys.readouterr().out)
+        assert preview['prompt'] == render_role_prompt(publication)
+        assert preview['schema'] == role_schema('publication')
+        assert json.dumps(publication.context['acceptance_artifact'], ensure_ascii=False, indent=2, sort_keys=True) in preview['prompt']
 
 
-def test_ticket_fallback_publication_discloses_the_unreviewed_candidate(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / "fallback", DeliveryKind.TICKET, reviews=("fail",), policy=Policy(ticket_rounds=1))
+def test_ticket_fallback_publication_discloses_the_unreviewed_candidate(tmp_path: Path, domain_scenario) -> None:
+    scenario = domain_scenario(tmp_path / "fallback", DeliveryKind.TICKET, reviews=("fail",), policy=Policy(ticket_rounds=1))
     operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
     publication = next_call(scenario, Role.PUBLICATION)
     facts = publication.context.get("fallback_publication_context")
@@ -179,7 +181,7 @@ def test_findings_review_uses_previous_actual_result_and_current_development(tmp
     assert scenario.port.git.run("rev-parse", "HEAD", cwd=checkout).stdout.strip() == rereview.context["reviewed_commit"]
 
 
-def test_ci_review_uses_failed_head_then_the_actual_findings_review(tmp_path: Path):
+def test_ci_review_uses_failed_head_then_the_actual_findings_review(tmp_path: Path, domain_scenario):
     # Shared range selection for all kinds is covered by run_scoped_ci_context;
     # this Ticket proves opt-in CI Review and both real successor connections.
     kind = DeliveryKind.TICKET
@@ -187,7 +189,7 @@ def test_ci_review_uses_failed_head_then_the_actual_findings_review(tmp_path: Pa
     # One isolated workflow covers both successors. Do not replay the entire
     # original delivery (and Final's Ticket Completion) for a second parameter.
     checks = ("fail", "fail", "none")
-    scenario = Scenario(tmp_path / kind.value, kind, policy=policy, checks=checks)
+    scenario = domain_scenario(tmp_path / kind.value, kind, policy=policy, checks=checks)
     runner = scenario.runner()
     previous_review = None
     development = None
