@@ -12,7 +12,7 @@ from agent_run.adapters.workspace import ManagedWorkspace
 from agent_run.contracts.task import TaskKey
 from agent_run.core.kernel import Kernel
 from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
-from support.offline import OfflinePort, Scenario
+from support.offline import OfflinePort
 from agent_run.cli.main import main
 from agent_run.storage.tasks import task_path
 from agent_run.storage.routing import RepositoryRoute
@@ -269,35 +269,25 @@ def test_unpublished_shells_do_not_consume_the_default_run_candidate_limit(
     assert _snapshot(data) == before
 
 
-def test_default_parent_selects_the_exact_published_run_and_retains_terminal_history(tmp_path, monkeypatch, capsys, git_repo):
-    from support import offline
-    from agent_run.model import DeliveryKind
+def test_default_parent_selects_the_exact_published_run_and_retains_terminal_history(tmp_path, capsys):
     workspace = ManagedWorkspace.for_repository('example/repository')
-    def managed_port(cls, root, initial_git=None):
-        assert root == workspace.root and initial_git is None
-        return cls.from_managed_clone(workspace, git_repo)
-    def managed_kernel(path, spec, **kwargs):
-        assert path == workspace.root / 'kernel.sqlite3'
-        assert spec.repository_root == str(workspace.repository_root)
-        return Kernel.create_task(workspace.state_root / 'kernel.sqlite3', spec, **kwargs)
-    with monkeypatch.context() as patch:
-        patch.setattr(OfflinePort, 'create', classmethod(managed_port))
-        patch.setattr(offline, 'create_kernel', managed_kernel)
-        scenario = Scenario(workspace.root, DeliveryKind.PARENT_ONLY)
-    assert workspace.open_path() == workspace.repository_root
-    assert scenario.run(approve=True).kind == 'complete'
-    assert scenario.kernel.control('stop', 'retire-query-driver') == 'applied'
-    scenario.kernel.confirm_executor_exit(scenario.execution)
-    original = scenario.kernel
-    successor_spec = replace(scenario.spec, run_id='published')
-    successor = Kernel.create_task(original.storage.path, successor_spec, requirements=scenario.requirements)
+    original = _published(workspace.state_root, 'offline-run', repository=workspace.repository)
+    # Declared historical terminal input with no Host, worktree or effects.
+    # This tests Task selection, not the producer of completed delivery.
+    with original.storage.transaction() as tx:
+        tx.execute("UPDATE subjects SET phase='complete' WHERE run_id=?", (original.storage.run_id,))
+    successor_spec = RunSpec('published', workspace.repository, 1, 'unread', 'unread',
+        (original.delivery('parent:1'),), language='en', repository_root=str(workspace.repository_root),
+        inputs=original.operation_binding().inputs)
+    successor = Kernel.create_task(original.storage.path, successor_spec,
+        requirements=Requirements(ParentIssue(1, 'Parent', 'Requirement'), ()))
     assert original.storage.path == successor.storage.path and successor.storage.run_id == 'published'
     before = _snapshot(workspace.root)
     # No explicit state directory or supplied routes: the default real managed
     # registry must find the current successor and exact original history.
-    args = ['--repo', scenario.spec.repository, '--json']
+    args = ['--repo', workspace.repository, '--json']
     assert '--state-dir' not in args
-    assert main(['status', '--parent', str(scenario.spec.parent_issue), *args]) == 0
+    assert main(['status', '--parent', '1', *args]) == 0
     assert json.loads(capsys.readouterr().out)['run_id'] == 'published'
     assert main(['runs', *args]) == 0
     runs = json.loads(capsys.readouterr().out)['runs']

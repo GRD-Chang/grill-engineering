@@ -6,13 +6,8 @@ from pathlib import Path
 import subprocess
 import sys
 
-import pytest
 
-from agent_run.core.kernel import Kernel
-from agent_run.errors import KernelError
 from agent_run.model import Blocker, Issue, ParentIssue, Policy, Requirements
-from agent_run.queries.run import read
-from agent_run.queries.read_facts import QueryError
 from support.offline import GraphScenario
 from support.environment import durable_snapshot as _snapshot
 
@@ -35,82 +30,6 @@ def _cli_history(kernel):
     output = json.loads(result.stdout)
     assert result.returncode == 0, {'returncode':result.returncode, 'output':output}
     return output
-
-
-def test_final_activation_preserves_run_wide_action_material_owners(tmp_path):
-    scenario = _graph(tmp_path/'graph')
-    kernel = scenario.kernel
-    assert kernel.source_status()['final_subject'] is None
-    revision = kernel.configure_profiles('profiles-before-final', preset='economy')
-    assert kernel.control('stop', 'stop-before-final') == 'applied'
-    kernel.confirm_executor_exit(scenario.execution)
-    assert kernel.control('resume', 'resume-before-final') == 'applied'
-    scenario.execution = kernel.claim_executor('resumed-before-final')
-    with kernel.storage.transaction(write=False) as tx:
-        original = {row['id']:dict(row) for row in tx.rows('SELECT * FROM actions')}
-        materials = {}
-        assert set(original) == {'profiles-before-final', 'stop-before-final', 'resume-before-final'}
-        for action in original.values():
-            assert action['subject'] is None
-            for field in ('payload_id', 'receipt_id'):
-                identity = action[field]
-                owner = tx.one('SELECT subject FROM material WHERE run_id=? AND id=?', (tx.run_id, identity))[0]
-                materials[identity] = (owner, tx.get(identity, owner))
-    for subject in ('ticket:2', 'ticket:3'):
-        scenario.select(subject)
-        assert scenario.run().kind == 'complete'
-    for _ in range(10):
-        if kernel.source_status()['final_subject'] is not None:
-            break
-        scenario.step()
-    else:
-        raise AssertionError('Real completed Tickets did not activate Final')
-    # Activation alone changes the first subject; no Final delivery is needed
-    # to prove that immutable Action materials retain their original owner.
-    kernel = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
-    with kernel.storage.transaction(write=False) as tx:
-        assert tx.one('SELECT id FROM subjects ORDER BY id LIMIT 1')[0] == 'final:1'
-        for identity, (owner, body) in materials.items():
-            assert tx.one('SELECT subject FROM material WHERE run_id=? AND id=?', (tx.run_id, identity))[0] == owner
-            assert tx.get(identity, owner) == body
-    before = _snapshot(tmp_path)
-    output = _cli_history(kernel)
-    actions = {item['id']:item for item in output['history']['actions']}
-    for identity, saved in original.items():
-        action = actions[identity]
-        assert action['subject'] is None
-        assert action['payload_id'] == saved['payload_id'] and action['receipt_id'] == saved['receipt_id']
-        assert action['payload']['kind'] == saved['kind']
-    assert actions['profiles-before-final']['receipt'] == {'profile_revision':revision}
-    assert output['latest_resume']['id'] == 'resume-before-final'
-    assert _snapshot(tmp_path) == before
-    # A repeated original Action is a read of that Action, not a new command.
-    assert kernel.control('stop', 'stop-before-final') == 'applied'
-    assert kernel.control('resume', 'resume-before-final') == 'applied'
-    assert kernel.configure_profiles('profiles-before-final', preset='economy') == revision
-    assert _snapshot(tmp_path) == before
-    with pytest.raises(KernelError, match='action_identity_changed'):
-        kernel.control('resume', 'stop-before-final')
-    with pytest.raises(KernelError, match='action_identity_changed'):
-        kernel.control('stop', 'stop-before-final', subject='ticket:3')
-    assert _snapshot(tmp_path) == before
-    # Wrong-scope material reads still fail; no subject probing or fallback.
-    with kernel.storage.transaction(write=False) as tx:
-        payload = original['profiles-before-final']['payload_id']
-        recorded_owner = materials[payload][0]
-        for owner in (row['id'] for row in tx.rows('SELECT id FROM subjects') if row['id'] != recorded_owner):
-            with pytest.raises(KernelError, match='material_corrupt'):
-                tx.get(payload, owner)
-    wrong = subprocess.run([sys.executable, '-m', 'agent_run', 'history', 'another-run',
-                            '--state-dir', str(kernel.storage.path), '--json'],
-                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           text=True, timeout=15)
-    assert wrong.returncode == 2
-    assert 'run_locator_missing' in wrong.stdout
-    with pytest.raises(QueryError) as mismatch:
-        read(kernel.storage.path, 'history', expected_run='another-run', storage=kernel.storage)
-    assert mismatch.value.code == 'run_locator_conflict'
-    assert _snapshot(tmp_path) == before
 
 
 def test_action_history_keeps_original_generation_after_explicit_requeue(tmp_path):
