@@ -1408,6 +1408,11 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                 assert len(kernel.source_status()["completions"]) == 1
                 assert kernel.source_status()["completions"][0]["generation"] == 2
                 assert kernel.status(final)["phase"] == "complete"
+                with kernel.storage.transaction(write=False) as tx:
+                    assert not tx.rows("SELECT id FROM leases")
+                    assert not tx.rows("SELECT subject FROM resource_cleanup WHERE state!='complete'")
+                    assert tx.one("SELECT count(*) FROM final_barriers WHERE subject=? AND generation=?",
+                                  (final, renewed["generation"]))[0] == 1
                 assert kernel.status(final)["generation"] == renewed["generation"]
                 assert kernel.status(final)["pr_number"] == final_before["pr_number"]
                 assert kernel.status(final)["source_sha"] == original_run_head

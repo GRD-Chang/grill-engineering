@@ -53,6 +53,11 @@ def test_three_deliveries_complete_with_required_review_and_exact_git_history(
     tmp_path: Path, kind: DeliveryKind, expected_roles: list[str], development_purpose: str, domain_scenario,
 ) -> None:
     scenario = domain_scenario(tmp_path / "scenario", kind, reviews=("fail", "pass"))
+    prefix_history = scenario.kernel.history("ticket:2") if kind == DeliveryKind.FINAL_RUN else None
+    if kind != DeliveryKind.TICKET:
+        assert scenario.run(cut="publication_pending").kind == "publication_pending"
+        assert [call["role"] for call in scenario.role_calls] == expected_roles[:-1]
+        assert not any(write["operation"] == "pr_write" for write in scenario.writes())
     original_target = scenario.port.remote_commit(scenario.delivery.target_ref)
     assert original_target is not None
     boundary = scenario.run()
@@ -71,12 +76,25 @@ def test_three_deliveries_complete_with_required_review_and_exact_git_history(
         assert scenario.historical_trace is not None
         assert scenario.historical_trace["raw_backend_calls"] == {"development": 1, "review": 1, "publication": 1}
         assert sum(write["operation"] == "merge" for write in scenario.port.writes()) == 2
+        assert scenario.kernel.history("ticket:2") == prefix_history
+        completion, = scenario.kernel.source_status()["completions"]
+        assert completion["subject"] == "ticket:2" and completion["review_attempt"] is not None
     target = scenario.port.remote_commit(scenario.delivery.target_ref)
     assert target is not None
     physical = scenario.port.physical.commit(target.sha)
     assert physical["sha"] == scenario.port.physical.refs()[scenario.delivery.target_ref] == target.sha
     assert [parent["sha"] for parent in physical["parents"]] == list(scenario.port.git.parents(target.sha))
     assert len(scenario.port.git.parents(target.sha)) == (1 if kind == DeliveryKind.TICKET else 2)
+    headers = {
+        DeliveryKind.TICKET: "Parent Issue: #1\nPrimary Ticket: #2\nDelivery Type: Ticket\n\n",
+        DeliveryKind.PARENT_ONLY: "Parent Issue: #1\nDelivery Type: Parent-only\n\n",
+        DeliveryKind.FINAL_RUN: "Parent Issue: #1\nDelivery Type: Final Run\n\n## Completed Tickets\n\n- #2: Deliver one ticket\n\n",
+    }
+    pr = scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref)
+    assert pr is not None and pr.state == "MERGED" and pr.body.startswith(headers[kind])
+    assert scenario.kernel.status(scenario.delivery.key)["resource_cleanup"]["state"] == "complete"
+    assert not Path(scenario.delivery.checkout).exists()
+    assert scenario.port.remote_refs().keys() == ({"refs/heads/main", "refs/heads/run"} if kind == DeliveryKind.TICKET else {"refs/heads/main"})
     assert scenario.kernel.status(scenario.delivery.key)["phase"] == "complete"
     assert scenario.port.git.run("ls-tree", "-r", "--name-only", target.sha).stdout.find("validation.tmp") == -1
     assert not list((scenario.port.root / "work").glob("review-*"))

@@ -2,26 +2,43 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any
 
 import pytest
 
 import agent_run.storage.notification_outbox as outbox
-from agent_run.model import DeliveryKind
+from agent_run.model import DeliveryKind, Role
 from agent_run.notifications.sender import NativeNotifications
-from agent_run.notifications.envelope import event_copy
+from agent_run.notifications.envelope import event_copy, event_envelope
+from agent_run.notifications.event_projection import event_state
 from agent_run.config.defaults import UserDefaultsStore
-from support.notification import _enabled_scenario, observe_and_wait
+from support.notification import _enabled_scenario, observe_and_wait, recorded_agents
 
 
 def test_acceptance_and_terminal_notifications_follow_committed_delivery_boundaries(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     scenario = _enabled_scenario(tmp_path, monkeypatch, DeliveryKind.PARENT_ONLY)
+    now = [time.time()]
+    scenario.kernel.clock = lambda: now[0]
+
+    def started(call):
+        seconds = {Role.DEVELOPMENT: 2, Role.REVIEW: 3, Role.PUBLICATION: 5}[call.role]
+        if call.role != Role.PUBLICATION:
+            scenario.kernel.observe_worker_activity(call, "start", active=True, observed_at=now[0] + 1, evidence={"type": "turn.started"})
+            scenario.kernel.observe_worker_activity(call, "end", active=False, observed_at=now[0] + 1 + seconds, evidence={"type": "turn.completed"})
+        now[0] += seconds + 2
+
+    recorded_agents(scenario, monkeypatch, started=started, activity=False)
+    captured = []
     sent: list[dict[str, Any]] = []
 
     def transport(_config: Any, rendered: dict[str, Any], _identity: str,
                   *_args: Any, **_kwargs: Any) -> dict[str, Any]:
         sent.append(rendered)
+        active, = [item["event"] for item in outbox.read_notifications(tmp_path, scenario.spec.run_id)["pending"]
+                   if item["outcome"] == "sending"]
+        captured.append(active)
         return {"outcome": "success", "reason": None}
 
     def observe(kind: str = "acceptance_passed") -> list[dict[str, Any]]:
@@ -99,6 +116,19 @@ def test_acceptance_and_terminal_notifications_follow_committed_delivery_boundar
     assert "/pull/" in str(sent[-1])
     assert observe("boundary") == completed
     assert observe() == accepted
+
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        close = tx.one("SELECT e.id,e.receipt_id FROM effects e JOIN history h ON h.identity=e.id AND h.material_id=e.receipt_id "
+                       "WHERE e.operation='close' AND e.status='confirmed' AND h.kind='effect_consumed'")
+        state = event_state(tx)
+    terminal, = [event for event in captured if event["id"] == completed[1]["id"]]
+    assert terminal["terminal"] and terminal["status_code"] == "completed"
+    assert terminal["id"] == event_envelope(state, "boundary", ["completed", close["id"], close["receipt_id"]], "")["id"]
+    assert terminal["execution_timing_complete"] is False and terminal["total_seconds"] is None
+    assert terminal["recorded_execution_seconds"] == 5
+    assert terminal["effort"]["development"]["execution_seconds"] == 2
+    assert terminal["effort"]["review"]["execution_seconds"] == 3
+    assert terminal["effort"]["development"]["rounds"] == terminal["effort"]["review"]["rounds"] == 1
 
 
 @pytest.mark.parametrize("changed_branch", ["source", "target"])

@@ -10,10 +10,9 @@ import agent_run.storage.notification_outbox as outbox
 from agent_run.notifications.envelope import event_copy, event_envelope
 from agent_run.notifications.event_projection import event_state, project_event
 from agent_run.queries.resume_facts import resume_facts
-from agent_run.model import DeliveryKind, Role
-from agent_run.model import wire_json
+from agent_run.model import Role, wire_json
 from agent_run.notifications.sender import NativeNotifications
-from support.notification import recorded_agents as _recorded_agents, _enabled_scenario, _kernel, _operations, observe_and_wait
+from support.notification import _kernel, _operations, observe_and_wait
 from support.observer_errors import ObserverErrors
 from support.worker_facts import start_worker, finish_worker, consume_local_result
 
@@ -90,41 +89,6 @@ def test_sender_merges_actual_resume_result_into_the_original_gate_without_a_sec
     first = outbox.read_notifications(tmp_path, kernel.storage.run_id)["records"]
     _observe(kernel, tmp_path, captured)
     assert outbox.read_notifications(tmp_path, kernel.storage.run_id)["records"] == first
-
-
-@pytest.mark.parametrize("publication_recorded", [True, False])
-def test_sender_terminal_uses_original_close_whole_effort_and_keeps_unknown_publication_unknown(tmp_path, monkeypatch, publication_recorded):
-    scenario = _enabled_scenario(tmp_path, monkeypatch, DeliveryKind.PARENT_ONLY)
-    now = [time.time()]
-    scenario.kernel.clock = lambda: now[0]
-
-    def started(call):
-        seconds = {Role.DEVELOPMENT: 2, Role.REVIEW: 3, Role.PUBLICATION: 5}[call.role]
-        if publication_recorded or call.role != Role.PUBLICATION:
-            scenario.kernel.observe_worker_activity(call, "start", active=True, observed_at=now[0] + 1, evidence={"type": "turn.started"})
-            scenario.kernel.observe_worker_activity(call, "end", active=False, observed_at=now[0] + 1 + seconds, evidence={"type": "turn.completed"})
-        now[0] += seconds + 2
-
-    _recorded_agents(scenario, monkeypatch, started=started, activity=False)
-    assert scenario.run(approve=True).kind == "complete"
-    with scenario.kernel.storage.transaction(write=False) as tx:
-        assert tx.one("SELECT count(*) FROM history WHERE kind='worker_started'")[0] == 3
-        close = tx.one("SELECT e.id,e.receipt_id FROM effects e JOIN history h ON h.identity=e.id AND h.material_id=e.receipt_id "
-                       "WHERE e.operation='close' AND e.status='confirmed' AND h.kind='effect_consumed'")
-        close_id, receipt_id = close["id"], close["receipt_id"]
-    captured = []
-    _observe(scenario.kernel, tmp_path, captured)
-    terminal, = [event for event in captured if event.get("terminal") and event["status_code"] == "completed"]
-    assert terminal["id"] == event_envelope(_state(scenario.kernel), "boundary", ["completed", close_id, receipt_id], "")["id"]
-    assert terminal["execution_timing_complete"] is publication_recorded
-    assert terminal["total_seconds"] == (10 if publication_recorded else None)
-    assert terminal["recorded_execution_seconds"] == (10 if publication_recorded else 5)
-    assert terminal["effort"]["development"]["execution_seconds"] == 2
-    assert terminal["effort"]["review"]["execution_seconds"] == 3
-    assert terminal["effort"]["development"]["rounds"] == terminal["effort"]["review"]["rounds"] == 1
-    first = list(captured)
-    _observe(scenario.kernel, tmp_path, captured)
-    assert captured == first
 
 
 def test_sender_compresses_real_development_to_review_and_preserves_gate_budget_and_return_order(tmp_path):

@@ -715,6 +715,9 @@ def test_public_ticket_completion_then_final_delivery_keep_distinct_query_bounda
 ) -> None:
     from agent_run.model import Issue, ParentIssue, Requirements
     from support.offline import GraphScenario
+    from agent_run.queries.read_facts import read_boundaries
+    from agent_run.storage.sqlite import Transaction
+    import time
 
     # One original Ticket Completion becomes the input to Final activation.
     from support import offline
@@ -729,8 +732,23 @@ def test_public_ticket_completion_then_final_delivery_keep_distinct_query_bounda
                           (Issue(2, "Ticket", "Original task", "OPEN", frozenset({"ready-for-agent"})),))
     scenario = GraphScenario(tmp_path / "scenario", source)
     scenario.spec = replace(scenario.spec, language="en", repository="example/repository")
+
+    def boundaries(*, material_free=False):
+        before = _snapshot(tmp_path)
+        with monkeypatch.context() as lightweight:
+            lightweight.setattr(query, "read_notifications", lambda *_a, **_kw: pytest.fail("Boundary facts must not read a journal"))
+            if material_free:
+                lightweight.setattr(Transaction, "get", lambda *_a, **_kw: pytest.fail("Approval boundaries must not expand audit material"))
+            with scenario.kernel.storage.transaction(write=False) as tx:
+                result = read_boundaries(tx, time.time())
+        assert _snapshot(tmp_path) == before
+        return result
+
     assert scenario.run().kind == "complete"
     _assert_completed_delivery_query(scenario, tmp_path, DeliveryKind.TICKET, "run_acceptance_pending")
+    ticket_only = boundaries()
+    assert ticket_only["is_terminal"] is False and ticket_only["status"] == "run_acceptance_pending"
+    assert ticket_only["closures"] == []
     for _ in range(40):
         scenario.step()
         if scenario.kernel.source_status()["final_subject"] is not None:
@@ -740,5 +758,23 @@ def test_public_ticket_completion_then_final_delivery_keep_distinct_query_bounda
     scenario.select("final:1")
     assert scenario.run().kind == "approval"
     _assert_approval_query(scenario, tmp_path)
+    approval = boundaries(material_free=True)
+    assert approval["is_terminal"] is False and approval["closures"] == []
+    assert approval["actions"][0]["reason"] == "final_approval"
+    assert approval["actions"][0]["subject"] == "final:1"
     assert scenario.run(approve=True).kind == "complete"
     _assert_completed_delivery_query(scenario, tmp_path, DeliveryKind.FINAL_RUN, "merged")
+    completed = boundaries()
+    assert completed["status"] == "completed" and completed["is_terminal"] is True
+    assert completed["abandonment"] is None and completed["delivery_cleanup"]["status"] == "completed"
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        effect = tx.one("SELECT id,receipt_id,pr_number FROM effects WHERE subject='final:1' AND operation='close' AND status='confirmed'")
+        receipt = json.loads(tx.get(effect["receipt_id"], "final:1"))
+    assert receipt["disposition"] == "target"
+    assert completed["closures"] == [{"subject": "final:1", "generation": scenario.kernel.status("final:1")["generation"],
+        "effect_id": effect["id"], "receipt_id": effect["receipt_id"], "pr_number": effect["pr_number"]}]
+    assert [call["role"] for call in scenario.role_calls] == ["development", "review", "publication", "review", "publication"]
+    assert [call["subject"] for call in scenario.role_calls] == ["ticket:2"] * 3 + ["final:1"] * 2
+    assert sum(write["operation"] == "merge" for write in scenario.port.writes()) == 2
+    assert scenario.port.remote_refs().keys() == {"refs/heads/main"}
+    assert not list((scenario.port.root / "work").iterdir())
