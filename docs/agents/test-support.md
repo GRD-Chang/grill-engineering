@@ -31,6 +31,12 @@
 parents/tree、需求和 Generation 保持一致。场景之间不共享可变 Kernel、Run、Locator
 或工作目录；增加新选项前先确认真实消费者，不建立任意 overrides 的通用工厂。
 
+`offline_git` 只支持自己独占创建并可重开的受信任合成世界，使用固定 Git 布局与小型配置。
+每次操作校验私有根、顶层元数据路径、配置和环境，拒绝 commondir/alternates 重定向；
+不导入任意仓库，也不承担恶意并发修改夹具元数据的安全模型，不递归扫描对象树。
+每次 refs/commit/祖先关系仍实际读取，授权、CAS、symref 锁和丢回复后的读回保持真实。
+产品 ManagedWorkspace 与原生隔离安全测试拥有产品边界，不用夹具自测替代。
+
 `CoreOperations` 选择工作并执行相应边界；脚本化 Agent 支撑提供本例声明的外部返回。
 准备席位、Invocation、实际执行、退出证明与计费仍由产品负责。
 缺字段、跨对象身份、损坏、unknown 和外部漂移测试保留原始负向输入，

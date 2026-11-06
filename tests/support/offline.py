@@ -72,8 +72,9 @@ _SHARED_REMOTE = frozenset({"pr_write", "merge", "completion_comment", "close", 
 
 class OfflinePort:
     def __init__(self, root: Path) -> None:
+        if root.is_symlink():
+            raise ValueError("offline world root must not redirect paths")
         self.root = root.resolve()
-        self._managed_workspace = None
         self.git = LocalGit(self.root / "authority")
         self.git.env.update({"GIT_AUTHOR_NAME": "Offline Publisher", "GIT_AUTHOR_EMAIL": "offline@example.invalid",
                              "GIT_COMMITTER_NAME": "Offline Publisher", "GIT_COMMITTER_EMAIL": "offline@example.invalid",
@@ -92,9 +93,9 @@ class OfflinePort:
 
     @classmethod
     def create(cls, root: Path, initial_git: Mapping[str, Any] | None = None) -> OfflinePort:
-        authority = root / "authority"
-        authority.mkdir(parents=True, exist_ok=False)
         port = cls(root)
+        authority = port.root / "authority"
+        authority.mkdir(parents=True, exist_ok=False)
         if initial_git is not None:
             port.git.env.update({"GIT_AUTHOR_NAME": initial_git["author_name"], "GIT_AUTHOR_EMAIL": initial_git["author_email"],
                                  "GIT_COMMITTER_NAME": initial_git["author_name"], "GIT_COMMITTER_EMAIL": initial_git["author_email"],
@@ -111,20 +112,6 @@ class OfflinePort:
             path.write_text(body, encoding="utf-8")
         port.git.run("add", "--all")
         port.git.run("commit", "-m", "initial fixture" if initial_git is None else initial_git["initial_message"])
-        port._initialize_external_objects()
-        return port
-
-    @classmethod
-    def from_managed_clone(cls, workspace, source: Path) -> OfflinePort:
-        """Real managed clone; only its remote GitHub/Agent adapter is synthetic."""
-        checkout = workspace.ensure_path(str(source))
-        port = cls(workspace.root)
-        environment = port.git.env
-        port.git = LocalGit(checkout)
-        port.git.env.update(environment)
-        port.git.run("config", "maintenance.auto", "false")
-        port.git.run("config", "gc.auto", "0")
-        port._managed_workspace = workspace
         port._initialize_external_objects()
         return port
 
@@ -234,7 +221,7 @@ class OfflinePort:
 
     @property
     def physical(self) -> OfflineGit:
-        return OfflineGit(self.root, environment=self.git.env, managed_workspace=self._managed_workspace)
+        return OfflineGit(self.root, environment=self.git.env)
 
 
     def remote_refs(self) -> dict[str, str]:

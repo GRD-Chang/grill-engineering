@@ -1,16 +1,13 @@
-# Synthetic external world
+# 合成外部世界
 
-`support.offline` provides Scenario, GraphScenario, OfflinePort and the physical
-ports used by their tests. `support.offline_api` owns raw fake API records and
-SyntheticGitHub; `support.offline_git` owns the private bare Git world.
-These are test/experiment support, not a product offline entry.
+`support.offline` 提供 Scenario、GraphScenario、OfflinePort 与物理端口；
+`offline_api` 保存合成 GitHub 原始记录，`offline_git` 操作私有 bare Git。
+这些模块仅用于测试和实验。
 
-All workflow decisions, authorization, budgets and recovery remain in the real
-Kernel/OperationRunner/RemoteEffects. The harness supplies Agent outputs and
-external objects, executes actual private Git operations, and projects traces;
-it must not calculate expected business outcomes from the production engine.
+业务选择、授权、预算和恢复由真实 Kernel、OperationRunner、RemoteEffects 执行。
+夹具只提供 Agent 返回与外部对象，执行真实 Git 并记录轨迹；预期结果由独立断言判断。
 
-From the project directory, use a new task-private directory:
+从项目目录选择本任务的新目录运行：
 
 ```sh
 PYTHONPATH=src:tests python -m support.offline \
@@ -18,9 +15,13 @@ PYTHONPATH=src:tests python -m support.offline \
   --scenario parent-only-normal --output /tmp/kernel-observation.json
 ```
 
-Other scenario names are listed by `--help`. The builder accepts only current
-raw API world files and self-contained private Git repositories. Unsupported
-formats are refused without upgrading or modifying their original files.
-Synthetic fault injection stays at physical I/O. No real accounts, credentials
-or services are needed. Original data and independent test assertions remain
-the oracle; the fake's protocol classification is not an expected-value source.
+场景见 `--help`。创建时独占新 `authority`，可重新打开自己创建的合成世界。
+夹具仅支持其生成的固定布局与小型配置；不导入任意仓库，也不模拟元数据遭恶意并发替换的环境。
+每次操作检查私有根、顶层 Git 路径、配置、commondir/alternates 和环境重定向；
+不递归遍历整个对象树。Git hooks 与非本地传输被禁用。
+每次观察仍新读 refs、commit 与祖先关系，写入继续使用真实 CAS、直接 ref、锁、
+原授权和丢回复后的读回，不能缓存事实或授权。
+产品 ManagedWorkspace、安全检查和原生生命周期由各自产品测试负责。
+
+故障注入位于物理 I/O；测试不使用真实账号、凭据或服务。
+原始数据和独立断言是结果依据，夹具不推导预期业务状态。

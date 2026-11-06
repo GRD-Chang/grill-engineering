@@ -12,7 +12,6 @@ import os
 from pathlib import Path
 import re
 import selectors
-import stat
 import subprocess
 from tempfile import TemporaryDirectory
 from time import monotonic
@@ -23,8 +22,7 @@ from agent_run.model import Commit
 from agent_run.runtime.git_command import MAX_GIT_ERROR_BYTES, _kill_group, run_git
 
 
-# Exact files produced by this fixture's Git init/config commands. Other Git
-# spellings, object formats and legal extra keys still use Git's own parser.
+# Exact files created by this fixture; existing repositories are not imported.
 _CANONICAL_CONFIG = {
     False: (b"[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n"
             b"\tbare = false\n\tlogallrefupdates = true\n"
@@ -38,20 +36,12 @@ _PRIVATE_GIT_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
 
 class OfflineGit:
     def __init__(self, root: Path, *, environment: Mapping[str, str],
-                 written: Callable[[str, Mapping[str, Any], subprocess.CompletedProcess[str]], None] | None = None,
-                 managed_workspace=None) -> None:
+                 written: Callable[[str, Mapping[str, Any], subprocess.CompletedProcess[str]], None] | None = None) -> None:
         self.written = written
+        if root.is_symlink():
+            raise ValueError("offline world root must not redirect paths")
         self.root = root.resolve(strict=True)
-        self.managed_workspace = managed_workspace
-        if managed_workspace is None:
-            self.repository = self.root / "authority"
-        else:
-            from agent_run.adapters.workspace import ManagedWorkspace
-            if (type(managed_workspace) is not ManagedWorkspace
-                    or managed_workspace != ManagedWorkspace.for_repository(managed_workspace.repository)
-                    or managed_workspace.root.resolve() != self.root):
-                raise ValueError("offline managed clone must be the exact canonical workspace")
-            self.repository = managed_workspace.open_path()
+        self.repository = self.root / "authority"
         self.remote = self.root / "remote.git"
         # Only Scenario-owned paths are accepted, never a configured remote URL.
         for path in (self.repository, self.remote):
@@ -96,100 +86,29 @@ class OfflineGit:
         if self.remote.exists() or self.remote.is_symlink():
             self._owned_repository(self.remote, bare=True)
 
-    def _canonical_config(self, path: Path, *, bare: bool) -> bool:
-        expected = _CANONICAL_CONFIG[bare]
-        def identity(value):
-            return (value.st_dev, value.st_ino, value.st_mode, value.st_size,
-                    value.st_mtime_ns, value.st_ctime_ns)
-        original = path.stat(follow_symlinks=False)
-        if not stat.S_ISREG(original.st_mode):
-            return False
-        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
-        try:
-            opened = os.fstat(descriptor)
-            if identity(original) != identity(opened):
-                raise ValueError("offline Git configuration changed while reading")
-            body = os.read(descriptor, len(expected) + 1)
-            if (identity(opened) != identity(os.fstat(descriptor))
-                    or identity(opened) != identity(path.stat(follow_symlinks=False))):
-                raise ValueError("offline Git configuration changed while reading")
-        except BaseException as error:
-            try:
-                os.close(descriptor)
-            except BaseException:
-                try:
-                    error.add_note("Offline Git config descriptor close failed; original exception preserved")
-                except BaseException:
-                    pass  # Even a failing diagnostic must not replace the original exception.
-            raise
-        else:
-            os.close(descriptor)
-        return body == expected and opened.st_size == len(expected)
-
     def _owned_repository(self, repository: Path, *, bare: bool) -> None:
+        """Check the fixed fixture boundary, not arbitrary hostile Git metadata."""
         directory = repository if bare else repository / ".git"
-        if (repository.is_symlink() or directory.is_symlink() or not directory.is_dir()
-                or not directory.resolve().is_relative_to(self.root)
+        if (self.root.is_symlink() or repository.is_symlink() or directory.is_symlink()
+                or not directory.resolve().is_relative_to(self.root) or not directory.is_dir()
                 or os.path.lexists(directory / "commondir")
                 or os.path.lexists(directory / "config.worktree")):
             raise ValueError("offline Git requires a private ordinary repository")
-        for name in ("HEAD", "config", "packed-refs", "refs", "objects", "logs"):
-            path = directory / name
-            if path.is_symlink():
+        for name in ("HEAD", "config", "packed-refs", "refs", "objects", "objects/info", "logs"):
+            if (directory / name).is_symlink():
                 raise ValueError("offline Git metadata must not redirect paths")
-            pending = [path] if path.is_dir() else []
-            while pending:
-                with os.scandir(pending.pop()) as entries:
-                    for entry in entries:
-                        if entry.is_symlink():
-                            raise ValueError("offline Git metadata must not redirect paths")
-                        if entry.is_dir(follow_symlinks=False):
-                            pending.append(entry.path)
-        # Parse only this file, without following include/includeIf. Unknown
-        # configuration (including URL rewrites and alternate transports) fails
-        # closed; do not sanitize or mutate a saved world's configuration.
-        allowed = {"core.repositoryformatversion": {"0", "1"}, "core.filemode": {"true", "false"},
-            "core.bare": {str(bare).lower()}, "core.logallrefupdates": {"true", "false"},
-            "core.ignorecase": {"true", "false"}, "core.precomposeunicode": {"true", "false"},
-            "extensions.objectformat": {"sha1", "sha256"}, "gc.auto": {"0"}, "maintenance.auto": {"false"},
-            "user.name": None, "user.email": None}
-        if not bare and self.managed_workspace is not None:
-            if repository != self.managed_workspace.open_path():
-                raise ValueError("offline managed repository changed")
-            document = self.managed_workspace._owned_document()
-            # Exact fixture clone configuration; includes/rewrites/hooks and
-            # every other formerly unsupported key still refuse unchanged.
-            allowed.update({"remote.origin.url": {document["remote_url"]},
-                "remote.origin.fetch": {"+refs/heads/*:refs/remotes/origin/*"},
-                "branch.main.remote": {"origin"}, "branch.main.merge": {"refs/heads/main"}})
-        if not self._canonical_config(directory / "config", bare=bare):
-            config = self._run(self.root, "config", "--no-includes", "--file", str(directory / "config"), "--null", "--list")
-            for item in config.stdout.split("\0"):
-                if not item:
-                    continue
-                key, _, value = item.partition("\n")
-                permitted = allowed.get(key)
-                if key not in allowed or permitted is not None and value not in permitted:
-                    raise ValueError("unsupported offline Git configuration: " + key)
-        # The fixture's ordinary layout is already fixed by the fresh path,
-        # config and environment checks. Other valid HEAD spellings still use
-        # Git's parser; damaged layouts must never discover an ancestor repo.
-        descriptor = os.open(directory / "HEAD", os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
-        with os.fdopen(descriptor, "rb") as stream:
-            head = stream.read(32)
-        if (head not in (b"ref: refs/heads/main\n", b"ref: refs/heads/master\n")
-                or not (directory / "refs").is_dir() or not (directory / "objects").is_dir()):
-            actual = self._run(repository, "rev-parse", "--path-format=absolute", "--git-common-dir", "--git-path", "refs").stdout.splitlines()
-            if actual != [str(directory), str(directory / "refs")]:
-                raise ValueError("offline Git common directory or refs redirected")
-        self._owned_objects(directory / "objects")
-
-    def _owned_objects(self, objects: Path) -> None:
-        if not objects.resolve(strict=True).is_relative_to(self.root):
-            raise ValueError("offline objects escape their Scenario")
-        alternates = objects / "info/alternates"
-        if alternates.exists():
+        if (not (directory / "refs").is_dir() or not (directory / "objects").is_dir()
+                or os.path.lexists(directory / "objects/info/alternates")):
             raise ValueError("offline objects must be self-contained")
+        for name, expected in (("config", _CANONICAL_CONFIG[bare]),
+                               ("HEAD", b"ref: refs/heads/main\n")):
+            path = directory / name
+            if not path.is_file():
+                raise ValueError("offline Git requires regular fixture metadata")
+            with path.open("rb") as stream:
+                body = stream.read(len(expected) + 1)
+            if body != expected:
+                raise ValueError("unsupported offline Git configuration or layout")
 
     @staticmethod
     def _oid(value: str) -> str:
@@ -214,7 +133,7 @@ class OfflineGit:
         object_format = self._run(self.repository, "rev-parse", "--show-object-format").stdout.strip()
         with TemporaryDirectory(prefix=".remote-git-create-", dir=self.root) as temporary:
             staged = Path(temporary) / "remote.git"
-            self._run(self.root, "init", "--bare", "--template=", "--object-format=" + object_format, str(staged))
+            self._run(self.root, "init", "--bare", "--initial-branch=main", "--template=", "--object-format=" + object_format, str(staged))
             self._owned_repository(staged, bare=True)
             # No shared alternates and no refs copied from the local workspace.
             for sha in sorted(set(refs.values())):

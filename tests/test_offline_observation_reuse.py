@@ -69,22 +69,12 @@ def test_observation_samples_both_refs_before_transfer_and_rereads_next_time(wor
     assert port.delivery(request, ('pass',), []).target == commits[-1]
 
 
-@pytest.mark.parametrize('fault', ['include', 'rewrite', 'symlink', 'alternates'])
 @pytest.mark.parametrize('stage', ['after-first-refs', 'next-observation'])
-def test_reused_adapter_rechecks_current_private_repository_ownership(world, monkeypatch, tmp_path, fault, stage):
+def test_reused_adapter_rechecks_current_private_repository_ownership(world, monkeypatch, stage):
     port, _commits, request = world
     def corrupt():
-        directory = port.root / 'remote.git'
-        if fault == 'include':
-            with (directory / 'config').open('a') as stream:
-                stream.write('\n[include]\n\tpath = /unread-offline-config\n')
-        elif fault == 'rewrite':
-            with (directory / 'config').open('a') as stream:
-                stream.write('\n[url "file:///unread-offline-repository"]\n\tinsteadOf = offline\n')
-        elif fault == 'symlink':
-            (directory / 'refs' / 'foreign').symlink_to(tmp_path / 'foreign-ref')
-        else:
-            (directory / 'objects' / 'info' / 'alternates').write_text(str(tmp_path / 'foreign-objects') + '\n')
+        with (port.root / 'remote.git/config').open('a') as stream:
+            stream.write('\n[include]\n\tpath = /unread-offline-config\n')
     if stage == 'next-observation':
         port.delivery(request, ('pass',), [])
         corrupt()
@@ -97,7 +87,6 @@ def test_reused_adapter_rechecks_current_private_repository_ownership(world, mon
         monkeypatch.setattr(offline_git.OfflineGit, 'refs', refs)
     with pytest.raises(ValueError, match='unsupported offline Git configuration|must not redirect|self-contained'):
         port.delivery(request, ('pass',), [])
-    assert not (tmp_path / 'foreign-ref').exists() and not (tmp_path / 'foreign-objects').exists()
 
 
 def test_unknown_ancestry_remains_a_failure_after_successful_observation(world):

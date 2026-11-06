@@ -28,17 +28,15 @@ def corrupt(port, tmp_path, location, fault):
     if fault == 'include':
         with (directory / 'config').open('a') as stream:
             stream.write('\n[include]\n\tpath = ignored-private-fixture-file\n')
-    elif fault == 'rewrite':
-        with (directory / 'config').open('a') as stream:
-            stream.write('\n[url "file:///unreached-private-fixture"]\n\tinsteadOf = offline\n')
     elif fault == 'alternates':
         (directory / 'objects/info/alternates').write_text(str(tmp_path / 'foreign-objects') + '\n')
     else:
-        (directory / 'objects/info/foreign').symlink_to(tmp_path / 'unreached-foreign-directory')
+        (directory / 'refs').rename(directory / 'saved-refs')
+        (directory / 'refs').symlink_to(tmp_path / 'unreached-foreign-directory')
 
 
 @pytest.mark.parametrize('location', ['local', 'bare'])
-@pytest.mark.parametrize('fault', ['include', 'rewrite', 'alternates', 'symlink'])
+@pytest.mark.parametrize('fault', ['include', 'alternates', 'symlink'])
 def test_derived_writer_rechecks_tampered_world_before_push_or_delete(world, tmp_path, location, fault):
     port, base, after = world
     ref = 'refs/heads/original'
@@ -158,3 +156,36 @@ def test_failed_cas_records_failure_without_forging_success(world):
     assert adapter.git_writes.refs()['refs/heads/existing'] == base.sha
     records = port.objects.snapshot()['api_requests']
     assert len(records) == 1 and json.loads(records[0]['response'])['returncode'] == result.returncode
+
+
+@pytest.mark.parametrize('redirect', [{'GIT_DIR': 'unread'}, {'GIT_CONFIG_GLOBAL': 'unread'}])
+def test_private_fixture_rejects_redirected_environment(world, monkeypatch, redirect):
+    backend = world[0].physical
+    backend.environment.update(redirect)
+    monkeypatch.setattr(backend, '_run', lambda *args, **kwargs: pytest.fail('No Git dispatch before isolation'))
+    with pytest.raises(ValueError, match='environment must not redirect'):
+        backend.refs()
+
+
+@pytest.mark.parametrize('redirect', ['commondir', 'config-symlink'])
+def test_private_fixture_rejects_redirected_layout(world, tmp_path, monkeypatch, redirect):
+    backend = world[0].physical
+    directory = backend.repository / '.git'
+    if redirect == 'commondir':
+        (directory / 'commondir').write_text(str(tmp_path / 'unread'))
+    else:
+        (directory / 'config').unlink()
+        (directory / 'config').symlink_to(tmp_path / 'unread')
+    monkeypatch.setattr(backend, '_run', lambda *args, **kwargs: pytest.fail('No Git dispatch before isolation'))
+    with pytest.raises(ValueError, match='private ordinary repository|must not redirect'):
+        backend.refs()
+
+
+def test_private_world_refuses_a_symlink_root_before_creation(tmp_path):
+    foreign = tmp_path / 'foreign'
+    foreign.mkdir()
+    root = tmp_path / 'world'
+    root.symlink_to(foreign, target_is_directory=True)
+    with pytest.raises(ValueError, match='root must not redirect'):
+        OfflinePort.create(root)
+    assert not tuple(foreign.iterdir())

@@ -2,7 +2,6 @@
 
 from support.repository_fixture import create_kernel
 from pathlib import Path
-from dataclasses import replace
 import json
 import shutil
 
@@ -12,7 +11,6 @@ from agent_run.adapters.workspace import ManagedWorkspace
 from agent_run.contracts.task import TaskKey
 from agent_run.core.kernel import Kernel
 from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
-from support.offline import OfflinePort
 from agent_run.cli.main import main
 from agent_run.storage.tasks import task_path
 from agent_run.storage.routing import RepositoryRoute
@@ -331,19 +329,3 @@ def test_exact_default_query_isolates_another_parents_bound_database_failure(tmp
     assert main(['runs', '--repo', 'example/project', '--json']) == 2
     assert json.loads(capsys.readouterr().out)['diagnostics'][0]['path'] == diagnostic['path']
     assert _snapshot(data) == before
-
-
-def test_managed_scenario_adapter_keeps_canonical_workspace_and_git_config_guards(tmp_path, git_repo):
-    from support.offline_git import OfflineGit
-    workspace = ManagedWorkspace.for_repository('example/repository')
-    port = OfflinePort.from_managed_clone(workspace, git_repo)
-    assert port.git.root == workspace.open_path() == workspace.repository_root
-    before = _snapshot(port.root / 'remote.git')
-    foreign = replace(workspace, root=tmp_path / 'foreign-workspace')
-    with pytest.raises(ValueError, match='exact canonical workspace'):
-        OfflineGit(workspace.root, environment=port.git.env, managed_workspace=foreign)
-    assert not foreign.root.exists()
-    port.git.run('config', '--local', 'core.hooksPath', str(tmp_path / 'unexecuted-hooks'))
-    with pytest.raises(ValueError, match='unsupported offline Git configuration: core.hookspath'):
-        port.physical.refs()
-    assert _snapshot(port.root / 'remote.git') == before
