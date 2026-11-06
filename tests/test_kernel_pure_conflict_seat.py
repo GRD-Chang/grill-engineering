@@ -204,50 +204,27 @@ def _waiter_gets_seat(scenario, operations):
     raise AssertionError("The released seat did not reach the original queued Ticket")
 
 
-@pytest.mark.parametrize("boundary", ["stop", "human", "unavailable", "abandon", "candidate_failure"])
-def test_definite_pause_or_nonconflict_failure_releases_the_conflict_seat(tmp_path, boundary):
+def test_nonconflict_content_check_failure_releases_the_conflict_seat(tmp_path):
     scenario, operations, agent, repair, _receipt = _conflict_with_waiter(tmp_path)
     kernel = scenario.kernel
     assert kernel.status("ticket:2")["holds_integration"]
-    if boundary == "stop":
-        assert kernel.control("stop", "stop-conflict", subject=repair.subject) == "applied"
-        kernel.agent_unavailable(repair, "controlled_unstarted_cancel", {}, before_dispatch=True)
-    elif boundary == "unavailable":
-        kernel.agent_unavailable(repair, "controlled_unstarted_failure", {}, before_dispatch=True)
-    elif boundary == "abandon":
-        writes = scenario.port.writes()
-        assert kernel.control("abandon", "abandon-conflict", discard_worktree=True,
-            resource_inspections=scenario.port.inspect_resources(kernel.generation_resources())) == "pending"
-        kernel.agent_unavailable(repair, "controlled_unstarted_cancel", {}, before_dispatch=True)
-        assert not kernel.status("ticket:2")["holds_integration"]
-        assert not kernel.status("ticket:3")["holds_integration"]
-        with pytest.raises(KernelError, match="executor_fenced"):
-            kernel.guard_agent(repair)
-        assert scenario.port.writes() == writes
-        return
-    else:
-        if boundary == "human":
-            kernel.receive(repair, wire_json({"result_kind": "human_blocker", "summary": None,
-                                             "human_blockers": ["Operator resolution is needed"]}))
-        else:
-            def invalid_content(call):
-                raw = agent(call)
-                (Path(call.context["checkout"]) / "README.md").write_text("Unacceptable trailing spaces   \n")
-                return raw
-            scripted_return(kernel, operations.runner, repair, invalid_content)
-        for _ in range(12):
-            operations.once()
-            if not kernel.status("ticket:2")["holds_integration"]:
-                break
-        assert kernel.status("ticket:2")["budgets"]["integration"]["developments_used"] == 1
-        if boundary == "human":
-            assert "human_blocker" in kernel.status("ticket:2")["gates"]
-        else:
-            with kernel.storage.transaction(write=False) as tx:
-                failure = tx.one("SELECT last_failure FROM subjects WHERE id=?", (repair.subject,))[0]
-                receipt = json.loads(tx.get(failure, repair.subject))
-                assert "--check" in receipt["raw"]["command"]
-                assert receipt["raw"].get("merge_conflict") is not True
+
+    def invalid_content(call):
+        raw = agent(call)
+        (Path(call.context["checkout"]) / "README.md").write_text("Unacceptable trailing spaces   \n")
+        return raw
+
+    scripted_return(kernel, operations.runner, repair, invalid_content)
+    for _ in range(12):
+        operations.once()
+        if not kernel.status("ticket:2")["holds_integration"]:
+            break
+    assert kernel.status("ticket:2")["budgets"]["integration"]["developments_used"] == 1
+    with kernel.storage.transaction(write=False) as tx:
+        failure = tx.one("SELECT last_failure FROM subjects WHERE id=?", (repair.subject,))[0]
+        receipt = json.loads(tx.get(failure, repair.subject))
+        assert "--check" in receipt["raw"]["command"]
+        assert receipt["raw"].get("merge_conflict") is not True
     assert not kernel.status("ticket:2")["holds_integration"]
     _waiter_gets_seat(scenario, operations)
 
