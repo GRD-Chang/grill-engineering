@@ -11,6 +11,7 @@ from agent_run.notifications.envelope import event_envelope
 from agent_run.notifications.progress import obsolete_progress
 from agent_run.notifications.event_projection import event_state, project_event
 from support.offline import GraphScenario
+from support.run_scoped_kernel import domain_kernel
 from support.notification import _project, _kernel, _operations
 from support.worker_facts import start_worker, finish_worker, consume_local_result, record_local_result
 from support.notification import recorded_agents as _recorded_agents
@@ -166,66 +167,67 @@ def test_original_repair_and_formal_promotion_follow_current_generation_and_appr
         ParentIssue(1, "Parent", "Original scope", (2,)),
         (Issue(2, "Ticket", "Original task", "OPEN", labels=("ready-for-agent",)),)),
         reviews=("pass", "fail", "pass"))
-    active = []
+    with domain_kernel(scenario.kernel) as scenario.kernel:
+        active = []
 
-    def started(call):
-        if call.subject != "final:1" or call.role != Role.DEVELOPMENT:
-            return
-        repair = [event for event in _project(scenario.kernel, "concise") if event["kind"] == "acceptance_repair"][-1]
-        assert repair["live"] is True and repair["attempt_id"] == call.attempt_id
+        def started(call):
+            if call.subject != "final:1" or call.role != Role.DEVELOPMENT:
+                return
+            repair = [event for event in _project(scenario.kernel, "concise") if event["kind"] == "acceptance_repair"][-1]
+            assert repair["live"] is True and repair["attempt_id"] == call.attempt_id
+            with scenario.kernel.storage.transaction(write=False) as tx:
+                assert obsolete_progress(tx, [repair], "concise", current_boundary=False) == set()
+            active.append(repair)
+
+        _recorded_agents(scenario, monkeypatch, started=started)
+        assert scenario.run().kind == "complete"
+        for _ in range(40):
+            scenario.step()
+            if scenario.kernel.source_status()["final_subject"] is not None:
+                break
+        else:
+            raise AssertionError("Real Ticket Completion did not admit Final")
+        scenario.select("final:1")
+        planned = None
+        for _ in range(100):
+            step = scenario.step()
+            projected = _project(scenario.kernel, "concise")
+            repairs = [event for event in projected if event["kind"] == "acceptance_repair"]
+            if repairs and planned is None:
+                planned, = repairs
+                assert planned["live"] is False
+                with scenario.kernel.storage.transaction(write=False) as tx:
+                    assert obsolete_progress(tx, [planned], "concise", current_boundary=False) == set()
+                    assert obsolete_progress(tx, [planned], "concise", current_boundary=True) == {planned["id"]}
+            promoted = [event for event in projected if event["kind"] == "acceptance_passed"]
+            if promoted:
+                promotion, = promoted
+                assert planned is not None and active and active[0]["id"] == planned["id"]
+                with scenario.kernel.storage.transaction(write=False) as tx:
+                    assert obsolete_progress(tx, [active[0], promotion], "concise", current_boundary=False) == {planned["id"]}
+                    original = dict(tx.one("SELECT * FROM history WHERE kind='role_consumed' AND identity=?",
+                                           (promotion["attempt_id"],)))
+                    suppressed, = project_event(tx, original, event_state(tx), "detailed")
+                    assert not suppressed.visible and suppressed.applicable is False
+                    assert obsolete_progress(tx, [suppressed.content], "detailed", current_boundary=False) == {suppressed.content["id"]}
+                break
+            assert step.kind not in {"paused", "waiting", "approval"}, step
+        else:
+            raise AssertionError("The actual repair did not reach formal promotion")
+        assert scenario.run().kind == "approval"
+        assert not any(event["kind"] == "approval_update" for event in _project(scenario.kernel, "concise"))
+        scenario.port.external_remote_append(scenario.delivery.target_ref, {"external.txt": "New target\n"}, "approval-update")
+        assert scenario.step().reason == "updating"
+        update, = [event for event in _project(scenario.kernel, "concise") if event["kind"] == "approval_update"]
         with scenario.kernel.storage.transaction(write=False) as tx:
-            assert obsolete_progress(tx, [repair], "concise", current_boundary=False) == set()
-        active.append(repair)
-
-    _recorded_agents(scenario, monkeypatch, started=started)
-    assert scenario.run().kind == "complete"
-    for _ in range(40):
-        scenario.step()
-        if scenario.kernel.source_status()["final_subject"] is not None:
-            break
-    else:
-        raise AssertionError("Real Ticket Completion did not admit Final")
-    scenario.select("final:1")
-    planned = None
-    for _ in range(100):
-        step = scenario.step()
+            invalidated = tx.one("SELECT * FROM history WHERE subject=? AND kind='boundary_update' ORDER BY position DESC LIMIT 1",
+                                 (scenario.delivery.key,))
+            assert update["source_position"] == invalidated["position"] and update["source_material_id"] == invalidated["material_id"]
+            assert update["work_subject"] == scenario.delivery.key and update["generation"] == 1
+            assert obsolete_progress(tx, [promotion, update], "concise", current_boundary=False) == {promotion["id"]}
+        assert scenario.run().kind == "approval"
         projected = _project(scenario.kernel, "concise")
-        repairs = [event for event in projected if event["kind"] == "acceptance_repair"]
-        if repairs and planned is None:
-            planned, = repairs
-            assert planned["live"] is False
-            with scenario.kernel.storage.transaction(write=False) as tx:
-                assert obsolete_progress(tx, [planned], "concise", current_boundary=False) == set()
-                assert obsolete_progress(tx, [planned], "concise", current_boundary=True) == {planned["id"]}
-        promoted = [event for event in projected if event["kind"] == "acceptance_passed"]
-        if promoted:
-            promotion, = promoted
-            assert planned is not None and active and active[0]["id"] == planned["id"]
-            with scenario.kernel.storage.transaction(write=False) as tx:
-                assert obsolete_progress(tx, [active[0], promotion], "concise", current_boundary=False) == {planned["id"]}
-                original = dict(tx.one("SELECT * FROM history WHERE kind='role_consumed' AND identity=?",
-                                       (promotion["attempt_id"],)))
-                suppressed, = project_event(tx, original, event_state(tx), "detailed")
-                assert not suppressed.visible and suppressed.applicable is False
-                assert obsolete_progress(tx, [suppressed.content], "detailed", current_boundary=False) == {suppressed.content["id"]}
-            break
-        assert step.kind not in {"paused", "waiting", "approval"}, step
-    else:
-        raise AssertionError("The actual repair did not reach formal promotion")
-    assert scenario.run().kind == "approval"
-    assert not any(event["kind"] == "approval_update" for event in _project(scenario.kernel, "concise"))
-    scenario.port.external_remote_append(scenario.delivery.target_ref, {"external.txt": "New target\n"}, "approval-update")
-    assert scenario.step().reason == "updating"
-    update, = [event for event in _project(scenario.kernel, "concise") if event["kind"] == "approval_update"]
-    with scenario.kernel.storage.transaction(write=False) as tx:
-        invalidated = tx.one("SELECT * FROM history WHERE subject=? AND kind='boundary_update' ORDER BY position DESC LIMIT 1",
-                             (scenario.delivery.key,))
-        assert update["source_position"] == invalidated["position"] and update["source_material_id"] == invalidated["material_id"]
-        assert update["work_subject"] == scenario.delivery.key and update["generation"] == 1
-        assert obsolete_progress(tx, [promotion, update], "concise", current_boundary=False) == {promotion["id"]}
-    assert scenario.run().kind == "approval"
-    projected = _project(scenario.kernel, "concise")
-    assert [event for event in projected if event["kind"] == "approval_update"] == [update]
-    assert not any(event["kind"] == "approval_ready" for event in projected)
-    with scenario.kernel.storage.transaction(write=False) as tx:
-        assert obsolete_progress(tx, [update], "concise", current_boundary=True) == {update["id"]}
+        assert [event for event in projected if event["kind"] == "approval_update"] == [update]
+        assert not any(event["kind"] == "approval_ready" for event in projected)
+        with scenario.kernel.storage.transaction(write=False) as tx:
+            assert obsolete_progress(tx, [update], "concise", current_boundary=True) == {update["id"]}

@@ -13,6 +13,7 @@ from agent_run.core.operation_runner import OperationRunner
 from agent_run.errors import KernelError
 from agent_run.model import Checks, DeliveryKind, Execution
 from support.offline import Scenario
+from support.run_scoped_kernel import domain_scenario
 from support.core_operations import prepare_scripted_agent
 from support.control_scenarios import managed_approval
 from support.control_scenarios import managed_parent
@@ -204,8 +205,8 @@ def test_approval_recovery_rejects_inapplicable_facts_without_an_action_or_grant
         assert tx.one("SELECT final_action FROM runs")[0] is None
 
 
-def test_checks_failure_after_an_accepted_merge_still_uses_the_original_recovery(tmp_path):
-    scenario = Scenario(tmp_path / "accepted", DeliveryKind.PARENT_ONLY)
+def test_checks_failure_after_an_accepted_merge_still_uses_the_original_recovery(tmp_path, domain_scenario):
+    scenario = domain_scenario(tmp_path / "accepted", DeliveryKind.PARENT_ONLY)
     assert scenario.run().kind == "approval"
     kernel, subject = scenario.kernel, scenario.delivery.key
     assert kernel.control("approve", "original-grant", subject=subject, world=scenario.world()) == "pending"

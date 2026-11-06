@@ -8,6 +8,7 @@ from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.model import wire_json
 from support.offline import GraphScenario, Scenario
+from support.run_scoped_kernel import domain_kernel, domain_scenario
 from support.notification import recorded_agents as _recorded_agents, _project
 
 
@@ -246,8 +247,8 @@ def test_activity_start_respects_the_original_invocation_deadline(
     assert kernel.worker_settled(call)
 
 
-def test_stopped_repair_activity_is_not_presented_as_still_active(tmp_path, monkeypatch):
-    scenario = Scenario(tmp_path, DeliveryKind.FINAL_RUN, reviews=("fail", "pass"))
+def test_stopped_repair_activity_is_not_presented_as_still_active(tmp_path, monkeypatch, domain_scenario):
+    scenario = domain_scenario(tmp_path, DeliveryKind.FINAL_RUN, reviews=("fail", "pass"))
     stopped = []
 
     def started(call):
@@ -328,48 +329,49 @@ def test_completed_ticket_effort_spans_budget_renewal_without_recounting_resume(
     scenario = GraphScenario(tmp_path, Requirements(ParentIssue(1, "Parent", "Scope", (2,)),
         (Issue(2, "Ticket", "Original task", "OPEN", labels=("ready-for-agent",)),)),
         policy=Policy(ticket_ci_developments=1, ticket_ci_review=True))
-    scenario.checks = ["fail", "fail", "none"]
-    now, calls = [100.0], []
-    scenario.kernel.clock = lambda: now[0]
+    with domain_kernel(scenario.kernel) as scenario.kernel:
+        scenario.checks = ["fail", "fail", "none"]
+        now, calls = [100.0], []
+        scenario.kernel.clock = lambda: now[0]
 
-    def started(call):
-        calls.append(call)
-        seconds = {Role.DEVELOPMENT: 2, Role.REVIEW: 3, Role.PUBLICATION: 5}[call.role]
-        scenario.kernel.observe_worker_activity(call, "start", active=True, observed_at=now[0] + 1,
-                                                evidence={"type": "turn.started"})
-        scenario.kernel.observe_worker_activity(call, "end", active=False, observed_at=now[0] + 1 + seconds,
-                                                evidence={"type": "turn.completed"})
-        now[0] += seconds + 2
+        def started(call):
+            calls.append(call)
+            seconds = {Role.DEVELOPMENT: 2, Role.REVIEW: 3, Role.PUBLICATION: 5}[call.role]
+            scenario.kernel.observe_worker_activity(call, "start", active=True, observed_at=now[0] + 1,
+                                                    evidence={"type": "turn.started"})
+            scenario.kernel.observe_worker_activity(call, "end", active=False, observed_at=now[0] + 1 + seconds,
+                                                    evidence={"type": "turn.completed"})
+            now[0] += seconds + 2
 
-    _recorded_agents(scenario, monkeypatch, started=started, activity=False)
-    assert scenario.run().kind == "paused"
-    before = scenario.kernel.status("ticket:2")["budgets"]
-    assert (before["ci"]["window"], before["ci"]["developments_used"], before["ci"]["reviews_used"]) == (1, 1, 1)
-    prior_attempts = {call.attempt_id for call in calls}
-    now[0] += 100  # Human waiting is not Agent execution.
-    assert scenario.kernel.control("resume", "renew-ci-once", subject="ticket:2") == "applied"
-    assert scenario.kernel.control("resume", "renew-ci-once", subject="ticket:2") == "applied"
-    renewed = scenario.kernel.status("ticket:2")["budgets"]
-    assert (renewed["ci"]["window"], renewed["ci"]["developments_used"], renewed["ci"]["reviews_used"]) == (2, 0, 1)
-    assert renewed["requirements"] == before["requirements"]
-    assert scenario.run().kind == "complete"
-    assert scenario.kernel.status("ticket:2")["resource_cleanup"]["state"] == "complete"
-    assert scenario.port.objects.issue(2)["state"] == "closed"
-    projected = _project(scenario.kernel, "concise")
-    event, = [item for item in projected if item["kind"] == "ticket_completed"]
-    attempts = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage).data["history"]["attempts"]
-    assert prior_attempts <= {attempt["id"] for attempt in attempts}
-    for role, seconds in ((Role.DEVELOPMENT, 6), (Role.REVIEW, 9)):
-        actual = {call.attempt_id for call in calls if call.role == role}
-        assert len(actual) == event["effort"][role.value]["rounds"] == 3
-        assert actual == {attempt["id"] for attempt in attempts if attempt["role"] == role.value}
-        assert event["effort"][role.value]["execution_seconds"] == seconds
-    assert sum(call.role == Role.PUBLICATION for call in calls) == 3
-    assert event["total_seconds"] == 30 and event["execution_timing_complete"] is True
-    for language, count in (("zh", "3 轮"), ("en", "3 rounds")):
-        rendered = json.dumps(card({**event, "language": language}), ensure_ascii=False)
-        assert rendered.count(count) == 2
-    assert _project(scenario.kernel, "concise") == projected
+        _recorded_agents(scenario, monkeypatch, started=started, activity=False)
+        assert scenario.run().kind == "paused"
+        before = scenario.kernel.status("ticket:2")["budgets"]
+        assert (before["ci"]["window"], before["ci"]["developments_used"], before["ci"]["reviews_used"]) == (1, 1, 1)
+        prior_attempts = {call.attempt_id for call in calls}
+        now[0] += 100  # Human waiting is not Agent execution.
+        assert scenario.kernel.control("resume", "renew-ci-once", subject="ticket:2") == "applied"
+        assert scenario.kernel.control("resume", "renew-ci-once", subject="ticket:2") == "applied"
+        renewed = scenario.kernel.status("ticket:2")["budgets"]
+        assert (renewed["ci"]["window"], renewed["ci"]["developments_used"], renewed["ci"]["reviews_used"]) == (2, 0, 1)
+        assert renewed["requirements"] == before["requirements"]
+        assert scenario.run().kind == "complete"
+        assert scenario.kernel.status("ticket:2")["resource_cleanup"]["state"] == "complete"
+        assert scenario.port.objects.issue(2)["state"] == "closed"
+        projected = _project(scenario.kernel, "concise")
+        event, = [item for item in projected if item["kind"] == "ticket_completed"]
+        attempts = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage).data["history"]["attempts"]
+        assert prior_attempts <= {attempt["id"] for attempt in attempts}
+        for role, seconds in ((Role.DEVELOPMENT, 6), (Role.REVIEW, 9)):
+            actual = {call.attempt_id for call in calls if call.role == role}
+            assert len(actual) == event["effort"][role.value]["rounds"] == 3
+            assert actual == {attempt["id"] for attempt in attempts if attempt["role"] == role.value}
+            assert event["effort"][role.value]["execution_seconds"] == seconds
+        assert sum(call.role == Role.PUBLICATION for call in calls) == 3
+        assert event["total_seconds"] == 30 and event["execution_timing_complete"] is True
+        for language, count in (("zh", "3 轮"), ("en", "3 rounds")):
+            rendered = json.dumps(card({**event, "language": language}), ensure_ascii=False)
+            assert rendered.count(count) == 2
+        assert _project(scenario.kernel, "concise") == projected
 
 
 @pytest.mark.parametrize("role", [Role.DEVELOPMENT, Role.REVIEW, Role.PUBLICATION])
@@ -377,50 +379,51 @@ def test_human_result_uses_original_paused_material_even_after_resume(tmp_path, 
     scenario = GraphScenario(tmp_path, Requirements(
         ParentIssue(1, "Parent", "Original scope", (2,)),
         (Issue(2, "Ticket", "Original task", "OPEN", labels=("ready-for-agent",)),)))
-    reason = "Original human decision / 保留原文"
-    original = scenario.agent
+    with domain_kernel(scenario.kernel) as scenario.kernel:
+        reason = "Original human decision / 保留原文"
+        original = scenario.agent
 
-    def result(call):
-        raw = original(call)
-        if call.role != role:
-            return raw
-        if role == Role.REVIEW:
-            return wire_json({"checks": {lane: {"status": "blocked" if lane == "e2e" else "pass",
-                                                "evidence": reason if lane == "e2e" else "Passed exact lane",
-                                                "findings": []} for lane in ("e2e", "standards", "spec")}})
-        return wire_json({"result_kind": "human_blocker", "human_blockers": [reason],
-                          **({"summary": None} if role == Role.DEVELOPMENT else
-                             {"commit_message": None, "pr_title": None, "pr_body_markdown": None})})
+        def result(call):
+            raw = original(call)
+            if call.role != role:
+                return raw
+            if role == Role.REVIEW:
+                return wire_json({"checks": {lane: {"status": "blocked" if lane == "e2e" else "pass",
+                                                    "evidence": reason if lane == "e2e" else "Passed exact lane",
+                                                    "findings": []} for lane in ("e2e", "standards", "spec")}})
+            return wire_json({"result_kind": "human_blocker", "human_blockers": [reason],
+                              **({"summary": None} if role == Role.DEVELOPMENT else
+                                 {"commit_message": None, "pr_title": None, "pr_body_markdown": None})})
 
-    _recorded_agents(scenario, monkeypatch, result)
-    for _ in range(100):
-        step = scenario.step()
-        if step.call is not None and step.call.role == role:
-            call = step.call
-            assert not any(event["kind"] == "stage_end" and event.get("attempt_id") == call.attempt_id
-                           for event in _project(scenario.kernel, "detailed"))
-            assert scenario.step().kind == "paused"
-            break
-        assert step.kind not in {"paused", "waiting", "approval"}, step
-    else:
-        raise AssertionError("The selected role never returned its human artifact")
-    results = [event for event in _project(scenario.kernel, "detailed")
-               if event["kind"] == "stage_end" and event.get("attempt_id") == call.attempt_id]
-    assert len(results) == 1 and reason in results[0]["summary"]
-    assert results[0]["status_code"] == ("review_blocked" if role == Role.REVIEW else "human_blocker")
-    assert results[0]["color"] == "yellow" and results[0]["next_step"]
-    assert not any(event["kind"] == "stage_end" for event in _project(scenario.kernel, "concise"))
-    scenario.kernel.control("resume", "answer-original", subject=call.subject,
-                            message="Use the original decision", world=scenario.world())
-    assert [event for event in _project(scenario.kernel, "detailed") if event["id"] == results[0]["id"]] == results
+        _recorded_agents(scenario, monkeypatch, result)
+        for _ in range(100):
+            step = scenario.step()
+            if step.call is not None and step.call.role == role:
+                call = step.call
+                assert not any(event["kind"] == "stage_end" and event.get("attempt_id") == call.attempt_id
+                               for event in _project(scenario.kernel, "detailed"))
+                assert scenario.step().kind == "paused"
+                break
+            assert step.kind not in {"paused", "waiting", "approval"}, step
+        else:
+            raise AssertionError("The selected role never returned its human artifact")
+        results = [event for event in _project(scenario.kernel, "detailed")
+                   if event["kind"] == "stage_end" and event.get("attempt_id") == call.attempt_id]
+        assert len(results) == 1 and reason in results[0]["summary"]
+        assert results[0]["status_code"] == ("review_blocked" if role == Role.REVIEW else "human_blocker")
+        assert results[0]["color"] == "yellow" and results[0]["next_step"]
+        assert not any(event["kind"] == "stage_end" for event in _project(scenario.kernel, "concise"))
+        scenario.kernel.control("resume", "answer-original", subject=call.subject,
+                                message="Use the original decision", world=scenario.world())
+        assert [event for event in _project(scenario.kernel, "detailed") if event["id"] == results[0]["id"]] == results
 
 
-def test_human_revision_after_a_new_generation_is_not_the_old_automatic_repair(tmp_path, monkeypatch):
+def test_human_revision_after_a_new_generation_is_not_the_old_automatic_repair(tmp_path, monkeypatch, domain_scenario):
     from dataclasses import replace
 
     # d847's Final fixture retains a real historical Ticket and Completion.
     # Its prefix has already passed Review; this script begins at Final Review.
-    scenario = Scenario(tmp_path, DeliveryKind.FINAL_RUN, reviews=("fail", "pass"))
+    scenario = domain_scenario(tmp_path, DeliveryKind.FINAL_RUN, reviews=("fail", "pass"))
     assert scenario.kernel.status("ticket:2")["phase"] == "complete"
     assert len(scenario.kernel.source_status()["completions"]) == 1
     start_views = {}
