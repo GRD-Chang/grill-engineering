@@ -214,15 +214,3 @@ def test_cli_selects_diagnostic_command_before_public_admission_and_restores_fac
     assert called == [['resume', '-exact-run', '--foreground']]
     assert entry.executor.command is original
     assert installed == ([tmp_path / 'costs' / f'cli-{os.getpid()}.jsonl'] if return_trace else [])
-
-
-@pytest.mark.parametrize('count,diagnostic', [(1, True), (2, True), (4, True), (2, False), (4, False)])
-def test_diagnostic_mode_cannot_enter_full_ci_shard_collection(count, diagnostic):
-    import conftest
-    values = {'host_loss_io_diagnostics': diagnostic, 'test_shard_count': count}
-    config = SimpleNamespace(getoption=values.__getitem__)
-    if diagnostic and count != 1:
-        with pytest.raises(pytest.UsageError, match='cannot produce full CI shard evidence'):
-            conftest.pytest_configure(config)
-    else:
-        conftest.pytest_configure(config)

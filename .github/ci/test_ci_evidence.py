@@ -574,6 +574,23 @@ class EvidenceTests(unittest.TestCase):
         with patch.object(evidence, 'collect_nodeids', side_effect=AssertionError('quality does not recollect')):
             self.assertEqual(evidence.verify(self.results, selected='true', product='true', contract='false', result='success'), 6)
 
+    def test_real_diagnostic_two_worker_run_cannot_record_full_acceptance(self):
+        (self.product / 'pyproject.toml').write_text('[tool.pytest.ini_options]\ntestpaths = ["tests"]\n')
+        (self.product / 'tests/conftest.py').write_text(
+            'def pytest_addoption(parser):\n'
+            '    parser.addoption("--host-loss-io-diagnostics", action="store_true", default=False)\n')
+        (self.product / 'tests/test_sample.py').write_text('def test_passes(): assert True\n')
+        (self.results / 'evidence.json').unlink()
+        result = self.run_pytest(self.results, '-n', '2', '--dist', 'worksteal', '--host-loss-io-diagnostics')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        suite = ET.parse(self.results / 'junit.xml').getroot().find('testsuite')
+        profile = suite.find(f'./properties/property[@name="{evidence.EXECUTION_PROFILE_PROPERTY}"]')
+        self.assertEqual(json.loads(profile.get('value')), {
+            'host_loss_io_diagnostics': True, 'workers': 2, 'dist': 'worksteal'})
+        with self.assertRaisesRegex(ValueError, 'official two-worker profile'):
+            evidence.record(self.results, contract=False)
+        self.assertFalse((self.results / 'evidence.json').exists())
+
     def test_real_pytest_subtest_failures_skips_and_errors_are_rejected(self):
         (self.product / 'pyproject.toml').write_text('[tool.pytest.ini_options]\ntestpaths = ["tests"]\n')
         (self.product / 'tests/test_sample.py').write_text(
