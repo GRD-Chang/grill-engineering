@@ -95,6 +95,8 @@ class Transaction:
             raise KernelError("query_limit", "request a bounded history page")
         byte_count = sum(sum(value or 0 for value in header) for header in headers)
         self._check_read_budget(len(headers), byte_count)
+        if not headers:
+            return []
         rows = self.execute(f"SELECT * FROM ({sql}) LIMIT ?", (*parameters, limit)).fetchall()
         self.rows_read += len(rows)
         self.bytes_read += byte_count

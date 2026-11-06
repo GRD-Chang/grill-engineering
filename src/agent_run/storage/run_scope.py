@@ -150,7 +150,19 @@ class RunTransaction(Transaction):
             raise KernelError("material_corrupt", identity)
         if self.bytes_read + header[5] > QUERY_LIMIT:
             raise KernelError("query_limit")
-        body = self.one("SELECT body FROM material WHERE run_id=? AND id=?", (self.run_id, identity))[0]
+        statement = "SELECT body FROM material WHERE run_id=? AND id=?"
+        if self.connection.in_transaction:
+            # This transaction already validated the exact primary key, type
+            # and byte size. Charge the body before crossing into Python.
+            self._check_read_budget(1, header[5])
+            row = self.execute(statement, (self.run_id, identity)).fetchone()
+            if row is None:
+                raise KernelError("missing_or_ambiguous_fact")
+            body = row[0]
+            self.rows_read += 1
+            self.bytes_read += header[5]
+        else:
+            body = self.one(statement, (self.run_id, identity))[0]
         if hashlib.sha256(body).hexdigest() != header["digest"]:
             raise KernelError("material_corrupt", identity)
         return bytes(body)

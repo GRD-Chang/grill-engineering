@@ -29,6 +29,35 @@ def test_raw_connection_cannot_create_a_scope_with_fresh_accounting(database):
     assert database.total_changes == before
 
 
+def test_empty_read_keeps_accounting_and_missing_fact_semantics(database):
+    owner = Transaction(database)
+    assert owner.rows("SELECT id FROM runs WHERE id='missing'") == []
+    assert (owner.rows_read, owner.bytes_read) == (0, 0)
+    with pytest.raises(KernelError, match="missing_or_ambiguous_fact"):
+        owner.one("SELECT id FROM runs WHERE id='missing'")
+    owner.rows_read = 65537
+    with pytest.raises(KernelError, match="query_limit"):
+        owner.rows("SELECT id FROM runs WHERE id='missing'")
+
+
+@pytest.mark.parametrize("remaining_rows", [2, 3])
+def test_material_body_uses_the_remaining_transaction_row_budget(database, remaining_rows):
+    identity = RunTransaction(Transaction(database), "A").put("parent:1", "raw", b"original")
+    database.execute("BEGIN")
+    try:
+        owner = Transaction(database)
+        selected = RunTransaction(owner, "A")
+        owner.rows_read = 65536 - remaining_rows
+        if remaining_rows == 3:
+            assert selected.get(identity, "parent:1") == b"original"
+            assert owner.rows_read == 65536
+        else:
+            with pytest.raises(KernelError, match="query_limit"):
+                selected.get(identity, "parent:1")
+    finally:
+        database.rollback()
+
+
 def test_scope_views_accumulate_the_original_owners_read_budget(database, monkeypatch):
     database.execute("BEGIN")
     try:
