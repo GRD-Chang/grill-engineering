@@ -26,7 +26,14 @@ def test_github_reader_can_be_imported_cold_in_an_independent_process():
 
 
 def test_host_real_core_original_merge_readback_final_approval_and_cleanup(tmp_path, monkeypatch):
-    scenario = GraphScenario(tmp_path / "host", independent_source())
+    from dataclasses import replace
+    source = independent_source()
+    # One completed Ticket is sufficient for Host -> Final -> approval wiring;
+    # the N=1 concurrent story below owns multiple independent Tickets.
+    ticket = source.issues[0]
+    source = replace(source, parent=replace(source.parent, sub_issue_numbers=(ticket.number,)),
+                     issues=(replace(ticket, blocked_by=()),))
+    scenario = GraphScenario(tmp_path / "host", source)
     host = _admit_host(scenario, tmp_path)
     ports = Ports(scenario)
     scenario.port.lose_response.add("merge")
@@ -52,7 +59,7 @@ def test_host_real_core_original_merge_readback_final_approval_and_cleanup(tmp_p
     assert executor.run(scenario.kernel, scenario.execution, {}) == 0
     final = scenario.kernel.source_status()["final_subject"]
     assert final is not None and scenario.kernel.status(final)["phase"] == "approval"
-    assert len(scenario.kernel.source_status()["completions"]) == 2
+    assert len(scenario.kernel.source_status()["completions"]) == 1
     runner = OperationRunner(scenario.kernel, scenario.execution, lambda binding: ports)
     scenario.kernel.control("approve", "approve-final", subject=final, world=runner.observe(final))
     assert executor.run(scenario.kernel, scenario.execution, {}) == 0
@@ -61,7 +68,7 @@ def test_host_real_core_original_merge_readback_final_approval_and_cleanup(tmp_p
         assert not tx.rows("SELECT id FROM leases")
         assert not tx.rows("SELECT subject FROM resource_cleanup WHERE state!='complete'")
         assert len(tx.rows("SELECT * FROM final_barriers")) == 1
-    assert sum(item["operation"] == "merge" for item in scenario.port.writes()) == 3
+    assert sum(item["operation"] == "merge" for item in scenario.port.writes()) == 2
 
 
 @pytest.mark.parametrize("stage", ["source", "delivery"])
