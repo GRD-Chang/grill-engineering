@@ -34,31 +34,29 @@ def published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, notifications=
     return scenario
 
 
-@pytest.mark.parametrize("kind", [DeliveryKind.TICKET, DeliveryKind.PARENT_ONLY, DeliveryKind.FINAL_RUN])
-def test_status_projection_and_intent_are_readonly_and_frozen(tmp_path, monkeypatch, kind):
+def test_status_projection_and_intent_are_readonly_and_frozen(tmp_path, monkeypatch):
     # Exercise mixed-case publication receipts within the existing real path.
-    if kind == DeliveryKind.PARENT_ONLY:
-        from support.offline_api import SyntheticGitHub
-        def spelling(value):
-            if isinstance(value, dict):
-                return {key: item.upper() if key == "full_name" and isinstance(item, str) else spelling(item)
-                        for key, item in value.items()}
-            return [spelling(item) for item in value] if isinstance(value, list) else value
-        original_object, original_list = SyntheticGitHub.object, SyntheticGitHub.list
-        monkeypatch.setattr(SyntheticGitHub, "object", lambda self, endpoint: spelling(original_object(self, endpoint)))
-        monkeypatch.setattr(SyntheticGitHub, "list", lambda self, endpoint: spelling(original_list(self, endpoint)))
-    scenario = published(tmp_path, monkeypatch, kind=kind)
+    from support.offline_api import SyntheticGitHub
+    def spelling(value):
+        if isinstance(value, dict):
+            return {key: item.upper() if key == "full_name" and isinstance(item, str) else spelling(item)
+                    for key, item in value.items()}
+        return [spelling(item) for item in value] if isinstance(value, list) else value
+    original_object, original_list = SyntheticGitHub.object, SyntheticGitHub.list
+    monkeypatch.setattr(SyntheticGitHub, "object", lambda self, endpoint: spelling(original_object(self, endpoint)))
+    monkeypatch.setattr(SyntheticGitHub, "list", lambda self, endpoint: spelling(original_list(self, endpoint)))
+    scenario = published(tmp_path, monkeypatch, kind=DeliveryKind.PARENT_ONLY)
     database, subject = scenario.kernel.storage.path, scenario.delivery.key
     before = database.read_bytes()
     projection = project_status(database, subject, storage=scenario.kernel.storage)
     assert projection.target.pr_number == scenario.kernel.status(subject)["pr_number"]
-    assert projection.target.issue == (2 if kind == DeliveryKind.TICKET else 1)
+    assert projection.target.issue == 1
     assert projection.target.parent_issue == 1
     assert scenario.kernel.operation_binding().inputs.notifications["enabled"] is False
     assert projection.target.actor == "offline-publisher"
     assert "Agent Run Status" in projection.body
     assert "Recorded Review: pass" in projection.body
-    assert ("Delivery: complete" if kind == DeliveryKind.TICKET else "Delivery: approval") in projection.body
+    assert "Delivery: approval" in projection.body
     assert "not_recorded" in projection.body  # This offline producer never launched a formal Host.
     sender = core_status_comments(scenario.kernel)
     intent = sender.stage(subject)
@@ -67,23 +65,21 @@ def test_status_projection_and_intent_are_readonly_and_frozen(tmp_path, monkeypa
     assert intent["sent"] is False
     assert sender.stage(subject) == intent
     assert database.read_bytes() == before
-    if kind == DeliveryKind.PARENT_ONLY:
-        from agent_run.contracts.task import TaskKey
-        from agent_run.storage.tasks import task_path
-        location = task_path(TaskKey(Path(scenario.spec.repository_root), scenario.spec.repository, 1))
-        location.parent.mkdir(parents=True, exist_ok=True)
-        location.write_text('{"run_id":"other","database":"/tmp/other.sqlite3"}')
-        assert project_status(database, subject, storage=scenario.kernel.storage) == projection
-        assert database.read_bytes() == before
+    from agent_run.contracts.task import TaskKey
+    from agent_run.storage.tasks import task_path
+    location = task_path(TaskKey(Path(scenario.spec.repository_root), scenario.spec.repository, 1))
+    location.parent.mkdir(parents=True, exist_ok=True)
+    location.write_text('{"run_id":"other","database":"/tmp/other.sqlite3"}')
+    assert project_status(database, subject, storage=scenario.kernel.storage) == projection
+    assert database.read_bytes() == before
     document = outbox.read_notifications(database.parent, scenario.spec.run_id)
     assert document["remote_status"]["version"] == 1
     assert len(document["remote_status"]["bindings"]) == 1
     assert document["pending"] == []  # No business effect or second notification event.
-    if kind == DeliveryKind.PARENT_ONLY:
-        database.write_bytes(b"damaged sqlite")
-        api = CommentsAPI(projection.target)
-        assert sender.deliver(subject, api=api) == "unavailable"
-        assert api.reads == 0 and api.commands == []
+    database.write_bytes(b"damaged sqlite")
+    api = CommentsAPI(projection.target)
+    assert sender.deliver(subject, api=api) == "unavailable"
+    assert api.reads == 0 and api.commands == []
 
 
 def test_foreign_status_edit_pauses_display_without_blocking_delivery(tmp_path, monkeypatch):
@@ -158,58 +154,41 @@ def test_status_concurrent_sender_and_final_stop_cancel_before_post(tmp_path, mo
     assert log.read_text() == "x"
 
 
-def test_status_and_existing_enabled_sender_share_one_original_run_binding(tmp_path, monkeypatch):
+def test_enabled_sender_binds_fresh_and_preexisting_status_journals(tmp_path, monkeypatch):
     from agent_run.notifications.sender import NativeNotifications
     scenario = published(tmp_path, monkeypatch, notifications={"enabled": True, "mode": "concise",
                          "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
     database, subject = scenario.kernel.storage.path, scenario.delivery.key
-    sender = core_status_comments(scenario.kernel)
-    sender.stage(subject)
     before = database.read_bytes()
-    sent = []
-    def transport(*args, **kwargs):
-        sent.append(args[2])
-        return {"outcome": "success", "reason": None}
-    api = CommentsAPI(project_status(database, subject, storage=scenario.kernel.storage).target)
-    assert sender.deliver(subject, api=api) == "confirmed"
-    observer = NativeNotifications(database, database.parent, transport=transport, status_api=api, storage=scenario.kernel.storage)
-    observer.close()
-    assert observer.failure_reason is None
-    assert sent
-    assert [command[1] for command in api.commands] == ["POST"]
-    document = outbox.read_notifications(database.parent, scenario.spec.run_id)
-    assert document["native_run_start"] is True
-    assert document["pending"] == []
-    assert len(document["remote_status"]["bindings"]) == 1
-    assert database.read_bytes() == before
-
-
-def test_existing_sender_automatically_updates_status_with_feishu_disabled(tmp_path, monkeypatch):
-    from agent_run.notifications.sender import NativeNotifications
-    from support.worker_process_timing import wait_until
-    scenario = published(tmp_path, monkeypatch)
-    database, subject = scenario.kernel.storage.path, scenario.delivery.key
-    api = CommentsAPI(project_status(database, subject, storage=scenario.kernel.storage).target)
-    def forbidden(*args, **kwargs):
-        pytest.fail("Feishu was disabled in the frozen Run")
-    observer = NativeNotifications(database, database.parent, transport=forbidden, status_api=api, storage=scenario.kernel.storage)
-    try:
-        wait_until(lambda: len(api.commands) == 1, timeout=5)
-        assert [command[1] for command in api.commands] == ["POST"]
-        for _ in range(3):
-            observer.observe_committed()
-        scenario.kernel.control("stop", "automatic-status-stop", subject=subject)
-        observer.observe_committed()
-        wait_until(lambda: len(api.commands) == 2, timeout=5)
-        assert [command[1] for command in api.commands] == ["POST", "PATCH"]
-        assert "operator_stopped" in api.comments[0]["body"]
-    finally:
-        observer.close()
-    assert not observer.thread.is_alive()
-    assert [command[1] for command in api.commands] == ["POST", "PATCH"]
-    assert len(api.comments) == 1
-    document = outbox.read_notifications(database.parent, scenario.spec.run_id)
-    assert document["pending"] == [] and document["records"] == []
+    journal = outbox.notification_path(database.parent, scenario.spec.run_id)
+    # Two independent journal inputs share immutable Core publication facts.
+    # The previous sender is fully stopped before its journal is removed.
+    for preexisting_status in (False, True):
+        assert not journal.exists()
+        sent = []
+        def transport(*args, **kwargs):
+            sent.append(args[2])
+            return {"outcome": "success", "reason": None}
+        api = CommentsAPI(project_status(database, subject, storage=scenario.kernel.storage).target)
+        if preexisting_status:
+            sender = core_status_comments(scenario.kernel)
+            sender.stage(subject)
+            assert sender.deliver(subject, api=api) == "confirmed"
+        observer = NativeNotifications(database, database.parent, transport=transport, status_api=api,
+            storage=scenario.kernel.storage)
+        try:
+            observer.close()
+            assert not observer.thread.is_alive() and observer.failure_reason is None
+            assert sent
+            assert [command[1] for command in api.commands] == ["POST"]
+            document = outbox.read_notifications(database.parent, scenario.spec.run_id)
+            assert document["native_binding"] == [scenario.spec.run_id, scenario.spec.repository, 1]
+            assert document["native_run_start"] is True and document["pending"] == []
+            assert len(document["remote_status"]["bindings"]) == 1
+            assert database.read_bytes() == before
+        finally:
+            observer.close(drain=False)
+        journal.unlink()
 
 
 def test_automatic_unknown_status_is_not_polled_by_clock_or_passive_queries(tmp_path, monkeypatch):
@@ -219,8 +198,10 @@ def test_automatic_unknown_status_is_not_polled_by_clock_or_passive_queries(tmp_
     scenario = published(tmp_path, monkeypatch)
     database, subject = scenario.kernel.storage.path, scenario.delivery.key
     api = CommentsAPI(project_status(database, subject, storage=scenario.kernel.storage).target)
+    def forbidden(*args, **kwargs):
+        pytest.fail("Feishu was disabled in the frozen Run")
     api.lose = True
-    observer = NativeNotifications(database, database.parent, status_api=api, storage=scenario.kernel.storage)
+    observer = NativeNotifications(database, database.parent, transport=forbidden, status_api=api, storage=scenario.kernel.storage)
     def unresolved():
         doc = outbox.read_notifications(database.parent, scenario.spec.run_id)
         values = list(doc.get("remote_status", {}).get("bindings", {}).values())
@@ -237,13 +218,25 @@ def test_automatic_unknown_status_is_not_polled_by_clock_or_passive_queries(tmp_
     assert [command[1] for command in api.commands] == ["POST"]
     assert not observer.thread.is_alive()
     api.lose = False
-    reopened = NativeNotifications(database, database.parent, status_api=api, storage=scenario.kernel.storage)
-    reopened.close()
+    reopened = NativeNotifications(database, database.parent, transport=forbidden, status_api=api, storage=scenario.kernel.storage)
+    def recovered():
+        doc = outbox.read_notifications(database.parent, scenario.spec.run_id)
+        entry, = doc["remote_status"]["bindings"].values()
+        return entry["intent"] is None and entry["comment_id"] == 100
+    try:
+        wait_until(recovered, timeout=5)
+        assert [command[1] for command in api.commands] == ["POST"]
+        scenario.kernel.control("stop", "automatic-status-stop", subject=subject)
+        reopened.observe_committed()
+        wait_until(lambda: len(api.commands) == 2, timeout=5)
+        assert "operator_stopped" in api.comments[0]["body"]
+    finally:
+        reopened.close()
     assert not reopened.thread.is_alive()
-    doc = outbox.read_notifications(database.parent, scenario.spec.run_id)
-    entry, = doc["remote_status"]["bindings"].values()
-    assert entry["intent"] is None and entry["comment_id"] == 100
-    assert [command[1] for command in api.commands] == ["POST"]
+    assert [command[1] for command in api.commands] == ["POST", "PATCH"]
+    assert len(api.comments) == 1
+    document = outbox.read_notifications(database.parent, scenario.spec.run_id)
+    assert document["pending"] == [] and document["records"] == []
 
 
 @pytest.mark.parametrize("mode", ["read", "write"])
@@ -424,27 +417,6 @@ def test_pending_important_card_keeps_its_budget_before_slow_status_and_status_r
     finally:
         recovered.close(drain=False)
 
-
-def test_fresh_enabled_sender_binds_its_own_journal_before_status(tmp_path, monkeypatch):
-    from agent_run.notifications.sender import NativeNotifications
-    scenario = published(tmp_path, monkeypatch, notifications={"enabled": True, "mode": "concise",
-                         "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
-    database, subject = scenario.kernel.storage.path, scenario.delivery.key
-    before = database.read_bytes()
-    assert not outbox.notification_path(database.parent, scenario.spec.run_id).exists()
-    api = CommentsAPI(project_status(database, subject, storage=scenario.kernel.storage).target)
-    def transport(*_args, **_kwargs):
-        return {"outcome": "success", "reason": None}
-    observer = NativeNotifications(database, database.parent, status_api=api, transport=transport, storage=scenario.kernel.storage)
-    try:
-        observer.close()
-        document = outbox.read_notifications(database.parent, scenario.spec.run_id)
-        assert document["native_binding"] == [scenario.spec.run_id, scenario.spec.repository, 1]
-        assert [row[1] for row in api.commands] == ["POST"]
-        assert not observer.thread.is_alive()
-        assert database.read_bytes() == before
-    finally:
-        observer.close(drain=False)
 
 
 def test_new_important_card_preempts_actual_status_read_and_same_sender_continues(tmp_path, monkeypatch):
@@ -722,6 +694,16 @@ def test_actual_sender_keeps_ticket_completion_receipt_summary_and_parent_progre
                           "JOIN effects e ON e.id=c.close_effect WHERE c.subject=?", (subject,))
         receipt = original["receipt_id"]
     before = database.read_bytes()
+    projection = project_status(database, subject, storage=scenario.kernel.storage)
+    assert projection.target.pr_number == scenario.kernel.status(subject)["pr_number"]
+    assert projection.target.issue == 2 and projection.target.parent_issue == 1
+    assert projection.target.actor == "offline-publisher"
+    assert "Recorded Review: pass" in projection.body and "Delivery: complete" in projection.body
+    assert "not_recorded" in projection.body
+    sender = core_status_comments(scenario.kernel)
+    intent = sender.stage(subject)
+    assert intent is not None and intent["body"].endswith(projection.body) and intent["sent"] is False
+    assert sender.stage(subject) == intent and database.read_bytes() == before
     captured = []
     def transport(_config, rendered, *_args, **_kwargs):
         active, = [row["event"] for row in outbox.read_notifications(database.parent, scenario.spec.run_id)["pending"]

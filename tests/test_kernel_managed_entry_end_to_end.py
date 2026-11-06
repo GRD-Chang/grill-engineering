@@ -38,6 +38,10 @@ from support.systemd_manager import _commit_resume_timeline_note
 from support.host_cost_trace import note_costs, report_costs
 
 
+FINDING = "Remove obsolete-extra.txt from the final diff; keep the requested implementation."
+EXTRA = "This earlier Candidate file is outside the requested scope.\n"
+
+
 def test_public_run_reaches_ticket_close_through_managed_host_after_lost_merge_reply(
     git_repo: Path, tmp_path: Path, monkeypatch,
 ) -> None:
@@ -71,7 +75,27 @@ if '--hostname' in sys.argv:
 '''
     _executable(binary / "gh", gh + FAKE_GH.replace(
         "d['issue_state']=body['state'];", "d['source_graph']['issues']['2']['state']=body['state'].upper();d['issue_state']=body['state'];"))
-    _executable(binary / "codex", _CODEX)
+    # Real failed Review and repair precede the original unknown-merge recovery.
+    classification = """schema = json.loads(Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text())
+role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commit_message' in schema['properties'] else 'development'
+"""
+    codex = _CODEX[:_CODEX.index("if prompt.startswith")] + classification + _CODEX[_CODEX.index("thread = "):]
+    codex = codex.replace("'managed-entry-' + role)", "'managed-entry-' + role + '-' + os.urandom(16).hex())")
+    codex = codex.replace("'head': head}", "'head': head, 'prompt': prompt}")
+    codex = codex.replace("if role == 'development':\n", f"""if role == 'development':
+    extra = Path('obsolete-extra.txt')
+    if Path('managed-delivery.txt').exists():
+        assert {FINDING!r} in prompt, 'The original Finding did not reach the repair Worker'
+        assert extra.read_text() == {EXTRA!r}
+        extra.unlink()
+    else:
+        extra.write_text({EXTRA!r})
+""")
+    codex = codex.replace("'status': 'pass', 'evidence':",
+        "'status': 'fail' if lane == 'spec' and Path('obsolete-extra.txt').exists() else 'pass', 'evidence':")
+    codex = codex.replace("'findings': []}",
+        f"'findings': [{FINDING!r}] if lane == 'spec' and Path('obsolete-extra.txt').exists() else []}}")
+    _executable(binary / "codex", codex)
     for name, value in {"PATH": str(binary) + os.pathsep + os.environ["PATH"], "REMOTE_TEST_STATE": str(state),
                         "REMOTE_TEST_CALLS": str(calls), "REMOTE_TEST_BARE": str(remote), "ENTRY_ROLE_TRACE": str(roles),
                         "DBUS_SESSION_BUS_ADDRESS": "unix:path=/fixture-terminal/bus"}.items():
@@ -117,12 +141,12 @@ if '--hostname' in sys.argv:
         assert kernel.status("ticket:3")["phase"] != "complete"
         assert kernel.operation_state().active == ()
         observed = [json.loads(line) for line in roles.read_text().splitlines()]
-        assert [row["role"] for row in observed] == ["development", "review", "publication"]
+        assert [row["role"] for row in observed] == ["development", "review", "development", "review", "publication"]
         assert observed[0]["head"] == base
         assert observed[1]["checkout"] != observed[0]["checkout"]
         history = kernel.history("ticket:2")
-        assert sum(event["kind"] == "worker_started" for event in history) == 3
-        assert sum(event["kind"] == "worker_exited" for event in history) == 3
+        assert sum(event["kind"] == "worker_started" for event in history) == 5
+        assert sum(event["kind"] == "worker_exited" for event in history) == 5
         ready = next(event["position"] for event in history if event["kind"] == "host_usage_ready")
         assert all(event["position"] > ready for event in history if event["kind"] == "worker_started")
         # Read-only forensic evidence: no test writes business facts or chooses
@@ -132,13 +156,48 @@ if '--hostname' in sys.argv:
                           "JOIN invocations i ON i.id=a.current_invocation "
                           "JOIN invocation_outputs o ON o.invocation=i.id JOIN threads t ON t.id=i.thread "
                           "WHERE a.subject='ticket:2' ORDER BY a.ordinal")
-            assert [row["role"] for row in rows] == ["development", "review", "publication"]
+            assert [row["role"] for row in rows] == ["development", "review", "development", "review", "publication"]
             for row, role in zip(rows, observed, strict=True):
                 assert row["ordinal"] == 0 and row["dispatch_state"] == "exited" and row["exit_code"] == 0
                 assert row["backend_id"] == role["thread"] and row["raw_id"] and row["result_id"]
                 identity = json.loads(tx.get(row["process_identity"], "ticket:2"))
                 assert identity["host_pid"] == children[0].pid and identity["start_token"]
                 assert json.loads(tx.get(row["raw_id"], "ticket:2"))
+        def public(*arguments: str):
+            result = subprocess.run([sys.executable, "-m", "agent_run", *arguments,
+                "--repo", "example/project", "--json"], cwd=git_repo, env=environment,
+                text=True, capture_output=True, timeout=20)
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            return json.loads(result.stdout)
+
+        status = public("status", accepted["run_id"])
+        repair_history = public("history", accepted["run_id"])["history"]
+        ticket, = (job for job in status["subjects"] if job["issue"] == 2)
+        assert ticket["issue"] == 2 and ticket["phase"] == "complete" and ticket["generation"] == 1
+        assert ticket["gates"] == [] and ticket["pending_attempt"] is None and ticket["pending_writes"] == []
+        assert ticket["delivery_cleanup"]["state"] == "complete"
+        budget, = (row for row in ticket["budgets"] if row["purpose"] == "requirements")
+        assert (budget["window"], budget["developments_used"], budget["reviews_used"]) == (1, 2, 2)
+        reviews = [row for row in repair_history["attempts"] if row["subject"] == ticket["subject"] and row["role"] == "review"]
+        reviews.sort(key=lambda row: row["ordinal"])
+        assert [row["outcome"] for row in reviews] == ["fail", "pass"]
+        assert reviews[0]["result"]["checks"]["spec"]["findings"] == [FINDING]
+        assert reviews[1]["result"]["checks"]["spec"]["findings"] == []
+        first, repaired = (row["candidate_sha"] for row in reviews)
+        assert first != repaired
+        root = Path(status["repository_root"])
+        assert _git(root, "rev-list", "--parents", "-n", "1", repaired).split() == [repaired, first]
+        assert _git(root, "show", first + ":obsolete-extra.txt") == EXTRA.strip()
+        assert _git(root, "ls-tree", "--name-only", repaired, "--", "obsolete-extra.txt") == ""
+        assert set(_git(root, "diff", "--name-only", base, first).splitlines()) == {
+            "managed-delivery.txt", "obsolete-extra.txt"}
+        assert _git(root, "diff", "--name-only", base, repaired).splitlines() == ["managed-delivery.txt"]
+        developers = [row for row in observed if row["role"] == "development"]
+        reviewers = [row for row in observed if row["role"] == "review"]
+        assert len(developers) == 2 and developers[1]["head"] == first
+        assert FINDING in developers[1]["prompt"]
+        assert [row["head"] for row in reviewers] == [first, repaired]
+        assert reviewers[0]["thread"] != reviewers[1]["thread"]
         usage = kernel.host_usage(accepted["action_id"])
         assert usage is not None and usage.usage_ready and not usage.usage_released
         assert usage.main_pid == children[0].pid
@@ -153,6 +212,8 @@ if '--hostname' in sys.argv:
         assert _git(remote, "rev-parse", "refs/heads/" + pr["base"]["ref"]) == merged
         assert _git(remote, "show", f"{merged}:managed-delivery.txt") == "Implementation from the managed native Worker."
         assert "validation.tmp" not in _git(remote, "ls-tree", "-r", "--name-only", merged).splitlines()
+        assert _git(remote, "diff", "--name-only", base, merged).splitlines() == ["managed-delivery.txt"]
+        assert document["source_graph"]["issues"]["2"]["state"] == "CLOSED"
         assert _git(remote, "rev-parse", "refs/heads/main") == base
         calls_seen = [json.loads(line) for line in calls.read_text().splitlines()]
         writes = [row for row in calls_seen if "--method" in row]
@@ -1141,6 +1202,12 @@ if role == 'development':
                 request = kernel.host_request(accepted["action_id"])
                 old_budget = before["budgets"]["integration"]
                 old_pr = next(pr for pr in json.loads(state.read_text())["prs"] if pr["number"] == before["pr_number"])
+                from agent_run.queries.status_comment import project_status
+                projection = project_status(kernel.storage.path, subject, storage=kernel.storage)
+                assert projection.target.pr_number == old_pr["number"]
+                assert projection.target.issue == projection.target.parent_issue == 1
+                assert projection.target.actor == old_pr["user"]["login"]
+                assert "Recorded Review: pass" in projection.body and "Delivery: approval" in projection.body
                 with kernel.storage.transaction(write=False) as tx:
                     old_threads = [dict(row) for row in tx.all("SELECT * FROM threads ORDER BY id")]
                     original_requirements = [dict(row) for row in tx.all("SELECT * FROM requirement_versions ORDER BY issue,revision")]
@@ -1395,99 +1462,6 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                             "SELECT position,subject,kind,phase,created_at FROM history ORDER BY position DESC LIMIT 20")]
                 (tmp_path / "control-timing.json").write_text(json.dumps(timing))
 
-
-FINDING = "Remove obsolete-extra.txt from the final diff; keep the requested implementation."
-EXTRA = "This earlier Candidate file is outside the requested scope.\n"
-
-
-def test_public_ticket_repair_deletes_an_earlier_candidate_file_without_a_human_blocker(
-    git_repo: Path, tmp_path: Path, monkeypatch,
-) -> None:
-    # The fake CLI edits files and returns raw role artifacts. The installed
-    # Controller still owns staging, commits, selection, Review and publication.
-    _hold_host_operation_return(tmp_path, monkeypatch, hold=False, observe_close=True)
-    classification = """schema = json.loads(Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text())
-role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commit_message' in schema['properties'] else 'development'
-"""
-    codex = _CODEX[:_CODEX.index("if prompt.startswith")] + classification + _CODEX[_CODEX.index("thread = "):]
-    codex = codex.replace("'managed-entry-' + role)", "'managed-entry-' + role + '-' + os.urandom(16).hex())")
-    codex = codex.replace("'head': head}", "'head': head, 'prompt': prompt}")
-    codex = codex.replace("if role == 'development':\n", f"""if role == 'development':
-    extra = Path('obsolete-extra.txt')
-    if Path('managed-delivery.txt').exists():
-        assert {FINDING!r} in prompt, 'The original Finding did not reach the repair Worker'
-        assert extra.read_text() == {EXTRA!r}
-        extra.unlink()
-    else:
-        extra.write_text({EXTRA!r})
-""")
-    codex = codex.replace("'status': 'pass', 'evidence':",
-        "'status': 'fail' if lane == 'spec' and Path('obsolete-extra.txt').exists() else 'pass', 'evidence':")
-    codex = codex.replace("'findings': []}",
-        f"'findings': [{FINDING!r}] if lane == 'spec' and Path('obsolete-extra.txt').exists() else []}}")
-    environment, state = _control_environment(git_repo, tmp_path, monkeypatch, codex=codex, tickets=(2,))
-    origin = tmp_path / "origin.git"
-    base = _git(origin, "rev-parse", "refs/heads/main")
-    deadline = time.monotonic() + 120
-    with _local_manager(tmp_path / "manager", environment, host_timeout=120) as (
-        manager, serving, errors, children, trace, commands, output,
-    ):
-        environment["PATH"] = str(Path(manager.systemctl).parent) + os.pathsep + environment["PATH"]
-
-        def public(*arguments: str):
-            result = subprocess.run([sys.executable, "-m", "agent_run", *arguments,
-                "--repo", "example/project", "--json"], cwd=git_repo, env=environment,
-                text=True, capture_output=True, timeout=min(20, max(0.1, deadline - time.monotonic())))
-            assert result.returncode == 0, (result.stdout, result.stderr)
-            return json.loads(result.stdout)
-
-        accepted = public("run", "1", "--no-notifications")
-        assert accepted["result"] == "accepted"
-        serving.join(timeout=max(0, deadline - time.monotonic()))
-        try:
-            assert not serving.is_alive() and not errors, (errors, output)
-        except AssertionError as error:
-            _managed_failure_note(error, stage='ticket-repair-before-normal-host-exit',
-                database=RepositoryRoute.for_workspace(ManagedWorkspace.for_repository('example/project')).database,
-                run_id=accepted['run_id'], roles=tmp_path / 'roles.jsonl')
-            raise_with_trace(error, tmp_path, children)
-        assert len(commands) == len(children) == 1 and children[0].returncode == 0
-        assert trace == ["fdstore", "barrier", "host_exited", "store_closed"]
-        status = public("status", accepted["run_id"])
-        history = public("history", accepted["run_id"])["history"]
-        ticket, = (job for job in status["subjects"] if job["kind"] == "ticket")
-        assert ticket["issue"] == 2 and ticket["phase"] == "complete" and ticket["generation"] == 1
-        assert ticket["gates"] == [] and ticket["pending_attempt"] is None and ticket["pending_writes"] == []
-        assert ticket["delivery_cleanup"]["state"] == "complete"
-        budget, = (row for row in ticket["budgets"] if row["purpose"] == "requirements")
-        assert (budget["window"], budget["developments_used"], budget["reviews_used"]) == (1, 2, 2)
-        reviews = [row for row in history["attempts"] if row["subject"] == ticket["subject"] and row["role"] == "review"]
-        reviews.sort(key=lambda row: row["ordinal"])
-        assert [row["outcome"] for row in reviews] == ["fail", "pass"]
-        assert reviews[0]["result"]["checks"]["spec"]["findings"] == [FINDING]
-        assert reviews[1]["result"]["checks"]["spec"]["findings"] == []
-        first, repaired = (row["candidate_sha"] for row in reviews)
-        assert first != repaired
-        root = Path(status["repository_root"])
-        assert _git(root, "rev-list", "--parents", "-n", "1", repaired).split() == [repaired, first]
-        assert _git(root, "show", first + ":obsolete-extra.txt") == EXTRA.strip()
-        assert _git(root, "ls-tree", "--name-only", repaired, "--", "obsolete-extra.txt") == ""
-        assert set(_git(root, "diff", "--name-only", base, first).splitlines()) == {
-            "managed-delivery.txt", "obsolete-extra.txt"}
-        assert _git(root, "diff", "--name-only", base, repaired).splitlines() == ["managed-delivery.txt"]
-        roles = [json.loads(line) for line in (tmp_path / "roles.jsonl").read_text().splitlines()]
-        developers = [row for row in roles if row["role"] == "development"]
-        reviewers = [row for row in roles if row["role"] == "review"]
-        assert len(developers) == 2 and developers[1]["head"] == first
-        assert FINDING in developers[1]["prompt"]
-        assert [row["head"] for row in reviewers[:2]] == [first, repaired]
-        assert reviewers[0]["thread"] != reviewers[1]["thread"]
-        remote = json.loads(state.read_text())
-        ticket_pr, = (pr for pr in remote["prs"] if pr["number"] == ticket["pr_number"])
-        assert ticket_pr["merged"] is True
-        assert _git(origin, "diff", "--name-only", base, ticket_pr["merge_commit_sha"]).splitlines() == ["managed-delivery.txt"]
-        assert remote["source_graph"]["issues"]["2"]["state"] == "CLOSED"
-        assert _git(origin, "rev-parse", "refs/heads/main") == base
 
 
 def test_public_local_worker_failure_preserves_completed_and_independent_tickets(

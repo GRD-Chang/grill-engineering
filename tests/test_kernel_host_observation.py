@@ -192,8 +192,7 @@ def test_stop_cancels_the_pass_without_reading_or_reactivating(tmp_path, monkeyp
     assert runner.state().disposition == "quiescent"
 
 
-@pytest.mark.parametrize("kind", ["parent", "final"])
-@pytest.mark.parametrize("change", ["unchanged", "source", "target"])
+@pytest.mark.parametrize("kind,change", [("parent", "source"), ("final", "target")])
 def test_approval_observation_executes_real_currentness_and_resync_checks(tmp_path, kind, change):
     if kind == "parent":
         scenario = managed_parent(tmp_path)
@@ -217,18 +216,67 @@ def test_approval_observation_executes_real_currentness_and_resync_checks(tmp_pa
     step = prepare_scripted_agent(scenario.kernel, runner.run_once())
     after = scenario.kernel.status(scenario.delivery.key)
     assert step.call is None
-    if change == "unchanged":
-        assert step.kind == "approval" and after["phase"] == "approval"
-        assert after["budgets"] == before["budgets"]
-        assert runner.state().disposition == "quiescent"
-    elif change == "source":
-        assert after["gates"] or scenario.kernel.source_status()["blocked"] == "final_refresh"
+    if change == "source":
+        assert "requeue_required" in after["gates"]
         assert after["budgets"] == before["budgets"]
         assert runner.state().disposition == "quiescent"
     else:
         assert step.kind == "progress" and after["resync"]["used"] == before["resync"]["used"] + 1
         assert after["phase"] != "approval"
 
+
+
+@pytest.mark.parametrize("kind", [DeliveryKind.PARENT_ONLY, DeliveryKind.FINAL_RUN])
+@pytest.mark.parametrize("change", ["unchanged", "source", "target"])
+def test_approval_consumer_preserves_budget_and_charges_only_target_resync(monkeypatch, kind, change):
+    from dataclasses import replace
+    from agent_run.core.operation_contract import Work
+    from agent_run.model import Commit, Execution, PullRequest, World
+    from support.repository_scope import insert
+    from support.run_scoped_kernel import effect_runs
+
+    # Persisted publication inputs for the real Core consumer. Physical source
+    # refresh and Git append reach this consumer in the two Host stories above.
+    base = Commit("a" * 40, "b" * 40)
+    subject = "parent:1"
+    with effect_runs(monkeypatch) as (db, kernels):
+        kernel = kernels["A"]
+        db.execute("UPDATE subjects SET kind=?,phase='approval',purpose='integration',"
+            "publication_sha=?,publication_tree=?,integration_target=?,pr_number=11 WHERE run_id='A'",
+            (kind, base.sha, base.tree, base.sha))
+        insert(db, "budgets", {"run_id": "A", "subject": subject, "purpose": "integration",
+            "window": 1, "development_limit": 3, "review_limit": 3, "review_required": 1,
+            "developments_used": 1, "reviews_used": 2})
+        insert(db, "resync_allowances", {"run_id": "A", "subject": subject, "generation": 1, "allowance": 3})
+        insert(db, "integration_snapshots", {"run_id": "A", "subject": subject, "window": 1,
+            "allowance_generation": 1, "source_ref": "refs/heads/work", "target_ref": "refs/heads/main",
+            "source_sha": base.sha, "target_sha": base.sha, "open": 0})
+        pr = PullRequest(11, "example/project", "refs/heads/work", "refs/heads/main", base, base,
+            "Approved subject", "Frozen publication", actor="controlled-actor", head_repository="example/project")
+        world = World("r", "g", "r", base, base, pr=pr)
+        if change == "source":
+            world = replace(world, parent_revision="new-requirements", revision="new-requirements")
+        elif change == "target":
+            target = Commit("c" * 40, "d" * 40)
+            world = replace(world, target=target, ancestry=((base.sha, target.sha),))
+        budgets = list(db.execute("SELECT * FROM budgets WHERE run_id='A'"))
+        work = Work(Execution("A", "same-owner", 1), "observation", subject, False, False, None, None,
+            approval_observed=True)
+        with kernel.storage.transaction() as tx:
+            step = kernel._advance(tx, work, world)
+        assert step.call is None
+        assert list(db.execute("SELECT * FROM budgets WHERE run_id='A'")) == budgets
+        phase = db.execute("SELECT phase FROM subjects WHERE run_id='A'").fetchone()[0]
+        used = db.execute("SELECT used FROM resync_allowances WHERE run_id='A'").fetchone()[0]
+        if change == "source":
+            assert step.kind == "paused" and phase == "approval" and used == 0
+            assert db.execute("SELECT code FROM gates WHERE run_id='A'").fetchone()[0] == "requeue_required"
+        elif change == "target":
+            assert step.kind == "progress" and phase == "integration" and used == 1
+        else:
+            assert step.kind == "approval" and phase == "approval" and used == 0
+        assert not db.execute("SELECT id FROM attempts WHERE run_id='A'").fetchall()
+        assert not db.execute("SELECT id FROM effects WHERE run_id='A'").fetchall()
 
 
 def test_observation_timeout_quiesces_without_consuming_or_renewing_the_intent(tmp_path):
