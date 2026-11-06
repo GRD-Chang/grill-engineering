@@ -6,7 +6,7 @@ import pytest
 from support.core_operations import CoreOperations
 from agent_run.model import wire_json
 from support.notification import _project, _kernel, _operations
-from support.notification_workers import start_worker, finish_worker
+from support.worker_facts import start_worker, finish_worker
 
 
 def test_resume_waits_for_its_own_invocation_and_ignores_a_sibling_start(tmp_path: Path):

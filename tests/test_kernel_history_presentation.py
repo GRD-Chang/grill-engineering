@@ -6,52 +6,62 @@ import json
 
 import pytest
 
-from agent_run.model import Issue, ParentIssue, Requirements, wire_json
+from agent_run.model import DeliveryKind, ParentIssue, Requirements, wire_json
 from agent_run.queries.run import read
 from support.offline import GraphScenario
-from support.core_operations import prepare_scripted_agent
-from support.notification import recorded_agents as _recorded_agents, continued_round
+from support.notification import recorded_agents as _recorded_agents
+from support.worker_facts import worker_fixture, start_worker, finish_worker, consume_local_result
 from support.environment import durable_snapshot as _snapshot
 
 
-@pytest.mark.parametrize("continued_round", ["complete", "partial", "unknown"], indirect=True)
-def test_history_timing_distinguishes_complete_partial_and_unknown_without_counting_human_wait(
-    continued_round, tmp_path: Path,
-) -> None:
-    from agent_run.queries.execution import invocation_timing
-
-    scenario, calls, timing = continued_round
-    before = _snapshot(tmp_path)
-    document = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage)
-    attempt, = document.data["history"]["attempts"]
-    assert attempt["id"] == calls[0].attempt_id
-    assert [(item["model"], item["effort"]) for item in attempt["invocations"]] == [
-        ("original-model", "low"), ("new-model", "high")]
-    facts = invocation_timing(attempt["invocations"])
-    assert facts["execution_timing_complete"] is (timing == "complete")
-    if timing == "complete":
-        assert facts["execution_seconds"] == 5
-    else:
-        assert "execution_seconds" not in facts
-    if timing != "unknown":
-        assert facts["recorded_execution_seconds"] == 5
-    else:
-        assert "recorded_execution_seconds" not in facts
-    assert _snapshot(tmp_path) == before
+@pytest.fixture
+def continued_round(tmp_path, request):
+    timing = request.param
+    kernel, operations = worker_fixture(tmp_path / "consumer")
+    operations.prepare_agents = True
+    kernel.configure_profiles("original-profile", overrides={
+        "development_model": "original-model", "development_effort": "low"})
+    now = [100.]
+    kernel.clock = lambda: now[0]
+    calls = []
+    for continued in (False, True):
+        call = operations.once().call
+        calls.append(call)
+        assert kernel.dispatch_agent(call)
+        operations.runner.authorize_agent(call)
+        process = {"pid": 21, "pgid": 21, "start_token": call.invocation_id,
+                   "host_pid": 10, "host_start_token": "synthetic-host"}
+        kernel.agent_started(call, process)
+        if timing != "unknown":
+            kernel.observe_worker_activity(call, "turn-start", active=True, observed_at=now[0] + 1,
+                                          evidence={"type": "turn.started"})
+            kernel.observe_worker_activity(call, "turn-end", active=False, observed_at=now[0] + (4 if continued else 3),
+                                          evidence={"type": "turn.completed"})
+            if timing == "partial" and not continued:
+                kernel.observe_worker_activity(call, "unfinished-turn", active=True, observed_at=now[0] + 4,
+                                              evidence={"type": "turn.started"})
+        now[0] += 5
+        raw = ({"result_kind": "development", "summary": "Original work", "human_blockers": None} if continued else
+               {"result_kind": "human_blocker", "summary": None, "human_blockers": ["Keep the original decision / 保留原文"]})
+        kernel.receive(call, wire_json(raw))
+        kernel.agent_exited(call, process, 0)
+        assert operations.once().kind == ("progress" if continued else "paused")
+        if not continued:
+            kernel.configure_profiles("new-profile", overrides={"development_model": "new-model", "development_effort": "high"})
+            now[0] = 200.  # Human wait must never count as worker execution.
+            assert kernel.control("resume", "original-answer", subject=call.subject, new_thread=True,
+                                  message="原始回复\r\nKeep exactly this.") == "applied"
+    assert calls[0].attempt_id == calls[1].attempt_id and calls[0].thread_id != calls[1].thread_id
+    return kernel, calls, timing
 
 
 def test_closed_activity_without_worker_exit_does_not_prove_complete_execution(tmp_path: Path) -> None:
     from agent_run.queries.execution import invocation_timing
-    scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Scope"), ()))
-    kernel = scenario.kernel
+    kernel, operations = worker_fixture(tmp_path / "consumer")
     kernel.clock = lambda: 100.0
-    runner = scenario.runner()
-    for _ in range(30):
-        call = prepare_scripted_agent(kernel, runner.run_once()).call
-        if call is not None:
-            break
-    else:
-        raise AssertionError("Normal producer did not allocate Development")
+    operations.prepare_agents = True
+    call = operations.once().call
+    runner = operations.runner
     assert call is not None and kernel.dispatch_agent(call)
     runner.authorize_agent(call)
     # Explicit Core process-observation seam, without launching or killing an
@@ -70,9 +80,24 @@ def test_closed_activity_without_worker_exit_does_not_prove_complete_execution(t
 @pytest.mark.parametrize("continued_round", ["complete", "partial", "unknown"], indirect=True)
 def test_history_renders_one_round_with_original_configurations_and_true_timing(continued_round, tmp_path: Path) -> None:
     from agent_run.cli.render import render
+    from agent_run.queries.execution import invocation_timing
 
-    scenario, calls, timing = continued_round
-    document = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage)
+    kernel, calls, timing = continued_round
+    document = read(kernel.storage.path, 'history', storage=kernel.storage)
+    attempt, = document.data["history"]["attempts"]
+    assert attempt["id"] == calls[0].attempt_id
+    assert [(item["model"], item["effort"]) for item in attempt["invocations"]] == [
+        ("original-model", "low"), ("new-model", "high")]
+    facts = invocation_timing(attempt["invocations"])
+    assert facts["execution_timing_complete"] is (timing == "complete")
+    if timing == "complete":
+        assert facts["execution_seconds"] == 5
+    else:
+        assert "execution_seconds" not in facts
+    if timing != "unknown":
+        assert facts["recorded_execution_seconds"] == 5
+    else:
+        assert "recorded_execution_seconds" not in facts
     original = json.dumps(document.data, ensure_ascii=False, sort_keys=True)
     before = _snapshot(tmp_path)
     for language, role, elapsed, recorded in (("en", "Development Agent", "Round execution time", "Recorded execution time"),
@@ -103,28 +128,24 @@ def test_history_renders_one_round_with_original_configurations_and_true_timing(
 
 @pytest.mark.parametrize("raw,marker", [(wire_json({"unvalidated-review": "原始材料"}), "unvalidated-review"),
     (b"unvalidated-review / non-JSON text", "unvalidated-review"), (b"null", "\nnull\n")], ids=["json", "text", "null"])
-def test_history_keeps_unconsumed_malformed_review_as_raw_evidence_without_a_verdict(tmp_path: Path, monkeypatch, raw: bytes, marker: str) -> None:
+def test_history_keeps_unconsumed_malformed_review_as_raw_evidence_without_a_verdict(tmp_path: Path, raw: bytes, marker: str) -> None:
     from agent_run.cli.render import render
 
-    scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Original scope"), ()))
-    original = scenario.agent
-
-    def agent(call):
-        if call.role == "review":
-            # Format repair requires the backend thread actually reported by
-            # this normal synthetic Agent, not merely a logical Thread row.
-            scenario.kernel.bind_thread(call, call.reported_thread or "history-review-backend")
-        return raw if call.role == "review" else original(call)
-
-    _recorded_agents(scenario, monkeypatch, agent)
-    for _ in range(30):
-        step = scenario.step()
-        if step.call is not None and step.call.role == "review":
-            break
-    else:
-        raise AssertionError("The normal pipeline did not reach Review")
+    kernel, operations = worker_fixture(tmp_path / "consumer", kind=DeliveryKind.PARENT_ONLY)
+    operations.prepare_agents = True
+    development = operations.once().call
+    process = start_worker(kernel, operations, development)
+    finish_worker(kernel, development, process)
+    assert operations.once().kind == "progress"
+    consume_local_result(kernel, operations, development.subject, "candidate")
+    consume_local_result(kernel, operations, development.subject, "validation_checkout")
+    call = operations.once().call
+    assert call.role == "review"
+    process = start_worker(kernel, operations, call)
+    kernel.bind_thread(call, "history-review-backend")
+    finish_worker(kernel, call, process, raw)
     before = _snapshot(tmp_path)
-    document = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage)
+    document = read(kernel.storage.path, 'history', storage=kernel.storage)
     review = next(row for row in document.data["history"]["attempts"] if row["role"] == "review")
     assert review["status"] == "returned" and review["outcome"] is None
     for details in (False, True):
@@ -134,9 +155,11 @@ def test_history_keeps_unconsumed_malformed_review_as_raw_evidence_without_a_ver
         assert "Acceptance passed" not in output.getvalue()
         assert (marker in output.getvalue()) is details
     assert _snapshot(tmp_path) == before
-    repair = scenario.step()
+    repair = operations.once()
     assert repair.call is not None and repair.call.output_ordinal == 1
-    full_document = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage)
+    process = start_worker(kernel, operations, repair.call)
+    finish_worker(kernel, repair.call, process, raw)
+    full_document = read(kernel.storage.path, 'history', storage=kernel.storage)
     full = full_document.data["history"]
     output = StringIO()
     render(replace(full_document, language="en"), style="plain", details=True, stream=output)
@@ -144,7 +167,7 @@ def test_history_keeps_unconsumed_malformed_review_as_raw_evidence_without_a_ver
     assert "Output continuations: 1, included in this round" in output.getvalue()
     event = next(item for item in full["events"] if item["kind"] == "output_repair_allocated")
     before = _snapshot(tmp_path)
-    page = read(scenario.kernel.storage.path, 'history', after=event['position'] - 1, limit=1, storage=scenario.kernel.storage)
+    page = read(kernel.storage.path, 'history', after=event['position'] - 1, limit=1, storage=kernel.storage)
     assert len(page.data["history"]["events"]) == 1 and page.data["history"]["attempts"] == []
     output = StringIO()
     render(replace(page, language="en"), style="plain", details=True, stream=output)
@@ -220,28 +243,21 @@ def test_history_binds_each_review_findings_and_evidence_to_its_original_candida
     assert _snapshot(tmp_path) == before
 
 
-def test_default_history_bounds_human_text_without_changing_details_or_audit(tmp_path, monkeypatch):
+def test_default_history_bounds_human_text_without_changing_details_or_audit(tmp_path):
     from agent_run.cli.render import render
 
-    scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Scope"), ()))
-    original = scenario.agent
+    kernel, operations = worker_fixture(tmp_path / "consumer")
+    operations.prepare_agents = True
     blocker = "ORIGINAL-BLOCKER " + "长文 x " * 300 + " BLOCKER-END"
     reply = "ORIGINAL-REPLY\r\n" + "回复 y " * 300 + " REPLY-END"
-    calls = []
-
-    def agent(call):
-        calls.append(call)
-        if len(calls) == 1:
-            return wire_json({"result_kind": "human_blocker", "summary": None, "human_blockers": [blocker]})
-        return original(call)
-
-    _recorded_agents(scenario, monkeypatch, agent)
-    assert scenario.run().kind == "paused"
-    assert scenario.kernel.control("resume", "long-original-answer", subject=scenario.delivery.key,
-                                   message=reply) == "applied"
-    assert scenario.step().call is not None
+    call = operations.once().call
+    process = start_worker(kernel, operations, call)
+    finish_worker(kernel, call, process, wire_json({"result_kind": "human_blocker", "summary": None, "human_blockers": [blocker]}))
+    assert operations.once().kind == "paused"
+    assert kernel.control("resume", "long-original-answer", subject=call.subject, message=reply) == "applied"
+    assert operations.once().call is not None
     before = _snapshot(tmp_path)
-    document = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage)
+    document = read(kernel.storage.path, 'history', storage=kernel.storage)
     audit = json.dumps(document.data, ensure_ascii=False, sort_keys=True)
     for language, marker in (("en", "truncated; --details retains the original"),
                              ("zh", "已截断；--details 保留原文")):

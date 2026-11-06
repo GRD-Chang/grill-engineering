@@ -1,23 +1,20 @@
 """Native Requirements consume synthetic returns through the actual attempt lifecycle."""
 
-from support.repository_fixture import create_kernel
-
 import json
 import os
 from pathlib import Path
-from dataclasses import replace
 
 import pytest
 
-from support.core_operations import CoreOperations, scripted_return, prepare_scripted_agent
+from support.core_operations import CoreOperations, next_call, prepare_scripted_agent
 from agent_run.model import Role
 from agent_run.contracts.artifact import parse_artifact, role_schema
 from agent_run.errors import ArtifactContractError
 from agent_run.runtime.codex import _CodexCapture
 from agent_run.model import ParentIssue, Requirements, wire_json
 from support.offline import GraphScenario, review_result
-from agent_run.core.kernel import Kernel
 from agent_run.config.resources import resolve_resources
+from support.worker_facts import worker_fixture, consume_local_result
 
 
 def publication(body="Recorded validation and user impact.", *, message="feat: change"):
@@ -52,35 +49,40 @@ def test_publication_message_rejects_a_missing_or_multiline_title(message):
         parse_artifact("publication", wire_json(publication(message=message)))
 
 
-def next_call(scenario, role, *, preparation=False):
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports, prepare_agents=not preparation)
-    for _ in range(40):
-        step = operations.once()
-        if step.preparation is not None:
-            if step.preparation.role == role:
-                return step.preparation
-            step = prepare_scripted_agent(scenario.kernel, step)
-        if step.call is not None and step.call.role == role:
-            return step.call
-        assert step.kind in {"agent", "effect", "progress"}, step
-        if step.call is not None:
-            scripted_return(scenario.kernel, operations.runner, step.call, scenario.agent)
-    raise AssertionError(f"No {role} call allocated")
-
-
-def returned(scenario, call, raw):
-    # Explicit synthetic process observations, as in the native policy tests;
-    # these establish returned-result consumption, not OS sandbox enforcement.
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
-    kernel = scenario.kernel
+def returned(kernel, call, raw):
+    # Original synthetic process observations, not OS sandbox proof.
     assert kernel.dispatch_agent(call)
-    kernel.bind_thread(call, call.reported_thread or "synthetic-contract-thread")
+    kernel.bind_thread(call, call.reported_thread or "synthetic-contract-" + call.thread_id)
     process = {"pid": 23 + call.output_ordinal, "pgid": 23 + call.output_ordinal,
                "start_token": f"output-{call.output_ordinal}",
                "host_pid": 11, "host_start_token": "synthetic-host"}
     kernel.agent_started(call, process)
     kernel.receive(call, raw)
     kernel.agent_exited(call, process, 0)
+
+
+def role_fixture(root, role, *, language="en"):
+    kernel, operations = worker_fixture(root, language=language)
+    request = operations.until(lambda step: step.preparation is not None).preparation
+    if role == Role.DEVELOPMENT:
+        return kernel, operations, request
+    development = prepare_scripted_agent(kernel, request).call
+    returned(kernel, development, wire_json(dict(result_kind="development", summary="Original change", human_blockers=None)))
+    assert operations.once().kind == "progress"
+    consume_local_result(kernel, operations, development.subject, "candidate")
+    consume_local_result(kernel, operations, development.subject, "validation_checkout")
+    request = operations.until(lambda step: step.preparation is not None).preparation
+    assert request.role == Role.REVIEW
+    if role == Role.REVIEW:
+        return kernel, operations, request
+    review = prepare_scripted_agent(kernel, request).call
+    returned(kernel, review, wire_json(review_result("pass")))
+    assert operations.once().kind == "progress"
+    consume_local_result(kernel, operations, review.subject, "validation_cleanup")
+    consume_local_result(kernel, operations, review.subject, "integrate")
+    request = operations.until(lambda step: step.preparation is not None).preparation
+    assert request.role == Role.PUBLICATION
+    return kernel, operations, request
 
 
 def test_native_publication_rejects_contract_drift_and_repairs_same_attempt(tmp_path: Path):
@@ -91,7 +93,7 @@ def test_native_publication_rejects_contract_drift_and_repairs_same_attempt(tmp_
     operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
     first = next_call(scenario, Role.PUBLICATION)
     raw = b"\n " + wire_json(value) + b"\n"
-    returned(scenario, first, raw)
+    returned(scenario.kernel, first, raw)
     step = operations.once()
     repair = step.call
     assert repair is not None and repair.mode == "output-repair", step
@@ -107,7 +109,7 @@ def test_native_publication_rejects_contract_drift_and_repairs_same_attempt(tmp_
         assert tx.one("SELECT source_sequence FROM runs")[0] is not None
         assert not tx.rows("SELECT id FROM effects WHERE operation='publication_commit'")
     valid = b"\n" + wire_json(publication()) + b"\n"
-    returned(scenario, repair, valid)
+    returned(scenario.kernel, repair, valid)
     consumed = operations.once(agent_capacity=0)
     assert consumed.kind == "progress"
     with scenario.kernel.storage.transaction(write=False) as tx:
@@ -131,55 +133,54 @@ _FAIL_AND_BLOCKED["checks"]["e2e"].update(status="blocked")
     (Role.PUBLICATION, human(["x" * 2000] * 8), "human_blocker"),
 ])
 def test_native_valid_outputs_keep_wire_raw_and_route_all_roles(tmp_path, role, value, outcome):
-    scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Deliver change"), ()))
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
-    request = next_call(scenario, role, preparation=True)
+    kernel, operations, request = role_fixture(tmp_path / "consumer", role)
+    Path(request.context["checkout"]).mkdir(parents=True, exist_ok=True)
     # Inspect the transport's actual owned schema file without launching a
     # process: UID namespaces are unavailable in some execution environments.
     credential = tmp_path / "fixture-hosts.yml"
     credential.write_text("github.com:\n  oauth_token: synthetic-not-a-credential\n")
     credential.chmod(0o600)
-    with _CodexCapture(scenario.kernel, request, executable="unused-local-codex",
+    with _CodexCapture(kernel, request, executable="unused-local-codex",
                        environment={"PATH": os.defpath, "HOME": str(tmp_path)},
                        credential_file=credential, hidden_paths=(), hidden_environment=()) as capture:
         assert capture.directory is not None
         descriptor = os.open("schema.json", os.O_RDONLY, dir_fd=capture.directory)
         with os.fdopen(descriptor, "rb") as schema:
             assert json.load(schema) == role_schema(role.value)
-    call = scenario.kernel.admit_agent(request).call
+    call = kernel.admit_agent(request).call
     assert call is not None
     raw = b"\n " + wire_json(value) + b" \n"
-    returned(scenario, call, raw)
+    returned(kernel, call, raw)
     step = operations.once(agent_capacity=0)
     blocked = outcome in {"human_blocker", "blocked"}
     assert (step.kind, step.reason) == (("paused", "human_blocker") if blocked else ("progress", ""))
-    with scenario.kernel.storage.transaction(write=False) as tx:
+    with kernel.storage.transaction(write=False) as tx:
         attempt = tx.one("SELECT * FROM attempts WHERE id=?", (call.attempt_id,))
         assert (attempt["status"], attempt["outcome"]) == ("human" if blocked else "consumed", outcome)
         assert tx.get(attempt["result_id"], call.subject) == raw
         assert tx.one("SELECT source_sequence FROM runs")[0] is not None
         if outcome == "fail":
             assert tx.one("SELECT phase FROM subjects WHERE id=?", (call.subject,))[0] == "development"
-            assert "human_blocker" not in scenario.kernel.status(call.subject)["gates"]
+            assert "human_blocker" not in kernel.status(call.subject)["gates"]
 
 
 def test_invalid_repair_is_gated_and_both_original_outputs_remain(tmp_path):
-    scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Deliver change"), ()))
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
-    first = next_call(scenario, Role.PUBLICATION)
+    kernel, operations, request = role_fixture(tmp_path / "consumer", Role.PUBLICATION)
+    operations.prepare_agents = True
+    first = prepare_scripted_agent(kernel, request).call
     rejected = [wire_json(publication(body)) for body in
                 ("Resolves #7", "## Completed Tickets\n#2", "Delivery Run: forged-run")]
     call = first
     for raw in rejected[:-1]:
-        returned(scenario, call, raw)
+        returned(kernel, call, raw)
         repair = operations.once().call
         assert repair is not None and repair.mode == "output-repair"
         assert repair.invocation_id == first.invocation_id and repair.attempt_id == first.attempt_id
         call = repair
-    returned(scenario, call, rejected[-1])
+    returned(kernel, call, rejected[-1])
     step = operations.once()
     assert (step.kind, step.reason) == ("paused", "invalid_artifact")
-    with scenario.kernel.storage.transaction(write=False) as tx:
+    with kernel.storage.transaction(write=False) as tx:
         outputs = tx.rows("SELECT raw_id FROM invocation_outputs WHERE invocation=? ORDER BY ordinal", (first.invocation_id,))
         assert [tx.get(row[0], first.subject) for row in outputs] == rejected
         assert not tx.rows("SELECT id FROM effects WHERE operation='publication_commit'")
@@ -189,26 +190,21 @@ def test_frozen_run_accepts_publication_in_the_other_language(tmp_path):
     # Artifact parsing takes only role and bytes, never the frozen UI language.
     # Exercise that connection once after real development/review preparation.
     language, role = "zh", Role.PUBLICATION
-    scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Deliver change"), ()))
-    assert scenario.spec.inputs is not None
     resources = resolve_resources(language)
-    scenario.spec = replace(scenario.spec, language=language,
-                            inputs=replace(scenario.spec.inputs, prompt_resources=resources))
-    scenario.kernel = create_kernel(tmp_path / "configured.sqlite3", scenario.spec, requirements=scenario.requirements)
-    scenario.execution = scenario.kernel.claim_executor("configured-language")
-    call = next_call(scenario, role)
+    kernel, operations, request = role_fixture(tmp_path / "consumer", role, language=language)
+    call = prepare_scripted_agent(kernel, request).call
     assert call.context["language"] == language and call.context["_prompt_resources"] == resources
     prose = "Keep this English evidence / API unchanged."
     value = publication(prose, message="feat: " + prose)
     value["pr_title"] = prose
     raw = b"\n" + wire_json(value) + b"\n"
-    returned(scenario, call, raw)
-    step = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports).once(agent_capacity=0)
+    returned(kernel, call, raw)
+    step = operations.once(agent_capacity=0)
     assert step.kind == "progress" and step.call is None
-    with scenario.kernel.storage.transaction(write=False) as tx:
+    with kernel.storage.transaction(write=False) as tx:
         attempt = tx.one("SELECT status,result_id FROM attempts WHERE id=?", (call.attempt_id,))
         assert attempt["status"] == "consumed"
         assert tx.get(attempt["result_id"], call.subject) == raw
         assert json.loads(tx.get(attempt["result_id"], call.subject)) == value
         assert len(tx.rows("SELECT id FROM invocations WHERE attempt=?", (call.attempt_id,))) == 1
-    assert scenario.kernel.status(call.subject)["gates"] == []
+    assert kernel.status(call.subject)["gates"] == []

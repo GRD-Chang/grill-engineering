@@ -8,10 +8,11 @@ import pytest
 
 from agent_run.core.operation_runner import OperationRunner
 from agent_run.errors import KernelError
-from agent_run.model import DeliveryKind, Policy, Role
+from agent_run.model import Policy, Role, wire_json
 from agent_run.runtime.codex import _CodexCapture, _execute_prepared, _write_member
 from support.core_operations import prepare_scripted_agent
-from support.offline import Scenario
+from support.offline import review_result
+from support.worker_facts import worker_fixture, start_worker, finish_worker, consume_local_result
 from support.core_operations import agent_preparation_fixture as preparation
 
 
@@ -44,25 +45,25 @@ def local_capture(kernel, request):
 
 
 def next_development(tmp_path):
-    scenario = Scenario(tmp_path, DeliveryKind.TICKET, reviews=('fail',), policy=Policy(ticket_rounds=2))
-    runner = OperationRunner(scenario.kernel, scenario.execution, scenario.make_ports)
-    original = None
-    for _ in range(64):
-        step = runner.run_once()
-        if step.preparation is None:
-            continue
-        request = step.preparation
-        if request.role == Role.DEVELOPMENT and original is not None:
-            assert request.thread_id == original.thread_id and request.reported_thread == 'offline-' + original.thread_id
-            assert request.attempt_id != original.attempt_id
-            return scenario.kernel, runner, request
-        call = prepare_scripted_agent(scenario.kernel, request).call
-        assert call is not None
-        if call.role == Role.DEVELOPMENT:
-            original = call
-        runner.authorize_agent(call)
-        scenario.kernel.receive(call, scenario.agent(call))
-    raise AssertionError('Review did not return the original Thread to Development')
+    kernel, operations = worker_fixture(tmp_path)
+    first = operations.until(lambda step: step.preparation is not None).preparation
+    original = prepare_scripted_agent(kernel, first).call
+    process = start_worker(kernel, operations, original)
+    kernel.bind_thread(original, 'offline-' + original.thread_id)
+    finish_worker(kernel, original, process)
+    assert operations.once().kind == 'progress'
+    consume_local_result(kernel, operations, original.subject, 'candidate')
+    consume_local_result(kernel, operations, original.subject, 'validation_checkout')
+    review = prepare_scripted_agent(kernel, operations.once()).call
+    assert review.role == Role.REVIEW
+    process = start_worker(kernel, operations, review)
+    finish_worker(kernel, review, process, wire_json(review_result('fail')))
+    assert operations.once().kind == 'progress'
+    consume_local_result(kernel, operations, review.subject, 'validation_cleanup')
+    request = operations.once().preparation
+    assert request.role == Role.DEVELOPMENT and request.attempt_id != original.attempt_id
+    assert request.thread_id == original.thread_id and request.reported_thread == 'offline-' + original.thread_id
+    return kernel, operations.runner, request
 
 
 def test_stop_after_bootstrap_binding_does_not_turn_precreated_empty_file_into_return(tmp_path):

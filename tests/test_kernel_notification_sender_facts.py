@@ -15,7 +15,7 @@ from agent_run.model import wire_json
 from agent_run.notifications.sender import NativeNotifications
 from support.notification import recorded_agents as _recorded_agents, _enabled_scenario, _kernel, _operations, observe_and_wait
 from support.observer_errors import ObserverErrors
-from support.notification_workers import start_worker, finish_worker, consume_local_result
+from support.worker_facts import start_worker, finish_worker, consume_local_result
 
 
 def _state(kernel) -> dict[str, Any]:

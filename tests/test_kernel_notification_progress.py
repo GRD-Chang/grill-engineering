@@ -12,7 +12,7 @@ from agent_run.notifications.progress import obsolete_progress
 from agent_run.notifications.event_projection import event_state, project_event
 from support.offline import GraphScenario
 from support.notification import _project, _kernel, _operations
-from support.notification_workers import start_worker, finish_worker, consume_local_result, record_local_result
+from support.worker_facts import start_worker, finish_worker, consume_local_result, record_local_result
 from support.notification import recorded_agents as _recorded_agents
 
 
