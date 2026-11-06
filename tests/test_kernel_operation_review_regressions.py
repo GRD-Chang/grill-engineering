@@ -216,6 +216,16 @@ raise SystemExit(response.returncode)
         assert failures[0]["operation"] == "push"
         assert failures[0]["dispatch_serial"] == 1
         assert failures[0]["evidence"]["returncode"] == command_exit
+        assert "actual transport command exited nonzero" in failures[0]["evidence"]["message"]
+    # Consuming this original result and advancing once cannot repeat the push
+    # or discard the physical failure proved before successful readback.
+    assert prepare_scripted_agent(scenario.kernel, runner.run_once(agent_capacity=0)).kind == "progress"
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        assert tuple(tx.one("SELECT status,attempts FROM effects WHERE id=?", (effect.effect_id,))) == ("confirmed", 1)
+        assert len(tx.rows("SELECT position FROM history WHERE kind='effect_failed' AND identity=?",
+                           (effect.effect_id,))) == int(bool(command_exit))
+    prepare_scripted_agent(scenario.kernel, runner.run_once(agent_capacity=0))
+    assert _failures(scenario) == [{**failure, "status": "confirmed"} for failure in failures]
     assert len(trace.read_text().splitlines()) == 1
 
 
@@ -252,13 +262,22 @@ def test_offline_lost_response_is_unknown_without_an_observed_command_failure(
         row = tx.one("SELECT evidence FROM waits WHERE subject=?", (scenario.delivery.key,))
         diagnostic = json.loads(tx.get(row["evidence"], scenario.delivery.key))
     assert diagnostic == {"code": "write_response_unavailable", "message": "pr_write took effect; response lost"}
+    status = read(scenario.kernel.storage.path, 'status', storage=scenario.kernel.storage).data
+    assert status["supervision_windows"][0]["latest_observation"] == diagnostic
+    assert scenario.runner().run_once().kind == "waiting"
     scenario.kernel.clock = lambda: 106.25
     assert scenario.run().kind == "approval"
     assert _failures(scenario) == []
     assert sum(row["operation"] == "pr_write" for row in scenario.port.writes()) == 1
     assert any(event["kind"] == "effect_readback" and event["identity"] == pending["id"]
                for event in scenario.kernel.history(scenario.delivery.key))
+    public = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage).data["history"]
+    events = [event for event in public["events"] if event.get("evidence") == diagnostic]
+    assert len(events) == 1 and pending["id"] in events[0]["identity"]
+    assert public["effect_failures"] == []
     with scenario.kernel.storage.transaction(write=False) as tx:
+        assert tuple(tx.one("SELECT attempts,status FROM effects WHERE id=?", (pending["id"],))) == (1, "confirmed")
+        assert not tx.rows("SELECT subject FROM waits")
         diagnostics = [json.loads(row[0]) for row in tx.rows(
             "SELECT body FROM material WHERE subject=? AND purpose='github_read_observation'", (scenario.delivery.key,))]
     assert diagnostic in diagnostics  # Settling target does not erase the original uncertainty.

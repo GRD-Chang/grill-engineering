@@ -5,18 +5,12 @@ from dataclasses import replace
 import json
 from pathlib import Path
 
-import pytest
 
 from agent_run.contracts.prompt import RESOURCE_KEYS
 from agent_run.config.defaults import UserDefaultsStore
 from agent_run.model import Commit, Delivery, DeliveryKind, RunSpec
-from agent_run.core.kernel import Kernel
 from agent_run.config.creation import freeze_creation
-from agent_run.core.operation_contract import ReadUnavailable
-from support.offline import Scenario
-from agent_run.queries.run import read
-from support.core_operations import CoreOperations, native_agent_fixture, scripted_return
-from support.remote_effects import _actual_publication_push
+from support.core_operations import CoreOperations, native_agent_fixture
 
 
 def test_explicit_frozen_profiles_keep_their_actual_source_without_a_preset(tmp_path: Path) -> None:
@@ -108,95 +102,3 @@ def test_creation_inputs_and_thread_revisions_survive_defaults_and_explicit_conf
         paused = tx.one("SELECT phase,purpose,status FROM history WHERE kind='paused' AND identity='execution_failed'")
         assert (paused["phase"], paused["purpose"]) == ("development", "requirements")
         assert json.loads(paused["status"])["gates"] == ["execution_failed"]
-
-
-def test_publication_call_retains_its_actual_development_reference_revision(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
-    revision = scenario.kernel.configure_profiles("choose-profile", preset="economy", overrides={
-        "development_model": "selected-development", "publication_from_development": True,
-    })
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
-    development = None
-    for _ in range(40):
-        step = operations.once()
-        if step.call is not None and step.call.role == "development":
-            development = step.call
-        if step.call is not None and step.call.role == "publication":
-            call = step.call
-            assert development is not None
-            assert call.thread_id == development.thread_id and call.reported_thread == "offline-" + development.thread_id
-            assert call.mode == "resume" and call.profile == development.profile
-            assert call.profile.model == "selected-development" and call.profile_revision == revision
-            assert call.profile_reference == development.profile_reference is None
-            assert call.context["language"] == "zh" and call.context["repository_root"] == str(scenario.port.git.root.resolve())
-            break
-        if step.call is not None:
-            scripted_return(scenario.kernel, operations.runner, step.call, scenario.agent)
-    else:
-        raise AssertionError("Publication was not allocated")
-    scenario.kernel.configure_profiles("separate-publication", overrides={"publication_model": "independent-publication"})
-    # A later revision cannot mutate the already-authorized Publication call.
-    assert scenario.kernel.dispatch_agent(call)
-    scenario.kernel.guard_agent(call)
-
-
-@pytest.mark.parametrize("command_exit", [0, 7], ids=["actual-zero", "actual-nonzero"])
-def test_publication_failure_observation_survives_successful_exact_readback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command_exit: int,
-) -> None:
-    scenario, effect = _actual_publication_push(tmp_path, monkeypatch, command_exit)
-    with scenario.kernel.storage.transaction(write=False) as tx:
-        assert tx.one("SELECT status FROM effects WHERE id=?", (effect.effect_id,))[0] == "observed"
-        failures = tx.rows("SELECT e.operation,e.subject,f.* FROM effect_failures f JOIN effects e ON e.id=f.effect")
-        assert len(failures) == (1 if command_exit else 0)
-        if command_exit:
-            assert failures[0]["operation"] == "push" and failures[0]["effect"] == effect.effect_id
-            assert failures[0]["dispatch_serial"] == 1
-            evidence = json.loads(tx.get(failures[0]["evidence"], failures[0]["subject"]))
-            assert evidence["returncode"] == command_exit
-            assert "actual transport command exited nonzero" in evidence["message"]
-        assert tx.one("SELECT sum(attempts) FROM effects")[0] > len(failures)
-
-
-def test_publication_unknown_response_retains_the_original_intent_without_inventing_an_exit_code(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
-    now = [100.25]
-    scenario.kernel.clock = lambda: now[0]
-    scenario.port.lose_response.add("pr_write")
-    make_ports = scenario.make_ports
-    exceptions = []
-    def capture_ports(binding):
-        ports = make_ports(binding)
-        execute = ports.execute
-        def capture(effect, authorize):
-            try:
-                return execute(effect, authorize)
-            except ReadUnavailable as error:
-                exceptions.append((effect.effect_id, effect.dispatch_serial,
-                                   getattr(error, "write_returncode", None)))
-                raise
-        ports.execute = capture
-        return ports
-    monkeypatch.setattr(scenario, "make_ports", capture_ports)
-    unresolved = scenario.run()
-    assert unresolved.kind == "waiting" and unresolved.reason == "github_convergence"
-    pending = scenario.kernel.status(scenario.delivery.key)["pending_write"]
-    assert pending is not None and pending["operation"] == "pr_write" and pending["status"] == "sent"
-    assert exceptions == [(pending["id"], 1, None)]
-    diagnostic = {"code": "write_response_unavailable", "message": "pr_write took effect; response lost"}
-    assert read(scenario.kernel.storage.path, 'status', storage=scenario.kernel.storage).data["supervision_windows"][0]["latest_observation"] == diagnostic
-    assert unresolved.retry_at is not None
-    now[0] = unresolved.retry_at
-    assert scenario.run().kind == "approval"
-    assert scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref) is not None
-    assert sum(row["operation"] == "pr_write" for row in scenario.port.writes()) == 1
-    with scenario.kernel.storage.transaction(write=False) as tx:
-        failures = tx.rows("SELECT e.operation,e.subject,f.* FROM effect_failures f JOIN effects e ON e.id=f.effect")
-        assert failures == []  # No physical command response proved a nonzero exit.
-        assert tx.one("SELECT sum(attempts) FROM effects")[0] > len(failures)
-        assert tx.one("SELECT attempts,status FROM effects WHERE id=?", (pending["id"],))[:] == (1, "confirmed")
-        observations = [json.loads(row[0]) for row in tx.rows(
-            "SELECT body FROM material WHERE subject=? AND purpose='github_read_observation'", (scenario.delivery.key,))]
-        assert diagnostic in observations

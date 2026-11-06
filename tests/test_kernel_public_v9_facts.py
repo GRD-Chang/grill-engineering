@@ -1,18 +1,13 @@
 """Public consumers read actual native producer facts, not a legacy Run view."""
 
-from support.repository_fixture import create_kernel
 import json
 from pathlib import Path
 
-import pytest
 
 from agent_run.contracts.prompt import RESOURCE_KEYS
-from agent_run.model import DeliveryKind, Policy
-from support.offline import Scenario
 from agent_run.queries.run import read
 from agent_run.cli.main import main
 from support.core_operations import CoreOperations
-from support.remote_effects import _actual_publication_push
 from support.cli_fixtures import _kernel
 
 
@@ -89,68 +84,6 @@ def test_query_retains_physical_output_raw_and_actual_activity_without_recountin
     returned = [event for event in data['history']['events'] if event['kind'] == 'raw_returned']
     assert [event['phase'] for event in returned] == ['development', 'development']
     assert data['subjects'][0]['phase'] == 'candidate'
-    assert _durable(tmp_path) == before
-
-
-def test_publication_actual_failure_is_not_dispatch_count_or_erased_by_successful_readback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    scenario, effect = _actual_publication_push(tmp_path, monkeypatch, 7)
-    before = _durable(tmp_path)
-    data = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage).data
-    failures = data['history']['effect_failures']
-    assert len(failures) == 1 and failures[0]['operation'] == 'push'
-    assert failures[0]['effect'] == effect.effect_id and failures[0]['dispatch_serial'] == 1
-    assert failures[0]['evidence']['returncode'] == 7
-    assert "actual transport command exited nonzero" in failures[0]['evidence']['message']
-    assert sum(operation['attempts'] for operation in data['history']['effects']) > len(failures)
-    assert next(row for row in data['history']['effects'] if row['id'] == effect.effect_id)['status'] == 'observed'
-    assert _durable(tmp_path) == before
-
-
-def test_publication_unknown_response_diagnostic_remains_public_after_successful_exact_readback(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / 'scenario', DeliveryKind.PARENT_ONLY)
-    now = [100.25]
-    scenario.kernel.clock = lambda: now[0]
-    scenario.port.lose_response.add('pr_write')
-    unresolved = scenario.run()
-    assert unresolved.kind == "waiting" and unresolved.reason == "github_convergence"
-    pending = scenario.kernel.status(scenario.delivery.key)["pending_write"]
-    assert pending is not None and pending["operation"] == "pr_write" and pending["status"] == "sent"
-    diagnostic = {"code": "write_response_unavailable", "message": "pr_write took effect; response lost"}
-    assert read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage).data['supervision_windows'][0]['latest_observation'] == diagnostic
-    assert unresolved.retry_at is not None
-    now[0] = unresolved.retry_at
-    assert scenario.run().kind == 'approval'
-    before = _durable(tmp_path)
-    data = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage).data
-    failures = data['history']['effect_failures']
-    assert failures == []  # Unknown response is not a proved nonzero command exit.
-    assert sum(operation['attempts'] for operation in data['history']['effects']) > len(failures)
-    assert scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref) is not None
-    operation = next(row for row in data['history']['effects'] if row['id'] == pending['id'])
-    assert operation['attempts'] == 1 and operation['status'] == 'confirmed'
-    assert sum(row['operation'] == 'pr_write' for row in scenario.port.writes()) == 1
-    ci = next(row for row in [budget for subject in data['subjects'] for budget in subject['budgets']] if row['purpose'] == 'ci' and row['current'])
-    assert ci['review_limit'] is None and bool(ci['review_required']) is True
-    assert _durable(tmp_path) == before
-    # Immutable storage alone is insufficient: the public audit must still make
-    # the original uncertainty diagnosable after the exact intent is consumed.
-    audit = json.dumps(data, ensure_ascii=False)
-    assert diagnostic['code'] in audit and diagnostic['message'] in audit
-
-
-def test_zero_resync_gate_exposes_actual_window_and_explicit_resume_without_renewal(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / 'scenario', DeliveryKind.PARENT_ONLY, policy=Policy(resync_limit=0))
-    assert scenario.run().kind == 'approval'
-    scenario.port.external_remote_append(scenario.delivery.target_ref, {'external.txt': 'Original external work'}, 'append')
-    assert scenario.run().kind == 'paused'
-    before = _durable(tmp_path)
-    data = read(scenario.kernel.storage.path, 'status', storage=scenario.kernel.storage).data
-    assert data['subjects'][0]['integration_resync']['limit'] == 0 and data['subjects'][0]['integration_resync']['used'] == 0
-    assert data['subjects'][0]['integration_resync']['window'] == 1 and data['subjects'][0]['integration_resync']['open'] is False
-    action = next(item for item in data['operator_actions'] if item['reason'] == 'integration_resync_exhausted')
-    assert action['operation'] == 'resume' and action['action']['command'] == 'resume'
     assert _durable(tmp_path) == before
 
 

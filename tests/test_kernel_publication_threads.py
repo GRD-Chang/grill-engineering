@@ -31,6 +31,9 @@ def test_publication_reuses_development_binding_after_future_profiles_change(tmp
     assert publication.reported_thread == "offline-" + development.thread_id
     assert publication.mode == "resume" and publication.role == Role.PUBLICATION
     assert publication.profile == development.profile and publication.profile_revision == development.profile_revision == 1
+    assert publication.profile_reference == development.profile_reference is None
+    # Later configuration must not change this already allocated Publication.
+    scenario.kernel.configure_profiles("separate-publication", overrides={"publication_model": "independent-publication"})
     assert publication.context["role"] == "publication" and publication.context["readonly"] is True
     assert scenario.review_count == 1
     assert scenario.kernel.status(scenario.delivery.key)["budgets"]["requirements"]["developments_used"] == 1
