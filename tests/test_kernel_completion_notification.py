@@ -7,7 +7,7 @@ import pytest
 from agent_run.model import Issue, ParentIssue, Requirements
 from agent_run.notifications.cards import card
 from agent_run.notifications.envelope import event_envelope
-from agent_run.notifications.event_projection import completion_context, event_state
+from agent_run.notifications.event_projection import completion_context
 from agent_run.queries.read_facts import read_boundaries
 from support.offline import GraphScenario
 from support.run_scoped_kernel import domain_kernel
@@ -61,38 +61,6 @@ def test_ticket_completion_keeps_original_summary_and_current_parent_progress(tm
         with scenario.kernel.storage.transaction(write=False) as tx:
             view = read_boundaries(tx, time.time())
             assert view["is_terminal"] is False and view["closures"] == []
-
-
-def test_parent_only_completion_context_uses_actual_cleanup_and_approval_boundaries(tmp_path):
-    scenario = GraphScenario(tmp_path, Requirements(ParentIssue(1, "Direct delivery", "Scope", ()), ()))
-    with domain_kernel(scenario.kernel) as scenario.kernel:
-        assert scenario.run().kind == "approval"
-
-        def context():
-            with scenario.kernel.storage.transaction(write=False) as tx:
-                return completion_context(read_boundaries(tx, time.time()), event_state(tx))
-
-        approval = context()
-        assert approval["parent_only"] is True and approval["ticket_progress"] is None
-        assert approval["next_step"] == "agent-run status --repo example/project -- offline-run"
-        assert len(approval["completion_actions"]) == 1
-        assert approval["completion_actions"][0]["next_action"] == "agent-run approve --repo example/project -- offline-run"
-        assert scenario.kernel.control("approve", "original-approval", subject="parent:1", world=scenario.world()) == "pending"
-        for _ in range(100):
-            if scenario.kernel.status("parent:1")["phase"] == "complete":
-                break
-            step = scenario.step()
-            assert step.kind not in {"paused", "waiting", "approval"}, step
-        else:
-            raise AssertionError("The original close did not complete")
-        pending = context()
-        assert pending["parent_only"] is True
-        assert pending["next_step"] == "agent-run resume --repo example/project -- offline-run"
-        assert pending["completion_actions"] == []
-        assert scenario.run().kind == "complete"
-        closed = context()
-        assert closed["next_step"] == "无需继续执行交付操作。"
-        assert closed["parent_only"] is True and closed["ticket_progress"] is None
 
 
 @pytest.mark.parametrize("language", ["zh", "en"])

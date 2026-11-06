@@ -11,9 +11,10 @@ import agent_run.storage.notification_outbox as outbox
 from agent_run.model import DeliveryKind, Role
 from agent_run.notifications.sender import NativeNotifications
 from agent_run.notifications.envelope import event_copy, event_envelope
-from agent_run.notifications.event_projection import event_state
+from agent_run.notifications.event_projection import completion_context, event_state, project_event
+from agent_run.notifications.progress import obsolete_progress
 from agent_run.config.defaults import UserDefaultsStore
-from support.notification import _enabled_scenario, observe_and_wait, recorded_agents
+from support.notification import _enabled_scenario, _project, observe_and_wait, recorded_agents
 
 
 def test_acceptance_and_terminal_notifications_follow_committed_delivery_boundaries(
@@ -47,6 +48,11 @@ def test_acceptance_and_terminal_notifications_follow_committed_delivery_boundar
         assert observer.failure_reason is None
         return [row for row in outbox.read_notifications(tmp_path, scenario.spec.run_id)["records"]
                 if row["kind"] == kind]
+
+    def completion():
+        from agent_run.queries.read_facts import read_boundaries
+        with scenario.kernel.storage.transaction(write=False) as tx:
+            return completion_context(read_boundaries(tx, time.time()), event_state(tx))
 
     # The real core first consumes a passing initial Reviewer, before its Git
     # integration and formal delivery promotion. That raw verdict is not yet
@@ -90,6 +96,10 @@ def test_acceptance_and_terminal_notifications_follow_committed_delivery_boundar
     for _ in range(100):
         step = scenario.step()
         if step.kind == "approval":
+            approval = completion()
+            assert approval["parent_only"] is True and approval["ticket_progress"] is None
+            assert approval["next_step"] == "agent-run status --repo example/project -- offline-run"
+            assert approval["completion_actions"][0]["next_action"] == "agent-run approve --repo example/project -- offline-run"
             scenario.kernel.control("approve", "original-approval", subject=scenario.delivery.key, world=scenario.world())
             continue
         if closed:
@@ -101,6 +111,9 @@ def test_acceptance_and_terminal_notifications_follow_committed_delivery_boundar
     with scenario.kernel.storage.transaction(write=False) as tx:
         assert tx.one("SELECT state FROM resource_cleanup WHERE subject=?", (scenario.delivery.key,))[0] != "complete"
         assert tx.one("SELECT count(*) FROM effects WHERE subject=? AND operation='close' AND status='confirmed'", (scenario.delivery.key,))[0] == 1
+    context = completion()
+    assert context["parent_only"] is True and context["completion_actions"] == []
+    assert context["next_step"] == "agent-run resume --repo example/project -- offline-run"
     pending = observe("boundary")
     assert len(pending) == 1
     assert sent[-1]["header"]["template"] == "yellow"
@@ -108,6 +121,9 @@ def test_acceptance_and_terminal_notifications_follow_committed_delivery_boundar
     assert observe("boundary") == pending
 
     assert scenario.run(approve=True).kind == "complete"
+    context = completion()
+    assert context["parent_only"] is True and context["ticket_progress"] is None
+    assert context["next_step"] == "No further delivery action required."
     completed = observe("boundary")
     assert len(completed) == 2 and completed[0] == pending[0]
     assert completed[1]["id"] != completed[0]["id"]
@@ -131,10 +147,21 @@ def test_acceptance_and_terminal_notifications_follow_committed_delivery_boundar
     assert terminal["effort"]["development"]["rounds"] == terminal["effort"]["review"]["rounds"] == 1
 
 
-@pytest.mark.parametrize("changed_branch", ["source", "target"])
 def test_observed_run_branch_write_does_not_promote_a_superseded_acceptance(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_branch: str) -> None:
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     scenario = _enabled_scenario(tmp_path, monkeypatch, DeliveryKind.FINAL_RUN, reviews=("fail", "pass"))
+    active, planned = [], None
+
+    def started(call):
+        if call.subject != scenario.delivery.key or call.role != Role.DEVELOPMENT:
+            return
+        repair = [event for event in _project(scenario.kernel, "concise") if event["kind"] == "acceptance_repair"][-1]
+        assert repair["live"] is True and repair["attempt_id"] == call.attempt_id
+        with scenario.kernel.storage.transaction(write=False) as tx:
+            assert obsolete_progress(tx, [repair], "concise", current_boundary=False) == set()
+        active.append(repair)
+
+    recorded_agents(scenario, monkeypatch, started=started)
     issued = []
     execute = scenario.port.execute
     def capture(effect, authorize=None):
@@ -144,6 +171,13 @@ def test_observed_run_branch_write_does_not_promote_a_superseded_acceptance(
     monkeypatch.setattr(scenario.port, "execute", capture)
     for _ in range(100):
         step = scenario.step()
+        repairs = [event for event in _project(scenario.kernel, "concise") if event["kind"] == "acceptance_repair"]
+        if repairs and planned is None:
+            planned, = repairs
+            assert planned["live"] is False
+            with scenario.kernel.storage.transaction(write=False) as tx:
+                assert obsolete_progress(tx, [planned], "concise", current_boundary=False) == set()
+                assert obsolete_progress(tx, [planned], "concise", current_boundary=True) == {planned["id"]}
         if issued:
             effect = issued[0]
             break
@@ -154,9 +188,8 @@ def test_observed_run_branch_write_does_not_promote_a_superseded_acceptance(
         assert tx.one("SELECT status FROM effects WHERE id=?", (effect.effect_id,))[0] == "observed"
         assert not tx.rows("SELECT position FROM history WHERE kind='acceptance_promoted'")
     original_reviews = scenario.review_count
-    ref = scenario.delivery.source_ref if changed_branch == "source" else scenario.delivery.target_ref
-    filename = f"foreign-{changed_branch}.txt"
-    foreign = scenario.port.external_remote_append(ref, {filename: "Independent retained work\n"}, "before-consume")
+    filename = "foreign-source.txt"
+    foreign = scenario.port.external_remote_append(scenario.delivery.source_ref, {filename: "Independent retained work\n"}, "before-consume")
     assert scenario.step().kind == "progress"  # Settle the original write, not a fresh acceptance.
     with scenario.kernel.storage.transaction(write=False) as tx:
         assert tx.one("SELECT status FROM effects WHERE id=?", (effect.effect_id,))[0] == "confirmed"
@@ -170,24 +203,104 @@ def test_observed_run_branch_write_does_not_promote_a_superseded_acceptance(
     assert observer.failure_reason is None
     assert not [row for row in outbox.read_notifications(tmp_path, scenario.spec.run_id)["records"]
                 if row["kind"] == "acceptance_passed"]
-    assert scenario.run(approve=True).kind == "complete"
+    for _ in range(100):
+        scenario.step()
+        promoted = [event for event in _project(scenario.kernel, "concise") if event["kind"] == "acceptance_passed"]
+        if promoted:
+            promotion, = promoted
+            break
+    else:
+        pytest.fail("The current Review never reached formal promotion")
+    assert planned is not None and active[0]["id"] == planned["id"]
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        assert obsolete_progress(tx, [active[0], promotion], "concise", current_boundary=False) == {planned["id"]}
+        original = dict(tx.one("SELECT * FROM history WHERE kind='role_consumed' AND identity=?", (promotion["attempt_id"],)))
+        suppressed, = project_event(tx, original, event_state(tx), "detailed")
+        assert not suppressed.visible and suppressed.applicable is False
+        assert obsolete_progress(tx, [suppressed.content], "detailed", current_boundary=False) == {suppressed.content["id"]}
+    assert scenario.run().kind == "approval"
     assert scenario.review_count > original_reviews
+    assert not any(event["kind"] == "approval_update" for event in _project(scenario.kernel, "concise"))
+    scenario.port.external_remote_append(scenario.delivery.target_ref, {"external.txt": "New target\n"}, "approval-update")
+    assert scenario.step().reason == "updating"
+    update, = [event for event in _project(scenario.kernel, "concise") if event["kind"] == "approval_update"]
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        invalidated = tx.one("SELECT * FROM history WHERE subject=? AND kind='boundary_update' ORDER BY position DESC LIMIT 1", (scenario.delivery.key,))
+        assert (update["source_position"], update["source_material_id"]) == (invalidated["position"], invalidated["material_id"])
+        assert update["work_subject"] == scenario.delivery.key and update["generation"] == 1
+        assert obsolete_progress(tx, [promotion, update], "concise", current_boundary=False) == {promotion["id"]}
+    assert scenario.run().kind == "approval"
+    projected = _project(scenario.kernel, "concise")
+    assert [event for event in projected if event["kind"] == "approval_update"] == [update]
+    assert not any(event["kind"] == "approval_ready" for event in projected)
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        assert obsolete_progress(tx, [update], "concise", current_boundary=True) == {update["id"]}
+    assert scenario.run(approve=True).kind == "complete"
     observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
     observer.close()
     assert observer.failure_reason is None
     accepted = [row for row in outbox.read_notifications(tmp_path, scenario.spec.run_id)["records"]
                 if row["kind"] == "acceptance_passed"]
-    assert len(accepted) == 1
+    # Source recovery and the later target invalidation each promote one new Review.
+    assert len(accepted) == len({row["id"] for row in accepted}) == 2
     target = scenario.port.remote_commit(scenario.delivery.target_ref)
     assert target is not None
     assert scenario.port.git.run("show", f"{target.sha}:{filename}").stdout == "Independent retained work\n"
     scenario.port.git.run("merge-base", "--is-ancestor", foreign.sha, target.sha)
 
 
-@pytest.mark.parametrize("approval", [True, False],
-                         ids=["canonical-case-approval", "canonical-case-checks-pending"])
+@pytest.mark.parametrize("target_changed", [False, True], ids=["current", "target-drift"])
+def test_run_branch_receipt_promotes_only_the_reviewed_target(target_changed):
+    """Consume recorded Review/effect inputs; the source-race story owns Git production."""
+    from contextlib import closing
+    from dataclasses import asdict
+    from agent_run.model import Commit, EffectResult, World, wire_json
+    from support.repository_scope import connection, insert, seed
+    from support.run_scoped_kernel import ScopedKernel
+    from support.offline import review_result
+
+    run, subject = "promotion-consumer", "final:1"
+    base, candidate = Commit("a" * 40, "b" * 40), Commit("c" * 40, "d" * 40)
+    target = Commit("e" * 40, "f" * 40) if target_changed else base
+    with closing(connection()) as db:
+        db.execute("BEGIN")
+        seed(db, run, subject=subject)
+        db.commit()
+        kernel = ScopedKernel(db, run)
+        with kernel.storage.transaction() as tx:
+            context = tx.put(subject, "role_context", wire_json({}))
+            result = tx.put(subject, "agent_result", wire_json(review_result("pass")))
+            insert(db, "attempts", dict(run_id=run, id="review", subject=subject,
+                generation=1, ordinal=1, role="review", purpose="integration", window=1,
+                revision="r", parent_revision="r", graph_revision="g", base_sha=base.sha,
+                candidate_sha=candidate.sha, candidate_tree=candidate.tree,
+                expected_tree=candidate.tree, completion_revision="completed",
+                context_id=context, result_id=result, status="consumed", outcome="pass"))
+            tx.execute("UPDATE subjects SET kind='final_run',phase='ready_publication',purpose='integration',"
+                       "candidate_sha=?,candidate_tree=?,integrated_sha=?,integrated_tree=?,expected_tree=?,"
+                       "completion_revision='completed',review_attempt='review' WHERE id=?",
+                       (candidate.sha, candidate.tree, candidate.sha, candidate.tree, candidate.tree, subject))
+            payload = tx.put(subject, "effect_intent", wire_json({}))
+            receipt = tx.put(subject, "effect_receipt", wire_json(asdict(EffectResult("target", commit=candidate))))
+            insert(db, "effects", dict(run_id=run, id="run-branch", subject=subject,
+                operation="run_branch", status="observed", executor="owner", epoch=1, actor="publisher",
+                parent_revision="r", graph_revision="g", revision="r", generation=1,
+                source_ref="refs/heads/work", target_ref="refs/heads/main",
+                before_sha=base.sha, after_sha=candidate.sha, base_sha=base.sha,
+                base_tree=base.tree, payload_id=payload, receipt_id=receipt, attempts=1))
+        world = World("r", "g", "r", target, candidate, completion_revision="completed")
+        with kernel.storage.transaction() as tx:
+            header, job = tx.one("SELECT * FROM runs"), tx.one("SELECT * FROM subjects")
+            effect = tx.one("SELECT * FROM effects")
+            assert kernel._apply_effect(tx, header, job, effect, world).kind == "progress"
+            assert tx.one("SELECT status FROM effects")[0] == "confirmed"
+            assert tx.one("SELECT phase FROM subjects")[0] == "publish"
+            promoted = tx.rows("SELECT identity FROM history WHERE kind='acceptance_promoted'")
+            assert [row[0] for row in promoted] == ([] if target_changed else ["review"])
+
+
 def test_healthy_final_pr_and_approval_in_one_observation_share_only_the_approval_card(
-    tmp_path, monkeypatch, approval,
+    tmp_path, monkeypatch,
 ):
     from support.offline_api import SyntheticGitHub
 
@@ -202,53 +315,54 @@ def test_healthy_final_pr_and_approval_in_one_observation_share_only_the_approva
 
     monkeypatch.setattr(SyntheticGitHub, "_with_refs", staticmethod(canonical_pr))
     scenario = _enabled_scenario(tmp_path, monkeypatch, DeliveryKind.PARENT_ONLY, mode="detailed")
-    if approval:
-        assert scenario.run().kind == "approval"
+    # Read the same real PR at checks and approval from independent journals.
+    for _ in range(80):
+        step = scenario.step()
+        if scenario.kernel.status(scenario.delivery.key)["phase"] == "checks":
+            break
+        assert step.kind not in {"paused", "waiting", "approval", "complete"}
     else:
-        # Stop after the genuine PR receipt is consumed, before checks grant
-        # approval. Creation alone remains a useful detailed-mode milestone.
-        for _ in range(80):
-            step = scenario.step()
-            status = scenario.kernel.status(scenario.delivery.key)
-            if status["phase"] == "checks":
-                break
-            assert step.kind not in {"paused", "waiting", "approval", "complete"}
-        else:
-            raise AssertionError("Normal producer did not consume its Final PR creation")
+        raise AssertionError("Normal producer did not consume its Final PR creation")
     pr = scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref)
     assert pr is not None
     assert pr.repository == "EXAMPLE/PROJECT"
     from agent_run.queries.run import read
-    # Discard mutable notification files from the read-only product comparison.
-    database_before = scenario.kernel.storage.path.read_bytes()
-    sent = []
+    for approval in (False, True):
+        if approval:
+            # The first observer is closed. Preserve its receipt separately so
+            # approval is observed with a fresh journal under the same owned root.
+            outbox.notification_path(tmp_path, scenario.spec.run_id).rename(tmp_path / "checks-notifications.json")
+            assert scenario.run().kind == "approval"
+        # Discard mutable notification files from the read-only product comparison.
+        database_before = scenario.kernel.storage.path.read_bytes()
+        sent = []
 
-    def transport(_config, rendered, _identity, *_args, **_kwargs):
-        sent.append(rendered)
-        return {"outcome": "success", "reason": None}
+        def transport(_config, rendered, _identity, *_args, **_kwargs):
+            sent.append(rendered)
+            return {"outcome": "success", "reason": None}
 
-    observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
-    try:
-        observer.close()
-        assert observer.failure_reason is None
-    finally:
-        observer.close(drain=False)
-    journal = outbox.read_notifications(tmp_path, scenario.spec.run_id)
-    assert journal.get("unavailable_reason") is None
-    records = journal["records"]
-    created = [item for item in records if item["kind"] == "pr_created"]
-    assert len([item for item in created if item["outcome"] != "cancelled"]) == int(not approval)
-    if approval:
-        assert len(created) == 1 and created[0]["outcome"] == "cancelled" and created[0]["attempts"] == 0
-        assert created[0]["reason"] == "included in current Final PR approval"
-    if approval:
-        assert not any(item["header"]["title"]["content"] == f"Final PR #{pr.number} created" for item in sent)
-    approval_cards = [item for item in sent if item["header"]["title"]["content"] == "Please approve the PR merge"]
-    assert bool(approval_cards) is approval
-    if approval:
-        assert any(f"https://github.com/example/project/pull/{pr.number}" in str(item) for item in approval_cards)
-    assert scenario.kernel.storage.path.read_bytes() == database_before
-    assert read(scenario.kernel.storage.path, 'status', storage=scenario.kernel.storage).data["subjects"][0]["phase"] == ("approval" if approval else "checks")
+        observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
+        try:
+            observer.close()
+            assert observer.failure_reason is None
+        finally:
+            observer.close(drain=False)
+        assert observer.closed
+        journal = outbox.read_notifications(tmp_path, scenario.spec.run_id)
+        assert journal.get("unavailable_reason") is None
+        records = journal["records"]
+        created = [item for item in records if item["kind"] == "pr_created"]
+        assert len([item for item in created if item["outcome"] != "cancelled"]) == int(not approval)
+        if approval:
+            assert len(created) == 1 and created[0]["outcome"] == "cancelled" and created[0]["attempts"] == 0
+            assert created[0]["reason"] == "included in current Final PR approval"
+            assert not any(item["header"]["title"]["content"] == f"Final PR #{pr.number} created" for item in sent)
+        approval_cards = [item for item in sent if item["header"]["title"]["content"] == "Please approve the PR merge"]
+        assert bool(approval_cards) is approval
+        if approval:
+            assert any(f"https://github.com/example/project/pull/{pr.number}" in str(item) for item in approval_cards)
+        assert scenario.kernel.storage.path.read_bytes() == database_before
+        assert read(scenario.kernel.storage.path, 'status', storage=scenario.kernel.storage).data["subjects"][0]["phase"] == ("approval" if approval else "checks")
 
 
 @pytest.mark.parametrize("language,prefix", [("en", "Feishu notifications unavailable; development continues"),
