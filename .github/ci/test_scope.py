@@ -51,7 +51,7 @@ FIXED_REPAIR_REGRESSION_TESTS = (
     'tests/test_local_cleanup_intent_core.py::test_worktree_command_preparation_keeps_fresh_core_and_resource_guards[stop]',
     'tests/test_local_cleanup_intent_core.py::test_worktree_command_preparation_keeps_fresh_core_and_resource_guards[owner]',
     'tests/test_kernel_cleanup_adapter.py::test_worktree_cleanup_authorizes_before_locks_and_at_command_start[revoked]',
-    'tests/test_kernel_cleanup_observation_projection.py::test_projection_cannot_be_rebound_to_other_effects_or_observation_types',
+    'tests/test_local_cleanup_intent_core.py::test_projection_cannot_be_rebound_to_other_effects_or_observation_types',
     'tests/test_kernel_control_policy.py::test_ticket_policy_window_does_not_change_a_sibling_call_or_its_allowances',
     'tests/test_kernel_control_policy.py::test_checkpoint_thread_policy_is_creation_frozen_and_legal_exceptions_stay_independent[control-False-new-per-attempt]',
     'tests/test_kernel_control_policy.py::test_checkpoint_thread_policy_is_creation_frozen_and_legal_exceptions_stay_independent[control-True-reuse]',
