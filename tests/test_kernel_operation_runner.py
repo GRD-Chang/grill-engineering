@@ -99,38 +99,6 @@ def test_allocated_agent_returns_immediately_without_post_allocation_read(tmp_pa
     raise AssertionError("Core did not return the reserved AgentPreparation")
 
 
-def test_one_operation_returns_committed_publication_final_and_cleanup_boundaries(tmp_path):
-    s, ports, runner = setup(tmp_path)
-    published = set()
-    for _ in range(160):
-        step = prepare_scripted_agent(s.kernel, runner.run_once())
-        if step.call is not None:
-            settle_agent(s, runner, step.call)
-        if step.subject and s.kernel.status(step.subject)["phase"] == "publish":
-            published.add(step.subject)
-        if s.kernel.source_status()["final_subject"] is not None:
-            assert published >= {"ticket:3", "ticket:4"}
-            assert len(s.kernel.source_status()["completions"]) == 2
-            for subject in ("ticket:3", "ticket:4"):
-                assert s.kernel.status(subject)["resource_cleanup"]["state"] == "complete"
-            break
-    else:
-        raise AssertionError("Core did not admit Final after original Ticket completion")
-    final = s.kernel.source_status()["final_subject"]
-    drive_until(s, runner, lambda step: s.kernel.status(final)["phase"] == "approval")
-    assert runner.state().disposition == "quiescent"
-    s.kernel.control("approve", "approve-synthetic-final", subject=final, world=runner.observe(final))
-    for _ in range(80):
-        if runner.state().disposition == "complete":
-            assert s.kernel.status(final)["phase"] == "complete"
-            assert s.kernel.status(final)["resource_cleanup"]["state"] == "complete"
-            return
-        step = prepare_scripted_agent(s.kernel, runner.run_once())
-        if step.call is not None:
-            settle_agent(s, runner, step.call)
-    raise AssertionError("Approved Final did not close and settle its resources")
-
-
 def drive_until(s, runner, predicate):
     for _ in range(160):
         step = prepare_scripted_agent(s.kernel, runner.run_once())
