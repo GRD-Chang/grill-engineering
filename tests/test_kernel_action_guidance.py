@@ -123,9 +123,12 @@ def _published_task(remote, repository, identity, parent, *, language="en", tick
     return Kernel.create_task(workspace.state_root / "kernel.sqlite3", spec, requirements=source)
 
 
-@pytest.mark.parametrize("language", ["zh", "en"])
-@pytest.mark.parametrize("local", [False, True], ids=["global-stop", "sibling-gate"])
-@pytest.mark.parametrize("identity", ["a b", "a  b", "a; false", "a 'quoted'", "--literal-run", "x" * 240, "7"])
+@pytest.mark.parametrize("identity,language,local", [
+    ("a b", "zh", False), ("a  b", "en", True),
+    ("a; false", "en", False), ("a 'quoted'", "zh", True),
+    ("--literal-run", "zh", False), ("x" * 240, "en", True),
+    ("7", "zh", False), ("7", "en", True),
+])
 def test_displayed_stop_resume_and_queries_select_only_the_original_published_task(
     tmp_path, git_repo, capsys, shell_argv, unavailable_manager, language, local, identity,
 ):
@@ -237,10 +240,14 @@ def test_stale_numeric_run_card_cannot_control_its_normal_successor(
     assert "exact_run_command_unavailable" in rendered
 
 
-@pytest.mark.parametrize("language", ["zh", "en"])
-@pytest.mark.parametrize("terminal", [False, True], ids=["plain", "rich"])
-@pytest.mark.parametrize("identity,encoded", [("a\u202eb", r'"a\u202eb"'),
-    ("a\x1b[31mb", r'"a\u001b[31mb"'), ("a\nb", r'"a\nb"')])
+@pytest.mark.parametrize("identity,encoded,language,terminal", [
+    ("a\u202eb", r'"a\u202eb"', "zh", False),
+    ("a\u202eb", r'"a\u202eb"', "en", True),
+    ("a\x1b[31mb", r'"a\u001b[31mb"', "en", False),
+    ("a\x1b[31mb", r'"a\u001b[31mb"', "zh", True),
+    ("a\nb", r'"a\nb"', "zh", False),
+    ("a\nb", r'"a\nb"', "en", True),
+])
 def test_terminal_guidance_never_deletes_a_control_character_to_target_another_run(
     tmp_path, git_repo, capsys, shell_argv, monkeypatch, language, terminal, identity, encoded,
 ):

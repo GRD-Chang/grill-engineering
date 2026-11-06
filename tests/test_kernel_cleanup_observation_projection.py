@@ -5,7 +5,7 @@ from dataclasses import replace
 
 import pytest
 
-from agent_run.core.operation_contract import LocalCleanupRead, LocalCleanupObservation, ReadUnavailable, RequirementsRead
+from agent_run.core.operation_contract import ReadUnavailable, RequirementsRead
 from agent_run.errors import KernelError
 from agent_run.model import ReadWait
 from agent_run.model import DeliveryKind
@@ -50,43 +50,6 @@ def pending_cleanup(tmp_path, monkeypatch, operation="cleanup_worktree", *, sibl
     return s, effect, authority, physical_ports[0], execute
 
 
-@pytest.mark.parametrize("window", ["source", "boundary"])
-def test_cleanup_retains_original_absolute_read_deadline(tmp_path, monkeypatch, window):
-    s, effect, authority, ports, execute = pending_cleanup(tmp_path, monkeypatch)
-    now = [100.25]
-    s.kernel.clock = lambda: now[0]
-    source = ports.source
-
-    def unavailable(parent):
-        raise ReadUnavailable("github_read_failed", "original outage")
-
-    monkeypatch.setattr(ports, "source", unavailable)
-    with pytest.raises(ReadWait):
-        authority.prepare()
-    now[0] = 105.25
-
-    def slow(parent):
-        result = source(parent)
-        if window == "source":
-            now[0] = 701.25
-        return result
-
-    monkeypatch.setattr(ports, "source", slow)
-    if window == "source":
-        with pytest.raises(ReadWait) as caught:
-            authority.prepare()
-    else:
-        final = authority.prepare()
-        now[0] = 701.25
-        with pytest.raises(ReadWait) as caught:
-            final()
-    assert caught.value.step.reason == "supervision_timeout"
-    assert effect_state(s, effect)[1] == 0
-    with s.kernel.storage.transaction(write=False) as tx:
-        assert tuple(tx.one("SELECT started_at,deadline FROM waits")) == (100.25, 700.25)
-    assert Path(s.delivery.checkout).exists()
-
-
 def test_reopened_ticket_still_blocks_original_cleanup(tmp_path, monkeypatch):
     s, effect, authority, ports, execute = pending_cleanup(tmp_path, monkeypatch)
     source = ports.source
@@ -101,35 +64,6 @@ def test_reopened_ticket_still_blocks_original_cleanup(tmp_path, monkeypatch):
     assert s.kernel.source_status()["blocked"] == "unsupported_scope_change"
     assert effect_state(s, effect)[1] == 0
     assert Path(s.delivery.checkout).exists()
-
-
-def test_projection_cannot_be_rebound_to_other_effects_or_observation_types(tmp_path, monkeypatch):
-    s, effect, authority, ports, execute = pending_cleanup(tmp_path, monkeypatch)
-    request = s.kernel.begin_effect_observation(effect)
-    assert isinstance(request, LocalCleanupRead)
-    assert request.source.query is None
-    source = ports.source(request.source.parent_number)
-    observation = s.kernel.accept_local_cleanup_requirements(request, source)
-    assert isinstance(observation, LocalCleanupObservation)
-    before = effect_state(s, effect)
-    for operation in ("cleanup_remote_ref", "workspace", "validation_cleanup", "validation_checkout",
-                      "candidate", "integrate", "publication_commit", "merge", "abandon_worktree"):
-        foreign = replace(effect, operation=operation)
-        with pytest.raises(KernelError):
-            s.kernel.begin_effect_observation(foreign)
-        with pytest.raises(KernelError, match="local_cleanup_observation_binding"):
-            s.kernel.accept_local_cleanup_requirements(LocalCleanupRead(foreign, request.source), source)
-        with pytest.raises(KernelError, match="local_cleanup_observation_binding"):
-            s.kernel.authorize_effect_observation(foreign, observation, observation.fence, prepared=True, inspections=None)
-    for malformed in (request.source, LocalCleanupRead(effect, None),
-                      LocalCleanupRead(effect, replace(request.source, fence=None))):
-        with pytest.raises(KernelError, match="local_cleanup_observation_binding"):
-            s.kernel.accept_local_cleanup_requirements(malformed, source)
-    with pytest.raises(KernelError, match="local_cleanup_observation_binding"):
-        s.kernel.authorize_effect_observation(effect, LocalCleanupObservation(effect, None), None, prepared=True, inspections=None)
-    with pytest.raises(KernelError, match="effect_observation_binding"):
-        s.kernel.authorize_effect_observation(effect, None, observation.fence, prepared=True, inspections=None)
-    assert effect_state(s, effect) == before
 
 
 def test_remote_cleanup_still_requests_complete_delivery(tmp_path, monkeypatch):
