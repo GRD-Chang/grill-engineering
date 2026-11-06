@@ -220,7 +220,9 @@ def test_ci_review_uses_failed_head_then_the_actual_findings_review(tmp_path: Pa
                     return
                 assert failed_head == previous_review.context["ci_evidence"]["head_sha"]
                 assert context["facts"]["previous_acceptance_artifact"] == review_result("fail")
-                assert context["facts"]["previous_review_identity"] == previous_review.context["current_review_identity"]
+                assert context["facts"]["previous_review_identity"] == (
+                    previous_review.context["review_context"]["facts"]["current_review_identity"]
+                )
             reviewed.append(call)
             previous_review = call
             runner.authorize_agent(call)

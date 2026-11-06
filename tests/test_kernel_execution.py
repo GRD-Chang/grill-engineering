@@ -2,7 +2,7 @@
 
 from support.repository_fixture import create_kernel
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 import json
 import os
@@ -285,42 +285,38 @@ def test_committed_binding_response_loss_settles_actual_exit_and_resumes_same_at
     assert reopened.status(call.subject)["budgets"]["requirements"]["developments_used"] == 1
 
 
-@pytest.mark.skipif(not hasattr(os, "fork") or not hasattr(os, "pidfd_open"), reason="requires Linux pidfd/fork")
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="requires Linux pidfd")
 def test_executor_loss_before_durable_binding_never_releases_or_restarts_worker(tmp_path: Path) -> None:
     path, kernel, call, _ = allocated(tmp_path)
     canary = tmp_path / "forbidden-agent-work"
-    read_fd, write_fd = os.pipe()
     arguments = [sys.executable, "-I", "-c", f"from pathlib import Path; Path({str(canary)!r}).write_text('ran')"]
+    request = tmp_path / "executor-request.json"
+    request.write_text(json.dumps({"database": str(path), "call": asdict(call),
+                                   "arguments": arguments, "cwd": str(tmp_path)}))
+    read_fd, write_fd = os.pipe()
     with child_subreaper():
-        executor: int | None = os.fork()
-        if executor == 0:
+        try:
+            executor = subprocess.Popen(
+                [sys.executable, "-I", str(Path(__file__).parent / "support" / "held_binding_executor.py"),
+                 str(request), str(write_fd)], pass_fds=(write_fd,),
+            )
+        except BaseException:
             os.close(read_fd)
-
-            class HeldBinding(Kernel):
-                def agent_started(self, exact_call: AgentCall, identity: dict[str, Any]) -> None:
-                    os.write(write_fd, str(identity["pid"]).encode("ascii"))
-                    os.close(write_fd)
-                    signal.pause()
-
-            try:
-                execute(HeldBinding(path, run_id=call.execution.run_id), call, arguments=arguments, cwd=tmp_path, prompt="",
-                        environment={"PATH": os.defpath}, timeout=5)
-            finally:
-                os._exit(0)
-        os.close(write_fd)
-        unrelated = subprocess.Popen([sys.executable, "-I", "-c", "import signal; signal.pause()"], start_new_session=True)
+            raise
+        finally:
+            os.close(write_fd)
+        unrelated = None
         worker, pidfd = None, None
         try:
+            unrelated = subprocess.Popen([sys.executable, "-I", "-c", "import signal; signal.pause()"], start_new_session=True)
             assert select.select([read_fd], [], [], 5)[0] == [read_fd]
             worker = int(os.read(read_fd, 32))
             pidfd = os.pidfd_open(worker)
             assert execute(kernel, call, arguments=arguments, cwd=tmp_path, prompt="",
                            environment={"PATH": os.defpath}, timeout=5) is None
             assert len(kernel.operation_state().active) == 1
-            assert executor is not None
-            os.kill(executor, signal.SIGKILL)
-            os.waitpid(executor, 0)
-            executor = None
+            executor.kill()
+            assert executor.wait(timeout=5) == -signal.SIGKILL
             assert select.select([pidfd], [], [], 5)[0] == [pidfd]
             assert not canary.exists() and unrelated.poll() is None
             os.waitpid(worker, 0)
@@ -331,20 +327,18 @@ def test_executor_loss_before_durable_binding_never_releases_or_restarts_worker(
             assert Kernel(path, run_id=kernel.storage.run_id).status(call.subject)["budgets"]["requirements"]["developments_used"] == 0
         finally:
             os.close(read_fd)
-            if executor is not None:
-                try:
-                    os.kill(executor, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                os.waitpid(executor, 0)
+            if executor.poll() is None:
+                executor.kill()
+                executor.wait(timeout=5)
             if pidfd is not None:
                 if not select.select([pidfd], [], [], 0)[0]:
                     signal.pidfd_send_signal(pidfd, signal.SIGKILL)
                 os.close(pidfd)
             if worker is not None:
                 os.waitpid(worker, 0)
-            unrelated.kill()
-            unrelated.wait(timeout=3)
+            if unrelated is not None:
+                unrelated.kill()
+                unrelated.wait(timeout=3)
 
 
 def test_real_source_refresh_revokes_blocked_worker_before_argv(tmp_path: Path) -> None:
