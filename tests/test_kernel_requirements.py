@@ -295,54 +295,6 @@ def test_graph_refresh_cannot_reopen_stop_and_late_siblings_settle_without_autho
         assert kernel.status(subject)["budgets"]["requirements"]["developments_used"] == 1
 
 
-def test_final_parent_drift_preserves_dirty_repair_and_restarts_full_review_without_refund(tmp_path: Path) -> None:
-    original = Requirements.from_wire(native_input()["initial_requirements"])
-    source = replace(original, parent=replace(original.parent, sub_issue_numbers=(3,)), issues=(original.issues[0],))
-    scenario = GraphScenario(tmp_path / "graph", source, reviews=("pass", "fail", "pass"), record_checkpoints=False)
-    assert scenario.run().kind == "complete"
-    activation = prepare_scripted_agent(scenario.kernel, scenario.runner().run_once())
-    assert activation.reason == "final_activated"
-    scenario.select(activation.subject)
-    for _ in range(100):
-        step = scenario.step()
-        if step.call is not None and step.call.role.value == "development":
-            break
-    else:
-        raise AssertionError("Final Findings never reached the real Repair checkout")
-    before = scenario.kernel.status(scenario.delivery.key)
-    run_head = scenario.port.git.commit("refs/heads/run")
-    old_checkout = Path(scenario.delivery.checkout)
-    old_contents = {path.name: path.read_bytes() for path in old_checkout.iterdir() if path.is_file()}
-    scenario.requirements = replace(source, parent=replace(source.parent, body="Updated Parent requirements after whole-Run work."))
-    fresh = scenario.world()
-    refreshed = scenario.kernel.status(scenario.delivery.key)
-    assert refreshed["phase"] == "refresh_final"
-    assert refreshed["budgets"] == before["budgets"]
-    # The formal lifecycle entry requires explicit requeue at final_refresh.
-    # An automatic operation must retain that gate and the old generation.
-    calls_before, writes_before = len(scenario.role_calls), len(scenario.port.writes())
-    blocked = prepare_scripted_agent(scenario.kernel, scenario.runner().run_once())
-    assert blocked.kind in {"paused", "quiescent"}
-    assert scenario.kernel.status(scenario.delivery.key) == refreshed
-    assert len(scenario.role_calls) == calls_before
-    assert len(scenario.port.writes()) == writes_before
-    assert scenario.kernel.status(scenario.delivery.key)["generation"] == before["generation"]
-    assert scenario.kernel.control("requeue", "accept-new-parent-requirements", subject=scenario.delivery.key, world=fresh) == "applied"
-    assert scenario.run(cut="publication_pending").kind == "publication_pending"
-    after = scenario.kernel.status(scenario.delivery.key)
-    assert after["generation"] == before["generation"] + 1
-    assert scenario.kernel.delivery(scenario.delivery.key).source_ref == "refs/heads/run"
-    assert Path(scenario.kernel.delivery(scenario.delivery.key).checkout) != old_checkout
-    assert old_contents == {path.name: path.read_bytes() for path in old_checkout.iterdir() if path.is_file()}
-    assert scenario.port.git.commit("refs/heads/run") == run_head
-    assert after["budgets"]["integration"]["developments_used"] == 1
-    assert after["budgets"]["integration"]["reviews_used"] == before["budgets"]["integration"]["reviews_used"] + 1
-    final_calls = [call for call in scenario.role_calls if call["subject"] == scenario.delivery.key]
-    assert [call["role"] for call in final_calls] == ["review", "development", "review"]
-    assert final_calls[-1]["context"]["requirements"][0]["body"] == scenario.requirements.parent.body
-    assert "previous_review" not in final_calls[-1]["context"]
-
-
 @pytest.mark.parametrize("outcome", ["target", "prior", "third", "foreign_receipt"])
 def test_original_final_approval_settlement_uses_its_grant_before_changed_requirements(outcome: str) -> None:
     from support.final_merge_record import approved_final_merge

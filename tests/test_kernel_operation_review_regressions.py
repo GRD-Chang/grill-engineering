@@ -22,9 +22,8 @@ import sys
 
 import pytest
 
-from agent_run.model import DeliveryKind, Effect, EffectResult, Requirements
-from agent_run.model import Issue, ParentIssue
-from support.offline import GraphScenario, Scenario
+from agent_run.model import DeliveryKind, Effect, EffectResult
+from support.offline import Scenario
 from agent_run.core.operation_contract import ReadUnavailable
 from agent_run.queries.run import read
 from agent_run.adapters.remote import RemoteEffects
@@ -262,29 +261,3 @@ def test_offline_lost_response_is_unknown_without_an_observed_command_failure(
         diagnostics = [json.loads(row[0]) for row in tx.rows(
             "SELECT body FROM material WHERE subject=? AND purpose='github_read_observation'", (scenario.delivery.key,))]
     assert diagnostic in diagnostics  # Settling target does not erase the original uncertainty.
-
-
-def test_formal_graph_completion_final_still_retires_the_remote_run_branch(tmp_path: Path) -> None:
-    """Same existing normal contract as test_kernel_cleanup_lifecycle[final_run]."""
-    source = Requirements(ParentIssue(1, "Parent", "Deliver the declared behavior", (2,)), (
-        Issue(2, "Ticket", "Implement the declared behavior", "OPEN", frozenset({"ready-for-agent"})),
-    ))
-    scenario = GraphScenario(tmp_path / "graph", source)
-    assert scenario.run().kind == "complete"
-    assert len(scenario.kernel.source_status()["completions"]) == 1
-    runner = scenario.runner()
-    for _ in range(12):
-        if scenario.kernel.source_status()["final_subject"] is not None:
-            break
-        assert prepare_scripted_agent(scenario.kernel, runner.run_once()).call is None
-    else:
-        raise AssertionError("The real Completion never admitted Final")
-    scenario.select(scenario.kernel.source_status()["final_subject"])
-    assert scenario.port.remote_commit("refs/heads/run") is not None
-    assert scenario.run(approve=True).kind == "complete"
-    assert set(scenario.port.remote_refs()) == {"refs/heads/main"}
-    final_deletes = [row for row in scenario.port.writes()
-                     if row["subject"] == scenario.delivery.key and row["operation"] == "cleanup_remote_ref"]
-    assert len(final_deletes) == 1
-    assert scenario.kernel.status(scenario.delivery.key)["resource_cleanup"]["state"] == "complete"
-

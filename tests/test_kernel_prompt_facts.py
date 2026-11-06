@@ -37,6 +37,7 @@ def test_same_thread_new_repair_and_human_continuation_keep_distinct_responsibil
     assert isinstance(context, dict)
     assert context["review_range"] == {"base_sha": scenario.initial.sha, "candidate_sha": review.context["reviewed_commit"]}
     assert set(context) == {"facts", "review_range"}
+    assert "integration_record" not in context["facts"]
     scripted_return(scenario.kernel, operations.runner, review, scenario.agent)
     repair = next_call(scenario, Role.DEVELOPMENT)
     assert repair.thread_id == first.thread_id and repair.mode == "resume"
@@ -88,6 +89,7 @@ def test_parent_publication_gets_the_actual_accepted_artifact(tmp_path: Path, ki
     preview = json.loads(capsys.readouterr().out)
     assert preview['prompt'] == render_role_prompt(publication)
     assert preview['schema'] == role_schema('publication')
+    assert json.dumps(publication.context['acceptance_artifact'], ensure_ascii=False, indent=2, sort_keys=True) in preview['prompt']
 
 
 def test_ticket_fallback_publication_discloses_the_unreviewed_candidate(tmp_path: Path) -> None:
@@ -101,6 +103,8 @@ def test_ticket_fallback_publication_discloses_the_unreviewed_candidate(tmp_path
     assert facts["last_review_artifact"] == review_result("fail")
     assert facts["development_summary"] == "Changed synthetic behavior 2"
     assert "acceptance_artifact" not in publication.context
+    assert "ci_repair_publication_context" not in publication.context
+    assert json.dumps(facts, ensure_ascii=False, indent=2, sort_keys=True) in render_role_prompt(publication)
 
 
 @pytest.mark.parametrize("kind", [DeliveryKind.TICKET, DeliveryKind.PARENT_ONLY])

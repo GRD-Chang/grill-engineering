@@ -188,14 +188,15 @@ def checks_timeout(db, kernel, run, *, kind='required_checks', deadline=90.):
     return scope_id, timeout
 
 
-def test_final_checkpoint_renews_limits_without_rewriting_original_attempt(scenario):
+@pytest.mark.parametrize("review_used,gate", [(2, "review_budget_exhausted"), (1, "modification_budget_exhausted")])
+def test_final_checkpoint_renews_limits_without_rewriting_original_attempt(scenario, review_used, gate):
     db, kernels = scenario
     kernel = kernels['A']
     attempt(db, 'A', role='review', purpose='integration')
     db.execute("UPDATE attempts SET status='consumed',outcome='fail',accounted=1 WHERE run_id='A'")
     db.execute("UPDATE subjects SET kind='final_run',phase='development',purpose='integration' WHERE run_id='A'")
-    db.execute("UPDATE budgets SET developments_used=1,reviews_used=2,development_limit=1,review_limit=2 WHERE run_id='A' AND purpose='integration'")
-    insert(db, 'gates', {'run_id': 'A', 'subject': SUBJECT, 'code': 'review_budget_exhausted', 'purpose': 'integration'})
+    db.execute("UPDATE budgets SET developments_used=1,reviews_used=?,development_limit=1,review_limit=2 WHERE run_id='A' AND purpose='integration'", (review_used,))
+    insert(db, 'gates', {'run_id': 'A', 'subject': SUBJECT, 'code': gate, 'purpose': 'integration'})
     old = dict(db.execute("SELECT * FROM budgets WHERE run_id='A' AND purpose='integration'").fetchone())
     original = list(db.execute("SELECT * FROM attempts WHERE run_id='A'"))
     before_b = rows(db, 'B')
@@ -206,7 +207,7 @@ def test_final_checkpoint_renews_limits_without_rewriting_original_attempt(scena
     assert rows(db, 'B') == before_b
     assert list(db.execute("SELECT * FROM attempts WHERE run_id='A'")) == original
     assert dict(db.execute("SELECT * FROM budgets WHERE run_id='A' AND purpose='integration' AND window=1").fetchone()) == {**old, 'current': 0}
-    assert db.execute("SELECT window,development_limit,review_limit,developments_used,reviews_used FROM budgets WHERE run_id='A' AND purpose='integration' AND current=1").fetchone()[:] == (2, 2, 3, 0, 0)
+    assert db.execute("SELECT window,development_limit,review_limit,developments_used,reviews_used FROM budgets WHERE run_id='A' AND purpose='integration' AND current=1").fetchone()[:] == (2, 2, 3, 0, 0 if review_used == 2 else 1)
     with kernel.storage.transaction(write=False) as tx:
         policy = kernel._subject_policy(tx, kernel._job(tx, SUBJECT))
         assert (policy.development_deadline_seconds, policy.review_deadline_seconds, policy.publication_deadline_seconds) == (13., 17., 19.)

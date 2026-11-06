@@ -235,6 +235,9 @@ def test_real_git_conflict_returns_to_integration_development_without_internal_p
     assert scenario.run(approve=True).kind == "complete"
     integration = [call for call in scenario.role_calls if call["role"] == "development" and call["purpose"] == "integration"]
     assert len(integration) == 1
+    if kind == DeliveryKind.TICKET:
+        assert scenario.review_count == 1
+        assert [call["role"] for call in scenario.role_calls if call["purpose"] == "integration"] == ["development", "publication"]
     assert scenario.kernel.status(scenario.delivery.key)["budgets"]["integration"]["developments_used"] == 1
     assert sum(write["operation"] == "pr_write" for write in scenario.writes()) == 1
     if kind == DeliveryKind.FINAL_RUN:
@@ -309,40 +312,6 @@ def test_fifo_and_stale_return_release_cannot_steal_new_lease(tmp_path: Path) ->
     third = operations.until(lambda step: step.call is not None).call
     assert third is not None and third.subject == "ticket:4"
     assert operations.runner.state().active == (third.lease_id,)
-
-
-def test_full_parent_resume_renews_only_exhausted_development_allowance(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.FINAL_RUN, reviews=("fail", "pass"),
-                        policy=Policy(run_repairs=1), edits=({"shared.txt": "Candidate\n"}, {"shared.txt": "Resolved\n"}))
-    for _ in range(60):
-        if scenario.development_count == 1 and scenario.kernel.status(scenario.delivery.key)["phase"] == "integration":
-            break
-        scenario.step()
-    else:
-        raise AssertionError("first repair Candidate was not created")
-    scenario.port.external_append(scenario.delivery.target_ref, {"shared.txt": "External\n"}, "selective-renew")
-    assert scenario.run().kind == "paused"
-    before = scenario.kernel.status(scenario.delivery.key)["budgets"]["integration"]
-    assert (before["developments_used"], before["reviews_used"]) == (1, 1)
-    scenario.kernel.control("resume", "selective-renew", subject=scenario.delivery.key)
-    after = scenario.kernel.status(scenario.delivery.key)["budgets"]["integration"]
-    assert (after["developments_used"], after["reviews_used"], after["window"]) == (0, 1, 2)
-    assert scenario.run(approve=True).kind == "complete"
-
-
-def test_ci_renewal_keeps_requirement_budget_and_cumulative_reviewer_count(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY, checks=("fail", "fail", "none"), policy=Policy(ticket_ci_developments=1, parent_ci_developments=1, ticket_ci_review=True))
-    assert scenario.run().kind == "paused"
-    before = scenario.kernel.status(scenario.delivery.key)["budgets"]
-    assert before["ci"]["developments_used"] == 1
-    assert before["ci"]["reviews_used"] == 1
-    scenario.kernel.control("resume", "ci-renew-once", subject=scenario.delivery.key)
-    assert scenario.kernel.control("resume", "ci-renew-once", subject=scenario.delivery.key) == "applied"
-    renewed = scenario.kernel.status(scenario.delivery.key)["budgets"]
-    assert (renewed["ci"]["window"], renewed["ci"]["developments_used"], renewed["ci"]["reviews_used"]) == (2, 0, 1)
-    assert renewed["requirements"] == before["requirements"]
-    assert scenario.run(approve=True).kind == "complete"
-    assert scenario.kernel.status(scenario.delivery.key)["budgets"]["ci"]["reviews_used"] == 2
 
 
 def test_final_approval_check_timeout_has_a_finite_action_and_same_grant_resume(tmp_path: Path) -> None:

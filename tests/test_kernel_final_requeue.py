@@ -47,6 +47,13 @@ def test_managed_final_requeue_reaccepts_current_run_without_a_repair_pr_or_budg
     world = scenario.world()
     assert world.source == current and kernel.source_status()["blocked"] == "final_refresh"
     writes = scenario.port.writes()
+    refreshed = kernel.status(subject)
+    assert refreshed["phase"] == "refresh_final" and refreshed["budgets"] == before["budgets"]
+    count = len(calls)
+    blocked = operations.once()
+    assert blocked.kind in {"paused", "quiescent"}
+    assert kernel.status(subject) == refreshed and len(calls) == count
+    assert scenario.port.writes() == writes
     assert kernel.control_host(request, "requeue", "reaccept-current-run", subject=subject, world=world) == "applied"
     assert kernel.control_host(request, "requeue", "reaccept-current-run", subject=subject, world=world) == "applied"
     after = kernel.status(subject)
@@ -68,6 +75,8 @@ def test_managed_final_requeue_reaccepts_current_run_without_a_repair_pr_or_budg
     assert fresh.role.value == "review" and fresh.context["generation"] == 2
     assert fresh.context["reviewed_commit"] == current.sha
     assert fresh.context["full_scope"] == "final_run"
+    assert "previous_review" not in fresh.context
+    assert "previous_acceptance_artifact" not in fresh.context["review_context"]["facts"]
     assert any("Clarified current whole-Run acceptance." in item["body"] for item in fresh.context["requirements"])
     scripted_return(kernel, operations.runner, fresh, scenario.agent)
     assert scenario.run().kind == "approval"

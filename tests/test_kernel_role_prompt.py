@@ -21,7 +21,7 @@ from agent_run.runtime.codex import execute_codex
 from agent_run.config.creation import freeze_creation
 from support.offline import Scenario, review_result
 from agent_run.core.prompts.role import render_role_prompt
-from support.core_operations import CoreOperations, native_agent_fixture, observed_call, prepare_scripted_agent, scripted_return, final_scenario
+from support.core_operations import CoreOperations, native_agent_fixture, observed_call, prepare_scripted_agent, scripted_return
 
 
 def frozen_call(tmp_path: Path) -> tuple[Kernel, AgentPreparation, CoreOperations, UserDefaultsStore]:
@@ -203,29 +203,18 @@ def test_human_continuation_renders_only_the_latest_original_response(tmp_path: 
     assert kernel.status(first.subject)["budgets"]["requirements"]["developments_used"] == 1
 
 
-@pytest.mark.parametrize("kind,route", [
-    (DeliveryKind.TICKET, "accepted"), (DeliveryKind.PARENT_ONLY, "accepted"),
-    (DeliveryKind.FINAL_RUN, "accepted"), (DeliveryKind.TICKET, "fallback"), (DeliveryKind.TICKET, "ci"),
-])
-def test_publication_prompt_consumes_only_the_actual_authorized_evidence(
-    tmp_path: Path, kind: DeliveryKind, route: str,
-) -> None:
-    # The unstarted fixture supplies a creation template only. Final below is
-    # reached through an actual completed Ticket with these frozen inputs.
-    scenario = Scenario(tmp_path / "scenario", kind, checks=("fail", "none") if route == "ci" else ("none",))
+def test_publication_prompt_consumes_only_the_actual_authorized_evidence(tmp_path: Path) -> None:
+    # Other scopes and fallback rendering use the actual allocated inputs in
+    # test_kernel_prompt_facts; keep one complete CLI/CI Publication connection.
+    scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET, checks=("fail", "none"))
     defaults = UserDefaultsStore(tmp_path / "defaults.json")
     defaults.configure(language="en", profile={"preset": "economy"},
-                       policy={"ticket_review_rounds": 1} if route == "fallback" else {},
                        github={"worker_source": "pat", "pat": {"env": "SELECTED_WORKER_TOKEN"}, "runner_source": "host"})
     resources = builtin_resources("en")
     resources["methods/publishing"] = "Frozen publishing method\n" + resources["methods/publishing"]
     spec = freeze_creation(scenario.spec, defaults, prompt_resources=resources)
-    if kind == DeliveryKind.FINAL_RUN:
-        scenario = final_scenario(tmp_path / 'configured-final', inputs=spec.inputs, language=spec.language)
-    else:
-        scenario.kernel = create_kernel(tmp_path / "state" / "kernel.sqlite3", spec, requirements=scenario.requirements)
-    if kind != DeliveryKind.FINAL_RUN:
-        scenario.execution = scenario.kernel.claim_executor("prompt-owner")
+    scenario.kernel = create_kernel(tmp_path / "state" / "kernel.sqlite3", spec, requirements=scenario.requirements)
+    scenario.execution = scenario.kernel.claim_executor("prompt-owner")
     operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports, prepare_agents=False)
     for _ in range(80):
         step = operations.once()
@@ -238,14 +227,13 @@ def test_publication_prompt_consumes_only_the_actual_authorized_evidence(
                             b'{"result_kind":"development","summary":"Implemented the allocated work.","human_blockers":null}', edit=True)
         elif call.role == Role.REVIEW:
             run_prompt_call(scenario.kernel, call, tmp_path,
-                            json.dumps(review_result("fail" if route == "fallback" else "pass")).encode())
+                            json.dumps(review_result("pass")).encode())
         else:
             raw = b'{"result_kind":"publication","commit_message":"feat: implement allocated work","pr_title":"feat: implement allocated work","pr_body_markdown":"Implemented and validated the allocated work.","human_blockers":null}'
             prompt = run_prompt_call(scenario.kernel, call, tmp_path, raw)
-            if route == "ci" and "ci_repair_publication_context" not in call.context:
+            if "ci_repair_publication_context" not in call.context:
                 continue
-            field = {"accepted": "acceptance_artifact", "fallback": "fallback_publication_context",
-                     "ci": "ci_repair_publication_context"}[route]
+            field = "ci_repair_publication_context"
             assert isinstance(call.context[field], dict)
             assert all(other == field or other not in call.context for other in (
                 "acceptance_artifact", "fallback_publication_context", "ci_repair_publication_context",
@@ -253,7 +241,6 @@ def test_publication_prompt_consumes_only_the_actual_authorized_evidence(
             assert json.dumps(call.context[field], ensure_ascii=False, indent=2, sort_keys=True) in prompt
             assert "Frozen publishing method" in prompt
             assert "_prompt_resources" not in prompt and "SELECTED_WORKER_TOKEN" not in prompt
-            if route != "accepted":
-                assert call.context[field]["current_candidate_has_additional_review"] is False
+            assert call.context[field]["current_candidate_has_additional_review"] is False
             return
     raise AssertionError("The actual publication route was not allocated")
