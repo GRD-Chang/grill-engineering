@@ -1,14 +1,15 @@
 """Core receipt contracts; synthetic Host witnesses are not physical E2E proof."""
 from dataclasses import replace
+from types import SimpleNamespace
 import time
 
 import pytest
 
 from agent_run.core.operation_runner import OperationRunner
 from agent_run.errors import KernelError
-from agent_run.model import DeliveryKind, Execution, HostObservation, Issue, ParentIssue, Policy, Requirements
-from support.core_operations import prepare_scripted_agent
-from support.offline import GraphScenario, Scenario
+from agent_run.model import Commit, Delivery, DeliveryKind, Execution, HostObservation, Policy, RunSpec
+from support.core_operations import native_agent_fixture, prepare_scripted_agent
+from support.offline import Scenario
 
 
 def managed_run(scenario, tmp_path):
@@ -28,9 +29,18 @@ def managed_run(scenario, tmp_path):
 
 
 def interrupted_run(tmp_path, *, count=2, admitted=True, bound=True):
-    source = Requirements(ParentIssue(1, 'Parent', 'Scope', tuple(range(2, 2+count))), tuple(
-        Issue(n, f'Ticket {n}', 'Original', 'OPEN', labels=('ready-for-agent',)) for n in range(2, 2+count)))
-    scenario = GraphScenario(tmp_path / 'scenario', source, policy=Policy(concurrency=count))
+    # Original Core admissions and synthetic process witnesses need no Git producer.
+    deliveries = []
+    for number in range(2, 2 + count):
+        checkout = tmp_path / f'work-{number}'
+        checkout.mkdir()
+        deliveries.append(Delivery(f'ticket:{number}', DeliveryKind.TICKET, number, 'Original',
+            Commit('a' * 40, 'b' * 40), 'refs/heads/work', 'refs/heads/target', checkout=str(checkout)))
+    kernel, ports = native_agent_fixture(tmp_path / 'state' / 'kernel.sqlite3', RunSpec(
+        'host-recovery', 'example/repository', 1, 'parent', 'graph', tuple(deliveries),
+        policy=Policy(concurrency=count)))
+    scenario = SimpleNamespace(kernel=kernel, requirements=ports.requirements,
+        execution=kernel.claim_executor('fixture'), make_ports=lambda _: ports)
     kernel, host, running, runner = managed_run(scenario, tmp_path)
     requests, calls = [], []
     for _ in range(30):

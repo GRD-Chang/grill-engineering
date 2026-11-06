@@ -23,7 +23,7 @@ from agent_run.core.kernel import Kernel
 from agent_run.config.creation import freeze_creation
 from agent_run.notifications.sender import NativeNotifications
 from support.offline import OfflinePort, Scenario
-from support.notification import _kernel, _operations, observe_and_wait
+from support.notification import _kernel, _operations, _project, observe_and_wait
 
 
 def test_native_run_start_is_sent_once_from_the_frozen_run_and_query_does_not_send(tmp_path: Path) -> None:
@@ -99,9 +99,9 @@ def test_native_unknown_ack_is_not_sent_again_after_reopen(tmp_path: Path) -> No
     assert len(calls) == 1 and record["outcome"] == "unknown" and record["attempts"] == 1
 
 
-@pytest.mark.parametrize("mode", ["detailed", "concise"])
 def test_native_pr_creation_requires_consumed_receipt_and_does_not_repeat_for_edits(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    mode = "detailed"
     defaults = UserDefaultsStore(tmp_path / "defaults.json")
     defaults.configure(language="en", notifications={"enabled": False, "mode": mode})
     original_prepare = OfflinePort.prepare
@@ -176,13 +176,14 @@ def test_native_pr_creation_requires_consumed_receipt_and_does_not_repeat_for_ed
     assert scenario.step().kind == "progress"
     records = observe()
     created = [record for record in records if record["kind"] == "pr_created"]
-    assert len(created) == (1 if mode == "detailed" else 0)
-    if created:
-        from agent_run.notifications.envelope import _identity
-        assert created[0]["id"] == _identity(scenario.spec.run_id, "pr_created", pr.number)
-        rendered = next(card for card, _key in sent
-                        if f"#{pr.number}" in card["header"]["title"]["content"])
-        assert f"https://github.com/example/repository/pull/{pr.number}" in str(rendered)
+    assert len(created) == 1
+    # The same consumed receipt is also the input to concise event filtering.
+    assert not any(event["kind"] == "pr_created" for event in _project(scenario.kernel, "concise"))
+    from agent_run.notifications.envelope import _identity
+    assert created[0]["id"] == _identity(scenario.spec.run_id, "pr_created", pr.number)
+    rendered = next(card for card, _key in sent
+                    if f"#{pr.number}" in card["header"]["title"]["content"])
+    assert f"https://github.com/example/repository/pull/{pr.number}" in str(rendered)
 
     # CI repair updates the same PR through another confirmed real effect.
     for _ in range(100):
@@ -197,6 +198,7 @@ def test_native_pr_creation_requires_consumed_receipt_and_does_not_repeat_for_ed
     assert len([write for write in scenario.port.writes() if write["operation"] == "pr_write"]) == 2
     assert scenario.step().kind == "progress"  # Consume the edit receipt as well.
     assert [record for record in observe() if record["kind"] == "pr_created"] == created
+    assert not any(event["kind"] == "pr_created" for event in _project(scenario.kernel, "concise"))
     sent_before = list(sent)
     observe()
     assert sent == sent_before

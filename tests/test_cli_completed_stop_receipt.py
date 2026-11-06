@@ -10,8 +10,8 @@ from support.control_scenarios import managed_approval
 from support.environment import durable_snapshot as _snapshot
 
 
-@pytest.mark.parametrize("language", ["zh", "en"])
-def test_completed_stop_public_plain_and_json_preserve_terminal_state(tmp_path, monkeypatch, capsys, language):
+def test_completed_stop_public_plain_and_json_preserve_terminal_state(tmp_path, monkeypatch, capsys):
+    language = "zh"
     kernel, runner, physical, _state, _calls, request, subject, _source = managed_approval(
         tmp_path, monkeypatch, tickets=(), language=language)
     # This helper originally stops at approval; its old Issue route hardcodes
@@ -76,3 +76,18 @@ def test_nonterminal_receipts_never_claim_delivery_completion(capsys, language, 
     assert "交付已完成；本次未执行新动作" not in output
     assert "Delivery already completed; no new action was performed" not in output
     assert "original-action" not in output and "unexpected-action" not in output
+
+
+@pytest.mark.parametrize("language,expected", [
+    ("zh", "交付已完成；本次未执行新动作"),
+    ("en", "Delivery already completed; no new action was performed"),
+])
+def test_completed_receipt_uses_requested_language_without_claiming_new_work(capsys, language, expected):
+    from argparse import Namespace
+    from agent_run.cli.main import _print_receipt
+
+    _print_receipt(Namespace(command="stop", repo="example/project", run_id="1", ticket=None, state_dir=None),
+        {"result": "completed", "status": "completed", "action_id": None, "action": "stop", "host": "exited"}, language)
+    output = capsys.readouterr().out
+    assert expected in output
+    assert not any(word in output for word in ("请求已受理", "Request accepted", "未确认", "Unconfirmed"))

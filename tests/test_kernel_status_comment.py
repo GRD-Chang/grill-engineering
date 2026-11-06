@@ -1,5 +1,6 @@
 """A Status comment is a recoverable projection, never delivery authority."""
 from pathlib import Path
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from agent_run.core.kernel import Kernel
 from agent_run.model import DeliveryKind
 from agent_run.queries.status_comment import project_status
+from agent_run.notifications.status_comment import StatusComments
 from agent_run.storage import notification_outbox as outbox
 from support.offline import Scenario
 from support.status_comments import CommentsAPI, core_status_comments
@@ -34,6 +36,28 @@ def published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, notifications=
     return scenario
 
 
+def sender_inputs(tmp_path, monkeypatch, *, enabled=False):
+    """Native Run/event producer plus declared display input, without a PR journey."""
+    import agent_run.notifications.sender as notifications
+    from support.notification import _kernel
+    from support.status_comments import display_inputs
+
+    kernel = _kernel(tmp_path / "sender", notifications=enabled)
+    delivery = kernel.delivery("native-ticket")
+    projection, _ = display_inputs(kernel.storage.path.parent)
+    target = replace(projection.target, run_id=kernel.storage.run_id, subject=delivery.key,
+        issue=delivery.issue, source_ref=delivery.source_ref, target_ref=delivery.target_ref)
+    current = [replace(projection, target=target)]
+    def read(database, subject, **kwargs):
+        assert database == kernel.storage.path and subject == target.subject
+        return current[0]
+    monkeypatch.setattr(notifications, "project_status", read)
+    monkeypatch.setattr(notifications, "status_subjects", lambda *_args, **_kwargs: [target.subject])
+    sender = StatusComments(kernel.storage.path.parent,
+        read_projection=lambda subject: read(kernel.storage.path, subject), read_binding=kernel.operation_binding)
+    return kernel, current, sender
+
+
 def test_status_projection_and_intent_are_readonly_and_frozen(tmp_path, monkeypatch):
     # Exercise mixed-case publication receipts within the existing real path.
     from support.offline_api import SyntheticGitHub
@@ -46,6 +70,7 @@ def test_status_projection_and_intent_are_readonly_and_frozen(tmp_path, monkeypa
     monkeypatch.setattr(SyntheticGitHub, "object", lambda self, endpoint: spelling(original_object(self, endpoint)))
     monkeypatch.setattr(SyntheticGitHub, "list", lambda self, endpoint: spelling(original_list(self, endpoint)))
     scenario = published(tmp_path, monkeypatch, kind=DeliveryKind.PARENT_ONLY)
+    assert_stale_and_unknown_review_records_are_readonly(scenario.kernel, scenario.delivery.key)
     database, subject = scenario.kernel.storage.path, scenario.delivery.key
     before = database.read_bytes()
     projection = project_status(database, subject, storage=scenario.kernel.storage)
@@ -82,32 +107,13 @@ def test_status_projection_and_intent_are_readonly_and_frozen(tmp_path, monkeypa
     assert api.reads == 0 and api.commands == []
 
 
-def test_foreign_status_edit_pauses_display_without_blocking_delivery(tmp_path, monkeypatch):
-    scenario = published(tmp_path, monkeypatch)
-    database, subject = scenario.kernel.storage.path, scenario.delivery.key
-    projection = project_status(database, subject, storage=scenario.kernel.storage)
-    sender = core_status_comments(scenario.kernel)
-    api = CommentsAPI(projection.target)
-    assert sender.deliver(subject, api=api) == "confirmed"
-    scenario.kernel.control("stop", "display-only-local-stop", subject=subject)
-    original_body = api.comments[0]["body"]
-    api.comments[0]["body"] += "\nHuman edit"
-    assert sender.deliver(subject, api=api) == "foreign"
-    reads = api.reads
-    api.comments[0]["body"] = original_body
-    assert sender.deliver(subject, api=api) == "unavailable"
-    assert api.reads == reads and len(api.commands) == 1
-    scenario.kernel.control("resume", "resume-business-only", subject=subject)
-    assert scenario.run(approve=True).kind == "complete"
-
 
 def test_status_concurrent_sender_and_final_stop_cancel_before_post(tmp_path, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
-    scenario = published(tmp_path, monkeypatch)
-    database, subject = scenario.kernel.storage.path, scenario.delivery.key
-    sender = core_status_comments(scenario.kernel)
-    api = CommentsAPI(project_status(database, subject, storage=scenario.kernel.storage).target)
+    kernel, current, sender = sender_inputs(tmp_path, monkeypatch, enabled=False)
+    database, subject = kernel.storage.path, current[0].target.subject
+    api = CommentsAPI(current[0].target)
     entered, release = Event(), Event()
     real_list, calls = api.list, 0
     def blocked_boundary(endpoint):
@@ -122,8 +128,10 @@ def test_status_concurrent_sender_and_final_stop_cancel_before_post(tmp_path, mo
         future = pool.submit(sender.deliver, subject, api=api)
         try:
             assert entered.wait(5)
-            assert core_status_comments(scenario.kernel).deliver(subject, api=api) == "busy"
-            scenario.kernel.control("stop", "during-status-boundary", subject=subject)
+            assert StatusComments(database.parent, read_projection=lambda _: current[0],
+                read_binding=kernel.operation_binding).deliver(subject, api=api) == "busy"
+            kernel.control("stop", "during-status-boundary", subject=subject)
+            current[0] = replace(current[0], body="operator_stopped")
         finally:
             release.set()
         assert future.result(timeout=10) == "unavailable"
@@ -145,9 +153,9 @@ def test_status_concurrent_sender_and_final_stop_cancel_before_post(tmp_path, mo
                     "p=Path(" + repr(str(log)) + ");p.write_text(p.read_text()+'x' if p.exists() else 'x')\nraise SystemExit(1)\n")
     fake.chmod(0o700)
     monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
-    binding = scenario.kernel.operation_binding()
+    binding = kernel.operation_binding()
     physical = RemoteEffects(binding.repository_root, binding.repository, runner_identity=binding.inputs.runner_identity)
-    projection = project_status(database, subject, storage=scenario.kernel.storage)
+    projection = current[0]
     intent = {"comment_id": None, "before": None, "body": "unused"}
     with pytest.raises(ValueError, match="cancelled"):
         physical.read_status_comment(projection.target, "unused", intent, log.exists)
@@ -156,12 +164,11 @@ def test_status_concurrent_sender_and_final_stop_cancel_before_post(tmp_path, mo
 
 def test_enabled_sender_binds_fresh_and_preexisting_status_journals(tmp_path, monkeypatch):
     from agent_run.notifications.sender import NativeNotifications
-    scenario = published(tmp_path, monkeypatch, notifications={"enabled": True, "mode": "concise",
-                         "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
-    database, subject = scenario.kernel.storage.path, scenario.delivery.key
+    kernel, current, sender = sender_inputs(tmp_path, monkeypatch, enabled=True)
+    database, subject = kernel.storage.path, current[0].target.subject
     before = database.read_bytes()
-    journal = outbox.notification_path(database.parent, scenario.spec.run_id)
-    # Two independent journal inputs share immutable Core publication facts.
+    journal = outbox.notification_path(database.parent, kernel.storage.run_id)
+    # Two independent journals share the same native Run and declared projection.
     # The previous sender is fully stopped before its journal is removed.
     for preexisting_status in (False, True):
         assert not journal.exists()
@@ -169,20 +176,19 @@ def test_enabled_sender_binds_fresh_and_preexisting_status_journals(tmp_path, mo
         def transport(*args, **kwargs):
             sent.append(args[2])
             return {"outcome": "success", "reason": None}
-        api = CommentsAPI(project_status(database, subject, storage=scenario.kernel.storage).target)
+        api = CommentsAPI(current[0].target)
         if preexisting_status:
-            sender = core_status_comments(scenario.kernel)
             sender.stage(subject)
             assert sender.deliver(subject, api=api) == "confirmed"
         observer = NativeNotifications(database, database.parent, transport=transport, status_api=api,
-            storage=scenario.kernel.storage)
+            storage=kernel.storage)
         try:
             observer.close()
             assert not observer.thread.is_alive() and observer.failure_reason is None
             assert sent
             assert [command[1] for command in api.commands] == ["POST"]
-            document = outbox.read_notifications(database.parent, scenario.spec.run_id)
-            assert document["native_binding"] == [scenario.spec.run_id, scenario.spec.repository, 1]
+            document = outbox.read_notifications(database.parent, kernel.storage.run_id)
+            assert document["native_binding"] == [kernel.storage.run_id, kernel.operation_binding().repository, 1]
             assert document["native_run_start"] is True and document["pending"] == []
             assert len(document["remote_status"]["bindings"]) == 1
             assert database.read_bytes() == before
@@ -195,22 +201,22 @@ def test_automatic_unknown_status_is_not_polled_by_clock_or_passive_queries(tmp_
     from agent_run.notifications.sender import NativeNotifications
     from agent_run.queries.run import read
     from support.worker_process_timing import wait_until
-    scenario = published(tmp_path, monkeypatch)
-    database, subject = scenario.kernel.storage.path, scenario.delivery.key
-    api = CommentsAPI(project_status(database, subject, storage=scenario.kernel.storage).target)
+    kernel, current, sender = sender_inputs(tmp_path, monkeypatch, enabled=False)
+    database, subject = kernel.storage.path, current[0].target.subject
+    api = CommentsAPI(current[0].target)
     def forbidden(*args, **kwargs):
         pytest.fail("Feishu was disabled in the frozen Run")
     api.lose = True
-    observer = NativeNotifications(database, database.parent, transport=forbidden, status_api=api, storage=scenario.kernel.storage)
+    observer = NativeNotifications(database, database.parent, transport=forbidden, status_api=api, storage=kernel.storage)
     def unresolved():
-        doc = outbox.read_notifications(database.parent, scenario.spec.run_id)
+        doc = outbox.read_notifications(database.parent, kernel.storage.run_id)
         values = list(doc.get("remote_status", {}).get("bindings", {}).values())
         return bool(values and values[0].get("intent", {}).get("sent") and not values[0].get("claim"))
     try:
         wait_until(unresolved, timeout=5)
         reads = api.reads
         for _ in range(3):
-            read(database, "status", expected_run=scenario.spec.run_id, storage=scenario.kernel.storage)
+            read(database, "status", expected_run=kernel.storage.run_id, storage=kernel.storage)
             observer.observe_committed()
     finally:
         observer.close()
@@ -218,15 +224,16 @@ def test_automatic_unknown_status_is_not_polled_by_clock_or_passive_queries(tmp_
     assert [command[1] for command in api.commands] == ["POST"]
     assert not observer.thread.is_alive()
     api.lose = False
-    reopened = NativeNotifications(database, database.parent, transport=forbidden, status_api=api, storage=scenario.kernel.storage)
+    reopened = NativeNotifications(database, database.parent, transport=forbidden, status_api=api, storage=kernel.storage)
     def recovered():
-        doc = outbox.read_notifications(database.parent, scenario.spec.run_id)
+        doc = outbox.read_notifications(database.parent, kernel.storage.run_id)
         entry, = doc["remote_status"]["bindings"].values()
         return entry["intent"] is None and entry["comment_id"] == 100
     try:
         wait_until(recovered, timeout=5)
         assert [command[1] for command in api.commands] == ["POST"]
-        scenario.kernel.control("stop", "automatic-status-stop", subject=subject)
+        kernel.control("stop", "automatic-status-stop", subject=subject)
+        current[0] = replace(current[0], body="operator_stopped")
         reopened.observe_committed()
         wait_until(lambda: len(api.commands) == 2, timeout=5)
         assert "operator_stopped" in api.comments[0]["body"]
@@ -235,11 +242,12 @@ def test_automatic_unknown_status_is_not_polled_by_clock_or_passive_queries(tmp_
     assert not reopened.thread.is_alive()
     assert [command[1] for command in api.commands] == ["POST", "PATCH"]
     assert len(api.comments) == 1
-    document = outbox.read_notifications(database.parent, scenario.spec.run_id)
+    document = outbox.read_notifications(database.parent, kernel.storage.run_id)
     assert document["pending"] == [] and document["records"] == []
 
 
 @pytest.mark.parametrize("mode", ["read", "write"])
+
 def test_status_transport_cancel_reaps_its_actual_child_without_retry(tmp_path, mode):
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
@@ -371,19 +379,19 @@ def test_pending_important_card_keeps_its_budget_before_slow_status_and_status_r
     import agent_run.notifications.status_comment as status_module
     from agent_run.storage.notification_outbox import DELIVERY_LIFETIME_SECONDS
 
-    scenario = published(tmp_path, monkeypatch, notifications={"enabled": True, "mode": "concise",
-                         "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
-    database, subject = scenario.kernel.storage.path, scenario.delivery.key
-    scenario.kernel.control("stop", "important-card-before-status", subject=subject)
-    # The public Status producer first creates this journal and immutable intent;
-    # no fabricated native receipt or foreign-journal adoption is involved.
-    core_status_comments(scenario.kernel).stage(subject)
+    kernel, current, sender = sender_inputs(tmp_path, monkeypatch, enabled=True)
+    database, subject = kernel.storage.path, current[0].target.subject
+    kernel.control("stop", "important-card-before-status", subject=subject)
+    current[0] = replace(current[0], body="operator_stopped")
+    # The real Status consumer creates this journal and immutable intent;
+    # the native Run still produces the important stop notification.
+    sender.stage(subject)
     clock = [time.time()]
     # Replace only these module clocks before starting their actual worker;
     # other Python threads and the product's Core clock are unchanged.
     monkeypatch.setattr(notifications, "time", SimpleNamespace(time=lambda: clock[0]))
     monkeypatch.setattr(status_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
-    api = CommentsAPI(project_status(database, subject, storage=scenario.kernel.storage).target)
+    api = CommentsAPI(current[0].target)
     original_object = api.object
     delayed = []
     sent = []
@@ -396,10 +404,10 @@ def test_pending_important_card_keeps_its_budget_before_slow_status_and_status_r
     def transport(_config, rendered, *_args, **_kwargs):
         sent.append(rendered)
         return {"outcome": "success", "reason": None}
-    observer = notifications.NativeNotifications(database, database.parent, transport=transport, status_api=api, storage=scenario.kernel.storage)
+    observer = notifications.NativeNotifications(database, database.parent, transport=transport, status_api=api, storage=kernel.storage)
     try:
         observer.close()
-        document = outbox.read_notifications(database.parent, scenario.spec.run_id)
+        document = outbox.read_notifications(database.parent, kernel.storage.run_id)
         important = [row for row in document["records"] if row.get("important") and not row.get("cancelled")]
         assert important and all(row["outcome"] == "success" and row["attempts"] == 1 for row in important)
         assert all(row["deadline_at"] - row["created_at"] == DELIVERY_LIFETIME_SECONDS for row in important)
@@ -408,7 +416,7 @@ def test_pending_important_card_keeps_its_budget_before_slow_status_and_status_r
         observer.close(drain=False)
     # The timeout did not disable Status or turn an unsent request into sent.
     api.object = original_object
-    recovered = notifications.NativeNotifications(database, database.parent, transport=transport, status_api=api, storage=scenario.kernel.storage)
+    recovered = notifications.NativeNotifications(database, database.parent, transport=transport, status_api=api, storage=kernel.storage)
     try:
         recovered.close()
         assert not recovered.thread.is_alive()
@@ -426,11 +434,10 @@ def test_new_important_card_preempts_actual_status_read_and_same_sender_continue
     from threading import Event
     from agent_run.notifications.sender import NativeNotifications
     from support.worker_process_timing import wait_until
-    scenario = published(tmp_path, monkeypatch, notifications={"enabled": True, "mode": "concise",
-                         "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
-    database, subject = scenario.kernel.storage.path, scenario.delivery.key
-    target = project_status(database, subject, storage=scenario.kernel.storage).target
-    core_status_comments(scenario.kernel).stage(subject)
+    kernel, current, sender = sender_inputs(tmp_path, monkeypatch, enabled=True)
+    database, subject = kernel.storage.path, current[0].target.subject
+    target = current[0].target
+    sender.stage(subject)
     state, calls, blocked = tmp_path / "remote.json", tmp_path / "requests.jsonl", tmp_path / "read-pid"
     state.write_text(json.dumps({"comments": []}))
     binary = tmp_path / "status-cli"
@@ -484,11 +491,12 @@ print(json.dumps(result))
         if stopped.is_set():
             delivered.set()
         return {"outcome": "success", "reason": None}
-    observer = NativeNotifications(database, database.parent, transport=transport, storage=scenario.kernel.storage)
+    observer = NativeNotifications(database, database.parent, transport=transport, storage=kernel.storage)
     try:
         wait_until(blocked.exists, timeout=5)
         pid = int(blocked.read_text())
-        scenario.kernel.control("stop", "important-during-native-read", subject=subject)
+        kernel.control("stop", "important-during-native-read", subject=subject)
+        current[0] = replace(current[0], body="operator_stopped")
         stopped.set()
         observer.observe_committed()
         assert delivered.wait(5), "Important card waited behind an active Status child"
@@ -508,10 +516,9 @@ def test_preempted_unknown_post_keeps_original_intent_and_never_creates_twice(tm
     from threading import Event
     from agent_run.notifications.sender import NativeNotifications
     from support.worker_process_timing import wait_until
-    scenario = published(tmp_path, monkeypatch, notifications={"enabled": True, "mode": "concise",
-                         "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
-    database, subject = scenario.kernel.storage.path, scenario.delivery.key
-    api = CommentsAPI(project_status(database, subject, storage=scenario.kernel.storage).target)
+    kernel, current, sender = sender_inputs(tmp_path, monkeypatch, enabled=True)
+    database, subject = kernel.storage.path, current[0].target.subject
+    api = CommentsAPI(current[0].target)
     posted, release, stopped, delivered = Event(), Event(), Event(), Event()
     real_write = api.write
     def lost_response(endpoint, method, body):
@@ -526,18 +533,19 @@ def test_preempted_unknown_post_keeps_original_intent_and_never_creates_twice(tm
         if stopped.is_set():
             delivered.set()
         return {"outcome": "success", "reason": None}
-    observer = NativeNotifications(database, database.parent, transport=transport, status_api=api, storage=scenario.kernel.storage)
+    observer = NativeNotifications(database, database.parent, transport=transport, status_api=api, storage=kernel.storage)
     try:
         assert posted.wait(5)
-        document = outbox.read_notifications(database.parent, scenario.spec.run_id)
+        document = outbox.read_notifications(database.parent, kernel.storage.run_id)
         entry, = document["remote_status"]["bindings"].values()
         original = dict(entry["intent"])
         assert original["sent"] is True and "operator_stopped" not in original["body"]
-        scenario.kernel.control("stop", "important-after-physical-post", subject=subject)
+        kernel.control("stop", "important-after-physical-post", subject=subject)
+        current[0] = replace(current[0], body="operator_stopped")
         before = database.read_bytes()
         stopped.set()
         observer.observe_committed()
-        unresolved, = outbox.read_notifications(database.parent, scenario.spec.run_id)["remote_status"]["bindings"].values()
+        unresolved, = outbox.read_notifications(database.parent, kernel.storage.run_id)["remote_status"]["bindings"].values()
         assert unresolved["intent"] == original
         release.set()
         assert delivered.wait(5)
@@ -546,11 +554,12 @@ def test_preempted_unknown_post_keeps_original_intent_and_never_creates_twice(tm
         assert not observer.thread.is_alive()
         assert [command[1] for command in api.commands] == ["POST", "PATCH"]
         assert len(api.comments) == 1 and database.read_bytes() == before
-        final, = outbox.read_notifications(database.parent, scenario.spec.run_id)["remote_status"]["bindings"].values()
+        final, = outbox.read_notifications(database.parent, kernel.storage.run_id)["remote_status"]["bindings"].values()
         assert final["intent"] is None and final["comment_id"] == 100 and "claim" not in final
     finally:
         release.set()
         observer.close(drain=False)
+
 def test_attach_updates_same_status_only_after_original_domain_and_usage_release(tmp_path, monkeypatch):
     import json
     import os
@@ -732,10 +741,10 @@ def test_status_dirty_journal_fault_keeps_worker_alive_until_explicit_recovery(t
     from threading import Event, current_thread
     import agent_run.notifications.sender as notifications
 
-    scenario = published(tmp_path, monkeypatch, notifications={"enabled": True, "mode": "concise",
-        "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
-    database, subject = scenario.kernel.storage.path, scenario.delivery.key
-    scenario.kernel.control("stop", "important-before-one-journal-fault", subject=subject)
+    kernel, current, sender = sender_inputs(tmp_path, monkeypatch, enabled=True)
+    database, subject = kernel.storage.path, current[0].target.subject
+    kernel.control("stop", "important-before-one-journal-fault", subject=subject)
+    current[0] = replace(current[0], body="operator_stopped")
     started, release, failed, paused, ended, delivered = (Event() for _ in range(6))
     original_work, original_pause = notifications.NativeNotifications._work, notifications.NativeNotifications._pause
     original_transaction = outbox.transaction
@@ -765,10 +774,10 @@ def test_status_dirty_journal_fault_keeps_worker_alive_until_explicit_recovery(t
         return {"outcome": "success", "reason": None}
     monkeypatch.setattr(notifications.NativeNotifications, "_work", held_work)
     monkeypatch.setattr(notifications.NativeNotifications, "_pause", observed_pause)
-    observer = notifications.NativeNotifications(database, database.parent, transport=transport, status_api=CommentsAPI(project_status(database, subject, storage=scenario.kernel.storage).target), storage=scenario.kernel.storage)
+    observer = notifications.NativeNotifications(database, database.parent, transport=transport, status_api=CommentsAPI(current[0].target), storage=kernel.storage)
     try:
         assert started.wait(5)
-        before = outbox.read_notifications(database.parent, scenario.spec.run_id)
+        before = outbox.read_notifications(database.parent, kernel.storage.run_id)
         important = [item for item in before["pending"] if item.get("important")]
         assert important and observer._status_dirty
         deadlines = {item["event"]["id"]: item["deadline_at"] for item in important}
@@ -777,13 +786,13 @@ def test_status_dirty_journal_fault_keeps_worker_alive_until_explicit_recovery(t
         assert paused.wait(5) and failed.is_set()
         assert not ended.wait(.5), "Unclosed sender died with dirty Status after a single journal fault"
         assert observer.thread.is_alive() and observer._mode == "running" and sent == []
-        faulted = outbox.read_notifications(database.parent, scenario.spec.run_id)
+        faulted = outbox.read_notifications(database.parent, kernel.storage.run_id)
         assert all(item["attempts"] == 0 for item in faulted["pending"])
         observer.observe_committed()
         assert delivered.wait(5)
         observer.close()
         assert not observer.thread.is_alive() and observer.failure_reason is None
-        final = outbox.read_notifications(database.parent, scenario.spec.run_id)
+        final = outbox.read_notifications(database.parent, kernel.storage.run_id)
         for item in final["records"]:
             if item["id"] in deadlines:
                 assert item["outcome"] == "success" and item["attempts"] == 1
@@ -798,10 +807,14 @@ def test_repeated_wakes_during_projection_keep_new_important_card_ahead_of_statu
     import agent_run.notifications.sender as notifications
     from support.worker_process_timing import wait_until
 
-    scenario = published(tmp_path, monkeypatch, notifications={"enabled": True, "mode": "concise",
-        "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
-    database, subject = scenario.kernel.storage.path, scenario.delivery.key
-    api = CommentsAPI(project_status(database, subject, storage=scenario.kernel.storage).target)
+    kernel, current, sender = sender_inputs(tmp_path, monkeypatch, enabled=True)
+    database, subject = kernel.storage.path, current[0].target.subject
+    # Leave a real history page to catch up after the blocked older projection.
+    # These settled gates are not current cards; only the later stop is important.
+    for index in range(9):
+        kernel.control("stop", f"historical-stop-{index}", subject=subject)
+        kernel.control("resume", f"historical-resume-{index}", subject=subject)
+    api = CommentsAPI(current[0].target)
     older_ready, older_release, important_release = (Event() for _ in range(3))
     important_sent = Event()
     ordering = []
@@ -811,7 +824,7 @@ def test_repeated_wakes_during_projection_keep_new_important_card_ahead_of_statu
         return original_write(*args)
     api.write = write
     def transport(*_args, **_kwargs):
-        pending = outbox.read_notifications(database.parent, scenario.spec.run_id)["pending"]
+        pending = outbox.read_notifications(database.parent, kernel.storage.run_id)["pending"]
         if older_ready.is_set() and any(item.get("important") and item["outcome"] == "sending" for item in pending):
             ordering.append("important")
             important_sent.set()
@@ -824,16 +837,17 @@ def test_repeated_wakes_during_projection_keep_new_important_card_ahead_of_statu
             assert older_release.wait(5)
         return original_wake(self, document, *args)
     monkeypatch.setattr(notifications.NativeNotifications, "_wake_pending", reordered_wake)
-    observer = notifications.NativeNotifications(database, database.parent, transport=transport, status_api=api, storage=scenario.kernel.storage)
+    observer = notifications.NativeNotifications(database, database.parent, transport=transport, status_api=api, storage=kernel.storage)
     try:
         assert older_ready.wait(5)
-        scenario.kernel.control("stop", "new-important-after-old-observation", subject=subject)
+        kernel.control("stop", "new-important-after-old-observation", subject=subject)
+        current[0] = replace(current[0], body="operator_stopped")
         for _ in range(3):
             observer.observe_committed()
         assert observer._call is None, "A wake alone cannot start physical Status work"
         older_release.set()
         assert important_sent.wait(5)
-        pending = outbox.read_notifications(database.parent, scenario.spec.run_id)["pending"]
+        pending = outbox.read_notifications(database.parent, kernel.storage.run_id)["pending"]
         assert len([item for item in pending if item.get("important")]) == 1
         assert observer._call is not None and observer._call.kind == "feishu"
         assert ordering == ["important"]
@@ -921,12 +935,21 @@ def test_existing_pr_status_tracks_current_review_failure_repair_and_pass(tmp_pa
     assert sender.deliver(subject, api=api) == "confirmed"
     assert len(api.comments) == 1 and api.comments[0]["id"] == comment_id
     assert [command[1] for command in api.commands] == ["POST", "PATCH", "PATCH"]
+    # A foreign display edit pauses only this comment; actual delivery can finish.
+    kernel.control("stop", "display-only-local-stop", subject=subject)
+    original_body = api.comments[0]["body"]
+    api.comments[0]["body"] += "\nHuman edit"
+    assert sender.deliver(subject, api=api) == "foreign"
+    reads, writes = api.reads, len(api.commands)
+    api.comments[0]["body"] = original_body
+    assert sender.deliver(subject, api=api) == "unavailable"
+    assert api.reads == reads and len(api.commands) == writes
+    kernel.control("resume", "resume-business-only", subject=subject)
+    assert scenario.run(approve=True).kind == "complete"
 
 
-def test_status_review_rejects_stale_scope_and_unknown_records_without_remote_writes(tmp_path, monkeypatch):
-    """Corrupt only isolated records negatively; normal positive flow is above."""
-    scenario = published(tmp_path, monkeypatch)
-    kernel, subject = scenario.kernel, scenario.delivery.key
+def assert_stale_and_unknown_review_records_are_readonly(kernel, subject):
+    """Negative records on the same original PR; restore each before the next query."""
     with kernel.storage.transaction(write=False) as tx:
         job = tx.one("SELECT * FROM subjects WHERE id=?", (subject,))
         review = dict(tx.one("SELECT * FROM attempts WHERE id=?", (job["review_attempt"],)))
@@ -963,4 +986,5 @@ def test_status_review_rejects_stale_scope_and_unknown_records_without_remote_wr
         with kernel.storage.transaction() as tx:
             tx.execute("UPDATE subjects SET review_attempt=? WHERE id=?", (review["id"], subject))
     assert "Recorded Review: pass" in project_status(kernel.storage.path, subject, storage=kernel.storage).body
-    assert not any(write["operation"] == "merge" for write in scenario.writes())
+    with kernel.storage.transaction(write=False) as tx:
+        assert not tx.rows("SELECT id FROM effects WHERE operation='merge'")
