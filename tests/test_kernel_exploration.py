@@ -82,20 +82,20 @@ def test_three_deliveries_complete_with_required_review_and_exact_git_history(
     assert not list((scenario.port.root / "work").glob("review-*"))
 
 
-def test_ticket_final_development_is_explicit_fallback_but_parent_cannot_skip_review(tmp_path: Path) -> None:
-    ticket = Scenario(tmp_path / "ticket", DeliveryKind.TICKET, reviews=("fail",), policy=Policy(ticket_rounds=1))
+def test_ticket_final_development_is_explicit_fallback_but_parent_cannot_skip_review(tmp_path: Path, domain_scenario) -> None:
+    ticket = domain_scenario(tmp_path / "ticket", DeliveryKind.TICKET, reviews=("fail",), policy=Policy(ticket_rounds=1))
     assert ticket.run().kind == "complete"
     assert [call["role"] for call in ticket.role_calls] == ["development", "review", "development", "publication"]
     assert ticket.kernel.status(ticket.delivery.key)["gate_mode"] == "deterministic_fallback"
-    parent = Scenario(tmp_path / "parent", DeliveryKind.PARENT_ONLY, reviews=("fail",), policy=Policy(parent_rounds=1))
+    parent = domain_scenario(tmp_path / "parent", DeliveryKind.PARENT_ONLY, reviews=("fail",), policy=Policy(parent_rounds=1))
     assert parent.run().kind == "paused"
     assert "review_budget_exhausted" in parent.kernel.status(parent.delivery.key)["gates"]
     assert not any(write["operation"] == "pr_write" for write in parent.port.writes())
 
 
 @pytest.mark.parametrize("kind", [DeliveryKind.TICKET, DeliveryKind.PARENT_ONLY])
-def test_ci_uses_separate_cumulative_development_and_parent_review(tmp_path: Path, kind: DeliveryKind) -> None:
-    scenario = Scenario(tmp_path / "scenario", kind, checks=("fail", "none"))
+def test_ci_uses_separate_cumulative_development_and_parent_review(tmp_path: Path, kind: DeliveryKind, domain_scenario) -> None:
+    scenario = domain_scenario(tmp_path / "scenario", kind, checks=("fail", "none"))
     assert scenario.run(approve=True).kind == "complete"
     ci = [call for call in scenario.role_calls if call["purpose"] == "ci"]
     assert [call["role"] for call in ci if call["role"] != "publication"] == (
@@ -153,8 +153,8 @@ print(json.dumps({'step':step.kind,'status':k.status('ticket:2')}))
     assert kernel.status("ticket:2")["budgets"]["requirements"]["developments_used"] == 1
 
 
-def test_unknown_successful_pr_write_is_read_back_without_a_second_write(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET)
+def test_unknown_successful_pr_write_is_read_back_without_a_second_write(tmp_path: Path, domain_scenario) -> None:
+    scenario = domain_scenario(tmp_path / "scenario", DeliveryKind.TICKET)
     now = [100.25]
     scenario.kernel.clock = lambda: now[0]
     scenario.port.lose_response.add("pr_write")
@@ -171,8 +171,8 @@ def test_unknown_successful_pr_write_is_read_back_without_a_second_write(tmp_pat
 
 
 @pytest.mark.parametrize("already_written", [False, True])
-def test_old_pr_intent_is_settled_before_reintegration_after_target_append(tmp_path: Path, monkeypatch, already_written: bool) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET)
+def test_old_pr_intent_is_settled_before_reintegration_after_target_append(tmp_path: Path, monkeypatch, already_written: bool, domain_scenario) -> None:
+    scenario = domain_scenario(tmp_path / "scenario", DeliveryKind.TICKET)
     held = advance_to_effect(scenario, monkeypatch, "pr_write", sent=True)
     effect = held.effect
     if already_written:
@@ -315,8 +315,8 @@ def test_fifo_and_stale_return_release_cannot_steal_new_lease(tmp_path: Path) ->
     assert operations.runner.state().active == (third.lease_id,)
 
 
-def test_final_approval_check_timeout_has_a_finite_action_and_same_grant_resume(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
+def test_final_approval_check_timeout_has_a_finite_action_and_same_grant_resume(tmp_path: Path, domain_scenario) -> None:
+    scenario = domain_scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
     assert scenario.run().kind == "approval"
     scenario.kernel.control("approve", "approve-exact", subject=scenario.delivery.key, world=scenario.world())
     with pytest.raises(KernelError, match="final_approval_noncancellable"):
@@ -334,8 +334,8 @@ def test_final_approval_check_timeout_has_a_finite_action_and_same_grant_resume(
     assert sum(write["operation"] == "merge" for write in scenario.port.writes()) == 1
 
 
-def test_parent_ci_target_append_changes_current_work_to_integration_and_retains_ci_accounting(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.FINAL_RUN,
+def test_parent_ci_target_append_changes_current_work_to_integration_and_retains_ci_accounting(tmp_path: Path, domain_scenario) -> None:
+    scenario = domain_scenario(tmp_path / "scenario", DeliveryKind.FINAL_RUN,
                         reviews=("pass", "pass", "fail", "pass"), checks=("fail", "none"))
     for _ in range(100):
         status = scenario.kernel.status(scenario.delivery.key)

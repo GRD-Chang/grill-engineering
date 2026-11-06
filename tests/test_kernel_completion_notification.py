@@ -10,6 +10,7 @@ from agent_run.notifications.envelope import event_envelope
 from agent_run.notifications.event_projection import completion_context, event_state
 from agent_run.queries.read_facts import read_boundaries
 from support.offline import GraphScenario
+from support.run_scoped_kernel import domain_kernel
 from support.notification import _completions
 
 
@@ -18,78 +19,80 @@ def test_ticket_completion_keeps_original_summary_and_current_parent_progress(tm
         ParentIssue(1, "Overall requirement", "Scope", (2, 3)), (
             Issue(2, "First task", "First scope", "OPEN", labels=("ready-for-agent",)),
             Issue(3, "Second task", "Second scope", "OPEN", labels=("ready-for-agent",)),)))
-    for number in (2, 3):
-        for _ in range(200):
-            if scenario.kernel.status(f"ticket:{number}")["phase"] == "complete":
-                break
-            step = scenario.step()
-            assert step.kind not in {"paused", "waiting", "approval"}, step
-        else:
-            raise AssertionError("The real Ticket did not complete")
-        completed = _completions(scenario.kernel)
-        assert len(completed) == number - 1
-        first = completed[0]
-        assert first["ticket_progress"] == {"completed": number - 1, "total": 2}
-        assert first["parent_only"] is False
-        assert first["task_title"] == "First task"
-        assert first["url"].endswith("/issues/2")
-        assert first["summary"] == "Changed synthetic behavior 1"
-        assert first["next_step"] == ("继续处理其他子任务" if number == 2 else "继续完成整体交付；当前步骤见状态查询。")
-        assert first["total_seconds"] is None
-        rendered = json.dumps(card(first), ensure_ascii=False)
-        assert f"子任务已完成 {number - 1}/2" in rendered
-        assert "Changed synthetic behavior 1" in rendered
-        if number == 2:
-            original = first
-            assert scenario.kernel.control("stop", "stop-sibling", subject="ticket:3") == "applied"
-            paused, = _completions(scenario.kernel)
-            assert paused["id"] == original["id"]
-            assert paused["next_step"] == "agent-run status --repo example/project -- offline-run"
-            assert paused["completion_actions"] == [{"issue": 3, "scope": "local",
-                "reasons": ["operator_stopped"],
-                "next_action": "agent-run resume --repo example/project --ticket 3 -- offline-run"}]
-            rendered = json.dumps(card(paused), ensure_ascii=False)
-            assert "operator\\_stopped" in rendered.replace("\\\\", "\\")
-            assert "--ticket 3" in rendered
-            assert scenario.kernel.control("resume", "resume-sibling", subject="ticket:3") == "applied"
-        else:
-            assert first["id"] == original["id"]
-            assert first["source_material_id"] == original["source_material_id"]
-            assert completed[1]["summary"] == "Changed synthetic behavior 2"
-    with scenario.kernel.storage.transaction(write=False) as tx:
-        view = read_boundaries(tx, time.time())
-        assert view["is_terminal"] is False and view["closures"] == []
+    with domain_kernel(scenario.kernel) as scenario.kernel:
+        for number in (2, 3):
+            for _ in range(200):
+                if scenario.kernel.status(f"ticket:{number}")["phase"] == "complete":
+                    break
+                step = scenario.step()
+                assert step.kind not in {"paused", "waiting", "approval"}, step
+            else:
+                raise AssertionError("The real Ticket did not complete")
+            completed = _completions(scenario.kernel)
+            assert len(completed) == number - 1
+            first = completed[0]
+            assert first["ticket_progress"] == {"completed": number - 1, "total": 2}
+            assert first["parent_only"] is False
+            assert first["task_title"] == "First task"
+            assert first["url"].endswith("/issues/2")
+            assert first["summary"] == "Changed synthetic behavior 1"
+            assert first["next_step"] == ("继续处理其他子任务" if number == 2 else "继续完成整体交付；当前步骤见状态查询。")
+            assert first["total_seconds"] is None
+            rendered = json.dumps(card(first), ensure_ascii=False)
+            assert f"子任务已完成 {number - 1}/2" in rendered
+            assert "Changed synthetic behavior 1" in rendered
+            if number == 2:
+                original = first
+                assert scenario.kernel.control("stop", "stop-sibling", subject="ticket:3") == "applied"
+                paused, = _completions(scenario.kernel)
+                assert paused["id"] == original["id"]
+                assert paused["next_step"] == "agent-run status --repo example/project -- offline-run"
+                assert paused["completion_actions"] == [{"issue": 3, "scope": "local",
+                    "reasons": ["operator_stopped"],
+                    "next_action": "agent-run resume --repo example/project --ticket 3 -- offline-run"}]
+                rendered = json.dumps(card(paused), ensure_ascii=False)
+                assert "operator\\_stopped" in rendered.replace("\\\\", "\\")
+                assert "--ticket 3" in rendered
+                assert scenario.kernel.control("resume", "resume-sibling", subject="ticket:3") == "applied"
+            else:
+                assert first["id"] == original["id"]
+                assert first["source_material_id"] == original["source_material_id"]
+                assert completed[1]["summary"] == "Changed synthetic behavior 2"
+        with scenario.kernel.storage.transaction(write=False) as tx:
+            view = read_boundaries(tx, time.time())
+            assert view["is_terminal"] is False and view["closures"] == []
 
 
 def test_parent_only_completion_context_uses_actual_cleanup_and_approval_boundaries(tmp_path):
     scenario = GraphScenario(tmp_path, Requirements(ParentIssue(1, "Direct delivery", "Scope", ()), ()))
-    assert scenario.run().kind == "approval"
+    with domain_kernel(scenario.kernel) as scenario.kernel:
+        assert scenario.run().kind == "approval"
 
-    def context():
-        with scenario.kernel.storage.transaction(write=False) as tx:
-            return completion_context(read_boundaries(tx, time.time()), event_state(tx))
+        def context():
+            with scenario.kernel.storage.transaction(write=False) as tx:
+                return completion_context(read_boundaries(tx, time.time()), event_state(tx))
 
-    approval = context()
-    assert approval["parent_only"] is True and approval["ticket_progress"] is None
-    assert approval["next_step"] == "agent-run status --repo example/project -- offline-run"
-    assert len(approval["completion_actions"]) == 1
-    assert approval["completion_actions"][0]["next_action"] == "agent-run approve --repo example/project -- offline-run"
-    assert scenario.kernel.control("approve", "original-approval", subject="parent:1", world=scenario.world()) == "pending"
-    for _ in range(100):
-        if scenario.kernel.status("parent:1")["phase"] == "complete":
-            break
-        step = scenario.step()
-        assert step.kind not in {"paused", "waiting", "approval"}, step
-    else:
-        raise AssertionError("The original close did not complete")
-    pending = context()
-    assert pending["parent_only"] is True
-    assert pending["next_step"] == "agent-run resume --repo example/project -- offline-run"
-    assert pending["completion_actions"] == []
-    assert scenario.run().kind == "complete"
-    closed = context()
-    assert closed["next_step"] == "无需继续执行交付操作。"
-    assert closed["parent_only"] is True and closed["ticket_progress"] is None
+        approval = context()
+        assert approval["parent_only"] is True and approval["ticket_progress"] is None
+        assert approval["next_step"] == "agent-run status --repo example/project -- offline-run"
+        assert len(approval["completion_actions"]) == 1
+        assert approval["completion_actions"][0]["next_action"] == "agent-run approve --repo example/project -- offline-run"
+        assert scenario.kernel.control("approve", "original-approval", subject="parent:1", world=scenario.world()) == "pending"
+        for _ in range(100):
+            if scenario.kernel.status("parent:1")["phase"] == "complete":
+                break
+            step = scenario.step()
+            assert step.kind not in {"paused", "waiting", "approval"}, step
+        else:
+            raise AssertionError("The original close did not complete")
+        pending = context()
+        assert pending["parent_only"] is True
+        assert pending["next_step"] == "agent-run resume --repo example/project -- offline-run"
+        assert pending["completion_actions"] == []
+        assert scenario.run().kind == "complete"
+        closed = context()
+        assert closed["next_step"] == "无需继续执行交付操作。"
+        assert closed["parent_only"] is True and closed["ticket_progress"] is None
 
 
 @pytest.mark.parametrize("language", ["zh", "en"])

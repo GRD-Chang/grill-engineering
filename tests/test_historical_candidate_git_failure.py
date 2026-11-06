@@ -4,12 +4,12 @@ import json
 from pathlib import Path
 
 import pytest
+from support.run_scoped_kernel import domain_scenario
 
-def test_crlf_conflict_repair_reaches_a_recoverable_current_work_boundary(tmp_path, monkeypatch):
-    from support.offline import Scenario
+def test_crlf_conflict_repair_reaches_a_recoverable_current_work_boundary(tmp_path, monkeypatch, domain_scenario):
     from agent_run.model import DeliveryKind
     from agent_run.errors import KernelError
-    scenario = Scenario(tmp_path/'scenario',DeliveryKind.TICKET,edits=(
+    scenario = domain_scenario(tmp_path/'scenario',DeliveryKind.TICKET,edits=(
         {'shared.txt':'Candidate content\n'},
         {'shared.txt':'Resolved complete content\n','new.csv':'\ufeffa,b\r\n1,2\r\n'}))
     for _ in range(30):
@@ -159,10 +159,9 @@ def test_candidate_git_failure_handling_does_not_swallow_final_authority_refusal
 
 
 @pytest.mark.parametrize('name', ['new.txt', 'README.md'])
-def test_candidate_failure_uses_existing_development_repair_and_budget(tmp_path, name):
-    from support.offline import Scenario
+def test_candidate_failure_uses_existing_development_repair_and_budget(tmp_path, name, domain_scenario):
     from agent_run.model import DeliveryKind, Role
-    scenario = Scenario(tmp_path/'scenario', DeliveryKind.TICKET, edits=(
+    scenario = domain_scenario(tmp_path/'scenario', DeliveryKind.TICKET, edits=(
         {name:'invalid trailing space \n'}, {name:'repaired content\n'}))
     runner = scenario.runner()
     repaired = None
@@ -233,11 +232,10 @@ def test_tracked_candidate_failure_rechecks_identity_after_slow_preparation(git_
     assert admitted == []
 
 
-def test_public_stop_during_tracked_candidate_validation_never_dispatches(tmp_path, monkeypatch):
+def test_public_stop_during_tracked_candidate_validation_never_dispatches(tmp_path, monkeypatch, domain_scenario):
     from agent_run.contracts.write_authority import WriteAuthority
     from agent_run.model import DeliveryKind
-    from support.offline import Scenario
-    scenario = Scenario(tmp_path/'scenario', DeliveryKind.TICKET, edits=({'README.md':'Invalid trailing space \n'},))
+    scenario = domain_scenario(tmp_path/'scenario', DeliveryKind.TICKET, edits=({'README.md':'Invalid trailing space \n'},))
     execute = scenario.port.execute
     stopped = []
     final_returned = []

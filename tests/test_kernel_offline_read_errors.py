@@ -3,12 +3,13 @@ from support.core_operations import prepare_scripted_agent
 from pathlib import Path
 
 import pytest
+from support.run_scoped_kernel import domain_scenario
 
 from agent_run.errors import GitHubReadError
 from agent_run.contracts.write_authority import FinalAdmission, WriteAuthority
 from agent_run.model import DeliveryKind, Requirements
 from agent_run.model import ReadWait, Step
-from support.offline import OfflinePort, Scenario
+from support.offline import OfflinePort
 from support.offline_api import SyntheticGitHub
 from support.effect_boundary import EffectBoundary, effect_boundary
 
@@ -19,8 +20,8 @@ class SourceOutage(OfflinePort):
 
 
 
-def test_authorization_wait_crosses_the_physical_adapter_without_a_write_or_fake_result(tmp_path: Path, monkeypatch) -> None:
-    scenario = Scenario(tmp_path / 'refused', DeliveryKind.PARENT_ONLY)
+def test_authorization_wait_crosses_the_physical_adapter_without_a_write_or_fake_result(tmp_path: Path, monkeypatch, domain_scenario) -> None:
+    scenario = domain_scenario(tmp_path / 'refused', DeliveryKind.PARENT_ONLY)
     # A real native PR request is writable only after its source was published.
     with effect_boundary(scenario, monkeypatch, 'pr_write'):
         with pytest.raises(EffectBoundary) as held:
@@ -38,8 +39,8 @@ def test_authorization_wait_crosses_the_physical_adapter_without_a_write_or_fake
     assert scenario.port.pull_request_by_ref(effect.source_ref, effect.target_ref) is None
 
 
-def test_offline_bootstrap_outage_preserves_original_wait_and_unstarted_lease(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / 'source', DeliveryKind.TICKET)
+def test_offline_bootstrap_outage_preserves_original_wait_and_unstarted_lease(tmp_path: Path, domain_scenario) -> None:
+    scenario = domain_scenario(tmp_path / 'source', DeliveryKind.TICKET)
     now = [100.25]
     scenario.kernel.clock = lambda: now[0]
     for _ in range(12):
@@ -63,8 +64,8 @@ def test_offline_bootstrap_outage_preserves_original_wait_and_unstarted_lease(tm
     assert not [row for row in scenario.kernel.history(call.subject) if row['kind'] == 'effect_failed']
 
 
-def test_optional_link_ack_loss_does_not_create_a_required_checks_wait(tmp_path: Path, monkeypatch) -> None:
-    scenario = Scenario(tmp_path / 'optional-link', DeliveryKind.TICKET)
+def test_optional_link_ack_loss_does_not_create_a_required_checks_wait(tmp_path: Path, monkeypatch, domain_scenario) -> None:
+    scenario = domain_scenario(tmp_path / 'optional-link', DeliveryKind.TICKET)
     scenario.kernel.clock = lambda: 1000.25
     scenario.port.lose_response.add('issue_link')
     execute = scenario.port.execute
@@ -94,8 +95,8 @@ def test_optional_link_ack_loss_does_not_create_a_required_checks_wait(tmp_path:
 
 
 @pytest.mark.parametrize('failure', ['readback', 'response'])
-def test_post_write_outage_keeps_sent_merge_without_command_failure_or_replay(tmp_path: Path, failure: str, monkeypatch) -> None:
-    scenario = Scenario(tmp_path / failure, DeliveryKind.PARENT_ONLY)
+def test_post_write_outage_keeps_sent_merge_without_command_failure_or_replay(tmp_path: Path, failure: str, monkeypatch, domain_scenario) -> None:
+    scenario = domain_scenario(tmp_path / failure, DeliveryKind.PARENT_ONLY)
     now = [100.25]
     scenario.kernel.clock = lambda: now[0]
     assert scenario.run().kind == 'approval'

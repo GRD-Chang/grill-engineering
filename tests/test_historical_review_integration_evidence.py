@@ -1,6 +1,7 @@
 """Historical fault regression; synthetic providers and private local Git only."""
 from support.core_operations import prepare_scripted_agent
 import json
+from support.run_scoped_kernel import domain_scenario
 from pathlib import Path
 
 
@@ -119,10 +120,9 @@ def test_original_integration_receipt_survives_review_continuation_and_findings(
     assert 'previous_acceptance_artifact' not in next_generation.context['review_context']['facts']
 
 
-def test_candidate_repair_does_not_replace_original_integration_failure(tmp_path):
-    from support.offline import Scenario
+def test_candidate_repair_does_not_replace_original_integration_failure(tmp_path, domain_scenario):
     from agent_run.model import DeliveryKind, Role
-    scenario = Scenario(tmp_path/'scenario', DeliveryKind.PARENT_ONLY, edits=(
+    scenario = domain_scenario(tmp_path/'scenario', DeliveryKind.PARENT_ONLY, edits=(
         {'shared.txt':'Candidate content\n'},
         {'shared.txt':'Resolved complete content\n', 'new.csv':'a,b \r\n'},
         {'new.csv':'a,b\r\n'}))

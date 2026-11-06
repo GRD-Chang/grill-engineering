@@ -10,6 +10,7 @@ from agent_run.cli.render import render
 from agent_run.model import ParentIssue, Requirements, wire_json
 from agent_run.queries.run import read
 from support.offline import GraphScenario
+from support.run_scoped_kernel import domain_kernel
 from support.notification import recorded_agents as _recorded_agents, continued_round
 from support.environment import durable_snapshot as _snapshot
 
@@ -20,28 +21,32 @@ from support.environment import durable_snapshot as _snapshot
 ], ids=["repeated-json", "text-and-null"])
 def test_consumed_review_keeps_each_original_format_return(tmp_path, monkeypatch, returns, marker, count):
     scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Scope"), ()))
-    original = scenario.agent
-    calls = []
+    # Produce business facts here; query readonly behavior stays on native Storage.
+    native = scenario.kernel
+    with domain_kernel(scenario.kernel) as scenario.kernel:
+        original = scenario.agent
+        calls = []
 
-    def agent(call):
-        if call.role == "review":
-            scenario.kernel.bind_thread(call, call.reported_thread or "original-review-backend")
-            calls.append(call)
-            if call.output_ordinal < len(returns):
-                return returns[call.output_ordinal]
-        return original(call)
+        def agent(call):
+            if call.role == "review":
+                scenario.kernel.bind_thread(call, call.reported_thread or "original-review-backend")
+                calls.append(call)
+                if call.output_ordinal < len(returns):
+                    return returns[call.output_ordinal]
+            return original(call)
 
-    _recorded_agents(scenario, monkeypatch, agent)
-    for _ in range(60):
-        step = scenario.step()
-        if step.call is not None and step.call.role == "review" and step.call.output_ordinal == 2:
-            assert scenario.step().kind == "progress"
-            break
-        assert step.kind not in {"paused", "waiting", "approval"}, step
-    else:
-        raise AssertionError("The actual Review did not consume its repaired result")
-    assert len(calls) == 3
-    assert len({call.attempt_id for call in calls}) == len({call.invocation_id for call in calls}) == 1
+        _recorded_agents(scenario, monkeypatch, agent)
+        for _ in range(60):
+            step = scenario.step()
+            if step.call is not None and step.call.role == "review" and step.call.output_ordinal == 2:
+                assert scenario.step().kind == "progress"
+                break
+            assert step.kind not in {"paused", "waiting", "approval"}, step
+        else:
+            raise AssertionError("The actual Review did not consume its repaired result")
+        assert len(calls) == 3
+        assert len({call.attempt_id for call in calls}) == len({call.invocation_id for call in calls}) == 1
+    scenario.kernel = native
     before = _snapshot(tmp_path)
     document = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage)
     payload = json.dumps(document.data, ensure_ascii=False, sort_keys=True)

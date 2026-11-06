@@ -9,6 +9,7 @@ import pytest
 from agent_run.model import DeliveryKind, ParentIssue, Requirements, wire_json
 from agent_run.queries.run import read
 from support.offline import GraphScenario
+from support.run_scoped_kernel import domain_kernel
 from support.notification import recorded_agents as _recorded_agents
 from support.worker_facts import worker_fixture, start_worker, finish_worker, consume_local_result
 from support.environment import durable_snapshot as _snapshot
@@ -181,30 +182,34 @@ def test_history_binds_each_review_findings_and_evidence_to_its_original_candida
 
     scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Original scope"), ()),
                              reviews=("fail", "pass"))
-    original = scenario.agent
-    reviews = []
-    finding = "问题：ORIGINAL-REVIEW-FINDING\n证据：original evidence\n必须修复：original fix\n复验：original retest"
+    # Produce business facts here; query readonly behavior stays on native Storage.
+    native = scenario.kernel
+    with domain_kernel(scenario.kernel) as scenario.kernel:
+        original = scenario.agent
+        reviews = []
+        finding = "问题：ORIGINAL-REVIEW-FINDING\n证据：original evidence\n必须修复：original fix\n复验：original retest"
 
-    def agent(call):
-        result = json.loads(original(call))
-        if call.role == "review":
-            reviews.append(call)
-            for name, lane in result["checks"].items():
-                lane["evidence"] = f"REVIEW-{len(reviews)}-{name}-EVIDENCE"
-                if lane["status"] == "fail":
-                    lane["findings"] = [finding]
-        return wire_json(result)
+        def agent(call):
+            result = json.loads(original(call))
+            if call.role == "review":
+                reviews.append(call)
+                for name, lane in result["checks"].items():
+                    lane["evidence"] = f"REVIEW-{len(reviews)}-{name}-EVIDENCE"
+                    if lane["status"] == "fail":
+                        lane["findings"] = [finding]
+            return wire_json(result)
 
-    _recorded_agents(scenario, monkeypatch, agent)
-    for _ in range(60):
-        step = scenario.step()
-        if step.call is not None and step.call.role == "review" and len(reviews) == 2:
-            assert scenario.step().kind == "progress"
-            break
-    else:
-        raise AssertionError("The normal repair path did not reach the second consumed Review")
-    assert reviews[0].context["candidate_sha"] != reviews[1].context["candidate_sha"]
-    assert scenario.run().kind == "approval"
+        _recorded_agents(scenario, monkeypatch, agent)
+        for _ in range(60):
+            step = scenario.step()
+            if step.call is not None and step.call.role == "review" and len(reviews) == 2:
+                assert scenario.step().kind == "progress"
+                break
+        else:
+            raise AssertionError("The normal repair path did not reach the second consumed Review")
+        assert reviews[0].context["candidate_sha"] != reviews[1].context["candidate_sha"]
+        assert scenario.run().kind == "approval"
+    scenario.kernel = native
     before = _snapshot(tmp_path)
     document = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage)
     attempts = {item["id"]: item for item in document.data["history"]["attempts"]}
