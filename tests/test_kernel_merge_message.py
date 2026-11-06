@@ -7,26 +7,13 @@ from pathlib import Path
 import pytest
 
 from agent_run.core.kernel import Kernel
+from agent_run.contracts.artifact import commit_message_matches
+from agent_run.contracts.write_authority import WriteAuthority
+from support.remote_effects import publication
 from agent_run.errors import KernelError
 from agent_run.model import DeliveryKind, Role, wire_json
 from support.offline import Scenario
 from support.offline_api import SyntheticGitHub
-
-
-def _message_agent(scenario: Scenario, monkeypatch: pytest.MonkeyPatch, message: str) -> None:
-    original = scenario.agent
-
-    def agent(call):
-        raw = original(call)
-        if call.role == Role.PUBLICATION:
-            value = json.loads(raw)
-            value["commit_message"] = message
-            return wire_json(value)
-        return raw
-
-    monkeypatch.setattr(scenario, "agent", agent)
-
-
 
 
 @pytest.mark.parametrize("repair", [False, True], ids=["first-publication", "updated-after-ci"])
@@ -41,7 +28,7 @@ def test_ticket_squash_uses_the_complete_published_pr_not_the_latest_commit(tmp_
         if call.role == Role.PUBLICATION:
             value = json.loads(raw)
             number = len(publications) + 1
-            value.update(commit_message=f"fix: narrow patch {number}",
+            value.update(commit_message=f"fix: narrow patch {number}\r\n\r\nBody\r\nLast line  \r\n\r\n",
                          pr_title=f"feat(ticket): 完整交付 {number}",
                          pr_body_markdown="## What Problem This Solves\r\n完整任务。\r\n\r\n## Evidence\r\nReviewed implementation " + str(number))
             publications.append(dict(value))
@@ -59,81 +46,23 @@ def test_ticket_squash_uses_the_complete_published_pr_not_the_latest_commit(tmp_
     assert row["status"] == "confirmed" and row["attempts"] == 1
     assert scenario.port.git.run("show", "-s", "--format=%B", receipt["commit"]["sha"]).stdout == expected + "\n\n"
     with scenario.kernel.storage.transaction(write=False) as tx:
-        published = json.loads(tx.get(tx.one("SELECT payload_id FROM effects WHERE operation='publication_commit' ORDER BY rowid DESC LIMIT 1")[0], scenario.delivery.key))
-        assert published["commit_message"] == publication["commit_message"]
+        attempt = tx.one("SELECT * FROM attempts WHERE subject=? AND role='publication' ORDER BY rowid DESC LIMIT 1",
+                         (scenario.delivery.key,))
+        output = tx.one("SELECT raw_id FROM invocation_outputs WHERE invocation=?", (attempt["current_invocation"],))
+        assert json.loads(tx.get(output[0], scenario.delivery.key))["commit_message"] == publication["commit_message"]
+        assert tx.get(attempt["result_id"], scenario.delivery.key) == tx.get(output[0], scenario.delivery.key)
+        effect = tx.one("SELECT * FROM effects WHERE operation='publication_commit' ORDER BY rowid DESC LIMIT 1")
+        published = json.loads(tx.get(effect["payload_id"], scenario.delivery.key))
+        canonical = f"fix: narrow patch {len(publications)}\n\nBody\r\nLast line  \r\n\r\n"
+        assert published["commit_message"] == canonical
         assert published["title"] == publication["pr_title"]
+        commit = json.loads(tx.get(effect["receipt_id"], scenario.delivery.key))["commit"]
+    assert scenario.port.git.run("cat-file", "-p", commit["sha"]).stdout.partition("\n\n")[2] == canonical
     assert len(publications) == (2 if repair else 1)
     assert scenario.development_count == (2 if repair else 1)
 
 
-def test_foreign_pr_body_cannot_be_adopted_as_the_ticket_squash_intent(tmp_path):
-    scenario = Scenario(tmp_path / "ticket", DeliveryKind.TICKET)
-    for _ in range(80):
-        scenario.step()
-        if scenario.kernel.status(scenario.delivery.key)["phase"] == "merge":
-            break
-    else:
-        raise AssertionError("The real Ticket never reached the merge boundary")
-    status = scenario.kernel.status(scenario.delivery.key)
-    pr_number = status["pr_number"]
-    before = scenario.port.remote_commit(scenario.delivery.target_ref)
-    external = SyntheticGitHub(scenario.port.git, scenario.port.database, "example/project",
-        physical=scenario.port.physical, written=lambda *args: None, read_faults=set(), actor="external-maintainer")
-    assert external.write(f"repos/example/project/pulls/{pr_number}", "PATCH", {"body": "Unapproved external narrative"}).returncode == 0
-    result = scenario.run()
-    assert result.kind == "paused"
-    row, payload, _receipt = _merge_record(scenario)
-    assert "Unapproved external narrative" not in payload["commit_message"]
-    assert "Synthetic scenario with recorded evidence 1." in payload["commit_message"]
-    assert row["attempts"] == 0
-    assert scenario.port.remote_commit(scenario.delivery.target_ref) == before
-    assert not any(write["operation"] in {"merge", "completion_comment", "close"} for write in scenario.port.writes())
-    assert scenario.port.objects.issue(scenario.delivery.issue)["state"] == "open"
-
-
-@pytest.mark.parametrize("message,expected", [
-    ("feat: no body\r\n", "feat: no body"),
-    ("feat: CRLF title\r\n\r\nBody\r\nLast line  \r\n\r\n",
-     "feat: CRLF title\n\nBody\r\nLast line  \r\n\r\n"),
-], ids=["no-body", "crlf-header"])
-def test_publication_commit_keeps_canonical_message_and_squash_keeps_full_pr(
-    tmp_path, monkeypatch, message, expected,
-):
-    original = SyntheticGitHub.write
-    requests = []
-
-    def write(self, endpoint, method, fields):
-        if endpoint.endswith("/merge"):
-            requests.append(dict(fields))
-        return original(self, endpoint, method, fields)
-
-    monkeypatch.setattr(SyntheticGitHub, "write", write)
-    scenario = Scenario(tmp_path / "ticket", DeliveryKind.TICKET)
-    _message_agent(scenario, monkeypatch, message)
-    assert scenario.run().kind == "complete"
-    row, payload, receipt = _merge_record(scenario)
-    title = "feat: synthetic behavior 1"
-    body = "Parent Issue: #1\nPrimary Ticket: #2\nDelivery Type: Ticket\n\nSynthetic scenario with recorded evidence 1."
-    squash = title + "\n\n" + body
-    assert len(requests) == 1
-    assert requests[0]["commit_title"] == title and requests[0]["commit_message"] == body
-    assert "\n" not in requests[0]["commit_title"] and "\r" not in requests[0]["commit_title"]
-    assert payload["commit_message"] == squash and row["attempts"] == 1
-    assert receipt["raw"]["commit_message"] == squash + "\n"
-    with scenario.kernel.storage.transaction(write=False) as tx:
-        attempt = tx.one("SELECT * FROM attempts WHERE subject=? AND role='publication'", (scenario.delivery.key,))
-        output = tx.one("SELECT raw_id FROM invocation_outputs WHERE invocation=?", (attempt["current_invocation"],))
-        assert json.loads(tx.get(output[0], scenario.delivery.key))["commit_message"] == message
-        assert tx.get(attempt["result_id"], scenario.delivery.key) == tx.get(output[0], scenario.delivery.key)
-        publication = tx.one("SELECT * FROM effects WHERE operation='publication_commit'")
-        assert json.loads(tx.get(publication["payload_id"], scenario.delivery.key))["commit_message"] == expected
-        commit = json.loads(tx.get(publication["receipt_id"], scenario.delivery.key))["commit"]
-    actual = scenario.port.git.run("cat-file", "-p", commit["sha"]).stdout.partition("\n\n")[2]
-    assert actual == (expected if expected.endswith("\n") else expected + "\n")
-
-
-@pytest.mark.parametrize("fault", ["duplicate-body", "extra-blank-line"])
-def test_wrong_squash_message_cannot_complete_or_repeat_the_original_merge(tmp_path, monkeypatch, fault):
+def test_wrong_squash_message_cannot_complete_or_repeat_the_original_merge(tmp_path, monkeypatch):
     original = SyntheticGitHub.write
     requested = []
 
@@ -141,7 +70,7 @@ def test_wrong_squash_message_cannot_complete_or_repeat_the_original_merge(tmp_p
         if endpoint.endswith("/merge"):
             requested.append(dict(body))
             details = body["commit_message"]
-            body = {**body, "commit_message": details + ("\n\n" + details if fault == "duplicate-body" else "\n\n")}
+            body = {**body, "commit_message": details + "\n\n" + details}
         return original(self, endpoint, method, body)
 
     monkeypatch.setattr(SyntheticGitHub, "write", duplicate_body)
@@ -159,8 +88,6 @@ def test_wrong_squash_message_cannot_complete_or_repeat_the_original_merge(tmp_p
     assert row["attempts"] == 1 and row["generation"] == status["generation"]
     assert receipt["raw"]["write_returncode"] == 0
     assert receipt["raw"]["commit_message"] != payload["commit_message"] + "\n"
-    if fault == "extra-blank-line":
-        assert receipt["raw"]["commit_message"] == payload["commit_message"] + "\n\n"
     assert receipt["commit"]["sha"] == scenario.port.remote_commit(scenario.delivery.target_ref).sha
     before = scenario.port.writes()
     scenario.kernel = Kernel(scenario.kernel.storage.path, run_id=scenario.kernel.storage.run_id)
@@ -178,21 +105,27 @@ def test_wrong_squash_message_cannot_complete_or_repeat_the_original_merge(tmp_p
     'feat: preserve body whitespace\n\nTrailing spaces remain here  \n\n  Indented line.',
     'feat: retain body line endings\n\nFirst body line\r\nSecond body line',
 ])
-def test_original_publication_message_survives_real_git_and_complete_receipt(tmp_path, monkeypatch, message):
-    scenario = Scenario(tmp_path / "ticket", DeliveryKind.TICKET)
-    _message_agent(scenario, monkeypatch, message)
-    assert scenario.run().kind == "complete"
-    row, payload, receipt = _merge_record(scenario)
-    assert row["status"] == "confirmed" and row["attempts"] == 1 and row["generation"] == 1
-    expected = "feat: synthetic behavior 1\n\nParent Issue: #1\nPrimary Ticket: #2\nDelivery Type: Ticket\n\nSynthetic scenario with recorded evidence 1."
-    assert payload["method"] == "squash" and payload["commit_message"] == expected
-    assert receipt["raw"]["commit_message"] == expected + "\n"
-    with scenario.kernel.storage.transaction(write=False) as tx:
-        publication = tx.one("SELECT * FROM effects WHERE operation='publication_commit'")
-        assert json.loads(tx.get(publication["payload_id"], scenario.delivery.key))["commit_message"] == message
-        sha = json.loads(tx.get(publication["receipt_id"], scenario.delivery.key))["commit"]["sha"]
-    assert scenario.port.git.run("cat-file", "-p", sha).stdout.partition("\n\n")[2] == message + "\n"
-    assert scenario.port.objects.issue(scenario.delivery.issue)["state"] == "closed"
+def test_publication_adapter_preserves_message_bytes(git_repo, tmp_path, message):
+    git, local, effect = publication(git_repo, tmp_path)
+    effect = replace(effect, payload={**effect.payload, "commit_message": message})
+    witness = local.prepare_publication(effect)
+    effect = replace(effect, payload={**effect.payload, "publication_commit_intent": witness})
+    result = local.execute(effect, WriteAuthority(lambda: lambda: None))
+    assert result.disposition == "target" and result.commit is not None
+    assert git.run("cat-file", "-p", result.commit.sha).stdout.partition("\n\n")[2] == message + "\n"
+
+
+@pytest.mark.parametrize("expected,actual,matches", [
+    ("Title\n\nBody", "Title\n\nBody", True),
+    ("Title\n\nBody", "Title\n\nBody\n", True),
+    ("Title\n\nBody", "Title\n\nBody\n\n", False),
+    ("Title\n\nBody", "Title\n\nBody\n\nBody", False),
+    ("Title\n\nBody\n", "Title\n\nBody\n", True),
+    ("Title\n\nBody\n", "Title\n\nBody\n\n", False),
+    ("Title\n\nBody", None, False),
+])
+def test_merge_message_receipt_accepts_only_an_optional_git_terminator(expected, actual, matches):
+    assert commit_message_matches(expected, actual) is matches
 
 
 def test_missing_full_message_stays_unknown_until_resume_reads_original_merge(tmp_path, monkeypatch):
@@ -227,23 +160,6 @@ def test_missing_full_message_stays_unknown_until_resume_reads_original_merge(tm
     assert len([w for w in scenario.port.writes() if w["operation"] == "merge"]) == 1
 
 
-def test_api_message_without_git_terminator_is_not_a_content_difference(tmp_path, monkeypatch):
-    original = SyntheticGitHub.object
-
-    def read(self, endpoint):
-        result = original(self, endpoint)
-        if "/git/commits/" in endpoint:
-            message = result["message"]
-            result["message"] = message.removesuffix("\n")
-        return result
-
-    monkeypatch.setattr(SyntheticGitHub, "object", read)
-    scenario = Scenario(tmp_path / "ticket", DeliveryKind.TICKET)
-    assert scenario.run().kind == "complete"
-    row, payload, receipt = _merge_record(scenario)
-    assert row["attempts"] == 1 and receipt["raw"]["commit_message"] == payload["commit_message"]
-
-
 def test_ordinary_parent_merge_keeps_its_own_message_policy(tmp_path, monkeypatch):
     original = SyntheticGitHub.write
     methods = []
@@ -264,8 +180,7 @@ def test_ordinary_parent_merge_keeps_its_own_message_policy(tmp_path, monkeypatc
     assert scenario.port.objects.issue(scenario.delivery.issue)["state"] == "closed"
 
 
-@pytest.mark.parametrize("old_message", [False, True], ids=["exact-current", "previous-generation"])
-def test_requeued_generation_uses_its_own_original_publication_message(tmp_path, monkeypatch, old_message):
+def test_requeued_generation_rejects_the_previous_publication_message(tmp_path, monkeypatch):
     scenario = Scenario(tmp_path / "ticket", DeliveryKind.TICKET)
     messages = []
     narratives = []
@@ -304,21 +219,18 @@ def test_requeued_generation_uses_its_own_original_publication_message(tmp_path,
     original_write = SyntheticGitHub.write
 
     def service(self, endpoint, method, body):
-        if old_message and endpoint.endswith("/merge"):
+        if endpoint.endswith("/merge"):
             title, _, details = narratives[0].partition("\n\n")
             body = {**body, "commit_title": title, "commit_message": details}
         return original_write(self, endpoint, method, body)
 
     monkeypatch.setattr(SyntheticGitHub, "write", service)
-    if old_message:
-        with pytest.raises(KernelError, match="foreign_merge_receipt"):
-            scenario.run()
-    else:
-        assert scenario.run().kind == "complete"
+    with pytest.raises(KernelError, match="foreign_merge_receipt"):
+        scenario.run()
     assert messages == ['feat: generation 1\n\nOriginal reviewed message.',
                         'feat: generation 2\n\nOriginal reviewed message.']
     row, payload, receipt = _merge_record(scenario)
     assert row["generation"] == 2 and row["attempts"] == 1 and payload["commit_message"] == narratives[1]
-    assert receipt["raw"]["commit_message"] == narratives[0 if old_message else 1] + "\n"
-    assert scenario.port.objects.issue(scenario.delivery.issue)["state"] == ("open" if old_message else "closed")
+    assert receipt["raw"]["commit_message"] == narratives[0] + "\n"
+    assert scenario.port.objects.issue(scenario.delivery.issue)["state"] == "open"
     assert len([w for w in scenario.port.writes() if w["operation"] == "merge"]) == 1

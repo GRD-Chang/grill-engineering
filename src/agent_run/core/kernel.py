@@ -22,6 +22,7 @@ from threading import RLock
 from uuid import uuid4
 
 from agent_run.contracts.agent_profiles import ProfileOverrides, resolve_profiles, validate_profile_options
+from agent_run.contracts.artifact import commit_message_matches
 from agent_run.contracts.identity import validate_identity_snapshot
 from agent_run.contracts.pr_observation import pr_target
 from agent_run.contracts.repository import same_repository
@@ -40,6 +41,7 @@ from agent_run.storage.run_paths import RunPaths, run_paths
 from agent_run.storage.routing import open_run
 from agent_run.core.attempt_continuation import (AttemptContinuationBasis, ContinuationFacts,
                                    bind_attempt_continuation, load_continuation)
+from agent_run.core.budget_policy import budget_limits, requires_review, renewed_budget
 from agent_run.contracts.policy_values import checkpoint_policy
 from agent_run.contracts.policy import AGENT_PREPARATION_SECONDS
 from agent_run.storage.tasks import task_lock, run_is_current
@@ -1179,23 +1181,13 @@ class Kernel:
                     delivery.source_ref, delivery.target_ref, delivery.base.sha, delivery.base.tree,
                     delivery.base.sha, delivery.base.sha if final else None, delivery.base.tree if final else None,
                     delivery.completion_revision, delivery.checkout, delivery.base.sha, delivery.owned_root, delivery.common_git_dir))
-        limits = self._budget_limits(policy, delivery.kind)
+        limits = budget_limits(policy, delivery.kind)
         for purpose, (development_limit, review_limit) in limits.items():
-            review_required = delivery.kind != DeliveryKind.TICKET or purpose == Purpose.REQUIREMENTS or (purpose == Purpose.CI and policy.ticket_ci_review)
+            review_required = requires_review(policy, delivery.kind, purpose)
             tx.execute(*run_statement(tx, 'INSERT INTO budgets(subject,purpose,window,development_limit,review_limit,review_required,run_id) VALUES (?,?,1,?,?,?,?)',
                 (delivery.key, purpose.value, development_limit, review_limit, review_required), run_last=True))
         tx.execute(*run_statement(tx, 'INSERT INTO resync_allowances(subject,generation,allowance,run_id) VALUES (?,1,?,?)',
             (delivery.key, policy.resync_limit), run_last=True))
-
-    def _budget_limits(self, policy: Policy, kind: DeliveryKind) -> dict[Purpose, tuple[int, int | None]]:
-        return {
-            Purpose.REQUIREMENTS: (policy.ticket_rounds + 1, policy.ticket_rounds)
-            if kind == DeliveryKind.TICKET else (policy.parent_rounds, policy.parent_rounds),
-            Purpose.INTEGRATION: (policy.run_repairs, policy.run_repairs + 1)
-            if kind == DeliveryKind.FINAL_RUN else (policy.run_repairs if kind == DeliveryKind.PARENT_ONLY else policy.integration_developments,
-                                                   0 if kind == DeliveryKind.TICKET else None),
-            Purpose.CI: (policy.ticket_ci_developments if kind == DeliveryKind.TICKET else policy.parent_ci_developments, None),
-        }
 
     @staticmethod
     def _fingerprint(value: Any) -> str:
@@ -1993,7 +1985,7 @@ class Kernel:
             (run["observed_parent_revision"],), run_last=True))
         for budget in tx.rows(*run_statement(tx, 'SELECT * FROM budgets WHERE subject=? AND current=1 AND run_id=?',
                           (subject,), run_last=True)):
-            limits = self._budget_limits(self._subject_policy(tx, job), DeliveryKind(job["kind"]))[Purpose(budget["purpose"])]
+            limits = budget_limits(self._subject_policy(tx, job), DeliveryKind(job["kind"]))[Purpose(budget["purpose"])]
             tx.execute(*run_statement(tx, 'UPDATE budgets SET current=0 WHERE subject=? AND purpose=? AND current=1 AND run_id=?',
                 (subject, budget["purpose"]), run_last=True))
             tx.execute(*run_statement(tx, 'INSERT INTO budgets(subject,purpose,window,development_limit,review_limit,review_required,run_id) VALUES (?,?,?,?,?,?,?)',
@@ -4286,20 +4278,9 @@ class Kernel:
         tx.execute(*run_statement(tx, 'UPDATE budgets SET current=0 WHERE subject=? AND purpose=? AND window=? AND run_id=?',
             (job["id"], purpose, old["window"]), run_last=True))
         policy = self._subject_policy(tx, job)
-        limit, review_limit = self._budget_limits(policy, DeliveryKind(job["kind"]))[Purpose(purpose)]
-        developments, reviews = 0, 0
-        if purpose == Purpose.CI:
-            reviews = old["reviews_used"]  # CI Reviewer count is cumulative, not a renewable quota.
-        if purpose == Purpose.INTEGRATION and job["kind"] == DeliveryKind.FINAL_RUN and not new_cycle:
-            developments = 0 if old["developments_used"] >= old["development_limit"] else old["developments_used"]
-            reviews = 0 if old["review_limit"] is not None and old["reviews_used"] >= old["review_limit"] else old["reviews_used"]
-        if purpose == Purpose.INTEGRATION and job["kind"] != DeliveryKind.FINAL_RUN:
-            # This policy extends an accumulated allowance instead of erasing use.
-            developments, reviews = old["developments_used"], old["reviews_used"]
-            limit += old["development_limit"]
-        review_required = job["kind"] != DeliveryKind.TICKET or purpose == Purpose.REQUIREMENTS or (purpose == Purpose.CI and policy.ticket_ci_review)
+        values = renewed_budget(policy, DeliveryKind(job["kind"]), Purpose(purpose), dict(old), new_cycle=new_cycle)
         tx.execute(*run_statement(tx, 'INSERT INTO budgets(subject,purpose,window,developments_used,reviews_used,development_limit,review_limit,review_required,current,run_id) VALUES (?,?,?,?,?,?,?,?,1,?)',
-            (job["id"], purpose, old["window"] + 1, developments, reviews, limit, review_limit, review_required), run_last=True))
+            (job["id"], purpose, old["window"] + 1, *values), run_last=True))
         self._event(tx, job["id"], "budget_renewed", f"{purpose}:{old['window'] + 1}", job["policy_id"])
 
     def status(self, subject: str) -> dict[str, Any]:
@@ -5254,17 +5235,13 @@ class Kernel:
     def _merge_receipt_matches(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, row: sqlite3.Row, result: dict[str, Any]) -> bool:
         pr, commit = result["pr"], result["commit"]
         payload = json.loads(tx.get(row["payload_id"], job["id"]))
-        expected, actual = payload["commit_message"], result["raw"].get("commit_message")
-        # Git/API may add one terminating LF to an unterminated message.
-        # Body content, explicit newlines and ordinary merge policy stay exact.
-        message_matches = isinstance(actual, str) and (actual == expected
-                           or not expected.endswith("\n") and actual == expected + "\n")
         return bool(result["disposition"] == "target" and pr and commit and pr["number"] == row["pr_number"]
                     and self._pr_identity(run, row, pr)
                     and pr["state"] == "MERGED" and pr["actor"] == row["actor"] and pr["head"]["sha"] == row["after_sha"]
                     and pr["base"]["sha"] == row["before_sha"] and pr["merged"] == commit and commit["tree"] == job["publication_tree"]
                     and result["raw"].get("parents") == payload["parents"]
-                    and (payload["method"] != "squash" or message_matches))
+                    and (payload["method"] != "squash" or commit_message_matches(
+                        payload["commit_message"], result["raw"].get("commit_message"))))
 
     def _final_merge_intent(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row) -> sqlite3.Row | None:
         """The frozen grant survives the bounded lifetime of an Action observer."""

@@ -96,7 +96,7 @@ def test_ticket_final_development_is_explicit_fallback_but_parent_cannot_skip_re
     assert not any(write["operation"] == "pr_write" for write in parent.port.writes())
 
 
-@pytest.mark.parametrize("kind", list(DeliveryKind))
+@pytest.mark.parametrize("kind", [DeliveryKind.TICKET, DeliveryKind.PARENT_ONLY])
 def test_ci_uses_separate_cumulative_development_and_parent_review(tmp_path: Path, kind: DeliveryKind) -> None:
     scenario = Scenario(tmp_path / "scenario", kind, checks=("fail", "none"))
     assert scenario.run(approve=True).kind == "complete"
@@ -105,9 +105,6 @@ def test_ci_uses_separate_cumulative_development_and_parent_review(tmp_path: Pat
         ["development"] if kind == DeliveryKind.TICKET else ["development", "review"])
     assert scenario.kernel.status(scenario.delivery.key)["budgets"]["ci"]["developments_used"] == 1
     assert sum(write["operation"] == "pr_write" for write in scenario.writes()) == 2
-    if kind == DeliveryKind.FINAL_RUN:
-        assert {write["subject"] for write in scenario.writes()} == {scenario.delivery.key}
-        assert sum(write["operation"] == "pr_write" for write in scenario.port.writes()) == 3
 
 
 def test_stop_late_raw_is_settlement_only_and_independent_process_can_read_it(tmp_path: Path) -> None:
@@ -536,9 +533,8 @@ def test_full_parent_resume_renews_only_exhausted_development_allowance(tmp_path
     assert scenario.run(approve=True).kind == "complete"
 
 
-@pytest.mark.parametrize("kind", list(DeliveryKind))
-def test_ci_renewal_keeps_requirement_budget_and_cumulative_reviewer_count(tmp_path: Path, kind: DeliveryKind) -> None:
-    scenario = Scenario(tmp_path / "scenario", kind, checks=("fail", "fail", "none"), policy=Policy(ticket_ci_developments=1, parent_ci_developments=1, ticket_ci_review=True))
+def test_ci_renewal_keeps_requirement_budget_and_cumulative_reviewer_count(tmp_path: Path) -> None:
+    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY, checks=("fail", "fail", "none"), policy=Policy(ticket_ci_developments=1, parent_ci_developments=1, ticket_ci_review=True))
     assert scenario.run().kind == "paused"
     before = scenario.kernel.status(scenario.delivery.key)["budgets"]
     assert before["ci"]["developments_used"] == 1

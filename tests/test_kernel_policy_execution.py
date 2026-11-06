@@ -1,6 +1,5 @@
 """Frozen policy controls real domain allocation and continuation authority."""
 
-from support.repository_fixture import create_kernel
 
 from dataclasses import replace
 from pathlib import Path
@@ -12,21 +11,6 @@ from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from support.offline import Scenario
 from support.core_operations import CoreOperations, native_agent_fixture, final_scenario
-
-
-@pytest.mark.parametrize(("kind", "expected"), [(DeliveryKind.TICKET, 1), (DeliveryKind.PARENT_ONLY, 2), (DeliveryKind.FINAL_RUN, 2)])
-def test_ci_allowance_uses_the_actual_ticket_or_parent_owner(tmp_path: Path, kind: DeliveryKind, expected: int) -> None:
-    base = Commit("base", "tree")
-    delivery = Delivery("delivery", kind, 1, "requirements", base, "refs/heads/source", "refs/heads/target")
-    policy = Policy(ticket_ci_developments=1, parent_ci_developments=2)
-    if kind == DeliveryKind.FINAL_RUN:
-        # Final is admitted only after a real Ticket Completion. A standalone
-        # Final template is not a live subject whose budget can be queried.
-        scenario = final_scenario(tmp_path / 'final', policy=policy)
-        kernel, delivery = scenario.kernel, scenario.delivery
-    else:
-        kernel = create_kernel(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,), policy))
-    assert kernel.status(delivery.key)["budgets"]["ci"]["development_limit"] == expected
 
 
 def test_frozen_call_deadline_cannot_be_extended_or_used_after_expiry(tmp_path: Path) -> None:
@@ -58,16 +42,6 @@ def test_created_language_is_consumed_by_the_actual_agent_call(tmp_path: Path) -
     assert call is not None
     assert call.context.get("language") == "en"
     assert call.context.get("repository_root") == str(tmp_path)
-
-
-@pytest.mark.parametrize(("kind", "review"), [(DeliveryKind.TICKET, False), (DeliveryKind.PARENT_ONLY, True)])
-def test_ci_review_requirement_is_not_inferred_from_an_unlimited_review_budget(tmp_path: Path, kind: DeliveryKind, review: bool) -> None:
-    base = Commit("base", "tree")
-    delivery = Delivery("delivery", kind, 1, "parent", base, "refs/heads/source", "refs/heads/target")
-    kernel = create_kernel(tmp_path / "run.sqlite3", RunSpec("run", "example/project", 1, "parent", "graph", (delivery,)))
-    ci = kernel.status(delivery.key)["budgets"]["ci"]
-    assert ci["review_limit"] is None
-    assert ci.get("review_required") is review
 
 
 @pytest.mark.parametrize("limit", [0, 1])

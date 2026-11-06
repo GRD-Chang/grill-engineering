@@ -99,6 +99,12 @@ def _commit_message(value: object) -> str:
     return title + ("\n\n" + body if body else "")
 
 
+def commit_message_matches(expected: str, actual: object) -> bool:
+    """Accept one Git/API terminating LF, preserving all explicit body bytes."""
+    return isinstance(actual, str) and (actual == expected
+        or not expected.endswith("\n") and actual == expected + "\n")
+
+
 def parse_artifact(role: str, raw: bytes) -> dict[str, Any]:
     """Validate one role's exact wire shape and normalize prose; callers retain raw bytes."""
     _role(role)
