@@ -139,9 +139,14 @@ class OfflineGit:
             path = directory / name
             if path.is_symlink():
                 raise ValueError("offline Git metadata must not redirect paths")
-            for entry in path.rglob("*"):
-                if entry.is_symlink():
-                    raise ValueError("offline Git metadata must not redirect paths")
+            pending = [path] if path.is_dir() else []
+            while pending:
+                with os.scandir(pending.pop()) as entries:
+                    for entry in entries:
+                        if entry.is_symlink():
+                            raise ValueError("offline Git metadata must not redirect paths")
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(entry.path)
         # Parse only this file, without following include/includeIf. Unknown
         # configuration (including URL rewrites and alternate transports) fails
         # closed; do not sanitize or mutate a saved world's configuration.
