@@ -1,5 +1,4 @@
 """The one sender consumes original Resume, close and delayed-progress facts."""
-from dataclasses import replace
 from pathlib import Path
 from threading import Event
 import time
@@ -9,18 +8,18 @@ import pytest
 
 import agent_run.storage.notification_outbox as outbox
 from agent_run.notifications.envelope import event_copy, event_envelope
-from agent_run.notifications.event_projection import event_state
-from support.core_operations import CoreOperations, scripted_return
+from agent_run.notifications.event_projection import event_state, project_event
+from agent_run.queries.resume_facts import resume_facts
 from agent_run.model import DeliveryKind, Role
-from agent_run.core.kernel import Kernel
 from agent_run.model import wire_json
 from agent_run.notifications.sender import NativeNotifications
 from support.notification import recorded_agents as _recorded_agents, _enabled_scenario, _kernel, _operations, observe_and_wait
 from support.observer_errors import ObserverErrors
+from support.notification_workers import start_worker, finish_worker, consume_local_result
 
 
-def _state(scenario) -> dict[str, Any]:
-    with scenario.kernel.storage.transaction(write=False) as tx:
+def _state(kernel) -> dict[str, Any]:
+    with kernel.storage.transaction(write=False) as tx:
         return event_state(tx)
 
 
@@ -30,64 +29,67 @@ def _active(root: Path, run: str) -> dict[str, Any]:
     return dict(sending[0]["event"])
 
 
-def _observe(scenario, root, captured):
+def _observe(kernel, root, captured):
     def transport(*_args, **_kwargs):
-        event = _active(root, scenario.spec.run_id)
+        event = _active(root, kernel.storage.run_id)
         event.update(_rendered_title=_args[1]["header"]["title"]["content"],
                      _rendered_color=_args[1]["header"]["template"])
         captured.append(event)
         return {"outcome": "success", "reason": None}
 
-    observer = NativeNotifications(scenario.kernel.storage.path, root, transport=transport, storage=scenario.kernel.storage)
+    observer = NativeNotifications(kernel.storage.path, root, transport=transport, storage=kernel.storage)
     observer.close()
     assert observer.failure_reason is None
 
 
 @pytest.mark.parametrize("outcome", ["failed", "human_action"])
-def test_sender_merges_actual_resume_result_into_the_original_gate_without_a_second_card(tmp_path, monkeypatch, outcome):
-    scenario = _enabled_scenario(tmp_path, monkeypatch, DeliveryKind.PARENT_ONLY)
+def test_sender_merges_actual_resume_result_into_the_original_gate_without_a_second_card(tmp_path, outcome):
+    kernel = _kernel(tmp_path)
+    operations = _operations(kernel, kernel.claim_executor("notification-consumer"))
     blocked = wire_json({"result_kind": "human_blocker", "summary": None, "human_blockers": ["Exact original decision"]})
     captured = []
-    resumed = [False]
-
-    def started(_call):
-        if resumed[0]:
-            _observe(scenario, tmp_path, captured)
-
-    _recorded_agents(scenario, monkeypatch, lambda call: blocked, started)
-    assert scenario.run().kind == "paused"
-    assert scenario.kernel.control("resume", "resume-original-gate", subject=scenario.delivery.key,
-                                   message="Continue the original target") == "applied"
-    resumed[0] = True
-    continued = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports).once()
+    first_call = operations.once().call
+    process = start_worker(kernel, operations, first_call)
+    finish_worker(kernel, first_call, process, blocked)
+    assert operations.once().kind == "paused"
+    assert kernel.control("resume", "resume-original-gate", subject=first_call.subject,
+                          message="Continue the original target") == "applied"
+    continued = operations.once()
     assert continued.call is not None
     if outcome == "failed":
-        assert scenario.kernel.dispatch_agent(continued.call)
-        scenario.kernel.agent_unavailable(continued.call, "worker_preparation_failed", {"message": "Original launch failed"})
+        assert kernel.dispatch_agent(continued.call)
+        kernel.agent_unavailable(continued.call, "worker_preparation_failed", {"message": "Original launch failed"})
     else:
-        scripted_return(scenario.kernel, scenario.runner(), continued.call, scenario.agent)
+        process = start_worker(kernel, operations, continued.call)
+        _observe(kernel, tmp_path, captured)
+        finish_worker(kernel, continued.call, process, blocked)
         actual_start, = [event for event in captured if event.get("resume_id") == "resume-original-gate"]
         assert actual_start["resume_outcome"] == "started"
         assert actual_start["color"] == actual_start["_rendered_color"] == "blue"
-        assert scenario.step().kind == "paused"
-    with scenario.kernel.storage.transaction(write=False) as tx:
+        assert operations.once().kind == "paused"
+    with kernel.storage.transaction(write=False) as tx:
         original = tx.one("SELECT position,material_id,generation,identity FROM history WHERE subject=? AND kind='paused' ORDER BY position DESC LIMIT 1",
-                          (scenario.delivery.key,))
+                          (first_call.subject,))
         position, material, generation = original["position"], original["material_id"], original["generation"]
-    _observe(scenario, tmp_path, captured)
+        row = dict(tx.one("SELECT * FROM history WHERE position=?", (position,)))
+        facts = resume_facts(tx, row)
+        assert facts["resume_scope"] == "subject" and facts["resume_subject"] == first_call.subject
+        assert facts["resume_generation"] == 1 and facts["reason_code"] == row["identity"]
+        assert project_event(tx, row, event_state(tx), "detailed") == []
+    _observe(kernel, tmp_path, captured)
     gates = [event for event in captured if event["kind"] == "boundary"]
     assert len(gates) == 1
     gate = gates[0]
     assert gate["resume_id"] == "resume-original-gate" and gate["resume_outcome"] == outcome
     assert gate["source_position"] == position and gate["source_material_id"] == material
-    assert gate["generation"] == generation and gate["work_subject"] == scenario.delivery.key
+    assert gate["generation"] == generation and gate["work_subject"] == first_call.subject
     assert gate["current"] is True and gate["next_step"]
-    assert gate["title"] == gate["_rendered_title"] == event_copy(_state(scenario), "resume_" + outcome)
+    assert gate["title"] == gate["_rendered_title"] == event_copy(_state(kernel), "resume_" + outcome)
     assert gate["color"] == gate["_rendered_color"] == ("red" if outcome == "failed" else "yellow")
     assert not any(event["kind"] == "resume" and event.get("resume_outcome") in {"failed", "human_action"} for event in captured)
-    first = outbox.read_notifications(tmp_path, scenario.spec.run_id)["records"]
-    _observe(scenario, tmp_path, captured)
-    assert outbox.read_notifications(tmp_path, scenario.spec.run_id)["records"] == first
+    first = outbox.read_notifications(tmp_path, kernel.storage.run_id)["records"]
+    _observe(kernel, tmp_path, captured)
+    assert outbox.read_notifications(tmp_path, kernel.storage.run_id)["records"] == first
 
 
 @pytest.mark.parametrize("publication_recorded", [True, False])
@@ -111,9 +113,9 @@ def test_sender_terminal_uses_original_close_whole_effort_and_keeps_unknown_publ
                        "WHERE e.operation='close' AND e.status='confirmed' AND h.kind='effect_consumed'")
         close_id, receipt_id = close["id"], close["receipt_id"]
     captured = []
-    _observe(scenario, tmp_path, captured)
+    _observe(scenario.kernel, tmp_path, captured)
     terminal, = [event for event in captured if event.get("terminal") and event["status_code"] == "completed"]
-    assert terminal["id"] == event_envelope(_state(scenario), "boundary", ["completed", close_id, receipt_id], "")["id"]
+    assert terminal["id"] == event_envelope(_state(scenario.kernel), "boundary", ["completed", close_id, receipt_id], "")["id"]
     assert terminal["execution_timing_complete"] is publication_recorded
     assert terminal["total_seconds"] == (10 if publication_recorded else None)
     assert terminal["recorded_execution_seconds"] == (10 if publication_recorded else 5)
@@ -121,50 +123,41 @@ def test_sender_terminal_uses_original_close_whole_effort_and_keeps_unknown_publ
     assert terminal["effort"]["review"]["execution_seconds"] == 3
     assert terminal["effort"]["development"]["rounds"] == terminal["effort"]["review"]["rounds"] == 1
     first = list(captured)
-    _observe(scenario, tmp_path, captured)
+    _observe(scenario.kernel, tmp_path, captured)
     assert captured == first
 
 
-def test_sender_compresses_real_development_to_review_and_preserves_gate_budget_and_return_order(tmp_path, monkeypatch):
-    from support import offline
-    original_create = offline.create_kernel
-
-    def detailed(path, spec, **kwargs):
-        assert spec.inputs is not None
-        inputs = replace(spec.inputs, notifications={**spec.inputs.notifications, "mode": "detailed"})
-        return original_create(path, replace(spec, inputs=inputs), **kwargs)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(offline, "create_kernel", detailed)
-        scenario = _enabled_scenario(tmp_path, monkeypatch, DeliveryKind.PARENT_ONLY)
+def test_sender_compresses_real_development_to_review_and_preserves_gate_budget_and_return_order(tmp_path):
+    kernel = _kernel(tmp_path)
+    operations = _operations(kernel, kernel.claim_executor("notification-consumer"))
     entered, release = Event(), Event()
     sent = []
     transport_errors, gate_ids = ObserverErrors(), []
 
     def transport(*_args, **_kwargs):
         with transport_errors.capture():
-            event = _active(tmp_path, scenario.spec.run_id)
+            event = _active(tmp_path, kernel.storage.run_id)
             if not sent:
                 sent.append(event)
                 entered.set()
                 assert release.wait(15)
             else:
-                document = outbox.read_notifications(tmp_path, scenario.spec.run_id)
+                document = outbox.read_notifications(tmp_path, kernel.storage.run_id)
                 assert any(record["id"] == sent[0]["id"] and record["outcome"] == "success" for record in document["records"])
                 sent.append(event)
             return {"outcome": "success", "reason": None}
 
-    observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
+    observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport, storage=kernel.storage)
     observed = []
 
     def started(call):
         observe_and_wait(observer, timeout=5)
-        document = outbox.read_notifications(tmp_path, scenario.spec.run_id)
+        document = outbox.read_notifications(tmp_path, kernel.storage.run_id)
         if call.role == Role.DEVELOPMENT:
-            item, = [item for item in document["pending"] if item["event"]["kind"] == "parent_started"]
+            item, = [item for item in document["pending"] if item["event"]["kind"] == "ticket_started"]
             observed.append((item["event"]["id"], item["deadline_at"]))
-            with outbox.transaction(tmp_path, scenario.spec.run_id) as journal:
-                outbox.enqueue(journal, event_envelope(_state(scenario), "stage_start", "unknown-origin-0", "Unknown recorded origin"), time.time())
+            with outbox.transaction(tmp_path, kernel.storage.run_id) as journal:
+                outbox.enqueue(journal, event_envelope(_state(kernel), "stage_start", "unknown-origin-0", "Unknown recorded origin"), time.time())
                 journal["unavailable_reason"] = "Original local delivery interruption"
         elif call.role == Role.REVIEW:
             old_id, deadline = observed[0]
@@ -175,14 +168,14 @@ def test_sender_compresses_real_development_to_review_and_preserves_gate_budget_
             # The original physical call still owns the single send slot.
             # The observation worker can project without a test-held condition.
             unknown = []
-            with outbox.transaction(tmp_path, scenario.spec.run_id) as journal:
+            with outbox.transaction(tmp_path, kernel.storage.run_id) as journal:
                 while len(journal["pending"]) < outbox.MAX_PENDING:
-                    event = event_envelope(_state(scenario), "stage_start", f"unknown-origin-{len(unknown) + 1}", "Capacity-only unknown")
+                    event = event_envelope(_state(kernel), "stage_start", f"unknown-origin-{len(unknown) + 1}", "Capacity-only unknown")
                     unknown.append(event["id"])
                     outbox.enqueue(journal, event, time.time())
-            assert scenario.kernel.control("stop", "protect-current-gate", subject=scenario.delivery.key) == "applied"
+            assert kernel.control("stop", "protect-current-gate", subject=call.subject) == "applied"
             observe_and_wait(observer, timeout=5)
-            document = outbox.read_notifications(tmp_path, scenario.spec.run_id)
+            document = outbox.read_notifications(tmp_path, kernel.storage.run_id)
             assert len(document["pending"]) <= outbox.MAX_PENDING
             gates = [item for item in document["pending"] if item["event"]["kind"] == "boundary"]
             assert len(gates) == 1 and gates[0]["important"] is True and gates[0]["attempts"] == 0
@@ -196,11 +189,17 @@ def test_sender_compresses_real_development_to_review_and_preserves_gate_budget_
     try:
         try:
             assert entered.wait(5)
-            _recorded_agents(scenario, monkeypatch, started=started)
-            for _ in range(40):
-                scenario.step()
-                if len(observed) == 2:
-                    break
+            development = operations.once().call
+            process = start_worker(kernel, operations, development)
+            started(development)
+            finish_worker(kernel, development, process)
+            assert operations.once().kind == "progress"
+            consume_local_result(kernel, operations, development.subject, "candidate")
+            consume_local_result(kernel, operations, development.subject, "validation_checkout")
+            review = operations.once().call
+            assert review.role == Role.REVIEW
+            start_worker(kernel, operations, review)
+            started(review)
             assert len(observed) == 2
         finally:
             release.set()
@@ -212,7 +211,7 @@ def test_sender_compresses_real_development_to_review_and_preserves_gate_budget_
         # The sender can turn a transport assertion into unknown. Preserve the
         # actual exception above and show only its exact first/Gate journal facts.
         from support.notification import sender_attempt_note
-        sender_attempt_note(error, tmp_path, scenario.spec.run_id,
+        sender_attempt_note(error, tmp_path, kernel.storage.run_id,
                             first_id=sent[0]['id'] if sent else None, gate_ids=gate_ids)
         raise
 

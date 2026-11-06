@@ -395,7 +395,7 @@ def test_quiet_wakes_preserve_slow_status_and_actual_important_gate_preempts_it(
     monkeypatch.setattr(NativeNotifications, '_page', page)
     monkeypatch.setattr(StatusComments, '_deliver_projection', status)
     monkeypatch.setattr('agent_run.notifications.sender.status_subjects', lambda *_args, **_kwargs: ['native-ticket'])
-    monkeypatch.setattr('agent_run.notifications.status_comment.project_status',
+    monkeypatch.setattr('agent_run.notifications.sender.project_status',
         lambda *_args, **_kwargs: SimpleNamespace(target=SimpleNamespace(key='original-status'), body='unchanged copy'))
     observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport, storage=kernel.storage)
     try:
@@ -457,7 +457,7 @@ def test_status_handoff_does_not_consume_the_only_feishu_recovery_wake(tmp_path,
 
     monkeypatch.setattr(notifications, 'read_boundaries', unavailable)
     monkeypatch.setattr(notifications, 'status_subjects', lambda *_args, **_kwargs: ['native-ticket'])
-    monkeypatch.setattr('agent_run.notifications.status_comment.project_status',
+    monkeypatch.setattr('agent_run.notifications.sender.project_status',
         lambda *_args, **_kwargs: SimpleNamespace(target=SimpleNamespace(key='original-status'), body='unchanged copy'))
     monkeypatch.setattr(StatusComments, '_deliver_projection', status)
     observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport, storage=kernel.storage)
@@ -525,7 +525,7 @@ def test_continuous_quiet_wakes_cannot_starve_important_send_or_status(tmp_path,
     monkeypatch.setattr(NativeNotifications, '_wake_pending', wake)
     monkeypatch.setattr(StatusComments, '_deliver_projection', status)
     monkeypatch.setattr('agent_run.notifications.sender.status_subjects', lambda *_args, **_kwargs: ['native-ticket'])
-    monkeypatch.setattr('agent_run.notifications.status_comment.project_status',
+    monkeypatch.setattr('agent_run.notifications.sender.project_status',
         lambda *_args, **_kwargs: SimpleNamespace(target=SimpleNamespace(key='original-status'), body='unchanged copy'))
     observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport, storage=kernel.storage)
     try:
@@ -592,7 +592,7 @@ def test_continuous_quiet_wakes_share_ordinary_feishu_and_status_opportunities(t
     monkeypatch.setattr(StatusComments, '_deliver_projection', status)
     monkeypatch.setattr('agent_run.notifications.sender.status_subjects', lambda *_a, **_k: ['native-ticket'])
     # Real changing display copy keeps Status eligible while the ordinary event waits.
-    monkeypatch.setattr('agent_run.notifications.status_comment.project_status',
+    monkeypatch.setattr('agent_run.notifications.sender.project_status',
         lambda *_a, **_k: SimpleNamespace(target=SimpleNamespace(key='original-status'), body=f'copy {len(ticks)}'))
     observer = NativeNotifications(kernel.storage.path, tmp_path, transport=transport, storage=kernel.storage)
     try:
@@ -625,7 +625,7 @@ def test_status_only_start_failure_recovers_its_durable_diagnostic(tmp_path, mon
 
     monkeypatch.setattr(Thread, 'start', start)
     monkeypatch.setattr('agent_run.notifications.sender.status_subjects', lambda *_a, **_k: ['native-ticket'])
-    monkeypatch.setattr('agent_run.notifications.status_comment.project_status',
+    monkeypatch.setattr('agent_run.notifications.sender.project_status',
         lambda *_a, **_k: SimpleNamespace(target=SimpleNamespace(key='original-status'), body='current copy'))
     monkeypatch.setattr(StatusComments, '_deliver_projection',
         lambda *_a, **_k: delivered.set() or 'unchanged')
