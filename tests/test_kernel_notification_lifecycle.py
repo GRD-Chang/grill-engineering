@@ -9,12 +9,13 @@ import pytest
 import agent_run.storage.notification_outbox as outbox
 from agent_run.model import DeliveryKind
 from agent_run.notifications.sender import NativeNotifications
+from agent_run.notifications.envelope import event_copy
 from agent_run.config.defaults import UserDefaultsStore
 from support.notification import _enabled_scenario, observe_and_wait
 
 
 @pytest.mark.parametrize("kind", [DeliveryKind.PARENT_ONLY, DeliveryKind.FINAL_RUN])
-def test_formal_acceptance_notification_waits_for_real_promotion(
+def test_acceptance_and_terminal_notifications_follow_committed_delivery_boundaries(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: DeliveryKind) -> None:
     scenario = _enabled_scenario(tmp_path, monkeypatch, kind)
     sent: list[dict[str, Any]] = []
@@ -24,12 +25,12 @@ def test_formal_acceptance_notification_waits_for_real_promotion(
         sent.append(rendered)
         return {"outcome": "success", "reason": None}
 
-    def observed_acceptances() -> list[dict[str, Any]]:
+    def observe(kind: str = "acceptance_passed") -> list[dict[str, Any]]:
         observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
         observer.close()
         assert observer.failure_reason is None
         return [row for row in outbox.read_notifications(tmp_path, scenario.spec.run_id)["records"]
-                if row["kind"] == "acceptance_passed"]
+                if row["kind"] == kind]
 
     # The real core first consumes a passing initial Reviewer, before its Git
     # integration and formal delivery promotion. That raw verdict is not yet
@@ -41,9 +42,9 @@ def test_formal_acceptance_notification_waits_for_real_promotion(
         assert step.kind not in {"paused", "waiting", "complete", "approval"}
     else:
         pytest.fail("No initial Reviewer reached")
-    assert observed_acceptances() == []
+    assert observe() == []
     assert scenario.step().kind == "progress"  # Consume that original raw.
-    assert observed_acceptances() == []
+    assert observe() == []
 
     # Follow the actual shared delivery path through confirmed local Git
     # integration and, for Final Run, publication of its Run Branch.
@@ -54,13 +55,52 @@ def test_formal_acceptance_notification_waits_for_real_promotion(
         assert step.kind not in {"paused", "waiting", "complete", "approval"}
     else:
         pytest.fail("No formal publication boundary reached")
-    accepted = observed_acceptances()
+    accepted = observe()
     assert len(accepted) == 1
     assert accepted[0]["outcome"] == "success"
-    assert observed_acceptances() == accepted  # No new budget after reopening.
+    assert observe() == accepted  # No new budget after reopening.
+
+    # The same real delivery now verifies close, cleanup and completion.
+    closed = []
+    original_execute = scenario.port.execute
+
+    def execute(effect, authorize=None):
+        result = original_execute(effect, authorize)
+        if effect.subject == scenario.delivery.key and effect.operation == "close":
+            assert observe("boundary") == []  # Remote close is not yet consumed.
+            closed.append(effect)
+        return result
+
+    monkeypatch.setattr(scenario.port, "execute", execute)
+    for _ in range(100):
+        step = scenario.step()
+        if step.kind == "approval":
+            scenario.kernel.control("approve", "original-approval", subject=scenario.delivery.key, world=scenario.world())
+            continue
+        if closed:
+            break
+        assert step.kind not in {"paused", "waiting", "complete"}
+    else:
+        pytest.fail("Original close operation not reached")
+    assert scenario.step().kind == "progress"
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        assert tx.one("SELECT state FROM resource_cleanup WHERE subject=?", (scenario.delivery.key,))[0] != "complete"
+        assert tx.one("SELECT count(*) FROM effects WHERE subject=? AND operation='close' AND status='confirmed'", (scenario.delivery.key,))[0] == 1
+    pending = observe("boundary")
+    assert len(pending) == 1
+    assert sent[-1]["header"]["template"] == "yellow"
+    assert sent[-1]["header"]["title"]["content"] == event_copy({"language": "en"}, "cleanup")
+    assert observe("boundary") == pending
 
     assert scenario.run(approve=True).kind == "complete"
-    assert observed_acceptances() == accepted
+    completed = observe("boundary")
+    assert len(completed) == 2 and completed[0] == pending[0]
+    assert completed[1]["id"] != completed[0]["id"]
+    assert sent[-1]["header"]["template"] == "green"
+    assert sent[-1]["header"]["title"]["content"] == event_copy({"language": "en"}, "completed")
+    assert "/pull/" in str(sent[-1])
+    assert observe("boundary") == completed
+    assert observe() == accepted
 
 
 @pytest.mark.parametrize("changed_branch", ["source", "target"])

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.model import AgentCall, DeliveryKind, Issue, ParentIssue, Requirements, Role, Step
+from agent_run.model import AgentCall, Commit, Delivery, DeliveryKind, Issue, ParentIssue, Requirements, Role, RunSpec, Step
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.model import wire_json
@@ -11,13 +11,23 @@ from support.offline import GraphScenario, Scenario
 from support.notification import recorded_agents as _recorded_agents, _project
 
 
+def _activity_kernel(root: Path, kind: DeliveryKind = DeliveryKind.PARENT_ONLY):
+    """Real allocation/activity facts; these tests never need a Git effect."""
+    from support.core_operations import native_agent_fixture
+
+    base = Commit("base", "tree")
+    delivery = Delivery("activity", kind, 2 if kind == DeliveryKind.TICKET else 1,
+                        "requirement", base, "refs/heads/source", "refs/heads/target")
+    return native_agent_fixture(root / "kernel.sqlite3", RunSpec(
+        "activity-run", "example/project", 1, "parent", "graph", (delivery,)))
+
+
 @pytest.mark.parametrize("kind", [DeliveryKind.TICKET, DeliveryKind.PARENT_ONLY])
 def test_bootstrap_binding_is_not_an_actual_start_and_first_activity_is_unique(tmp_path, kind):
     from support.core_operations import CoreOperations
 
-    scenario = Scenario(tmp_path, kind)
-    kernel = scenario.kernel
-    operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
+    kernel, ports = _activity_kernel(tmp_path, kind)
+    operations = CoreOperations(kernel, kernel.claim_executor("activity-owner"), lambda _binding: ports)
     step = operations.until(lambda step: step.call is not None)
     call = step.call
     assert call is not None and kernel.dispatch_agent(call)
@@ -89,10 +99,11 @@ def test_pre_go_source_rejection_reaps_its_real_bootstrap_without_start_notifica
 @pytest.mark.parametrize("old_observer", [False, True])
 def test_late_stopped_activity_does_not_take_the_first_start_or_resume_milestone(tmp_path, monkeypatch, whole_run, old_observer):
     from agent_run.queries.run import read
+    from agent_run.core.operation_runner import observe_control
     from support.core_operations import CoreOperations
 
-    scenario = Scenario(tmp_path, DeliveryKind.PARENT_ONLY)
-    kernel = scenario.kernel
+    kernel, ports = _activity_kernel(tmp_path)
+    execution = kernel.claim_executor("activity-owner")
     now = [100.0]
     kernel.clock = lambda: now[0]
     if old_observer:
@@ -103,7 +114,7 @@ def test_late_stopped_activity_does_not_take_the_first_start_or_resume_milestone
                 record(tx, subject, kind, identity, material, **kwargs)
 
         monkeypatch.setattr(kernel, "_event", without_observer_trigger)
-    operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
+    operations = CoreOperations(kernel, execution, lambda _binding: ports)
     first = operations.until(lambda step: step.call is not None).call
     assert first is not None and kernel.dispatch_agent(first)
     operations.runner.authorize_agent(first)
@@ -120,12 +131,13 @@ def test_late_stopped_activity_does_not_take_the_first_start_or_resume_milestone
     assert not any(event["kind"] == "parent_started" for event in _project(kernel, "concise"))
     kernel.agent_exited(first, process, 1, failure="Controlled stopped process", failure_kind="fatal")
     if whole_run:
-        kernel.confirm_executor_exit(scenario.execution)
+        kernel.confirm_executor_exit(execution)
     now[0] = 102.0
-    assert kernel.control("resume", "resume-original", subject=scope, world=scenario.world()) == "applied"
+    world = observe_control(kernel, first.subject, lambda _binding: ports)
+    assert kernel.control("resume", "resume-original", subject=scope, world=world) == "applied"
     if whole_run:
-        scenario.execution = kernel.claim_executor("recovered-owner")
-    operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
+        execution = kernel.claim_executor("recovered-owner")
+    operations = CoreOperations(kernel, execution, lambda _binding: ports)
     resumed = operations.until(lambda step: step.call is not None).call
     assert resumed is not None and resumed.attempt_id == first.attempt_id
     assert resumed.invocation_id != first.invocation_id and kernel.dispatch_agent(resumed)
@@ -160,10 +172,12 @@ def test_activity_start_respects_the_original_invocation_deadline(
 ):
     import json
     from agent_run.cli.main import main
+    from agent_run.queries.run import read
+    from agent_run.core.operation_runner import observe_control
     from support.core_operations import CoreOperations
 
-    scenario = Scenario(tmp_path, DeliveryKind.PARENT_ONLY)
-    kernel = scenario.kernel
+    kernel, ports = _activity_kernel(tmp_path)
+    execution = kernel.claim_executor("activity-owner")
     now = [100.0]
     kernel.clock = lambda: now[0]
     if old_observer:
@@ -174,7 +188,7 @@ def test_activity_start_respects_the_original_invocation_deadline(
                 record(tx, subject, kind, identity, material, **kwargs)
 
         monkeypatch.setattr(kernel, "_event", without_observer_trigger)
-    operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
+    operations = CoreOperations(kernel, execution, lambda _binding: ports)
     first = operations.until(lambda step: step.call is not None).call
     assert first is not None and kernel.dispatch_agent(first)
     operations.runner.authorize_agent(first)
@@ -190,7 +204,7 @@ def test_activity_start_respects_the_original_invocation_deadline(
         kernel.agent_exited(first, process, 1, failure="Controlled stopped fixture", failure_kind="fatal")
         now[0] = 103.0
         assert kernel.control("resume", "resume-deadline", subject=first.subject,
-                              world=scenario.world()) == "applied"
+                              world=observe_control(kernel, first.subject, lambda _binding: ports)) == "applied"
         call = operations.until(lambda step: step.call is not None).call
         assert call is not None and call.attempt_id == first.attempt_id
         assert call.invocation_id != first.invocation_id and call.thread_id == first.thread_id
@@ -210,8 +224,12 @@ def test_activity_start_respects_the_original_invocation_deadline(
         # Reading later must preserve a real in-deadline start, without granting
         # an expired observation a fresh interval or another Development charge.
         now[0] = deadline + 2
-        assert main(["status", scenario.spec.run_id, "--state-dir", str(kernel.storage.path), "--json"]) == 0
-        data = json.loads(capsys.readouterr().out)
+        if resumed and old_observer and offset == -1:
+            # One public CLI contract; the rule matrix uses its real query directly.
+            assert main(["status", kernel.storage.run_id, "--state-dir", str(kernel.storage.path), "--json"]) == 0
+            data = json.loads(capsys.readouterr().out)
+        else:
+            data = read(kernel.storage.path, "status", storage=kernel.storage).data
         if resumed:
             facts = data["latest_resume"]["resume"]
             assert (facts["progress"] is not None) is (offset < 0)
@@ -356,102 +374,104 @@ def test_completed_ticket_effort_spans_budget_renewal_without_recounting_resume(
     assert _project(scenario.kernel, "concise") == projected
 
 
-@pytest.mark.parametrize("mode", ["detailed", "concise"])
 def test_role_events_require_real_start_and_consumption_and_do_not_duplicate_first_start(
-    tmp_path: Path, mode: str, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scenario = GraphScenario(tmp_path, Requirements(
         ParentIssue(1, "Parent", "Original scope", (2,)),
         (Issue(2, "Ticket", "Original task", "OPEN", labels=("ready-for-agent",)),)))
     _recorded_agents(scenario, monkeypatch)
-    consumed: list[str] = []
+    modes = ("detailed", "concise")
+    consumed: dict[str, list[str]] = {mode: [] for mode in modes}
     for _ in range(100):
         step = scenario.step()
         if step.kind == "agent":
-            # The explicit synthetic Agent seam recorded dispatch/start/raw/exit.
-            # The next real Core advance has not consumed the result.
+            # Project both modes from one real producer, before and after consume.
             assert step.call is not None
-            before = _project(scenario.kernel, mode)
-            assert sum(event["kind"] == "ticket_started" for event in before) == 1
-            assert not any(event["kind"] == "stage_start" and event.get("role") == "development" for event in before)
-            assert not any(event["kind"] == "stage_end" and event.get("attempt_id") == step.call.attempt_id for event in before)
+            for mode in modes:
+                before = _project(scenario.kernel, mode)
+                assert sum(event["kind"] == "ticket_started" for event in before) == 1
+                assert not any(event["kind"] == "stage_start" and event.get("role") == "development" for event in before)
+                assert not any(event["kind"] == "stage_end" and event.get("attempt_id") == step.call.attempt_id for event in before)
             assert scenario.step().kind == "progress"
-            after = _project(scenario.kernel, mode)
-            ended = [event for event in after if event["kind"] == "stage_end" and event.get("attempt_id") == step.call.attempt_id]
-            assert len(ended) == (1 if mode == "detailed" else 0)
-            if ended:
-                assert ended[0]["role"] == step.call.role.value
-                consumed.append(ended[0]["role"])
-                if step.call.role.value == "publication":
-                    assert ended[0]["status_code"] == "publication_artifact"
-                    assert not any(event["kind"] == "pr_created" for event in after)
+            for mode in modes:
+                after = _project(scenario.kernel, mode)
+                ended = [event for event in after if event["kind"] == "stage_end" and event.get("attempt_id") == step.call.attempt_id]
+                assert len(ended) == (1 if mode == "detailed" else 0)
+                if ended:
+                    assert ended[0]["role"] == step.call.role.value
+                    consumed[mode].append(ended[0]["role"])
+                    if step.call.role.value == "publication":
+                        assert ended[0]["status_code"] == "publication_artifact"
+                        assert not any(event["kind"] == "pr_created" for event in after)
         else:
             assert step.kind not in {"paused", "waiting"}, step
-        # Stop sampling this Ticket only after its actual Completion/cleanup.
-        # The next global operation may legitimately admit Final; no global
-        # quiescence or subject-selected transition is manufactured here.
         ticket = scenario.kernel.status("ticket:2")
         if (ticket["phase"] == "complete" and ticket["resource_cleanup"] is not None
                 and ticket["resource_cleanup"]["state"] == "complete"):
             break
     else:
         raise AssertionError("The real Ticket pipeline did not finish")
-    projected = _project(scenario.kernel, mode)
-    assert sum(event["kind"] == "ticket_started" for event in projected) == 1
-    assert sum(event["kind"] == "ticket_completed" for event in projected) == 1
-    assert sum(event["kind"] == "pr_created" for event in projected) == (1 if mode == "detailed" else 0)
-    assert consumed == (["development", "review", "publication"] if mode == "detailed" else [])
-    assert [event["role"] for event in projected if event["kind"] == "stage_start"] == (
-        ["review", "publication"] if mode == "detailed" else [])
-    assert _project(scenario.kernel, mode) == projected
+    for mode in modes:
+        projected = _project(scenario.kernel, mode)
+        assert sum(event["kind"] == "ticket_started" for event in projected) == 1
+        assert sum(event["kind"] == "ticket_completed" for event in projected) == 1
+        assert sum(event["kind"] == "pr_created" for event in projected) == (1 if mode == "detailed" else 0)
+        assert consumed[mode] == (["development", "review", "publication"] if mode == "detailed" else [])
+        assert [event["role"] for event in projected if event["kind"] == "stage_start"] == (
+            ["review", "publication"] if mode == "detailed" else [])
+        assert _project(scenario.kernel, mode) == projected
 
 
-@pytest.mark.parametrize("mode", ["detailed", "concise"])
-def test_full_run_first_review_and_repair_replace_corresponding_stage_events(tmp_path, monkeypatch, mode):
+def test_full_run_first_review_and_repair_replace_corresponding_stage_events(tmp_path, monkeypatch):
     from agent_run.notifications.envelope import event_copy
 
-    # d847's Final fixture retains a real historical Ticket and Completion.
-    # Its prefix has already passed Review; this script begins at Final Review.
     scenario = Scenario(tmp_path, DeliveryKind.FINAL_RUN, reviews=("fail", "pass"))
     assert scenario.kernel.status("ticket:2")["phase"] == "complete"
     assert len(scenario.kernel.source_status()["completions"]) == 1
+    modes = ("detailed", "concise")
     start_views = {}
 
     def started(call):
         if call.subject == "final:1" and call.role == Role.DEVELOPMENT:
-            start_views[call.attempt_id] = _project(scenario.kernel, mode)
+            start_views[call.attempt_id] = {mode: _project(scenario.kernel, mode) for mode in modes}
 
     _recorded_agents(scenario, monkeypatch, started=started)
     first_review = repair = None
-    planned_id = None
+    planned_ids = {}
     for _ in range(100):
         step = scenario.step()
-        projected = _project(scenario.kernel, mode)
+        projected = {mode: _project(scenario.kernel, mode) for mode in modes}
         if step.call is not None and step.call.role == Role.REVIEW and first_review is None:
             first_review = step.call.attempt_id
-            started = [event for event in projected if event["kind"] == "acceptance_started"]
-            assert len(started) == 1 and started[0]["attempt_id"] == first_review
-            assert not any(event["kind"] == "stage_start" and event.get("attempt_id") == first_review for event in projected)
-            assert not any(event["kind"] == "acceptance_repair" for event in projected)
+            for mode in modes:
+                starts = [event for event in projected[mode] if event["kind"] == "acceptance_started"]
+                assert len(starts) == 1 and starts[0]["attempt_id"] == first_review
+                assert not any(event["kind"] == "stage_start" and event.get("attempt_id") == first_review for event in projected[mode])
+                assert not any(event["kind"] == "acceptance_repair" for event in projected[mode])
             assert scenario.step().kind == "progress"
-            planned = [event for event in _project(scenario.kernel, mode) if event["kind"] == "acceptance_repair"]
-            assert len(planned) == 1 and planned[0]["live"] is False
-            assert planned[0]["title"] == event_copy({"language": "zh"}, "acceptance_repair_planned")
-            planned_id = planned[0]["id"]
-            assert not any(event["kind"] == "stage_end" and event.get("attempt_id") == first_review
-                           for event in _project(scenario.kernel, mode))
+            for mode in modes:
+                after = _project(scenario.kernel, mode)
+                planned = [event for event in after if event["kind"] == "acceptance_repair"]
+                assert len(planned) == 1 and planned[0]["live"] is False
+                assert planned[0]["title"] == event_copy({"language": "zh"}, "acceptance_repair_planned")
+                planned_ids[mode] = planned[0]["id"]
+                assert not any(event["kind"] == "stage_end" and event.get("attempt_id") == first_review for event in after)
         elif step.call is not None and step.call.role == Role.DEVELOPMENT:
             repair = step.call.attempt_id
-            milestones = [event for event in start_views[repair] if event["kind"] == "acceptance_repair"]
-            assert milestones[-1]["live"] is True
-            assert milestones[-1]["title"] == event_copy({"language": "zh"}, "acceptance_repair_active")
-            assert {event["id"] for event in milestones} == {planned_id}
-            assert not any(event["kind"] == "stage_start" and event.get("attempt_id") == repair for event in projected)
-        promoted = [event for event in projected if event["kind"] == "acceptance_passed"]
-        if promoted:
+            for mode in modes:
+                milestones = [event for event in start_views[repair][mode] if event["kind"] == "acceptance_repair"]
+                assert milestones[-1]["live"] is True
+                assert milestones[-1]["title"] == event_copy({"language": "zh"}, "acceptance_repair_active")
+                assert {event["id"] for event in milestones} == {planned_ids[mode]}
+                assert not any(event["kind"] == "stage_start" and event.get("attempt_id") == repair for event in projected[mode])
+        promoted = {mode: [event for event in projected[mode] if event["kind"] == "acceptance_passed"] for mode in modes}
+        if any(promoted.values()):
             assert first_review is not None and repair is not None
-            assert not any(event["kind"] == "stage_end" and event.get("attempt_id") == promoted[0]["attempt_id"]
-                           for event in projected)
+            for mode in modes:
+                assert len(promoted[mode]) == 1
+                assert not any(event["kind"] == "stage_end" and event.get("attempt_id") == promoted[mode][0]["attempt_id"]
+                               for event in projected[mode])
             break
         assert step.kind not in {"paused", "waiting", "approval"}, step
     else:
