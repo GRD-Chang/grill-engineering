@@ -4,14 +4,14 @@ from pathlib import Path
 import pytest
 
 from agent_run.model import DeliveryKind
-from support.offline import Scenario
+from support.run_scoped_kernel import domain_scenario
 
 
 @pytest.mark.parametrize('kind', [DeliveryKind.TICKET, DeliveryKind.PARENT_ONLY])
 def test_conflict_repair_keeps_target_ancestry_through_publication_and_real_merge(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: DeliveryKind,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: DeliveryKind, domain_scenario,
 ) -> None:
-    scenario = Scenario(tmp_path / 'scenario', kind,
+    scenario = domain_scenario(tmp_path / 'scenario', kind,
         edits=({'shared.txt': 'Candidate content\n'}, {'shared.txt': 'Resolved complete content\n'}))
     for _ in range(30):
         if scenario.kernel.status(scenario.delivery.key)['phase'] == 'integration':

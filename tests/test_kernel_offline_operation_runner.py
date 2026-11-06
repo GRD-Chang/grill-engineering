@@ -8,6 +8,7 @@ from agent_run.model import DeliveryKind, Requirements
 from agent_run.errors import KernelError
 from agent_run.model import Issue, ParentIssue
 from support.offline import GraphScenario, Scenario
+from support.run_scoped_kernel import domain_kernel, domain_scenario
 
 
 def test_abandon_terminal_comes_from_core_without_completing_the_delivery(tmp_path: Path) -> None:
@@ -114,8 +115,8 @@ def test_graph_assertion_focus_does_not_select_the_work(tmp_path: Path) -> None:
     assert scenario.kernel.status('ticket:3')['pending_attempt'] is None
 
 
-def test_publication_cut_approval_and_cleanup_use_the_same_runner(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / 'cut', DeliveryKind.PARENT_ONLY, reviews=('fail', 'pass'))
+def test_publication_cut_approval_and_cleanup_use_the_same_runner(tmp_path: Path, domain_scenario) -> None:
+    scenario = domain_scenario(tmp_path / 'cut', DeliveryKind.PARENT_ONLY, reviews=('fail', 'pass'))
     cut = scenario.run(cut='publication_pending')
     assert cut.kind == 'publication_pending'
     assert [call['role'] for call in scenario.role_calls] == ['development', 'review', 'development', 'review']
@@ -134,23 +135,24 @@ def test_graph_ticket_and_final_use_one_runner_with_independent_expected_roles(t
     source = Requirements(ParentIssue(1, 'Parent', 'Deliver the declared ticket.', (2,)), (
         Issue(2, 'Ticket', 'Deliver a tested change.', 'OPEN', frozenset({'ready-for-agent'})),))
     scenario = GraphScenario(tmp_path / 'whole', source)
-    assert scenario.run().kind == 'complete'
-    for _ in range(10):
-        scenario.step()
-        final = scenario.kernel.source_status()['final_subject']
-        if final is not None:
-            scenario.select(final)
-            break
-    else:
-        raise AssertionError('Core did not create Final from the real Completion')
-    assert scenario.run().kind == 'approval'
-    assert scenario.run(approve=True).kind == 'complete'
-    assert [call['role'] for call in scenario.role_calls] == [
-        'development', 'review', 'publication', 'review', 'publication']
-    assert [call['subject'] for call in scenario.role_calls] == [
-        'ticket:2', 'ticket:2', 'ticket:2', 'final:1', 'final:1']
-    assert scenario.kernel.status('ticket:2')['budgets']['requirements']['developments_used'] == 1
-    assert scenario.kernel.status('final:1')['budgets']['integration']['developments_used'] == 0
-    assert [write['operation'] for write in scenario.port.writes()].count('merge') == 2
-    assert scenario.port.remote_refs().keys() == {'refs/heads/main'}
-    assert not list((scenario.port.root / 'work').iterdir())
+    with domain_kernel(scenario.kernel) as scenario.kernel:
+        assert scenario.run().kind == 'complete'
+        for _ in range(10):
+            scenario.step()
+            final = scenario.kernel.source_status()['final_subject']
+            if final is not None:
+                scenario.select(final)
+                break
+        else:
+            raise AssertionError('Core did not create Final from the real Completion')
+        assert scenario.run().kind == 'approval'
+        assert scenario.run(approve=True).kind == 'complete'
+        assert [call['role'] for call in scenario.role_calls] == [
+            'development', 'review', 'publication', 'review', 'publication']
+        assert [call['subject'] for call in scenario.role_calls] == [
+            'ticket:2', 'ticket:2', 'ticket:2', 'final:1', 'final:1']
+        assert scenario.kernel.status('ticket:2')['budgets']['requirements']['developments_used'] == 1
+        assert scenario.kernel.status('final:1')['budgets']['integration']['developments_used'] == 0
+        assert [write['operation'] for write in scenario.port.writes()].count('merge') == 2
+        assert scenario.port.remote_refs().keys() == {'refs/heads/main'}
+        assert not list((scenario.port.root / 'work').iterdir())

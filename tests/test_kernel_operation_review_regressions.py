@@ -24,6 +24,7 @@ import pytest
 
 from agent_run.model import DeliveryKind, Effect, EffectResult
 from support.offline import Scenario
+from support.run_scoped_kernel import domain_scenario
 from agent_run.core.operation_contract import ReadUnavailable
 from agent_run.queries.run import read
 from agent_run.adapters.remote import RemoteEffects
@@ -106,9 +107,9 @@ def test_a_read_finishing_after_the_absolute_wait_deadline_allocates_no_agent(
 @pytest.mark.parametrize("command_exit", [0, 7], ids=["actual-zero", "actual-nonzero"])
 @pytest.mark.parametrize("readback_fails", [False, True], ids=["readback-target", "readback-outage"])
 def test_actual_native_push_status_is_audited_once_independently_of_its_readback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command_exit: int, readback_fails: bool,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command_exit: int, readback_fails: bool, domain_scenario,
 ) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
+    scenario = domain_scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
     now = [100.25]
     scenario.kernel.clock = lambda: now[0]
     bare = scenario.port.physical.remote
@@ -219,9 +220,9 @@ raise SystemExit(response.returncode)
 
 
 def test_offline_lost_response_is_unknown_without_an_observed_command_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, domain_scenario,
 ) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
+    scenario = domain_scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
     scenario.kernel.clock = lambda: 100.25
     scenario.port.lose_response.add("pr_write")
     make_ports = scenario.make_ports

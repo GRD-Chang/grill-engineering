@@ -17,6 +17,7 @@ from agent_run.errors import DeliveryPolicyError, KernelError
 from agent_run.model import Issue, ParentIssue, Policy, Requirements, wire_json
 from agent_run.queries.run import read
 from support.offline import GraphScenario, Scenario
+from support.run_scoped_kernel import domain_kernel, domain_scenario
 from support.core_operations import CoreOperations
 
 
@@ -139,59 +140,60 @@ def test_sibling_progress_does_not_renew_wait_and_stop_cannot_start_repair(tmp_p
         Issue(n, f"Ticket {n}", "Work", "OPEN", frozenset({"ready-for-agent"})) for n in (2, 3)))
     scenario = GraphScenario(tmp_path / "graph", source,
                              policy=Policy(required_checks_wait_seconds=120, concurrency=2))
-    scenario.checks[:] = ["pending"]
-    scenario.kernel.clock = lambda: 100
-    assert scenario.run().reason == "required_checks"
-    first = read(scenario.kernel.storage.path, 'status', storage=scenario.kernel.storage).data["supervision_windows"][0]
-    scenario.kernel.clock = lambda: 110
-    for _ in range(60):
-        scenario.step()
-        if scenario.kernel.status("ticket:3")["phase"] == "integration":
-            break
-    else:
-        raise AssertionError("Sibling did not finish independent development and review")
-    windows = read(scenario.kernel.storage.path, 'status', storage=scenario.kernel.storage).data["supervision_windows"]
-    assert len(windows) == 1  # The first Ticket correctly owns the single integration seat.
-    assert (windows[0]["scope_id"], windows[0]["deadline"]) == (first["scope_id"], 220)
-    assert scenario.kernel.status("ticket:2")["holds_integration"]
-    assert not scenario.kernel.status("ticket:3")["holds_integration"]
-
-    # Finish the first PR, then the second PR gets its own full interval.
-    make_ports = scenario.make_ports
-    def selected(binding):
-        ports = make_ports(binding)
-        delivery = ports.delivery
-        def physical(request):
-            facts = delivery(request)
-            if request.source_ref == "refs/heads/ticket-3" and facts.checks is not None:
-                return replace(facts, checks=replace(facts.checks, result="pending", details=(("required", "pending"),)))
-            return facts
-        ports.delivery = physical
-        return ports
-    scenario.make_ports = selected
-    scenario.checks[:] = ["pass"]
-    scenario.kernel.clock = lambda: 120
-    for _ in range(100):
-        scenario.step()
+    with domain_kernel(scenario.kernel) as scenario.kernel:
+        scenario.checks[:] = ["pending"]
+        scenario.kernel.clock = lambda: 100
+        assert scenario.run().reason == "required_checks"
+        first = read(scenario.kernel.storage.path, 'status', storage=scenario.kernel.storage).data["supervision_windows"][0]
+        scenario.kernel.clock = lambda: 110
+        for _ in range(60):
+            scenario.step()
+            if scenario.kernel.status("ticket:3")["phase"] == "integration":
+                break
+        else:
+            raise AssertionError("Sibling did not finish independent development and review")
         windows = read(scenario.kernel.storage.path, 'status', storage=scenario.kernel.storage).data["supervision_windows"]
-        if any(w["subject"] == "ticket:3" and w["kind"] == "required_checks" for w in windows):
-            break
-    else:
-        raise AssertionError("Second PR did not start its own pending checks window")
-    second, = [w for w in windows if w["subject"] == "ticket:3"]
-    assert (second["started_at"], second["deadline"]) == (120, 240)
-    assert second["scope_id"] != first["scope_id"]
-    roles = len(scenario.role_calls)
-    writes = scenario.port.writes()
-    scenario.kernel.control("stop", "stop-pending-ci")
-    scenario.checks[:] = ["fail"]
-    with pytest.raises(KernelError, match="executor_fenced"):
-        scenario.step()
-    assert len(scenario.role_calls) == roles and scenario.port.writes() == writes
+        assert len(windows) == 1  # The first Ticket correctly owns the single integration seat.
+        assert (windows[0]["scope_id"], windows[0]["deadline"]) == (first["scope_id"], 220)
+        assert scenario.kernel.status("ticket:2")["holds_integration"]
+        assert not scenario.kernel.status("ticket:3")["holds_integration"]
+
+        # Finish the first PR, then the second PR gets its own full interval.
+        make_ports = scenario.make_ports
+        def selected(binding):
+            ports = make_ports(binding)
+            delivery = ports.delivery
+            def physical(request):
+                facts = delivery(request)
+                if request.source_ref == "refs/heads/ticket-3" and facts.checks is not None:
+                    return replace(facts, checks=replace(facts.checks, result="pending", details=(("required", "pending"),)))
+                return facts
+            ports.delivery = physical
+            return ports
+        scenario.make_ports = selected
+        scenario.checks[:] = ["pass"]
+        scenario.kernel.clock = lambda: 120
+        for _ in range(100):
+            scenario.step()
+            windows = read(scenario.kernel.storage.path, 'status', storage=scenario.kernel.storage).data["supervision_windows"]
+            if any(w["subject"] == "ticket:3" and w["kind"] == "required_checks" for w in windows):
+                break
+        else:
+            raise AssertionError("Second PR did not start its own pending checks window")
+        second, = [w for w in windows if w["subject"] == "ticket:3"]
+        assert (second["started_at"], second["deadline"]) == (120, 240)
+        assert second["scope_id"] != first["scope_id"]
+        roles = len(scenario.role_calls)
+        writes = scenario.port.writes()
+        scenario.kernel.control("stop", "stop-pending-ci")
+        scenario.checks[:] = ["fail"]
+        with pytest.raises(KernelError, match="executor_fenced"):
+            scenario.step()
+        assert len(scenario.role_calls) == roles and scenario.port.writes() == writes
 
 
-def test_budget_checkpoint_explicit_wait_override_only_changes_future_windows(tmp_path):
-    scenario = Scenario(tmp_path / "checkpoint", DeliveryKind.PARENT_ONLY, reviews=("fail",),
+def test_budget_checkpoint_explicit_wait_override_only_changes_future_windows(tmp_path, domain_scenario):
+    scenario = domain_scenario(tmp_path / "checkpoint", DeliveryKind.PARENT_ONLY, reviews=("fail",),
                         checks=("pending",), policy=Policy(parent_rounds=1, required_checks_wait_seconds=60))
     kernel, subject = scenario.kernel, scenario.delivery.key
     paused = scenario.run()
