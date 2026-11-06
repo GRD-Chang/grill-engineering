@@ -27,7 +27,10 @@ class ScopedKernel(Kernel):
         def transaction(*, write=True, ordered=True, cancelled=None, deadline=None):
             assert cancelled is None and deadline is None and not db.in_transaction
             if enforce_readonly:
-                db.execute("PRAGMA query_only=" + ("OFF" if write else "ON"))
+                # Reassigning this flag expires every prepared statement, even
+                # when unchanged. Read the private connection's actual mode.
+                if db.execute("PRAGMA query_only").fetchone()[0] != int(not write):
+                    db.execute("PRAGMA query_only=" + ("OFF" if write else "ON"))
             owner = Transaction(db)
             if record_owners:
                 self.owners.append(owner)
@@ -40,9 +43,6 @@ class ScopedKernel(Kernel):
             except BaseException:
                 db.rollback()
                 raise
-            finally:
-                if enforce_readonly:
-                    db.execute("PRAGMA query_only=OFF")
 
         self.storage = SimpleNamespace(transaction=transaction, path=path, run_id=run)
         self.clock = lambda: 100.
