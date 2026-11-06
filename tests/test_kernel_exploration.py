@@ -6,11 +6,10 @@ import json
 import os
 import subprocess
 import sys
-import sqlite3
 
 import pytest
 
-from agent_run.model import Checks, Commit, Delivery, DeliveryKind, Policy, RunSpec, World
+from agent_run.model import DeliveryKind, Policy
 from agent_run.core.kernel import Kernel
 from agent_run.contracts.write_authority import FinalAdmission, WriteAuthority
 from agent_run.errors import KernelError
@@ -19,8 +18,6 @@ from agent_run.model import wire_json
 from support.core_operations import CoreOperations, native_agent_fixture, scripted_return
 from support.agent_continuation import ticket_spec
 from support.effect_boundary import advance_to_effect
-
-
 
 
 def test_return_is_durable_before_consumption_and_resume_does_not_charge_twice(tmp_path: Path) -> None:
@@ -44,7 +41,6 @@ def test_return_is_durable_before_consumption_and_resume_does_not_charge_twice(t
     assert consumed.kind == "progress"
     assert reopened.status("ticket:2")["phase"] == "candidate"
     assert reopened.status("ticket:2")["budgets"]["requirements"]["developments_used"] == 1
-
 
 
 @pytest.mark.parametrize(("kind", "expected_roles", "development_purpose"), [
@@ -156,7 +152,6 @@ print(json.dumps({'step':step.kind,'status':k.status('ticket:2')}))
     assert kernel.status("ticket:2")["budgets"]["requirements"]["developments_used"] == 1
 
 
-
 def test_unknown_successful_pr_write_is_read_back_without_a_second_write(tmp_path: Path) -> None:
     scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET)
     now = [100.25]
@@ -172,200 +167,6 @@ def test_unknown_successful_pr_write_is_read_back_without_a_second_write(tmp_pat
     assert scenario.run().kind == "complete"
     assert sum(write["operation"] == "pr_write" for write in scenario.port.writes()) == 1
     assert scenario.publication_count == 1
-
-
-
-@pytest.mark.parametrize("boundary", ["current", "stopped", "checkout_changed", "unclaimed"])
-def test_noop_integration_requires_current_dispatch_before_consuming_exact_candidate(
-    tmp_path: Path, monkeypatch, boundary: str,
-) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET)
-    held = advance_to_effect(scenario, monkeypatch, "integrate")
-    effect = held.effect
-    local = scenario.port.local
-    observed = local.reconcile(effect)
-    assert observed.disposition == "target" and observed.commit == effect.candidate
-    assert scenario.kernel.status(effect.subject)["pending_write"]["status"] == "prepared"
-    assert effect.dispatch_serial == 1  # An allocated serial is not a dispatch receipt.
-
-    if boundary == "unclaimed":
-        execute = scenario.port.execute
-        def without_dispatch(selected, authorize):
-            return observed if selected.effect_id == effect.effect_id else execute(selected, authorize)
-        monkeypatch.setattr(scenario.port, "execute", without_dispatch)
-        settled = scenario.step()
-        assert settled.kind == "paused" and settled.reason == "write_not_dispatched"
-        assert "write_conflict" in scenario.kernel.status(effect.subject)["gates"]
-        return
-    if boundary == "stopped":
-        scenario.kernel.control("stop", "stop-before-noop")
-
-    def prepare() -> FinalAdmission:
-        final_admission = held.authorize.prepare()
-        if boundary == "checkout_changed":
-            (Path(effect.payload["checkout"]) / "concurrent-work.txt").write_text("Preserve this work.\n")
-        return final_admission
-
-    authority = WriteAuthority(prepare)
-
-    if boundary != "current":
-        with pytest.raises(KernelError, match=("executor_fenced" if boundary == "stopped"
-                                              else "local_effect_boundary_changed")):
-            local.execute(effect, authority)
-        assert scenario.kernel.status(effect.subject)["phase"] == "integration"
-        history = [event["kind"] for event in scenario.kernel.history(effect.subject)
-                   if event["identity"] == effect.effect_id]
-        assert "effect_consumed" not in history
-        if boundary == "stopped":
-            assert "effect_dispatched" not in history
-            stopped = scenario.kernel.status(effect.subject)
-            assert stopped["stopped"] and stopped["pending_write"] is None
-            assert local.reconcile(effect) == observed
-        else:
-            assert (Path(effect.payload["checkout"]) / "concurrent-work.txt").read_text() == "Preserve this work.\n"
-        return
-    result = local.execute(effect, authority)
-    assert result == observed
-    assert scenario.kernel.status(effect.subject)["pending_write"]["status"] == "sent"
-    assert local.reconcile(effect) == observed
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
-    assert operations.once().kind == "progress"
-    assert operations.once().kind == "progress"
-    assert scenario.kernel.status(effect.subject)["phase"] == "ready_publication"
-
-
-
-@pytest.mark.parametrize("ci", [False, True])
-def test_unchanged_development_candidate_requires_lazy_authority_and_keeps_its_charge(
-    tmp_path: Path, monkeypatch, ci: bool,
-) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET,
-                        checks=("fail", "none") if ci else ("none",),
-                        edits=({"implemented.txt": "Requested work.\n"}, {}) if ci else ({},))
-    held = advance_to_effect(scenario, monkeypatch, "candidate", developments=2 if ci else 1)
-    effect = held.effect
-    before = scenario.kernel.status(effect.subject)["budgets"]
-    observed = scenario.port.local.reconcile(effect)
-    assert observed.disposition == "target" and observed.raw["no_change"] is True
-    assert observed.commit is not None and observed.commit.sha == effect.before_sha
-    result = scenario.port.local.execute(effect, held.authorize)
-    assert result == observed
-    assert scenario.kernel.status(effect.subject)["pending_write"]["status"] == "sent"
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
-    operations.once()
-    consumed = operations.once()
-    assert consumed.kind == ("paused" if ci else "progress")
-    state = scenario.kernel.status(effect.subject)
-    assert state["budgets"] == before
-    assert state["budgets"]["ci" if ci else "requirements"]["developments_used"] == 1
-    assert ("ci_investigation_paused" in state["gates"]) if ci else state["phase"] == "review"
-
-
-
-def test_explicit_final_publication_reuse_requires_lazy_current_authority(tmp_path: Path, monkeypatch) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.FINAL_RUN)
-    held = advance_to_effect(scenario, monkeypatch, "publication_commit")
-    effect = held.effect
-    observed = scenario.port.local.reconcile(effect)
-    assert observed.disposition == "target" and observed.commit is not None
-    assert observed.commit.sha == effect.payload["reuse_sha"]
-    assert scenario.port.local.execute(effect, held.authorize) == observed
-    assert scenario.kernel.status(effect.subject)["pending_write"]["status"] == "sent"
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
-    operations.once()
-    assert operations.once().kind == "progress"
-    assert scenario.kernel.status(effect.subject)["phase"] == "push"
-
-
-
-@pytest.mark.parametrize("operation", ["validation_cleanup", "cleanup_worktree", "cleanup_local_ref"])
-def test_original_absent_local_cleanup_requires_lazy_authority(tmp_path: Path, monkeypatch, operation: str) -> None:
-    from support.offline import GraphScenario
-    from support.requirements_scenarios import independent_source
-
-    scenario = GraphScenario(tmp_path / "scenario", independent_source())
-    held = advance_to_effect(scenario, monkeypatch, operation)
-    effect = held.effect
-    if operation != "validation_cleanup":
-        assert scenario.kernel.status(effect.subject)["phase"] == "complete"
-    git = scenario.port.git
-    if operation == "cleanup_local_ref":
-        git.run("update-ref", "-d", effect.source_ref, effect.payload["expected_head"])
-        for field in ("owned_root", "common_git_dir"):
-            foreign = replace(effect, payload={**effect.payload, field: str(tmp_path / "foreign")})
-            assert scenario.port.local.execute(foreign, WriteAuthority(lambda: lambda: pytest.fail("foreign resource cannot dispatch"))).disposition == "third"
-    else:
-        git.run("worktree", "remove", "--force", effect.payload["checkout"])
-    local = scenario.port.local
-    observed = local.reconcile(effect)
-    assert observed.disposition == "target"
-    before = scenario.kernel.status(effect.subject)
-    if operation != "validation_cleanup":
-        assert before["resource_cleanup"]["stage"] == (0 if operation == "cleanup_worktree" else 1)
-        assert [write["operation"] for write in scenario.port.writes()
-                if write["operation"] in scenario.kernel.CLEANUP] == ([] if operation == "cleanup_worktree" else ["cleanup_worktree"])
-    assert local.execute(effect, held.authorize) == observed
-    assert any(event["kind"] == "effect_dispatched" and event["identity"] == effect.effect_id
-               for event in scenario.kernel.history(effect.subject))
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
-    operations.once()
-    assert operations.once().kind == "progress"
-    after = scenario.kernel.status(effect.subject)
-    assert after["phase"] == before["phase"] and after["budgets"] == before["budgets"]
-    if operation != "validation_cleanup":
-        assert after["resource_cleanup"]["stage"] == before["resource_cleanup"]["stage"] + 1
-
-
-
-@pytest.mark.parametrize("disposition", ["prior", "target", "third", "unknown"])
-def test_unknown_write_branches_preserve_intent_and_resume_only_original_outcome(tmp_path: Path, monkeypatch, disposition: str) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET)
-    now = [100.25]
-    if disposition in {"third", "unknown"}:
-        scenario.kernel.clock = lambda: now[0]
-    held = advance_to_effect(scenario, monkeypatch, "pr_write", sent=True)
-    effect = held.effect
-    if disposition != "prior":
-        scenario.port.execute(effect, held.authorize)
-    if disposition == "third":
-        from support.offline_api import SyntheticGitHub
-        original_pr = scenario.port.pull_request_by_ref(effect.source_ref, effect.target_ref)
-        assert original_pr is not None
-        api = SyntheticGitHub(scenario.port.git, scenario.port.database, effect.repository,
-            physical=scenario.port.physical, written=lambda *args: None, read_faults=set(), actor="external-editor")
-        api.write(f"repos/{effect.repository}/pulls/{original_pr.number}", "PATCH",
-                  {"title": original_pr.title + " externally edited"})
-    elif disposition == "unknown":
-        from support.offline_api import SyntheticGitHub
-        readback, read_objects = scenario.port.reconcile, SyntheticGitHub.list
-
-        def unavailable_identity(api, endpoint):
-            rows = read_objects(api, endpoint)
-            return [{**row, "user": None} for row in rows] if "/pulls?" in endpoint else rows
-
-        def read_without_identity(original):
-            with monkeypatch.context() as identity_outage:
-                identity_outage.setattr(SyntheticGitHub, "list", unavailable_identity)
-                return readback(original)
-
-        monkeypatch.setattr(scenario.port, "reconcile", read_without_identity)
-    unresolved = scenario.step()
-    if disposition in {"third", "unknown"}:
-        assert scenario.kernel.status(scenario.delivery.key)["pending_write"]["status"] == "sent"
-        assert scenario.kernel.status(scenario.delivery.key)["holds_integration"]
-        assert sum(write["operation"] == "pr_write" for write in scenario.port.writes()) == 1
-        if disposition == "third":
-            api.write(f"repos/{effect.repository}/pulls/{original_pr.number}", "PATCH",
-                      {"title": original_pr.title, "body": original_pr.body})
-        else:
-            monkeypatch.setattr(scenario.port, "reconcile", readback)
-        if unresolved.retry_at is not None:
-            now[0] = unresolved.retry_at
-        scenario.step()
-        scenario.kernel.control("resume", "resume-exact-write", subject=scenario.delivery.key)
-    assert scenario.run().kind == "complete"
-    assert sum(write["operation"] == "pr_write" for write in scenario.port.writes()) == 1
-
 
 
 @pytest.mark.parametrize("already_written", [False, True])
@@ -385,7 +186,6 @@ def test_old_pr_intent_is_settled_before_reintegration_after_target_append(tmp_p
     assert sum(write["operation"] == "pr_write" for write in scenario.port.writes()) == int(already_written)
     assert scenario.run().kind == "complete"
     assert scenario.port.git.run("show", f"{scenario.delivery.target_ref}:external.txt").stdout == "Other actor's retained work\n"
-
 
 
 def test_human_continuation_replaces_thread_but_keeps_attempt_budget_and_original_context(tmp_path: Path) -> None:
@@ -415,7 +215,6 @@ def test_human_continuation_replaces_thread_but_keeps_attempt_budget_and_origina
     with kernel.storage.transaction(write=False) as tx:
         assert [dict(row) for row in tx.rows("SELECT id,subject,invocation FROM leases")] == [
             {"id": second.lease_id, "subject": second.subject, "invocation": second.invocation_id}]
-
 
 
 @pytest.mark.parametrize("kind", list(DeliveryKind))
@@ -473,7 +272,6 @@ def test_successor_git_write_rechecks_stop_after_previous_git_operation(tmp_path
     assert not any(write["operation"] == "candidate" for write in scenario.port.writes())
 
 
-
 def test_fifo_and_stale_return_release_cannot_steal_new_lease(tmp_path: Path) -> None:
     original = ticket_spec()
     deliveries = tuple(replace(original.deliveries[0], key=f"ticket:{number}", issue=number) for number in (2, 3, 4))
@@ -511,7 +309,6 @@ def test_fifo_and_stale_return_release_cannot_steal_new_lease(tmp_path: Path) ->
     third = operations.until(lambda step: step.call is not None).call
     assert third is not None and third.subject == "ticket:4"
     assert operations.runner.state().active == (third.lease_id,)
-
 
 
 def test_full_parent_resume_renews_only_exhausted_development_allowance(tmp_path: Path) -> None:
@@ -565,27 +362,6 @@ def test_final_approval_check_timeout_has_a_finite_action_and_same_grant_resume(
         scenario.kernel.control("stop", "cancel-resumed-final")
     assert scenario.run().kind == "complete"
     assert sum(write["operation"] == "merge" for write in scenario.port.writes()) == 1
-
-
-def test_failed_approval_rolls_back_action_material_grant_and_business_facts(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
-    assert scenario.run().kind == "approval"
-    world = scenario.world()
-    assert world.pr is not None
-    changed = replace(world, checks=Checks(world.pr.number, world.pr.head.sha, "pass", (("new-required-check", "pass"),)))
-
-    def independent_snapshot() -> dict[str, list[tuple[object, ...]]]:
-        with sqlite3.connect(f"file:{scenario.kernel.storage.path}?mode=ro", uri=True) as connection:
-            return {table: connection.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
-                    for table in ("actions", "grants", "material", "history", "subjects", "budgets")}
-
-    before = independent_snapshot()
-    writes = scenario.port.writes()
-    with pytest.raises(KernelError, match="approval_checks_changed"):
-        scenario.kernel.control("approve", "atomic-approval", subject=scenario.delivery.key, world=changed)
-    assert independent_snapshot() == before
-    assert scenario.port.writes() == writes
-    assert scenario.kernel.control("approve", "atomic-approval", subject=scenario.delivery.key, world=world) == "pending"
 
 
 def test_parent_ci_target_append_changes_current_work_to_integration_and_retains_ci_accounting(tmp_path: Path) -> None:

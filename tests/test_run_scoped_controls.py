@@ -381,6 +381,18 @@ def test_approve_failure_enters_existing_checks_path_without_grant_or_budget_res
     assert list(db.execute("SELECT * FROM budgets WHERE run_id='A'")) == budgets
 
 
+def test_changed_approval_checks_roll_back_action_material_and_grant(scenario):
+    db, kernels = scenario
+    world = approval(db, 'A')
+    changed = replace(world, checks=Checks(world.pr.number, world.pr.head.sha,
+        'pass', (('new-required-check', 'pass'),)))
+    before = {run: rows(db, run) for run in ('A', 'B')}
+    with pytest.raises(KernelError, match='approval_checks_changed'):
+        kernels['A'].control('approve', 'atomic-approval', subject=SUBJECT, world=changed)
+    assert {run: rows(db, run) for run in ('A', 'B')} == before
+    assert kernels['A'].control('approve', 'atomic-approval', subject=SUBJECT, world=world) == 'pending'
+
+
 def test_base_advance_returns_only_selected_approval_to_existing_integration(scenario):
     db, kernels = scenario
     world = approval(db, 'A')
@@ -418,6 +430,27 @@ def test_requeue_generation_and_source_revision_do_not_clear_sibling_gates(scena
     assert db.execute("SELECT generation,revision,phase FROM subjects WHERE run_id='A'").fetchone()[:] == (2, 'next-A', 'workspace')
     assert db.execute("SELECT blocked,parent_revision FROM runs WHERE id='A'").fetchone()[:] == (None, 'next-A')
     assert db.execute('PRAGMA foreign_key_check').fetchone() is None
+
+
+def test_requeue_requires_original_publication_actor_before_recording_retirement(scenario):
+    db, kernels = scenario
+    world = approval(db, 'A')
+    effect(db, 'A', operation='pr_write', status='confirmed')
+    with kernels['A'].storage.transaction() as tx:
+        receipt_id = tx.put(SUBJECT, 'recorded_publication_input', wire_json({'pr': asdict(world.pr)}))
+        tx.execute("UPDATE effects SET receipt_id=?,pr_number=11 WHERE run_id='A'", (receipt_id,))
+        tx.execute("UPDATE runs SET blocked='requeue_required',observed_parent_revision='next' WHERE id='A'")
+        tx.execute("INSERT INTO gates(run_id,subject,code) VALUES ('A',?,'requeue_required')", (SUBJECT,))
+    world = replace(world, revision='next', parent_revision='next')
+    replacement = Delivery(SUBJECT, DeliveryKind.PARENT_ONLY, 1, 'next', BASE,
+        'refs/heads/new-generation', 'refs/heads/main', checkout='/fixture/new-generation')
+    before = {run: rows(db, run) for run in ('A', 'B')}
+    with pytest.raises(KernelError, match='retirement_pr_changed'):
+        kernels['A'].control('requeue', 'original-publication', subject=SUBJECT,
+            world=replace(world, pr=replace(world.pr, actor='foreign-author')), replacement=replacement)
+    assert {run: rows(db, run) for run in ('A', 'B')} == before
+    assert kernels['A'].control('requeue', 'original-publication', subject=SUBJECT,
+        world=world, replacement=replacement) == 'pending'
 
 
 @pytest.mark.parametrize('boundary', ['requeue_run', 'requeue_job', 'retirement_run', 'retirement_job',

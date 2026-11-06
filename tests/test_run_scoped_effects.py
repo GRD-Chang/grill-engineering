@@ -183,6 +183,76 @@ def test_definite_prior_rearms_only_the_original_intent_and_keeps_three_attempt_
     assert _rows(db, "B") == before_b
 
 
+def test_conflicting_readback_cannot_consume_or_replay_original_write(scenario):
+    db, kernels = scenario
+    kernel = kernels['A']
+    request = _prepare(kernel, 'A', operation='push', after=BASE.sha)
+    assert kernel._dispatch(request.effect, request.work.execution, WORLD, token=request.token)
+    original = db.execute("SELECT payload_id,attempts FROM effects WHERE run_id='A'").fetchone()[:]
+    assert kernel._reconcile(request, EffectResult('third')).reason == 'third'
+    assert db.execute("SELECT status,receipt_id FROM effects WHERE run_id='A'").fetchone()[:] == ('sent', None)
+    assert db.execute("SELECT code FROM gates WHERE run_id='A'").fetchone()[0] == 'write_conflict'
+    with pytest.raises(KernelError, match='unresolved_write_conflict'):
+        kernel.control('resume', 'cannot-replay', subject=SUBJECT)
+    assert not kernel._dispatch(request.effect, request.work.execution, WORLD, token=request.token)
+    assert kernel._reconcile(request, EffectResult('target', commit=BASE)).kind == 'progress'
+    assert db.execute("SELECT payload_id,attempts FROM effects WHERE run_id='A'").fetchone()[:] == original
+
+
+def test_target_without_dispatch_cannot_become_a_consumable_receipt(scenario):
+    db, kernels = scenario
+    request = _prepare(kernels['A'], 'A', operation='integrate', payload={'source_sha': BASE.sha})
+    step = kernels['A']._reconcile(request, EffectResult('target', commit=BASE, expected_tree=BASE.tree))
+    assert (step.kind, step.reason) == ('paused', 'write_not_dispatched')
+    assert db.execute("SELECT status,attempts,receipt_id FROM effects WHERE run_id='A'").fetchone()[:] == ('prepared', 0, None)
+    assert db.execute("SELECT code FROM gates WHERE run_id='A'").fetchone()[0] == 'write_conflict'
+
+
+@pytest.mark.parametrize('purpose', ['requirements', 'ci'])
+def test_no_change_candidate_keeps_its_charge_and_uses_current_purpose(scenario, purpose):
+    db, kernels = scenario
+    db.execute("UPDATE subjects SET kind='ticket',phase='candidate',purpose=? WHERE run_id='A'", (purpose,))
+    db.execute("UPDATE budgets SET purpose=?,developments_used=1 WHERE run_id='A'", (purpose,))
+    before = [tuple(row) for row in db.execute("SELECT * FROM budgets WHERE run_id='A'")]
+    request = _prepare(kernels['A'], 'A', operation='candidate', payload={'parents': [BASE.sha]})
+    assert kernels['A']._dispatch(request.effect, request.work.execution, WORLD, token=request.token)
+    kernels['A']._reconcile(request, EffectResult('target', commit=BASE, raw={'no_change': True}))
+    result = _consume(kernels['A'], request.effect)
+    assert result.kind == ('paused' if purpose == 'ci' else 'progress')
+    assert [tuple(row) for row in db.execute("SELECT * FROM budgets WHERE run_id='A'")] == before
+    assert db.execute("SELECT phase FROM subjects WHERE run_id='A'").fetchone()[0] == ('development' if purpose == 'ci' else 'review')
+    if purpose == 'ci':
+        assert db.execute("SELECT code FROM gates WHERE run_id='A'").fetchone()[0] == 'ci_investigation_paused'
+
+
+def test_reused_final_publication_consumes_exact_receipt_without_refunding_budget(scenario):
+    db, kernels = scenario
+    kernel = kernels['A']
+    db.execute("UPDATE subjects SET kind='final_run',phase='publication_commit',integrated_sha=?,integrated_tree=? WHERE run_id='A'",
+               (BASE.sha, BASE.tree))
+    before = [tuple(row) for row in db.execute("SELECT * FROM budgets WHERE run_id='A'")]
+    request = _prepare(kernel, 'A', operation='publication_commit', payload={'reuse_sha': BASE.sha})
+    assert kernel._dispatch(request.effect, request.work.execution, WORLD, token=request.token)
+    kernel._reconcile(request, EffectResult('target', commit=BASE))
+    assert _consume(kernel, request.effect).kind == 'progress'
+    assert db.execute("SELECT phase,publication_sha FROM subjects WHERE run_id='A'").fetchone()[:] == ('push', BASE.sha)
+    assert [tuple(row) for row in db.execute("SELECT * FROM budgets WHERE run_id='A'")] == before
+
+
+def test_absent_validation_cleanup_preserves_phase_and_budget(scenario):
+    db, kernels = scenario
+    kernel = kernels['A']
+    db.execute("UPDATE subjects SET validation_cleanup='/fixture/review-original' WHERE run_id='A'")
+    before = [tuple(row) for row in db.execute("SELECT * FROM budgets WHERE run_id='A'")]
+    request = _prepare(kernel, 'A', operation='validation_cleanup', payload={
+        'reviewed_commit': BASE.sha, 'checkout': '/fixture/review-original'})
+    assert kernel._dispatch(request.effect, request.work.execution, WORLD, token=request.token)
+    kernel._reconcile(request, EffectResult('target', raw={'reason': 'worktree_absent'}))
+    assert _consume(kernel, request.effect).kind == 'progress'
+    assert db.execute("SELECT phase,validation_cleanup FROM subjects WHERE run_id='A'").fetchone()[:] == ('review', None)
+    assert [tuple(row) for row in db.execute("SELECT * FROM budgets WHERE run_id='A'")] == before
+
+
 def test_failure_audit_is_idempotent_per_run_and_never_becomes_a_receipt(scenario):
     db, kernels = scenario
     a, b = [_prepare(kernels[run], run) for run in ("A", "B")]
