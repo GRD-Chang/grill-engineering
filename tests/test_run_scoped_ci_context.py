@@ -164,6 +164,41 @@ def test_ci_review_keeps_the_original_evidence_and_head_range(scenario, monkeypa
         assert context["review_context"]["review_range"]["base_sha"] == "original-ci-head"
 
 
+@pytest.mark.parametrize("kind", ["ticket", "parent_only", "final_run"])
+@pytest.mark.parametrize("new_failure", [False, True], ids=["same-head-findings", "new-failed-head"])
+def test_ci_review_range_consumes_original_findings_for_each_delivery(scenario, kind, new_failure):
+    db, kernels = scenario
+    kernel = kernels["A"]
+    failure, _ = prepare(db, kernel)
+    db.execute("UPDATE subjects SET kind=? WHERE run_id='A'", (kind,))
+    with kernel.storage.transaction() as tx:
+        run = tx.one("SELECT * FROM runs WHERE id='A'")
+        job = tx.one("SELECT * FROM subjects WHERE run_id='A'")
+        previous = kernel._context(tx, run, job, WORLD, Role.REVIEW)
+        original_context = tx.put(SUBJECT, "original_review_context", wire_json(previous))
+        original_result = tx.put(SUBJECT, "original_review_result", wire_json(review_result("fail")))
+        insert(db, "attempts", {"run_id": "A", "id": "previous-review", "subject": SUBJECT,
+            "generation": 1, "ordinal": 1, "role": "review", "purpose": "ci", "window": 1,
+            "parent_revision": run["parent_revision"], "graph_revision": run["graph_revision"],
+            "revision": job["revision"], "base_sha": previous["base_sha"],
+            "completion_revision": job["completion_revision"], "context_id": original_context,
+            "result_id": original_result, "status": "consumed", "outcome": "fail"})
+        current_failure = (tx.put(SUBJECT, "next_failed_head", wire_json({"head_sha": "new-ci-head"}))
+                           if new_failure else failure)
+        tx.execute("UPDATE subjects SET candidate_sha=?,candidate_tree=?,review_attempt=?,ci_failure=? WHERE run_id='A'",
+            ("c" * 40, "d" * 40, "previous-review", current_failure))
+        job = tx.one("SELECT * FROM subjects WHERE run_id='A'")
+        current = kernel._context(tx, run, job, WORLD, Role.REVIEW)
+        review = current["review_context"]
+        assert review["review_range"] == {
+            "base_sha": "new-ci-head" if new_failure else previous["reviewed_commit"],
+            "candidate_sha": "c" * 40}
+        assert review["facts"]["previous_acceptance_artifact"] == review_result("fail")
+        assert review["facts"]["previous_review_identity"] == previous["review_context"]["facts"]["current_review_identity"]
+        assert review["facts"]["current_review_identity"]["reviewed_candidate_sha"] == "c" * 40
+        assert json.loads(tx.get(original_context, SUBJECT)) == previous
+
+
 @pytest.mark.parametrize("role", [Role.DEVELOPMENT, Role.PUBLICATION])
 @pytest.mark.parametrize("damage", ["missing", "digest", "foreign"])
 def test_first_ci_material_read_still_rejects_invalid_original_evidence(scenario, monkeypatch, damage, role):

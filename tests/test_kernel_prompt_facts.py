@@ -175,20 +175,15 @@ def test_findings_review_uses_previous_actual_result_and_current_development(tmp
     assert scenario.port.git.run("rev-parse", "HEAD", cwd=checkout).stdout.strip() == rereview.context["reviewed_commit"]
 
 
-@pytest.mark.parametrize("kind", [DeliveryKind.TICKET, DeliveryKind.PARENT_ONLY, DeliveryKind.FINAL_RUN])
-def test_ci_review_uses_failed_head_then_the_actual_findings_review(tmp_path: Path, kind):
+def test_ci_review_uses_failed_head_then_the_actual_findings_review(tmp_path: Path):
+    # Shared range selection for all kinds is covered by run_scoped_ci_context;
+    # this Ticket proves opt-in CI Review and both real successor connections.
+    kind = DeliveryKind.TICKET
     policy = Policy(ticket_ci_review=True)
     # One isolated workflow covers both successors. Do not replay the entire
     # original delivery (and Final's Ticket Completion) for a second parameter.
     checks = ("fail", "fail", "none")
-    scenario = (final_scenario(tmp_path / kind.value, policy=policy, checks=checks)
-                if kind == DeliveryKind.FINAL_RUN else
-                Scenario(tmp_path / kind.value, kind, policy=policy, checks=checks))
-    if kind == DeliveryKind.FINAL_RUN:
-        # Its preparatory Ticket already created development-1.txt. Each new
-        # development must make a real change, including subsequent CI repair.
-        scenario.edits = tuple({f"final-ci-repair-{index}.txt": f"Actual repair {index}\n"}
-                               for index in range(1, 5))
+    scenario = Scenario(tmp_path / kind.value, kind, policy=policy, checks=checks)
     runner = scenario.runner()
     previous_review = None
     development = None
