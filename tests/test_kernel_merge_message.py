@@ -13,12 +13,13 @@ from support.remote_effects import publication
 from agent_run.errors import KernelError
 from agent_run.model import DeliveryKind, Role, wire_json
 from support.offline import Scenario
+from support.run_scoped_kernel import domain_scenario
 from support.offline_api import SyntheticGitHub
 
 
 @pytest.mark.parametrize("repair", [False, True], ids=["first-publication", "updated-after-ci"])
-def test_ticket_squash_uses_the_complete_published_pr_not_the_latest_commit(tmp_path, monkeypatch, repair):
-    scenario = Scenario(tmp_path / "ticket", DeliveryKind.TICKET,
+def test_ticket_squash_uses_the_complete_published_pr_not_the_latest_commit(tmp_path, monkeypatch, repair, domain_scenario):
+    scenario = domain_scenario(tmp_path / "ticket", DeliveryKind.TICKET,
                         checks=("fail", "pass") if repair else ("pass",))
     original = scenario.agent
     publications = []
@@ -160,7 +161,7 @@ def test_missing_full_message_stays_unknown_until_resume_reads_original_merge(tm
     assert len([w for w in scenario.port.writes() if w["operation"] == "merge"]) == 1
 
 
-def test_ordinary_parent_merge_keeps_its_own_message_policy(tmp_path, monkeypatch):
+def test_ordinary_parent_merge_keeps_its_own_message_policy(tmp_path, monkeypatch, domain_scenario):
     original = SyntheticGitHub.write
     methods = []
 
@@ -171,7 +172,7 @@ def test_ordinary_parent_merge_keeps_its_own_message_policy(tmp_path, monkeypatc
         return original(self, endpoint, method, body)
 
     monkeypatch.setattr(SyntheticGitHub, "write", server_merge_message)
-    scenario = Scenario(tmp_path / "parent", DeliveryKind.PARENT_ONLY)
+    scenario = domain_scenario(tmp_path / "parent", DeliveryKind.PARENT_ONLY)
     assert scenario.run(approve=True).kind == "complete"
     row, payload, receipt = _merge_record(scenario)
     assert methods == ["merge"] and payload["method"] == "merge" and row["attempts"] == 1
@@ -180,8 +181,8 @@ def test_ordinary_parent_merge_keeps_its_own_message_policy(tmp_path, monkeypatc
     assert scenario.port.objects.issue(scenario.delivery.issue)["state"] == "closed"
 
 
-def test_requeued_generation_rejects_the_previous_publication_message(tmp_path, monkeypatch):
-    scenario = Scenario(tmp_path / "ticket", DeliveryKind.TICKET)
+def test_requeued_generation_rejects_the_previous_publication_message(tmp_path, monkeypatch, domain_scenario):
+    scenario = domain_scenario(tmp_path / "ticket", DeliveryKind.TICKET)
     messages = []
     narratives = []
     original_agent = scenario.agent

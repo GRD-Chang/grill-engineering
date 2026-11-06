@@ -9,7 +9,7 @@ import pytest
 from agent_run.model import Commit, Delivery, DeliveryKind, Policy, RunSpec
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
-from support.offline import Scenario
+from support.run_scoped_kernel import domain_kernel, domain_scenario
 from support.core_operations import CoreOperations, native_agent_fixture, final_scenario
 
 
@@ -45,8 +45,8 @@ def test_created_language_is_consumed_by_the_actual_agent_call(tmp_path: Path) -
 
 
 @pytest.mark.parametrize("limit", [0, 1])
-def test_resync_charges_only_external_completed_snapshots_and_resume_only_renews_it(tmp_path: Path, limit: int) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY, policy=Policy(resync_limit=limit))
+def test_resync_charges_only_external_completed_snapshots_and_resume_only_renews_it(tmp_path: Path, limit: int, domain_scenario) -> None:
+    scenario = domain_scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY, policy=Policy(resync_limit=limit))
     assert scenario.run().kind == "approval"
     initial = scenario.kernel.status(scenario.delivery.key)
     for ordinal in range(1, limit + 2):
@@ -76,38 +76,39 @@ def test_resync_charges_only_external_completed_snapshots_and_resume_only_renews
 
 def test_external_changes_during_open_integration_share_the_free_snapshot(tmp_path: Path) -> None:
     scenario = final_scenario(tmp_path / "scenario", policy=Policy(resync_limit=0))
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
-    execute = scenario.port.execute
-    appended = []
+    with domain_kernel(scenario.kernel) as scenario.kernel:
+        operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+        execute = scenario.port.execute
+        appended = []
 
-    def append_after_integration(effect, authorize=None):
-        result = execute(effect, authorize)
-        if effect.operation == "integrate" and not appended:
-            appended.append(scenario.port.external_remote_append(scenario.delivery.source_ref,
-                {"foreign-source.txt": "Source work\n"}, "open-source"))
-            scenario.port.external_remote_append(scenario.delivery.target_ref,
-                {"foreign-target.txt": "Target work\n"}, "open-target")
-        return result
+        def append_after_integration(effect, authorize=None):
+            result = execute(effect, authorize)
+            if effect.operation == "integrate" and not appended:
+                appended.append(scenario.port.external_remote_append(scenario.delivery.source_ref,
+                    {"foreign-source.txt": "Source work\n"}, "open-source"))
+                scenario.port.external_remote_append(scenario.delivery.target_ref,
+                    {"foreign-target.txt": "Target work\n"}, "open-target")
+            return result
 
-    scenario.port.execute = append_after_integration
-    for _ in range(50):
-        step = operations.once()
-        assert step.call is None, step
-        if appended:
-            break
-    else:
-        raise AssertionError("Integration was not reached")
-    source = appended[0]
-    opened = scenario.kernel.status(scenario.delivery.key)["resync"]
-    assert (opened["used"], opened["window"], opened["open"]) == (0, 1, True)
-    assert scenario.run().kind == "approval"
-    completed = scenario.kernel.status(scenario.delivery.key)["resync"]
-    assert (completed["used"], completed["window"], completed["open"]) == (0, 1, False)
-    published = scenario.port.remote_commit(scenario.delivery.source_ref)
-    assert published is not None and scenario.port.git.is_ancestor(source.sha, published.sha)
-    assert scenario.port.git.run("show", published.sha + ":foreign-source.txt").stdout == "Source work\n"
-    assert scenario.port.git.run("show", published.sha + ":foreign-target.txt").stdout == "Target work\n"
-    assert scenario.development_count == 0
+        scenario.port.execute = append_after_integration
+        for _ in range(50):
+            step = operations.once()
+            assert step.call is None, step
+            if appended:
+                break
+        else:
+            raise AssertionError("Integration was not reached")
+        source = appended[0]
+        opened = scenario.kernel.status(scenario.delivery.key)["resync"]
+        assert (opened["used"], opened["window"], opened["open"]) == (0, 1, True)
+        assert scenario.run().kind == "approval"
+        completed = scenario.kernel.status(scenario.delivery.key)["resync"]
+        assert (completed["used"], completed["window"], completed["open"]) == (0, 1, False)
+        published = scenario.port.remote_commit(scenario.delivery.source_ref)
+        assert published is not None and scenario.port.git.is_ancestor(source.sha, published.sha)
+        assert scenario.port.git.run("show", published.sha + ":foreign-source.txt").stdout == "Source work\n"
+        assert scenario.port.git.run("show", published.sha + ":foreign-target.txt").stdout == "Target work\n"
+        assert scenario.development_count == 0
 
 
 @pytest.mark.parametrize("invalid_output", [b"invalid structured output", b"\x00" * (1024 * 1024)], ids=["small", "escaped-limit"])

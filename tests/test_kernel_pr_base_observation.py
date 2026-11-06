@@ -8,13 +8,13 @@ from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.core.operation_contract import DeliveryRead, ReadUnavailable
 from agent_run.errors import KernelError
 from agent_run.model import DeliveryKind
-from support.offline import Scenario
+from support.run_scoped_kernel import domain_scenario
 from support.offline_api import SyntheticGitHub
 from support.remote_effects import _fixture, _publish_pr
 
 
-def test_ticket_ci_repair_finishes_when_the_pr_reports_an_ancestor_base(tmp_path, monkeypatch):
-    scenario = Scenario(tmp_path / 'scenario', DeliveryKind.TICKET, checks=('fail', 'none'))
+def test_ticket_ci_repair_finishes_when_the_pr_reports_an_ancestor_base(tmp_path, monkeypatch, domain_scenario):
+    scenario = domain_scenario(tmp_path / 'scenario', DeliveryKind.TICKET, checks=('fail', 'none'))
     kernel, subject = scenario.kernel, scenario.delivery.key
     for _ in range(160):
         status = kernel.status(subject)
@@ -148,8 +148,8 @@ def test_an_ancestor_base_does_not_authorize_foreign_or_missing_pr_facts(tmp_pat
     assert len(writes) == 1 and 'POST' in writes[0]
 
 
-def test_parent_requires_fresh_review_and_approval_for_the_live_target(tmp_path, monkeypatch):
-    scenario = Scenario(tmp_path / 'scenario', DeliveryKind.PARENT_ONLY)
+def test_parent_requires_fresh_review_and_approval_for_the_live_target(tmp_path, monkeypatch, domain_scenario):
+    scenario = domain_scenario(tmp_path / 'scenario', DeliveryKind.PARENT_ONLY)
     assert scenario.run().kind == 'approval'
     kernel, subject = scenario.kernel, scenario.delivery.key
     old = scenario.world()
