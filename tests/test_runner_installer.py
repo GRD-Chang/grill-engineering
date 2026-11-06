@@ -213,6 +213,28 @@ def fast_in_process_build(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(runner_installer, "_build_candidate", fast_build_candidate)
 
 
+def test_real_build_ignores_stale_setuptools_output_without_modifying_source(
+    tmp_path: Path, offline_install_environment: dict[str, str],
+) -> None:
+    source = _source_tree(tmp_path, real_install=True)
+    stale = source / "build" / "lib" / "agent_run" / "retired_module.py"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("raise RuntimeError('obsolete module from a previous build')\n")
+    # A package resource named build is source data, not setuptools output.
+    resource = source / "src" / "agent_run" / "resources" / "build" / "source.md"
+    resource.parent.mkdir(parents=True, exist_ok=True)
+    resource.write_text("Preserve current package data.\n")
+    candidate = tmp_path / "candidate"
+
+    runner_installer._build_candidate(candidate, source)
+
+    installed = runner_installer._runtime_package(candidate)
+    assert not (installed / "retired_module.py").exists()
+    assert (installed / "resources" / "build" / "source.md").read_bytes() == resource.read_bytes()
+    assert stale.exists()
+    assert not list(tmp_path.glob("build-source-*"))
+
+
 def _signal_at_marker(
     process: subprocess.Popen[str], marker: Path,
 ) -> tuple[str, str]:

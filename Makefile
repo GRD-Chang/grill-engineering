@@ -16,6 +16,8 @@ test_scope = $(shell $(TEST_SCOPE) $(1) || echo .invalid-test-selection)
 # Shared dependency preparation for local validation and CI.
 test-bootstrap:
 	$(PYTHON) -m pip install --only-binary=:all: --require-hashes -r tests/dev-requirements.txt
+	# setuptools reuses build/lib, including modules removed from src.
+	rm -rf -- build
 	$(PYTHON) -m pip install --no-build-isolation --no-deps .
 	$(MAKE) test-prepare
 

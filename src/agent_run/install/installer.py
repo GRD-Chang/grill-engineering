@@ -446,7 +446,12 @@ def _build_candidate(candidate: Path, source: Path) -> tuple[str, str]:
                 build_source,
                 dirs_exist_ok=True,
                 symlinks=True,
-                ignore=shutil.ignore_patterns(".git", ".agent-run"),
+                # Local setuptools output can retain modules removed from src.
+                # Exclude only the root build directory; nested package data is source.
+                ignore=lambda directory, names: (
+                    set(shutil.ignore_patterns(".git", ".agent-run")(directory, names))
+                    | ({"build"} if Path(directory) == source else set())
+                ),
             )
         except (OSError, shutil.Error) as error:
             raise InstallerError(
