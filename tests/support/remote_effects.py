@@ -312,11 +312,8 @@ if method!='GET' and not status_operation and d.get('lose_operation')==('issue_l
 '''
 
 
-def _reader(root: Path, monkeypatch, *, invalid: bool = False) -> tuple[GhGitHubReader, Path]:
-    binary = root / 'bin'
-    binary.mkdir()
-    responses = root / 'responses.json'
-    log = root / 'gh-calls.jsonl'
+def _reader_data(*, invalid: bool = False) -> dict:
+    """Declared source pages shared by raw-response and executable transport tests."""
     def page(nodes, more=False, cursor=None):
         return {'nodes': nodes, 'pageInfo': {'hasNextPage': more, 'endCursor': cursor}}
     initial = {
@@ -342,6 +339,15 @@ def _reader(root: Path, monkeypatch, *, invalid: bool = False) -> tuple[GhGitHub
     for key in ('parent', 'parent-next', '9', 'blocker-next', '3'):
         totals = {'subIssues': 2} if key.startswith('parent') else {'blockedBy': 2} if key in ('9', 'blocker-next') else {}
         initial[key] = source_issue(initial[key], totals=totals)
+    return initial
+
+
+def _reader(root: Path, monkeypatch, *, invalid: bool = False) -> tuple[GhGitHubReader, Path]:
+    binary = root / 'bin'
+    binary.mkdir()
+    responses = root / 'responses.json'
+    log = root / 'gh-calls.jsonl'
+    initial = _reader_data(invalid=invalid)
     responses.write_text(json.dumps(initial))
     script = binary / 'gh'
     script.write_text('#!' + sys.executable + '\n' + f'import sys\nsys.path.insert(0, {str(Path(__file__).parent.parent)!r})\nfrom support.github_checks import repository_response\n' + CHECK_ROLLUP_FAKE + LATEST_CHECK_FAKE + '''import json, os, sys
