@@ -139,3 +139,16 @@ def test_unknown_ancestry_remains_a_failure_after_successful_observation(world):
     port.delivery(request, ('pass',), [])
     with pytest.raises(KernelError, match='git_ancestry_unknown'):
         port.delivery(replace(request, anchors=('f' * 40,)), ('pass',), [])
+
+
+def test_missing_remote_object_is_transferred_without_moving_local_refs(world):
+    port, commits, _ = world
+    physical = port.physical
+    original_refs = port.git.run('show-ref').stdout
+    sha = physical._run(physical.remote, 'commit-tree', commits[0].tree,
+                        '-p', commits[-1].sha, input='Remote-only commit\n').stdout.strip()
+    assert port.git.run('cat-file', '-e', sha + '^{commit}', check=False).returncode != 0
+    physical.fetch(sha)
+    assert port.git.commit(sha).tree == commits[0].tree
+    assert port.git.run('show-ref').stdout == original_refs
+    assert physical.commit(sha)['message'] == 'Remote-only commit\n'

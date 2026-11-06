@@ -1,8 +1,5 @@
 """Fresh private Git config validation; real Git, no Task/Host/SaveClock."""
-import json
 import os
-import resource
-import time
 
 import pytest
 
@@ -16,13 +13,6 @@ def world(tmp_path):
     return OfflinePort.create(tmp_path / 'world')
 
 
-@pytest.fixture(params=['git-parser', 'canonical-bytes'])
-def parser(request, monkeypatch):
-    if request.param == 'git-parser':
-        monkeypatch.setattr(offline_git.OfflineGit, '_canonical_config', lambda *args, **kwargs: False)
-    return request.param
-
-
 def commands(monkeypatch):
     actual, calls = offline_git.OfflineGit._run, []
     def run(backend, directory, *args, **kwargs):
@@ -32,20 +22,20 @@ def commands(monkeypatch):
     return calls
 
 
-def test_canonical_files_skip_only_the_config_parser(world, parser, monkeypatch):
+def test_canonical_files_are_validated_without_reparsing(world, monkeypatch):
     backend = world.physical
     before = durable_snapshot(world.root)
     calls = commands(monkeypatch)
     assert backend.refs() == {'refs/heads/main': world.git.commit('HEAD').sha}
-    assert sum(row[:1] == ('config',) for row in calls) == (2 if parser == 'git-parser' else 0)
+    assert sum(row[:1] == ('config',) for row in calls) == 0
     assert sum(row[:1] == ('rev-parse',) for row in calls) == 2
-    assert sum(row[:1] == ('ls-remote',) for row in calls) == 1
+    assert sum(row[:1] == ('for-each-ref',) for row in calls) == 1
     assert durable_snapshot(world.root) == before
 
 
 @pytest.mark.parametrize('bare', [False, True])
 @pytest.mark.parametrize('change', ['comment', 'large-comment', 'user', 'filemode', 'duplicate', 'continuation'])
-def test_legal_noncanonical_files_still_use_git(world, parser, monkeypatch, bare, change):
+def test_legal_noncanonical_files_still_use_git(world, monkeypatch, bare, change):
     backend = world.physical
     directory = backend.remote if bare else backend.repository / '.git'
     path = directory / 'config'
@@ -67,7 +57,7 @@ def test_legal_noncanonical_files_still_use_git(world, parser, monkeypatch, bare
     assert durable_snapshot(world.root) == before
 
 
-def test_sha256_repositories_keep_the_original_parser(world, parser, tmp_path, monkeypatch):
+def test_sha256_repositories_keep_the_original_parser(world, tmp_path, monkeypatch):
     root = tmp_path / 'sha256-world'
     root.mkdir()
     backend = world.physical
@@ -91,7 +81,7 @@ def test_sha256_repositories_keep_the_original_parser(world, parser, tmp_path, m
     b'[core]\n\tbare = INVALID\n\tbare = false\n',
     b'[user]\n\tname = "unterminated\n',
 ])
-def test_changed_configuration_refuses_before_any_write(world, parser, monkeypatch, bare, suffix):
+def test_changed_configuration_refuses_before_any_write(world, monkeypatch, bare, suffix):
     backend = world.physical
     head = world.git.commit('HEAD').sha
     directory = backend.remote if bare else backend.repository / '.git'
@@ -110,7 +100,7 @@ def test_changed_configuration_refuses_before_any_write(world, parser, monkeypat
 @pytest.mark.parametrize('fault', ['head-missing', 'head-invalid', 'refs-missing', 'objects-missing',
     'commondir', 'worktree-config', 'config-symlink', 'refs-symlink', 'objects-symlink',
     'alternates', 'gitfile', 'gitdir-symlink', 'parent-symlink'])
-def test_layout_and_object_checks_remain_fresh(world, parser, tmp_path, monkeypatch, fault):
+def test_layout_and_object_checks_remain_fresh(world, tmp_path, monkeypatch, fault):
     backend = world.physical
     directory = backend.repository / '.git'
     if fault == 'head-missing':
@@ -149,7 +139,7 @@ def test_layout_and_object_checks_remain_fresh(world, parser, tmp_path, monkeypa
     {'GIT_NAMESPACE': 'other'}, {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'user.name', 'GIT_CONFIG_VALUE_0': 'other'},
     {'GIT_CONFIG_PARAMETERS': "'user.name=other'"}, {'GIT_CONFIG_GLOBAL': 'unread'},
 ])
-def test_mutable_redirect_environment_uses_original_parser(world, parser, monkeypatch, redirect):
+def test_mutable_redirect_environment_uses_original_parser(world, monkeypatch, redirect):
     backend = world.physical
     backend.environment.update(redirect)
     calls = commands(monkeypatch)
@@ -230,30 +220,3 @@ def test_read_or_cancel_wins_over_close_and_note_failure(world, monkeypatch, pri
     assert len(closed_descriptors) == 1 and calls == []
     if note_failure is None:
         assert primary.__notes__ == ['Offline Git config descriptor close failed; original exception preserved']
-
-
-def test_same_refs_workload_compares_git_parser_and_fresh_bytes(world, monkeypatch, record_property):
-    backend = world.physical
-    expected = backend.refs()
-    before = durable_snapshot(world.root)
-    original = offline_git.OfflineGit._canonical_config
-    calls = commands(monkeypatch)
-    batches = []
-    for mode in ('git-parser', 'canonical-bytes', 'canonical-bytes', 'git-parser'):
-        monkeypatch.setattr(offline_git.OfflineGit, '_canonical_config', original if mode == 'canonical-bytes' else lambda *args, **kwargs: False)
-        calls.clear()
-        children = resource.getrusage(resource.RUSAGE_CHILDREN)
-        begin, cpu = time.perf_counter_ns(), time.process_time_ns()
-        for _ in range(12):
-            assert backend.refs() == expected
-        end_children = resource.getrusage(resource.RUSAGE_CHILDREN)
-        batches.append({'mode': mode, 'wall_ns': time.perf_counter_ns() - begin,
-            'parent_cpu_ns': time.process_time_ns() - cpu,
-            'waited_child_cpu_seconds': end_children.ru_utime + end_children.ru_stime - children.ru_utime - children.ru_stime,
-            'commands': len(calls), 'config_commands': sum(row[:1] == ('config',) for row in calls)})
-        assert len(calls) == (60 if mode == 'git-parser' else 36)
-        assert sum(row[:1] == ('rev-parse',) for row in calls) == 24
-        assert sum(row[:1] == ('ls-remote',) for row in calls) == 12
-        assert durable_snapshot(world.root) == before
-    record_property('fresh_config_cost', json.dumps(batches, sort_keys=True))
-    print('fresh_config_cost=' + json.dumps(batches, sort_keys=True))

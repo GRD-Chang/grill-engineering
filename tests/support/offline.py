@@ -432,7 +432,7 @@ class Scenario:
     def __init__(self, root: Path, kind: DeliveryKind, *, reviews: Sequence[str] = ("pass",),
                  checks: Sequence[str] = ("none",), policy: Policy | None = None,
                  edits: Sequence[Mapping[str, str]] | None = None, neutral_script: Mapping[str, Any] | None = None,
-                 record_checkpoints: bool = True) -> None:
+                 record_checkpoints: bool = False) -> None:
         self.script = neutral_script
         if neutral_script is not None:
             declared = {"ticket": DeliveryKind.TICKET, "parent_only": DeliveryKind.PARENT_ONLY, "full_parent": DeliveryKind.FINAL_RUN}[neutral_script.get("delivery_kind", "ticket")]
@@ -451,7 +451,7 @@ class Scenario:
         self.historical_trace: dict[str, Any] | None = None
         self.observation_start = 0
         if kind == DeliveryKind.FINAL_RUN:
-            producer = self._completed_source(root, policy, neutral_script)
+            producer = self._completed_source(root, policy, neutral_script, record_checkpoints=record_checkpoints)
             self.port, self.initial, self.spec = producer.port, producer.initial, producer.spec
             self.kernel = Kernel(producer.kernel.storage.path, run_id=producer.kernel.storage.run_id)
             self.requirements = producer.requirements
@@ -503,12 +503,14 @@ class Scenario:
         self.reviewed_heads: list[str] = []
 
     @staticmethod
-    def _completed_source(root: Path, policy: Policy | None, script: Mapping[str, Any] | None) -> Scenario:
+    def _completed_source(root: Path, policy: Policy | None, script: Mapping[str, Any] | None,
+                          *, record_checkpoints: bool = False) -> Scenario:
         """Produce real historical Completion; never insert accepted state rows."""
         producer: Scenario
         if script is None:
             producer = _CompletedTicketProducer(root, DeliveryKind.TICKET, policy=policy,
-                checks=("pass",), edits=({"ticket.txt": "Completed synthetic Ticket.\n"},))
+                checks=("pass",), edits=({"ticket.txt": "Completed synthetic Ticket.\n"},),
+                record_checkpoints=record_checkpoints)
         else:
             historical = script["completed_ticket_precondition"]
             prefix = {**script, "id": script["id"] + "-historical-source", "delivery_kind": "ticket",
@@ -522,7 +524,7 @@ class Scenario:
                         "pr_title": "feat(ticket): accepted historical fixture",
                         "pr_body_markdown": "Accepted historical Ticket with recorded review, checks and exact Git evidence.",
                         "human_blockers": None}]}}
-            producer = Scenario(root, DeliveryKind.TICKET, neutral_script=prefix)
+            producer = Scenario(root, DeliveryKind.TICKET, neutral_script=prefix, record_checkpoints=record_checkpoints)
         if producer.run().kind != "complete":
             raise KernelError("historical_source_incomplete")
         if script is not None:
@@ -608,13 +610,21 @@ class Scenario:
             self.checkpoints.append(self.kernel.status(self.delivery.key))
         return step
 
+    def _progress(self):
+        # A fixture stopping condition needs no prompt, budget, history or material
+        # projection. Read current facts each time; Core alone chooses the work.
+        with self.kernel.storage.transaction(write=False) as tx:
+            return tx.one("SELECT s.phase,c.state AS cleanup_state,c.outcome FROM subjects s "
+                "LEFT JOIN resource_cleanup c ON c.run_id=s.run_id AND c.subject=s.id "
+                "AND c.generation=s.generation WHERE s.run_id=? AND s.id=?",
+                (self.kernel.storage.run_id, self.delivery.key))
+
     def run(self, *, approve: bool = False, max_steps: int = 200, cut: str = "complete") -> Step:
         for _ in range(max_steps):
-            state = self.kernel.status(self.delivery.key)
-            if cut == "publication_pending" and state["phase"] == "publish":
+            progress = self._progress()
+            if cut == "publication_pending" and progress["phase"] == "publish":
                 return Step("publication_pending", self.delivery.key)
-            cleanup = state["resource_cleanup"]
-            if state["phase"] == "complete" and (cleanup is None or cleanup["state"] == "complete"):
+            if progress["phase"] == "complete" and progress["cleanup_state"] in {None, "complete"}:
                 return Step("complete", self.delivery.key)
             step = self.step()
             if step.subject and step.subject != self.delivery.key:
@@ -634,13 +644,12 @@ class Scenario:
             if step.kind == "approval" and approve:
                 self.kernel.control("approve", f"approval-{self.publication_count}", subject=self.delivery.key, world=self.world())
             elif step.kind in {"paused", "approval", "waiting"}:
-                current = self.kernel.status(self.delivery.key)
-                cleanup = current["resource_cleanup"]
+                current = self._progress()
                 # The operation above attempted cleanup. Preserve the original
                 # run() business result while status retains unresolved assets;
                 # cleanup() itself still reports its pending/conflict boundary.
-                if (cut == "complete" and current["phase"] == "complete" and cleanup
-                        and cleanup["outcome"] in {"third", "unknown"}):
+                if (cut == "complete" and current["phase"] == "complete"
+                        and current["outcome"] in {"third", "unknown"}):
                     return Step("complete", self.delivery.key)
                 return step
         raise AssertionError("offline runner failed to reach the requested observable boundary")
@@ -693,6 +702,8 @@ class Scenario:
 
     def neutral_observation(self, script: Mapping[str, Any], input_digest: str) -> dict[str, Any]:
         """Actual same-input facts; cleanup differences are deliberately retained."""
+        if not self.record_checkpoints:
+            raise ValueError("Neutral observations require record_checkpoints=True")
         import hashlib
         pr = self.port.pull_request_by_ref(self.delivery.source_ref, self.delivery.target_ref)
         if pr is None or pr.merged is None or not self.reviewed_heads:
@@ -828,7 +839,7 @@ class GraphScenario(Scenario):
 
     def __init__(self, root: Path, requirements: Requirements, *, policy: Policy | None = None,
                  reviews: Sequence[str] = ("pass",), initial_git: Mapping[str, Any] | None = None,
-                 record_checkpoints: bool = True) -> None:
+                 record_checkpoints: bool = False) -> None:
         self.requirements = requirements
         self.script = None
         self.port = OfflinePort.create(root, initial_git)
@@ -907,7 +918,7 @@ def main() -> None:
     }
     kind, reviews, cut = configurations[args.scenario]
     script = None if args.input is None else json.loads(args.input.read_text(encoding="utf-8"))
-    scenario = Scenario(args.root, kind, reviews=reviews, neutral_script=script)
+    scenario = Scenario(args.root, kind, reviews=reviews, neutral_script=script, record_checkpoints=True)
     boundary = scenario.run(approve=kind != DeliveryKind.TICKET, cut=cut)
     result = {"schema": "kernel-observable-trace/1", "implementation": "independent-kernel-exploration",
               "cross_architecture_compared": False, "scenarios": [scenario.observable(args.scenario, boundary)]}

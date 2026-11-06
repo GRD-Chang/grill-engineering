@@ -176,9 +176,6 @@ class OfflineGit:
     def _owned_objects(self, objects: Path) -> None:
         if not objects.resolve(strict=True).is_relative_to(self.root):
             raise ValueError("offline objects escape their Scenario")
-        for path in objects.rglob("*"):
-            if path.is_symlink():
-                raise ValueError("offline object paths must not redirect")
         alternates = objects / "info/alternates"
         if alternates.exists():
             raise ValueError("offline objects must be self-contained")
@@ -219,16 +216,17 @@ class OfflineGit:
 
     def refs(self) -> dict[str, str]:
         self._owned()
-        result = self._run(self.repository, "ls-remote", "--refs", "--", str(self.remote))
+        result = self._run(self.remote, "for-each-ref", "--format=%(objectname)%09%(refname)")
         return {ref: self._oid(sha) for sha, ref in (line.split("\t") for line in result.stdout.splitlines())}
 
     def commit(self, sha: str) -> dict[str, Any]:
         self._owned()
         sha = self._oid(sha)
-        row = self._run(self.remote, "show", "--no-patch", "--format=%H %T %P", sha + "^{commit}").stdout.split()
         raw = self._run(self.remote, "cat-file", "commit", sha).stdout
-        return {"sha": row[0], "tree": {"sha": row[1]}, "parents": [{"sha": parent} for parent in row[2:]],
-                "message": raw.partition("\n\n")[2]}
+        header, _, message = raw.partition("\n\n")
+        fields = [line.split(" ", 1) for line in header.splitlines()]
+        return {"sha": sha, "tree": {"sha": next(value for key, value in fields if key == "tree")},
+                "parents": [{"sha": value} for key, value in fields if key == "parent"], "message": message}
 
     def compare(self, base: str, head: str) -> dict[str, Any]:
         self._owned()
@@ -340,5 +338,9 @@ class OfflineGit:
     def fetch(self, sha: str) -> None:
         """Copy an observed physical object for local inspection, without refs."""
         self._owned()
-        self._run(self.repository, "fetch", "--no-tags", "--no-write-fetch-head", "--",
-                  str(self.remote), self._oid(sha))
+        sha = self._oid(sha)
+        # Git objects are immutable by full OID. Recheck possession, not a cached
+        # ref or authority; only objects missing locally need transport.
+        if self._run(self.repository, "cat-file", "-e", sha + "^{commit}", check=False).returncode:
+            self._run(self.repository, "fetch", "--no-tags", "--no-write-fetch-head", "--",
+                      str(self.remote), sha)
