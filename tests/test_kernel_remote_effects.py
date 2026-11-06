@@ -291,49 +291,18 @@ def test_selected_runner_actor_change_cannot_dispatch_original_effect(tmp_path, 
         port.execute(effect, WriteAuthority(lambda: lambda: pytest.fail("actor mismatch must precede authorization")))
 
 
-def test_optional_issue_link_ack_loss_is_not_readback_success_or_an_automatic_retry(tmp_path, monkeypatch):
-    port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
-    assert port.execute(push, WriteAuthority(lambda: lambda: None)).disposition == "target"
-    link = replace(push, effect_id="link-1", operation="issue_link", before_sha=push.after_sha,
-        payload={"issue": 2, "ref": push.source_ref, "source_head": push.after_sha})
-    _change(state, lose_operation="issue_link")
-    authorized = []
-    result = port.execute(link, WriteAuthority(lambda: lambda: authorized.append("link")))
-    assert result.disposition == "unknown" and result.raw["display"] == "indeterminate"
-    assert json.loads(state.read_text())["links"] == [{"ref": "delivery", "sha": push.after_sha}]
-    # Actual linked branch exists, but it cannot prove a lost acknowledgement.
-    reopened = RemoteEffects(port.root, port.repository, runner_identity={"source": "host"})
-    assert reopened.reconcile(link).disposition == "unknown" and authorized == ["link"]
-    actual = [json.loads(line) for line in calls.read_text().splitlines()]
-    assert sum(c[1] == "graphql" and "POST" in c for c in actual) == 1
-
-
-def test_optional_issue_link_keeps_exact_successful_graphql_acknowledgement(tmp_path, monkeypatch):
-    port, _git, push, state, _calls = _fixture(tmp_path, monkeypatch)
-    assert port.execute(push, WriteAuthority(lambda: lambda: None)).disposition == "target"
-    link = replace(push, effect_id="link-1", operation="issue_link", before_sha=push.after_sha,
-        payload={"issue": 2, "ref": push.source_ref, "source_head": push.after_sha})
-    result = port.execute(link, WriteAuthority(lambda: lambda: None))
-    assert result.disposition == "target" and result.raw["display"] == "linked"
-    assert result.raw["acknowledgement"]["data"]["createLinkedBranch"]["linkedBranch"]["ref"] == {
-        "name": "delivery", "target": {"oid": push.after_sha}}
-    assert json.loads(state.read_text())["links"] == [{"ref": "delivery", "sha": push.after_sha}]
-
-
-@pytest.mark.parametrize("mode", ["acknowledged", "ack-lost", "unavailable"])
-def test_real_issue_ack_stays_optional_and_once_across_kernel_reopen(tmp_path, monkeypatch, mode):
+def test_real_issue_ack_stays_optional_and_once_across_kernel_reopen(tmp_path, monkeypatch):
     from agent_run.core.kernel import Kernel
     from agent_run.model import Issue, ParentIssue, Requirements
     from support.offline import GraphScenario
     from support.core_operations import Ports, settle_agent
     _port, _git, _push, state, calls = _fixture(tmp_path, monkeypatch)
-    _change(state, actor="offline-publisher", lose_operation="issue_link" if mode == "ack-lost" else None,
-            issue_read_error=mode == "unavailable")
+    _change(state, actor="offline-publisher", lose_operation="issue_link")
     source = Requirements(ParentIssue(1, "Parent", "Whole requirement", (2,)),
                           (Issue(2, "Ticket", "Whole ticket", "OPEN", frozenset({"ready-for-agent"})),))
     scenario = GraphScenario(tmp_path / "scenario", source)
     ports = Ports(scenario)
-    original = ports.execute
+    original, links = ports.execute, []
     selected = RemoteEffects(scenario.port.git.root, scenario.spec.repository,
                              runner_identity=scenario.spec.inputs.runner_identity,
                              remote=scenario.spec.inputs.repository_remote)
@@ -341,6 +310,7 @@ def test_real_issue_ack_stays_optional_and_once_across_kernel_reopen(tmp_path, m
         if effect.operation != "issue_link":
             return original(effect, authorize)
         scenario.port.git.run("push", str(tmp_path / "origin.git"), effect.before_sha + ":" + effect.source_ref)
+        links.append(effect)
         return selected.execute(effect, authorize)
     monkeypatch.setattr(ports, "execute", execute)
     def finish_ticket():
@@ -356,15 +326,63 @@ def test_real_issue_ack_stays_optional_and_once_across_kernel_reopen(tmp_path, m
     finish_ticket()
     durable = Kernel(scenario.kernel.storage.path, run_id=scenario.kernel.storage.run_id)
     assert durable.status("ticket:2")["phase"] == "complete"
-    assert durable.status("ticket:2")["issue_link"]["state"] == {"ack-lost": "indeterminate", "acknowledged": "linked", "unavailable": "unavailable"}[mode]
+    assert durable.status("ticket:2")["issue_link"]["state"] == "indeterminate"
+    link, = links
+    assert selected.reconcile(link).disposition == "unknown"
     before_roles = list(scenario.role_calls)
     before_usage = durable.status("ticket:2")["budgets"]
     scenario.kernel = durable
-    finish_ticket()
+    assert OperationRunner(durable, scenario.execution, lambda binding: ports).run_once(agent_capacity=0).call is None
     assert scenario.role_calls == before_roles and durable.status("ticket:2")["budgets"] == before_usage
     actual = [json.loads(line) for line in calls.read_text().splitlines()]
-    assert sum(c[1] == "graphql" and "POST" in c for c in actual) == (0 if mode == "unavailable" else 1)
-    assert len(json.loads(state.read_text()).get("links", [])) == (0 if mode == "unavailable" else 1)
+    assert sum(c[1] == "graphql" and "POST" in c for c in actual) == 1
+    assert len(json.loads(state.read_text()).get("links", [])) == 1
+
+
+@pytest.mark.parametrize("unavailable", [False, True], ids=["linked", "unavailable"])
+def test_original_issue_ack_is_durable_without_replaying_the_optional_write(tmp_path, monkeypatch, unavailable):
+    """Real adapter ACK -> Core receipt -> SQLite reopen, without Agent delivery."""
+    from agent_run.core.kernel import Kernel
+    from agent_run.core.operation_contract import Work
+    from agent_run.model import Delivery, DeliveryKind, RunSpec, World
+    from support.offline import fixture_inputs
+    from support.core_operations import native_agent_fixture
+    port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
+    assert port.execute(push, WriteAuthority(lambda: lambda: None)).disposition == "target"
+    inputs = replace(fixture_inputs(), runner_identity={"source": "host"})
+    job = Delivery("ticket:2", DeliveryKind.TICKET, 2, "original", push.base, push.source_ref, push.target_ref)
+    kernel, _ports = native_agent_fixture(tmp_path / "kernel.sqlite3",
+        RunSpec("link-run", port.repository, 1, "parent", "graph", (job,), inputs=inputs))
+    execution = kernel.claim_executor("original-link")
+    with kernel.storage.transaction() as tx:
+        run, job = tx.one("SELECT * FROM runs"), kernel._job(tx, "ticket:2")
+        world = World(run["parent_revision"], run["graph_revision"], job["revision"], push.base, push.candidate,
+            publisher_actor=push.actor, publisher_identity=inputs.runner_identity)
+        request = kernel._prepare_effect(tx, run, job, Work(execution, "link", "ticket:2", False, True, None, None),
+            world, "issue_link", before=push.after_sha,
+            payload={"issue": 2, "ref": push.source_ref, "source_head": push.after_sha})
+        tx.execute("INSERT INTO issue_links(run_id,subject,generation,source_ref,source_sha,issue,effect_id) VALUES (?,?,1,?,?,2,?)",
+            (run["id"], "ticket:2", push.source_ref, push.after_sha, request.effect.effect_id))
+        budgets = [tuple(row) for row in tx.all("SELECT * FROM budgets")]
+    _change(state, issue_read_error=unavailable)
+    admission = WriteAuthority(lambda: lambda: kernel._dispatch(request.effect, execution, world, token=request.token))
+    result = port.execute(request.effect, admission)
+    if not unavailable:
+        assert result.raw["acknowledgement"]["data"]["createLinkedBranch"]["linkedBranch"]["ref"] == {
+            "name": "delivery", "target": {"oid": push.after_sha}}
+    kernel.acknowledge_link(request.effect, result)
+    reopened = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
+    expected = "unavailable" if unavailable else "linked"
+    assert reopened.status("ticket:2")["issue_link"]["state"] == expected
+    assert not reopened._dispatch(request.effect, execution, world, token=request.token)
+    assert reopened._reconcile(request, port.reconcile(request.effect)).kind == "progress"
+    with reopened.storage.transaction(write=False) as tx:
+        assert tuple(tx.one("SELECT status,attempts FROM effects WHERE operation='issue_link'")) == ("confirmed", 1)
+        assert [tuple(row) for row in tx.all("SELECT * FROM budgets")] == budgets
+        assert not tx.rows("SELECT * FROM waits")
+    actual = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert sum(command[1] == "graphql" and "POST" in command for command in actual) == (0 if unavailable else 1)
+    assert len(json.loads(state.read_text()).get("links", [])) == (0 if unavailable else 1)
 
 
 def test_remote_cleanup_uses_selected_runner_transport_and_original_head(tmp_path, monkeypatch):

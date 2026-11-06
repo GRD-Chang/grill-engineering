@@ -109,25 +109,27 @@ def test_original_merge_readback_distinguishes_server_commit_from_partial_local_
         assert pending.value.phase == "reconcile" and pending.value.effect == effect
 
 
-@pytest.mark.parametrize("operation", ["merge", "close"], ids=["merge-ack-lost", "close-ack-lost"])
-def test_parent_closeout_recovers_after_merged_source_ref_is_deleted(tmp_path, monkeypatch, operation):
+def test_parent_closeout_recovers_both_lost_acks_after_merged_source_ref_is_deleted(tmp_path, monkeypatch):
     scenario = Scenario(tmp_path / "parent", DeliveryKind.PARENT_ONLY)
-    with effect_boundary(scenario, monkeypatch, operation, sent=True):
-        with pytest.raises(EffectBoundary) as held:
-            scenario.run(approve=True)
-    effect, authority = held.value.effect, held.value.authorize
-    assert authority is not None
-    scenario.port.lose_response.add(operation)
-    with pytest.raises(ReadUnavailable):
-        scenario.port.execute(effect, authority)
-    pr = scenario.port.pull_request_by_ref(effect.source_ref, effect.target_ref)
-    assert pr is not None and pr.merged is not None
-    assert scenario.port.remote_commit(effect.target_ref) == pr.merged
-    assert scenario.port.physical.delete(effect.source_ref, pr.head.sha).returncode == 0
-    assert effect.source_ref not in scenario.port.remote_refs()
-    roles, budgets = list(scenario.role_calls), scenario.kernel.status(effect.subject)["budgets"]
-    assert scenario.kernel.status(effect.subject)["pending_write"]["status"] == "sent"
-    scenario.kernel = Kernel(scenario.kernel.storage.path, run_id=scenario.kernel.storage.run_id)
+    for operation in ("merge", "close"):
+        with effect_boundary(scenario, monkeypatch, operation, sent=True):
+            with pytest.raises(EffectBoundary) as held:
+                scenario.run(approve=True)
+        effect, authority = held.value.effect, held.value.authorize
+        assert authority is not None
+        scenario.port.lose_response.add(operation)
+        with pytest.raises(ReadUnavailable):
+            scenario.port.execute(effect, authority)
+        if operation == "merge":
+            pr = scenario.port.pull_request_by_ref(effect.source_ref, effect.target_ref)
+            assert pr is not None and pr.merged is not None
+            assert scenario.port.remote_commit(effect.target_ref) == pr.merged
+            assert scenario.port.physical.delete(effect.source_ref, pr.head.sha).returncode == 0
+            roles = list(scenario.role_calls)
+            budgets = scenario.kernel.status(effect.subject)["budgets"]
+        assert effect.source_ref not in scenario.port.remote_refs()
+        assert scenario.kernel.status(effect.subject)["pending_write"]["status"] == "sent"
+        scenario.kernel = Kernel(scenario.kernel.storage.path, run_id=scenario.kernel.storage.run_id)
     assert scenario.run(approve=True).kind == "complete"
     status = scenario.kernel.status(effect.subject)
     assert status["phase"] == "complete" and status["budgets"] == budgets

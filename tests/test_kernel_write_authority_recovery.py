@@ -1,6 +1,6 @@
 """Recovery facts are checked after slow preparation and before live Core admission."""
 from support.core_operations import prepare_scripted_agent
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 
 import pytest
@@ -33,8 +33,8 @@ def test_write_authority_does_not_cache_permission_before_its_boundary():
     assert order == ["prepare", "boundary", "final"]
 
 
-@pytest.mark.parametrize("operation", ["reopen_ticket", "recovery_comment"])
-def test_real_core_preparation_cannot_write_after_foreign_recovery_transition(tmp_path, monkeypatch, operation):
+def test_real_core_preparation_cannot_write_after_foreign_recovery_transition(tmp_path, monkeypatch):
+    operation = "recovery_comment"
     scenario, host = managed_abandon_scenario(tmp_path)
     assert scenario.run().kind == "complete"
     kernel = scenario.kernel
@@ -124,97 +124,87 @@ def test_real_core_preparation_cannot_write_after_foreign_recovery_transition(tm
     assert scenario.port.objects.events(effect["payload"]["issue"])[-1]["actor"]["login"] == "another-maintainer"
 
 
-@pytest.mark.parametrize("operation", ["pr_edit", "completion_comment", "close"])
-def test_real_core_original_write_rechecks_its_prior_after_preparation(tmp_path, monkeypatch, operation):
+@pytest.mark.parametrize("operation", ["pr_edit", "completion_comment", "close", "reopen_ticket"])
+def test_remote_write_rechecks_its_prior_after_preparation(tmp_path, monkeypatch, operation):
+    """The physical boundary must refuse before calling final Core admission.
+
+    The managed recovery test above proves real preparation/admission wiring;
+    these cases own the adapter-specific PR/comment/event comparisons.
+    """
     from agent_run.contracts.write_authority import WriteAuthority
-    from agent_run.model import DeliveryKind
-    from support.effect_boundary import EffectBoundary
-    from support.offline import Scenario
-
-    scenario = Scenario(tmp_path / "delivery", DeliveryKind.TICKET,
-                        checks=("fail", "none") if operation == "pr_edit" else ("none",))
-    make_ports = scenario.make_ports
-
-    def hold_original(binding):
-        ports = make_ports(binding)
-        execute = ports.execute
-        def hold(effect, authority):
-            selected = (effect.operation == "pr_write" and effect.pr_number is not None
-                        if operation == "pr_edit" else effect.operation == operation)
-            if selected:
-                # Preserve a real admission for this original unresolved request.
-                authority.prepare()()
-                raise EffectBoundary(effect, authority)
-            return execute(effect, authority)
-        ports.execute = hold
-        return ports
-
-    with monkeypatch.context() as patch:
-        patch.setattr(scenario, "make_ports", hold_original)
-        with pytest.raises(EffectBoundary) as captured:
-            for _ in range(160):
-                step = scenario.step()
-                assert step.kind not in {"paused", "waiting", "approval", "complete"}, step
-    held = captured.value
-    effect, authority = held.effect, held.authorize
-    frozen = asdict(effect)
-    kernel = scenario.kernel
-    with kernel.storage.transaction(write=False) as tx:
-        original = dict(tx.one("SELECT * FROM effects WHERE id=?", (effect.effect_id,)))
-        assert original["status"] == "sent" and original["attempts"] == 1
-        payload = tx.get(original["payload_id"], effect.subject)
-    api = SyntheticGitHub(scenario.port.git, scenario.port.database, effect.repository,
-        physical=scenario.port.physical, actor=effect.actor if operation == "completion_comment" else "another-maintainer",
-        written=lambda *args: None, read_faults=set())
-    remote = scenario.port._remote(effect.repository)
-    issue = f"repos/{effect.repository}/issues/{effect.payload.get('issue', scenario.delivery.issue)}"
-    commands = len(scenario.port.objects.snapshot()["api_requests"])
-    prepared, admitted = [], []
+    from support.remote_effects import _fixture, _publish_pr
+    from support.fixture_text import replace_once
+    port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
+    fixture_authority = WriteAuthority(lambda: lambda: None)
+    # Recovery observes the Issue timestamp as well as the timeline. Supply this
+    # explicit provider field through the real gh executable, not a Core result.
+    binary = tmp_path / "bin" / "gh"
+    binary.write_text(replace_once(binary.read_text(),
+        "'node_id':'issue-node-2','state':d['issue_state']}",
+        "'node_id':'issue-node-2','state':d['issue_state'],'updated_at':d.get('issue_updated_at','2026-10-21T10:01:00Z')}"))
+    issue = f"repos/{push.repository}/issues/2"
+    if operation == "pr_edit":
+        creation, pr = _publish_pr(port, push)
+        effect = replace(creation, effect_id="edit", pr_number=pr.number,
+            payload={"title": "New title", "body": "New body", "prior": {"title": pr.title, "body": pr.body}})
+    else:
+        effect = replace(push, effect_id="comment", operation="completion_comment", before_sha=push.after_sha,
+            after_sha=None, pr_number=17,
+            payload={"issue": 2, "merge_sha": push.after_sha, "kind": "ticket", "gate_mode": "reviewed"})
+        if operation in {"close", "reopen_ticket"}:
+            comment = port.execute(effect, fixture_authority)
+            effect = replace(effect, effect_id="close", operation="close",
+                payload={**effect.payload, "close_intent": comment.raw["close_intent"]})
+        if operation == "reopen_ticket":
+            closed = port.execute(effect, fixture_authority)
+            effect = replace(effect, effect_id="reopen", operation="reopen_ticket",
+                payload={**effect.payload, "close_receipt": asdict(closed),
+                    "completion": {"subject": effect.subject, "merge_sha": effect.before_sha, "close_effect": effect.effect_id}})
+    frozen, prepared, admitted = asdict(effect), [], []
+    before = len(calls.read_text().splitlines()) if calls.exists() else 0
     body = None
     if operation == "completion_comment":
-        baseline = max((event["id"] for event in scenario.port.objects.events(effect.payload["issue"])), default=0)
-        intent = remote._comment_intent(effect, baseline)
-        body = remote._comment_body(effect, intent)
+        body = port._comment_body(effect, port._comment_intent(effect, 0))
 
     def prepare():
-        final_admission = authority.prepare()
         prepared.append(effect.effect_id)
         if operation == "pr_edit":
-            api.write(f"repos/{effect.repository}/pulls/{effect.pr_number}", "PATCH",
-                      {"title": "External description", "body": "Preserve this external edit."})
+            port._write(f"repos/{effect.repository}/pulls/{effect.pr_number}", "PATCH",
+                {"title": "External description", "body": "Preserve this external edit."}, fixture_authority)
         elif operation == "completion_comment":
-            # A delayed copy of the already admitted original request becomes visible.
-            api.write(issue + "/comments", "POST", {"body": body})
+            port._write(issue + "/comments", "POST", {"body": body}, fixture_authority)
         else:
-            api.write(issue, "PATCH", {"state": "closed"})
-            api.write(issue, "PATCH", {"state": "open"})
-        def final():
-            admitted.append(effect.effect_id)
-            final_admission()
-        return final
+            # Another actor's timeline is an external input to this adapter.
+            document = json.loads(state.read_text())
+            transitions = ("closed", "reopened") if operation == "close" else ("reopened", "closed")
+            for minute, event in enumerate(transitions, 2):
+                document["events"].append({"id": len(document["events"]) + 1,
+                    "event": event, "actor": {"login": "another-maintainer"},
+                    "created_at": f"2026-10-21T10:0{minute}:00Z"})
+            document.update(issue_state="open" if operation == "close" else "closed",
+                            issue_updated_at="2026-10-21T10:03:00Z")
+            state.write_text(json.dumps(document))
+        return lambda: admitted.append(effect.effect_id)
 
-    with pytest.raises(KernelError, match="pr_boundary_changed" if operation == "pr_edit" else "operation_boundary_changed"):
-        remote.execute(effect, WriteAuthority(prepare))
-    assert prepared == [effect.effect_id] and admitted == []
-    assert asdict(effect) == frozen
-    with kernel.storage.transaction(write=False) as tx:
-        assert dict(tx.one("SELECT * FROM effects WHERE id=?", (effect.effect_id,))) == original
-        assert tx.get(original["payload_id"], effect.subject) == payload
-    writes = scenario.port.objects.snapshot()["api_requests"][commands:]
-    assert len(writes) == (2 if operation == "close" else 1)
+    reason = ("pr_boundary_changed" if operation == "pr_edit" else
+              "ticket_recovery_boundary_changed" if operation == "reopen_ticket" else "operation_boundary_changed")
+    with pytest.raises(KernelError, match=reason):
+        port.execute(effect, WriteAuthority(prepare))
+    assert prepared == [effect.effect_id] and admitted == [] and asdict(effect) == frozen
+    writes = [json.loads(line) for line in calls.read_text().splitlines()[before:] if "--method" in line]
+    assert len(writes) == (0 if operation in {"close", "reopen_ticket"} else 1)
+    document = json.loads(state.read_text())
     if operation == "pr_edit":
-        pr = api.object(f"repos/{effect.repository}/pulls/{effect.pr_number}")
-        assert pr["title"] == "External description" and pr["body"] == "Preserve this external edit."
-        assert [(row["method"], row["endpoint"]) for row in writes] == [("PATCH", f"repos/{effect.repository}/pulls/{effect.pr_number}")]
+        assert document["prs"][0]["title"] == "External description"
+        assert document["prs"][0]["body"] == "Preserve this external edit."
     elif operation == "completion_comment":
-        exact = [comment for comment in scenario.port.objects.comments(effect.payload["issue"]) if remote._marker(effect) in comment["body"]]
+        exact = [comment for comment in document["comments"] if port._marker(effect) in comment["body"]]
         assert len(exact) == 1 and exact[0]["body"] == body
-        assert [(row["method"], row["endpoint"]) for row in writes] == [("POST", issue + "/comments")]
     else:
-        assert api.object(issue)["state"] == "open"
-        events = scenario.port.objects.events(effect.payload["issue"])[-2:]
-        assert [event["event"] for event in events] == ["closed", "reopened"]
-        assert all(event["actor"]["login"] == "another-maintainer" for event in events)
+        expected = ["closed", "reopened"] if operation == "close" else ["reopened", "closed"]
+        assert [event["event"] for event in document["events"][-2:]] == expected
+        assert all(event["actor"]["login"] == "another-maintainer" for event in document["events"][-2:])
+        assert document["issue_state"] == ("open" if operation == "close" else "closed")
 
 
 def test_pr_noop_foreign_readback_does_not_dispatch_a_new_admission(tmp_path, monkeypatch):
