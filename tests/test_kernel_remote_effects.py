@@ -465,7 +465,7 @@ def test_observe_uses_real_requirements_remote_commits_and_required_ci_facts(tmp
     assert world.checks.result == "fail" and world.checks.head_sha == latest.sha
     assert "Original required failure" in world.checks.logs and "not_collected" in world.checks.logs
     assert world.publisher_actor == "publisher" and world.publisher_identity == {"source": "host"}
-    assert (push.base.sha, latest.sha) in world.ancestry
+    assert world.ancestry == ((world.pr.base.sha, world.target.sha),)
     assert git.commit(latest.sha) == latest
     assert not (port.root / ".git" / "FETCH_HEAD").exists()
     assert git.run("for-each-ref", "--format=%(refname) %(objectname)").stdout == refs_before

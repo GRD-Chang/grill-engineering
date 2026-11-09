@@ -1070,7 +1070,7 @@ class RemoteEffects:
             # just like the other API facts reused in this observation.
             commits[pr.base.sha] = pr.base
             reused.add(pr.base.sha)
-        checked = requested_ancestry(request, source)
+        checked = requested_ancestry(request, source, target, pr)
         heads = set(request.anchors) | {head for head in (source_sha, target_sha) if head is not None}
         if checked is not None:
             heads.update(head for pair in checked for head in pair)

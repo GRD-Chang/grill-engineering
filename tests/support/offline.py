@@ -191,11 +191,11 @@ class OfflinePort:
             physical.fetch(head)
         commits = physical.read_commits(sampled_heads)
         source, target = (commits.get(refs.get(ref)) for ref in (request.source_ref, request.target_ref))
-        checked = requested_ancestry(request, source)
+        checked = requested_ancestry(request, source, target, pr)
         ancestry_heads = set(request.anchors) | {head.sha for head in (source, target) if head is not None}
-        if checked is not None:
-            ancestry_heads.update(head for pair in checked for head in pair)
-            # Even a reflexive edge requires its actual commit object.
+        if request.ancestry_pairs is not None:
+            ancestry_heads.update(head for pair in checked or () for head in pair)
+            # Even a reflexive or unresolved demand retains anchor object checks.
             for head in sorted(ancestry_heads):
                 if self.git.run("cat-file", "-e", head + "^{commit}", check=False).returncode:
                     raise KernelError("git_ancestry_unknown")

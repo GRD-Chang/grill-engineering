@@ -17,6 +17,25 @@ def test_explicit_requeue_consumes_its_proven_closed_pr_with_an_ancestor_base(tm
     assert receipt['pr']['base']['sha'] == old.target.sha
     assert receipt['raw']['write_returncode'] == 0 and row['attempts'] == 1
     assert payload['retirement_intent']['control_action'] == 'original-requeue'
+    # The original receipt is observed but unconsumed when GitHub advances its
+    # reported base. That receipt's base (not the new scope target) owns the edge.
+    from support.offline_api import SyntheticGitHub
+    read = SyntheticGitHub.object
+    def current_base(api, endpoint):
+        value = read(api, endpoint)
+        if endpoint.startswith(f'repos/{scenario.spec.repository}/pulls/') and value.get('number') == old.pr.number:
+            return {**value, 'base': {**value['base'], 'sha': world.target.sha}}
+        return value
+    monkeypatch.setattr(SyntheticGitHub, 'object', current_base)
+    observed = scenario.world()
+    edge = (receipt['pr']['base']['sha'], observed.pr.base.sha)
+    assert row['status'] == 'observed' and edge[0] != edge[1] and edge in observed.ancestry
+    with kernel.storage.transaction(write=False) as tx:
+        run = tx.one('SELECT * FROM runs WHERE id=?', (kernel.storage.run_id,))
+        job = kernel._job(tx, subject)
+        assert kernel._retirement_current(tx, run, job, row, observed)
+        assert not kernel._retirement_current(tx, run, job, row,
+            replace(observed, ancestry=tuple(pair for pair in observed.ancestry if pair != edge)))
     scenario.requirements = replace(scenario.requirements,
         parent=replace(scenario.requirements.parent, body=scenario.requirements.parent.body + '\nAnother explicit revision.'))
     world = scenario.world()

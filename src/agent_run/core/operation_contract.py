@@ -37,7 +37,7 @@ class DeliveryRead:
     check_head: str | None = None
     read_pr: bool = True
     # None retains the complete anchor relation. An explicit tuple requests
-    # only these directed edges; "source" resolves to this observation's head.
+    # only these directed edges; source, target and pr_base resolve in this observation.
     ancestry_pairs: tuple[tuple[str, str], ...] | None = None
     # False omits only Required Checks, never PR/ref identity observation.
     read_checks: bool = True
@@ -65,11 +65,12 @@ class DeliveryFacts:
     checks_requested: bool = True
 
 
-def requested_ancestry(request: DeliveryRead, source: Commit | None) -> tuple[tuple[str, str], ...] | None:
-    """Resolve explicit demand, without inventing a missing remote head.
+def requested_ancestry(request: DeliveryRead, source: Commit | None,
+                       target: Commit | None = None, pr: PullRequest | None = None) -> tuple[tuple[str, str], ...] | None:
+    """Resolve each directed demand from the same observation's exact objects.
 
-    None also denotes an unresolved source. The consumer retains its original
-    missing-ref boundary; it cannot use that observation as ancestry evidence.
+    Missing refs leave only their incident edges unresolved, never negative.
+    An explicit empty request is distinct from an entirely unresolved request.
     """
     if request.ancestry_pairs is None:
         return None
@@ -77,18 +78,21 @@ def requested_ancestry(request: DeliveryRead, source: Commit | None) -> tuple[tu
             or any(not isinstance(pair, tuple) or len(pair) != 2
                    or any(not isinstance(value, str) for value in pair) for pair in request.ancestry_pairs)):
         raise ReadUnavailable("ancestry_request_invalid", "Ancestry requires directed pairs")
-    endpoints = {value for pair in request.ancestry_pairs for value in pair}
-    if any(value != "source" and (len(value) not in (40, 64)
-            or any(char not in "0123456789abcdef" for char in value)) for value in endpoints):
+    observed = {"source": source, "target": target, "pr_base": None if pr is None else pr.base}
+    def exact(value: str) -> bool:
+        return len(value) in (40, 64) and all(char in "0123456789abcdef" for char in value)
+    if any(value not in observed and not exact(value) for pair in request.ancestry_pairs for value in pair):
         raise ReadUnavailable("ancestry_request_invalid", "Ancestry requires exact commit identities")
-    if "source" in endpoints:
-        if source is None:
-            return None
-        if len(source.sha) not in (40, 64) or any(char not in "0123456789abcdef" for char in source.sha):
-            raise ReadUnavailable("ancestry_request_invalid", "Observed source is not an exact commit identity")
-    return tuple(sorted({(source.sha if before == "source" and source is not None else before,
-                          source.sha if after == "source" and source is not None else after)
-                         for before, after in request.ancestry_pairs}))
+    heads = {name: None if commit is None else commit.sha for name, commit in observed.items()}
+    resolved = set()
+    for pair in request.ancestry_pairs:
+        before, after = (heads.get(value, value) for value in pair)
+        if before is None or after is None:
+            continue
+        if not exact(before) or not exact(after):
+            raise ReadUnavailable("ancestry_request_invalid", "Observed endpoint is not an exact commit identity")
+        resolved.add((before, after))
+    return tuple(sorted(resolved)) if resolved or not request.ancestry_pairs else None
 
 @dataclass(frozen=True)
 class OperationSupervision:

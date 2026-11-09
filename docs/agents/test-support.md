@@ -37,6 +37,14 @@ parents/tree、需求和 Generation 保持一致。场景之间不共享可变 K
 每次 refs/commit/祖先关系仍实际读取，授权、CAS、symref 锁和丢回复后的读回保持真实。
 产品 ManagedWorkspace 与原生隔离安全测试拥有产品边界，不用夹具自测替代。
 
+交付观察由 Core 明确请求有向祖先边：Completion→Run、PR base→target、
+集成快照→当前 source/target、发布时 target→原 source，以及 Requeue 原 scope/退休回执→当前对象。
+RemotePort 与 OfflinePort 使用同一观察解析 source、target、pr_base；缺失端点不算负证据，
+已解析边必须完整报告 checked，正边只能来自 checked。真实 Git 对象检查与 ref 首尾核验保持原样。
+[Git 官方 `merge-base --is-ancestor`](https://git-scm.com/docs/git-merge-base) 约定
+退出码 0 表示祖先、1 表示非祖先，其余是错误；未知对象/查询失败不能降为 false。
+`test_delivery_ancestry_demand` 验证该协议，发布、集成漂移和退休恢复旅程验证需求完整性。
+
 `CoreOperations` 选择工作并执行相应边界；脚本化 Agent 支撑提供本例声明的外部返回。
 准备席位、Invocation、实际执行、退出证明与计费仍由产品负责。
 缺字段、跨对象身份、损坏、unknown 和外部漂移测试保留原始负向输入，

@@ -65,7 +65,7 @@ def test_explicit_empty_and_reflexive_demand_do_not_expand_to_all_pairs(tmp_path
     assert facts.ancestry == facts.ancestry_checked == expected
 
 
-@pytest.mark.parametrize('endpoint', ['refs/heads/main', 'target', 'a' * 39, 'A' * 40])
+@pytest.mark.parametrize('endpoint', ['refs/heads/main', 'unknown_ref', 'a' * 39, 'A' * 40])
 def test_bad_demand_is_rejected_before_external_reads(tmp_path, monkeypatch, endpoint):
     port, _, effect, _, _ = _fixture(tmp_path, monkeypatch)
     monkeypatch.setattr(port, '_commit', lambda *a: pytest.fail('Invalid demand reached GitHub'))
@@ -170,9 +170,12 @@ def test_current_completion_demand_is_fenced_before_acceptance_and_activation(tm
         else:
             pytest.fail('Normal producer did not reach the second close receipt')
         assert len(kernel.source_status()['completions']) == 1
-        # Every actual Ticket continuation, including integration and
-        # publication-parent selection, retains the original full relation.
-        assert queries and all(query.read_pr and query.ancestry_pairs is None for query in queries)
+        # Every Ticket uses explicit demand; publication preserves the reverse
+        # target -> stored source edge used to select real commit parents.
+        assert queries and all(query.read_pr and query.ancestry_pairs is not None for query in queries)
+        assert all(("pr_base", "target") in query.ancestry_pairs for query in queries)
+        assert any(before == "target" and after not in {"source", "target", "pr_base"}
+                   for query in queries for before, after in query.ancestry_pairs)
         query = kernel.accept_requirements(kernel.begin_observation(None, execution=scenario.execution),
             scenario.port.source(source, 1))
         facts = scenario.port.delivery(query.query, ['none'], [])
@@ -237,3 +240,15 @@ def test_requested_relation_accepts_full_sha256_without_accepting_partial_ids():
 def test_malformed_pair_shape_is_an_explicit_read_failure(pairs):
     with pytest.raises(ReadUnavailable, match='directed pairs'):
         requested_ancestry(DeliveryRead('a', 'b', None, (), ancestry_pairs=pairs), None)
+
+
+def test_unresolved_edges_do_not_hide_independent_checks():
+    base, head = Commit("a" * 40, "b" * 40), Commit("c" * 40, "d" * 40)
+    query = DeliveryRead("source", "target", None, (), ancestry_pairs=(
+        ("pr_base", "target"), ("target", head.sha), (base.sha, "source")))
+    assert requested_ancestry(query, None, base) == ((base.sha, head.sha),)
+    assert requested_ancestry(replace(query, ancestry_pairs=(("pr_base", "target"),)),
+                              None, Commit("base", "tree")) is None
+    assert requested_ancestry(replace(query, ancestry_pairs=()), None) == ()
+    with pytest.raises(ReadUnavailable, match="exact commit identities"):
+        requested_ancestry(replace(query, ancestry_pairs=(("not-an-oid", "source"),)), None)

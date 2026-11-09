@@ -266,12 +266,21 @@ class Kernel:
             job = tx.one(*run_statement(tx, 'SELECT * FROM final_target WHERE run_id=?',
                       (), run_last=True))
             anchors = set(self._final_ancestry_anchors(tx))
+            pairs = {(sha, "source") for sha in anchors}
         else:
             job = self._job(tx, fence.subject)
             anchors = {job[key] for key in ("base_sha", "source_sha", "candidate_sha", "integrated_sha") if job[key] is not None}
+            pairs = {("pr_base", "target")}
             for row in tx.rows(*run_statement(tx, 'SELECT source_sha,target_sha FROM integration_snapshots WHERE subject=? AND run_id=? ORDER BY window DESC LIMIT 1',
                            (fence.subject,), run_last=True)):
                 anchors.update(value for value in row if value is not None)
+                pairs.update(((row["source_sha"], "source"), (row["target_sha"], "target")))
+                # Integration can consume the stored source when its remote ref is absent.
+                if job["source_sha"] is not None and row["source_sha"] != job["source_sha"]:
+                    pairs.add((row["source_sha"], job["source_sha"]))
+            if job["kind"] in {DeliveryKind.TICKET, DeliveryKind.PARENT_ONLY} and job["phase"] == "publication_commit":
+                pairs.add(("target", job["source_sha"]))
+            pairs.update(self._retirement_ancestry(tx, job))
             if job["review_attempt"] is not None:
                 review = tx.one(*run_statement(tx, 'SELECT context_id FROM attempts WHERE id=? AND run_id=?',
                              (job["review_attempt"],), run_last=True))
@@ -281,7 +290,7 @@ class Kernel:
         return DeliveryRead(job["source_ref"], job["target_ref"], job["pr_number"] if fence.subject is not None else None,
                             tuple(sorted(anchors)), job["source_sha"] if fence.subject is not None and job["phase"] == "checks" else None,
                             fence.subject is not None,
-                            tuple((sha, "source") for sha in sorted(anchors)) if fence.subject is None else None,
+                            tuple(sorted(pairs)),
                             read_checks=fence.local_effect is None)
 
     def accept_requirements(self, request: RequirementsRead, source: Requirements) -> DeliveryObservation:
@@ -303,7 +312,7 @@ class Kernel:
                     or not required and facts.checks is not None):
                 raise ReadUnavailable("checks_observation_incomplete", "Required Checks demand was not exactly observed")
             if request.query.ancestry_pairs is not None:
-                checked = requested_ancestry(request.query, facts.source)
+                checked = requested_ancestry(request.query, facts.source, facts.target, facts.pr)
                 if (facts.ancestry_checked != checked
                         or checked is None and facts.ancestry
                         or checked is not None and not set(facts.ancestry) <= set(checked)):
@@ -2013,13 +2022,43 @@ class Kernel:
             raise KernelError("effect_binding")
         return dict(json.loads(tx.get(action["receipt_id"], action["subject"]))["requeue"])
 
-    def _recorded_retirement(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, world: World) -> sqlite3.Row:
-        self._control_binding(tx, run, job)
+    def _confirmed_retirement(self, tx: Transaction, job: sqlite3.Row,
+                              effect_id: str | None = None) -> sqlite3.Row | None:
+        if effect_id is not None:
+            return tx.one(*run_statement(tx, "SELECT * FROM effects WHERE id=? AND subject=? AND generation=? AND status='confirmed' AND run_id=?",
+                (effect_id, job["id"], job["generation"]), run_last=True))
         rows = tx.rows(*run_statement(tx, "SELECT * FROM effects WHERE subject=? AND generation=? AND pr_number=? AND operation='retire_pr' AND status='confirmed' AND run_id=? ORDER BY rowid DESC LIMIT 1",
                    (job["id"], job["generation"], job["pr_number"]), run_last=True))
-        if not rows or not self._retirement_current(tx, run, job, rows[0], world):
+        return rows[0] if rows else None
+
+    def _retirement_ancestry(self, tx: Transaction, job: sqlite3.Row) -> set[tuple[str, str]]:
+        """Read the same original action/receipt selected by requeue consumption."""
+        if job["pr_number"] is None:
+            return set()
+        pairs = set()
+        action = self._pending_requeue(tx, job["id"])
+        if action is None:
+            retirement = self._confirmed_retirement(tx, job)
+        else:
+            scope = self._requeue_scope(tx, action)
+            pairs.add((scope["target"]["sha"], "target"))
+            retirement = (None if scope.get("retired_effect") is None else
+                          self._confirmed_retirement(tx, job, scope["retired_effect"]))
+            pending = self._pending_effect(tx, job["id"])
+            if pending is not None and pending["status"] == "observed":
+                retirement = pending
+        if retirement is not None and retirement["receipt_id"] is not None:
+            result = json.loads(tx.get(retirement["receipt_id"], job["id"]))
+            if result["disposition"] == "target" and isinstance(result.get("pr"), dict):
+                pairs.add((result["pr"]["base"]["sha"], "pr_base"))
+        return pairs
+
+    def _recorded_retirement(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row, world: World) -> sqlite3.Row:
+        self._control_binding(tx, run, job)
+        row = self._confirmed_retirement(tx, job)
+        if row is None or not self._retirement_current(tx, run, job, row, world):
             raise KernelError("retirement_pr_changed")
-        return rows[0]
+        return row
 
     def _retirement_current(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row,
                             row: sqlite3.Row, world: World) -> bool:
@@ -2161,8 +2200,8 @@ class Kernel:
         readback = None
         retirement = None
         if scope.get("retired_effect") is not None:
-            original = tx.one(*run_statement(tx, "SELECT * FROM effects WHERE id=? AND subject=? AND generation=? AND status='confirmed' AND run_id=?",
-                           (scope["retired_effect"], subject, job["generation"]), run_last=True))
+            original = self._confirmed_retirement(tx, job, scope["retired_effect"])
+            assert original is not None
             previous = tx.rows(*run_statement(tx, "SELECT material_id FROM history WHERE kind='retirement_rechecked' AND identity=? AND run_id=? ORDER BY position DESC LIMIT 1",
                            (action["id"],), run_last=True))
             if not previous:
