@@ -172,11 +172,13 @@ def test_parent_requires_fresh_review_and_approval_for_the_live_target(tmp_path,
         assert not tx.rows('SELECT id FROM grants WHERE subject=?', (subject,))
         assert tx.one('SELECT final_action FROM runs')[0] is None
     assert not any(w['operation'] == 'merge' for w in scenario.writes())
-    reviews = scenario.review_count
+    reviews, developments = scenario.review_count, scenario.development_count
     assert scenario.run().kind == 'approval'
     assert scenario.review_count == reviews + 1
+    assert scenario.development_count == developments
     current = scenario.world()
     assert current.target == newer and current.pr is not None and current.pr.base == old.target
+    assert current.pr.number == old.pr.number
     kernel.control('approve', 'fresh-target-approval', subject=subject, world=current)
     assert scenario.run().kind == 'complete'
     merged = scenario.port.remote_commit(scenario.delivery.target_ref)

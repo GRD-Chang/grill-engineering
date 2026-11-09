@@ -249,17 +249,12 @@ def test_explicit_approval_poll_observes_target_append_without_background_pollin
         s.port.external_remote_append(s.delivery.target_ref, {"external.txt": "Original external work"}, "append")
         assert runner.run_once().kind == "paused"
         data = read(s.kernel.storage.path, 'status', storage=s.kernel.storage).data
-        assert data["subjects"][0]["integration_resync"]["limit"] == 0 and data["subjects"][0]["integration_resync"]["used"] == 0
-        assert data["subjects"][0]["integration_resync"]["window"] == 1 and data["subjects"][0]["integration_resync"]["open"] is False
+        # The direct snapshot rules own allowance/window/renewal combinations;
+        # this journey owns quiescence -> explicit observation -> operator action.
         action = next(item for item in data["operator_actions"] if item["reason"] == "integration_resync_exhausted")
         assert action["operation"] == "resume" and action["action"]["command"] == "resume"
         assert s.kernel.status("parent:1")["budgets"] == budgets
-        s.kernel.control("resume", "explicit-zero-resync-resume", subject="parent:1")
-        assert runner.run_once().kind == "paused"
-        resumed = read(s.kernel.storage.path, 'status', storage=s.kernel.storage).data["subjects"][0]["integration_resync"]
-        assert resumed["limit"] == 0 and resumed["used"] == 0
-        assert resumed["window"] == 1 and resumed["open"] is False
-        assert s.kernel.status("parent:1")["budgets"] == budgets
+
 
 
 @pytest.mark.parametrize("uncertain", ["unknown", "third"])

@@ -33,6 +33,7 @@ def test_acceptance_and_terminal_notifications_follow_committed_delivery_boundar
     recorded_agents(scenario, monkeypatch, started=started, activity=False)
     captured = []
     sent: list[dict[str, Any]] = []
+    status_api = None
 
     def transport(_config: Any, rendered: dict[str, Any], _identity: str,
                   *_args: Any, **_kwargs: Any) -> dict[str, Any]:
@@ -43,7 +44,8 @@ def test_acceptance_and_terminal_notifications_follow_committed_delivery_boundar
         return {"outcome": "success", "reason": None}
 
     def observe(kind: str = "acceptance_passed") -> list[dict[str, Any]]:
-        observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
+        observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport,
+                                       status_api=status_api, storage=scenario.kernel.storage)
         observer.close()
         assert observer.failure_reason is None
         return [row for row in outbox.read_notifications(tmp_path, scenario.spec.run_id)["records"]
@@ -114,10 +116,26 @@ def test_acceptance_and_terminal_notifications_follow_committed_delivery_boundar
     context = completion()
     assert context["parent_only"] is True and context["completion_actions"] == []
     assert context["next_step"] == "agent-run resume --repo example/project -- offline-run"
+    # The same committed close owns both notification and Status guidance.
+    from agent_run.queries.status_comment import project_status
+    from agent_run.queries.read_facts import action_guidance
+    from support.status_comments import CommentsAPI
+    import shlex
+    projection = project_status(scenario.kernel.storage.path, scenario.delivery.key, storage=scenario.kernel.storage)
+    status_api = CommentsAPI(projection.target)
+    database_before = scenario.kernel.storage.path.read_bytes()
+    quoted = action_guidance("resume", run_id="a'  b", repository=scenario.spec.repository, language="en")
+    assert shlex.split(quoted) == ["agent-run", "resume", "--repo", scenario.spec.repository, "--", "a'  b"]
     pending = observe("boundary")
     assert len(pending) == 1
     assert sent[-1]["header"]["template"] == "yellow"
     assert sent[-1]["header"]["title"]["content"] == event_copy({"language": "en"}, "cleanup")
+    terminal, = [event for event in captured if event["id"] == pending[0]["id"]]
+    assert terminal["terminal"] and terminal["next_step"] == context["next_step"]
+    assert terminal["parent_only"] is True and terminal["ticket_progress"] is None
+    assert terminal["completion_actions"] == [] and terminal["next_step"] in projection.body
+    assert [command[1] for command in status_api.commands] == ["POST"]
+    assert scenario.kernel.storage.path.read_bytes() == database_before
     assert observe("boundary") == pending
 
     assert scenario.run(approve=True).kind == "complete"
@@ -157,6 +175,10 @@ def test_observed_run_branch_write_does_not_promote_a_superseded_acceptance(
             return
         repair = [event for event in _project(scenario.kernel, "concise") if event["kind"] == "acceptance_repair"][-1]
         assert repair["live"] is True and repair["attempt_id"] == call.attempt_id
+        if not active:
+            assert scenario.kernel.control("stop", "stop-current-repair", subject=call.subject) == "applied"
+            stopped = [event for event in _project(scenario.kernel, "concise") if event["kind"] == "acceptance_repair"][-1]
+            assert stopped["id"] == repair["id"] and stopped["live"] is False
         with scenario.kernel.storage.transaction(write=False) as tx:
             assert obsolete_progress(tx, [repair], "concise", current_boundary=False) == set()
         active.append(repair)
@@ -170,6 +192,9 @@ def test_observed_run_branch_write_does_not_promote_a_superseded_acceptance(
         return execute(effect, authorize)
     monkeypatch.setattr(scenario.port, "execute", capture)
     for _ in range(100):
+        if active and "operator_stopped" in scenario.kernel.status(scenario.delivery.key)["gates"]:
+            # The controlled original process has returned and exited before Resume.
+            assert scenario.kernel.control("resume", "continue-original-repair", subject=scenario.delivery.key) == "applied"
         step = scenario.step()
         repairs = [event for event in _project(scenario.kernel, "concise") if event["kind"] == "acceptance_repair"]
         if repairs and planned is None:
@@ -314,6 +339,14 @@ def test_healthy_final_pr_and_approval_in_one_observation_share_only_the_approva
         return response
 
     monkeypatch.setattr(SyntheticGitHub, "_with_refs", staticmethod(canonical_pr))
+    original_page, pages = NativeNotifications._page, []
+
+    def page(self, after):
+        result = original_page(self, after)
+        pages.append((after, result[1]))
+        return result
+
+    monkeypatch.setattr(NativeNotifications, "_page", page)
     scenario = _enabled_scenario(tmp_path, monkeypatch, DeliveryKind.PARENT_ONLY, mode="detailed")
     # Read the same real PR at checks and approval from independent journals.
     for _ in range(80):
@@ -343,6 +376,15 @@ def test_healthy_final_pr_and_approval_in_one_observation_share_only_the_approva
 
         observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
         try:
+            observe_and_wait(observer)
+            if approval:
+                from support.worker_process_timing import wait_until
+                retired = wait_until(lambda: [item for item in
+                    outbox.read_notifications(tmp_path, scenario.spec.run_id)["records"]
+                    if item["kind"] == "boundary" and item["outcome"] == "success"], timeout=3)
+                assert len(retired) == 1
+                # A fresh wake after a retired approval must not resend its PR.
+                observe_and_wait(observer)
             observer.close()
             assert observer.failure_reason is None
         finally:
@@ -361,6 +403,12 @@ def test_healthy_final_pr_and_approval_in_one_observation_share_only_the_approva
         assert bool(approval_cards) is approval
         if approval:
             assert any(f"https://github.com/example/project/pull/{pr.number}" in str(item) for item in approval_cards)
+            assert len(approval_cards) == 1
+            assert [item for item in records if item["id"] == retired[0]["id"]] == retired
+            assert not any(item["kind"] == "pr_created" and item["attempts"] for item in records)
+            assert any(more for _after, more in pages)
+            with scenario.kernel.storage.transaction(write=False) as tx:
+                assert journal["native_cursor"] == tx.one("SELECT max(position) FROM history")[0]
         assert scenario.kernel.storage.path.read_bytes() == database_before
         assert read(scenario.kernel.storage.path, 'status', storage=scenario.kernel.storage).data["subjects"][0]["phase"] == ("approval" if approval else "checks")
 
@@ -454,46 +502,3 @@ def test_final_pr_coalescing_requires_an_exact_current_approval_and_an_unsent_cr
         assert record["deadline_at"] == before["pending"][0]["deadline_at"]
     else:
         assert document == before
-
-
-def test_healthy_multi_page_observation_does_not_repeat_pr_creation_after_approval_was_sent(tmp_path, monkeypatch):
-    from support.worker_process_timing import wait_until
-
-    scenario = _enabled_scenario(tmp_path, monkeypatch, DeliveryKind.PARENT_ONLY, mode="detailed")
-    sent = []
-    pages = []
-    original_page = NativeNotifications._page
-
-    def observed_page(self, after):
-        result = original_page(self, after)
-        pages.append((after, result[1]))
-        return result
-
-    monkeypatch.setattr(NativeNotifications, "_page", observed_page)
-
-    def transport(_config, rendered, _identity, *_args, **_kwargs):
-        sent.append(rendered)
-        return {"outcome": "success", "reason": None}
-
-    observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
-    try:
-        assert scenario.run().kind == "approval"
-        observe_and_wait(observer)
-        approval_retired = wait_until(lambda: [item for item in
-            outbox.read_notifications(tmp_path, scenario.spec.run_id).get("records", [])
-            if item["kind"] == "boundary" and item["outcome"] == "success"], timeout=3)
-        assert len(approval_retired) == 1
-        assert any(more for _after, more in pages), "The real observation never reached a second history page"
-        # A later wake rechecks the durable receipt after the same worker has
-        # completed paginated observation and retired the important approval.
-        observe_and_wait(observer)
-        observer.close()
-        assert observer.failure_reason is None
-        titles = [item["header"]["title"]["content"] for item in sent]
-        assert titles.count("Please approve the PR merge") == 1
-        assert not any(title.startswith("Final PR #") and title.endswith(" created") for title in titles)
-        records = outbox.read_notifications(tmp_path, scenario.spec.run_id)["records"]
-        assert [item for item in records if item["id"] == approval_retired[0]["id"]] == approval_retired
-        assert not any(item["kind"] == "pr_created" and item["attempts"] for item in records)
-    finally:
-        observer.close(drain=False)

@@ -132,3 +132,11 @@ Invocation/output 复合关系，不负责补准备、Go、活动、raw 或退�
 
 `core_operations.declared_delivery` 只投影明确给定的外部关系和精确 Commit 的反身关系；
 显式 checked 可声明负边，未声明的非反身边必须失败，不把缺少 fixture 输入解释为 Git false。
+
+通知的正式提交与投影连接分别由 Parent close→cleanup、Final observed Run Branch
+后的 source race、Ticket CI 续额→Completion 三条旅程负责；Status 的 terminal 指引
+及 Ticket receipt/summary/progress 直接消费同一条旅程的提交事实。
+分页与再次 wake 的去重由真实 coalescing 旅程负责，不另重演完整 Parent 发布。
+Resync 额度、窗口和续期组合在 `test_kernel_policy_execution` 使用明确 snapshot 输入；
+实际外部追加由该文件的 Final open-window 旅程负责，正常重新集成的同 PR、
+不重复 Development 与新 Review 由 `test_kernel_pr_base_observation` 的 Parent 漂移旅程负责。

@@ -70,3 +70,53 @@ class CommentsAPI:
             raise OSError("lost reply; private diagnostic must not enter journal")
         return subprocess.CompletedProcess([], 0, "", "")
 
+
+def assert_completed_ticket_sender(scenario, *, summary, completed):
+    """Consume the caller's original Completion, without another Git journey."""
+    import json
+    from agent_run.notifications.sender import NativeNotifications
+    from agent_run.storage import notification_outbox as outbox
+
+    database, subject = scenario.kernel.storage.path, scenario.delivery.key
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        original = tx.one("SELECT e.receipt_id,c.development_attempt FROM completions c "
+                          "JOIN effects e ON e.id=c.close_effect WHERE c.subject=?", (subject,))
+        receipt = original["receipt_id"]
+    before = database.read_bytes()
+    projection = project_status(database, subject, storage=scenario.kernel.storage)
+    assert projection.target.pr_number == scenario.kernel.status(subject)["pr_number"]
+    assert projection.target.issue == scenario.delivery.issue and projection.target.parent_issue == 1
+    assert projection.target.actor == "offline-publisher"
+    assert "Recorded Review: pass" in projection.body and "Delivery: complete" in projection.body
+    assert "not_recorded" in projection.body
+    sender = core_status_comments(scenario.kernel)
+    intent = sender.stage(subject)
+    assert intent is not None and intent["body"].endswith(projection.body) and intent["sent"] is False
+    assert sender.stage(subject) == intent and database.read_bytes() == before
+    captured = []
+    def transport(_config, rendered, *_args, **_kwargs):
+        active, = [row["event"] for row in outbox.read_notifications(database.parent, scenario.spec.run_id)["pending"]
+                   if row["outcome"] == "sending"]
+        captured.append((active, rendered))
+        return {"outcome": "success", "reason": None}
+    api = CommentsAPI(project_status(database, subject, storage=scenario.kernel.storage).target)
+    observer = NativeNotifications(database, database.parent, status_api=api, transport=transport, storage=scenario.kernel.storage)
+    try:
+        observer.close()
+        assert observer.failure_reason is None and observer.status_failure_reason is None
+        event, rendered = next(item for item in captured if item[0]["kind"] == "ticket_completed")
+        assert sum(item[0]["kind"] == "ticket_completed" for item in captured) == 1
+        assert event["source_material_id"] == receipt
+        assert event["summary"] == summary
+        assert event["ticket_progress"] == {"completed": 1, "total": 1} and event["parent_only"] is False
+        assert event["status_query"] == f"agent-run status --repo {scenario.spec.repository} -- {scenario.spec.run_id}"
+        assert event["id"] == completed["id"] and event["effort"] == completed["effort"]
+        assert event["total_seconds"] == completed["total_seconds"]
+        assert event["execution_timing_complete"] == completed["execution_timing_complete"]
+        assert "1/1" in json.dumps(rendered, ensure_ascii=False)
+        records = outbox.read_notifications(database.parent, scenario.spec.run_id)["records"]
+        assert any(row["id"] == event["id"] and row["outcome"] == "success" for row in records)
+        assert not observer.thread.is_alive() and database.read_bytes() == before
+    finally:
+        observer.close(drain=False)
+

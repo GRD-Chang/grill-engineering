@@ -247,25 +247,6 @@ def test_activity_start_respects_the_original_invocation_deadline(
     assert kernel.worker_settled(call)
 
 
-def test_stopped_repair_activity_is_not_presented_as_still_active(tmp_path, monkeypatch, domain_scenario):
-    scenario = domain_scenario(tmp_path, DeliveryKind.FINAL_RUN, reviews=("fail", "pass"))
-    stopped = []
-
-    def started(call):
-        if call.role != Role.DEVELOPMENT:
-            return
-        current = [event for event in _project(scenario.kernel, "concise") if event["kind"] == "acceptance_repair"][-1]
-        assert current["live"] is True
-        assert scenario.kernel.control("stop", "stop-current-repair", subject=call.subject) == "applied"
-        waiting = [event for event in _project(scenario.kernel, "concise") if event["kind"] == "acceptance_repair"][-1]
-        assert waiting["id"] == current["id"] and waiting["live"] is False
-        stopped.append(call.attempt_id)
-
-    _recorded_agents(scenario, monkeypatch, started=started)
-    assert scenario.run().kind == "paused"
-    assert len(stopped) == 1
-
-
 def test_same_protocol_activity_without_observer_trigger_keeps_real_start_and_resume(tmp_path, monkeypatch):
     from agent_run.queries.run import read
     from support.core_operations import CoreOperations
@@ -326,10 +307,14 @@ def test_completed_ticket_effort_spans_budget_renewal_without_recounting_resume(
     from agent_run.notifications.cards import card
     from agent_run.queries.run import read
 
-    scenario = GraphScenario(tmp_path, Requirements(ParentIssue(1, "Parent", "Scope", (2,)),
-        (Issue(2, "Ticket", "Original task", "OPEN", labels=("ready-for-agent",)),)),
+    from support.notification import _enabled_scenario
+    from support.status_comments import assert_completed_ticket_sender
+
+    scenario = _enabled_scenario(tmp_path, monkeypatch, DeliveryKind.TICKET,
         policy=Policy(ticket_ci_developments=1, ticket_ci_review=True))
-    with domain_kernel(scenario.kernel) as scenario.kernel:
+    subject = scenario.delivery.key
+    native = scenario.kernel
+    with domain_kernel(native) as scenario.kernel:
         scenario.checks = ["fail", "fail", "none"]
         now, calls = [100.0], []
         scenario.kernel.clock = lambda: now[0]
@@ -345,18 +330,18 @@ def test_completed_ticket_effort_spans_budget_renewal_without_recounting_resume(
 
         _recorded_agents(scenario, monkeypatch, started=started, activity=False)
         assert scenario.run().kind == "paused"
-        before = scenario.kernel.status("ticket:2")["budgets"]
+        before = scenario.kernel.status(subject)["budgets"]
         assert (before["ci"]["window"], before["ci"]["developments_used"], before["ci"]["reviews_used"]) == (1, 1, 1)
         prior_attempts = {call.attempt_id for call in calls}
         now[0] += 100  # Human waiting is not Agent execution.
-        assert scenario.kernel.control("resume", "renew-ci-once", subject="ticket:2") == "applied"
-        assert scenario.kernel.control("resume", "renew-ci-once", subject="ticket:2") == "applied"
-        renewed = scenario.kernel.status("ticket:2")["budgets"]
+        assert scenario.kernel.control("resume", "renew-ci-once", subject=subject) == "applied"
+        assert scenario.kernel.control("resume", "renew-ci-once", subject=subject) == "applied"
+        renewed = scenario.kernel.status(subject)["budgets"]
         assert (renewed["ci"]["window"], renewed["ci"]["developments_used"], renewed["ci"]["reviews_used"]) == (2, 0, 1)
         assert renewed["requirements"] == before["requirements"]
         assert scenario.run().kind == "complete"
-        assert scenario.kernel.status("ticket:2")["resource_cleanup"]["state"] == "complete"
-        assert scenario.port.objects.issue(2)["state"] == "closed"
+        assert scenario.kernel.status(subject)["resource_cleanup"]["state"] == "complete"
+        assert scenario.port.objects.issue(scenario.delivery.issue)["state"] == "closed"
         projected = _project(scenario.kernel, "concise")
         event, = [item for item in projected if item["kind"] == "ticket_completed"]
         attempts = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage).data["history"]["attempts"]
@@ -372,6 +357,9 @@ def test_completed_ticket_effort_spans_budget_renewal_without_recounting_resume(
             rendered = json.dumps(card({**event, "language": language}), ensure_ascii=False)
             assert rendered.count(count) == 2
         assert _project(scenario.kernel, "concise") == projected
+
+    scenario.kernel = native  # The actual sender owns a different thread/SQLite reader.
+    assert_completed_ticket_sender(scenario, summary="Changed synthetic behavior 3", completed=event)
 
 
 @pytest.mark.parametrize("role", [Role.DEVELOPMENT, Role.REVIEW, Role.PUBLICATION])

@@ -6,11 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.model import Commit, Delivery, DeliveryKind, Policy, RunSpec
+from agent_run.model import Commit, Delivery, DeliveryKind, Policy, RunSpec, World
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from support.run_scoped_kernel import domain_kernel, domain_scenario
 from support.core_operations import CoreOperations, native_agent_fixture, final_scenario
+from support.worker_facts import worker_fixture
 
 
 def test_frozen_call_deadline_cannot_be_extended_or_used_after_expiry(tmp_path: Path) -> None:
@@ -44,34 +45,46 @@ def test_created_language_is_consumed_by_the_actual_agent_call(tmp_path: Path) -
     assert call.context.get("repository_root") == str(tmp_path)
 
 
-@pytest.mark.parametrize("limit", [0, 1])
-def test_resync_charges_only_external_completed_snapshots_and_resume_only_renews_it(tmp_path: Path, limit: int, domain_scenario) -> None:
-    scenario = domain_scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY, policy=Policy(resync_limit=limit))
-    assert scenario.run().kind == "approval"
-    initial = scenario.kernel.status(scenario.delivery.key)
-    for ordinal in range(1, limit + 2):
-        scenario.port.external_remote_append(scenario.delivery.target_ref, {f"external-{ordinal}.txt": "Retained external work\n"}, f"resync-{ordinal}")
-        boundary = scenario.run()
-        if ordinal <= limit:
-            assert boundary.kind == "approval"
-            current = scenario.kernel.status(scenario.delivery.key)
-            assert current["budgets"]["requirements"] == initial["budgets"]["requirements"]
-            assert current["budgets"]["ci"] == initial["budgets"]["ci"]
+@pytest.mark.parametrize("limit,used", [(0, 0), (1, 0), (1, 1)])
+def test_resync_charges_only_external_completed_snapshots_and_resume_only_renews_it(tmp_path: Path, limit: int, used: int) -> None:
+    native, _operations = worker_fixture(tmp_path, kind=DeliveryKind.PARENT_ONLY, policy=Policy(resync_limit=limit))
+    with domain_kernel(native) as kernel:
+        subject, run = "parent_only:1", kernel.storage.run_id
+        delivery = kernel.delivery(subject)
+        before, after = delivery.base, Commit("e" * 40, "f" * 40)
+        # Recorded output of a completed integration, not proof of its producer.
+        # The real open-window Git journey below owns that connection.
+        with kernel.storage.transaction() as tx:
+            tx.execute("UPDATE resync_allowances SET used=? WHERE run_id=? AND subject=? AND current=1", (used, run, subject))
+            tx.execute("INSERT INTO integration_snapshots(run_id,subject,window,allowance_generation,source_ref,target_ref,source_sha,target_sha,open) VALUES (?,?,?,1,?,?,?,?,0)",
+                (run, subject, used + 1, delivery.source_ref, delivery.target_ref, before.sha, before.sha))
+            budgets = [dict(row) for row in tx.rows("SELECT * FROM budgets WHERE run_id=? AND subject=?", (run, subject))]
+        world = World("parent", "graph", "original", after, before, ancestry=((before.sha, after.sha),))
+
+        def observe():
+            with kernel.storage.transaction() as tx:
+                job = tx.one("SELECT * FROM subjects WHERE run_id=? AND id=?", (run, subject))
+                accepted = kernel._observe_integration_snapshot(tx, job, world)
+                return accepted, kernel._resync_state(tx, subject)
+
+        accepted, state = observe()
+        assert accepted is (used < limit)
+        assert (state["used"], state["window"], state["open"]) == (
+            used + 1 if accepted else used, used + 2 if accepted else used + 1, accepted)
+        if accepted:
+            # Re-observing this same open window spends no second allowance.
+            assert observe() == (True, state)
         else:
-            assert boundary.kind == "paused" and "integration_resync_exhausted" in scenario.kernel.status(scenario.delivery.key)["gates"]
-    before = scenario.kernel.status(scenario.delivery.key)
-    assert initial["resync"]["used"] == 0 and initial["resync"]["open"] is False
-    assert before["resync"]["used"] == limit
-    assert before["resync"]["window"] == limit + 1
-    assert scenario.development_count == 1
-    if limit:
-        scenario.kernel.control("resume", "renew-resync-only", subject=scenario.delivery.key)
-        renewed = scenario.kernel.status(scenario.delivery.key)
-        assert renewed["resync"]["generation"] == 2 and renewed["resync"]["used"] == 0
-        assert renewed["budgets"] == before["budgets"]
-        assert scenario.run().kind == "approval"
-        assert scenario.kernel.status(scenario.delivery.key)["resync"]["used"] == 1
-        assert scenario.port.pull_request_by_ref(scenario.kernel.delivery(scenario.delivery.key).source_ref, scenario.kernel.delivery(scenario.delivery.key).target_ref).number == initial["pr_number"]
+            assert "integration_resync_exhausted" in kernel.status(subject)["gates"]
+            kernel.control("resume", "renew-resync-only", subject=subject)
+            with kernel.storage.transaction(write=False) as tx:
+                renewed = kernel._resync_state(tx, subject)
+            assert (renewed["generation"], renewed["used"], renewed["window"], renewed["open"]) == (2, 0, used + 1, False)
+            resumed, state = observe()
+            assert resumed is bool(limit)
+            assert state["used"] == int(bool(limit))
+        with kernel.storage.transaction(write=False) as tx:
+            assert [dict(row) for row in tx.rows("SELECT * FROM budgets WHERE run_id=? AND subject=?", (run, subject))] == budgets
 
 
 def test_external_changes_during_open_integration_share_the_free_snapshot(tmp_path: Path) -> None:

@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from agent_run.model import AgentCall, Commit, Delivery, DeliveryKind, Issue, ParentIssue, Requirements, RunSpec, wire_json
+from agent_run.model import AgentCall, Commit, Delivery, DeliveryKind, Issue, ParentIssue, Policy, Requirements, RunSpec, wire_json
 
 from agent_run.contracts.prompt import RESOURCE_KEYS
 from agent_run.config.defaults import UserDefaultsStore
@@ -245,7 +245,8 @@ def _project(kernel: Kernel, mode: str) -> list[dict[str, Any]]:
 
 
 def _enabled_scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: DeliveryKind,
-                      *, reviews: tuple[str, ...] = ("pass",), mode: str = "concise", language: str = "en") -> Scenario:
+                      *, reviews: tuple[str, ...] = ("pass",), mode: str = "concise", language: str = "en",
+                      policy: Policy | None = None) -> Scenario:
     defaults = UserDefaultsStore(tmp_path / "defaults.json")
     defaults.configure(language=language, notifications={"enabled": False, "mode": mode})
     from support import offline
@@ -257,7 +258,9 @@ def _enabled_scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: Del
         assert spec.inputs is not None
         inputs = replace(spec.inputs, notifications={"enabled": True, "mode": mode,
                          "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
-        return original_create(path, replace(spec, language=language, inputs=inputs), **kwargs)
+        # These are declared fixture inputs, not a defaults-resolution test.
+        return original_create(path, replace(spec, language=language, inputs=inputs,
+            policy=spec.policy if policy is None else policy), **kwargs)
 
     source = independent_source()
     if kind == DeliveryKind.PARENT_ONLY:
@@ -271,10 +274,11 @@ def _enabled_scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: Del
         patch.setattr(offline, "create_kernel", create)
         if kind == DeliveryKind.FINAL_RUN:
             # d847 builds and retains actual historical Ticket Completion.
-            scenario = Scenario(tmp_path, kind, reviews=reviews)
+            scenario = Scenario(tmp_path, kind, reviews=reviews, policy=policy)
             assert len(scenario.kernel.source_status()["completions"]) == 1
         else:
-            scenario = GraphScenario(tmp_path, source, reviews=reviews if kind == DeliveryKind.PARENT_ONLY else ("pass",))
+            scenario = GraphScenario(tmp_path, source, policy=policy,
+                                     reviews=reviews if kind == DeliveryKind.PARENT_ONLY else ("pass",))
     return scenario
 
 

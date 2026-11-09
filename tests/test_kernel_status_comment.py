@@ -14,25 +14,9 @@ from support.offline import Scenario
 from support.status_comments import CommentsAPI, core_status_comments
 
 
-def published(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, notifications=None, kind=DeliveryKind.PARENT_ONLY, runner_identity=None) -> Scenario:
-    # The fixture uses the real atomic Task/Run producer in one repository DB.
-    from support import offline
-    original = offline.create_kernel
-    def create(path: Path, spec: Any, **kwargs: Any) -> Kernel:
-        if notifications is not None or runner_identity is not None:
-            from dataclasses import replace
-            assert spec.inputs is not None
-            values = {}
-            if notifications is not None:
-                values["notifications"] = notifications
-            if runner_identity is not None:
-                values["runner_identity"] = runner_identity
-            spec = replace(spec, inputs=replace(spec.inputs, **values))
-        return original(path, spec, **kwargs)
-    with monkeypatch.context() as patch:
-        patch.setattr(offline, "create_kernel", create)
-        scenario = Scenario(tmp_path / "run", kind)
-    assert scenario.run().kind == ("complete" if kind == DeliveryKind.TICKET else "approval")
+def published(tmp_path: Path) -> Scenario:
+    scenario = Scenario(tmp_path / "run", DeliveryKind.PARENT_ONLY)
+    assert scenario.run().kind == "approval"
     return scenario
 
 
@@ -69,7 +53,7 @@ def test_status_projection_and_intent_are_readonly_and_frozen(tmp_path, monkeypa
     original_object, original_list = SyntheticGitHub.object, SyntheticGitHub.list
     monkeypatch.setattr(SyntheticGitHub, "object", lambda self, endpoint: spelling(original_object(self, endpoint)))
     monkeypatch.setattr(SyntheticGitHub, "list", lambda self, endpoint: spelling(original_list(self, endpoint)))
-    scenario = published(tmp_path, monkeypatch, kind=DeliveryKind.PARENT_ONLY)
+    scenario = published(tmp_path)
     assert_stale_and_unknown_review_records_are_readonly(scenario.kernel, scenario.delivery.key)
     database, subject = scenario.kernel.storage.path, scenario.delivery.key
     before = database.read_bytes()
@@ -296,7 +280,7 @@ def test_normal_exit_hook_uses_original_handoff_without_claiming_domain_release(
     from agent_run.runtime.process_identity import _process_start_token
     from agent_run.runtime.execution import _cgroup
     from support.systemd_manager import controlled_manager
-    scenario = published(tmp_path, monkeypatch)
+    scenario = published(tmp_path)
     kernel, subject = scenario.kernel, scenario.delivery.key
     kernel.control("stop", "offline-executor-exit")
     kernel.confirm_executor_exit(scenario.execution)
@@ -571,7 +555,7 @@ def test_attach_updates_same_status_only_after_original_domain_and_usage_release
     from agent_run.runtime.handoff import prepare_handoff
     from agent_run.runtime.package_lease import runner_usage_lease
     from support.systemd_manager import controlled_manager
-    scenario = published(tmp_path, monkeypatch)
+    scenario = published(tmp_path)
     kernel, subject = scenario.kernel, scenario.delivery.key
     kernel.control("stop", "retire-offline-for-managed-release")
     kernel.confirm_executor_exit(scenario.execution)
@@ -633,107 +617,6 @@ def test_attach_updates_same_status_only_after_original_domain_and_usage_release
     finally:
         if handoff is not None and handoff.process.poll() is None:
             handoff.process.terminate(); handoff.process.wait(timeout=3)
-
-
-def test_terminal_sender_and_status_share_exact_cleanup_guidance(tmp_path, monkeypatch):
-    run_id = "a'  b"
-    from dataclasses import replace
-    import json
-    import shlex
-    from agent_run.notifications.sender import NativeNotifications
-    from support.offline import OfflinePort
-    original_prepare = OfflinePort.prepare
-    def named_prepare(*args, **kwargs):
-        spec, delivery = original_prepare(*args, **kwargs)
-        return replace(spec, run_id=run_id), delivery
-    with monkeypatch.context() as patch:
-        patch.setattr(OfflinePort, "prepare", named_prepare)
-        scenario = published(tmp_path, monkeypatch, notifications={"enabled": True, "mode": "concise",
-                             "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
-    kernel, subject = scenario.kernel, scenario.delivery.key
-    assert scenario.spec.run_id == run_id
-    assert kernel.control("approve", "original-cleanup-approval", subject=subject, world=scenario.world()) == "pending"
-    for _ in range(100):
-        if kernel.status(subject)["phase"] == "complete":
-            break
-        assert scenario.step().kind not in {"paused", "waiting", "approval"}
-    else:
-        pytest.fail("The original close was not consumed")
-    database = kernel.storage.path
-    with kernel.storage.transaction(write=False) as tx:
-        closure = dict(tx.one("SELECT id,receipt_id FROM effects WHERE operation='close' AND status='confirmed'"))
-        assert tx.one("SELECT state FROM resource_cleanup WHERE subject=?", (subject,))[0] != "complete"
-    before = database.read_bytes()
-    captured = []
-    def transport(_config, rendered, *_args, **_kwargs):
-        document = outbox.read_notifications(database.parent, run_id)
-        active, = [row["event"] for row in document["pending"] if row["outcome"] == "sending"]
-        captured.append((active, rendered))
-        return {"outcome": "success", "reason": None}
-    api = CommentsAPI(project_status(database, subject, storage=kernel.storage).target)
-    observer = NativeNotifications(database, database.parent, transport=transport, status_api=api, storage=kernel.storage)
-    try:
-        observer.close()
-        terminal, = [(event, rendered) for event, rendered in captured if event.get("terminal")]
-        event, rendered = terminal
-        guidance = event["next_step"]
-        assert shlex.split(guidance) == ["agent-run", "resume", "--repo", scenario.spec.repository, "--", run_id]
-        assert event["parent_only"] is True and event["ticket_progress"] is None
-        assert event["completion_actions"] == []
-        assert guidance in project_status(database, subject, storage=kernel.storage).body
-        assert scenario.spec.repository in json.dumps(rendered, ensure_ascii=False)
-        assert [row[1] for row in api.commands] == ["POST"]
-        assert database.read_bytes() == before
-        with kernel.storage.transaction(write=False) as tx:
-            assert dict(tx.one("SELECT id,receipt_id FROM effects WHERE operation='close' AND status='confirmed'")) == closure
-        assert not observer.thread.is_alive()
-    finally:
-        observer.close(drain=False)
-
-
-def test_actual_sender_keeps_ticket_completion_receipt_summary_and_parent_progress(tmp_path, monkeypatch):
-    import json
-    from agent_run.notifications.sender import NativeNotifications
-    scenario = published(tmp_path, monkeypatch, kind=DeliveryKind.TICKET,
-        notifications={"enabled": True, "mode": "concise", "profile": "fixture",
-                       "open_id": "ou_fixture", "app_id": "app_fixture"})
-    database, subject = scenario.kernel.storage.path, scenario.delivery.key
-    with scenario.kernel.storage.transaction(write=False) as tx:
-        original = tx.one("SELECT e.receipt_id,c.development_attempt FROM completions c "
-                          "JOIN effects e ON e.id=c.close_effect WHERE c.subject=?", (subject,))
-        receipt = original["receipt_id"]
-    before = database.read_bytes()
-    projection = project_status(database, subject, storage=scenario.kernel.storage)
-    assert projection.target.pr_number == scenario.kernel.status(subject)["pr_number"]
-    assert projection.target.issue == 2 and projection.target.parent_issue == 1
-    assert projection.target.actor == "offline-publisher"
-    assert "Recorded Review: pass" in projection.body and "Delivery: complete" in projection.body
-    assert "not_recorded" in projection.body
-    sender = core_status_comments(scenario.kernel)
-    intent = sender.stage(subject)
-    assert intent is not None and intent["body"].endswith(projection.body) and intent["sent"] is False
-    assert sender.stage(subject) == intent and database.read_bytes() == before
-    captured = []
-    def transport(_config, rendered, *_args, **_kwargs):
-        active, = [row["event"] for row in outbox.read_notifications(database.parent, scenario.spec.run_id)["pending"]
-                   if row["outcome"] == "sending"]
-        captured.append((active, rendered))
-        return {"outcome": "success", "reason": None}
-    api = CommentsAPI(project_status(database, subject, storage=scenario.kernel.storage).target)
-    observer = NativeNotifications(database, database.parent, status_api=api, transport=transport, storage=scenario.kernel.storage)
-    try:
-        observer.close()
-        event, rendered = next(item for item in captured if item[0]["kind"] == "ticket_completed")
-        assert sum(item[0]["kind"] == "ticket_completed" for item in captured) == 1
-        assert event["source_material_id"] == receipt
-        assert event["summary"] == "Changed synthetic behavior 1"
-        assert event["ticket_progress"] == {"completed": 1, "total": 1} and event["parent_only"] is False
-        assert event["status_query"] == "agent-run status --repo example/repository -- offline-run"
-        assert event["total_seconds"] is None and event["execution_timing_complete"] is False
-        assert "子任务已完成 1/1" in json.dumps(rendered, ensure_ascii=False)
-        assert not observer.thread.is_alive() and database.read_bytes() == before
-    finally:
-        observer.close(drain=False)
 
 
 def test_status_dirty_journal_fault_keeps_worker_alive_until_explicit_recovery(tmp_path, monkeypatch):
@@ -870,7 +753,7 @@ def test_existing_pr_status_tracks_current_review_failure_repair_and_pass(tmp_pa
     from agent_run.queries.run import read
     from support.environment import durable_snapshot
 
-    scenario = published(tmp_path, monkeypatch)
+    scenario = published(tmp_path)
     kernel, subject = scenario.kernel, scenario.delivery.key
     sender = core_status_comments(kernel)
     api = CommentsAPI(project_status(kernel.storage.path, subject, storage=kernel.storage).target)
