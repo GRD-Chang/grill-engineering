@@ -149,7 +149,7 @@ def markdown(report: dict) -> str:
         "测试 CPU/RSS 等仍读取 test-diagnostics 中的 test-report；并行步骤用时之和不等于关键路径。",
         "quality 自身尚在运行时只能观测部分成本；run 结束后可用同一助手只读刷新最终值。",
         "若 workflow 整体取消使本汇总未运行，成本附件也可能缺失；不能把缺失报告解释为零成本。",
-        "产品 job 使用 20 分钟 timeout；本报告另记完整 workflow 墙钟，不以缺失报告推定达标。", "",
+        "产品 job 防护超时为 30 分钟；完整 workflow 性能目标仍为 20 分钟，完整通过不代表预算达标。", "",
     ]
     return "\n".join(lines)
 
