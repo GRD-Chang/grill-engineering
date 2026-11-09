@@ -88,8 +88,9 @@ class Transaction:
         if description is None:
             raise KernelError("query_shape")
         columns = ['"' + field[0].replace('"', '""') + '"' for field in description]
-        sizes = ",".join(f"CASE WHEN typeof({column}) IN ('text','blob') THEN length(CAST({column} AS BLOB)) ELSE 16 END" for column in columns)
-        # SQLite measures bytes before any selected body crosses into Python.
+        sizes = ",".join(f"CASE WHEN typeof({column}) IN ('text','blob') THEN octet_length({column}) ELSE 16 END" for column in columns)
+        # Measure stored columns from SQLite's length metadata, without loading
+        # their bodies for a cast. No selected body crosses into Python first.
         headers = self.execute(f"SELECT {sizes} FROM ({sql}) LIMIT ?", (*parameters, limit + 1)).fetchall()
         if len(headers) > limit:
             raise KernelError("query_limit", "request a bounded history page")
