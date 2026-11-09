@@ -17,6 +17,7 @@ from tempfile import TemporaryDirectory
 from time import monotonic
 from typing import Any
 
+from agent_run.adapters.git_objects import OBJECT_BATCH_FORMAT, object_rows
 from agent_run.errors import GitError, KernelError
 from agent_run.model import Commit
 from agent_run.runtime.git_command import MAX_GIT_ERROR_BYTES, _kill_group, run_git
@@ -191,18 +192,9 @@ class OfflineGit:
                 and len(row[0]) == len(head) and re.fullmatch(r"[0-9a-f]+", row[0]) is not None)
 
     def _object_rows(self, queries: tuple[str, ...]) -> list[list[str]]:
-        result = self._run(self.repository, "cat-file", "--batch-check=%(objectname) %(objecttype) %(rest)",
+        result = self._run(self.repository, "cat-file", OBJECT_BATCH_FORMAT,
             input="".join(query + " " + query + "\n" for query in queries), check=False)
-        rows = [line.split() for line in result.stdout.splitlines()]
-        if result.returncode or len(rows) != len(queries):
-            raise KernelError("git_operation_failed", "Invalid offline object observation")
-        for query, row in zip(queries, rows):
-            # Git reports missing input verbatim, without expanding the format.
-            if row == [query, "missing"]:
-                continue
-            elif len(row) != 3 or row[2] != query:
-                raise KernelError("git_operation_failed", "Invalid offline object observation")
-        return rows
+        return object_rows(result, queries)
 
     def require_commits(self, shas: tuple[str, ...]) -> None:
         """Retain cat-file -e <oid>^{commit} semantics for historical anchors."""

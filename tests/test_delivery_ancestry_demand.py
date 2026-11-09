@@ -46,7 +46,7 @@ def test_ten_completion_edges_replace_the_full_relation_without_losing_facts(tmp
     assert set(sparse.ancestry) <= set(complete.ancestry)
     assert (sparse.source, sparse.target, sparse.pr, sparse.checks) == (
         complete.source, complete.target, None, None)
-    assert Counter(call[0] for call in calls) == {'cat-file': 12, 'merge-base': 10}
+    assert Counter(call[0] for call in calls) == {'cat-file': 1, 'merge-base': 10}
     assert not any((head.sha, sha) in sparse.ancestry for sha in ancestors)
     # Next observation sees a force push; a checked false edge is not unknown.
     git.run('push', '--force', 'origin', effect.base.sha + ':' + effect.source_ref)

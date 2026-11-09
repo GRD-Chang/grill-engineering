@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 import subprocess
 from typing import Callable, Iterable
@@ -12,6 +13,23 @@ from agent_run.runtime.git_command import run_git
 
 from agent_run.model import Commit
 from agent_run.errors import KernelError
+
+
+OBJECT_BATCH_FORMAT = "--batch-check=%(objectname) %(objecttype) %(rest)"
+
+
+def object_rows(result: subprocess.CompletedProcess[str], queries: tuple[str, ...]) -> list[list[str]]:
+    """Bind one finite cat-file response to its ordered original queries."""
+    rows = [line.split() for line in result.stdout.splitlines()]
+    if result.returncode or len(rows) != len(queries):
+        raise KernelError("git_operation_failed", "Invalid Git object observation")
+    for query, row in zip(queries, rows):
+        # Missing responses echo the query rather than expanding the format.
+        if row == [query, "missing"]:
+            continue
+        if len(row) != 3 or row[2] != query:
+            raise KernelError("git_operation_failed", "Invalid Git object observation")
+    return rows
 
 
 class LocalGit:
@@ -60,6 +78,26 @@ class LocalGit:
         resolved = self.run("rev-parse", "--verify", f"{sha}^{{commit}}").stdout.strip()
         tree = self.run("rev-parse", f"{resolved}^{{tree}}").stdout.strip()
         return Commit(resolved, tree)
+
+    def missing_commits(self, shas: Iterable[str]) -> tuple[str, ...]:
+        """Observe commit availability, retaining tag peeling and no tree demand."""
+        heads = tuple(dict.fromkeys(shas))
+        if any(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha) is None for sha in heads):
+            raise KernelError("git_operation_failed", "Expected complete Git object IDs")
+        if not heads:
+            return ()
+        queries = tuple(sha + "^{commit}" for sha in heads)
+        result = self.run("cat-file", OBJECT_BATCH_FORMAT,
+            input_text="".join(query + " " + query + "\n" for query in queries), check=False)
+        rows = object_rows(result, queries)
+        missing = []
+        for sha, query, row in zip(heads, queries, rows):
+            if row == [query, "missing"]:
+                missing.append(sha)
+            elif (row[1:] != ["commit", query] or len(row[0]) != len(sha)
+                    or re.fullmatch(r"[0-9a-f]+", row[0]) is None):
+                raise KernelError("git_operation_failed", "Invalid Git commit observation")
+        return tuple(missing)
 
     def parents(self, sha: str) -> tuple[str, ...]:
         return tuple(self.run("show", "-s", "--format=%P", sha).stdout.strip().split())

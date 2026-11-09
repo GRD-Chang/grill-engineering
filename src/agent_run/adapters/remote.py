@@ -5,7 +5,7 @@ This adapter has no local journal, delivery phase or writable Run representation
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import wraps
@@ -1079,8 +1079,7 @@ class RemoteEffects:
         # Only exact objects are reused within this observation. Live refs are
         # still bracketed below; no World or write authority is cached.
         prepared = sorted({_sha(head) for head in heads})
-        for head in prepared:
-            self._prepare_ancestor_object(head)
+        self._prepare_ancestor_objects(prepared)
         if reused:
             # Do not let reuse hide inconsistent API tree evidence. Resolve the
             # exact immutable objects already prepared above, without decoding
@@ -1127,22 +1126,21 @@ class RemoteEffects:
                      else effect.payload["owned_root"]))
         return LocalEffects(self.git, owned_root=root)
 
-    def _prepare_ancestor_object(self, sha: str) -> None:
-        # Exact objects are immutable. Fetch missing objects without updating
-        # local refs or FETCH_HEAD; a local tracking ref is never an observation.
-        if self.git.run("cat-file", "-e", sha + "^{commit}", check=False).returncode:
+    def _prepare_ancestor_objects(self, shas: Iterable[str]) -> None:
+        # Transport only absent immutable objects; refs and FETCH_HEAD stay intact.
+        missing = self.git.missing_commits(shas)
+        for sha in missing:
             if self.git_writes is None:
                 self._read(["git", "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "--", self.remote, sha])
             else:
                 self.git_writes.fetch(sha)
-            if self.git.run("cat-file", "-e", sha + "^{commit}", check=False).returncode:
-                raise GitHubReadError("git_ancestry_unknown", "Fetched commit object is unavailable")
+        if missing and self.git.missing_commits(missing):
+            raise GitHubReadError("git_ancestry_unknown", "Fetched commit object is unavailable")
 
     def _ancestor(self, before: str, after: str) -> bool:
         if before == after:
             return True
-        for sha in (before, after):
-            self._prepare_ancestor_object(sha)
+        self._prepare_ancestor_objects((before, after))
         return self.git.is_ancestor(before, after)
 
     def _binding(self, effect: Effect) -> None:
