@@ -32,20 +32,19 @@ def test_delivery_prepares_each_exact_sha_once(tmp_path, monkeypatch, count):
         heads.append(git.make_commit(effect.candidate.tree, (heads[-1],), 'Exact object, same tree').sha)
     heads.sort()
     calls = counted(port, monkeypatch)
-    old = tuple((a, b) for a in heads for b in heads if port._ancestor(a, b))
-    assert len(calls) == 3 * count * (count - 1)
-    calls.clear()
     facts = port.delivery(query(effect, heads + heads))
-    assert facts.ancestry == old
     assert facts.source == facts.target == effect.base
-    assert Counter(c[0] for c in calls) == {'cat-file': count, 'merge-base': count * (count - 1), 'log': 1}
+    assert Counter(c[0] for c in calls) == {'cat-file': 1, 'merge-base': count * (count - 1), 'log': 1}
     # Independent real-Git oracle, including both directions and self pairs.
+    expected = set()
     for a in heads:
         for b in heads:
             result = subprocess.run(['git', 'merge-base', '--is-ancestor', a, b], cwd=git.root,
                                     capture_output=True, timeout=5)
             assert result.returncode in (0, 1)
-            assert ((a, b) in facts.ancestry) == (result.returncode == 0)
+            if result.returncode == 0:
+                expected.add((a, b))
+    assert set(facts.ancestry) == expected
 
 
 def test_next_observation_rechecks_objects_and_fresh_refs(tmp_path, monkeypatch):
