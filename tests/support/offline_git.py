@@ -28,7 +28,8 @@ _CANONICAL_CONFIG = {
     False: (b"[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n"
             b"\tbare = false\n\tlogallrefupdates = true\n"
             b"[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n"),
-    True: (b"[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n"),
+    True: (b"[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n"
+           b"[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n"),
 }
 _PRIVATE_GIT_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
     "GIT_CONFIG_SYSTEM": os.devnull, "GIT_OPTIONAL_LOCKS": "0",
@@ -135,6 +136,10 @@ class OfflineGit:
         with TemporaryDirectory(prefix=".remote-git-create-", dir=self.root) as temporary:
             staged = Path(temporary) / "remote.git"
             self._run(self.root, "init", "--bare", "--initial-branch=main", "--template=", "--object-format=" + object_format, str(staged))
+            # Local push transport clears the client's -c configuration before
+            # starting receive-pack. The receiver must be quiescent itself.
+            self._run(staged, "config", "--local", "maintenance.auto", "false")
+            self._run(staged, "config", "--local", "gc.auto", "0")
             self._owned_repository(staged, bare=True)
             # No shared alternates and no refs copied from the local workspace.
             for sha in sorted(set(refs.values())):

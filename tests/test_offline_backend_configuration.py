@@ -23,6 +23,35 @@ def world(tmp_path):
     return port, base, after
 
 
+@pytest.mark.parametrize('operation', ['push', 'delete'])
+def test_private_receiver_never_starts_automatic_maintenance(world, tmp_path, monkeypatch, operation):
+    import support.offline_git as physical
+
+    port, base, after = world
+    ref = 'refs/heads/original'
+    assert port.physical.push(ref, None, base.sha).returncode == 0
+    trace = tmp_path / 'receiver-trace.jsonl'
+    original = physical.run_git
+
+    def traced(*args, **options):
+        options['environment'] = {**options['environment'], 'GIT_TRACE2_EVENT': str(trace)}
+        return original(*args, **options)
+
+    monkeypatch.setattr(physical, 'run_git', traced)
+    result = (port.physical.push(ref, base.sha, after.sha) if operation == 'push'
+              else port.physical.delete(ref, base.sha))
+    assert result.returncode == 0
+    events = [json.loads(line) for line in trace.read_text().splitlines()]
+    receivers = {event['sid'] for event in events
+                 if event['event'] == 'cmd_name' and event.get('name') == 'receive-pack'}
+    assert receivers, 'The real local push receiver must be traced'
+    maintenance = [event for event in events if event['event'] == 'child_start'
+                   and event['sid'] in receivers and 'maintenance' in event.get('argv', [])
+                   and '--auto' in event['argv']]
+    assert maintenance == []
+    assert port.physical.refs().get(ref) == (after.sha if operation == 'push' else None)
+
+
 def corrupt(port, tmp_path, location, fault):
     directory = port.git.root / '.git' if location == 'local' else port.root / 'remote.git'
     if fault == 'include':
