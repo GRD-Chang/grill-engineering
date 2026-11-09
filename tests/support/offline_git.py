@@ -158,26 +158,73 @@ class OfflineGit:
         return {"sha": sha, "tree": {"sha": next(value for key, value in fields if key == "tree")},
                 "parents": [{"sha": value} for key, value in fields if key == "parent"], "message": message}
 
-    def read_commits(self, heads: tuple[str, ...]) -> dict[str, Commit]:
-        """Read only this observation's transferred heads in one Git process."""
+    def read_commits(self, heads: tuple[str, ...], *, transfer_missing: bool = False) -> dict[str, Commit]:
+        """Read exact heads and trees, transporting only absent head objects."""
         self._owned()
         heads = tuple(dict.fromkeys(self._oid(head) for head in heads))
         if not heads:
             return {}
-        queries = "".join(head + "\n" + head + "^{tree}\n" for head in heads)
-        result = self._run(self.repository, "cat-file", "--batch-check=%(objectname) %(objecttype)",
-            input=queries, check=False)
-        rows = [line.split() for line in result.stdout.splitlines()]
-        if result.returncode or len(rows) != 2 * len(heads):
-            raise KernelError("git_operation_failed", "Invalid offline commit observation")
-        commits = {}
+        queries = tuple(query for head in heads for query in (head, head + "^{tree}"))
+        rows = self._object_rows(queries)
+        missing = []
         for index, head in enumerate(heads):
             commit, tree = rows[2 * index:2 * index + 2]
-            if (commit != [head, "commit"] or len(tree) != 2 or tree[1] != "tree"
-                    or len(tree[0]) != len(head) or re.fullmatch(r"[0-9a-f]+", tree[0]) is None):
+            if commit == [head, "missing"]:
+                missing.append(head)
+            elif commit != [head, "commit", head]:
                 raise KernelError("git_operation_failed", "Invalid offline commit observation")
-            commits[head] = Commit(head, tree[0])
-        return commits
+            elif not self._tree_row(tree, head):
+                raise KernelError("git_operation_failed", "Invalid offline commit observation")
+        if missing:
+            if not transfer_missing:
+                raise KernelError("git_operation_failed", "Missing offline commit observation")
+            self._owned()
+            self._run(self.repository, "fetch", "--no-tags", "--no-write-fetch-head", "--",
+                      str(self.remote), *missing)
+            # Revalidate the physical response after transport, including trees.
+            return self.read_commits(heads)
+        return {head: Commit(head, rows[2 * index + 1][0]) for index, head in enumerate(heads)}
+
+    @staticmethod
+    def _tree_row(row: list[str], head: str) -> bool:
+        return (len(row) == 3 and row[1:] == ["tree", head + "^{tree}"]
+                and len(row[0]) == len(head) and re.fullmatch(r"[0-9a-f]+", row[0]) is not None)
+
+    def _object_rows(self, queries: tuple[str, ...]) -> list[list[str]]:
+        result = self._run(self.repository, "cat-file", "--batch-check=%(objectname) %(objecttype) %(rest)",
+            input="".join(query + " " + query + "\n" for query in queries), check=False)
+        rows = [line.split() for line in result.stdout.splitlines()]
+        if result.returncode or len(rows) != len(queries):
+            raise KernelError("git_operation_failed", "Invalid offline object observation")
+        for query, row in zip(queries, rows):
+            # Git reports missing input verbatim, without expanding the format.
+            if row == [query, "missing"]:
+                continue
+            elif len(row) != 3 or row[2] != query:
+                raise KernelError("git_operation_failed", "Invalid offline object observation")
+        return rows
+
+    def require_commits(self, shas: tuple[str, ...]) -> None:
+        """Retain cat-file -e <oid>^{commit} semantics for historical anchors."""
+        self._owned()
+        shas = tuple(dict.fromkeys(self._oid(sha) for sha in shas))
+        if not shas:
+            return
+        queries = tuple(sha + "^{commit}" for sha in shas)
+        try:
+            rows = self._object_rows(queries)
+            for sha, query, row in zip(shas, queries, rows):
+                if (len(row) != 3 or row[1:] != ["commit", query]
+                        or len(row[0]) != len(sha) or re.fullmatch(r"[0-9a-f]+", row[0]) is None):
+                    raise KernelError("git_ancestry_unknown")
+        except KernelError as error:
+            raise KernelError("git_ancestry_unknown") from error
+        except OSError as error:
+            # Anchor inspection previously used LocalGit, whose native child
+            # failures are KernelError rather than retryable transport outages.
+            if isinstance(error.__cause__, GitError):
+                raise KernelError("git_operation_failed", str(error.__cause__)) from error.__cause__
+            raise
 
     def compare(self, base: str, head: str) -> dict[str, Any]:
         self._owned()

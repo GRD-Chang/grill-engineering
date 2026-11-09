@@ -187,18 +187,14 @@ class OfflinePort:
         refs = physical.refs()
         sampled_heads = tuple(dict.fromkeys(refs[ref] for ref in (request.source_ref, request.target_ref)
                                             if ref in refs))
-        for head in sampled_heads:
-            physical.fetch(head)
-        commits = physical.read_commits(sampled_heads)
+        commits = physical.read_commits(sampled_heads, transfer_missing=True)
         source, target = (commits.get(refs.get(ref)) for ref in (request.source_ref, request.target_ref))
         checked = requested_ancestry(request, source, target, pr)
         ancestry_heads = set(request.anchors) | {head.sha for head in (source, target) if head is not None}
         if request.ancestry_pairs is not None:
             ancestry_heads.update(head for pair in checked or () for head in pair)
             # Even a reflexive or unresolved demand retains anchor object checks.
-            for head in sorted(ancestry_heads):
-                if self.git.run("cat-file", "-e", head + "^{commit}", check=False).returncode:
-                    raise KernelError("git_ancestry_unknown")
+            physical.require_commits(tuple(sorted(ancestry_heads)))
         pairs = ((before, after) for before in sorted(ancestry_heads) for after in sorted(ancestry_heads)) if request.ancestry_pairs is None else iter(checked or ())
         ancestry = tuple((before, after) for before, after in pairs
                          if before == after or self.git.is_ancestor(before, after))

@@ -140,3 +140,9 @@ Invocation/output 复合关系，不负责补准备、Go、活动、raw 或退�
 Resync 额度、窗口和续期组合在 `test_kernel_policy_execution` 使用明确 snapshot 输入；
 实际外部追加由该文件的 Final open-window 旅程负责，正常重新集成的同 PR、
 不重复 Development 与新 Review 由 `test_kernel_pr_base_observation` 的 Parent 漂移旅程负责。
+
+Offline 的一次交付观察先采样 refs，再批读去重后的精确 head/tree；只为缺失 head
+传输对象，传输后重新验证。历史 anchors 在另一批中验证原 `^{commit}` 可用性，
+允许 tag peeling，不额外要求 tree；两者不能混成一种更强的验证合同。
+批输出逐项绑定原查询，零退出码的 missing、错序或不完整响应仍拒绝。
+每轮都重新执行真实 Git 和当前 fixture 归属检查，不保留跨观察的对象图或授权结果。

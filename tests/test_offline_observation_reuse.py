@@ -4,7 +4,7 @@ from dataclasses import replace
 import pytest
 
 from agent_run.core.operation_contract import DeliveryRead
-from agent_run.errors import KernelError
+from agent_run.errors import GitError, KernelError
 from support.offline import OfflinePort
 from support import offline_git
 
@@ -56,14 +56,15 @@ def test_later_observations_keep_fresh_refs_and_pr_facts(world, monkeypatch):
 
 def test_observation_samples_both_refs_before_transfer_and_rereads_next_time(world, monkeypatch):
     port, commits, request = world
-    original = offline_git.OfflineGit.fetch
+    original = offline_git.OfflineGit.refs
     calls = []
-    def fetch(adapter, sha):
-        original(adapter, sha)
-        calls.append(sha)
+    def refs(adapter):
+        sampled = original(adapter)
+        calls.append(sampled)
         if len(calls) == 1:
             assert port.physical.push(request.target_ref, commits[-2].sha, commits[-1].sha).returncode == 0
-    monkeypatch.setattr(offline_git.OfflineGit, 'fetch', fetch)
+        return sampled
+    monkeypatch.setattr(offline_git.OfflineGit, 'refs', refs)
     facts = port.delivery(request, ('pass',), [])
     assert facts.source == commits[-1] and facts.target == commits[-2]
     assert port.delivery(request, ('pass',), []).target == commits[-1]
@@ -96,6 +97,20 @@ def test_unknown_ancestry_remains_a_failure_after_successful_observation(world):
         port.delivery(replace(request, anchors=('f' * 40,)), ('pass',), [])
 
 
+def test_anchor_batch_keeps_native_git_failure_classification(world, monkeypatch):
+    port, commits, request = world
+    run = offline_git.run_git
+
+    def interrupted(arguments, **kwargs):
+        if "^{commit}" in (kwargs.get("input") or ""):
+            raise GitError("Controlled native child ownership failure")
+        return run(arguments, **kwargs)
+
+    monkeypatch.setattr(offline_git, "run_git", interrupted)
+    with pytest.raises(KernelError, match="git_operation_failed"):
+        port.delivery(replace(request, ancestry_pairs=((commits[0].sha, "source"),)), ('pass',), [])
+
+
 def test_missing_remote_object_is_transferred_without_moving_local_refs(world):
     port, commits, _ = world
     physical = port.physical
@@ -103,8 +118,7 @@ def test_missing_remote_object_is_transferred_without_moving_local_refs(world):
     sha = physical._run(physical.remote, 'commit-tree', commits[0].tree,
                         '-p', commits[-1].sha, input='Remote-only commit\n').stdout.strip()
     assert port.git.run('cat-file', '-e', sha + '^{commit}', check=False).returncode != 0
-    physical.fetch(sha)
-    assert port.git.commit(sha).tree == commits[0].tree
+    assert physical.read_commits((sha,), transfer_missing=True)[sha].tree == commits[0].tree
     assert port.git.run('show-ref').stdout == original_refs
     assert physical.commit(sha)['message'] == 'Remote-only commit\n'
 
@@ -118,14 +132,14 @@ def test_commit_batch_rejects_missing_or_non_commit_objects(world, object_kind):
         port.physical.read_commits((head,))
 
 
-@pytest.mark.parametrize("fault", ["truncated", "extra", "identity", "tree"])
+@pytest.mark.parametrize("fault", ["truncated", "extra", "identity", "tree", "order"])
 def test_commit_batch_rejects_malformed_output(world, monkeypatch, fault):
     port, commits, _ = world
     physical = port.physical
     original = physical._run
     def malformed(directory, *args, **kwargs):
         result = original(directory, *args, **kwargs)
-        if args[:2] == ("cat-file", "--batch-check=%(objectname) %(objecttype)"):
+        if args[:2] == ("cat-file", "--batch-check=%(objectname) %(objecttype) %(rest)"):
             lines = result.stdout.splitlines()
             if fault == "truncated":
                 lines.pop()
@@ -133,6 +147,8 @@ def test_commit_batch_rejects_malformed_output(world, monkeypatch, fault):
                 lines.append(lines[0])
             elif fault == "identity":
                 lines[0] = commits[1].sha + " commit"
+            elif fault == "order":
+                lines.reverse()
             else:
                 lines[1] = "not-an-oid tree"
             result.stdout = "\n".join(lines) + "\n"
@@ -140,3 +156,76 @@ def test_commit_batch_rejects_malformed_output(world, monkeypatch, fault):
     monkeypatch.setattr(physical, "_run", malformed)
     with pytest.raises(KernelError, match="git_operation_failed"):
         physical.read_commits((commits[0].sha,))
+
+
+def test_anchor_commit_peeling_does_not_require_a_tree(world):
+    port, commits, _ = world
+    physical = port.physical
+    missing_tree = "e" * 40
+    raw = f"tree {missing_tree}\nauthor Test <test@example.com> 1 +0000\ncommitter Test <test@example.com> 1 +0000\n\nmissing tree\n"
+    broken = physical._run(physical.repository, "hash-object", "-t", "commit", "-w", "--stdin", input=raw).stdout.strip()
+    tag = physical._run(physical.repository, "hash-object", "-t", "tag", "-w", "--stdin", input=
+        f"object {broken}\ntype commit\ntag anchor\ntagger Test <test@example.com> 1 +0000\n\nanchor\n").stdout.strip()
+    physical.require_commits((commits[0].sha, tag, broken))
+    with pytest.raises(KernelError, match="git_operation_failed"):
+        physical.read_commits((broken,), transfer_missing=True)
+    with pytest.raises(KernelError, match="git_ancestry_unknown"):
+        physical.require_commits((commits[0].sha, "f" * 40))
+
+
+def test_existing_observation_needs_no_per_object_probes_or_fetch(world, monkeypatch):
+    port, _, request = world
+    original = offline_git.OfflineGit._run
+    calls = []
+    def run(adapter, directory, *args, **kwargs):
+        calls.append(args)
+        return original(adapter, directory, *args, **kwargs)
+    monkeypatch.setattr(offline_git.OfflineGit, "_run", run)
+    port.delivery(replace(request, ancestry_pairs=()), ("pass",), [])
+    assert not any(args[0] == "fetch" or args[:2] == ("cat-file", "-e") for args in calls)
+    assert sum(args[0] == "cat-file" for args in calls) == 2
+
+
+@pytest.mark.parametrize("fault", ["missing", "type", "identity", "truncated", "extra", "order"])
+def test_anchor_batch_rejects_invalid_responses(world, monkeypatch, fault):
+    port, commits, _ = world
+    physical = port.physical
+    original = physical._run
+    def malformed(directory, *args, **kwargs):
+        result = original(directory, *args, **kwargs)
+        if args[0] == "cat-file":
+            lines = result.stdout.splitlines()
+            if fault == "missing":
+                lines[0] = commits[0].sha + "^{commit} missing"
+            elif fault == "type":
+                lines[0] = lines[0].replace(" commit ", " tree ")
+            elif fault == "identity":
+                lines[0] = lines[0].replace(commits[0].sha + "^{commit}", commits[1].sha + "^{commit}")
+            elif fault == "truncated":
+                lines.pop()
+            elif fault == "extra":
+                lines.append(lines[0])
+            else:
+                lines.reverse()
+            result.stdout = "\n".join(lines) + "\n"
+        return result
+    monkeypatch.setattr(physical, "_run", malformed)
+    with pytest.raises(KernelError, match="git_ancestry_unknown"):
+        physical.require_commits(tuple(commit.sha for commit in commits[:2]))
+
+
+def test_transport_success_cannot_hide_missing_head(world, monkeypatch):
+    port, _, _ = world
+    physical = port.physical
+    original = physical._run
+    calls = []
+    def no_transfer(directory, *args, **kwargs):
+        if args[0] == 'fetch':
+            from subprocess import CompletedProcess
+            calls.append(args)
+            return CompletedProcess(args, 0, '', '')
+        return original(directory, *args, **kwargs)
+    monkeypatch.setattr(physical, '_run', no_transfer)
+    with pytest.raises(KernelError, match='git_operation_failed'):
+        physical.read_commits(('f' * 40,), transfer_missing=True)
+    assert len(calls) == 1
