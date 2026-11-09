@@ -14,7 +14,7 @@ from agent_run.core.prompts.role import render_role_prompt
 from agent_run.errors import KernelError
 from agent_run.model import DeliveryKind, Role
 from support.core_operations import final_scenario
-from support.offline import Scenario, fixture_inputs
+from support.offline import Scenario, fixture_inputs, review_result
 from support.run_scoped_kernel import domain_kernel
 
 
@@ -52,7 +52,14 @@ def test_publication_ranges_reach_runtime_and_public_preview_from_real_work(tmp_
                     assert call.context["publication_context"] == expected
                     saved = json.loads(tx.get(tx.one("SELECT context_id FROM attempts WHERE id=?", (call.attempt_id,))[0], call.subject))
                     assert saved["publication_context"] == expected
+                if kind != DeliveryKind.TICKET and not publications:
+                    assert call.context["acceptance_artifact"] == review_result("pass")
+                    assert "fallback_publication_context" not in call.context
+                    assert "ci_repair_publication_context" not in call.context
                 prompt = render_role_prompt(call)
+                if kind != DeliveryKind.TICKET:
+                    assert json.dumps(call.context["acceptance_artifact"], ensure_ascii=False,
+                                      indent=2, sort_keys=True) in prompt
                 visible = json.dumps({"publication_context": expected}, ensure_ascii=False, indent=2, sort_keys=True)
                 assert visible in prompt
                 facts = {field: call.context[field] for field in ("acceptance_identity", "ticket_completions", "ci_evidence")

@@ -118,3 +118,17 @@ Invocation/output 复合关系，不负责补准备、Go、活动、raw 或退�
 这些责任由同库兄弟 Task/Run 的受控事务回归验证，不重复启动真实 Host。
 没有当前消费者、仅调用已删除 API 的旧 `executor`、`systemd_exit_manager` 和
 `durable_save_boundaries` 支撑已退役；历史研究不构成恢复旧协议的理由。
+
+### 阶段输入与真实旅程的主要归属
+
+阶段消费者只准备其所需输入；变体不得为取得同一输入反复重放历史交付。
+以下真实连接集中维护，其他消费者通过既有关系输入或更短的合法前置验证独有规则：
+
+| 合同 | 主要真实连接 | 消费者边界 |
+| --- | --- | --- |
+| Publication 的通过 artifact、范围、渲染和公开 preview | `test_kernel_publication_scope` 的 Ticket / Parent / Final 分配及实际提交 | 文案与协议组合归 renderer；不另建只验证相同 preview 的完整交付 |
+| Final Integration Development 后的新 Publication Thread | `test_kernel_exploration` 的真实 Git 冲突修复旅程 | 线程选择规则不另重放 Ticket→Completion 前缀 |
+| Reviewer checkout 与输出目录隔离 | `test_kernel_codex_transport` 的真实 Parent Reviewer / `local_codex` | 传输与沙箱不依赖 Final 激活；Final 激活由 requirements、ancestry demand 与完整 Parent 旅程负责 |
+
+`core_operations.declared_delivery` 只投影明确给定的外部关系和精确 Commit 的反身关系；
+显式 checked 可声明负边，未声明的非反身边必须失败，不把缺少 fixture 输入解释为 Git false。

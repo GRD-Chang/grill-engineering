@@ -13,14 +13,14 @@ from typing import Any
 
 import pytest
 
-from agent_run.model import AgentCall, AgentPreparation, Commit, Delivery, DeliveryKind, EffectResult, Policy, Profile, RunSpec
+from agent_run.model import AgentCall, AgentPreparation, Commit, Delivery, DeliveryKind, EffectResult, Policy, Profile, Role, RunSpec
 from agent_run.adapters.git_objects import LocalGit
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.runtime.codex import execute_codex
-from support.offline import fixture_inputs, review_result
+from support.offline import Scenario, fixture_inputs, review_result
 from agent_run.contracts.agent_profiles import resolve_profiles
-from support.core_operations import CoreOperations, ReadOnlyPorts, final_scenario, native_agent_fixture, observed_call
+from support.core_operations import CoreOperations, ReadOnlyPorts, native_agent_fixture, observed_call, next_call, scripted_return
 from support.native_runtime import local_codex
 
 
@@ -275,7 +275,9 @@ if {replacement!r} == 'symlink':
 
 
 def test_kernel_allocated_reviewer_cannot_write_checkout_but_can_return_final(tmp_path: Path) -> None:
-    scenario = final_scenario(tmp_path / "scenario")
+    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
+    development = next_call(scenario, Role.DEVELOPMENT)
+    scripted_return(scenario.kernel, scenario.runner(), development, scenario.agent)
     operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports, prepare_agents=False)
     def review_ready(step):
         if step.preparation is None:

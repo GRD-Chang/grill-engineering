@@ -9,7 +9,7 @@ import sys
 
 import pytest
 
-from agent_run.model import DeliveryKind, Policy
+from agent_run.model import DeliveryKind, Policy, Role
 from agent_run.core.kernel import Kernel
 from agent_run.contracts.write_authority import FinalAdmission, WriteAuthority
 from agent_run.errors import KernelError
@@ -180,14 +180,26 @@ def test_human_continuation_replaces_thread_but_keeps_attempt_budget_and_origina
             {"id": second.lease_id, "subject": second.subject, "invocation": second.invocation_id}]
 
 
-def test_real_git_conflict_returns_to_integration_development_without_internal_pr(tmp_path: Path, domain_scenario) -> None:
+def test_real_git_conflict_returns_to_integration_development_without_internal_pr(tmp_path: Path, domain_scenario, monkeypatch) -> None:
     scenario = domain_scenario(tmp_path / "scenario", DeliveryKind.FINAL_RUN,
         edits=({"ticket.txt": "Resolved complete content\n"},))
+    original_agent, threads = scenario.agent, {}
+
+    def agent(call):
+        if call.role == Role.DEVELOPMENT:
+            threads["development"] = call.thread_id
+        elif call.role == Role.PUBLICATION:
+            assert call.thread_id != threads["development"]
+            assert call.mode == "fresh" and call.reported_thread is None
+            threads["publication"] = call.thread_id
+        return original_agent(call)
+
+    monkeypatch.setattr(scenario, "agent", agent)
     historical_writes = scenario.port.writes()
     scenario.port.external_append(scenario.delivery.target_ref, {"ticket.txt": "External content\n"}, "conflict")
     assert scenario.run(approve=True).kind == "complete"
     integration = [call for call in scenario.role_calls if call["role"] == "development" and call["purpose"] == "integration"]
-    assert len(integration) == 1
+    assert len(integration) == 1 and set(threads) == {"development", "publication"}
     assert scenario.kernel.status(scenario.delivery.key)["budgets"]["integration"]["developments_used"] == 1
     assert sum(write["operation"] == "pr_write" for write in scenario.writes()) == 1
     assert scenario.port.writes()[:len(historical_writes)] == historical_writes

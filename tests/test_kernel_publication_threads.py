@@ -1,7 +1,7 @@
 """Publication keeps its actual backend context and immutable execution binding."""
 from pathlib import Path
 
-from support.core_operations import CoreOperations, final_scenario
+from support.core_operations import CoreOperations
 from agent_run.model import AgentCall, DeliveryKind, Role, wire_json
 from support.offline import Scenario, review_result
 from agent_run.core.prompts.role import render_role_prompt
@@ -155,13 +155,3 @@ def test_development_context_fallback_stops_at_the_fourth_publication_attempt(mo
                 "ordinal": ordinal, "role": "publication", "purpose": "requirements", "window": 1,
                 "parent_revision": "r", "graph_revision": "g", "revision": "r", "base_sha": "a" * 40,
                 "completion_revision": "no-tickets", "context_id": "profile", "status": "consumed", "thread_id": "development"})
-
-
-def test_final_publication_uses_a_new_thread_after_integration_development(tmp_path: Path) -> None:
-    scenario = final_scenario(tmp_path / "scenario", reviews=("fail", "pass"))
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
-    development = next_call(scenario, Role.DEVELOPMENT)
-    finish_call(scenario, development)
-    publication = next_call(scenario, Role.PUBLICATION)
-    assert publication.thread_id != development.thread_id
-    assert publication.mode == "fresh" and publication.reported_thread is None

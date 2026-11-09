@@ -6,14 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from support.core_operations import CoreOperations, scripted_return, final_scenario, prepare_scripted_agent
+from support.core_operations import CoreOperations, scripted_return, prepare_scripted_agent
 from agent_run.model import AgentCall, DeliveryKind, Policy, Role, Step
 from agent_run.model import wire_json
 from agent_run.core.kernel import Kernel
 from agent_run.core.prompts.role import render_role_prompt
 from agent_run.errors import KernelError
 from support.offline import Scenario, review_result
-from support.run_scoped_kernel import domain_kernel, domain_scenario
+from support.run_scoped_kernel import domain_scenario
 
 
 def next_call(scenario: Scenario, role: Role) -> AgentCall:
@@ -69,29 +69,6 @@ def test_same_thread_new_repair_and_human_continuation_keep_distinct_responsibil
     assert frozen["review_range"]["candidate_sha"] == second.context["reviewed_commit"]
     assert second.context["base_sha"] == scenario.initial.sha
     assert frozen["facts"]["previous_acceptance_artifact"] == review_result("fail")
-
-
-@pytest.mark.parametrize("kind", [DeliveryKind.PARENT_ONLY, DeliveryKind.FINAL_RUN])
-def test_parent_publication_gets_the_actual_accepted_artifact(tmp_path: Path, kind: DeliveryKind, capsys) -> None:
-    scenario = (final_scenario(tmp_path / kind.value) if kind == DeliveryKind.FINAL_RUN
-                else Scenario(tmp_path / kind.value, kind))
-    with domain_kernel(scenario.kernel) as scenario.kernel:
-        operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
-        publication = next_call(scenario, Role.PUBLICATION)
-        assert publication.context.get("acceptance_artifact") == review_result("pass")
-        assert "fallback_publication_context" not in publication.context
-        assert "ci_repair_publication_context" not in publication.context
-        from agent_run.cli.main import main
-        from agent_run.contracts.artifact import role_schema
-        request = tmp_path / 'actual-publication-request.json'
-        request.write_text(json.dumps({**publication.context, 'thread_id': publication.reported_thread,
-                                       '_invocation_mode': 'new-thread' if publication.mode == 'fresh' else 'new-attempt'}))
-        role = 'final-publication' if kind == DeliveryKind.FINAL_RUN else 'publication'
-        assert main(['prompts', 'preview', '--role', role, '--request', str(request), '--json']) == 0
-        preview = json.loads(capsys.readouterr().out)
-        assert preview['prompt'] == render_role_prompt(publication)
-        assert preview['schema'] == role_schema('publication')
-        assert json.dumps(publication.context['acceptance_artifact'], ensure_ascii=False, indent=2, sort_keys=True) in preview['prompt']
 
 
 def test_ticket_fallback_publication_discloses_the_unreviewed_candidate(tmp_path: Path, domain_scenario) -> None:
