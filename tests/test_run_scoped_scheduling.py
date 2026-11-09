@@ -18,10 +18,28 @@ from agent_run.storage.sqlite import Transaction
 from support.offline import fixture_inputs
 from support.repository_scope import connection, insert, seed
 from support.run_scoped_kernel import ScopedKernel
+from support.core_operations import declared_delivery
 
 
 SUBJECT = "parent:1"
 BASE = Commit("a" * 40, "b" * 40)
+
+
+@pytest.mark.parametrize('relation', ['positive', 'negative', 'unknown'])
+def test_declared_delivery_does_not_turn_an_unknown_relation_into_false(relation):
+    target = Commit('c' * 40, 'd' * 40)
+    edge = (BASE.sha, target.sha)
+    facts = DeliveryFacts(target, BASE,
+        ancestry=(edge,) if relation == 'positive' else (),
+        ancestry_checked=(edge,) if relation == 'negative' else None)
+    request = DeliveryRead('source', 'target', None, (), ancestry_pairs=(('source', 'target'),))
+    if relation == 'unknown':
+        with pytest.raises(ReadUnavailable, match='has not declared'):
+            declared_delivery(request, facts)
+    else:
+        observed = declared_delivery(request, facts)
+        assert observed.ancestry_checked == (edge,)
+        assert observed.ancestry == ((edge,) if relation == 'positive' else ())
 
 
 def _source(run, version="initial"):
@@ -393,7 +411,8 @@ def _once(kernel, run, source, *, facts=None):
     result = kernel.next_work(_execution(run))
     if isinstance(result, ObserveIO):
         observation = kernel.accept_requirements(result.request, source)
-        actual = kernel.accept_delivery(observation, DeliveryFacts(BASE, BASE) if facts is None else facts)
+        actual = kernel.accept_delivery(observation, declared_delivery(observation.query,
+            DeliveryFacts(BASE, BASE) if facts is None else facts))
         result = kernel.accept_work(result, actual)
     return result
 
@@ -699,8 +718,7 @@ def _until_preparation(kernel, run, source, role, candidate, *, facts=None):
         if isinstance(result, EffectIO):
             observation = kernel.accept_requirements(kernel.begin_effect_observation(result.effect), source)
             observed = DeliveryFacts(BASE, BASE) if facts is None else facts
-            observed = replace(observed, checks_requested=observation.query.read_checks,
-                               checks=observed.checks if observation.query.read_checks else None)
+            observed = declared_delivery(observation.query, observed)
             world, fence = kernel.accept_delivery(observation, observed)
             kernel.authorize_effect_observation(result.effect, world, fence, prepared=True, inspections=None)
             if result.effect.operation == 'candidate':
@@ -1317,7 +1335,9 @@ def test_observation_preseals_complete_delivery_demand_before_source(scenario, e
         assert isinstance(selected, ObserveIO)
         request = selected.request
     expected = DeliveryRead('refs/heads/work', 'refs/heads/main', 17,
-        tuple(value * 40 for value in ('1', '2', '3', 'a', 'c', 'd', 'e')), 'c' * 40)
+        tuple(value * 40 for value in ('1', '2', '3', 'a', 'c', 'd', 'e')), 'c' * 40,
+        ancestry_pairs=(('1' * 40, 'c' * 40), ('1' * 40, 'source'),
+                        ('2' * 40, 'target'), ('pr_base', 'target')))
     assert request.query == expected
     accepted = kernel.accept_requirements(request, _source('A'))
     assert accepted.query == request.query and accepted.fence == request.fence

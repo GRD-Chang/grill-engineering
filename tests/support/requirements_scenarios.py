@@ -14,7 +14,7 @@ def native_input() -> dict:
 
 def source_run(path: Path, requirements: Requirements | None = None) -> tuple[Kernel, Requirements]:
     source = requirements or Requirements.from_wire(native_input()["initial_requirements"])
-    base = Commit("base", "base-tree")
+    base = Commit("a" * 40, "b" * 40)
     deliveries = tuple(Delivery(f"ticket:{number}", DeliveryKind.TICKET, number, "reader-untrusted-revision", base,
                                 f"refs/heads/ticket-{number}", "refs/heads/run") for number in source.parent.sub_issue_numbers)
     final = Delivery("final:1", DeliveryKind.FINAL_RUN, 1, "reader-untrusted-revision", base, "refs/heads/run", "refs/heads/main")

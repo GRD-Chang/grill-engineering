@@ -13,7 +13,7 @@ from typing import Any, Mapping
 
 from agent_run.model import Commit, AgentCall, AgentPreparation, CreationInputs, Delivery, DeliveryKind, Effect, EffectResult, Execution, Issue, Policy, ParentIssue, Requirements, wire_json, ResourceInspection, ResourceWitness, RunSpec, Step
 from agent_run.core.kernel import Kernel
-from agent_run.core.operation_contract import DeliveryFacts, DeliveryRead, OperationBinding, OperationPorts
+from agent_run.core.operation_contract import DeliveryFacts, DeliveryRead, OperationBinding, OperationPorts, requested_ancestry
 from agent_run.core.operation_runner import OperationRunner
 from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.storage.run_scope import transaction_scope
@@ -50,6 +50,28 @@ def scripted_return(kernel: Kernel, runner: OperationRunner, call: AgentCall,
     kernel.receive(call, agent(call))
 
 
+def declared_delivery(request: DeliveryRead, facts: DeliveryFacts) -> DeliveryFacts:
+    """Project declared external relations, never infer an unknown Git edge.
+
+    Exact observed Commit identities prove only their reflexive relations.
+    Other positive/negative edges must be explicit fixture inputs.
+    """
+    checked = requested_ancestry(request, facts.source, facts.target, facts.pr)
+    ancestry = facts.ancestry
+    if request.ancestry_pairs is not None:
+        commits = (facts.source, facts.target) if facts.pr is None else (
+            facts.source, facts.target, facts.pr.head, facts.pr.base)
+        reflexive = {(commit.sha, commit.sha) for commit in commits if commit is not None}
+        positive = set(ancestry) | reflexive
+        known = set(facts.ancestry_checked or ()) | positive
+        if not set(checked or ()) <= known:
+            raise ReadUnavailable("fixture_ancestry_unknown", "Fixture has not declared the requested Git relation")
+        ancestry = tuple(pair for pair in checked or () if pair in positive)
+    return replace(facts, ancestry=ancestry, ancestry_checked=checked,
+                   checks=facts.checks if request.read_checks else None,
+                   checks_requested=request.read_checks)
+
+
 class ReadOnlyPorts:
     """Explicit external facts for Agent-lifecycle tests with no Git writes.
 
@@ -66,8 +88,7 @@ class ReadOnlyPorts:
 
     def delivery(self, request: DeliveryRead) -> DeliveryFacts:
         assert (request.source_ref, request.target_ref) == (self.source_ref, self.target_ref)
-        return replace(self.facts, checks=self.facts.checks if request.read_checks else None,
-                       checks_requested=request.read_checks)
+        return declared_delivery(request, self.facts)
 
     def inspect(self, resources: tuple[ResourceWitness, ...]) -> tuple[ResourceInspection, ...]:
         raise AssertionError("This read-only fixture cannot inspect physical resources")
