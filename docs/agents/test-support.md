@@ -72,6 +72,9 @@ Core、OperationRunner、Git 和每次业务提交仍实际执行；事务保留
 替换，不再次搜索已插入的值，不改标识符或无关文案。默认程序字节保持，受控扩展
 继续使用同一脚本，不新增模拟服务。Completion 事件筛选也复用通知 `_project` 的
 准确 Run 读取；同库兄弟 Run 的 history 不能作为当前事件输入。
+读取重试的延迟由 `github_retries.set_read_retry_sleep` 或 `immediate_read_retries`
+控制；三个读取适配器使用独立时钟对象，保留真实 monotonic。
+不要修改标准库 `time.sleep`，以免把子进程退出等待也计为 GitHub 重试或变成忙等。
 `_source_kernel` 创建正常 Requirements 与 RunSpec；`_publish_pr` 仍实际执行 push/PR
 并检查返回，没有将其改为写入预先完成的业务记录。脚本只合成外部协议，
 原 Git、锁、CAS、逐写授权、状态读写、日志、失回复与失败退出继续执行。

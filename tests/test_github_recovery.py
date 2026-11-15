@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from support.github_retries import set_read_retry_sleep
 from support.github_checks import repository_response
 
 from agent_run.adapters.github import GhGitHubReader
@@ -31,7 +32,7 @@ def test_github_reader_retries_transient_timeout(
         return _repository_response(arguments)
 
     monkeypatch.setattr('agent_run.adapters.github_commands._run_bounded_command', fake_run)
-    monkeypatch.setattr('agent_run.adapters.github_commands.time.sleep', lambda _seconds: None)
+    set_read_retry_sleep(monkeypatch, lambda _seconds: None)
 
     reader = GhGitHubReader("example/project")
     assert reader.repository().name_with_owner == "example/project"
@@ -68,7 +69,7 @@ def test_github_read_retries_do_not_classify_stderr(
         return subprocess.CompletedProcess(arguments, 1, "", stderr)
 
     monkeypatch.setattr('agent_run.adapters.github_commands._run_bounded_command', fake_run)
-    monkeypatch.setattr('agent_run.adapters.github_commands.time.sleep', lambda _seconds: None)
+    set_read_retry_sleep(monkeypatch, lambda _seconds: None)
 
     result = run_read_command(["gh", "api", "repos/example/project"])
 
@@ -154,7 +155,7 @@ def test_github_reader_retries_transient_http_status(
         return _repository_response(arguments)
 
     monkeypatch.setattr('agent_run.adapters.github_commands._run_bounded_command', fake_run)
-    monkeypatch.setattr('agent_run.adapters.github_commands.time.sleep', lambda _seconds: None)
+    set_read_retry_sleep(monkeypatch, lambda _seconds: None)
 
     reader = GhGitHubReader("example/project")
     assert reader.repository().name_with_owner == "example/project"

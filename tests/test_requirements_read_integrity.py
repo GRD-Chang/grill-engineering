@@ -9,6 +9,7 @@ from agent_run.adapters import github_commands
 from agent_run.adapters.github import GhGitHubReader
 from agent_run.adapters.source import read_requirements
 from agent_run.errors import GitHubReadError
+from support.github_retries import set_read_retry_sleep
 from support.github_requirements import source_response, source_snapshot
 from support.remote_effects import _reader, _reader_data
 
@@ -45,7 +46,7 @@ def raw_source(monkeypatch):
 def test_graphql_partial_data_and_errors_is_not_a_requirement_snapshot(raw_source, monkeypatch, errors):
     reader, data, calls = raw_source
     delays = []
-    monkeypatch.setattr(github_commands.time, 'sleep', delays.append)
+    set_read_retry_sleep(monkeypatch, delays.append)
     data['graphql_errors'] = errors
     with pytest.raises(GitHubReadError):
         read_requirements(reader, 1)

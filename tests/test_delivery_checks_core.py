@@ -12,6 +12,8 @@ import json
 
 import pytest
 
+from support.github_retries import set_read_retry_sleep
+
 from agent_run.core.operation_contract import ObserveIO, ReadUnavailable, Work
 from agent_run.core.operation_runner import OperationRunner, observe_control
 from agent_run.errors import KernelError
@@ -106,7 +108,7 @@ def test_complete_read_keeps_source_gate_or_original_wait_window(reader, tmp_pat
         return bounded([sys.executable, '-I', '-c', code], **options)
 
     monkeypatch.setattr(github_commands, '_run_bounded_command', returned)
-    monkeypatch.setattr(github_commands.time, 'sleep', lambda _: None)
+    set_read_retry_sleep(monkeypatch, lambda _: None)
     monkeypatch.setattr(s.ports, 'source', native.source)
     first = s.runner().run_once()
     assert db.execute('SELECT count(*) FROM effects').fetchone()[0] == 0
@@ -1092,7 +1094,6 @@ def test_local_preparation_still_bounds_its_required_source_and_pr_reads(decisio
 def test_mixed_source_failure_never_commits_or_renews_a_supervision_window(
     reader, monkeypatch, tmp_path, next_observation,
 ):
-    from agent_run.adapters import github
     from agent_run.adapters.remote import RemoteEffects
     from support.remote_effects import _reader
 
@@ -1105,7 +1106,7 @@ def test_mixed_source_failure_never_commits_or_renews_a_supervision_window(
     document['9']['state'] = 'INVALID'
     document['graphql_errors'] = [{'message': 'Controlled missing required permission'}]
     state.write_text(json.dumps(document))
-    monkeypatch.setattr(github.time, 'sleep', lambda _: None)
+    set_read_retry_sleep(monkeypatch, lambda _: None)
     native = RemoteEffects(tmp_path, 'example/project', runner_identity={'source': 'host'})
     monkeypatch.setattr(s.ports, 'source', native.source)
     before = [tuple(row) for row in db.execute('SELECT * FROM source_observations')]

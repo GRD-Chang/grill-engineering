@@ -5,6 +5,7 @@ import pytest
 
 from agent_run.adapters.source import read_requirements
 from agent_run.errors import GitHubReadError
+from support.github_retries import set_read_retry_sleep
 from support.remote_effects import _reader
 from test_source_snapshot_observation import _flat
 
@@ -40,7 +41,7 @@ def test_repository_string_variables_survive_canonical_pages(tmp_path, monkeypat
     assert marker in text
     program.write_text(text.replace(marker, codec + marker, 1))
     from agent_run.adapters import github_commands
-    monkeypatch.setattr(github_commands.time, 'sleep', lambda _: None)
+    set_read_retry_sleep(monkeypatch, lambda _: None)
     bounded, arguments = github_commands._run_bounded_command, []
     def request(command, **options):
         arguments.append(command)

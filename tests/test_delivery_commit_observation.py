@@ -5,6 +5,8 @@ import json
 
 import pytest
 
+from support.github_retries import set_read_retry_sleep
+
 from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.core.operation_contract import DeliveryRead, ReadUnavailable
 from agent_run.errors import GitHubReadError
@@ -122,7 +124,7 @@ def test_completed_read_never_hides_a_later_invalid_or_unavailable_object(tmp_pa
             raise GitHubReadError('github_read_failed', 'controlled unavailable object')
     start = len(_reads(calls))
     with monkeypatch.context() as damaged:
-        damaged.setattr('agent_run.adapters.remote.time.sleep', lambda _: None)
+        set_read_retry_sleep(damaged, lambda _: None)
         _damage_basis(damaged, broken)
         with pytest.raises((ValueError, KeyError, ReadUnavailable)):
             port.delivery(request)

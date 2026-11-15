@@ -1,5 +1,6 @@
 """Real fake-gh transport into native Requirements; Kernel owns all decisions."""
 
+from support.github_retries import set_read_retry_sleep
 from support.repository_fixture import create_kernel
 import json
 import os
@@ -191,11 +192,10 @@ def test_check_normalizer_uses_original_required_status_not_cli_exit_or_incident
 
 @pytest.mark.parametrize('http_status', [404, 403], ids=['classic-absent-does-not-erase-ruleset', 'permission-error-is-not-absence'])
 def test_classic_protection_absence_and_permission_failure_have_distinct_meanings(tmp_path: Path, monkeypatch, http_status: int) -> None:
-    from agent_run.adapters import github_commands
     from agent_run.adapters.source import read_required_check_facts, normalize_required_checks
     reader, log = _reader(tmp_path, monkeypatch)
     delays = []
-    monkeypatch.setattr(github_commands.time, 'sleep', delays.append)
+    set_read_retry_sleep(monkeypatch, delays.append)
     responses = tmp_path / 'responses.json'
     data = json.loads(responses.read_text())
     data['classic_http'] = http_status
@@ -278,11 +278,10 @@ def test_large_job_logs_keep_the_original_diagnostic_tail(tmp_path: Path, monkey
 
 
 def test_unavailable_job_logs_do_not_erase_an_exact_failure_or_become_empty_logs(tmp_path: Path, monkeypatch) -> None:
-    from agent_run.adapters import github_commands
     from agent_run.adapters.source import read_required_check_facts, normalize_required_checks
     reader, log = _reader(tmp_path, monkeypatch)
     delays = []
-    monkeypatch.setattr(github_commands.time, 'sleep', delays.append)
+    set_read_retry_sleep(monkeypatch, delays.append)
     _failed_job(tmp_path, logs_http=403)
     facts = read_required_check_facts(reader, 17, expected_head_sha='2' * 40)
     check = facts['required_checks'][0]
@@ -446,7 +445,7 @@ def test_incomplete_required_check_identity_or_pages_never_prove_success(tmp_pat
                          else {'http': 403} if damage == 'page-403'
                          else _rollup_page([], more=True, cursor='next'))
     reader, _, _ = _bound_reader(tmp_path, monkeypatch, pages)
-    monkeypatch.setattr('agent_run.adapters.github_commands.time.sleep', lambda _: None)
+    set_read_retry_sleep(monkeypatch, lambda _: None)
     with pytest.raises(GitHubReadError) as failure:
         read_required_check_facts(reader, 17, expected_head_sha='2' * 40)
     if damage == 'partial-errors':
@@ -565,7 +564,7 @@ def test_latest_endpoint_cannot_supply_incomplete_or_foreign_evidence(tmp_path, 
     data = json.loads(path.read_text()); data['latest_pages'] = pages
     if damage == '403': data['latest_http'] = 403
     path.write_text(json.dumps(data))
-    monkeypatch.setattr('agent_run.adapters.github_commands.time.sleep', lambda _: None)
+    set_read_retry_sleep(monkeypatch, lambda _: None)
     with pytest.raises(GitHubReadError):
         read_required_check_facts(reader, 17, expected_head_sha='2' * 40)
 
@@ -727,10 +726,9 @@ def test_repository_fixture_reads_only_the_exact_declared_default_ref(tmp_path, 
 
 @pytest.mark.parametrize('status', [404, 403, 503])
 def test_repository_fixture_preserves_absence_and_ref_read_failures(tmp_path, monkeypatch, status):
-    from agent_run.adapters import github_commands
     reader, log = _reader(tmp_path, monkeypatch)
     delays = []
-    monkeypatch.setattr(github_commands.time, 'sleep', delays.append)
+    set_read_retry_sleep(monkeypatch, delays.append)
     responses = tmp_path / 'responses.json'
     data = json.loads(responses.read_text())
     if status == 404:
@@ -778,7 +776,7 @@ def test_required_checks_failure_keeps_safe_exit_and_shape(
         "if sys.argv[1:3]==['api','graphql']:\n"
         f' sys.stdout.write({stdout!r});sys.stderr.write({(stderr + " Authorization: Bearer secret-fixture-value")!r});raise SystemExit({exit_code})\n'
         + rest)
-    monkeypatch.setattr('agent_run.adapters.github_commands.time.sleep', lambda _: None)
+    set_read_retry_sleep(monkeypatch, lambda _: None)
     with pytest.raises(GitHubReadError) as failed:
         read_required_check_facts(reader, 17, expected_head_sha='2' * 40)
     assert failed.value.code == code

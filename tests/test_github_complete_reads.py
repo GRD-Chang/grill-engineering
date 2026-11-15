@@ -1,9 +1,10 @@
 """Structured read success requires original complete bytes; writes retain tails."""
 import json
-import subprocess
 import sys
 
 import pytest
+
+from support.github_retries import set_read_retry_sleep
 
 from agent_run.adapters import github_commands as commands
 from agent_run.errors import GitHubReadError
@@ -100,7 +101,7 @@ def test_read_byte_budget_is_exact_and_stderr_keeps_only_its_tail(monkeypatch):
 
 def test_nonzero_read_and_write_ack_keep_original_tail_and_replacement_contract(monkeypatch):
     monkeypatch.setattr(commands, 'MAX_COMMAND_OUTPUT_BYTES', 128)
-    monkeypatch.setattr(commands.time, 'sleep', lambda _: None)
+    set_read_retry_sleep(monkeypatch, lambda _: None)
     body = "import sys;sys.stdout.buffer.write(b'x'*200+b'\\xff');raise SystemExit(1)"
     read = commands.run_read_command([sys.executable, '-I', '-c', body], complete_stdout=True)
     writes = []
@@ -128,7 +129,7 @@ def test_command_timeout_keeps_its_retry_budget_and_priority_over_malformed_outp
         return replace(result, timed_out=True)  # Controlled command-deadline result.
 
     monkeypatch.setattr(commands, 'capture_command', expired)
-    monkeypatch.setattr(commands.time, 'sleep', lambda _: None)
+    set_read_retry_sleep(monkeypatch, lambda _: None)
     result = commands.run_read_command([sys.executable, '-I', '-c',
         "import sys;sys.stdout.buffer.write(b'{\"text\":\"\\xff\"}')"], complete_stdout=True)
     assert calls == [0, 0, 0] and result.returncode == 1

@@ -6,6 +6,7 @@ import pytest
 from agent_run.adapters import github, github_commands
 from agent_run.adapters.source import read_requirements
 from agent_run.errors import GitHubReadError
+from support.github_retries import set_read_retry_sleep
 from support.github_requirements import source_issue
 from support.remote_effects import _reader
 
@@ -24,7 +25,7 @@ def _flat(tmp_path, monkeypatch, count=2):
     data['parent']['subIssues']['totalCount'] = count
     data['parent']['subIssues']['pageInfo'] = {'hasNextPage': False, 'endCursor': None}
     state.write_text(json.dumps(data))
-    monkeypatch.setattr(github_commands.time, 'sleep', lambda _: None)
+    set_read_retry_sleep(monkeypatch, lambda _: None)
     return reader, state, log
 
 
@@ -135,7 +136,7 @@ def test_overflow_and_compact_reads_share_original_budget(tmp_path, monkeypatch,
 
 def test_retry_discards_all_prior_parent_pages(tmp_path, monkeypatch):
     reader, log = _reader(tmp_path, monkeypatch)
-    monkeypatch.setattr(github_commands.time, 'sleep', lambda _: None)
+    set_read_retry_sleep(monkeypatch, lambda _: None)
     state = tmp_path / 'responses.json'
     bounded, failed = github_commands._run_bounded_command, []
 

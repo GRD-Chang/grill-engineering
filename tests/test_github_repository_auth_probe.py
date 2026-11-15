@@ -9,6 +9,8 @@ import sys
 
 import pytest
 
+from support.github_retries import set_read_retry_sleep
+
 from agent_run.adapters.github import GhGitHubReader
 import agent_run.adapters.auth.identity as identity
 from agent_run.adapters.github_commands import MAX_COMMAND_OUTPUT_BYTES
@@ -154,7 +156,7 @@ def test_repository_ref_read_keeps_retry_and_error_propagation(monkeypatch):
         return subprocess.CompletedProcess(arguments, 1, "", "HTTP 403: unavailable")
 
     monkeypatch.setattr(commands, "_run_bounded_command", read)
-    monkeypatch.setattr(commands.time, "sleep", lambda seconds: None)
+    set_read_retry_sleep(monkeypatch, lambda _: None)
     with pytest.raises(GitHubReadError) as caught:
         GhGitHubReader("example/project").repository()
     assert caught.value.code == "github_read_failed"

@@ -6,6 +6,7 @@ import pytest
 
 from agent_run.adapters.source import normalize_required_checks, read_required_check_facts
 from agent_run.errors import GitHubReadError
+from support.github_retries import set_read_retry_sleep
 from support.remote_effects import _reader
 
 
@@ -81,19 +82,18 @@ def test_required_checks_permission_errors_never_become_unprotected_success(tmp_
             return subprocess.CompletedProcess(arguments, 1, '', 'HTTP 403 forbidden')
         return original(arguments, **kwargs)
     monkeypatch.setattr(commands, '_run_bounded_command', read)
-    monkeypatch.setattr(commands.time, 'sleep', lambda _: None)
+    set_read_retry_sleep(monkeypatch, lambda _: None)
     with pytest.raises(GitHubReadError) as failed:
         read_required_check_facts(reader, 17, expected_head_sha='2' * 40)
     assert failed.value.code == 'github_read_failed'
 
 
 def test_completed_observation_does_not_hide_a_later_repository_permission_failure(tmp_path, monkeypatch):
-    from agent_run.adapters import github_commands as commands
     reader, log = _reader(tmp_path, monkeypatch)
     # This is a freshness/error test, not a real-time backoff boundary. Keep
     # every actual command and its scheduled delays without sleeping here.
     delays = []
-    monkeypatch.setattr(commands.time, 'sleep', delays.append)
+    set_read_retry_sleep(monkeypatch, delays.append)
     assert normalize_required_checks(read_required_check_facts(reader, 17, expected_head_sha='2' * 40)).result == 'none'
     before = len(log.read_text().splitlines())
     path = tmp_path / 'responses.json'

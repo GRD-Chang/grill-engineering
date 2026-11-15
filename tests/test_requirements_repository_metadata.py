@@ -5,6 +5,7 @@ import pytest
 
 from agent_run.adapters.source import read_required_check_facts, read_requirements
 from agent_run.errors import GitHubReadError
+from support.github_retries import set_read_retry_sleep
 from support.remote_effects import _reader
 from support.fixture_text import replace_once
 
@@ -40,8 +41,7 @@ def _metadata_reader(root, monkeypatch):
     script.write_text(replace_once(program, "print(result.stdout,end='');print(result.stderr,end='',file=sys.stderr)", '''if result.returncode==0 and data.get('ref_type'):
         value=json.loads(result.stdout); value['object']['type']=data['ref_type']; result.stdout=json.dumps(value)
     print(result.stdout,end='');print(result.stderr,end='',file=sys.stderr)'''))
-    import agent_run.adapters.github_commands as commands
-    monkeypatch.setattr(commands.time, 'sleep', lambda _: None)  # Keep all three real failed subprocess attempts.
+    set_read_retry_sleep(monkeypatch, lambda _: None)  # Keep all three real failed subprocess attempts.
     return reader, log
 
 
