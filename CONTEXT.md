@@ -13,7 +13,7 @@ Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付�
 
 持续多线监督已接入：开发或审核长调用期间，当前集成 Ticket 的 CI、合入和收尾独立推进；并发为 1 也保留监督。统一 Ticket 工作额度与持久 FIFO 动态补位已接入；单票立即 Stop 已接入同一 Worker 监督和持久租约；运行中定向 Resume 已接入同一 Executor 与 FIFO，见 [ADR 0019](docs/adr/0019-ticket-work-concurrency-and-supervision.md)。下文这些术语描述目标合同。
 
-本轮架构合同见 [ADR 0024](docs/adr/0024-orchestration-responsibility-separation.md) 与 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md)。共同 Agent 执行、图调度与交付阶段分界、固定预算归属、Review Context、同类证据适用规则及准确发布对账共同支持三种交付对象。完整 Parent 的修复直接纳入自身开发、集成和审核，程序准确更新 Run Branch，仅最终 Run PR 承担 Publish 文案、Hosted CI 与人工批准。Ticket 与 Parent-only 在自身 Job 保存预算，完整 Parent 在 Run Acceptance 保存预算，Repair Job 仅引用所属 Parent 的额度。Review Context 在既有 Semantic Attempt 中固定调用事实并绑定返回结论。修复保留身份、受管工作区、必要本地分支、候选与历史；不兼容读取或迁移旧 Run。审核范围、额度策略、准确成果核验及人工批准合同继续有效。
+本轮架构合同见 [ADR 0024](docs/adr/0024-orchestration-responsibility-separation.md) 与 [ADR 0031](docs/adr/0031-parent-repair-pr-and-repository-ci.md)，修复通路的设计与实施状态见后者；[ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md) 保留历史取舍。共同 Agent 执行、图调度与交付阶段分界、固定预算归属、Review Context、同类证据适用规则及准确发布对账共同支持三种交付对象。完整 Parent 的修复纳入自身开发、集成和审核，经 Run Repair PR 的检查和合入进入 Run Branch，最终 Run PR 承担默认分支检查与人工批准。Ticket 与 Parent-only 在自身 Job 保存预算，完整 Parent 在 Run Acceptance 保存预算，Repair Job 仅引用所属 Parent 的额度。Review Context 在既有 Semantic Attempt 中固定调用事实并绑定返回结论。修复保留身份、受管工作区、必要本地分支、候选与历史；不兼容读取或迁移旧 Run。审核范围、额度策略、准确成果核验及人工批准合同继续有效。
 
 Publication 在原 Attempt 输入中固定实际发布提交的内容范围、整个 PR 相对目标快照的范围及已有 PR 原文。
 提交说明描述前者，PR 文案描述完整任务成果；最终多 Ticket Parent 不据文案创建新提交。
@@ -140,7 +140,7 @@ Development 在实现或修复完成验证与自行检查后的内部质量预�
 _Avoid_: 内部验收、只审已提交 HEAD、遗漏未跟踪文件、把一轮等同于一个 Reviewer、把开发结论作为审查前提、修复后常规再派 Reviewer、无新增关键风险仍重复审查、Fresh Acceptance
 
 **Development–Acceptance Engine（开发验收引擎）**:
-Controller 复用 Development–Review 的共同变更循环：Development 修改 checkout，程序创建准确 Candidate，Fresh Reviewer 输出 Acceptance Artifact，Findings 原样返回开发。Ticket 与 Parent-only 验收后调用 Publish 并由程序推送对应 PR，等待准确 Required Checks 与 Published-Head Gate，再按对象门禁合入；Ticket 兜底只有在准确 head 形成 Deterministic Integration Record 后取得合入权限。完整 Parent 的修复共用开发、Review、预算与结果续接能力，在适用集成和验收后由程序直接更新 Run Branch；不经过内部 Publish、PR、CI 或合并生命周期。Parent-only 的人工批准只授予准确对象的合并权限，批准后的重新核验、合并与恢复仍由同一交付能力执行。
+Controller 复用 Development–Review 的共同变更循环：Development 修改 checkout，程序创建准确 Candidate，Fresh Reviewer 输出 Acceptance Artifact，Findings 原样返回开发。Ticket 与 Parent-only 验收后调用 Publish 并由程序推送对应 PR，等待准确 Required Checks 与 Published-Head Gate，再按对象门禁合入；Ticket 兜底只有在准确 head 形成 Deterministic Integration Record 后取得合入权限。完整 Parent 的修复共用开发、Review、预算与结果续接能力，在适用集成和验收后由程序通过 Run Repair PR 的检查与合入更新 Run Branch；不另建一套修复预算或重复审核流水线。Parent-only 的人工批准只授予准确对象的合并权限，批准后的重新核验、合并与恢复仍由同一交付能力执行。
 Development–Review 阶段由同一有限循环推进：Ticket 与 Parent-only 从 Development 开始，完整 Parent 在既有远端集成后从 Review 开始。候选提交、审核结果恢复、Findings 后修复和预算暂停共用推进与记账规则；完整 Parent 仍独立审查完整需求、Ticket Set、累计变化及准确预期合并结果。完整 Parent 的 Repair 保留准确集成、Run Branch 写入与验收提升边界，当前候选通过不能自行代替最终交付。已返回的 Run Review 结果先与 Semantic Attempt、预算一同落盘；版本回读中断时续接该结果，边界变化则丢弃结论。
 
 集成交付提供单步推进结果（可继续、等待、需要 Agent、暂停、完成），完整交付入口调用同一能力。编排方未提供 Agent 名额时，程序仍可进行机械集成、已发布版本的 CI 观测和合入对账；真实冲突、适用审核或新文案在分配 Attempt 前交还编排。一轮准入最多执行一次 Agent 工作，后续工作再次交还。该接口不自行调度其他 Ticket，也不改变最终完成权威。
@@ -483,7 +483,7 @@ Run Repair 尚未写入 Run Branch 时，对 repair Candidate `C` 与准确默�
 _Avoid_: 仅审 repair diff、合入后无条件重跑同一 Reviewer、用候选通过直接授权发布
 
 **Default Branch Drift（默认分支漂移）**:
-默认分支 head 发生变化，使最终预期合并结果不再是 Reviewer 验收过的组合。Controller 自动废弃旧 Run Acceptance 与 Run PR Narrative，并首先在新 base 和当前 Run Branch 或 repair Candidate 上重新预演合并：预演成功时直接对该新组合执行全新整体验收，不创建 Repair；预演冲突或新组合验收失败时，才把原始证据交给 Run Repair Codex。活跃 Repair 中再次发生默认分支漂移时，Controller 固化已有 Candidate、保留 Repair Thread 与物理 Integration-repair Worktree，并按新 base 重新准备集成现场；Run Branch、Parent、Graph 或 Ticket Completion 漂移则使 Repair Job Generation 失效，不自动迁移其 Candidate 或工作区。只有无法自动解决或耗尽预算时才请求人工介入。
+默认分支 head 发生变化，使最终预期合并结果不再是 Reviewer 验收过的组合。Controller 自动废弃旧 Run Acceptance 与 Run PR Narrative，并首先在新 base 和当前 Run Branch 或 repair Candidate 上重新预演合并：预演成功时直接对该新组合执行全新整体验收，不因漂移直接开始代码修复；预演冲突或新组合验收失败时，才把原始证据交给 Run Repair Codex。活跃 Repair 中再次发生默认分支漂移时，Controller 固化已有 Candidate、保留 Repair Thread 与物理 Integration-repair Worktree，并按新 base 重新准备集成现场；Run Branch、Parent、Graph 或 Ticket Completion 漂移则使 Repair Job Generation 失效，不自动迁移其 Candidate 或工作区。只有无法自动解决或耗尽预算时才请求人工介入。
 _Avoid_: 把 base 漂移直接当作代码修复、将旧 repair 自动套用到新的交付边界、Ticket Content Revision、人工逐次确认、复用旧验收
 
 **Run Publication Codex（运行发布 Codex）**:
@@ -499,9 +499,9 @@ _Avoid_: Ticket Development Thread、Run Reviewer Thread、人工修复会话
 _Avoid_: Run Branch 本身、Reviewer 的只读工作区、Agent 自行发布、每次 Finding 都丢弃原修复现场
 
 **Run Repair Job（运行修复任务）**:
-完整 Parent 中承接整体验收 Findings、CI 失败或集成问题的一份修复工作，保留明确工作身份、原始证据、成果与恢复位置。它使用 Parent 的额度与交付循环，不拥有独立内部 PR 的交付生命周期，见 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md)。
+完整 Parent 中承接整体验收 Findings、CI 失败或集成问题的一份修复工作，保留明确工作身份、原始证据、成果与恢复位置。它使用 Parent 的额度与交付循环；Run Repair PR 承载修复成果进入 Run Branch 的检查与合入，不形成另一份 Parent 工作或预算，见 [ADR 0031](docs/adr/0031-parent-repair-pr-and-repository-ci.md)。
 
-程序将审核通过且绑定事实仍有效的准确成果更新到 Run Branch，不因内部 PR 已合并而轮换 Job、分支或 PR。默认分支前进后在原修复工作中核验最新组合，保存重载和 resume 保留工作身份与已保存结果。
+程序通过 Run Repair PR 将审核通过且绑定事实仍有效的准确成果合入 Run Branch，不因修复 PR 合并而轮换 Job 或重置预算；已合并 PR 作为原成果记录，不复用为后续新修复的活动 PR。默认分支前进后在原修复工作中核验最新组合，保存重载和 resume 保留工作身份与已保存结果。
 _Avoid_: Ticket Job、独立修复流水线、另有一份 Parent 预算
 
 **Repair Cycle（修复周期）**:
@@ -509,16 +509,16 @@ _Avoid_: Ticket Job、独立修复流水线、另有一份 Parent 预算
 _Avoid_: 用 Delivery Run 的历史累计修改数作为当前预算、把流程重试计作代码修改、base 漂移重置同一问题的预算
 
 **Run Repair PR（运行修复拉取请求）**:
-旧交付路径中从独立修复分支指向 Run Branch 的内部 PR，承载修复的独立 CI 与合并记录。[ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md) 取消此交付路径；此术语仅用于解释历史记录，不是当前交付对象。
-_Avoid_: 最终 Run PR、Ticket PR、新架构必须保留的交付对象
+承载完整 Parent 修复或整体集成成果、以 Run Branch 为目标的拉取请求。它接受目标仓库规定的检查，并由程序在门禁通过后合入，不承担最终默认分支的人工批准；设计与实施状态见 [ADR 0031](docs/adr/0031-parent-repair-pr-and-repository-ci.md)。
+_Avoid_: 最终 Run PR、Ticket PR、Parent-only PR、直接推送 Run Branch
 
 **Merge-resolution Candidate（合并解决候选）**:
 程序依据修复工作区生成、记录准确 Run head 与默认分支 head 为父提交的冲突解决成果，是完整 Parent 审核的候选对象。它保留已解决的默认分支祖先关系；实际发布成果仍须与被审核的文件树和集成事实一致，才能沿用审核结论。
 _Avoid_: Agent 自行提交 merge、squash 丢失集成祖先、把冲突只当作文本补丁
 
 **Run Acceptance Repair Loop（运行验收修复循环）**:
-完整 Parent 为解决整体验收 Findings 或最终 PR 的 CI 失败而进行的有界修复，复用开发—审核与集成—Git 检查—适用审核两个循环；修复始终覆盖当前 Parent 的工作范围。按 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md)，程序准确更新 Run Branch 后由最终 PR 的 CI 和人工批准继续把关，保留成果、证据和累计用量供后续修复或 resume。
-_Avoid_: 独立内部 PR 流水线、仅修复局部 Ticket、无依据复用旧审核、Agent 直接更新 Run Branch
+完整 Parent 为解决整体验收 Findings 或最终 PR 的 CI 失败而进行的有界修复，复用开发—审核与集成—Git 检查—适用审核两个循环；修复始终覆盖当前 Parent 的工作范围。按 [ADR 0031](docs/adr/0031-parent-repair-pr-and-repository-ci.md)，程序经 Run Repair PR 的检查与合入更新 Run Branch，随后由最终 PR 的检查和人工批准继续把关，保留成果、证据和累计用量供后续修复或 resume。
+_Avoid_: 另一套修复预算或审核流水线、仅修复局部 Ticket、无依据复用旧审核、Agent 直接更新 Run Branch
 
 **Run Feedback Revision（运行反馈版本）**:
 维护者通过 Final Revision Command 提交的 Run 级权威反馈及其稳定指纹。它进入 Run Repair Job 的 Effective Revision、Run Acceptance Artifact envelope 和后续 Run Acceptance 需求源，直到 Delivery Run 被批准或放弃；Controller 不总结、改写或静默丢弃该反馈。
@@ -904,7 +904,7 @@ _Avoid_: Scope Impact Assessment、结构确认、自动吸收、自动 Requeue
 未知推送或 PR 结果仍保留 Ticket 集成席位；成功写入不重复执行，已持久化且绑定事实未变的 Publish 文案复用。
 需求、验收或成果变化不继承旧 CI 与 Parent 批准。Status/History 只展示意图、准确版本与实际席位，不执行对账。
 
-多 Ticket Parent 在所有 Ticket Completion 后，先读取远端 Run Branch 与默认分支的准确 head，保留本地、远端源分支和目标分支的成果，再启动首次完整 Run Acceptance。Reviewer 看到 Parent、Ticket 完成与 fallback、Ticket/Run 集成记录及准确合并结果；这一次审核属于当前集成窗口的首次审核。默认累计集成开发上限为 3 次，首次审核另计；Git 问题与整体验收 Findings 共用开发额度，普通 Git 失败以准确操作、原始输出和版本交回 Development。Parent 修复经准确 Candidate Acceptance 核验后由程序更新 Run Branch；最终 Run PR 的必要 CI、人工批准与最终复核仍保护默认分支。
+多 Ticket Parent 在所有 Ticket Completion 后，先读取远端 Run Branch 与默认分支的准确 head，保留本地、远端源分支和目标分支的成果，再启动首次完整 Run Acceptance。Reviewer 看到 Parent、Ticket 完成与 fallback、Ticket/Run 集成记录及准确合并结果；这一次审核属于当前集成窗口的首次审核。默认累计集成开发上限为 3 次，首次审核另计；Git 问题与整体验收 Findings 共用开发额度，普通 Git 失败以准确操作、原始输出和版本交回 Development。Parent 修复经准确 Candidate Acceptance 核验后，由程序通过 Run Repair PR 的检查与合入更新 Run Branch；最终 Run PR 的必要 CI、人工批准与最终复核仍保护默认分支。
 
 Parent-only 先在固定开发基线完成最多 D10/R10 的完整需求开发与独立验收，Reviewer 必须通过，不使用 Ticket fallback 或 Ticket CI 豁免。交付前接纳准确远端 Parent Branch 与默认分支快照；验收复用核对完整范围、Parent 身份、需求版本、基线、候选 SHA/tree、预期合并 tree 及全部通过的独立记录，相同 tree 不足以证明结论有效。事实不变复用，事实变化则审核当前组合；已有同需求完整基线可增量核验并形成整体结论，否则建立完整基线。
 

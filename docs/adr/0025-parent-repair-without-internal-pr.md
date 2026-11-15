@@ -1,8 +1,13 @@
 ---
-status: accepted
+status: superseded by ADR-0031
 ---
 
 # 完整 Parent 的修复不再经过内部 Repair PR
+
+本决定中取消修复 PR、直接更新 Run Branch 的条款，已由
+[ADR 0031](0031-parent-repair-pr-and-repository-ci.md) 的已确认设计取代。
+新路径尚未实施，当前 Runner 仍执行本文路径；以下保留当时的决定与取舍，
+其余准确验收、预算、恢复和最终批准边界仍须遵守。
 
 完整 Parent 的 Findings 与 CI 修复进入 Parent 自身的开发、集成和发布循环，由程序准确更新 Run Branch，最终 Run PR 承担 Hosted CI 与人工批准门禁。取消内部 Repair PR 的文案、创建、CI 等待、合并对账，以及因其已合并而轮换修复 Job 的流程。修复仍有明确的工作身份、受管工作区、成果和历史。
 
