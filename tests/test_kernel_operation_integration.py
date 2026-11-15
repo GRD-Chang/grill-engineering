@@ -160,8 +160,12 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
                     assert held.wait(completed, 8), "Ticket merge/close stalled behind the only Agent worker"
                     assert not returned.is_set()
                     held.mark_returned()
-            scenario.select(call.subject)
-            kernel.receive(call, scenario.agent(call))
+            # The sibling returns at the first legal operator boundary. Its
+            # subsequent delivery is independent of the observed overlap.
+            from agent_run.model import wire_json
+            assert call.subject == "ticket:4"
+            kernel.receive(call, wire_json({"result_kind": "human_blocker", "summary": None,
+                                            "human_blockers": ["Choose how to continue this independent Ticket."]}))
         finally:
             kernel.agent_exited(call, process, 0)
     monkeypatch.setattr('agent_run.runtime.codex.execute_selected_codex', execute)
@@ -205,7 +209,8 @@ def test_real_core_n1_ci_poll_advances_during_independent_long_agent(tmp_path, m
         signal.signal(signal.SIGALRM, previous_handler)
     assert entered.is_set() and polled.is_set()
     assert completed.is_set() and returned.is_set()
-    assert scenario.kernel.status(scenario.kernel.source_status()["final_subject"])["phase"] == "approval"
+    assert "human_blocker" in scenario.kernel.status("ticket:4")["gates"]
+    assert scenario.kernel.source_status()["final_subject"] is None
 
 
 def test_real_core_future_failure_and_raw_cannot_release_unknown_process(tmp_path, monkeypatch):

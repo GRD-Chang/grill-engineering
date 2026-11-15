@@ -23,8 +23,8 @@ def test_activation_rejects_direct_claim_without_external_reads(tmp_path, monkey
     assert scenario.kernel.status(scenario.delivery.key)["pending_attempt"] is None
 
 
-def test_managed_activation_reads_the_original_sent_target_once(tmp_path, monkeypatch):
-    scenario = managed_parent(tmp_path)
+def test_managed_activation_reads_the_original_sent_target_once(tmp_path, monkeypatch, parent_before_push):
+    scenario = admit_scenario(parent_before_push, tmp_path)
     kernel = scenario.kernel
     now = [100.25]
     kernel.clock = lambda: now[0]
@@ -193,17 +193,11 @@ def test_stop_cancels_the_pass_without_reading_or_reactivating(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("kind,change", [("parent", "source"), ("final", "target")])
-def test_approval_observation_executes_real_currentness_and_resync_checks(tmp_path, kind, change):
+def test_approval_observation_executes_real_currentness_and_resync_checks(tmp_path, kind, change, request):
     if kind == "parent":
-        scenario = managed_parent(tmp_path)
+        scenario = admit_scenario(request.getfixturevalue("parent_at_approval"), tmp_path)
     else:
-        source = Requirements(ParentIssue(1, "Parent", "Original", (2,)),
-            (Issue(2, "Ticket", "Task", "OPEN", frozenset({"ready-for-agent"})),))
-        scenario = admit_scenario(GraphScenario(tmp_path / "graph", source), tmp_path)
-        assert scenario.run().kind == "complete"
-        activated = prepare_scripted_agent(scenario.kernel, scenario.runner().run_once())
-        assert activated.reason == "final_activated"
-        scenario.select(activated.subject)
+        scenario = admit_scenario(request.getfixturevalue("graph_final_at_approval"), tmp_path)
     assert scenario.run().kind == "approval"
     before = scenario.kernel.status(scenario.delivery.key)
     runner = scenario.runner()

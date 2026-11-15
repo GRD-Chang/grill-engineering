@@ -134,8 +134,9 @@ def test_waits_do_not_authorize_a_stopped_or_replaced_scope(tmp_path: Path, monk
     assert not operations.runner.worker_settled(call)
 
 
-def test_checks_read_error_reuses_the_original_45_minute_window(tmp_path: Path, monkeypatch) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET, checks=("pending",))
+def test_checks_read_error_reuses_the_original_45_minute_window(ticket_before_pr, monkeypatch) -> None:
+    scenario = ticket_before_pr
+    scenario.checks[:] = ["pending"]
     scenario.kernel.clock = lambda: 100
     assert scenario.run().reason == "required_checks"
     operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)

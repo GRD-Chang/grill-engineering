@@ -9,20 +9,20 @@ import json
 
 import pytest
 
-from agent_run.model import DeliveryKind, Effect, EffectResult
+from agent_run.model import Effect, EffectResult
 from agent_run.core.kernel import Kernel
 from support.offline import OfflinePort
 from support.core_operations import CoreOperations
-from support.cleanup_scenarios import _native_scenario, _local_head
+from support.cleanup_scenarios import _local_head
 
 
 CLEANUP_OPERATIONS = ("cleanup_worktree", "cleanup_local_ref", "cleanup_remote_ref")
 
 
 def test_completed_final_retires_only_its_recorded_resources(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    graph_final_at_approval, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scenario = _native_scenario(tmp_path / "scenario", DeliveryKind.FINAL_RUN)
+    scenario = graph_final_at_approval
     main = "refs/heads/main"
     main_before = scenario.port.git.commit(main)
     sibling = "refs/heads/other-active-ticket"

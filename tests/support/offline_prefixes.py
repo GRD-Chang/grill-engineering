@@ -56,6 +56,19 @@ def _at_phase(root, kind, phase, *, policy=None):
 
 
 @pytest.fixture(scope="session")
+def _parent_push_stage(tmp_path_factory):
+    with _prepared_stage(tmp_path_factory, "parent-push",
+                         lambda root: _at_phase(root, DeliveryKind.PARENT_ONLY, "push")) as checkout:
+        yield checkout
+
+
+@pytest.fixture
+def parent_before_push(_parent_push_stage, isolated_user_environment):
+    with _parent_push_stage() as scenario:
+        yield scenario
+
+
+@pytest.fixture(scope="session")
 def _ticket_pr_stage(tmp_path_factory):
     with _prepared_stage(tmp_path_factory, "pr", lambda root: _at_phase(root, DeliveryKind.TICKET, "pr")) as checkout:
         yield checkout
@@ -199,4 +212,28 @@ def _notification_pr_stage(tmp_path_factory):
 @pytest.fixture
 def notification_ticket_before_pr(_notification_pr_stage, isolated_user_environment):
     with _notification_pr_stage() as scenario:
+        yield scenario
+
+
+@pytest.fixture(scope="session")
+def _graph_final_approval_stage(tmp_path_factory):
+    from support.cleanup_scenarios import _native_scenario
+
+    def prepare(root):
+        scenario = _native_scenario(root, DeliveryKind.TICKET)
+        with prepare_domain_history(scenario):
+            assert scenario.run().kind == "complete"
+            activation = scenario.runner().run_once()
+            assert activation.reason == "final_activated"
+            scenario.select(activation.subject)
+            assert scenario.run().kind == "approval"
+        return scenario
+
+    with _prepared_stage(tmp_path_factory, "graph-final-approval", prepare) as checkout:
+        yield checkout
+
+
+@pytest.fixture
+def graph_final_at_approval(_graph_final_approval_stage, isolated_user_environment):
+    with _graph_final_approval_stage() as scenario:
         yield scenario

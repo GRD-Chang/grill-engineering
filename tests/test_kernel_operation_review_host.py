@@ -11,17 +11,16 @@ from pathlib import Path
 import pytest
 
 import agent_run.runtime.executor as executor
-from agent_run.model import DeliveryKind, EffectResult
+from agent_run.model import EffectResult
 from agent_run.errors import KernelError
 from agent_run.model import Execution, HostObservation
-from support.offline import Scenario
 from support.notification import _NoNotifications
 
 
 def test_direct_claim_quiesces_at_unknown_push_and_resume_reads_its_original(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    parent_before_push, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
+    scenario = parent_before_push
     kernel = scenario.kernel
     now = [100.25]
     kernel.clock = lambda: now[0]
@@ -87,7 +86,7 @@ def test_direct_claim_quiesces_at_unknown_push_and_resume_reads_its_original(
 
 
 def test_public_run_reads_a_restored_third_push_before_conflict_resume(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parent_before_push,
 ) -> None:
     """Same expectation on old 259/2078 Host and the shared operation Host.
 
@@ -96,7 +95,7 @@ def test_public_run_reads_a_restored_third_push_before_conflict_resume(
     Host loop; it never calls run_once/advance/reconcile as a recovery shortcut.
     The manager receipt is controlled, as in the existing native Host tests.
     """
-    scenario = Scenario(tmp_path / "third", DeliveryKind.PARENT_ONLY)
+    scenario = parent_before_push
     kernel = scenario.kernel
     reconcile = scenario.port.reconcile
     execute = scenario.port.execute

@@ -25,7 +25,6 @@ import pytest
 
 from agent_run.model import DeliveryKind, Effect, EffectResult
 from support.offline import Scenario
-from support.offline_prefixes import _at_phase, _prepared_stage
 from support.run_scoped_kernel import domain_kernel
 from agent_run.core.operation_contract import ReadUnavailable
 from agent_run.queries.run import read
@@ -106,26 +105,18 @@ def test_a_read_finishing_after_the_absolute_wait_deadline_allocates_no_agent(
     assert (step.kind, step.reason) == ("paused", "supervision_timeout")
 
 
-@pytest.fixture(scope="module")
-def _parent_push_stage(tmp_path_factory):
-    with _prepared_stage(tmp_path_factory, "parent-push",
-                         lambda root: _at_phase(root, DeliveryKind.PARENT_ONLY, "push")) as checkout:
-        yield checkout
-
-
 @pytest.fixture
-def parent_before_push(_parent_push_stage, isolated_user_environment):
-    with _parent_push_stage() as scenario, domain_kernel(scenario.kernel) as kernel:
-        scenario.kernel = kernel
-        yield scenario
+def domain_parent_before_push(parent_before_push):
+    with domain_kernel(parent_before_push.kernel) as parent_before_push.kernel:
+        yield parent_before_push
 
 
 @pytest.mark.parametrize("command_exit", [0, 7], ids=["actual-zero", "actual-nonzero"])
 @pytest.mark.parametrize("readback_fails", [False, True], ids=["readback-target", "readback-outage"])
 def test_actual_native_push_status_is_audited_once_independently_of_its_readback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command_exit: int, readback_fails: bool, parent_before_push,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command_exit: int, readback_fails: bool, domain_parent_before_push,
 ) -> None:
-    scenario = parent_before_push
+    scenario = domain_parent_before_push
     now = [100.25]
     scenario.kernel.clock = lambda: now[0]
     bare = scenario.port.physical.remote
@@ -241,9 +232,9 @@ raise SystemExit(response.returncode)
 
 
 def test_offline_lost_response_is_unknown_without_an_observed_command_failure(
-    monkeypatch: pytest.MonkeyPatch, parent_before_push,
+    monkeypatch: pytest.MonkeyPatch, domain_parent_before_push,
 ) -> None:
-    scenario = parent_before_push
+    scenario = domain_parent_before_push
     scenario.kernel.clock = lambda: 100.25
     scenario.port.lose_response.add("pr_write")
     make_ports = scenario.make_ports

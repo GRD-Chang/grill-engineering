@@ -110,8 +110,10 @@ def drive_until(s, runner, predicate):
     raise AssertionError("Core did not reach the requested public boundary")
 
 
-def test_lost_merge_response_records_original_readback_before_any_source_read(tmp_path):
-    s, ports, runner = setup(tmp_path, dependent=True)
+def test_lost_merge_response_records_original_readback_before_any_source_read(graph_ticket_before_merge):
+    s = graph_ticket_before_merge
+    ports = Ports(s)
+    runner = OperationRunner(s.kernel, s.execution, lambda _: ports)
     now = [100.25]
     s.kernel.clock = lambda: now[0]
     s.port.lose_response.add("merge")
@@ -132,8 +134,10 @@ def test_lost_merge_response_records_original_readback_before_any_source_read(tm
                for row in s.kernel.history(lost.subject))
 
 
-def test_unknown_original_write_quiesces_and_keeps_integration_owner(tmp_path, monkeypatch):
-    s, ports, runner = setup(tmp_path, dependent=True)
+def test_unknown_original_write_quiesces_and_keeps_integration_owner(graph_ticket_before_merge, monkeypatch):
+    s = graph_ticket_before_merge
+    ports = Ports(s)
+    runner = OperationRunner(s.kernel, s.execution, lambda _: ports)
     now = [100.25]
     s.kernel.clock = lambda: now[0]
     s.port.lose_response.add("merge")
@@ -304,21 +308,12 @@ def test_sent_merge_can_settle_a_late_readback_without_new_write_or_attempt(grap
         assert ("write_result_unknown" if uncertain == "unknown" else "write_conflict") in s.kernel.status(effect.subject)["gates"]
 
 
-def test_original_approved_prior_merge_continues_new_review_without_a_new_control(tmp_path):
-    source = Requirements(ParentIssue(1, "Parent", "Original requirement", (2,)),
-                          (Issue(2, "Ticket", "Ticket requirement", "OPEN", frozenset({"ready-for-agent"})),))
-    s = GraphScenario(tmp_path / "graph", source)
+def test_original_approved_prior_merge_continues_new_review_without_a_new_control(graph_final_at_approval):
+    s = graph_final_at_approval
+    source = s.requirements
     with domain_kernel(s.kernel) as s.kernel:
         ports = Ports(s)
         runner = OperationRunner(s.kernel, s.execution, lambda binding: ports)
-        for _ in range(120):
-            step = prepare_scripted_agent(s.kernel, runner.run_once())
-            if step.call is not None:
-                settle_agent(s, runner, step.call)
-            if s.kernel.source_status()["final_subject"] is not None and s.kernel.status("final:1")["phase"] == "approval":
-                break
-        else:
-            raise AssertionError("Final did not reach its real first approval")
         s.kernel.control("approve", "original-final-approval", subject="final:1", world=runner.observe("final:1"))
         execute = ports.execute
         sent = []

@@ -46,13 +46,11 @@ def test_closed_local_dependency_without_completion_never_unblocks_or_creates_fi
     assert reopened.status("ticket:4")["pending_attempt"] is None
 
 
-def test_real_ticket_close_receipts_create_completion_before_dependency_and_final(tmp_path: Path) -> None:
-    source = Requirements.from_wire(native_input()["initial_requirements"])
-    scenario = GraphScenario(tmp_path / "graph", source, record_checkpoints=False)
+def test_real_ticket_close_receipts_create_completion_before_dependency_and_final(dependent_ticket) -> None:
+    # Ticket 3 really closed and unblocked Ticket 4 in this independent copy.
+    scenario, _ = dependent_ticket
+    source = scenario.requirements
     assert scenario.kernel.source_status()["final_subject"] is None
-    assert scenario.run(cut="publication_pending").kind == "publication_pending"
-    assert scenario.kernel.status("ticket:3")["phase"] == "publish"
-    assert scenario.run().kind == "complete"
     completed = scenario.kernel.source_status()["completions"]
     assert [entry["subject"] for entry in completed] == ["ticket:3"]
     assert completed[0]["source_sha"] == scenario.port.pr_by_number(completed[0]["pr_number"]).head.sha
@@ -104,12 +102,8 @@ def test_real_ticket_close_receipts_create_completion_before_dependency_and_fina
     assert scenario.port.remote_commit("refs/heads/main") != scenario.port.remote_commit("refs/heads/run")
     pr = scenario.port.pr_by_number(scenario.kernel.status(final)["pr_number"])
     assert pr.body.startswith("Parent Issue: #1\nDelivery Type: Final Run\n\n## Completed Tickets\n\n")
-    scenario.kernel.control("approve", "approve-whole-parent", subject=final, world=scenario.world())
-    assert scenario.run().kind == "complete"
-    assert scenario.runner().state().disposition == "complete"
-    assert scenario.kernel.status(final)["phase"] == "complete"
-    assert scenario.kernel.status(final)["resource_cleanup"]["state"] == "complete"
-    assert len(scenario.port.git.parents(scenario.port.remote_commit("refs/heads/main").sha)) == 2
+    # Final merge/close and its ancestry are checked with the uncertain original
+    # merge receipt below. This graph ends at the PR containing both Completions.
 
 
 def test_requirement_requeue_is_explicit_idempotent_and_retains_sibling_return(tmp_path: Path) -> None:
@@ -337,16 +331,8 @@ def test_original_final_approval_settlement_uses_its_grant_before_changed_requir
         assert db.execute("PRAGMA foreign_key_check").fetchone() is None
 
 
-def final_merge_in_flight(path: Path) -> tuple[GraphScenario, Effect]:
-    """Real Ticket Completion, full Review and human approval precede the fault."""
-    original = Requirements.from_wire(native_input()["initial_requirements"])
-    source = replace(original, parent=replace(original.parent, sub_issue_numbers=(3,)), issues=(original.issues[0],))
-    scenario = GraphScenario(path, source, record_checkpoints=False)
-    assert scenario.run().kind == "complete"
-    activation = scenario.runner().run_once()
-    assert activation.reason == "final_activated"
-    scenario.select(activation.subject)
-    assert scenario.run().kind == "approval"
+def final_merge_in_flight(scenario: GraphScenario) -> Effect:
+    """Cut the actual approved merge after its external write."""
     final = scenario.delivery.key
     scenario.kernel.control("approve", "original-final-approval", subject=final, world=scenario.world())
     sent = []
@@ -368,14 +354,15 @@ def final_merge_in_flight(path: Path) -> tuple[GraphScenario, Effect]:
         assert len(sent) == 1
         effect = sent[0]
         assert scenario.kernel.status(final)["pending_write"]["status"] == "sent"
-        return scenario, effect
+        return effect
     finally:
         scenario.port.execute = execute
     raise AssertionError("Final approval did not send its exact merge")
 
 
-def test_original_final_merge_keeps_closeout_after_uncertain_reads_target_append_and_parent_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    scenario, effect = final_merge_in_flight(tmp_path / "graph")
+def test_original_final_merge_keeps_closeout_after_uncertain_reads_target_append_and_parent_drift(graph_final_at_approval, monkeypatch: pytest.MonkeyPatch) -> None:
+    scenario = graph_final_at_approval
+    effect = final_merge_in_flight(scenario)
     before = scenario.kernel.status(effect.subject)
     for actor in (None, "foreign-publisher"):
         restore_read = pr_author_read(monkeypatch, scenario.port.database, effect.pr_number, actor)
@@ -390,6 +377,7 @@ def test_original_final_merge_keeps_closeout_after_uncertain_reads_target_append
         restore_read()
     pr = scenario.port.pr_by_number(effect.pr_number)
     assert pr is not None and pr.merged is not None
+    assert len(scenario.port.git.parents(pr.merged.sha)) == 2
     local_before = scenario.port.git.commit(effect.target_ref)
     advanced = scenario.port.external_remote_append(effect.target_ref, {"later.txt": "Later independent work\n"}, "after-merge")
     assert scenario.port.git.commit(effect.target_ref) == local_before
@@ -405,6 +393,9 @@ def test_original_final_merge_keeps_closeout_after_uncertain_reads_target_append
     assert scenario.run().kind == "complete"
     assert scenario.port.remote_commit(effect.target_ref) == advanced
     after = scenario.kernel.status(effect.subject)
+    assert scenario.runner().state().disposition == "complete"
+    assert after["phase"] == "complete"
+    assert after["resource_cleanup"]["state"] == "complete"
     assert after["generation"] == before["generation"]
     assert after["budgets"] == before["budgets"]
     assert [call["role"] for call in scenario.role_calls if call["subject"] == effect.subject] == ["review", "publication"]
@@ -414,10 +405,10 @@ def test_original_final_merge_keeps_closeout_after_uncertain_reads_target_append
     assert not [write for write in scenario.port.writes() if write["operation"] == "reopen_ticket"]
 
 
-def test_final_requirement_refresh_never_reuses_old_generation_human_response(tmp_path: Path) -> None:
-    original = Requirements.from_wire(native_input()["initial_requirements"])
-    source = replace(original, parent=replace(original.parent, sub_issue_numbers=(3,)), issues=(original.issues[0],))
-    scenario = GraphScenario(tmp_path / "graph", source, reviews=("pass", "blocked", "pass"), record_checkpoints=False)
+def test_final_requirement_refresh_never_reuses_old_generation_human_response(graph_ticket_before_merge) -> None:
+    scenario = graph_ticket_before_merge
+    source = scenario.requirements
+    scenario.reviews[:] = ["pass", "blocked", "pass"]
     with domain_kernel(scenario.kernel) as scenario.kernel:
         assert scenario.run().kind == "complete"
         activation = prepare_scripted_agent(scenario.kernel, scenario.runner().run_once())
