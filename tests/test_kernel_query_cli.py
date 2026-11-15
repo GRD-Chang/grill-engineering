@@ -95,7 +95,7 @@ def test_status_shows_ticket_progress_without_claiming_whole_delivery_complete(t
 
 
 def test_parent_only_status_keeps_recorded_pass_evidence_and_hides_completed_allowances(
-    parent_at_approval, capsys,
+    parent_at_approval, tmp_path, capsys,
 ) -> None:
     from io import StringIO
     from agent_run.cli.render import render
@@ -105,6 +105,7 @@ def test_parent_only_status_keeps_recorded_pass_evidence_and_hides_completed_all
     # Both languages render the same canonical facts; no new Run or translated
     # Agent evidence is manufactured to exercise a different display channel.
     assert scenario.run().kind == "approval"
+    user_before = _snapshot(tmp_path / "user")
     _assert_approval_query(scenario, root)
     document = query.read(scenario.kernel.storage.path, "status", storage=scenario.kernel.storage)
     before = _snapshot(root)
@@ -119,7 +120,9 @@ def test_parent_only_status_keeps_recorded_pass_evidence_and_hides_completed_all
             assert value.count("Known synthetic acceptance evidence") == 3
             assert "当前问题" not in value and "Current findings" not in value
     assert _snapshot(root) == before
+    assert _snapshot(tmp_path / "user") == user_before
     assert scenario.run(approve=True).kind == "complete"
+    user_before = _snapshot(tmp_path / "user")
     _assert_completed_delivery_query(scenario, root, DeliveryKind.PARENT_ONLY, "completed")
     before = _snapshot(root)
     assert main(["status", scenario.spec.run_id, "--state-dir", str(scenario.kernel.storage.path), "--plain"]) == 0
@@ -137,6 +140,7 @@ def test_parent_only_status_keeps_recorded_pass_evidence_and_hides_completed_all
             assert "W1 D 0/3" in historical_output.getvalue()
             assert "W1 D 1/10 R 1/10" in historical_output.getvalue()
     assert _snapshot(root) == before
+    assert _snapshot(tmp_path / "user") == user_before
 
 
 def test_missing_progress_facts_are_not_called_parent_only(tmp_path: Path) -> None:
