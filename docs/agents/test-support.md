@@ -130,6 +130,21 @@ Invocation/output 复合关系，不负责补准备、Go、活动、raw 或退�
 | Final Integration Development 后的新 Publication Thread | `test_kernel_exploration` 的真实 Git 冲突修复旅程 | 线程选择规则不另重放 Ticket→Completion 前缀 |
 | Reviewer checkout 与输出目录隔离 | `test_kernel_codex_transport` 的真实 Parent Reviewer / `local_codex` | 传输与沙箱不依赖 Final 激活；Final 激活由 requirements、ancestry demand 与完整 Parent 旅程负责 |
 
+Parent push 前与单 Ticket 图的 Final approval 前状态由 `offline_prefixes` 按 worker
+准备只读模板，每例复制独立 Git/SQLite，并重建原生 Kernel；Host、重开和故障测试
+仅复用故障前的历史，被测段仍使用原生存储。图依赖用例负责 Completion→后继 Ticket→
+Final PR 的连接；不确定 Final merge 的恢复用例负责准确合并、关闭与完整资源回收。
+
+公开 Human Resume 与 Abandon 共用 `test_public_parent_integration_human_resume` 的
+真实 Host 旅程：先验证 Final 冲突修复、原 Attempt、线程和预算，再放弃未批准 PR，
+验证 Ticket 回开、恢复/退役回执、写入顺序和真实退出。`managed_abandon_recovery`
+只收集及断言本例事实，不制造完成状态。普通批准与完成后的正常退出仍由公开入口旅程负责。
+
+Squash 消息用一条 CI 修复旅程同时核验初次和更新的 publication 原始字节、提交意图、
+回执及物理 Git 消息，最终合并仍使用完整 PR 文案。错误、缺失和跨 Generation 的消息
+继续由各自负向用例负责。发行包冒烟负责真实离线 wheel 安装；另一个生命周期用例
+复用构建替身，保留真实探针、激活、失败清理、回滚和卸载。
+
 `core_operations.declared_delivery` 只投影明确给定的外部关系和精确 Commit 的反身关系；
 显式 checked 可声明负边，未声明的非反身边必须失败，不把缺少 fixture 输入解释为 Git false。
 

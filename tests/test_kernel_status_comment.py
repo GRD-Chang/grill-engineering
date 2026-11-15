@@ -6,18 +6,10 @@ from typing import Any
 import pytest
 
 from agent_run.core.kernel import Kernel
-from agent_run.model import DeliveryKind
 from agent_run.queries.status_comment import project_status
 from agent_run.notifications.status_comment import StatusComments
 from agent_run.storage import notification_outbox as outbox
-from support.offline import Scenario
 from support.status_comments import CommentsAPI, core_status_comments
-
-
-def published(tmp_path: Path) -> Scenario:
-    scenario = Scenario(tmp_path / "run", DeliveryKind.PARENT_ONLY)
-    assert scenario.run().kind == "approval"
-    return scenario
 
 
 def sender_inputs(tmp_path, monkeypatch, *, enabled=False):
@@ -42,18 +34,8 @@ def sender_inputs(tmp_path, monkeypatch, *, enabled=False):
     return kernel, current, sender
 
 
-def test_status_projection_and_intent_are_readonly_and_frozen(tmp_path, monkeypatch):
-    # Exercise mixed-case publication receipts within the existing real path.
-    from support.offline_api import SyntheticGitHub
-    def spelling(value):
-        if isinstance(value, dict):
-            return {key: item.upper() if key == "full_name" and isinstance(item, str) else spelling(item)
-                    for key, item in value.items()}
-        return [spelling(item) for item in value] if isinstance(value, list) else value
-    original_object, original_list = SyntheticGitHub.object, SyntheticGitHub.list
-    monkeypatch.setattr(SyntheticGitHub, "object", lambda self, endpoint: spelling(original_object(self, endpoint)))
-    monkeypatch.setattr(SyntheticGitHub, "list", lambda self, endpoint: spelling(original_list(self, endpoint)))
-    scenario = published(tmp_path)
+def test_status_projection_and_intent_are_readonly_and_frozen(parent_at_approval):
+    scenario = parent_at_approval
     assert_stale_and_unknown_review_records_are_readonly(scenario.kernel, scenario.delivery.key)
     database, subject = scenario.kernel.storage.path, scenario.delivery.key
     before = database.read_bytes()

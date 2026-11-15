@@ -140,8 +140,8 @@ print(json.dumps({'step':step.kind,'status':k.status('ticket:2')}))
 
 
 
-def test_old_pr_intent_is_settled_before_reintegration_after_target_append(monkeypatch, ticket_before_pr) -> None:
-    scenario = ticket_before_pr
+def test_old_pr_intent_is_settled_before_reintegration_after_target_append(monkeypatch, domain_ticket_before_pr) -> None:
+    scenario = domain_ticket_before_pr
     held = advance_to_effect(scenario, monkeypatch, "pr_write", sent=True)
     effect = held.effect
     scenario.port.execute(effect, held.authorize)

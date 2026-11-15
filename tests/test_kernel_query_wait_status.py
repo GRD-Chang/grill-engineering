@@ -2,18 +2,17 @@
 import json
 import time
 
-from agent_run.model import Checks, DeliveryKind
 from agent_run.core.kernel import Kernel
 import agent_run.queries.run as query
-from support.offline import Scenario
 from agent_run.core.operation_runner import OperationRunner
 from agent_run.cli.main import main
 from agent_run.queries.read_facts import read_boundaries
 from support.environment import durable_snapshot as _snapshot
 
 
-def test_public_checks_status_reads_the_original_committed_wait(tmp_path, monkeypatch, capsys):
-    scenario = Scenario(tmp_path / 'scenario', DeliveryKind.TICKET, checks=('pending',))
+def test_public_checks_status_reads_the_original_committed_wait(ticket_before_pr, tmp_path, monkeypatch, capsys):
+    scenario = ticket_before_pr
+    scenario.checks[:] = ['pending']
     scenario.kernel.clock = lambda: 100.25
     assert scenario.run().reason == 'required_checks'
     subject = scenario.delivery.key
@@ -23,7 +22,8 @@ def test_public_checks_status_reads_the_original_committed_wait(tmp_path, monkey
     with scenario.kernel.storage.transaction(write=False) as tx:
         window, = tx.rows('SELECT kind,started_at,deadline FROM waits WHERE subject=?', (subject,))
         assert tuple(window) == ('required_checks', 100.25, 2800.25)
-    before = _snapshot(tmp_path)
+    scenario_root = scenario.kernel.storage.path.parent
+    before = (_snapshot(scenario_root), _snapshot(tmp_path))
 
     def forbidden(*_args, **_kwargs):
         raise AssertionError('A read-only query attempted Core observation or advancement')
@@ -45,4 +45,4 @@ def test_public_checks_status_reads_the_original_committed_wait(tmp_path, monkey
         assert document['operator_actions'] == []
     with scenario.kernel.storage.transaction(write=False) as tx:
         assert read_boundaries(tx, time.time())['status'] == 'waiting_checks'
-    assert _snapshot(tmp_path) == before
+    assert (_snapshot(scenario_root), _snapshot(tmp_path)) == before

@@ -364,16 +364,21 @@ def test_healthy_final_pr_and_approval_in_one_observation_share_only_the_approva
     monkeypatch.setattr(NativeNotifications, "_page", page)
     scenario = _enabled_scenario(tmp_path, monkeypatch, DeliveryKind.PARENT_ONLY, mode="detailed")
     # Read the same real PR at checks and approval from independent journals.
-    for _ in range(80):
-        step = scenario.step()
-        if scenario.kernel.status(scenario.delivery.key)["phase"] == "checks":
-            break
-        assert step.kind not in {"paused", "waiting", "approval", "complete"}
-    else:
-        raise AssertionError("Normal producer did not consume its Final PR creation")
+    from support.run_scoped_kernel import prepare_domain_history
+    with prepare_domain_history(scenario):
+        for _ in range(80):
+            step = scenario.step()
+            if scenario.kernel.status(scenario.delivery.key)["phase"] == "checks":
+                break
+            assert step.kind not in {"paused", "waiting", "approval", "complete"}
+        else:
+            raise AssertionError("Normal producer did not consume its Final PR creation")
     pr = scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref)
     assert pr is not None
     assert pr.repository == "EXAMPLE/PROJECT"
+    # Status comments and notifications both consume the same provider spelling.
+    from agent_run.queries.status_comment import project_status
+    assert project_status(scenario.kernel.storage.path, scenario.delivery.key, storage=scenario.kernel.storage).target.pr_number == pr.number
     from agent_run.queries.run import read
     for approval in (False, True):
         if approval:

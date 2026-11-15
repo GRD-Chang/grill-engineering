@@ -16,10 +16,9 @@ from support.run_scoped_kernel import domain_scenario
 from support.offline_api import SyntheticGitHub
 
 
-@pytest.mark.parametrize("repair", [False, True], ids=["first-publication", "updated-after-ci"])
-def test_ticket_squash_uses_the_complete_published_pr_not_the_latest_commit(tmp_path, monkeypatch, repair, domain_scenario):
+def test_ticket_squash_uses_the_complete_published_pr_not_the_latest_commit(tmp_path, monkeypatch, domain_scenario):
     scenario = domain_scenario(tmp_path / "ticket", DeliveryKind.TICKET,
-                        checks=("fail", "pass") if repair else ("pass",))
+                        checks=("fail", "pass"))
     original = scenario.agent
     publications = []
 
@@ -45,21 +44,31 @@ def test_ticket_squash_uses_the_complete_published_pr_not_the_latest_commit(tmp_
     assert receipt["raw"]["commit_message"] == expected + "\n"
     assert row["status"] == "confirmed" and row["attempts"] == 1
     assert scenario.port.git.run("show", "-s", "--format=%B", receipt["commit"]["sha"]).stdout == expected + "\n\n"
+    # The same journey checks both the original and CI-updated publication;
+    # each owns its raw result, canonical intent and physical Git message.
+    commits = []
     with scenario.kernel.storage.transaction(write=False) as tx:
-        attempt = tx.one("SELECT * FROM attempts WHERE subject=? AND role='publication' ORDER BY rowid DESC LIMIT 1",
-                         (scenario.delivery.key,))
-        output = tx.one("SELECT raw_id FROM invocation_outputs WHERE invocation=?", (attempt["current_invocation"],))
-        assert json.loads(tx.get(output[0], scenario.delivery.key))["commit_message"] == publication["commit_message"]
-        assert tx.get(attempt["result_id"], scenario.delivery.key) == tx.get(output[0], scenario.delivery.key)
-        effect = tx.one("SELECT * FROM effects WHERE operation='publication_commit' ORDER BY rowid DESC LIMIT 1")
-        published = json.loads(tx.get(effect["payload_id"], scenario.delivery.key))
-        canonical = f"fix: narrow patch {len(publications)}\n\nBody\r\nLast line  \r\n\r\n"
-        assert published["commit_message"] == canonical
-        assert published["title"] == publication["pr_title"]
-        commit = json.loads(tx.get(effect["receipt_id"], scenario.delivery.key))["commit"]
-    assert scenario.port.git.run("cat-file", "-p", commit["sha"]).stdout.partition("\n\n")[2] == canonical
-    assert len(publications) == (2 if repair else 1)
-    assert scenario.development_count == (2 if repair else 1)
+        scope = (scenario.execution.run_id, scenario.delivery.key)
+        attempts = tx.rows("SELECT * FROM attempts WHERE run_id=? AND subject=? AND role='publication' ORDER BY rowid", scope)
+        effects = tx.rows("SELECT * FROM effects WHERE run_id=? AND subject=? AND operation='publication_commit' ORDER BY rowid", scope)
+        assert len(attempts) == len(effects) == len(publications) == 2
+        for number, (attempt, effect, published_result) in enumerate(zip(attempts, effects, publications, strict=True), 1):
+            output = tx.one("SELECT raw_id FROM invocation_outputs WHERE run_id=? AND invocation=?",
+                            (scenario.execution.run_id, attempt["current_invocation"]))
+            raw = tx.get(output[0], scenario.delivery.key)
+            assert raw == wire_json(published_result)
+            assert tx.get(attempt["result_id"], scenario.delivery.key) == raw
+            published = json.loads(tx.get(effect["payload_id"], scenario.delivery.key))
+            canonical = f"fix: narrow patch {number}\n\nBody\r\nLast line  \r\n\r\n"
+            assert published["commit_message"] == canonical
+            assert published["title"] == published_result["pr_title"]
+            assert effect["status"] == "confirmed"
+            commit = json.loads(tx.get(effect["receipt_id"], scenario.delivery.key))["commit"]
+            commits.append((commit["sha"], canonical.encode("utf-8")))
+    for sha, canonical_bytes in commits:
+        physical = scenario.port.git.run("cat-file", "-p", sha).stdout.encode("utf-8")
+        assert physical.partition(b"\n\n")[2] == canonical_bytes
+    assert scenario.development_count == 2
 
 
 def test_wrong_squash_message_cannot_complete_or_repeat_the_original_merge(monkeypatch, ticket_before_pr):

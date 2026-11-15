@@ -298,51 +298,54 @@ def test_pending_effect_keeps_original_route_and_settlement(decision_scenario, m
         assert request.reason == ('stale_intent_retired' if state == 'stale_prepared' else 'original_outcome_retained')
 
 
-@pytest.mark.parametrize('decision_scenario', [DeliveryKind.TICKET, DeliveryKind.PARENT_ONLY], indirect=True)
-def test_pr_activity_time_does_not_revoke_current_checks(decision_scenario, monkeypatch):
+@pytest.mark.parametrize('prefix', ['ticket_before_pr', 'parent_before_push'])
+def test_pr_activity_time_does_not_revoke_current_checks(request, prefix, monkeypatch):
     from agent_run.adapters.source import normalize_required_checks
 
-    s, db = decision_scenario
-    s.checks[:] = ['none']
-    delivery, activity = s.port.delivery, ['2026-10-21T10:00:00Z']
+    # Start before the PR/checks producer so both observations differ only in
+    # activity time; the shared real prefix already supplied Development/Review.
+    s = request.getfixturevalue(prefix)
+    with _scoped(s.kernel) as (s.kernel, _db):
+        s.checks[:] = ['none']
+        delivery, activity = s.port.delivery, ['2026-10-21T10:00:00Z']
 
-    def observed(*args, **kwargs):
-        facts = delivery(*args, **kwargs)
-        if facts.checks is None:
-            return facts
-        pr = facts.pr
-        assert pr is not None
-        raw = {'number': pr.number, 'state': pr.state.lower(), 'updated_at': activity[0],
-               'head': {'sha': pr.head.sha, 'ref': pr.source_ref.removeprefix('refs/heads/'),
-                        'repo': {'full_name': pr.head_repository}},
-               'base': {'sha': pr.base.sha, 'ref': pr.target_ref.removeprefix('refs/heads/'),
-                        'repo': {'full_name': pr.repository}}}
-        checks = normalize_required_checks({'pr_before': raw, 'pr_after': raw, 'head_sha': pr.head.sha,
-            'repository': pr.repository, 'repository_default_branch': 'main', 'required_checks': [],
-            'classic_checks': [], 'classic_contexts': [], 'classic_protection_absent': False, 'rulesets': []})
-        return replace(facts, checks=checks)
+        def observed(*args, **kwargs):
+            facts = delivery(*args, **kwargs)
+            if facts.checks is None:
+                return facts
+            pr = facts.pr
+            assert pr is not None
+            raw = {'number': pr.number, 'state': pr.state.lower(), 'updated_at': activity[0],
+                   'head': {'sha': pr.head.sha, 'ref': pr.source_ref.removeprefix('refs/heads/'),
+                            'repo': {'full_name': pr.head_repository}},
+                   'base': {'sha': pr.base.sha, 'ref': pr.target_ref.removeprefix('refs/heads/'),
+                            'repo': {'full_name': pr.repository}}}
+            checks = normalize_required_checks({'pr_before': raw, 'pr_after': raw, 'head_sha': pr.head.sha,
+                'repository': pr.repository, 'repository_default_branch': 'main', 'required_checks': [],
+                'classic_checks': [], 'classic_contexts': [], 'classic_protection_absent': False, 'rulesets': []})
+            return replace(facts, checks=checks)
 
-    monkeypatch.setattr(s.port, 'delivery', observed)
-    boundary = 'merge' if s.delivery.kind == DeliveryKind.TICKET else 'approval'
-    for _ in range(100):
-        if s.kernel.status(s.delivery.key)['phase'] == boundary:
-            break
-        assert s.step().kind not in {'paused', 'waiting'}
-    else:
-        pytest.fail('Normal producer did not reach the checks authority boundary')
-    with s.kernel.storage.transaction(write=False) as tx:
-        row = tx.one('SELECT material_id FROM checks WHERE run_id=? AND id=(SELECT checks_id FROM subjects WHERE run_id=? AND id=?)',
-                     (s.execution.run_id, s.execution.run_id, s.delivery.key))
-        original = tx.get(row[0], s.delivery.key)
-    activity[0] = '2026-10-21T10:00:01Z'
-    current = s.world()
-    assert current.checks is not None and current.checks.logs != json.loads(original)['logs']
-    if boundary == 'approval':
-        assert s.kernel.control('approve', 'approve-current-checks', subject=s.delivery.key, world=current) == 'pending'
-    assert s.run().kind == 'complete'
-    assert sum(write['operation'] == 'merge' for write in s.writes()) == 1
-    with s.kernel.storage.transaction(write=False) as tx:
-        assert tx.get(row[0], s.delivery.key) == original  # Preserve the original API evidence.
+        monkeypatch.setattr(s.port, 'delivery', observed)
+        boundary = 'merge' if s.delivery.kind == DeliveryKind.TICKET else 'approval'
+        for _ in range(100):
+            if s.kernel.status(s.delivery.key)['phase'] == boundary:
+                break
+            assert s.step().kind not in {'paused', 'waiting'}
+        else:
+            pytest.fail('Normal producer did not reach the checks authority boundary')
+        with s.kernel.storage.transaction(write=False) as tx:
+            row = tx.one('SELECT material_id FROM checks WHERE run_id=? AND id=(SELECT checks_id FROM subjects WHERE run_id=? AND id=?)',
+                         (s.execution.run_id, s.execution.run_id, s.delivery.key))
+            original = tx.get(row[0], s.delivery.key)
+        activity[0] = '2026-10-21T10:00:01Z'
+        current = s.world()
+        assert current.checks is not None and current.checks.logs != json.loads(original)['logs']
+        if boundary == 'approval':
+            assert s.kernel.control('approve', 'approve-current-checks', subject=s.delivery.key, world=current) == 'pending'
+        assert s.run().kind == 'complete'
+        assert sum(write['operation'] == 'merge' for write in s.writes()) == 1
+        with s.kernel.storage.transaction(write=False) as tx:
+            assert tx.get(row[0], s.delivery.key) == original  # Preserve the original API evidence.
 
 
 @pytest.mark.parametrize('after_selection', [-0.0005, 0.0, 0.0005])

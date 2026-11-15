@@ -12,6 +12,7 @@ from agent_run.core.operation_runner import OperationRunner
 from support.offline import GraphScenario
 from support.systemd_manager import _CODEX, _control_environment, _git
 from support.core_operations import Ports, settle_agent
+from support.run_scoped_kernel import prepare_domain_history
 
 
 @pytest.fixture
@@ -72,47 +73,50 @@ def test_normal_core_final_link_is_unknown_only_after_injected_response_loss(
     state.write_text(json.dumps(document))
     reader = GhGitHubReader('example/project', working_directory=git_repo, runner_identity={'source': 'host'})
     scenario = GraphScenario(tmp_path / 'normal-producer', read_requirements(reader, 1))
-    ports = Ports(scenario)
-    original = ports.execute
-    selected = RemoteEffects(scenario.port.git.root, scenario.spec.repository,
-        runner_identity=scenario.spec.inputs.runner_identity, remote=scenario.spec.inputs.repository_remote)
-    observed = []
-    def execute(effect, authority):
-        if effect.operation != 'issue_link':
-            return original(effect, authority)
-        scenario.port.git.run('push', str(remote), effect.before_sha + ':' + effect.source_ref)
-        if effect.subject == 'final:1':
-            document = json.loads(state.read_text())
-            document['lose_operation'] = 'issue_link'
-            state.write_text(json.dumps(document))
-        result = selected.execute(effect, authority)
-        observed.append((effect, result))
-        return result
-    monkeypatch.setattr(ports, 'execute', execute)
-    runner = OperationRunner(scenario.kernel, scenario.execution, lambda binding: ports)
-    for _ in range(120):
-        step = prepare_scripted_agent(scenario.kernel, runner.run_once())
-        if step.call is not None:
-            settle_agent(scenario, runner, step.call)
-        assert step.kind not in {'paused', 'waiting'}
-        if observed and observed[-1][0].subject == 'final:1':
-            break
-    else:
-        raise AssertionError('Normal producer did not reach the Final link')
-    assert [(effect.subject, effect.payload['issue']) for effect, _ in observed] == [('ticket:2', 2), ('final:1', 1)]
-    assert observed[0][1].disposition == 'target'
-    effect, result = observed[-1]
-    assert result.disposition == 'unknown'
-    assert result.raw['write_returncode'] == 1
-    assert 'response lost after actual mutation' in result.raw['diagnostic']
-    final = scenario.kernel.status('final:1')
-    assert final['issue_link']['state'] == 'indeterminate'
-    assert final['phase'] == 'checks' and not final['gates']
-    prepare_scripted_agent(scenario.kernel, runner.run_once())
-    assert scenario.kernel.status('final:1')['phase'] == 'approval'
-    with scenario.kernel.storage.transaction(write=False) as tx:
-        row = tx.one('SELECT status,attempts FROM effects WHERE id=?', (effect.effect_id,))
-        assert tuple(row) == ('sent', 1)
-    calls = [json.loads(line) for line in (tmp_path / 'gh-calls.jsonl').read_text().splitlines()]
-    assert sum(args[1] == 'graphql' and 'POST' in args for args in calls) == 2
-    assert len(json.loads(state.read_text())['links']) == 2
+    # Core owns every transition; this contract exercises actual Git and gh
+    # responses without retesting native file admission on every transaction.
+    with prepare_domain_history(scenario):
+        ports = Ports(scenario)
+        original = ports.execute
+        selected = RemoteEffects(scenario.port.git.root, scenario.spec.repository,
+            runner_identity=scenario.spec.inputs.runner_identity, remote=scenario.spec.inputs.repository_remote)
+        observed = []
+        def execute(effect, authority):
+            if effect.operation != 'issue_link':
+                return original(effect, authority)
+            scenario.port.git.run('push', str(remote), effect.before_sha + ':' + effect.source_ref)
+            if effect.subject == 'final:1':
+                document = json.loads(state.read_text())
+                document['lose_operation'] = 'issue_link'
+                state.write_text(json.dumps(document))
+            result = selected.execute(effect, authority)
+            observed.append((effect, result))
+            return result
+        monkeypatch.setattr(ports, 'execute', execute)
+        runner = OperationRunner(scenario.kernel, scenario.execution, lambda binding: ports)
+        for _ in range(120):
+            step = prepare_scripted_agent(scenario.kernel, runner.run_once())
+            if step.call is not None:
+                settle_agent(scenario, runner, step.call)
+            assert step.kind not in {'paused', 'waiting'}
+            if observed and observed[-1][0].subject == 'final:1':
+                break
+        else:
+            raise AssertionError('Normal producer did not reach the Final link')
+        assert [(effect.subject, effect.payload['issue']) for effect, _ in observed] == [('ticket:2', 2), ('final:1', 1)]
+        assert observed[0][1].disposition == 'target'
+        effect, result = observed[-1]
+        assert result.disposition == 'unknown'
+        assert result.raw['write_returncode'] == 1
+        assert 'response lost after actual mutation' in result.raw['diagnostic']
+        final = scenario.kernel.status('final:1')
+        assert final['issue_link']['state'] == 'indeterminate'
+        assert final['phase'] == 'checks' and not final['gates']
+        prepare_scripted_agent(scenario.kernel, runner.run_once())
+        assert scenario.kernel.status('final:1')['phase'] == 'approval'
+        with scenario.kernel.storage.transaction(write=False) as tx:
+            row = tx.one('SELECT status,attempts FROM effects WHERE id=?', (effect.effect_id,))
+            assert tuple(row) == ('sent', 1)
+        calls = [json.loads(line) for line in (tmp_path / 'gh-calls.jsonl').read_text().splitlines()]
+        assert sum(args[1] == 'graphql' and 'POST' in args for args in calls) == 2
+        assert len(json.loads(state.read_text())['links']) == 2
