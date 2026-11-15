@@ -651,8 +651,7 @@ if os.environ.get('ENTRY_APPROVAL_CONTROL') and sys.argv[1:3] == ['api', 'graphq
         "v['issueId'] in {f\"issue-node-{issue['number']}\" for issue in "
         "(d['source_graph']['parent'], *d['source_graph']['issues'].values())}")
     gh = replace_once(gh, "'number':17,'state':'open'", "'number':17+len(d['prs']),'state':'open'")
-    gh = replace_once(gh, "delivery_basis(d,fields,git,repository='example/project',actor=d.get('actor','publisher'))",
-        "delivery_basis(d,fields,git,repository='example/project',actor=d.get('actor','publisher'),refresh_head=head)")
+    gh = replace_once(gh, "live_refs=True)", "live_refs=True,refresh_pr=True)")
     # The canonical gh fixture already filters exact head/base query fields.
     # Do not silently attempt to replace its retired unfiltered list branch.
     gh = replace_once(gh, "elif endpoint.startswith('repos/example/project/pulls'):\n",

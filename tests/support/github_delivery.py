@@ -3,24 +3,47 @@ from copy import deepcopy
 from functools import cache
 
 
-def delivery_basis(document, fields, git, *, repository, actor, refresh_head=None, read_ref=None):
+def delivery_basis(document, fields, git, *, repository, actor, live_refs=False, refresh_pr=False):
     repo = {'id': 'repository-' + repository, 'nameWithOwner': repository}
+
+    original = None
+    if 'pr' in fields:
+        number = int(fields['pr'])
+        matches = [pr for pr in document['prs'] if pr['number'] == number]
+        assert len(matches) <= 1
+        original = matches[0] if matches else None
+    refresh = refresh_pr and original is not None and not original['merged']
+    refs = document.get('refs', {})
+    trees = {}
+    if live_refs and (refresh or 'sourceRef' in fields or 'targetRef' in fields):
+        # A fake response samples the private remote's refs and commit trees
+        # together. The next observation reads Git again after any mutation.
+        refs = {}
+        wanted = {fields[key] for key in ('sourceRef', 'targetRef') if key in fields}
+        if refresh:
+            wanted.update('refs/heads/' + original[side]['ref'] for side in ('head', 'base'))
+        snapshot = git('for-each-ref', '--format=%(refname)%00%(objectname)%00%(tree)', '--', *sorted(wanted))
+        for row in filter(None, snapshot.split('\n')):
+            ref, sha, tree = row.split('\0')
+            refs[ref] = sha
+            if tree:
+                trees[sha] = tree
 
     @cache
     def raw_commit(sha):
         return git('cat-file', 'commit', sha)
 
     def commit(sha):
-        raw = raw_commit(sha)
-        first = raw.split('\n', 1)[0]
-        assert first.startswith('tree ')
-        return {'__typename': 'Commit', 'oid': sha, 'tree': {'oid': first[5:]}}
+        if sha not in trees:
+            first = raw_commit(sha).split('\n', 1)[0]
+            assert first.startswith('tree ')
+            trees[sha] = first[5:]
+        return {'__typename': 'Commit', 'oid': sha, 'tree': {'oid': trees[sha]}}
 
     for key, sha in fields.items():
         if not key.startswith('object'):
             continue
         repo[key] = commit(sha)
-    resolve_ref = read_ref if read_ref is not None else document.get('refs', {}).get
     for key in ('sourceRef', 'targetRef'):
         if key not in fields:
             continue
@@ -28,20 +51,16 @@ def delivery_basis(document, fields, git, *, repository, actor, refresh_head=Non
         assert ref.startswith('refs/')
         namespace, separator, name = ref[5:].partition('/')
         assert namespace and separator and name
-        sha = resolve_ref(ref)
+        sha = refs.get(ref)
         repo[key] = None if sha is None else {
             'name': name, 'prefix': 'refs/' + namespace + '/',
             'repository': {'nameWithOwner': repository}, 'target': commit(sha)}
     if 'pr' in fields:
-        number = int(fields['pr'])
-        matches = [pr for pr in document['prs'] if pr['number'] == number]
-        assert len(matches) <= 1
         value = None
-        if matches:
-            original = matches[0]
-            if refresh_head is not None and not original['merged']:
+        if original is not None:
+            if refresh:
                 for side in ('head', 'base'):
-                    sha = refresh_head('refs/heads/' + original[side]['ref'])
+                    sha = refs.get('refs/heads/' + original[side]['ref'])
                     if sha:
                         original[side]['sha'] = sha
             pr = deepcopy(original)

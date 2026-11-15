@@ -88,12 +88,7 @@ def test_incomplete_observations_never_trigger_capacity_fallback(tmp_path, monke
         if fault in {'partial', 'null'}:
             data['graphql_errors'] = [{'message': 'Controlled incomplete observation'}]
         if fault.startswith('null'):
-            program = tmp_path / 'bin/gh'
-            marker = "    print(json.dumps(result))\nelif args[:1]==['api'] and '/commits/'"
-            text = program.read_text()
-            assert marker in text
-            assignment = "    result['data']=None\n" if fault == 'null-data' else "    result['data']['repository']=None\n"
-            program.write_text(text.replace(marker, assignment + marker, 1))
+            data['graphql_data'] = None if fault == 'null-data' else {'repository': None}
     state.write_text(json.dumps(data))
     with pytest.raises(GitHubReadError) as caught:
         read_requirements(reader, 1)

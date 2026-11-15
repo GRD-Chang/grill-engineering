@@ -195,10 +195,7 @@ elif endpoint=='graphql' and method=='GET':
         fields['pr']=fields['number']
     if 'DeliveryBasis' in fields.get('query','') or 'StatusCommentObservation' in fields.get('query',''):
         from support.github_delivery import delivery_basis
-        from functools import partial
-        # Keep the Local fixture's exact refresh_head extension anchor below.
-        delivery_basis=partial(delivery_basis,read_ref=head)
-        result=delivery_basis(d,fields,git,repository='example/project',actor=d.get('actor','publisher'))
+        result=delivery_basis(d,fields,git,repository='example/project',actor=d.get('actor','publisher'),live_refs=True)
         if 'StatusCommentObservation' in fields['query']:
             from support.github_comments import status_comment_pages
             assert '--paginate' in args and '--slurp' in args
@@ -412,6 +409,7 @@ elif args[:2]==['api','graphql']:
             repository=control['repository'],actor=control.get('actor','actual-publisher'))['data']
         result['data']['delivery']=delivery_data['repository']
         if 'viewer' in delivery_data:result['data']['viewer']=delivery_data['viewer']
+    if 'graphql_data' in control: result['data']=control['graphql_data']
     if 'graphql_errors' in control: result['errors']=control['graphql_errors']
     print(json.dumps(result))
 else:

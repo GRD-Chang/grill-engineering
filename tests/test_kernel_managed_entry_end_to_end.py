@@ -74,7 +74,7 @@ if '--hostname' in sys.argv:
     del sys.argv[position:position + 2]
 '''
     _executable(binary / "gh", gh + FAKE_GH.replace(
-        "d['issue_state']=body['state'];", "d['source_graph']['issues']['2']['state']=body['state'].upper();d['issue_state']=body['state'];"))
+        "d['issue_state']=body['state'];", "d['source_graph']['issues']['2']['state']=body['state'].upper();d['issue_state']=body['state'];"), no_site=True)
     # Real failed Review and repair precede the original unknown-merge recovery.
     classification = """schema = json.loads(Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text())
 role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commit_message' in schema['properties'] else 'development'

@@ -127,3 +127,17 @@ def test_fake_pr_get_still_persists_fresh_live_heads(git_repo, tmp_path, monkeyp
     assert json.loads(response.stdout)['head']['sha'] == later.sha
     stored, = json.loads(state.read_text())['prs']
     assert stored['head']['sha'] == later.sha and stored['base']['sha'] == base.sha
+
+    # The next GraphQL response must sample new refs together, even when its
+    # explicit object has since lost the last ref pointing at it.
+    git.run('push', '--force', remote, base.sha + ':refs/heads/candidate')
+    git.run('--git-dir', remote, 'pack-refs', '--all')
+    response = subprocess.run([executable, 'api', 'graphql', '-f', 'query=DeliveryBasis',
+        '-F', 'pr=17', '-f', 'sourceRef=refs/heads/candidate', '-f', 'targetRef=refs/heads/missing',
+        '-f', 'object0=' + later.sha], cwd=git_repo, env=environment, text=True, capture_output=True, timeout=5)
+    assert response.returncode == 0, response.stderr
+    repo = json.loads(response.stdout)['data']['repository']
+    assert repo['pullRequest']['headRefOid'] == repo['sourceRef']['target']['oid'] == base.sha
+    assert repo['sourceRef']['target']['tree']['oid'] == base.tree
+    assert repo['targetRef'] is None
+    assert repo['object0'] == {'__typename': 'Commit', 'oid': later.sha, 'tree': {'oid': later.tree}}
