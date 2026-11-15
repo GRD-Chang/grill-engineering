@@ -7,7 +7,7 @@ import pytest
 from support.core_operations import CoreOperations, scripted_return
 
 
-def test_managed_final_requeue_reaccepts_current_run_without_a_repair_pr_or_budget_refund(
+def test_managed_final_requeue_reaccepts_current_run_without_extra_repair_or_budget_refund(
     monkeypatch: pytest.MonkeyPatch, managed_completed_ticket,
 ) -> None:
     scenario, request = managed_completed_ticket

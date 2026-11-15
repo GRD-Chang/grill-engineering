@@ -270,6 +270,7 @@ class World:
     ancestry: tuple[tuple[str, str], ...] = ()
     publisher_actor: str | None = None
     publisher_identity: Mapping[str, Any] | None = None
+    repair: World | None = None
 
 
 @dataclass(frozen=True)

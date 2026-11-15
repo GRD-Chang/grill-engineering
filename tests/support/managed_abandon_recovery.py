@@ -108,7 +108,22 @@ def abandon_at_approval(public, kernel, accepted, state, original_main, deadline
     run_head = _git(remote, "rev-parse", delivery.source_ref)
     before, original_writes = _remote_snapshot(state, deadline)
     assert before["source_graph"]["issues"]["2"]["state"] == "CLOSED"
-    assert len(before["prs"]) == 2
+    final_status = kernel.status(final)
+    repair_records = final_status["repair_history"]
+    expected_prs = {row["pr_number"] for row in completions} | {final_status["pr_number"]}
+    expected_prs.update(row["pr_number"] for row in repair_records)
+    assert len(before["prs"]) == len(expected_prs)
+    assert {pr["number"] for pr in before["prs"]} == expected_prs
+    preserved_repairs = []
+    for record in repair_records:
+        repair_pr, = [pr for pr in before["prs"] if pr["number"] == record["pr_number"]]
+        assert record["state"] == "merged" and repair_pr["merged"] and repair_pr["state"] == "closed"
+        assert "refs/heads/" + repair_pr["base"]["ref"] == record["target_ref"] == delivery.source_ref
+        assert "refs/heads/" + repair_pr["head"]["ref"] == record["source_ref"]
+        assert repair_pr["head"]["sha"] == record["integrated_sha"] == record["published_sha"]
+        assert repair_pr["merge_commit_sha"] == record["merge_sha"]
+        _git(remote, "merge-base", "--is-ancestor", record["merge_sha"], run_head)
+        preserved_repairs.append(repair_pr)
     ticket_pr = next(pr for pr in before["prs"] if pr["number"] == completions[0]["pr_number"])
     final_pr = next(pr for pr in before["prs"] if pr["number"] == kernel.status(final)["pr_number"])
     assert ticket_pr["merged"] and not final_pr["merged"] and final_pr["state"] == "open"
@@ -131,6 +146,13 @@ def abandon_at_approval(public, kernel, accepted, state, original_main, deadline
     projection = project_status(kernel.storage.path, 'ticket:2', storage=kernel.storage)
     journal = read_notifications(kernel.storage.path.parent, accepted['run_id'])
     assert_completed_pr_preserved(before, document, original_writes, current_writes, projection, journal)
+    assert kernel.status(final)["repair_history"] == repair_records
+    assert kernel.status(final)["budgets"] == final_status["budgets"]
+    for repair_pr in preserved_repairs:
+        assert next(pr for pr in document["prs"] if pr["number"] == repair_pr["number"]) == repair_pr
+        forbidden = {f"repos/example/project/{kind}/{repair_pr['number']}" for kind in ("issues", "pulls")}
+        forbidden.add(f"repos/example/project/pulls/{repair_pr['number']}/merge")
+        assert not any(row[1].split("?", 1)[0] in forbidden for row in current_writes[len(original_writes):])
     retired = next(pr for pr in document["prs"] if pr["number"] == final_pr["number"])
     assert retired["state"] == "closed" and not retired["merged"]
     assert _git(remote, "rev-parse", "refs/heads/main") == original_main

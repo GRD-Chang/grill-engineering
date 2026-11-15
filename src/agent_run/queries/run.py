@@ -169,11 +169,20 @@ def _subject(tx: Transaction, run: Mapping[str, Any], job: dict[str, Any], bound
         check["evidence"] = _material(tx, check["material_id"], subject)
         checks = check
     title = _rows(tx, 'SELECT title FROM requirement_versions WHERE run_id=? AND issue=? AND revision=?', (job['issue'], job['revision']))
+    repairs = _all(tx, 'SELECT * FROM run_repairs WHERE run_id=? AND subject=? ORDER BY sequence', (subject,))
+    for repair in repairs:
+        repair["required_checks"] = None
+        if repair["checks_id"]:
+            repair["required_checks"] = _material(tx,
+                _one(tx, 'SELECT material_id FROM checks WHERE run_id=? AND id=? AND subject=?',
+                     (repair['checks_id'], subject))[0], subject)
     return {"subject": subject, "kind": job["kind"], "issue": job["issue"],
             "title": title[0][0] if title else None, "phase": job["phase"], "purpose": job["purpose"],
             "generation": job["generation"], "revision": job["revision"],
             "candidate_sha": job["candidate_sha"], "publication_sha": job["publication_sha"],
             "integrated_sha": job["integrated_sha"], "pr_number": job["pr_number"],
+            "repair_pr": next((repair for repair in repairs if repair["state"] == "open"), None),
+            "repair_history": repairs,
             "ci_evidence": _material(tx, job["ci_failure"], subject),
             "gates": boundary["gates"], "budgets": budgets, "pending_attempt": pending, "review": review, "review_state": recorded_review(tx, run, job), "required_checks": checks,
             "integration_resync": _resync(tx, subject), "effect_failures": _effect_failures(tx, subject),

@@ -8,11 +8,11 @@ status: accepted
 [#419](https://github.com/GRD-Chang/grill-engineer/issues/419)：代码确定任务与业务后继，
 Agent 自主完成当前开发、审核或发布文案工作。调度、业务推进、物理执行是不同职责；
 不新增通用工作流引擎、第四个管理 Agent 或第二套持久状态机。
-以下映射更新为当前单 Core / native v21 实现，不要求恢复历史 Engine API 或旧数据。
+以下映射更新为当前单 Core / repository v23 实现，不要求恢复历史 Engine API 或旧数据。
 
 后续已确认的 [ADR 0031](0031-parent-repair-pr-and-repository-ci.md) 恢复完整 Parent 的修复 PR，
-并将仓库 CI 去重与通用 Runner 分开。修复 PR 路径尚未实施；本文下述当前实现映射继续如实记录
-直接更新 Run Branch 的现状，不能据此否定新的目标路径或声称恢复已经完成。
+并将仓库 CI 去重与通用 Runner 分开。当前实现复用同一 Core、Parent subject 与 Effect 对账，
+在独立候选验收后通过修复 PR 的目标检查和普通合入更新 Run Branch，不恢复旧 Engine 或另一套预算。
 
 ## 当前实现与事实归属
 
@@ -33,8 +33,8 @@ Ticket、Parent-only 从开发进入；多 Ticket Parent 在全部真实 Complet
 Completion。集成 Git 问题和集成 Findings 调用集成 Development 后返回集成检查；
 当前 PR/head 的 CI 失败回当前交付对象的开发工作。Ticket 集成不新增 Review，
 其初始末轮豁免、CI 可选审核保持；两种 Parent 保留完整验收责任与最终人工批准。
-完整 Parent 修复直接更新 Run Branch / 最终 PR，不恢复内部 Repair PR 生命周期，
-其取舍见 [ADR 0025](0025-parent-repair-without-internal-pr.md)。
+完整 Parent 修复经候选验收、修复 PR 检查及普通合入进入 Run Branch，再推进最终 PR，
+其取舍见 [ADR 0031](0031-parent-repair-pr-and-repository-ci.md)；[ADR 0025](0025-parent-repair-without-internal-pr.md) 保留旧路径的历史决定。
 
 业务进度和暂停分别保存：`subjects.phase/purpose/generation/current_attempt` 表达当前工作，
 `gates`、Run 级 stopped/blocked 表达阻止条件。`attempts.result_id` 关联已保存角色产物，

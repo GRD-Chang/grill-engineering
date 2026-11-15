@@ -30,7 +30,9 @@ flowchart TD
 
 Ticket、Parent-only 和完整 Parent 的 Final 交付共用一个 Core。
 开发、独立审核、修复、集成、CI、发布及批准按各自交付对象推进；
-完整 Parent 的修复直接更新 Run Branch，仅最终 Run PR 承担最终发布和人工批准。
+完整 Parent 的修复在候选独立验收后，以 Run Repair PR 取得 Run Branch 的检查并由程序自动普通合入；
+最终 Run PR 另行读取默认分支检查，保留明确人工批准。修复 PR 关系与写入意图归属原 Parent，
+不新增 Agent 角色、开发审核预算或第二套编排器。
 本页的架构归属说明不改变业务流程、角色合同或批准条件。
 从准备 Parent 到一条命令推进、人工批准和收尾的操作路径见
 [运行说明](agent-run.md#一条命令推进-ticket-交付)。
@@ -69,7 +71,7 @@ Requirements 在有序写入准入后先核对期限，再接受来源变化；D
 
 ## 状态与证据
 
-本开发候选的唯一状态协议是 **`independent-delivery-repository-v22`**；
+本开发候选的唯一状态协议是 **`independent-delivery-repository-v23`**；
 尚待同版独立验收，不表示已经部署或验证真实 Host。
 每个受管仓库使用 `repositories/<owner>/<repo>/state/kernel.sqlite3`。
 Task 可先独立持久化为 idle；完整冻结的 Run、必要关系/材料及 `Task.current_run`

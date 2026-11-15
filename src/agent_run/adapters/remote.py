@@ -272,6 +272,8 @@ class RemoteEffects:
         def check_prior() -> None:
             fresh = self._reconcile(effect)
             if fresh.disposition != "prior" or not self._same_pr_boundary(observed, fresh):
+                if effect.payload.get("repair_id"):
+                    raise GitHubReadError("github_observation_pending", "Repair boundary changed before the write was admitted")
                 raise KernelError("pr_boundary_changed" if operation == "pr_write" else "operation_boundary_changed")
 
         if operation in {"push", "run_branch"}:
@@ -697,6 +699,8 @@ class RemoteEffects:
         from agent_run.core.operation_contract import PreparedRequirements
         if type(parent_number) is not int or parent_number < 1:
             raise ValueError('Parent Issue number must be a positive integer')
+        if query is not None:
+            self._validate_delivery_read(query)
         reader = GhGitHubReader(self.repository, working_directory=self.root, runner_identity=self.identity,
                                 cancelled=self.cancelled)
         projection = None
@@ -753,10 +757,7 @@ class RemoteEffects:
         stage = prepared.physical
         if not isinstance(stage, _SourceBasis) or stage.owner is not self:
             raise ValueError('Foreign Source observation')
-        from agent_run.core.operation_contract import ReadUnavailable, requested_ancestry
-        if type(query.read_checks) is not bool or not query.read_checks and query.check_head is not None:
-            raise ReadUnavailable("checks_request_invalid", "An exact checks head requires a checks observation")
-        requested_ancestry(query, None)
+        self._validate_delivery_read(query)
         observation = stage.observation
         if self.api is not None:
             return self.delivery(query)
@@ -1024,10 +1025,7 @@ class RemoteEffects:
     @_operation_errors
     def delivery(self, request: DeliveryRead) -> DeliveryFacts:
         """Read exact Core-supplied refs and immutable ancestry anchors."""
-        from agent_run.core.operation_contract import ReadUnavailable, requested_ancestry
-        if type(request.read_checks) is not bool or not request.read_checks and request.check_head is not None:
-            raise ReadUnavailable("checks_request_invalid", "An exact checks head requires a checks observation")
-        requested_ancestry(request, None)  # Validate literal demand before I/O.
+        self._validate_delivery_read(request)
         source_sha, target_sha = read_remote_heads(self.root, request.source_ref, request.target_ref,
                                                   runner_identity=self.identity, remote=self.remote)
         basis: dict[str, Commit] = {}
@@ -1043,6 +1041,19 @@ class RemoteEffects:
             # PhysicalAPI's existing injected REST interface has no GraphQL port.
             raw_pr = self._find_pr(request.source_ref, request.target_ref, request.pr_number) if request.read_pr else None
         return self._finish_delivery(request, (source_sha, target_sha), basis, raw_pr, actor)
+
+    @staticmethod
+    def _validate_delivery_read(request: DeliveryRead) -> None:
+        """Reject unbounded or unrelated repair demand before physical reads."""
+        from agent_run.core.operation_contract import DeliveryRead, ReadUnavailable, requested_ancestry
+        repair = request.repair
+        if repair is not None and (not isinstance(repair, DeliveryRead) or repair.repair is not None
+                                   or repair.target_ref != request.source_ref):
+            raise ReadUnavailable("repair_request_invalid", "Repair must target the Run source and cannot contain another repair")
+        for query in (request,) if repair is None else (request, repair):
+            if type(query.read_checks) is not bool or not query.read_checks and query.check_head is not None:
+                raise ReadUnavailable("checks_request_invalid", "An exact checks head requires a checks observation")
+            requested_ancestry(query, None)
 
     def _finish_delivery(self, request: DeliveryRead, refs: tuple[str | None, str | None],
                          basis: Mapping[str, Commit], raw_pr: Mapping[str, Any] | None,
@@ -1104,11 +1115,15 @@ class RemoteEffects:
                 checks = normalize_required_checks(read_required_check_facts(
                     reader, pr.number, expected_head_sha=request.check_head or source.sha))
         actor = self.actor() if actor is None else actor
+        repair = None if request.repair is None else self.delivery(request.repair)
+        if repair is not None and (repair.target != source or repair.publisher_actor != actor
+                                   or repair.publisher_identity != self.identity):
+            raise GitHubReadError("github_observation_pending", "Repair and Run observations have not converged")
         if read_remote_heads(self.root, request.source_ref, request.target_ref,
                 runner_identity=self.identity, remote=self.remote) != (source_sha, target_sha):
             raise GitHubReadError("github_observation_pending", "Remote refs changed during delivery observation")
         return DeliveryFacts(target, source, pr, checks, ancestry, actor, dict(self.identity), checked,
-                             request.read_checks)
+                             request.read_checks, repair)
 
     @_operation_errors
     def inspect(self, resources: tuple[ResourceWitness, ...]) -> tuple[ResourceInspection, ...]:
@@ -1305,6 +1320,8 @@ class RemoteEffects:
         pr = self._pr(data)
         if pr.actor is None or pr.head_repository is None:
             return EffectResult("unknown", pr=pr, raw={"diagnostic": "PR identity is not observable"})
+        if effect.operation == "merge" and effect.payload.get("repair_id") and pr.state == "OPEN":
+            return self._repair_merge_prior(effect, pr)
         same = (pr.repository.casefold() == self.repository.casefold() and pr.head_repository is not None
                 and pr.head_repository.casefold() == self.repository.casefold()
                 and pr.source_ref == effect.source_ref and pr.target_ref == effect.target_ref
@@ -1349,6 +1366,31 @@ class RemoteEffects:
             return EffectResult("third", pr=pr)
         return EffectResult("prior" if self._pr_target(effect, pr, source, target) == effect.base
                             and source == effect.after_sha and target == effect.before_sha else "third", pr=pr)
+
+    def _repair_merge_prior(self, effect: Effect, pr: PullRequest) -> EffectResult:
+        """Prove absence of the original ordinary merge before changing its intent.
+
+        An OPEN snapshot alone is insufficient: the live append-only target
+        must still exclude the original candidate, which every successful
+        ordinary merge would have retained as an ancestor.
+        """
+        source, target = self._remote_heads(effect.source_ref, effect.target_ref)
+        identity = (pr.actor == effect.actor and pr.number == effect.pr_number
+                    and pr.repository.casefold() == self.repository.casefold()
+                    and pr.head_repository is not None and pr.head_repository.casefold() == self.repository.casefold()
+                    and pr.source_ref == effect.source_ref and pr.target_ref == effect.target_ref)
+        if not identity or source is None or target is None or effect.after_sha is None:
+            return EffectResult("third", pr=pr)
+        if (self._pr_target(effect, pr, source, target) is None
+                or not self._ancestor(effect.before_sha, target) or not self._ancestor(effect.after_sha, source)):
+            return EffectResult("third", pr=pr)
+        if self._ancestor(effect.after_sha, target):
+            return EffectResult("unknown", pr=pr, raw={"diagnostic": "Candidate is already contained; original merge outcome is not observable"})
+        if self._remote_heads(effect.source_ref, effect.target_ref) != (source, target):
+            return EffectResult("unknown", pr=pr)
+        return EffectResult("prior", pr=pr, raw={"merge_not_applied": {
+            "before_sha": effect.before_sha, "after_sha": effect.after_sha,
+            "source_sha": source, "target_sha": target, "pr_number": pr.number}})
 
     def _current_pr_edit(self, effect: Effect, observed: EffectResult) -> EffectResult:
         """An original unchanged edit requires live anchors before and after authorization."""

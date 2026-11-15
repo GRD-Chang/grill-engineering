@@ -44,7 +44,7 @@ Skill 例外、明确需求链接及修复风险审查例外。领域定义见 [
 角色正文与公开 `prompts preview`、实际运行共用 `core/prompts/role.py` 的同一组装入口；
 输出 schema 另列，来自后端实际使用的 `role_schema`，不复制进角色正文。`--json` 预览结果分别包含 `prompt` 和 `schema`。
 安装器兼容性检查和文案握手只读展示各自的真实文案与 schema，不执行探针。
-目录只保留当前合法组合：CI 免审仅适用于 Ticket；不展示内部 Repair PR、Ticket 集成 Review 或完整 Parent 的初次整体 Development。
+目录只保留当前合法组合：CI 免审仅适用于 Ticket；不展示额外的修复 PR Agent 角色、Ticket 集成 Review 或完整 Parent 的初次整体 Development。Run Repair PR 的发布、检查与自动合入属于程序职责，候选仍由原 Parent 的独立 Reviewer 验收；修复 PR 不产生另一份审核或开发预算。
 发布示例包括 `publication-update`、`parent-publication-update`、`final-publication-update`：
 展示实际组装器消费的完整 PR 范围、本次发布提交内容范围及已有 PR 原文，全部明确标为示例。
 实际安装探针读取候选安装包自己的文案；展示脚本使用当前源码。必需资源缺失时明确报错，避免复制正文后漂移。它不启动 Codex、不访问 GitHub、不读取真实运行状态，

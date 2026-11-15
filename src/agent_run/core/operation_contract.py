@@ -41,6 +41,9 @@ class DeliveryRead:
     ancestry_pairs: tuple[tuple[str, str], ...] | None = None
     # False omits only Required Checks, never PR/ref identity observation.
     read_checks: bool = True
+    # A complete Parent may also observe one repair PR targeting its Run source.
+    # The primary delivery remains Run -> default; nested repairs are invalid.
+    repair: DeliveryRead | None = None
 
 @dataclass(frozen=True)
 class PreparedRequirements:
@@ -63,6 +66,7 @@ class DeliveryFacts:
     # False means not requested. With an observed PR, True + no open PR is
     # inapplicable; True + open PR + checks=None is unknown, never a pass.
     checks_requested: bool = True
+    repair: DeliveryFacts | None = None
 
 
 def requested_ancestry(request: DeliveryRead, source: Commit | None,

@@ -37,7 +37,10 @@ _COPY = {
            "worker_exit_wait": "原 Worker 退出尚未确认", "supervision": "外部事实监督",
            "github_convergence": "GitHub 事实收敛", "required_checks": "必要检查",
            "remaining": "剩余秒数", "retry_count": "已记录重试", "deadline": "截止时间",
-           "timeout_resume": "超时后的恢复命令"},
+           "timeout_resume": "超时后的恢复命令", "repair_pr": "Run 修复 PR", "repair_branch": "Run 修复分支",
+           "repair_open": "尚未合入 Run", "repair_merged": "已合入 Run", "repair_checks": "修复 PR 检查",
+           "checks_none": "无强制检查；未声称 CI 已运行", "checks_pass": "通过", "checks_fail": "未通过",
+           "checks_pending": "等待结果", "checks_unknown": "结果未知"},
     "en": {"run": "Delivery Run", "status": "Status", "phase": "Phase", "subject": "Work subject", "unknown": "Not recorded",
            "next": "Next action", "model": "Model", "effort": "Reasoning effort", "history": "Work history", "budget": "Cumulative usage",
            "findings": "Current findings", "evidence": "Evidence", "duration": "Task elapsed seconds", "agent": "Agent",
@@ -58,13 +61,19 @@ _COPY = {
            "worker_exit_wait": "Worker exit not yet confirmed", "supervision": "External fact supervision",
            "github_convergence": "GitHub convergence", "required_checks": "Required checks",
            "remaining": "Seconds remaining", "retry_count": "Recorded retries", "deadline": "Deadline",
-           "timeout_resume": "Resume command after timeout"},
+           "timeout_resume": "Resume command after timeout", "repair_pr": "Run Repair PR", "repair_branch": "Run repair branch",
+           "repair_open": "Not merged into Run", "repair_merged": "Merged into Run", "repair_checks": "Repair PR checks",
+           "checks_none": "No required checks; CI execution is not asserted", "checks_pass": "Passed", "checks_fail": "Failed",
+           "checks_pending": "Pending", "checks_unknown": "Unknown"},
 }
 
 _TERMS = {
     "zh": {"development": "开发", "developing": "开发", "review": "验收", "reviewing": "验收", "publish": "准备发布文案",
            "publication_pending": "准备发布文案", "candidate": "保存候选", "integration": "集成检查", "workspace": "准备工作区",
            "ready_publication": "准备发布", "publication_commit": "保存发布提交", "push": "推送发布成果", "pr_write": "创建或更新 PR",
+           "repair_push": "发布修复分支", "repair_pr": "创建或更新修复 PR", "repair_checks": "等待修复 PR 检查", "repair_merge": "合入修复 PR",
+           "repair_prepared": "修复候选已准备", "repair_checks_observed": "修复 PR 检查已观察", "repair_merged": "修复 PR 已合入 Run",
+           "repair_pr_identity_changed": "修复 PR 身份发生变化",
            "checks": "等待必需检查", "waiting_checks": "等待必需检查", "approval": "等待最终批准", "merge": "合并", "merging": "合并",
            "completion_comment": "记录完成说明", "close": "Issue 收尾", "closing": "Issue 收尾", "complete": "业务已完成", "completed": "业务已完成",
            "parallel": "多个对象并行", "requirements": "需求实现", "ci": "CI 修复", "abandoned": "已放弃", "abandonment_pending": "正在放弃",
@@ -86,6 +95,9 @@ _TERMS = {
     "en": {"development": "Development", "developing": "Development", "review": "Review", "reviewing": "Review", "publish": "Publication narrative",
            "publication_pending": "Publication narrative", "candidate": "Saving candidate", "integration": "Integration checks", "workspace": "Preparing checkout",
            "ready_publication": "Preparing publication", "publication_commit": "Saving publication commit", "push": "Publishing branch", "pr_write": "Creating or updating PR",
+           "repair_push": "Publishing repair branch", "repair_pr": "Creating or updating Repair PR", "repair_checks": "Waiting for Repair PR checks", "repair_merge": "Merging Repair PR",
+           "repair_prepared": "Repair candidate prepared", "repair_checks_observed": "Repair PR checks observed", "repair_merged": "Repair PR merged into Run",
+           "repair_pr_identity_changed": "Repair PR identity changed",
            "checks": "Waiting for required checks", "waiting_checks": "Waiting for required checks", "approval": "Waiting for final approval", "merge": "Merging", "merging": "Merging",
            "completion_comment": "Recording completion", "close": "Closing Issue", "closing": "Closing Issue", "complete": "Business completed", "completed": "Business completed",
            "parallel": "Concurrent work subjects", "requirements": "Requirements", "ci": "CI repair", "abandoned": "Abandoned", "abandonment_pending": "Abandonment pending",
@@ -292,7 +304,7 @@ def _history_lines(document: QueryDocument, details: bool) -> Iterator[str]:
     shown: set[str] = set()
     milestones = {"final_activated", "paused", "human_response", "control_applied", "checks_observed", "ci_failed",
                   "effect_consumed", "generation_requeued", "budget_renewed", "resource_retired", "cleanup_pending",
-                  "boundary_update", "acceptance_promoted"}
+                  "boundary_update", "acceptance_promoted", "repair_prepared", "repair_checks_observed", "repair_merged"}
     round_events = {"agent_allocated", "agent_dispatched", "worker_started", "worker_active", "worker_exited", "raw_returned",
                     "role_consumed", "output_repair_allocated"}
     for event in history["events"]:
@@ -421,6 +433,15 @@ def _lines(document: QueryDocument, details: bool) -> Iterator[str]:
         yield f"{copy['next']}: {next_action or copy['complete']}"
     for job in data["subjects"]:
         yield f"{copy['subject']}: #{job['issue']} {job['title'] or ''} — {terms.get(job['phase'], job['phase'])} ({terms.get(job['purpose'], job['purpose'])})"
+        repairs = job.get("repair_history", [])
+        displayed_repairs = repairs if details else repairs[-1:]
+        for repair in displayed_repairs:
+            label = f"{copy['repair_pr']} #{repair['pr_number']}" if repair['pr_number'] else copy['repair_branch']
+            yield f"  {label}: {repair['source_ref'].removeprefix('refs/heads/')} → {repair['target_ref'].removeprefix('refs/heads/')} | {copy['repair_' + repair['state']]}"
+            checks = repair.get("required_checks")
+            if checks:
+                result = copy["checks_" + checks["result"]]
+                yield f"  {copy['repair_checks']}: {result} | {checks['head_sha']}"
         pending = job["pending_attempt"]
         if pending:
             label = ("触发待办的 Agent" if document.language == "zh" else "Agent that triggered this boundary") if job["gates"] else copy["agent"]

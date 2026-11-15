@@ -67,7 +67,7 @@ def test_single_public_schema_idle_task_and_exact_run_owner(managed):
     route.initialize()
     task = TaskKey(managed.repository_root, managed.repository, 1)
     route.idle(task)
-    assert require_supported_state(route.database) == PROTOCOL == 'independent-delivery-repository-v22'
+    assert require_supported_state(route.database) == PROTOCOL == 'independent-delivery-repository-v23'
     assert not hasattr(routing, 'REPOSITORY_PUBLIC_READY')
     before = dump(route.database)
     assert route.task(task).current_run is None

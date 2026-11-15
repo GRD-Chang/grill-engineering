@@ -368,10 +368,10 @@ def public_status(run: Mapping[str, Any], subjects: list[dict[str, Any]], termin
     if not current and subjects and all(job["kind"] == "ticket" for job in subjects):
         return "run_acceptance_pending"
     wait_kinds = {window["kind"] for window in supervision_windows if any(
-        job["phase"] in {"checks", "merge"} and job["subject"] == window["subject"] for job in current)}
+        job["phase"] in {"checks", "merge", "repair_checks", "repair_merge"} and job["subject"] == window["subject"] for job in current)}
     if "github_convergence" in wait_kinds:
         return "waiting_external"
-    if "required_checks" in wait_kinds or any(job["phase"] == "checks" for job in current):
+    if "required_checks" in wait_kinds or any(job["phase"] in {"checks", "repair_checks"} for job in current):
         return "waiting_checks"
     if len(current) == 1:
         job = current[0]

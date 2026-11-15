@@ -1,7 +1,7 @@
 """One Run-owned relational schema per managed repository, no migration reader."""
 from functools import lru_cache
 
-PROTOCOL = "independent-delivery-repository-v22"
+PROTOCOL = "independent-delivery-repository-v23"
 
 REPOSITORY_RUN_SCHEMA = """
 CREATE TABLE meta (protocol TEXT NOT NULL);
@@ -91,6 +91,38 @@ CREATE TABLE subjects (
  FOREIGN KEY(run_id,ci_failure) REFERENCES material(run_id,id) DEFERRABLE INITIALLY DEFERRED,
  FOREIGN KEY(run_id,last_failure) REFERENCES material(run_id,id) DEFERRABLE INITIALLY DEFERRED
 );
+CREATE TABLE run_repairs (
+ run_id TEXT NOT NULL,
+ id TEXT NOT NULL,
+ subject TEXT NOT NULL,
+ sequence INTEGER NOT NULL,
+ generation INTEGER NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('open','merged')),
+ source_ref TEXT NOT NULL,
+ target_ref TEXT NOT NULL,
+ run_sha TEXT NOT NULL,
+ default_sha TEXT NOT NULL,
+ candidate_sha TEXT NOT NULL,
+ candidate_tree TEXT NOT NULL,
+ integrated_sha TEXT NOT NULL,
+ integrated_tree TEXT NOT NULL,
+ expected_tree TEXT NOT NULL,
+ review_attempt TEXT NOT NULL,
+ revision TEXT NOT NULL,
+ parent_revision TEXT NOT NULL,
+ graph_revision TEXT NOT NULL,
+ completion_revision TEXT NOT NULL,
+ published_sha TEXT,
+ pr_number INTEGER,
+ checks_id TEXT,
+ merge_sha TEXT,
+ PRIMARY KEY(run_id,id),
+ UNIQUE(run_id,subject,sequence),
+ FOREIGN KEY(run_id,subject) REFERENCES subjects(run_id,id),
+ FOREIGN KEY(run_id,review_attempt) REFERENCES attempts(run_id,id),
+ FOREIGN KEY(run_id,checks_id) REFERENCES checks(run_id,id)
+);
+CREATE UNIQUE INDEX current_run_repair ON run_repairs(run_id,subject) WHERE state='open';
 CREATE TABLE dependencies (
  run_id TEXT NOT NULL,
  subject TEXT NOT NULL,

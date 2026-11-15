@@ -1177,17 +1177,30 @@ def _request_final_revision(public, kernel, accepted, state, message):
     return old_pr
 
 
-def _assert_revised_publication(tmp_path, state, old_pr, message):
+def _assert_revised_publication(tmp_path, state, old_pr, message, kernel):
     """Check the original message in the repaired checkout, Worker calls and updated PR."""
     publication = next(Path(tmp_path / "user").glob("**/run-publication/revision-evidence.txt"))
     assert json.loads(publication.read_text()) == message
     updated = next(pr for pr in json.loads(state.read_text())["prs"] if pr["number"] == old_pr["number"])
     assert updated["head"]["sha"] != old_pr["head"]["sha"] and not updated["merged"]
-    assert len(json.loads(state.read_text())["prs"]) == 2  # Original Ticket and original Final PR.
+    prs = json.loads(state.read_text())["prs"]
+    assert len(prs) == 3  # Original Ticket, checked Repair, and original Final PR.
+    final = kernel.status(kernel.source_status()["final_subject"])
+    repair_record, = final["repair_history"]
+    repair_pr, = [pr for pr in prs if pr["number"] == repair_record["pr_number"]]
+    delivery = kernel.delivery(final["subject"])
+    assert repair_record["state"] == "merged" and repair_pr["merged"] and repair_pr["state"] == "closed"
+    assert "refs/heads/" + repair_pr["base"]["ref"] == repair_record["target_ref"] == delivery.source_ref
+    assert "refs/heads/" + repair_pr["head"]["ref"] == repair_record["source_ref"]
+    assert repair_pr["head"]["sha"] == repair_record["published_sha"] == repair_record["integrated_sha"]
+    assert repair_pr["merge_commit_sha"] == repair_record["merge_sha"] == updated["head"]["sha"]
+    assert _git(tmp_path / "origin.git", "show", "-s", "--format=%T", repair_pr["head"]["sha"]) == repair_record["integrated_tree"]
+    assert _git(tmp_path / "origin.git", "show", "-s", "--format=%T", repair_record["merge_sha"]) == repair_record["expected_tree"]
     roles = [json.loads(line) for line in (tmp_path / "roles.jsonl").read_text().splitlines()]
     feedback = [event for event in roles if message in event["prompt"] or json.dumps(message, ensure_ascii=False) in event["prompt"]]
     assert [event["role"] for event in feedback] == ["development", "review", "publication"]
     assert f"https://github.com/example/project/issues/1" in feedback[0]["prompt"]
+    return repair_pr
 
 
 def _final_control_backend():
@@ -1322,7 +1335,7 @@ def test_public_requeue_and_revise_deliver_fresh_generations_in_the_original_man
                 previous_pr = _request_final_revision(public, kernel, accepted, state, message)
                 advance_to_approval(kernel.status(final)["generation"], "final-after-revise")
                 assert kernel.status(final)["phase"] == "approval"
-                _assert_revised_publication(tmp_path, state, previous_pr, message)
+                preserved_repair_pr = _assert_revised_publication(tmp_path, state, previous_pr, message, kernel)
                 timing["revise_to_approval_seconds"] = time.monotonic() - revision_started
                 final_before = kernel.status(final)
                 final_delivery = kernel.delivery(final)
@@ -1405,8 +1418,11 @@ def test_public_requeue_and_revise_deliver_fresh_generations_in_the_original_man
                     assert all(json.loads(tx.get(row["process_identity"], "ticket:2"))["host_pid"] == children[0].pid for row in workers)
                 assert _git(tmp_path / "origin.git", "show", original_run_head + ":requeue-evidence.txt") == fresh_body
                 assert json.loads(state.read_text())["source_graph"]["issues"]["2"]["state"] == "CLOSED"
-                assert len(json.loads(state.read_text())["prs"]) == 2
-                assert next(pr for pr in json.loads(state.read_text())["prs"] if pr["number"] == final_before["pr_number"])["merged"]
+                final_prs = json.loads(state.read_text())["prs"]
+                assert len(final_prs) == 3
+                assert next(pr for pr in final_prs if pr["number"] == preserved_repair_pr["number"]) == preserved_repair_pr
+                assert kernel.status(final)["repair_history"] == final_before["repair_history"]
+                assert next(pr for pr in final_prs if pr["number"] == final_before["pr_number"])["merged"]
                 code, completed = public("status", accepted["run_id"])
                 assert code == 0 and completed["status"] == "completed", completed
                 assert trace == ["fdstore", "barrier", "host_exited", "store_closed"]

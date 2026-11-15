@@ -165,7 +165,7 @@ def test_acceptance_and_terminal_notifications_follow_committed_delivery_boundar
     assert terminal["effort"]["development"]["rounds"] == terminal["effort"]["review"]["rounds"] == 1
 
 
-def test_observed_run_branch_write_does_not_promote_a_superseded_acceptance(
+def test_observed_repair_merge_does_not_promote_a_superseded_acceptance(
         monkeypatch: pytest.MonkeyPatch, notification_failed_final_review) -> None:
     scenario, native_storage = notification_failed_final_review
     root = native_storage.path.parent
@@ -185,12 +185,27 @@ def test_observed_run_branch_write_does_not_promote_a_superseded_acceptance(
         active.append(repair)
 
     recorded_agents(scenario, monkeypatch, started=started)
-    issued = []
+    issued, merge_budgets = [], []
     execute = scenario.port.execute
     def capture(effect, authorize=None):
-        if effect.operation == "run_branch":
+        is_repair_merge = effect.operation == "merge" and effect.payload.get("repair_id")
+        if is_repair_merge:
+            assert effect.subject == scenario.delivery.key
+            assert effect.target_ref == scenario.delivery.source_ref
+            assert effect.source_ref != effect.target_ref
+            before = scenario.port.pr_by_number(effect.pr_number)
+            assert before.state == "OPEN" and before.head.sha == effect.after_sha
+            assert before.source_ref == effect.source_ref and before.target_ref == effect.target_ref
+            merge_budgets.append(scenario.kernel.status(effect.subject)["budgets"])
+        result = execute(effect, authorize)
+        if is_repair_merge:
+            assert result.disposition == "target"
+            merged = scenario.port.pr_by_number(effect.pr_number)
+            assert merged.state == "MERGED" and merged.merged == result.commit
+            assert result.commit.tree == effect.payload["integrated_tree"]
+            assert scenario.port.git.parents(result.commit.sha) == (effect.before_sha, effect.after_sha)
             issued.append(effect)
-        return execute(effect, authorize)
+        return result
     monkeypatch.setattr(scenario.port, "execute", capture)
     for _ in range(100):
         if active and "operator_stopped" in scenario.kernel.status(scenario.delivery.key)["gates"]:
@@ -217,16 +232,22 @@ def test_observed_run_branch_write_does_not_promote_a_superseded_acceptance(
             break
         assert step.kind not in {"paused", "waiting", "complete", "approval"}
     else:
-        pytest.fail("No actual Run Branch write reached")
+        pytest.fail("No actual Repair PR merge reached")
     with scenario.kernel.storage.transaction(write=False) as tx:
         assert tx.one("SELECT status FROM effects WHERE id=?", (effect.effect_id,))[0] == "observed"
         assert not tx.rows("SELECT position FROM history WHERE kind='acceptance_promoted'")
     original_reviews = scenario.review_count
     filename = "foreign-source.txt"
     foreign = scenario.port.external_remote_append(scenario.delivery.source_ref, {filename: "Independent retained work\n"}, "before-consume")
-    assert scenario.step().kind == "progress"  # Settle the original write, not a fresh acceptance.
+    assert scenario.step().kind == "progress"  # Settle the original merge, not a fresh acceptance.
+    assert scenario.kernel.status(effect.subject)["budgets"] == merge_budgets[0]
+    assert sum(write["operation"] == "merge" and write["intent"] == effect.effect_id
+               for write in scenario.port.writes()) == 1
     with scenario.kernel.storage.transaction(write=False) as tx:
         assert tx.one("SELECT status FROM effects WHERE id=?", (effect.effect_id,))[0] == "confirmed"
+        repair = tx.one("SELECT * FROM run_repairs WHERE id=?", (effect.payload["repair_id"],))
+        assert repair["state"] == "merged" and repair["pr_number"] == effect.pr_number
+        assert repair["merge_sha"] == scenario.port.pr_by_number(effect.pr_number).merged.sha
         assert not tx.rows("SELECT position FROM history WHERE kind='acceptance_promoted'")
 
 
@@ -290,18 +311,22 @@ def test_observed_run_branch_write_does_not_promote_a_superseded_acceptance(
 
 
 @pytest.mark.parametrize("target_changed", [False, True], ids=["current", "target-drift"])
-def test_run_branch_receipt_promotes_only_the_reviewed_target(target_changed):
-    """Consume recorded Review/effect inputs; the source-race story owns Git production."""
+def test_repair_merge_receipt_promotes_only_the_reviewed_target(target_changed):
+    """Consume recorded merge inputs; the source-race story owns real Git production."""
     from contextlib import closing
     from dataclasses import asdict
-    from agent_run.model import Commit, EffectResult, World, wire_json
+    from agent_run.model import Commit, EffectResult, PullRequest, World, wire_json
     from support.repository_scope import connection, insert, seed
     from support.run_scoped_kernel import ScopedKernel
     from support.offline import review_result
 
     run, subject = "promotion-consumer", "final:1"
     base, candidate = Commit("a" * 40, "b" * 40), Commit("c" * 40, "d" * 40)
+    run_head, merged = Commit("1" * 40, "2" * 40), Commit("3" * 40, candidate.tree)
     target = Commit("e" * 40, "f" * 40) if target_changed else base
+    source_ref, repair_ref = "refs/heads/work", "refs/heads/work-repair-1"
+    pr = PullRequest(17, "example/project", repair_ref, source_ref, candidate, run_head,
+                     "Parent repair", "Reviewed repair result", "MERGED", "publisher", merged, "example/project")
     with closing(connection()) as db:
         db.execute("BEGIN")
         seed(db, run, subject=subject)
@@ -316,25 +341,38 @@ def test_run_branch_receipt_promotes_only_the_reviewed_target(target_changed):
                 candidate_sha=candidate.sha, candidate_tree=candidate.tree,
                 expected_tree=candidate.tree, completion_revision="completed",
                 context_id=context, result_id=result, status="consumed", outcome="pass"))
-            tx.execute("UPDATE subjects SET kind='final_run',phase='ready_publication',purpose='integration',"
+            tx.execute("UPDATE subjects SET kind='final_run',phase='repair_merge',purpose='integration',source_sha=?,"
                        "candidate_sha=?,candidate_tree=?,integrated_sha=?,integrated_tree=?,expected_tree=?,"
                        "completion_revision='completed',review_attempt='review' WHERE id=?",
-                       (candidate.sha, candidate.tree, candidate.sha, candidate.tree, candidate.tree, subject))
-            payload = tx.put(subject, "effect_intent", wire_json({}))
-            receipt = tx.put(subject, "effect_receipt", wire_json(asdict(EffectResult("target", commit=candidate))))
-            insert(db, "effects", dict(run_id=run, id="run-branch", subject=subject,
-                operation="run_branch", status="observed", executor="owner", epoch=1, actor="publisher",
+                       (run_head.sha, candidate.sha, candidate.tree, candidate.sha, candidate.tree, candidate.tree, subject))
+            insert(db, "run_repairs", dict(run_id=run, id="repair", subject=subject, sequence=1,
+                generation=1, state="open", source_ref=repair_ref, target_ref=source_ref,
+                run_sha=run_head.sha, default_sha=base.sha, candidate_sha=candidate.sha,
+                candidate_tree=candidate.tree, integrated_sha=candidate.sha, integrated_tree=candidate.tree,
+                expected_tree=candidate.tree, review_attempt="review", revision="r", parent_revision="r",
+                graph_revision="g", completion_revision="completed", published_sha=candidate.sha, pr_number=pr.number))
+            parents = [run_head.sha, candidate.sha]
+            payload = tx.put(subject, "effect_intent", wire_json({"repair_id": "repair", "method": "merge",
+                "parents": parents, "integrated_tree": candidate.tree}))
+            receipt = tx.put(subject, "effect_receipt", wire_json(asdict(EffectResult("target", commit=merged,
+                pr=pr, raw={"parents": parents}))))
+            insert(db, "effects", dict(run_id=run, id="repair-merge", subject=subject,
+                operation="merge", status="observed", executor="owner", epoch=1, actor="publisher",
                 parent_revision="r", graph_revision="g", revision="r", generation=1,
-                source_ref="refs/heads/work", target_ref="refs/heads/main",
-                before_sha=base.sha, after_sha=candidate.sha, base_sha=base.sha,
-                base_tree=base.tree, payload_id=payload, receipt_id=receipt, attempts=1))
-        world = World("r", "g", "r", target, candidate, completion_revision="completed")
+                source_ref=repair_ref, target_ref=source_ref, pr_number=pr.number,
+                before_sha=run_head.sha, after_sha=candidate.sha, base_sha=run_head.sha,
+                base_tree=run_head.tree, payload_id=payload, receipt_id=receipt, attempts=1))
+        child = World("r", "g", "r", merged, candidate, pr=pr,
+            ancestry=((candidate.sha, candidate.sha), (base.sha, candidate.sha), (run_head.sha, candidate.sha)))
+        world = World("r", "g", "r", target, merged, completion_revision="completed", repair=child)
         with kernel.storage.transaction() as tx:
             header, job = tx.one("SELECT * FROM runs"), tx.one("SELECT * FROM subjects")
             effect = tx.one("SELECT * FROM effects")
             assert kernel._apply_effect(tx, header, job, effect, world).kind == "progress"
             assert tx.one("SELECT status FROM effects")[0] == "confirmed"
-            assert tx.one("SELECT phase FROM subjects")[0] == "publish"
+            assert tx.one("SELECT phase FROM subjects")[0] == ("integration" if target_changed else "publish")
+            repair = tx.one("SELECT state,merge_sha,pr_number FROM run_repairs")
+            assert tuple(repair) == ("merged", merged.sha, pr.number)
             promoted = tx.rows("SELECT identity FROM history WHERE kind='acceptance_promoted'")
             assert [row[0] for row in promoted] == ([] if target_changed else ["review"])
 

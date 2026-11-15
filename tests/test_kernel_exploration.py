@@ -185,7 +185,7 @@ def test_human_continuation_replaces_thread_but_keeps_attempt_budget_and_origina
             {"id": second.lease_id, "subject": second.subject, "invocation": second.invocation_id}]
 
 
-def test_real_git_conflict_returns_to_integration_development_without_internal_pr(tmp_path: Path, domain_scenario, monkeypatch) -> None:
+def test_real_git_conflict_returns_to_parent_development_then_repair_pr(tmp_path: Path, domain_scenario, monkeypatch) -> None:
     scenario = domain_scenario(tmp_path / "scenario", DeliveryKind.FINAL_RUN,
         edits=({"ticket.txt": "Resolved complete content\n"},))
     original_agent, threads = scenario.agent, {}
@@ -206,7 +206,7 @@ def test_real_git_conflict_returns_to_integration_development_without_internal_p
     integration = [call for call in scenario.role_calls if call["role"] == "development" and call["purpose"] == "integration"]
     assert len(integration) == 1 and set(threads) == {"development", "publication"}
     assert scenario.kernel.status(scenario.delivery.key)["budgets"]["integration"]["developments_used"] == 1
-    assert sum(write["operation"] == "pr_write" for write in scenario.writes()) == 1
+    assert sum(write["operation"] == "pr_write" for write in scenario.writes()) == 2
     assert scenario.port.writes()[:len(historical_writes)] == historical_writes
     assert sum(write["operation"] == "pr_write" for write in historical_writes) == 1
     target = scenario.port.remote_commit(scenario.delivery.target_ref)

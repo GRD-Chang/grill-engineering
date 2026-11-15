@@ -313,7 +313,20 @@ def test_public_resume_repairs_final_then_abandon_recovers_the_completed_ticket(
                 assert sum(event['kind'] == 'worker_exited' for event in history) == 4
                 assert _rows(sibling) == sibling_rows
                 assert all(_process_binding_status(process['pid'], process['start_token']) == 'absent' for process in owned_processes)
-                assert len(json.loads(state.read_text())['prs']) == 2  # Ticket and Final only.
+                prs = json.loads(state.read_text())['prs']
+                assert len(prs) == 3  # Ticket, checked Repair, and Final.
+                repair_record, = final['repair_history']
+                repair_pr, = [pr for pr in prs if pr['number'] == repair_record['pr_number']]
+                final_pr, = [pr for pr in prs if pr['number'] == final['pr_number']]
+                run_ref = reopened.delivery('final:1').source_ref
+                assert repair_record['state'] == 'merged' and repair_pr['merged']
+                assert repair_pr['state'] == 'closed'
+                assert 'refs/heads/' + repair_pr['base']['ref'] == repair_record['target_ref'] == run_ref
+                assert 'refs/heads/' + repair_pr['head']['ref'] == repair_record['source_ref']
+                assert repair_pr['head']['sha'] == repair_record['published_sha'] == repair_record['integrated_sha']
+                assert repair_pr['merge_commit_sha'] == repair_record['merge_sha'] == final_pr['head']['sha']
+                assert _git(tmp_path / 'origin.git', 'show', '-s', '--format=%T', repair_pr['head']['sha']) == repair_record['integrated_tree']
+                assert _git(tmp_path / 'origin.git', 'show', '-s', '--format=%T', repair_record['merge_sha']) == repair_record['expected_tree']
                 assert _git(tmp_path / 'origin.git', 'rev-parse', 'refs/heads/main') == external_head
                 with abandon_at_approval(public, reopened, accepted, state, external_head, deadline):
                     release_approval.set()

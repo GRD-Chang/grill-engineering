@@ -133,11 +133,16 @@ class LocalEffects:
                 raise KernelError("integration_tree_unknown")
             return result.stdout.splitlines()[0] if result.returncode == 0 else None
 
+    @staticmethod
+    def _integration_stages(effect: Effect) -> tuple[tuple[str, str | None], ...]:
+        return (("source", effect.payload["source_sha"]), ("target", effect.base.sha),
+                ("repair", effect.payload.get("repair_source_sha")))
+
     def _integration(self, effect: Effect, checkout: Path, head: str) -> EffectResult:
         if effect.candidate is None:
             raise KernelError("missing_candidate")
         stages = [(suffix, target) for suffix, target in
-                  (("source", effect.payload["source_sha"]), ("target", effect.base.sha)) if target]
+                  self._integration_stages(effect) if target]
         proven: dict[str, str] = {}
         current = head
         for suffix, target in reversed(stages):
@@ -217,8 +222,12 @@ class LocalEffects:
             return EffectResult("third", raw={"reason": "dirty_local_checkout"})
         if effect.payload.get("reuse_sha"):
             commit = self.git.commit(effect.payload["reuse_sha"])
-            if commit.tree != effect.payload["integrated_tree"] or head != commit.sha:
+            if commit.tree != effect.payload["integrated_tree"]:
                 return EffectResult("third")
+            if head != commit.sha:
+                if head != effect.payload.get("reuse_before") or not self.git.is_ancestor(head, commit.sha):
+                    return EffectResult("third")
+                return EffectResult("prior")
             return EffectResult("target", commit=commit, raw={"parents": self.git.parents(commit.sha)})
         if not effect.payload.get("publication_commit_intent"):
             return EffectResult("prior" if head == effect.payload["integrated_sha"] else "third")
@@ -335,7 +344,7 @@ class LocalEffects:
         elif effect.operation == "integrate":
             assert observed.commit is not None
             current = observed.commit
-            for suffix, target in (("source", effect.payload["source_sha"]), ("target", effect.base.sha)):
+            for suffix, target in self._integration_stages(effect):
                 if not target or self.git.is_ancestor(target, current.sha):
                     continue
                 try:
@@ -349,6 +358,9 @@ class LocalEffects:
                     return EffectResult("failure", commit=self.git.commit(str(raw["head"])), raw=raw)
                 writer.install_checkout(checkout, current.sha)
         elif effect.operation == "publication_commit":
+            if effect.payload.get("reuse_sha"):
+                writer.install_checkout(checkout, effect.payload["reuse_sha"])
+                return self.reconcile(effect)
             if not effect.payload.get("publication_commit_intent"):
                 raise KernelError("publication_intent_missing")
             intent = self.prepare_publication(effect)

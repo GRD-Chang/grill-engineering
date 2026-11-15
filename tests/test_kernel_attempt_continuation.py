@@ -54,7 +54,7 @@ def test_human_resume_uses_attempt_input_and_binding_without_charging_again(tmp_
     assert second is not None and second.attempt_id == first.attempt_id
     assert bound == [first.attempt_id]
     with kernel.storage.transaction(write=False) as tx:
-        assert tx.one("SELECT protocol FROM meta")[0] == PROTOCOL == "independent-delivery-repository-v22"
+        assert tx.one("SELECT protocol FROM meta")[0] == PROTOCOL == "independent-delivery-repository-v23"
         references = {row["from"]: (row["table"], row["to"])
                       for row in tx.execute("PRAGMA foreign_key_list(attempts)")}
         assert references["thread_id"] == ("threads", "id")

@@ -1172,5 +1172,7 @@
   "presentation.observation.exited": "已观察到退出；不推定准确 Worker 结束时间",
   "presentation.observation.recorded_exit": "已记录退出",
   "presentation.observation.host_exit": "已观察到 Host 域退出；未记录 Worker 退出回执",
-  "presentation.observation.unknown": "未知；缺少可比较的本地证据"
+  "presentation.observation.unknown": "未知；缺少可比较的本地证据",
+  "repair.pr_title": "fix: Parent #{issue} 整体修复 {sequence}",
+  "repair.pr_body": "Parent #{issue} 的 Run Repair PR\n\n候选：`{candidate}`\n\n独立 Parent 验收：`{review}`。本 PR 等待目标 Run 分支的必过检查，通过后由程序合入。最终交付仍需默认分支检查及明确人工批准。"
 }

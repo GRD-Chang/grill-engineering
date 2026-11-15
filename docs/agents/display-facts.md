@@ -101,10 +101,11 @@ Status/History 只读展示当前额度和续期历史，不补造旧内外层�
 文案单独失效保留适用 Review；CI 与批准继续绑定准确 PR/head 和原授权对象。
 普通 resume/message 不表示批准，待确认的正式写入仍显示原操作并先核验结果。
 
-完整 Parent 的修复展示准确 subject、Generation、Candidate、工作区与 Run Branch 待完成操作，
-不显示内部 Repair PR 发布、CI 等待或合并待办。历史既有 PR 记录保留原含义，
-不补造当前修复 PR。修复完成不表示最终 PR CI、人工批准或默认分支交付完成。
-未知 Run Branch 推送保留原写入意图；status/history 不能把暂停解释为未写入，也不能代替对账或恢复。
+完整 Parent 的修复展示准确 subject、Generation、Candidate、工作区，以及 `run_repairs` 中的修复分支、
+PR 目标、检查与合入记录。`subjects[].repair_pr` 引用当前开放记录，`repair_history` 保留已合入记录；
+它们从同一权威关系读取，不建立展示状态或另收费的工作。修复检查等待与最终 PR 检查等待分属各自 PR，
+明确未配置检查显示 `none`，不称 CI 通过。修复合入不表示最终 PR 检查、人工批准或默认分支交付完成。
+未知写入保留原意图；status/history 不能把暂停解释为未发生，也不能代替对账或恢复。
 
 ## 通知与验证入口
 

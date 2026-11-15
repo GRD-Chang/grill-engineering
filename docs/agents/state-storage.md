@@ -7,14 +7,14 @@
 
 数据主目录默认为 `~/.local/share/agent-run/`，或 `$XDG_DATA_HOME/agent-run/`。
 本开发候选按受管仓库共用 `repositories/<owner>/<repo>/state/kernel.sqlite3`，
-`meta.protocol` 唯一值为 **`independent-delivery-repository-v22`**。
+`meta.protocol` 唯一值为 **`independent-delivery-repository-v23`**。
 该源码候选仍待同版独立验收，不代表用户环境已经切换或真实进程验收通过。
 `tasks` 保存准确Task身份和可空的 `current_run`；`task_runs` 绑定历史Run。
 独立idle Task不产生空壳Run、Invocation、预算或执行权。完整冻结Run及必要关系/材料
 与Task绑定在同一短事务中提交；COMMIT未知仅对账原proposal，不重新创建或套用新默认值。
 
 [`storage.preflight`](../../src/agent_run/storage/preflight.py) 只读检查原数据库。
-旧JSON/v6、native v17–v21、早期仓库实验marker、封印和导入状态均拒绝，
+旧JSON/v6、native v17–v22、早期仓库实验marker、封印和导入状态均拒绝，
 保留原SQLite/WAL、raw、材料、预算和工作区，不升级、不转换、不双写。
 旧的每Run库目录残留不能被当作空仓库重新初始化。
 Task锁仍使用 `native-task-locations/<task-fingerprint>.lock` 的原inode；
@@ -23,6 +23,10 @@ Task锁仍使用 `native-task-locations/<task-fingerprint>.lock` 的原inode；
 `Storage.create` 排他创建新文件，拒绝接管已有数据库或遗留 sidecar。
 写事务在打开写连接前、取得写锁后及提交前复核支持边界；查询同样只接受当前 native 状态。
 旧迁移链与 `original_query` 已退出，不存在跨版本查询或原地升级入口。
+
+Parent 修复 PR 使用同一数据库的 `run_repairs` 关系保存准确分支、PR、候选、默认分支和 Run 基线、
+检查及实际合入事实。开放 PR 随原 Parent 修复更新，已合入记录不复用；
+开发、审核、CI 调查额度仍归属原 Parent subject。协议升级不自动续接旧 Run，也不修改旧现场。
 
 ## 事实的唯一归属
 

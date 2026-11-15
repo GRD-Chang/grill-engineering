@@ -37,7 +37,8 @@ class RepositoryRunSchemaTests(unittest.TestCase):
             insert(self.db,'material',{'run_id':'A','id':'bad','subject':'only-C','purpose':'test','digest':'x','size':1,'body':b'x'})
     def test_all_foreign_relations_have_matching_run_scope(self):
         tables=[row[0] for row in self.db.execute("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
-        self.assertEqual(len(tables),38)
+        self.assertEqual(len(tables),39)
+        self.assertIn("run_repairs", tables)
         for table in tables:
             columns={r[1] for r in self.db.execute('PRAGMA table_info('+table+')')}
             if table not in {'meta','runs'}:self.assertIn('run_id',columns)
@@ -52,6 +53,30 @@ class RepositoryRunSchemaTests(unittest.TestCase):
                     else:
                         expected='id' if table=='runs' else 'run_id'
                         self.assertTrue(any(r[3]==expected and r[4]=='run_id' for r in rows),rows)
+    def test_repair_relations_keep_reviews_checks_and_open_identity_in_the_same_run(self):
+        self.db.execute('BEGIN');seed(self.db,'C',subject='only-C');self.db.commit()
+        for run, attempt in (('A','A-review'), ('B','B-review')):
+            insert(self.db,'attempts',{'run_id':run,'id':attempt,'subject':'parent:1','generation':1,
+                'ordinal':1,'role':'review','purpose':'integration','window':1,'parent_revision':'r',
+                'graph_revision':'g','revision':'r','base_sha':'a'*40,'completion_revision':'no-tickets',
+                'context_id':'profile','status':'consumed'})
+        insert(self.db,'checks',{'run_id':'B','id':'B-checks','subject':'parent:1','pr_number':7,
+            'head_sha':'c'*40,'result':'none','material_id':'profile'})
+        record = {'run_id':'A','id':'same-repair','subject':'parent:1','sequence':1,'generation':1,
+            'state':'open','source_ref':'refs/heads/repair','target_ref':'refs/heads/run',
+            'run_sha':'a'*40,'default_sha':'a'*40,'candidate_sha':'c'*40,'candidate_tree':'d'*40,
+            'integrated_sha':'c'*40,'integrated_tree':'d'*40,'expected_tree':'d'*40,
+            'review_attempt':'A-review','revision':'r','parent_revision':'r','graph_revision':'g',
+            'completion_revision':'no-tickets'}
+        for change in ({'subject':'only-C'}, {'review_attempt':'B-review'}, {'checks_id':'B-checks'}):
+            with self.subTest(change=change), self.assertRaises(sqlite3.IntegrityError):
+                insert(self.db,'run_repairs',dict(record,**change))
+        insert(self.db,'run_repairs',record)
+        insert(self.db,'run_repairs',dict(record,run_id='B',review_attempt='B-review',checks_id='B-checks'))
+        with self.assertRaises(sqlite3.IntegrityError):
+            insert(self.db,'run_repairs',dict(record,id='second-open',sequence=2))
+        self.assertEqual(self.db.execute('PRAGMA foreign_key_check').fetchall(),[])
+
     def test_foreign_opaque_attempt_is_not_a_valid_invocation_owner(self):
         insert(self.db,'attempts',{'run_id':'B','id':'B-only-attempt','subject':'parent:1','generation':1,
             'ordinal':1,'role':'development','purpose':'requirements','window':1,'parent_revision':'r','graph_revision':'g',

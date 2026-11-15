@@ -17,6 +17,7 @@
 | Abandon 与 PR 退休前置 | `control_scenarios` | `managed_abandon_scenario`、`_parent_requeue`、`_retirement` 保留各自原控制顺序、原意图和准确回执；不合并不同恢复权限 |
 | 资源清理前置与本地 ref 读取 | `cleanup_scenarios` | `_native_scenario`、`_local_head` 保留原种类和准确 ref 语义；`_intent` / `_checkout` 保留原机械 adapter 场景的准确 REF；`prepared_generation_two_cleanup` 只准备正常 Requeue 与原观察回调，执行和 foreign/退出断言仍由各用例拥有 |
 | 真实 gh 子进程与远端 effect 前置 | `remote_effects` | 唯一 `FAKE_GH` 脚本、显式 `fake_gh(repository=..., actor=...)` 字段绑定及 `_fixture`、`_change`、`_pr_effect`、`_publish_pr`、`_source_kernel`、`_reader`、`publication`、`_actual_publication_push`；调用方拥有独立仓库、状态、日志及 monkeypatch |
+| Parent 修复旅程 | `parent_repair` | 有界推进既有 Scenario、按可控时钟跨过等待，并只读观察修复 PR 与真实请求；不选择 Core 后继、不改业务状态、不将替身视为真实 GitHub 接入证明 |
 | GitHub 读取与文本 fixture | `github_requirements`、`github_checks`、`fixture_text` | 保留编号/仓库/父子关系、分页、检查身份及文本路径语义；错误响应仍由真实 reader 拒绝 |
 | 写前边界与外部观察 | `effect_boundary`、`api_observation` | 在原外部 I/O 窗口注入变化，保留 prepare、物理核验和最终 Core 准入；`workspace_intent` / `advance_to_effect` 只挂起正常选择出的准确 Effect，不缓存已通过的许可 |
 | 受控 manager、托管入口与 Status 端口 | `systemd_manager`、`status_comments` | `_local_manager` 仅替换外部 manager，执行原封存 argv；`_control_environment` / 批准屏障保留原 Git、状态、FD-store 与收尾。manager/sysfs/评论响应的合成输入不冒充真实 OS 或 GitHub 验收 |

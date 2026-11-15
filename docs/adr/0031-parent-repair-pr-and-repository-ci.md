@@ -6,8 +6,9 @@ status: accepted
 
 ## 决定与实施状态
 
-本决定已确认，通用 Runner 的修复 PR 路径尚未实施。当前 Runner 仍采用 [ADR 0025](0025-parent-repair-without-internal-pr.md)
-的直接更新 Run Branch 路径；不能把本文或领域术语的更新当成已交付证明。
+本决定由当前单一 Core 的 Parent 修复路径实现，取代 [ADR 0025](0025-parent-repair-without-internal-pr.md)
+的直接更新 Run Branch 路径。修复 PR 的分支、候选、检查、合入意图与回执在所属 Parent 下保存，
+不新建开发或审核额度。实现和本地测试不代替真实 GitHub 保护规则下的接入证明；具体证据由本轮验证记录提供。
 
 完整 Parent 的修复及需要写入 Run Branch 的整体集成成果，经独立整体验收后，
 由程序发布为指向 Run Branch 的 Run Repair PR。程序读取目标仓库的 GitHub 检查要求，

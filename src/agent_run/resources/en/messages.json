@@ -1172,5 +1172,7 @@
   "presentation.observation.exited": "observed exited; no exact Worker end time inferred",
   "presentation.observation.recorded_exit": "recorded exit",
   "presentation.observation.host_exit": "Host-domain exit observed; no Worker exit receipt recorded",
-  "presentation.observation.unknown": "unknown; comparable local evidence unavailable"
+  "presentation.observation.unknown": "unknown; comparable local evidence unavailable",
+  "repair.pr_title": "fix: Parent #{issue} repair {sequence}",
+  "repair.pr_body": "Parent #{issue} — Run Repair PR\n\nCandidate: `{candidate}`\n\nIndependent Parent acceptance: `{review}`. This PR awaits the target Run branch required checks before automatic merge. Final delivery retains default branch checks and explicit human approval."
 }

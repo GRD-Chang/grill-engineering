@@ -44,7 +44,7 @@ before/after hello 真实 namespace 合成2P、unknown 负例1P；这些不同�
 真实 Codex 与父助手原云交付仍未验收。
 不能把合成通过、上述合同或 doctor 的能力预检作为完整交付证明。环境实测边界统一见[支持矩阵](productization/support.md)。
 
-本候选仅接受 repository v22；v21及更旧Run、早期未激活仓库候选保留原数据但拒绝续接，无迁移，见[状态存储](agents/state-storage.md)。
+本候选仅接受 repository v23；v22及更旧Run、早期未激活仓库候选保留原数据但拒绝续接，无迁移，见[状态存储](agents/state-storage.md)。
 
 ## 一条命令推进 Ticket 交付
 
@@ -65,7 +65,7 @@ agent-run run <parent-issue> --repo OWNER/REPO
 | --- | --- | --- |
 | Ticket 开发与审查 | 领取可执行 Ticket，开发、自测、独立审核及有界修复；Ticket 普通审核额度末轮存在既定 fallback，不能把 fallback 称为审核通过 | 当前 Ticket 合同、真实开发产物、审核 Findings 与额度 |
 | Ticket 集成与 CI | 程序核验本地集成、发布 Ticket PR；监督准确 PR/head 的必需检查，真实失败交回 Development；满足当前授权和检查后 squash 合入 Run Branch、关闭 Ticket | 准确提交、PR、检查观测、merge 与关闭事实；集成失败保留现场进入定向开发 |
-| 完整 Parent 验收 | 全部 Ticket 完成后集成整体成果，对照完整 Parent 做独立 Review；Findings 和最终 CI 修复沿原 Run 工作循环推进 | E2E、Standards、Spec 三条 lane、准确候选与预期合并结果；内部修复不创建独立 PR |
+| 完整 Parent 验收 | 全部 Ticket 完成后集成整体成果，对照完整 Parent 做独立 Review；Findings 和最终 CI 修复沿原 Run 工作循环推进 | E2E、Standards、Spec 三条 lane、准确候选与预期合并结果；需要更新 Run 时经修复 PR 检查并自动普通合入 |
 | 最终发布 | 生成最终 PR 文案，发布到默认分支的 PR，监督适用检查 | `pending` / `unknown` 不等于通过；明确未配置必需检查也不等于 CI 通过 |
 | 人工批准与完成 | 停在最终批准门禁；明确批准后重新核验当前事实，程序合并、关闭 Parent、完成必要清理 | 最终 PR/head/base 与验收证据适用，真实 merge/close/cleanup 已确认 |
 
@@ -303,7 +303,7 @@ evidence；任一可重建输入变化都先回到 fresh Run Acceptance 判断 R
 | `stop --ticket` | 未终止 Run 中尚未完成的指定 Ticket，最终批准期间除外 | 持久记录停止意图，立即中断准确归属该票的 Agent，取消未启动的工作排队；确认进程退出后释放名额，其他 Ticket 与 CI 监督继续 | 保留工作区、Attempt、适用 Thread 与独立预算门禁；在途写入先对账，状态展示等待收口原因；用 `resume --ticket` 显式继续 |
 | `abandon` | 未完成 Run（包括人工边界） | 先检查所有 Managed Development Checkout；干净时写入 durable abandonment，再执行受限的 PR 关闭、Ticket reopen 与本地清理恢复 | 不回滚默认分支；dirty checkout 默认不删且不执行 GitHub mutation，只有显式 `--discard-worktree` 才强制丢弃 |
 
-控制 Action、Host、Executor 与业务事实同在该仓库的唯一v22数据库中，不能依靠删除一个控制文件恢复准入。
+控制 Action、Host、Executor 与业务事实同在该仓库的唯一v23数据库中，不能依靠删除一个控制文件恢复准入。
 生命周期命令先核验准确 Task 绑定、原 Host 和 Runner 使用租约，再决定附着或交接。
 附着回执不表示本次新请求已应用；须核对 requested action 与实际应用结果。
 Run 已到人工边界、PID 消失或原命令参数相同，都不能代替准确 Host/Worker 的退出证明。
@@ -414,8 +414,10 @@ Completion Record、
 Expected Merge Result 与 SHA/Revision 绑定只由 Controller 在验收外层校验，不进入 Codex
 Prompt。失败 findings 原样交给持久 Run Repair Development Thread；每次真实
 代码修改先形成不可变 repair Candidate，由全新的 Candidate Run Acceptance Reviewer 按完整 Parent 范围
-检查准确 default head 与 Candidate 的预期合并结果。Candidate 通过后由程序核验准确源与默认分支必要祖先关系，并直接更新 Run Branch，
-不创建内部修复 PR、调用内部 Publish 或等待内部 CI。Controller 只在 Candidate tree、repair base、实际 Run tree、
+检查准确 default head 与 Candidate 的预期合并结果。Candidate 通过后由程序核验准确源与默认分支必要祖先关系，
+发布修复分支和以 Run Branch 为 base 的 Run Repair PR，读取该 PR 目标分支的 Required Checks。
+检查通过或明确未配置时，由程序自动普通合入 Run，不增加人工批准点。真实 CI 失败回到同一 Parent 修复工作，
+尚未合入的 PR 原地更新；已合入记录保留，后续新修复使用新 PR，不重置累计额度。Controller 只在 Candidate tree、repair base、实际 Run tree、
 default head、Parent/Graph revision 和 Ticket Completion records 全部精确匹配时提升该结论。若仅 default head
 前进，Controller 在原 Repair Cycle 重新预演并验收最新组合；其余权威边界失配才废弃 Candidate，并进入新的
 Run Acceptance Generation。
@@ -629,7 +631,7 @@ Worker host/PAT/App 来源通过 `settings show/configure` 管理，详情见[�
 
 配置继续位于 `$XDG_CONFIG_HOME/agent-run/`（默认 `~/.config/agent-run/`），临时环境交接文件使用运行时目录。卸载仅清理安装内容，保留任务数据。用户仓库的文件、索引、引用和 Git 元数据均由用户自行管理。
 
-本开发候选唯一状态协议是 **`independent-delivery-repository-v22`**（尚待同版独立验收，非已部署声明），详见[状态存储](agents/state-storage.md)。
+本开发候选唯一状态协议是 **`independent-delivery-repository-v23`**（尚待同版独立验收，非已部署声明），详见[状态存储](agents/state-storage.md)。
 旧 JSON/v6、native v17/v18、来源封印及导入状态不升级、不转换，不提供兼容查询或恢复；
 原数据、Candidate 和工作区保留，拒绝继续不授予清理权限。
 稳定 Development Checkout 在 Required Checks pending 或 Worker/Publisher 普通失败、超时、
@@ -657,4 +659,4 @@ Ticket 原开发—审核与规定上限后的末轮跳过保持原合同；取�
 
 status/history 区分需求开发与集成开发累计用量、额度窗口及语义工作。Git 机械操作限时 30 秒，超时保留现场和输出；工作使用原共享 Ticket Agent 名额与 FIFO，集成交付继续单席，正常 CI 等待不占 Agent 名额。新状态不迁移旧 Run。详见 [ADR 0020](adr/0020-ticket-integration-development-loop.md)。
 
-完整 Parent 的直接 Run Branch 更新仍受实际运行凭据和仓库规则约束；权限或规则拒绝时保全修复成果与写入意图，说明缺口并暂停，由维护者处理后通过 `resume` 继续。未知推送先对账，不通过强推、重置、改规则或内部修复 PR 兜底。
+完整 Parent 修复 PR 与最终 Run PR 分别遵守各自目标分支的真实检查规则。修复 PR 发布或合入响应丢失时，先按原意图读回，未知结果不当作未发生，也不重建 PR 逃避原记录。权限、触发或规则不满足时保全成果，说明准确缺口，经处理后通过 `resume` 继续；Runner 不修改 Workflow、规则或强推绕过。最终合入默认分支仍须当前整体验收、该最终 PR 的检查与明确人工批准。

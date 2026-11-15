@@ -369,6 +369,11 @@ class _ScenarioPorts:
                                        publisher_identity=self.binding.inputs.runner_identity))
         if request.source_ref == scenario.delivery.source_ref:
             scenario.heads = heads
+        if request.repair is not None:
+            repair = self.delivery(request.repair)
+            if repair.target != facts.source:
+                raise ReadUnavailable("github_observation_pending", "Run changed between Parent and repair observations")
+            facts = replace(facts, repair=repair)
         return facts
 
     def inspect(self, resources: tuple[ResourceWitness, ...]) -> tuple[ResourceInspection, ...]:

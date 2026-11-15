@@ -11,7 +11,7 @@ Run 的身份读取由 [`cli.selection`](../../src/agent_run/cli/selection.py) �
 | 查询参数及输出、Parent或准确Run的生命周期分流 | [`cli.main`](../../src/agent_run/cli/main.py)、[`cli.lifecycle`](../../src/agent_run/cli/lifecycle.py) |
 | Action、Receipt、代次、恢复和冻结配置 | [`core.kernel`](../../src/agent_run/core/kernel.py)；Host/exit-hook必须携带准确Run |
 
-源码候选只接受 `independent-delivery-repository-v22`；旧协议拒绝保留，不迁移。
+源码候选只接受 `independent-delivery-repository-v23`；旧协议拒绝保留，不迁移。
 发现只枚举有界受管仓库注册目录，不遍历clone、Run产物目录或安装快照，不读取JSON locator。
 每仓库同一数据库按Task/current选择；准确Run ID可读取历史Run，Parent选择当前绑定。
 多匹配不按时间猜测。显式 `--repo` 查询仍须同时指定Parent或准确Run，`runs --repo`可列举。
