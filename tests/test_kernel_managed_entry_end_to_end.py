@@ -544,7 +544,8 @@ def test_public_parallel_review_and_publication_keep_each_threads_binding(
     git_repo: Path, tmp_path: Path, monkeypatch, record_property, request,
 ) -> None:
     _measure_host_calls(tmp_path, monkeypatch, enabled=request.config.getoption('host_loss_io_diagnostics'))
-    from agent_run.adapters.foreground import ProcessPin, read_record, record_root, subreaper
+    from agent_run.adapters.foreground import read_record, record_root, subreaper
+    from agent_run.queries import run as run_query
     classification = """schema = json.loads(Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text())
 role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commit_message' in schema['properties'] else 'development'
 """
@@ -587,7 +588,7 @@ content = 'Implementation""")
             return json.loads(result.stdout)
 
         def invocation(number, role):
-            history = public('history')['history']
+            history = run_query.read(kernel.storage.path, 'history', storage=kernel.storage).data['history']
             attempt, = (row for row in history['attempts'] if row['subject'] == f'ticket:{number}' and row['role'] == role)
             original, = attempt['invocations']
             return attempt, original
@@ -638,6 +639,7 @@ content = 'Implementation""")
             record, = (read_record(path) for path in record_root(lock).glob('*.json'))
             assert record['binding'][0] == run_id and record['phase'] == 'running'
             _pin_control_host(record, pins)
+            kernel = Kernel(Path(record['database']), run_id=run_id)
 
             # Force the historical order using real stdout, not bind_thread calls.
             event_b, channel_b = channels['review']
@@ -674,29 +676,32 @@ content = 'Implementation""")
             still_a, current_a = invocation(2, 'publication')
             assert current_a['backend_id'] == event_a['thread'] and still_a['result'] is None
             channel_a.sendall(b'1')
-            try:
-                output, error = child.communicate(timeout=90)
-            except subprocess.TimeoutExpired as error:
-                note_costs(error, tmp_path, arrivals_ns=arrival_times)
-                raise
-            assert child.returncode == 0, (output, error)
-            accepted = json.loads(output)
-            assert accepted['run_id'] == run_id and accepted['host'] == 'exited'
-            final = public('status')
-            tickets = [row for row in final['subjects'] if row['kind'] == 'ticket']
-            assert len(tickets) == 2 and all(row['phase'] == 'complete' and not row['gates'] for row in tickets)
-            assert all(row['delivery_cleanup']['state'] == 'complete' for row in tickets)
+            # Observe the two original results at consumption. Other public
+            # journeys own subsequent PR merges, Ticket close and Final.
+            def both_consumed():
+                history = run_query.read(kernel.storage.path, 'history', storage=kernel.storage).data['history']
+                counts = [sum(event['kind'] == 'role_consumed' and event['identity'] == attempt['id']
+                              for event in history['events']) for attempt in (attempt_a, attempt_b)]
+                return history if counts == [1, 1] else None
+
+            history = wait_until(both_consumed, timeout=15)
+            for original in (row_b, row_a):
+                attempt, = (row for row in history['attempts'] if row['id'] == original['attempt'])
+                current, = attempt['invocations']
+                assert current['id'] == original['id'] and current['backend_id'] == original['backend_id']
+                assert attempt['result'] is not None and all(item['dispatch_state'] == 'exited' for item in current['outputs'])
+            tickets = [row for row in public('status')['subjects'] if row['kind'] == 'ticket']
             for ticket in tickets:
                 budget, = (row for row in ticket['budgets'] if row['purpose'] == 'requirements')
                 assert (budget['window'], budget['developments_used'], budget['reviews_used']) == (1, 1, 1)
-            for number, role, original in ((3, 'review', row_b), (2, 'publication', row_a)):
-                attempt, current = invocation(number, role)
-                assert current['id'] == original['id'] and current['backend_id'] == original['backend_id']
-                assert attempt['result'] is not None and all(item['dispatch_state'] == 'exited' for item in current['outputs'])
-                assert sum(event['kind'] == 'role_consumed' and event['identity'] == attempt['id']
-                           for event in public('history')['history']['events']) == 1
-            document = json.loads(remote_state.read_text())
-            assert all(document['source_graph']['issues'][str(number)]['state'] == 'CLOSED' for number in (2, 3))
+            stopped = subprocess.run([sys.executable, '-m', 'agent_run', 'stop', '1',
+                '--repo', 'example/project', '--json'], cwd=git_repo, env=environment,
+                capture_output=True, text=True, timeout=10)
+            assert stopped.returncode == 0, (stopped.stdout, stopped.stderr)
+            output, error = child.communicate(timeout=30)
+            assert child.returncode == 0, (output, error)
+            accepted = json.loads(output)
+            assert accepted['run_id'] == run_id and accepted['host'] == 'exited'
             assert all(pin.observe() == 'exited' for pin in pins)
             assert not list(record_root(lock).glob('*.json'))
             with runner_management_lease(lock):
@@ -1745,13 +1750,13 @@ if role == 'development':
         log.write(json.dumps({'event': 'worker_produced', 'subject': 'ticket-' + str(issue),
             'thread': thread, 'checkout': str(Path.cwd())}) + chr(10))
 """)
-    ticket_check = "assert Path('delivery-' + str(issue) + '.txt').read_text() == content"
-    assert codex.count(ticket_check) == 2
-    codex = codex.replace(ticket_check, """if issue == 1:
-        for number in (2, 3):
-            assert Path('delivery-' + str(number) + '.txt').read_text() == f'Original delivery for Ticket {number}.' + chr(10)
-    else:
-        """ + ticket_check)
+    # Both recovered Developers and their Reviewers must consume real results.
+    # End at the next natural waiting point instead of replaying Ticket merges
+    # and the Final approval already covered by the public Host-loss journey.
+    codex = codex.replace(produced, """if role == 'publication':
+    result = {'result_kind': 'human_blocker', 'commit_message': None, 'pr_title': None,
+              'pr_body_markdown': None, 'human_blockers': ['Await publication decision.']}
+""" + produced)
     program = '''import json, os, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
@@ -1916,9 +1921,12 @@ else:
                 output, = current['outputs']
                 assert output['raw_id'] is None and output['raw_return'] is None and output['exit_code'] is None
                 assert retained['status'] == 'consumed' and retained['result']['result_kind'] == 'development'
-            assert all(kernel.status(subject)['phase'] == 'complete' for subject in before)
+            for subject in before:
+                publication, = [row for row in attempts if row['subject'] == subject and row['role'] == 'publication']
+                assert publication['outcome'] == 'human_blocker'
+                assert kernel.status(subject)['gates'] == ['human_blocker']
             source = kernel.source_status()
-            assert kernel.status(source['final_subject'])['phase'] == 'approval'
+            assert source['final_subject'] is None
             assert not select.select([unrelated_fd], [], [], 0)[0]
             assert not list(record_root(lock).glob('*.json'))
             for subject in before:

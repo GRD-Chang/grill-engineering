@@ -12,13 +12,16 @@ import time
 
 from agent_run.adapters.foreground import ProcessPin, read_record, subreaper
 from agent_run.core.kernel import Kernel
+from agent_run.config.defaults import UserDefaultsStore
+from agent_run.cli.main import main
+from support.environment import durable_snapshot
 from agent_run.runtime.package_lease import default_runner_lock_path, runner_management_lease
 from support.systemd_manager import _CODEX, _control_environment, _git
 from support.sqlite_faults import logical_state
 from agent_run.adapters.workspace import ManagedWorkspace
 
 
-def test_installed_foreground_parent_only_public_lifecycle(git_repo, tmp_path, monkeypatch):
+def test_installed_foreground_parent_only_public_lifecycle(git_repo, tmp_path, monkeypatch, capsys):
     ready = tmp_path / 'development-ready'
     released = tmp_path / 'development-released'
     codex = _CODEX
@@ -107,6 +110,23 @@ def test_installed_foreground_parent_only_public_lifecycle(git_repo, tmp_path, m
                     flag in args and args[args.index(flag) + 1] in {'POST', 'PATCH', 'PUT', 'DELETE'}
                     for flag in ('--method', '-X')) or any('mutation ' in arg for arg in args)]
             written = mutations()
+            # The same completed Task owns the public Stop contract. Its frozen
+            # language and durable state survive both renderings of the receipt.
+            UserDefaultsStore().configure(language='zh')
+            before_stop = durable_snapshot(tmp_path)
+            stop = ['stop', original['run_id'], '--repo', 'example/project']
+            assert main(stop) == 0
+            plain = capsys.readouterr()
+            assert plain.err == '' and 'Delivery already completed; no new action was performed' in plain.out
+            assert original['run_id'] not in plain.out
+            assert not any(text in plain.out for text in ('Request accepted', 'Unconfirmed', 'does not prove'))
+            assert durable_snapshot(tmp_path) == before_stop
+            assert main([*stop, '--json']) == 0
+            machine = capsys.readouterr()
+            assert machine.err == ''
+            assert json.loads(machine.out) == {'result': 'completed', 'status': 'completed',
+                'run_id': original['run_id'], 'action_id': None, 'action': 'stop', 'host': 'exited'}
+            assert durable_snapshot(tmp_path) == before_stop
             child = start('resume', original['run_id'], '--foreground')
             out, err = child.communicate(timeout=90)
             assert child.returncode == 2, (out, err)

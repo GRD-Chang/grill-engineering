@@ -13,12 +13,10 @@ from typing import Iterator
 
 import pytest
 
-from agent_run.model import ParentIssue, Requirements
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.model import Execution, HostObservation
 from support.core_operations import CoreOperations
-from support.offline import GraphScenario, Scenario
 from agent_run.storage.sqlite import Transaction
 
 
@@ -160,8 +158,8 @@ def test_observed_running_requires_actual_usage_handoff_before_work(tmp_path: Pa
     assert CoreOperations(kernel, execution, lambda binding: ports).once().kind == "agent"
 
 
-def test_complete_run_cannot_be_rebound_until_host_and_usage_retire(tmp_path: Path) -> None:
-    scenario = GraphScenario(tmp_path / "delivery", Requirements(ParentIssue(1, "Parent", "Requirement"), ()))
+def test_complete_run_cannot_be_rebound_until_host_and_usage_retire(tmp_path: Path, parent_at_approval) -> None:
+    scenario = parent_at_approval
     # Retire the fixture's trusted Executor before entering the managed seam.
     scenario.kernel.control("stop", "retire-fixture")
     scenario.kernel.confirm_executor_exit(scenario.execution)

@@ -401,12 +401,32 @@ def _delayed_public_recovery_case(tmp_path, monkeypatch):
             point = "    try:\n        yield proof"
             assert text.count(point) == 1
             text = text.replace(point, "    try:\n        import json, os, signal\n"
-                + "        Path(" + repr(str(receipt)) + ").write_text(json.dumps({'guardian': proof.receipt['guardian'], 'cli': os.getpid()}))\n"
+                + "        staged = Path(" + repr(str(receipt.with_suffix('.tmp'))) + ")\n"
+                + "        staged.write_text(json.dumps({'guardian': proof.receipt['guardian'], 'cli': os.getpid()}))\n"
+                + "        staged.replace(" + repr(str(receipt)) + ")\n"
                 + "        signal.pause()\n        yield proof")
         return original_write(path, text, *args, **kwargs)
     monkeypatch.setattr(Path, "write_text", delayed)
     import subprocess
     prepared = restorable_public_resume(tmp_path, monkeypatch, "managed-checkout")
+    _restore_guardian_checkout(prepared)
+    from support.worker_process_timing import wait_until
+    with subprocess.Popen(prepared.command, env=prepared.environment, cwd=tmp_path,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as cli:
+        try:
+            wait_until(lambda: receipt.exists() or cli.poll() is not None, timeout=15)
+            assert receipt.exists(), cli.communicate(timeout=1)
+            with pytest.raises(subprocess.TimeoutExpired) as timed_out:
+                cli.communicate(timeout=0.05)
+            assert timed_out.value.timeout == 0.05 and timed_out.value.cmd == prepared.command
+            # Exercise the isolated runner's cleanup on the real exception.
+            raise timed_out.value
+        finally:
+            cli.kill()
+            cli.communicate(timeout=3)
+
+
+def _restore_guardian_checkout(prepared):
     # This case tests a guardian timeout, not the separate missing-checkout
     # rejection. Restore the exact retained directory before public admission.
     assert prepared.database.read_bytes() == prepared.backup
@@ -419,23 +439,15 @@ def _delayed_public_recovery_case(tmp_path, monkeypatch):
     assert (restored.st_dev, restored.st_ino) == (original.st_dev, original.st_ino)
     assert (restored_git.st_dev, restored_git.st_ino) == (original_git.st_dev, original_git.st_ino)
     assert prepared.database.read_bytes() == prepared.backup
-    result = subprocess.run(prepared.command, env=prepared.environment, cwd=tmp_path,
-                            text=True, capture_output=True, timeout=15)
-    pytest.fail("Delayed recovery returned before the expected guardian timeout: " + repr({
-        "returncode": result.returncode, "guardian_receipt_exists": receipt.exists(),
-        "stdout": {"bytes": len(result.stdout.encode()), "head": result.stdout[:4096], "tail": result.stdout[-4096:]},
-        "stderr": {"bytes": len(result.stderr.encode()), "head": result.stderr[:4096], "tail": result.stderr[-4096:]},
-    }))
 
 
 def test_public_resume_timeout_reaps_exact_guardian_without_touching_unrelated_child(tmp_path, monkeypatch):
-    import subprocess
     from agent_run.runtime.process_identity import _process_start_token
 
     with guardian_timeout_owners(tmp_path) as (receipt, unrelated, unrelated_token):
-        with pytest.raises((subprocess.TimeoutExpired, pytest.fail.Exception)) as failed:
+        # The isolated runner returns the child's traceback over its socket.
+        with pytest.raises(pytest.fail.Exception, match=r"(?m)^subprocess\.TimeoutExpired: Command .* timed out after 0\.05 seconds$") as failed:
             _delayed_public_recovery_case(tmp_path, monkeypatch)
-        assert "timed out after 15 seconds" in str(failed.value)
         assert not getattr(failed.value, "__notes__", ()), "Owned cleanup must not fail behind the expected timeout"
         recorded = json.loads(receipt.read_text())
         guardian = recorded["guardian"]
@@ -575,9 +587,8 @@ def test_guardian_timeout_scope_reaps_only_its_exact_receipted_child(tmp_path, m
 
 
 @pytest.mark.parametrize('database_changed', [False, True], ids=['original', 'changed-database'])
-def test_delayed_recovery_restores_original_checkout_before_its_timeout_window(tmp_path, monkeypatch, database_changed):
+def test_delayed_recovery_restores_original_checkout_before_its_timeout_window(tmp_path, database_changed):
     """Preparation order only; no guardian, Host, Worker or process is started."""
-    import subprocess
     from types import SimpleNamespace
     saved, checkout = tmp_path / 'trusted-checkout', tmp_path / 'original-checkout'
     saved.mkdir()
@@ -589,33 +600,15 @@ def test_delayed_recovery_restores_original_checkout_before_its_timeout_window(t
     backup = b'Original retained database bytes'
     database.write_bytes(backup + (b'changed' if database_changed else b''))
     before = database.read_bytes()
-    command, environment = ['unexecuted-private-resume'], {'HOME': str(tmp_path)}
-    prepared = SimpleNamespace(saved_checkout=saved, checkout=checkout, database=database,
-        backup=backup, damaged=before, command=command, environment=environment)
-    module = __import__(__name__)
-    def preparation(root, patch, missing):
-        assert root == tmp_path and patch is monkeypatch and missing == 'managed-checkout'
-        return prepared
-    monkeypatch.setattr(module, 'restorable_public_resume', preparation)
-    timeout = subprocess.TimeoutExpired(command, 15)
-    calls = []
-    def resume(arguments, **options):
-        calls.append(arguments)
-        assert arguments is command and options['env'] is environment
-        assert options['cwd'] == tmp_path and options['timeout'] == 15
+    prepared = SimpleNamespace(saved_checkout=saved, checkout=checkout, database=database, backup=backup)
+    if database_changed:
+        with pytest.raises(AssertionError):
+            _restore_guardian_checkout(prepared)
+        assert saved.is_dir() and not checkout.exists()
+    else:
+        _restore_guardian_checkout(prepared)
         assert not saved.exists() and checkout.is_dir()
         assert (checkout.stat().st_dev, checkout.stat().st_ino) == identity
         assert ((checkout / '.git').stat().st_dev, (checkout / '.git').stat().st_ino) == git_identity
         assert (checkout / 'original.txt').read_bytes() == b'Original retained work\x00\xff'
-        assert database.read_bytes() == backup
-        raise timeout
-    monkeypatch.setattr(subprocess, 'run', resume)
-    if database_changed:
-        with pytest.raises(AssertionError):
-            _delayed_public_recovery_case.__wrapped__(tmp_path, monkeypatch)
-        assert calls == [] and saved.is_dir() and not checkout.exists()
-    else:
-        with pytest.raises(subprocess.TimeoutExpired) as failed:
-            _delayed_public_recovery_case.__wrapped__(tmp_path, monkeypatch)
-        assert failed.value is timeout and calls == [command]
     assert database.read_bytes() == before

@@ -81,6 +81,13 @@ if outcome == 'normal':
     os._exit(0)
 signal.pause()
 \"\"\"
+if helper == 'systemd' and outcome == 'timeout':
+    from agent_run.adapters import systemd
+    capture = systemd.capture_command
+    def short_capture(process, *, timeout, max_output):
+        assert timeout == 5
+        return capture(process, timeout=0.05, max_output=max_output)
+    systemd.capture_command = short_capture
 if helper == 'github_read':
     command = command.replace("print('normal output', flush=True)", "print('{}', flush=True)")
 def structured_read(arguments, sample):
@@ -141,9 +148,7 @@ try:
             guard_fired.set()
             if (sample / 'child.pid').exists():
                 os.kill(int((sample / 'child.pid').read_text()), signal.SIGKILL)
-        # Systemd's real five-second command deadline precedes cleanup; keep
-        # the original three-second rescue allowance after that deadline.
-        guard = threading.Timer(8 if helper == 'systemd' and outcome == 'timeout' else 3, rescue)
+        guard = threading.Timer(3, rescue)
         try:
             arguments = [sys.executable, '-c', command, str(sample), outcome, 'escaped' if escaped else 'owned']
             if helper == 'git':

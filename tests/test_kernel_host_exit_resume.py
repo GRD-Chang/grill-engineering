@@ -180,8 +180,8 @@ def test_exact_host_exit_recovers_original_preparation_without_invocation_or_cha
 
 
 @pytest.mark.parametrize('stage',['approval','complete'])
-def test_normal_quiescent_host_exit_creates_no_artificial_resume_boundary(tmp_path,stage):
-    scenario=Scenario(tmp_path/'scenario',DeliveryKind.PARENT_ONLY)
+def test_normal_quiescent_host_exit_creates_no_artificial_resume_boundary(tmp_path,stage, parent_at_approval):
+    scenario = parent_at_approval
     kernel,host,running,_=managed_run(scenario,tmp_path)
     assert scenario.run().kind=='approval'
     if stage=='complete':
@@ -283,8 +283,8 @@ def test_durable_original_raw_is_consumed_before_any_replacement_invocation(tmp_
         assert tx.get(row['result_id'],original.subject)==raw
 
 
-def test_host_exit_does_not_block_continuation_of_an_already_approved_final_action(tmp_path):
-    scenario=Scenario(tmp_path/'scenario',DeliveryKind.PARENT_ONLY)
+def test_host_exit_does_not_block_continuation_of_an_already_approved_final_action(tmp_path, parent_at_approval):
+    scenario = parent_at_approval
     kernel,host,running,_=managed_run(scenario,tmp_path)
     assert scenario.run().kind=='approval'
     assert kernel.control('approve','original-final-grant',subject=scenario.delivery.key,world=scenario.world())=='pending'

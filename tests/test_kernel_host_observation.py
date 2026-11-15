@@ -67,8 +67,8 @@ def test_managed_activation_reads_the_original_sent_target_once(tmp_path, monkey
     assert sum(item["operation"] == "push" for item in scenario.port.writes()) == 1
 
 
-def test_managed_approval_observation_is_finite_and_passive_afterwards(tmp_path, monkeypatch):
-    scenario = managed_parent(tmp_path)
+def test_managed_approval_observation_is_finite_and_passive_afterwards(tmp_path, monkeypatch, parent_at_approval):
+    scenario = admit_scenario(parent_at_approval, tmp_path)
     assert scenario.run().kind == "approval"
     before = scenario.kernel.status(scenario.delivery.key)["budgets"]
     runner = scenario.runner()

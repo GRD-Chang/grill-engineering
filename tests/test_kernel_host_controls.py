@@ -5,10 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.model import DeliveryKind, Policy
+from agent_run.model import Policy
 from agent_run.errors import KernelError
 from agent_run.model import Execution, HostObservation
-from support.offline import GraphScenario, Scenario
+from support.offline import GraphScenario
 from agent_run.model import Issue, ParentIssue, Requirements
 from support.core_operations import CoreOperations
 
@@ -66,8 +66,8 @@ def test_busy_host_applies_resume_message_once_and_preserves_the_ticket_queue(tm
     assert len(applied) == 1
 
 
-def test_busy_host_applies_approval_to_the_original_delivery(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / "delivery", DeliveryKind.PARENT_ONLY)
+def test_busy_host_applies_approval_to_the_original_delivery(tmp_path: Path, parent_at_approval) -> None:
+    scenario = parent_at_approval
     scenario.kernel.control("stop", "retire-fixture")
     scenario.kernel.confirm_executor_exit(scenario.execution)
     scenario.kernel.control("resume", "prepare-managed")

@@ -1,13 +1,11 @@
 """Pure durable Stop uses the exact Task even without a running Host."""
 
 from support.repository_fixture import create_kernel
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from agent_run.contracts.task import TaskKey
-from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.model import Execution, HostObservation
 from support.offline import GraphScenario
@@ -15,31 +13,8 @@ from support.repository_fixture import foreign_task_run, read_binding
 import sqlite3
 from support.requirements_scenarios import independent_source
 from support.core_operations import CoreOperations
-from support.control_scenarios import managed_parent
 from support.environment import durable_snapshot
 from agent_run.storage.tasks import task_lock
-
-
-def test_completed_task_stop_preserves_the_terminal_result_without_an_action(tmp_path: Path) -> None:
-    scenario = managed_parent(tmp_path)
-    assert scenario.run(approve=True).kind == "complete"
-    kernel = scenario.kernel
-    request = kernel.host_request("start")
-    assert kernel.observe_host(request, HostObservation("exited", request.unit_name, "original", "/host", "boot",
-        exit_status=0, ended_at=111.0, usage_released=True)) == "exited"
-    before = kernel.source_status(), kernel.status(scenario.delivery.key), kernel.history(scenario.delivery.key)
-    assert before[1]["resource_cleanup"]["state"] == "complete"
-    assert kernel.active_host_action() is None and kernel.operation_state().active == ()
-    with kernel.storage.transaction(write=False) as tx:
-        actions = [dict(row) for row in tx.all("SELECT * FROM actions ORDER BY rowid")]
-        assert tx.one("SELECT final_action,executor FROM runs")[0] is None
-        assert tx.one("SELECT final_action,executor FROM runs")[1] is None
-    assert kernel.stop_task("late-stop") == "complete"
-    assert kernel.stop_task("another-late-stop") == "complete"
-    assert (kernel.source_status(), kernel.status(scenario.delivery.key), kernel.history(scenario.delivery.key)) == before
-    with kernel.storage.transaction(write=False) as tx:
-        assert [dict(row) for row in tx.all("SELECT * FROM actions ORDER BY rowid")] == actions
-
 
 
 @pytest.mark.parametrize("host_state", ["unlaunched", "unknown", "rebound"])
