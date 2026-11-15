@@ -1,5 +1,4 @@
 """Diagnostic non-interference; no native Host or business completion proof."""
-from contextlib import nullcontext
 import faulthandler
 import json
 import os
@@ -186,40 +185,23 @@ def test_observer_does_not_arm_native_dump_even_with_old_snapshot_environment(tm
 
 @pytest.mark.parametrize('failure', [RuntimeError('note unavailable'), TimeoutError('note watchdog')])
 def test_abandon_prefix_note_failure_still_rethrows_original_assertion(tmp_path, monkeypatch, failure):
-    # Exercise the actual story's prefix failure seam only. No public process,
-    # storage, manager, transport or execution evidence is supplied by these stubs.
-    path = Path(__file__).with_name('test_kernel_public_abandon_completed_ticket.py')
-    story = runpy.run_path(str(path))[
-        'test_public_abandon_recovers_its_completed_ticket_and_closes_unapproved_final_pr']
-    scope, seen, releases = story.__globals__, [], []
+    from support import managed_abandon_recovery
+
+    seen, releases = [], []
     release = SimpleNamespace(set=lambda: releases.append('released'))
     child = SimpleNamespace(poll=lambda: 0)
     kernel = SimpleNamespace(storage=SimpleNamespace(path=tmp_path / 'unopened.sqlite3', run_id='original'),
                              source_status=lambda: {'prefix': 'controlled failure'})
-    environment = {'PATH': os.defpath, 'ENTRY_APPROVAL_CONTROL': '@unused'}
 
     def note(error, **options):
         seen.append((error, options['stage']))
         raise failure
 
-    replacements = {
-        '_approval_read_barrier': lambda: nullcontext(('@unused', [], SimpleNamespace(wait=lambda _: False), release)),
-        '_hold_host_operation_return': lambda *args, **options: None,
-        '_control_environment': lambda *args, **options: (environment, tmp_path / 'unopened.json'),
-        'install_currentness': lambda *args: None,
-        '_git': lambda *args: 'unexecuted',
-        '_local_manager': lambda *args, **options: nullcontext((
-            SimpleNamespace(systemctl=tmp_path / 'systemctl'), SimpleNamespace(is_alive=lambda: False),
-            [], [child], [], [('--database', str(kernel.storage.path), '--run-id=original')], [(b'', b'')])),
-        'Kernel': lambda *args, **options: kernel,
-        'subprocess': SimpleNamespace(run=lambda *args, **options: SimpleNamespace(
-            returncode=0, stdout=json.dumps({'result': 'accepted', 'action_id': 'unexecuted'}), stderr='')),
-        '_managed_failure_note': note,
-    }
-    for name, value in replacements.items():
-        monkeypatch.setitem(scope, name, value)
+    monkeypatch.setattr(managed_abandon_recovery, '_managed_failure_note', note)
     with pytest.raises(AssertionError) as caught:
-        story(tmp_path, tmp_path, monkeypatch)
+        with managed_abandon_recovery.final_approval_hold(SimpleNamespace(wait=lambda _: False), release,
+                SimpleNamespace(is_alive=lambda: False), kernel, tmp_path, [child], 0):
+            pytest.fail('A failed approval observation continued to Abandon')
     assert len(seen) == 1 and caught.value is seen[0][0]
     assert seen[0][1] == 'abandon-before-first-final-approval'
     assert releases == ['released']

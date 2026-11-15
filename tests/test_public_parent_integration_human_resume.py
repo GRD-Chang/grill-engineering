@@ -21,7 +21,10 @@ from agent_run.core.kernel import Kernel
 from agent_run.model import Commit, Delivery, DeliveryKind, RunSpec, wire_json
 from agent_run.runtime.process_identity import _process_binding_status
 from support.core_operations import CoreOperations, Ports, delivery_run, native_agent_fixture, scripted_return, source_operations
+from agent_run.runtime.package_lease import default_runner_lock_path, runner_management_lease
 from support.fixture_text import replace_once
+from support.managed_abandon_transport import install_currentness
+from support.managed_abandon_recovery import abandon_at_approval, final_approval_hold, report_abandon_failure
 from support.offline import OfflinePort, review_result
 from support.repository_fixture import create_kernel
 from support.run_scoped_kernel import ScopedKernel
@@ -85,7 +88,8 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
 def _hold_human_return(directory, monkeypatch):
     """Pause only after the real Core has committed the exact HumanBlocker."""
     directory.mkdir()
-    (directory / 'sitecustomize.py').write_text("""import os, sys
+    hook = directory / 'sitecustomize.py'
+    hook.write_text("""import os, sys
 if sys.orig_argv[1:3] == ['-m', 'agent_run.runtime.executor']:
     import socket
     from agent_run.core.operation_runner import OperationRunner
@@ -96,18 +100,28 @@ if sys.orig_argv[1:3] == ['-m', 'agent_run.runtime.executor']:
         step = original(self, agent_capacity=agent_capacity)
         if not held and step.subject == 'final:1' and step.kind == 'paused' and step.reason == 'human_blocker':
             held = True
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
-                channel.settimeout(25)
-                channel.connect(chr(0) + os.environ['ENTRY_INTEGRATION_HUMAN'][1:])
-                channel.sendall(b'1'); channel.shutdown(socket.SHUT_WR)
-                assert channel.recv(1) == b'1'
+            address = os.environ['ENTRY_INTEGRATION_HUMAN']
+        elif held and step.kind in {'progress', 'approval'} and step.call is None:
+            address = os.environ['ENTRY_INTEGRATION_APPROVAL']
+        else:
+            return step
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+            channel.settimeout(25)
+            channel.connect(chr(0) + address[1:])
+            channel.sendall(b'1'); channel.shutdown(socket.SHUT_WR)
+            assert channel.recv(1) == b'1'
         return step
     OperationRunner.run_once = observed
 """)
+    with hook.open('a') as stream:
+        stream.write(f"    sys.path.insert(0, {str(Path(__file__).parent)!r})\n"
+                     "    from pathlib import Path\n"
+                     "    from support.host_close_trace import install\n"
+                     f"    install(Path({str(directory / 'close-trace.jsonl')!r}))\n")
     monkeypatch.setenv('PYTHONPATH', str(directory) + os.pathsep + os.environ.get('PYTHONPATH', ''))
 
 
-def test_public_parent_integration_human_resume_reuses_work_in_new_development_thread(git_repo, tmp_path, monkeypatch):
+def test_public_resume_repairs_final_then_abandon_recovers_the_completed_ticket(git_repo, tmp_path, monkeypatch):
     (git_repo / 'shared.txt').write_text('Base content\n')
     _git(git_repo, 'add', 'shared.txt')
     _git(git_repo, 'commit', '-m', 'Integration conflict base')
@@ -121,10 +135,13 @@ def test_public_parent_integration_human_resume_reuses_work_in_new_development_t
         workers.bind('')
         workers.listen(2)
         monkeypatch.setenv('ENTRY_INTEGRATION_WORKER', '@' + workers.getsockname()[1:].decode())
-        _hold_human_return(tmp_path / 'integration-hook', monkeypatch)
+        _hold_human_return(tmp_path / 'host-return-hook', monkeypatch)
         environment, state = _control_environment(git_repo, tmp_path, monkeypatch, codex=_codex(), tickets=(2,))
         address, databases, reached, release = barriers.enter_context(_approval_read_barrier(boundary=blocked))
+        install_currentness(tmp_path, state)
+        approval_address, approval_runs, at_approval, release_approval = barriers.enter_context(_approval_read_barrier())
         environment['ENTRY_INTEGRATION_HUMAN'] = address
+        environment['ENTRY_INTEGRATION_APPROVAL'] = approval_address
         with _local_manager(tmp_path / 'manager', environment, host_timeout=180) as (manager, serving, errors, children, trace, commands, output):
             deadline = time.monotonic() + 180
             environment['PATH'] = str(Path(manager.systemctl).parent) + os.pathsep + environment['PATH']
@@ -160,6 +177,7 @@ def test_public_parent_integration_human_resume_reuses_work_in_new_development_t
                 path = Path(command[command.index('--database') + 1])
                 kernel = Kernel(path, run_id=accepted['run_id'])
                 databases.append(kernel)
+                approval_runs.append(kernel)
                 original_host = kernel.host_request(accepted['action_id'])
                 for role in ('development', 'review', 'publication'):
                     event, channel = next_worker()
@@ -268,9 +286,9 @@ def test_public_parent_integration_human_resume_reuses_work_in_new_development_t
                 with closing(channel):
                     assert publication['role'] == 'publication'
                     channel.sendall(b'1')
-                serving.join(timeout=remaining())
-                assert not serving.is_alive() and not errors, (errors, output)
-                assert len(children) == len(commands) == 1 and children[0].returncode == 0
+                barriers.enter_context(final_approval_hold(at_approval, release_approval, serving, reopened,
+                                                          tmp_path, children, deadline))
+                assert serving.is_alive() and children[0].poll() is None
                 final = reopened.status('final:1')
                 assert final['phase'] == 'approval' and final['generation'] == before['generation']
                 assert final['budgets']['integration']['window'] == budget['window']
@@ -297,8 +315,19 @@ def test_public_parent_integration_human_resume_reuses_work_in_new_development_t
                 assert all(_process_binding_status(process['pid'], process['start_token']) == 'absent' for process in owned_processes)
                 assert len(json.loads(state.read_text())['prs']) == 2  # Ticket and Final only.
                 assert _git(tmp_path / 'origin.git', 'rev-parse', 'refs/heads/main') == external_head
-                assert trace == ['fdstore', 'barrier', 'host_exited', 'store_closed']
+                with abandon_at_approval(public, reopened, accepted, state, external_head, deadline):
+                    release_approval.set()
+                    with report_abandon_failure('abandon-host-after-barrier-release', reopened, tmp_path, children):
+                        serving.join(timeout=remaining())
+                        assert not serving.is_alive() and not errors, (errors, output)
+                        assert len(children) == len(commands) == 1 and children[0].returncode == 0
+                        assert trace == ['fdstore', 'barrier', 'host_exited', 'store_closed']
+                assert _rows(sibling) == sibling_rows
+                with runner_management_lease(default_runner_lock_path(environment)):
+                    pass
+                assert _git(git_repo, 'status', '--porcelain=v1') == ''
             finally:
+                release_approval.set()
                 release.set()
 
 
