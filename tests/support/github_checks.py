@@ -29,139 +29,56 @@ def repository_response(arguments: Sequence[str], *, repository: str,
     return subprocess.CompletedProcess(command, 0, json.dumps(data), "")
 
 
-CHECK_ROLLUP_FAKE = r'''
-def fixture_prs(data):
-    return [data['pull_request']] if data.get('pull_request') else data.get('prs', [])
+def check_response(args, data, log):
+    """Serve one CLI response from external PR, rule, job and check facts."""
+    from io import StringIO
+    from pathlib import Path
+    from support.check_rollup import current_checks, print_latest_response
 
-def current_checks(data, fields):
-    if data.get('rollup_http'):
-        print('HTTP ' + str(data['rollup_http']), file=sys.stderr)
-        raise SystemExit(1)
-    if 'rollup_pages' in data:
-        page = data['rollup_pages'][fields.get('cursor', '')]
-        if page.get('http'):
-            print('HTTP ' + str(page['http']), file=sys.stderr)
-            raise SystemExit(1)
-        return page
-    matches = [pr for pr in fixture_prs(data) if pr['number'] == int(fields['number'])]
-    if len(matches) > 1:
-        raise ValueError('Duplicate fixture PR number')
-    if not matches:
-        return {'data': {'repository': {'pullRequest': None}}}
-    pr = matches[0]
-    sha = pr['head']['sha']
-    nodes = fixture_check_nodes(data, sha)
-    return {'data': {'repository': {'pullRequest': {'number': pr['number'],
-        'headRefOid': sha, 'commits': {'nodes': [{'commit': {'oid': sha,
-        'statusCheckRollup': {'contexts': {'nodes': nodes,
-            'pageInfo': {'hasNextPage': False, 'endCursor': None}}}}}]}}}}}
-
-def fixture_check_nodes(data, sha):
-    checks = data.get('checks', [])
-    nodes = checks
-    if isinstance(checks, list):
-        nodes = []
-        for index, check in enumerate(checks):
-            bucket = check.get('bucket')
-            conclusion = {'pass': 'SUCCESS', 'fail': 'FAILURE', 'cancel': 'CANCELLED',
-                          'skipping': 'SKIPPED', 'neutral': 'NEUTRAL'}.get(bucket, check.get('state', bucket))
-            nodes.append({'__typename': 'CheckRun', 'id': 'check-' + str(index),
-                'databaseId': index + 1, 'name': check['name'], 'isRequired': True,
-                'status': 'QUEUED' if bucket == 'pending' else 'COMPLETED', 'conclusion': conclusion,
-                'detailsUrl': check.get('link'), 'title': check.get('description', ''),
-                'checkSuite': {'id': 'suite-current', 'databaseId': 101, 'commit': {'oid': sha},
-                    'app': {'databaseId': 1001},
-                    'workflowRun': {'workflow': {'name': check.get('workflow', '')}}}})
-    return nodes
-'''
-
-LATEST_CHECK_FAKE = r'''
-def fixture_commit_nodes(data, head):
-    if 'rollup_pages' in data:
-        nodes = []
-        for page in data['rollup_pages'].values():
-            if 'data' in page and not page.get('errors'):
-                nodes.extend(page['data']['repository']['pullRequest']['commits']['nodes'][0]['commit']['statusCheckRollup']['contexts']['nodes'])
-        return nodes
-    if any(pr['head']['sha'] == head for pr in fixture_prs(data)):
-        return fixture_check_nodes(data, head)
-    return []
-
-def _latest_check_pages(data, endpoint):
-    from urllib.parse import urlsplit, parse_qs
-    parsed = urlsplit(endpoint)
-    if not ('/commits/' in parsed.path and parsed.path.endswith(('/check-runs', '/check-suites', '/status'))):
-        return None
-    head = parsed.path.split('/commits/')[1].split('/')[0]
-    if parsed.path.endswith('/check-suites'):
-        if 'suite_pages_after' in data:
-            with open(os.environ['SOURCE_TEST_LOG']) as stream:
-                if sum('/check-suites?' in line for line in stream) > 1: return data['suite_pages_after']
-        if 'suite_pages' in data: return data['suite_pages']
-        scope = {}
-        for node in fixture_commit_nodes(data, head):
-            suite = node.get('checkSuite') or {}
-            if suite.get('databaseId'):
-                scope[suite['databaseId']] = {'id':suite['databaseId'], 'head_sha':head,
-                                            'app':{'id':(suite.get('app') or {}).get('databaseId')}}
-        rows = list(scope.values())
-        count = data.get('suite_count', len(rows))
-        if 'suite_count_after' in data:
-            with open(os.environ['SOURCE_TEST_LOG']) as stream:
-                reads = sum('/check-suites?' in line for line in stream)
-            if reads > 1:
-                count = data['suite_count_after']
-                if count == 2 and len(rows) == 1:
-                    rows.append({'id':99999,'head_sha':head,'app':{'id':1001}})
-        if 'suite_sample' in data: rows = [data['suite_sample']]
-        return {'total_count': count, 'check_suites': rows}
-    if data.get('latest_http'):
-        print('HTTP ' + str(data['latest_http']), file=sys.stderr)
-        raise SystemExit(1)
-    if parsed.path.endswith('/check-runs'):
-        query = parse_qs(parsed.query)
-        assert query['filter'] == ['latest'] and 'status' not in query
-        if 'latest_pages' in data:
-            return data['latest_pages']
-        app = int(query['app_id'][0])
-    nodes = data.get('latest_nodes')
-    if nodes is None:
-        nodes = fixture_commit_nodes(data, head)
-    if parsed.path.endswith('/status'):
-        if 'status_pages' in data: return data['status_pages']
-        rows = [{'id': index + 1, 'node_id': n['id'], 'context': n['context'], 'state': n['state'].lower()}
-                for index, n in enumerate(nodes) if n.get('__typename') == 'StatusContext']
-        return [{'sha': head, 'total_count': len(rows), 'statuses': rows}]
-    rows = []
-    for node in nodes:
-        if node.get('__typename') != 'CheckRun': continue
-        suite = node.get('checkSuite') or {}
-        observed_app = (suite.get('app') or {}).get('databaseId')
-        if observed_app != app: continue
-        rows.append({'id': node.get('databaseId'), 'name': node['name'],
-                     'app': {'id': observed_app}, 'head_sha': (suite.get('commit') or {}).get('oid'),
-                     'check_suite': {'id': suite.get('databaseId')}, 'status': node['status'].lower(),
-                     'conclusion': str(node.get('conclusion')).lower()})
-    return [{'total_count': len(rows), 'check_runs': rows}]
-
-def latest_check_response(data, endpoint):
-    from urllib.parse import urlsplit, parse_qs
-    pages = _latest_check_pages(data, endpoint)
-    if '--slurp' in sys.argv: return pages
-    if not isinstance(pages,list): pages = [pages]
-    index = int(parse_qs(urlsplit(endpoint).query).get('page',['1'])[0]) - 1
-    if index < len(pages): return pages[index]
-    field = 'check_runs' if '/check-runs?' in endpoint else 'check_suites' if '/check-suites?' in endpoint else 'statuses'
-    return {**pages[0], field:[]}
-
-def print_latest_response(data, args):
-    from urllib.parse import urlsplit, parse_qs
+    stdout, stderr = StringIO(), StringIO()
+    code = 0
     endpoint = args[1]
-    payload = latest_check_response(data, endpoint)
-    if '--include' in args:
-        pages = _latest_check_pages(data, endpoint)
-        index = int(parse_qs(urlsplit(endpoint).query).get('page',['1'])[0]) - 1
-        links = '\r\nLink: <https://api.github.com/ignored?page=next>; rel="next"' if isinstance(pages,list) and index + 1 < len(pages) else ''
-        print(data.get('latest_headers', 'HTTP/1.1 200 OK' + links + '\r\n\r\n'), end='')
-    print(json.dumps(payload))
-'''
+    if args[:2] == ['repo', 'view'] or (args[0] == 'api' and '/git/ref/heads/' in endpoint):
+        return repository_response(args, repository=data['repository'], default_branch=data['default_branch'],
+                                   refs=data['refs'], errors=data.get('ref_errors'))
+    try:
+        if args[:2] == ['api', 'graphql']:
+            fields = dict(value.split('=', 1) for index, value in enumerate(args) if index and args[index-1] in ('-F', '-f'))
+            assert 'CurrentRequiredChecks' in fields['query']
+            print(json.dumps(current_checks(data, fields, stderr=stderr)), file=stdout)
+        elif args[0] == 'api' and '/commits/' in endpoint:
+            assert endpoint.split('?')[0].endswith(('/check-runs', '/check-suites', '/status'))
+            print_latest_response(data, args, stdout=stdout, stderr=stderr)
+        elif args[:2] == ['api', 'repos/example/project/pulls/17']:
+            pr = data['pull_request']
+            if 'pr_head_after' in data:
+                reads = sum(json.loads(line)[:2] == args[:2] for line in Path(log).read_text().splitlines())
+                if reads > 1:
+                    pr['head']['sha'] = data['pr_head_after']
+            print(json.dumps(pr), file=stdout)
+        elif args[0] == 'api' and endpoint.startswith('repos/example/project/actions/jobs/'):
+            if endpoint.endswith('/logs'):
+                if data.get('logs_http'):
+                    return subprocess.CompletedProcess(args, 1, '', 'HTTP ' + str(data['logs_http']))
+                stdout.write(data['job_logs'])
+            else:
+                print(json.dumps(data['job']), file=stdout)
+        elif args[:2] == ['pr', 'checks']:
+            assert '--required' in args
+            print(json.dumps(data['checks']), file=stdout)
+        elif args[:2] == ['api', 'repos/example/project/rulesets']:
+            assert '--paginate' in args and '--slurp' in args
+            print(json.dumps([data['rulesets']]), file=stdout)
+        elif args[0] == 'api' and endpoint.startswith('repos/example/project/rulesets/'):
+            print(json.dumps(data['ruleset_detail']), file=stdout)
+        else:
+            classic = f"repos/example/project/branches/{quote(data['default_branch'], safe='')}/protection/required_status_checks"
+            assert args[:2] in (['api', classic], ['api', classic + '/contexts']), args
+            if data.get('classic_http'):
+                return subprocess.CompletedProcess(args, 1, '', 'HTTP ' + str(data['classic_http']))
+            checks = data.get('classic_checks', [{'context': context, 'app_id': None} for context in data['classic']])
+            result = data['classic'] if endpoint.endswith('/contexts') else {'contexts': data['classic'], 'checks': checks}
+            print(json.dumps(result), file=stdout)
+    except SystemExit as error:
+        code = error.code
+    return subprocess.CompletedProcess(args, code, stdout.getvalue(), stderr.getvalue())

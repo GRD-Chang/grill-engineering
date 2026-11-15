@@ -19,7 +19,15 @@ from agent_run.errors import KernelError
 from agent_run.adapters.remote import RemoteEffects
 from agent_run.core.operation_contract import ReadUnavailable
 from support.effect_boundary import EffectBoundary, effect_boundary
-from support.remote_effects import _change, _fixture, _pr_effect, _publish_pr, _source_kernel
+from support.remote_effects import _change, _fixture, _pr_effect, _publish_pr, _source_kernel, existing_pr
+
+
+@pytest.fixture
+def immediate_read_retries(monkeypatch):
+    from types import SimpleNamespace
+    from agent_run.adapters import github_commands
+
+    monkeypatch.setattr(github_commands, 'time', SimpleNamespace(sleep=lambda _seconds: None))
 
 
 def test_publish_uses_exact_remote_lease_and_does_not_repeat_a_lost_response(tmp_path, monkeypatch):
@@ -97,7 +105,7 @@ def test_written_pr_target_settles_after_base_append_without_another_write(tmp_p
 
 
 @pytest.mark.parametrize("lost_response", [True, False], ids=["failed-command", "successful-command"])
-def test_lost_write_response_and_failed_readback_retain_both_observed_outcomes(tmp_path, monkeypatch, lost_response):
+def test_lost_write_response_and_failed_readback_retain_both_observed_outcomes(tmp_path, monkeypatch, lost_response, immediate_read_retries):
     port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
     assert port.execute(push, WriteAuthority(lambda: lambda: None)).disposition == "target"
     pr = _pr_effect(push)
@@ -119,8 +127,8 @@ def test_lost_write_response_and_failed_readback_retain_both_observed_outcomes(t
 
 @pytest.mark.parametrize("field", ["actor", "head_repository", "title", "closed"])
 def test_pr_foreign_original_facts_cannot_be_overwritten_or_replaced(tmp_path, monkeypatch, field):
-    port, _git, push, state, _calls = _fixture(tmp_path, monkeypatch)
-    effect, _pr = _publish_pr(port, push)
+    port, _git, push, state, _calls, _pr = existing_pr(tmp_path, monkeypatch)
+    effect = _pr_effect(push)
     document = json.loads(state.read_text())
     pr = document["prs"][0]
     if field == "actor": pr["user"]["login"] = "external-author"
@@ -134,8 +142,7 @@ def test_pr_foreign_original_facts_cannot_be_overwritten_or_replaced(tmp_path, m
 
 @pytest.mark.parametrize("method", ["squash", "merge"])
 def test_original_merge_ack_loss_settles_after_later_target_append(tmp_path, monkeypatch, method):
-    port, git, push, state, calls = _fixture(tmp_path, monkeypatch)
-    _effect, pr = _publish_pr(port, push)
+    port, git, push, state, calls, pr = existing_pr(tmp_path, monkeypatch)
     parents = [push.base.sha] + ([] if method == "squash" else [push.after_sha])
     merge = replace(push, effect_id="merge-1", operation="merge", pr_number=pr.number,
         payload={"method": method, "parents": parents,
@@ -171,8 +178,7 @@ def test_original_merge_ack_loss_settles_after_later_target_append(tmp_path, mon
 
 @pytest.mark.parametrize("changed", ["pr-title", "pr-body", "original-intent"])
 def test_squash_never_rebinds_an_original_intent_to_other_pr_text(tmp_path, monkeypatch, changed):
-    port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
-    _effect, pr = _publish_pr(port, push)
+    port, _git, push, state, calls, pr = existing_pr(tmp_path, monkeypatch)
     original_message = pr.title + "\n\n" + pr.body
     merge = replace(push, effect_id="original-squash", operation="merge", pr_number=pr.number,
         payload={"method": "squash", "parents": [push.base.sha], "commit_message": original_message})
@@ -238,8 +244,7 @@ def test_close_uses_original_comment_watermark_and_rejects_reopened_or_foreign_i
 
 def test_comment_collections_keep_distinct_issue_pr_and_foreign_identity(tmp_path, monkeypatch):
     import subprocess
-    port, _git, push, state, _calls = _fixture(tmp_path, monkeypatch)
-    _effect, pr = _publish_pr(port, push)
+    port, _git, push, state, _calls, pr = existing_pr(tmp_path, monkeypatch)
     assert pr.number == 17 and push.subject == "ticket:2"
     completion = replace(push, effect_id="completion-routing", operation="completion_comment", after_sha=None,
         pr_number=pr.number, payload={"issue": 2, "merge_sha": push.after_sha, "gate_mode": "reviewed", "kind": "ticket"})
@@ -270,7 +275,7 @@ def test_comment_collections_keep_distinct_issue_pr_and_foreign_identity(tmp_pat
     assert json.loads(state.read_text())["comments"] == document["comments"]
 
 
-def test_unknown_reads_and_unbound_close_never_authorize_a_write(tmp_path, monkeypatch):
+def test_unknown_reads_and_unbound_close_never_authorize_a_write(tmp_path, monkeypatch, immediate_read_retries):
     port, _git, effect, state, calls = _fixture(tmp_path, monkeypatch)
     close = replace(effect, operation="close", payload={"issue": 2, "merge_sha": effect.after_sha})
     assert port.execute(close, WriteAuthority(lambda: lambda: pytest.fail("no persisted close intent"))).disposition == "unknown"
@@ -340,7 +345,7 @@ def test_real_issue_ack_stays_optional_and_once_across_kernel_reopen(tmp_path, m
 
 
 @pytest.mark.parametrize("unavailable", [False, True], ids=["linked", "unavailable"])
-def test_original_issue_ack_is_durable_without_replaying_the_optional_write(tmp_path, monkeypatch, unavailable):
+def test_original_issue_ack_is_durable_without_replaying_the_optional_write(tmp_path, monkeypatch, unavailable, immediate_read_retries):
     """Real adapter ACK -> Core receipt -> SQLite reopen, without Agent delivery."""
     from agent_run.core.kernel import Kernel
     from agent_run.core.operation_contract import Work
@@ -429,8 +434,7 @@ def test_remote_cleanup_uses_selected_runner_transport_and_original_head(tmp_pat
 
 
 def test_observe_uses_real_requirements_remote_commits_and_required_ci_facts(tmp_path, monkeypatch):
-    port, git, push, state, calls = _fixture(tmp_path, monkeypatch)
-    _effect, published = _publish_pr(port, push)
+    port, git, push, state, calls, published = existing_pr(tmp_path, monkeypatch)
     # A real remote-only append is absent from this managed clone's object DB.
     other = tmp_path / "external-clone"
     git.run("clone", "--branch", "delivery", str(tmp_path / "origin.git"), str(other))

@@ -10,7 +10,7 @@ from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.core.operation_contract import DeliveryRead, ReadUnavailable
 from agent_run.model import Effect, Execution
 from support.offline import OfflinePort
-from support.remote_effects import _change, _fixture, _publish_pr
+from support.remote_effects import _change, existing_pr
 
 
 def _calls(path, start=0):
@@ -19,8 +19,7 @@ def _calls(path, start=0):
 
 @pytest.fixture
 def published(tmp_path, monkeypatch):
-    port, git, push, state, calls = _fixture(tmp_path, monkeypatch)
-    _original, pr = _publish_pr(port, push)
+    port, git, push, state, calls, pr = existing_pr(tmp_path, monkeypatch)
     request = DeliveryRead(push.source_ref, push.target_ref, pr.number, ())
     return port, git, push, pr, state, calls, request
 

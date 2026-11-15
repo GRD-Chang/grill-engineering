@@ -13,13 +13,12 @@ from agent_run.runtime.executor import _make_ports
 from support.core_operations import CoreOperations
 from agent_run.errors import KernelError
 from agent_run.model import ReadWait, Step
-from support.remote_effects import _fixture, _publish_pr, _source_kernel
+from support.remote_effects import _source_kernel, existing_pr
 from support.agent_continuation import _allocated_worker, RAW
 
 
 def test_executor_waits_for_real_pr_and_remote_ref_observations_to_converge(tmp_path, monkeypatch):
-    port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
-    _effect, published = _publish_pr(port, push)
+    port, _git, push, state, calls, published = existing_pr(tmp_path, monkeypatch)
     kernel = _source_kernel(tmp_path, port, push)
     now = 1000.25
     kernel.clock = lambda: now

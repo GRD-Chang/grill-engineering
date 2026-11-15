@@ -9,13 +9,12 @@ from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.model import ResourceWitness
 from agent_run.core.operation_contract import DeliveryRead, OperationPorts
 from agent_run.adapters.remote import RemoteEffects
-from support.remote_effects import publication
+from support.remote_effects import publication, existing_pr
 from support.remote_effects import _change, _fixture, _publish_pr
 
 
 def test_source_and_delivery_facts_need_no_core_or_database(tmp_path, monkeypatch):
-    port, git, push, state, calls = _fixture(tmp_path, monkeypatch)
-    _effect, published = _publish_pr(port, push)
+    port, git, push, state, calls, published = existing_pr(tmp_path, monkeypatch)
     _change(state, source_graph={"parent": {"number": 1, "title": "Parent", "body": "Whole requirement", "sub_issues": []},
                                  "issues": {}})
     ports: OperationPorts = port

@@ -9,7 +9,7 @@ from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.core.operation_contract import DeliveryRead, ReadUnavailable
 from agent_run.errors import GitHubReadError
 from agent_run.adapters import github_commands
-from support.remote_effects import _fixture, _publish_pr
+from support.remote_effects import _fixture, _pr_effect, existing_pr
 
 
 def _reads(path, start=0):
@@ -44,8 +44,7 @@ def _damage_basis(monkeypatch, mutation):
 
 
 def test_one_delivery_reads_each_complete_object_once_but_keeps_live_pr_checks(tmp_path, monkeypatch):
-    port, _git, push, _state, calls = _fixture(tmp_path, monkeypatch)
-    _original, pr = _publish_pr(port, push)
+    port, _git, push, _state, calls, pr = existing_pr(tmp_path, monkeypatch)
     start = len(_reads(calls))
     facts = port.delivery(DeliveryRead(push.source_ref, push.target_ref, pr.number, ()))
     observed = _reads(calls, start)
@@ -60,8 +59,7 @@ def test_one_delivery_reads_each_complete_object_once_but_keeps_live_pr_checks(t
 
 
 def test_merged_pr_retains_its_independent_first_parent_receipt_read(tmp_path, monkeypatch):
-    port, _git, push, _state, calls = _fixture(tmp_path, monkeypatch)
-    _original, pr = _publish_pr(port, push)
+    port, _git, push, _state, calls, pr = existing_pr(tmp_path, monkeypatch)
     merge = replace(push, effect_id='original-merge', operation='merge', pr_number=pr.number,
         payload={'method': 'merge', 'parents': [push.base.sha, push.after_sha],
                  'commit_message': 'Original complete object'})
@@ -82,8 +80,7 @@ def test_merged_pr_retains_its_independent_first_parent_receipt_read(tmp_path, m
 
 
 def test_next_observation_rereads_objects_refs_pr_and_actor(tmp_path, monkeypatch):
-    port, git, push, state, calls = _fixture(tmp_path, monkeypatch)
-    _original, pr = _publish_pr(port, push)
+    port, git, push, state, calls, pr = existing_pr(tmp_path, monkeypatch)
     request = DeliveryRead(push.source_ref, push.target_ref, pr.number, ())
     first = port.delivery(request)
     later = git.make_commit(pr.head.tree, (pr.head.sha,), 'New source object')
@@ -103,8 +100,7 @@ def test_next_observation_rereads_objects_refs_pr_and_actor(tmp_path, monkeypatc
 
 @pytest.mark.parametrize('fault', ['foreign-sha', 'missing-sha', 'invalid-tree', 'missing-tree', 'invalid-type', 'unavailable'])
 def test_completed_read_never_hides_a_later_invalid_or_unavailable_object(tmp_path, monkeypatch, fault):
-    port, _git, push, _state, calls = _fixture(tmp_path, monkeypatch)
-    _original, pr = _publish_pr(port, push)
+    port, _git, push, _state, calls, pr = existing_pr(tmp_path, monkeypatch)
     request = DeliveryRead(push.source_ref, push.target_ref, pr.number, ())
     assert port.delivery(request).source == pr.head
     seen = []
@@ -139,8 +135,7 @@ def test_completed_read_never_hides_a_later_invalid_or_unavailable_object(tmp_pa
 
 @pytest.mark.parametrize('replacement', ['different-object', 'short-sha', 'ref-name'])
 def test_pr_head_cannot_rebind_or_alias_an_object_read_from_the_source_ref(tmp_path, monkeypatch, replacement):
-    port, git, push, state, calls = _fixture(tmp_path, monkeypatch)
-    _original, pr = _publish_pr(port, push)
+    port, git, push, state, calls, pr = existing_pr(tmp_path, monkeypatch)
     other = git.make_commit(pr.head.tree, (pr.head.sha,), 'Unselected object')
     git.run('push', 'origin', other.sha + ':refs/heads/unselected')
     document = json.loads(state.read_text())
@@ -159,8 +154,8 @@ def test_pr_head_cannot_rebind_or_alias_an_object_read_from_the_source_ref(tmp_p
 
 
 def test_write_readback_uses_its_own_fresh_commit_reads_after_delivery(tmp_path, monkeypatch):
-    port, _git, push, _state, calls = _fixture(tmp_path, monkeypatch)
-    original, pr = _publish_pr(port, push)
+    port, _git, push, _state, calls, pr = existing_pr(tmp_path, monkeypatch)
+    original = _pr_effect(push)
     assert port.delivery(DeliveryRead(push.source_ref, push.target_ref, pr.number, ())).source == pr.head
     start = len(_reads(calls))
     observed = port.reconcile(original)
@@ -172,8 +167,7 @@ def test_write_readback_uses_its_own_fresh_commit_reads_after_delivery(tmp_path,
 
 @pytest.mark.parametrize('which', ['source', 'target'])
 def test_same_sha_changed_api_tree_cannot_be_hidden_by_reuse(tmp_path, monkeypatch, which):
-    port, _git, push, _state, calls = _fixture(tmp_path, monkeypatch)
-    _original, pr = _publish_pr(port, push)
+    port, _git, push, _state, calls, pr = existing_pr(tmp_path, monkeypatch)
     selected, wrong = (pr.head, pr.base) if which == 'source' else (pr.base, pr.head)
     assert selected.tree != wrong.tree
     seen = []
@@ -221,8 +215,8 @@ def test_absent_refs_do_not_read_a_default_local_head(tmp_path, monkeypatch):
 
 
 def test_delivery_cache_cannot_hide_a_malformed_write_readback(tmp_path, monkeypatch):
-    port, _git, push, _state, calls = _fixture(tmp_path, monkeypatch)
-    original, pr = _publish_pr(port, push)
+    port, _git, push, _state, calls, pr = existing_pr(tmp_path, monkeypatch)
+    original = _pr_effect(push)
     assert port.delivery(DeliveryRead(push.source_ref, push.target_ref, pr.number, ())).pr == pr
     read = port._api
     def malformed(endpoint, *args, **kwargs):

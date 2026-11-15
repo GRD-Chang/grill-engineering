@@ -10,7 +10,7 @@ import pytest
 
 from agent_run.adapters import github, github_commands, remote
 from agent_run.core.operation_contract import DeliveryRead, ReadUnavailable
-from support.remote_effects import _fixture, _publish_pr
+from support.remote_effects import _fixture, existing_pr
 
 
 def _query(command):
@@ -28,8 +28,7 @@ def _no_backoff(monkeypatch):
 
 @pytest.mark.parametrize('failure', ['malformed', 'scoped-nonzero'])
 def test_complete_source_returns_before_delivery_failure(tmp_path, monkeypatch, failure):
-    port, _, push, _, calls = _fixture(tmp_path, monkeypatch)
-    _, pr = _publish_pr(port, push)
+    port, _, push, _, calls, pr = existing_pr(tmp_path, monkeypatch)
     query = DeliveryRead(push.source_ref, push.target_ref, pr.number, (), read_checks=False)
     original = github_commands._run_bounded_command
     start = len(_reads(calls))
@@ -86,8 +85,7 @@ def test_same_oid_with_contradictory_projected_trees_is_rejected(tmp_path, monke
 
 
 def test_short_name_fallback_discards_projected_facts_and_rereads(tmp_path, monkeypatch):
-    port, _, push, state, calls = _fixture(tmp_path, monkeypatch)
-    _, pr = _publish_pr(port, push)
+    port, _, push, state, calls, pr = existing_pr(tmp_path, monkeypatch)
     query = DeliveryRead(push.source_ref, push.target_ref, pr.number, (), read_checks=False)
     original = github_commands._run_bounded_command
     start = len(_reads(calls))
@@ -114,8 +112,7 @@ def test_short_name_fallback_discards_projected_facts_and_rereads(tmp_path, monk
 
 
 def test_source_pagination_retry_discards_basis_and_preserves_two_delivery_attempts(tmp_path, monkeypatch):
-    port, _, push, state, calls = _fixture(tmp_path, monkeypatch)
-    _, pr = _publish_pr(port, push)
+    port, _, push, state, calls, pr = existing_pr(tmp_path, monkeypatch)
     document = json.loads(state.read_text())
     document['source_graph'] = {
         'parent': {'number': 1, 'title': 'Parent', 'body': 'Original Source', 'sub_issues': [2]},
@@ -162,8 +159,7 @@ def test_source_pagination_retry_discards_basis_and_preserves_two_delivery_attem
 
 
 def test_changed_core_demand_discards_old_delivery_error(tmp_path, monkeypatch):
-    port, _, push, _, calls = _fixture(tmp_path, monkeypatch)
-    _, pr = _publish_pr(port, push)
+    port, _, push, _, calls, pr = existing_pr(tmp_path, monkeypatch)
     speculative = DeliveryRead(push.source_ref, push.target_ref, pr.number, (), read_checks=False)
     actual = replace(speculative, pr_number=None, read_pr=False)
     original = github_commands._run_bounded_command
@@ -186,8 +182,7 @@ def test_changed_core_demand_discards_old_delivery_error(tmp_path, monkeypatch):
 
 
 def test_closing_refs_cover_changes_after_required_checks_complete(tmp_path, monkeypatch):
-    port, git, push, _, _ = _fixture(tmp_path, monkeypatch)
-    _, pr = _publish_pr(port, push)
+    port, git, push, _, _, pr = existing_pr(tmp_path, monkeypatch)
     later = git.make_commit(pr.head.tree, (pr.head.sha,), 'Concurrent update after checks')
     query = DeliveryRead(push.source_ref, push.target_ref, pr.number, ())
     checked = []
@@ -208,8 +203,7 @@ def test_closing_refs_cover_changes_after_required_checks_complete(tmp_path, mon
 
 
 def test_joint_capacity_overflow_splits_two_individually_legal_materials(tmp_path, monkeypatch):
-    port, _, push, state, calls = _fixture(tmp_path, monkeypatch)
-    _, pr = _publish_pr(port, push)
+    port, _, push, state, calls, pr = existing_pr(tmp_path, monkeypatch)
     document = json.loads(state.read_text())
     document['source_body'] = 'S' * 600_000
     document['prs'][0]['body'] = 'P' * 600_000

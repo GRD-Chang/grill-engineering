@@ -1,12 +1,17 @@
 """Selected Delivery GraphQL fields over the existing locked fake-gh state."""
 from copy import deepcopy
+from functools import cache
 
 
 def delivery_basis(document, fields, git, *, repository, actor, refresh_head=None, read_ref=None):
     repo = {'id': 'repository-' + repository, 'nameWithOwner': repository}
 
+    @cache
+    def raw_commit(sha):
+        return git('cat-file', 'commit', sha)
+
     def commit(sha):
-        raw = git('cat-file', 'commit', sha)
+        raw = raw_commit(sha)
         first = raw.split('\n', 1)[0]
         assert first.startswith('tree ')
         return {'__typename': 'Commit', 'oid': sha, 'tree': {'oid': first[5:]}}
@@ -50,7 +55,7 @@ def delivery_basis(document, fields, git, *, repository, actor, refresh_head=Non
                 'baseRefName': pr['base']['ref'], 'baseRefOid': pr['base']['sha'],
                 'mergeCommit': None if not pr['merged'] else {'oid': pr['merge_commit_sha']}}
             if pr['merged'] and 'parents(first:100)' in fields['query']:
-                raw = git('cat-file', 'commit', pr['merge_commit_sha'])
+                raw = raw_commit(pr['merge_commit_sha'])
                 parents = []
                 for line in raw.split('\n')[1:]:
                     if not line.startswith('parent '):

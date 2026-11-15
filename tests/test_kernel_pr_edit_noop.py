@@ -8,15 +8,15 @@ from pathlib import Path
 import pytest
 
 from agent_run.errors import KernelError
-from support.remote_effects import _fixture, _publish_pr
+from support.remote_effects import _pr_effect, existing_pr
 
 
 @pytest.mark.parametrize("mode", ["current", "stopped", "changed_head", "changed_base", "foreign", "stale_base"])
 def test_exact_original_pr_edit_noop_authorizes_and_rechecks_live_anchors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
 ) -> None:
-    port, git, push, state, calls = _fixture(tmp_path, monkeypatch)
-    original_effect, original = _publish_pr(port, push)
+    port, git, push, state, calls, original = existing_pr(tmp_path, monkeypatch)
+    original_effect = _pr_effect(push)
     revised = git.make_commit(original.head.tree, (original.head.sha,), "Repair the original PR head")
     git.run("push", "origin", revised.sha + ":" + push.source_ref)
     document = json.loads(state.read_text())
@@ -74,4 +74,4 @@ def test_exact_original_pr_edit_noop_authorizes_and_rechecks_live_anchors(
     assert prepared == ([] if mode == "stale_base" else [mode])
     observed_calls = [json.loads(line) for line in calls.read_text().splitlines()]
     writes = [call for call in observed_calls if "--method" in call]
-    assert len(writes) == 1 and "POST" in writes[0] and writes[0][1].endswith("/pulls")
+    assert writes == []

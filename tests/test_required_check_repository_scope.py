@@ -31,8 +31,6 @@ def test_required_checks_resolve_repository_once_and_refresh_the_next_observatio
         'rules': [{'type': 'required_status_checks', 'parameters': {
             'required_status_checks': [{'context': 'new-required', 'integration_id': None}]}}]}
     path.write_text(json.dumps(changed))
-    gh = tmp_path / 'bin' / 'gh'
-    gh.write_text(gh.read_text().replace('/branches/main/protection/', '/branches/trunk/protection/'))
     log.unlink()
     second = read_required_check_facts(reader, 17, expected_head_sha='2' * 40)
     calls = [json.loads(line) for line in log.read_text().splitlines()]

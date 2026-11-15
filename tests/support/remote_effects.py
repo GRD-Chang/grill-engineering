@@ -16,8 +16,7 @@ from agent_run.adapters.git_objects import LocalGit
 from agent_run.adapters.github import GhGitHubReader
 from agent_run.adapters.remote import RemoteEffects
 from agent_run.contracts.write_authority import WriteAuthority
-from agent_run.model import Effect, Execution
-from support.github_checks import CHECK_ROLLUP_FAKE, LATEST_CHECK_FAKE
+from agent_run.model import Effect, Execution, PullRequest
 from support.github_requirements import source_issue
 import pytest
 from agent_run.adapters.local_git import LocalEffects
@@ -88,7 +87,7 @@ def _fixture(tmp_path, monkeypatch, *, repository="example/project", actor="publ
     binary = tmp_path / "bin"
     binary.mkdir()
     fake = binary / "gh"
-    fake.write_text("#!" + sys.executable + "\n" +
+    fake.write_text("#!" + sys.executable + " -S\n" +
                     fake_gh(repository=repository, actor=actor))
     fake.chmod(0o755)
     monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
@@ -122,6 +121,25 @@ def _publish_pr(port, effect):
     return effect, result.pr
 
 
+def existing_pr(tmp_path, monkeypatch):
+    """Create only the real Git refs and external PR consumed by a read test."""
+    port, git, push, state, calls = _fixture(tmp_path, monkeypatch)
+    effect = _pr_effect(push)
+    git.run('push', 'origin', f'{push.after_sha}:{push.source_ref}')
+    pr = PullRequest(17, push.repository, push.source_ref, push.target_ref, push.candidate,
+                     push.base, effect.payload['title'], effect.payload['body'],
+                     actor=push.actor, head_repository=push.repository)
+    record = {'number': pr.number, 'state': 'open', 'merged': False, 'merge_commit_sha': None,
+              'title': pr.title, 'body': pr.body, 'user': {'login': pr.actor},
+              'head': {'ref': pr.source_ref.removeprefix('refs/heads/'), 'sha': pr.head.sha,
+                       'repo': {'full_name': pr.repository}},
+              'base': {'ref': pr.target_ref.removeprefix('refs/heads/'), 'sha': pr.base.sha,
+                       'repo': {'full_name': pr.repository}}}
+    _change(state, prs=[record])
+    calls.touch()
+    return port, git, push, state, calls, pr
+
+
 def _source_kernel(tmp_path, port, push):
     from agent_run.model import Delivery, DeliveryKind, RunSpec
     from agent_run.core.kernel import Kernel
@@ -140,7 +158,7 @@ def _source_kernel(tmp_path, port, push):
 
 FAKE_GH = ('import sys\nsys.path.insert(0, ' + repr(str(Path(__file__).parent.parent)) + ')\n'
            'from support.fixture_text import read_text, write_text\n'
-           + CHECK_ROLLUP_FAKE + LATEST_CHECK_FAKE) + r'''import json, os, sys
+           'from support.check_rollup import current_checks, print_latest_response\n') + r'''import json, os, sys
 args=sys.argv[1:]
 state=os.environ['REMOTE_TEST_STATE']
 import fcntl
@@ -346,7 +364,9 @@ def _reader(root: Path, monkeypatch, *, invalid: bool = False) -> tuple[GhGitHub
     initial = _reader_data(invalid=invalid)
     responses.write_text(json.dumps(initial))
     script = binary / 'gh'
-    script.write_text('#!' + sys.executable + '\n' + f'import sys\nsys.path.insert(0, {str(Path(__file__).parent.parent)!r})\nfrom support.github_checks import repository_response\n' + CHECK_ROLLUP_FAKE + LATEST_CHECK_FAKE + '''import json, os, sys
+    script.write_text(f'#!{sys.executable} -S\nimport sys\nsys.path.insert(0, {str(Path(__file__).parent.parent)!r})\n'
+                      'from support.github_checks import repository_response\n'
+                      'from support.check_rollup import current_checks\n' + '''import json, os, sys
 args=sys.argv[1:]
 import fcntl
 server_lock=open(os.environ['SOURCE_TEST_RESPONSES']+'.lock','a+')
@@ -394,40 +414,12 @@ elif args[:2]==['api','graphql']:
         if 'viewer' in delivery_data:result['data']['viewer']=delivery_data['viewer']
     if 'graphql_errors' in control: result['errors']=control['graphql_errors']
     print(json.dumps(result))
-elif args[:1]==['api'] and '/commits/' in args[1] and args[1].split('?')[0].endswith(('/check-runs','/check-suites','/status')):
-    with open(os.environ['SOURCE_TEST_RESPONSES']) as f: data=json.load(f)
-    print_latest_response(data,args)
-elif args[:2]==['api','repos/example/project/pulls/17']:
-    with open(os.environ['SOURCE_TEST_RESPONSES']) as f: data=json.load(f)
-    pr=data['pull_request']
-    with open(os.environ['SOURCE_TEST_LOG']) as f: count=sum(json.loads(line)[:2]==args[:2] for line in f)
-    if count>1 and 'pr_head_after' in data: pr['head']['sha']=data['pr_head_after']
-    print(json.dumps(pr))
-elif args[:1]==['api'] and args[1].startswith('repos/example/project/actions/jobs/'):
-    with open(os.environ['SOURCE_TEST_RESPONSES']) as f: data=json.load(f)
-    if args[1].endswith('/logs'):
-        if data.get('logs_http'):
-            print('HTTP '+str(data['logs_http']),file=sys.stderr)
-            raise SystemExit(1)
-        print(data['job_logs'],end='')
-    else:
-        print(json.dumps(data['job']))
-elif args[:2]==['pr','checks']:
-    assert '--required' in args
-    with open(os.environ['SOURCE_TEST_RESPONSES']) as f: print(json.dumps(json.load(f)['checks']))
-elif args[:2]==['api','repos/example/project/rulesets']:
-    assert '--paginate' in args and '--slurp' in args
-    with open(os.environ['SOURCE_TEST_RESPONSES']) as f: print(json.dumps([json.load(f)['rulesets']]))
-elif args[:1]==['api'] and args[1].startswith('repos/example/project/rulesets/'):
-    with open(os.environ['SOURCE_TEST_RESPONSES']) as f: print(json.dumps(json.load(f)['ruleset_detail']))
-elif args[:2] in (['api','repos/example/project/branches/main/protection/required_status_checks/contexts'], ['api','repos/example/project/branches/main/protection/required_status_checks']):
-    with open(os.environ['SOURCE_TEST_RESPONSES']) as f: data=json.load(f)
-    if data.get('classic_http'):
-        print('HTTP '+str(data['classic_http']),file=sys.stderr)
-        raise SystemExit(1)
-    print(json.dumps(data['classic'] if args[1].endswith('/contexts') else {'contexts':data['classic'], 'checks':data.get('classic_checks', [{'context':context,'app_id':None} for context in data['classic']])}))
 else:
-    raise SystemExit('Unexpected external command: '+repr(args))
+    from support.github_checks import check_response
+    with open(os.environ['SOURCE_TEST_RESPONSES']) as f: data=json.load(f)
+    result=check_response(args,data,os.environ['SOURCE_TEST_LOG'])
+    sys.stdout.write(result.stdout);sys.stderr.write(result.stderr)
+    raise SystemExit(result.returncode)
 ''')
     script.chmod(0o755)
     monkeypatch.setenv('PATH', str(binary) + os.pathsep + os.environ['PATH'])

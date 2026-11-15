@@ -17,6 +17,10 @@ from support.remote_effects import _reader
 def test_paginated_source_preserves_native_order_text_and_external_blockers(tmp_path: Path, monkeypatch) -> None:
     reader, log = _reader(tmp_path, monkeypatch)
     result = read_requirements(reader, 1)
+    from agent_run.model import Blocker, Issue, ParentIssue
+    assert isinstance(result.parent, ParentIssue)
+    assert all(isinstance(issue, Issue) for issue in result.issues)
+    assert all(isinstance(blocker, Blocker) for issue in result.issues for blocker in issue.blocked_by)
     assert result.parent.sub_issue_numbers == (9, 3) and result.parent.sub_issue_order_reliable is True
     assert result.parent.body == 'Original Parent body\r\n保留原文'
     assert tuple(issue.number for issue in result.issues) == (9, 3)
@@ -26,15 +30,6 @@ def test_paginated_source_preserves_native_order_text_and_external_blockers(tmp_
     assert all(args[0] in {'api', 'repo'} for args in calls)
     assert any('cursor=parent-next' in args for args in calls)
     assert any('cursor=blocker-next' in args for args in calls)
-
-
-def test_reader_returns_the_canonical_requirement_values(tmp_path: Path, monkeypatch) -> None:
-    from agent_run.model import Blocker, Issue, ParentIssue
-    reader, _log = _reader(tmp_path, monkeypatch)
-    source = reader.requirements(1)
-    assert isinstance(source.parent, ParentIssue)
-    assert all(isinstance(issue, Issue) for issue in source.issues)
-    assert all(isinstance(blocker, Blocker) for issue in source.issues for blocker in issue.blocked_by)
 
 
 def test_closed_local_dependency_is_still_decided_by_native_completion_not_reader(tmp_path: Path, monkeypatch) -> None:
@@ -380,6 +375,17 @@ def _bound_reader(tmp_path, monkeypatch, pages, *, classic=False):
             'rules': [{'type': 'required_status_checks', 'parameters': {
                 'required_status_checks': [{'context': 'quality', 'integration_id': 1001}]}}]}
     path.write_text(json.dumps(data))
+    from agent_run.adapters import github_commands
+    from support.github_checks import check_response
+
+    def read(arguments, **_options):
+        assert arguments[0] == 'gh'
+        args = arguments[1:]
+        with log.open('a') as stream:
+            print(json.dumps(args), file=stream)
+        return check_response(args, json.loads(path.read_text()), log)
+
+    monkeypatch.setattr(github_commands, '_run_bounded_command', read)
     return reader, log, path
 
 

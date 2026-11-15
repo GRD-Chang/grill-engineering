@@ -9,7 +9,7 @@ import pytest
 from agent_run.adapters import github_commands, remote
 from agent_run.core.operation_contract import DeliveryRead, ReadUnavailable
 from agent_run.errors import GitHubReadError
-from support.remote_effects import _fixture, _publish_pr
+from support.remote_effects import _fixture, _publish_pr, existing_pr
 from test_delivery_commit_observation import _damage_basis, _reads
 
 
@@ -31,8 +31,7 @@ def test_absence_uses_one_packet_and_next_delivery_rediscovers(tmp_path, monkeyp
 
 @pytest.mark.parametrize('owner', ['foreign', 'EXAMPLE'])
 def test_discovery_preserves_owner_filter_and_same_owner_ambiguity(tmp_path, monkeypatch, owner):
-    port, _, push, state, _ = _fixture(tmp_path, monkeypatch)
-    _, pr = _publish_pr(port, push)
+    port, _, push, state, _, pr = existing_pr(tmp_path, monkeypatch)
     document = json.loads(state.read_text())
     other = deepcopy(document['prs'][0])
     other['number'] = 18
@@ -50,8 +49,7 @@ def test_discovery_preserves_owner_filter_and_same_owner_ambiguity(tmp_path, mon
 
 @pytest.mark.parametrize('reason', ['more', 'deleted-owner'])
 def test_incomplete_discovery_identity_uses_original_rest_collection(tmp_path, monkeypatch, reason):
-    port, _, push, state, calls = _fixture(tmp_path, monkeypatch)
-    _, pr = _publish_pr(port, push)
+    port, _, push, state, calls, pr = existing_pr(tmp_path, monkeypatch)
     if reason == 'deleted-owner':
         document = json.loads(state.read_text())
         document['prs'][0]['head']['repo'] = None
@@ -70,8 +68,7 @@ def test_incomplete_discovery_identity_uses_original_rest_collection(tmp_path, m
 
 @pytest.mark.parametrize('damage', ['null', 'nodes', 'page', 'owner', 'refs', 'number', 'partial'])
 def test_malformed_or_partial_discovery_never_becomes_absence_or_fallback(tmp_path, monkeypatch, damage):
-    port, _, push, _, calls = _fixture(tmp_path, monkeypatch)
-    _publish_pr(port, push)
+    port, _, push, _, calls, _ = existing_pr(tmp_path, monkeypatch)
     def corrupt(body):
         connection = body['data']['repository']['discovery']
         if damage == 'null': body['data']['repository']['discovery'] = None
@@ -93,8 +90,7 @@ def test_malformed_or_partial_discovery_never_becomes_absence_or_fallback(tmp_pa
 
 
 def test_discovery_row_is_only_a_number_and_pr_details_are_read_afterwards(tmp_path, monkeypatch):
-    port, _, push, state, _ = _fixture(tmp_path, monkeypatch)
-    _publish_pr(port, push)
+    port, _, push, state, _, _ = existing_pr(tmp_path, monkeypatch)
     def changed_after_packet(body):
         document = json.loads(state.read_text())
         document['prs'][0]['title'] = 'Changed after discovery'

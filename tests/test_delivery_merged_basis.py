@@ -1,28 +1,27 @@
 """Merged Delivery reuses tree facts while REST still proves original parent order."""
-from dataclasses import replace
+import json
 from types import SimpleNamespace
 import time
 
 import pytest
 
 from agent_run.adapters import remote
-from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.core.operation_contract import DeliveryRead, ReadUnavailable
 from agent_run.errors import GitHubReadError
-from support.remote_effects import _fixture, _publish_pr
+from support.remote_effects import existing_pr
 from test_delivery_commit_observation import _damage_basis, _objects, _reads
 
 
 def _merged(tmp_path, monkeypatch):
-    port, git, push, state, calls = _fixture(tmp_path, monkeypatch)
-    _, pr = _publish_pr(port, push)
-    merge = replace(push, effect_id='original-merge', operation='merge', pr_number=pr.number,
-        payload={'method': 'merge', 'parents': [push.base.sha, push.after_sha],
-                 'commit_message': 'Original ordered merge'})
-    result = port.execute(merge, WriteAuthority(lambda: lambda: None))
-    assert result.disposition == 'target' and result.commit is not None
+    port, git, push, state, calls, pr = existing_pr(tmp_path, monkeypatch)
+    merged = git.make_commit(pr.head.tree, (pr.base.sha, pr.head.sha), 'Original ordered merge')
+    git.run('push', 'origin', f'{merged.sha}:{push.target_ref}')
+    document = json.loads(state.read_text())
+    document['prs'][0].update(state='closed', merged=True, merge_commit_sha=merged.sha,
+                              merged_by={'login': pr.actor})
+    state.write_text(json.dumps(document))
     query = DeliveryRead(push.source_ref, push.target_ref, pr.number, (), read_checks=False)
-    return port, git, push, state, calls, pr, result.commit, query
+    return port, git, push, state, calls, pr, merged, query
 
 
 def test_merged_delivery_reuses_trees_but_reads_original_parent_receipt_and_both_refs(tmp_path, monkeypatch):

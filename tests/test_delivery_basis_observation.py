@@ -11,13 +11,12 @@ from agent_run.core.operation_contract import DeliveryRead, ReadUnavailable
 from agent_run.adapters import github_commands, remote
 from agent_run.errors import GitHubReadError
 from test_delivery_commit_observation import _damage_basis
-from support.remote_effects import _fixture, _publish_pr
+from support.remote_effects import _fixture, existing_pr
 
 
 @pytest.mark.parametrize('mode,expected', [('known', 1), ('discovery', 2), ('without-pr', 1)])
 def test_delivery_basis_uses_one_packet_without_removing_ref_or_check_boundaries(tmp_path, monkeypatch, mode, expected):
-    port, _, push, _, calls = _fixture(tmp_path, monkeypatch)
-    _, pr = _publish_pr(port, push)
+    port, _, push, _, calls, pr = existing_pr(tmp_path, monkeypatch)
     start = len(calls.read_text().splitlines())
     query = DeliveryRead(push.source_ref, push.target_ref, pr.number if mode == 'known' else None,
                          (), read_pr=mode != 'without-pr', read_checks=False)
@@ -36,8 +35,7 @@ def test_delivery_basis_uses_one_packet_without_removing_ref_or_check_boundaries
 
 
 def test_base_snapshot_may_lag_live_target_without_becoming_its_tip(tmp_path, monkeypatch):
-    port, git, push, _, calls = _fixture(tmp_path, monkeypatch)
-    _, pr = _publish_pr(port, push)
+    port, git, push, _, calls, pr = existing_pr(tmp_path, monkeypatch)
     later = git.make_commit(pr.base.tree, (pr.base.sha,), 'Later independent base')
     git.run('push', 'origin', later.sha + ':' + push.target_ref)
     facts = port.delivery(DeliveryRead(push.source_ref, push.target_ref, pr.number, (), read_checks=False))
@@ -48,8 +46,7 @@ def test_base_snapshot_may_lag_live_target_without_becoming_its_tip(tmp_path, mo
 
 @pytest.mark.parametrize('repository', [None, 'foreign/project'])
 def test_closed_fork_or_deleted_head_does_not_become_selected_repository(tmp_path, monkeypatch, repository):
-    port, _, push, state, _ = _fixture(tmp_path, monkeypatch)
-    _, pr = _publish_pr(port, push)
+    port, _, push, state, _, pr = existing_pr(tmp_path, monkeypatch)
     document = json.loads(state.read_text())
     document['prs'][0]['state'] = 'closed'
     document['prs'][0]['head']['repo'] = None if repository is None else {'full_name': repository}
@@ -61,8 +58,7 @@ def test_closed_fork_or_deleted_head_does_not_become_selected_repository(tmp_pat
 
 @pytest.mark.parametrize('part', ['repository', 'object', 'viewer', 'pr', 'base-repository', 'merge-object', 'partial-errors'])
 def test_incomplete_basis_never_supplies_facts_or_writes(tmp_path, monkeypatch, part):
-    port, _, push, _, calls = _fixture(tmp_path, monkeypatch)
-    _, pr = _publish_pr(port, push)
+    port, _, push, _, calls, pr = existing_pr(tmp_path, monkeypatch)
     start = len(calls.read_text().splitlines())
     def missing(body):
         data = body['data']
@@ -83,8 +79,7 @@ def test_incomplete_basis_never_supplies_facts_or_writes(tmp_path, monkeypatch, 
 
 
 def test_same_head_checks_and_both_pr_envelopes_are_fresh_on_next_delivery(tmp_path, monkeypatch):
-    port, _, push, state, calls = _fixture(tmp_path, monkeypatch)
-    _, pr = _publish_pr(port, push)
+    port, _, push, state, calls, pr = existing_pr(tmp_path, monkeypatch)
     query = DeliveryRead(push.source_ref, push.target_ref, pr.number, ())
     first = port.delivery(query)
     document = json.loads(state.read_text())
@@ -148,8 +143,7 @@ def test_basis_fallback_shares_attempt_and_absolute_deadline_budget(tmp_path, mo
 @pytest.mark.parametrize('oversized', [False, True], ids=['aggregate-only', 'single-pr'])
 def test_real_capacity_fallback_does_not_truncate_or_regrant_budget(tmp_path, monkeypatch, oversized):
     from support.github_delivery import delivery_basis
-    port, git, push, state, calls = _fixture(tmp_path, monkeypatch)
-    _, pr = _publish_pr(port, push)
+    port, git, push, state, calls, pr = existing_pr(tmp_path, monkeypatch)
     document = json.loads(state.read_text())
     document['prs'][0]['body'] = ''
     fields = {'query': 'viewer { login }', 'pr': str(pr.number),
@@ -177,8 +171,7 @@ def test_real_capacity_fallback_does_not_truncate_or_regrant_budget(tmp_path, mo
 
 
 def test_refs_change_after_basis_is_rejected_before_delivery_returns(tmp_path, monkeypatch):
-    port, git, push, _, _ = _fixture(tmp_path, monkeypatch)
-    _, pr = _publish_pr(port, push)
+    port, git, push, _, _, pr = existing_pr(tmp_path, monkeypatch)
     later = git.make_commit(pr.head.tree, (pr.head.sha,), 'Concurrent source replacement')
     original = port._delivery_basis
     def basis(*args):
@@ -192,8 +185,7 @@ def test_refs_change_after_basis_is_rejected_before_delivery_returns(tmp_path, m
 
 def test_merged_delivery_still_rejects_a_malformed_original_parent_receipt(tmp_path, monkeypatch):
     from agent_run.contracts.write_authority import WriteAuthority
-    port, _, push, _, _ = _fixture(tmp_path, monkeypatch)
-    _, pr = _publish_pr(port, push)
+    port, _, push, _, _, pr = existing_pr(tmp_path, monkeypatch)
     merge = replace(push, effect_id='merge', operation='merge', pr_number=pr.number,
         payload={'method': 'merge', 'parents': [push.base.sha, push.after_sha], 'commit_message': 'Original merge'})
     result = port.execute(merge, WriteAuthority(lambda: lambda: None))
@@ -211,8 +203,7 @@ def test_merged_delivery_still_rejects_a_malformed_original_parent_receipt(tmp_p
 
 @pytest.mark.parametrize('damage', ['repository-type', 'pr-repository-type', 'missing-data', 'errors-type'])
 def test_complete_malformed_basis_is_rejected_without_retry(tmp_path, monkeypatch, damage):
-    port, _, push, _, calls = _fixture(tmp_path, monkeypatch)
-    _, pr = _publish_pr(port, push)
+    port, _, push, _, calls, pr = existing_pr(tmp_path, monkeypatch)
     start = len(calls.read_text().splitlines())
     def malformed(body):
         if damage == 'repository-type': body['data']['repository']['nameWithOwner'] = 42
