@@ -8,38 +8,15 @@ import sqlite3
 
 import pytest
 
-from agent_run.core.operation_contract import DeliveryFacts
-from agent_run.model import Commit, Delivery, DeliveryKind, EffectResult, RunSpec, wire_json
-from support.core_operations import CoreOperations, ReadOnlyPorts, native_agent_fixture
+from agent_run.model import Commit, Delivery, DeliveryKind, RunSpec, wire_json
+from support.core_operations import CoreOperations, native_agent_fixture
+from support.review_facts import ReviewFacts
 from support.offline import review_result
 from support.run_scoped_kernel import ScopedKernel
 
 
 SUBJECT = 'parent:1'
 BASE = Commit('a' * 40, 'b' * 40)
-
-
-class BudgetFacts(ReadOnlyPorts):
-    """Finite external inputs; no SQL writes or invented budget/completion rows."""
-    def __init__(self, original):
-        super().__init__(original.requirements, original.source_ref, original.target_ref,
-            DeliveryFacts(BASE, BASE))
-        self.candidate, self.candidates = BASE, 0
-
-    def execute(self, effect, authorize):
-        assert effect.operation in {'candidate', 'validation_checkout', 'validation_cleanup', 'integrate'}
-        authorize.prepare()()
-        if effect.operation == 'candidate':
-            self.candidates += 1
-            self.candidate = Commit(f'{self.candidates:040x}', f'{100 + self.candidates:040x}')
-            return EffectResult('target', commit=self.candidate)
-        if effect.operation == 'validation_cleanup':
-            return EffectResult('target')
-        if effect.operation == 'validation_checkout':
-            assert effect.payload['reviewed_commit'] == self.candidate.sha
-            return EffectResult('target', commit=self.candidate)
-        assert effect.candidate == self.candidate
-        return EffectResult('target', commit=self.candidate, expected_tree=self.candidate.tree)
 
 
 @contextmanager
@@ -72,7 +49,7 @@ def test_default_parent_tenth_review_controls_publication_without_an_eleventh_de
         Delivery(SUBJECT, DeliveryKind.PARENT_ONLY, 1, 'unused', BASE,
             'refs/heads/parent', 'refs/heads/main', checkout=str(tmp_path / 'checkout')),))
     _, original = native_agent_fixture(path, spec)
-    ports = BudgetFacts(original)
+    ports = ReviewFacts(original)
     execution, retained = None, None
     calls = []
     for first, last in ((1, 9), (10, 10)):

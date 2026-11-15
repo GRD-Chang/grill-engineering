@@ -4,14 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from support.control_scenarios import managed_abandon_scenario
 from support.core_operations import CoreOperations, scripted_return
 
 
 def test_managed_final_requeue_reaccepts_current_run_without_a_repair_pr_or_budget_refund(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, managed_completed_ticket,
 ) -> None:
-    scenario, request = managed_abandon_scenario(tmp_path)
+    scenario, request = managed_completed_ticket
     calls = []
     agent = scenario.agent
 
@@ -21,7 +20,6 @@ def test_managed_final_requeue_reaccepts_current_run_without_a_repair_pr_or_budg
 
     monkeypatch.setattr(scenario, "agent", recorded_agent)
     scenario.reviews[:] = ["pass", "pass", "fail", "pass"]
-    assert scenario.run().kind == "complete"
     scenario.select("ticket:4")
     assert scenario.run().kind == "complete"
     operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)

@@ -10,7 +10,7 @@ import pytest
 from support.environment import _apply_test_environment, _inherited_git_override, _user_environment
 from support.installed_runtime import require_current_installation
 
-pytest_plugins = ("support.reporting", "support.offline_prefixes")
+pytest_plugins = ("support.reporting", "support.offline_prefixes", "support.review_facts")
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:

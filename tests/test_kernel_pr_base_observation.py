@@ -7,14 +7,13 @@ import pytest
 from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.core.operation_contract import DeliveryRead, ReadUnavailable
 from agent_run.errors import KernelError
-from agent_run.model import DeliveryKind
-from support.run_scoped_kernel import domain_scenario
 from support.offline_api import SyntheticGitHub
 from support.remote_effects import _fixture, _publish_pr, _pr_effect, existing_pr
 
 
-def test_ticket_ci_repair_finishes_when_the_pr_reports_an_ancestor_base(tmp_path, monkeypatch, domain_scenario):
-    scenario = domain_scenario(tmp_path / 'scenario', DeliveryKind.TICKET, checks=('fail', 'none'))
+def test_ticket_ci_repair_finishes_when_the_pr_reports_an_ancestor_base(monkeypatch, domain_ticket_before_pr):
+    scenario = domain_ticket_before_pr
+    scenario.checks[:] = ['fail', 'none']
     kernel, subject = scenario.kernel, scenario.delivery.key
     for _ in range(160):
         status = kernel.status(subject)

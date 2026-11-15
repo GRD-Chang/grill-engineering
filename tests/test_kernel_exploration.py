@@ -13,7 +13,8 @@ from agent_run.model import DeliveryKind, Policy, Role
 from agent_run.core.kernel import Kernel
 from agent_run.contracts.write_authority import FinalAdmission, WriteAuthority
 from agent_run.errors import KernelError
-from support.offline import Scenario
+from support.offline import Scenario, review_result
+from support.review_facts import requirement_review
 from agent_run.model import wire_json
 from support.core_operations import CoreOperations, native_agent_fixture
 from support.agent_continuation import ticket_spec
@@ -44,23 +45,25 @@ def test_return_is_durable_before_consumption_and_resume_does_not_charge_twice(t
     assert reopened.status("ticket:2")["budgets"]["requirements"]["developments_used"] == 1
 
 
-def test_ticket_final_development_is_explicit_fallback_but_parent_cannot_skip_review(tmp_path: Path, domain_scenario) -> None:
-    ticket = domain_scenario(tmp_path / "ticket", DeliveryKind.TICKET, reviews=("fail",), policy=Policy(ticket_rounds=1))
-    assert ticket.run().kind == "complete"
-    assert [call["role"] for call in ticket.role_calls] == ["development", "review", "development", "publication"]
-    assert ticket.kernel.status(ticket.delivery.key)["gate_mode"] == "deterministic_fallback"
-    parent = domain_scenario(tmp_path / "parent", DeliveryKind.PARENT_ONLY, reviews=("fail",), policy=Policy(parent_rounds=1))
-    assert parent.run().kind == "paused"
-    assert "review_budget_exhausted" in parent.kernel.status(parent.delivery.key)["gates"]
-    assert not any(write["operation"] == "pr_write" for write in parent.port.writes())
+def test_parent_cannot_skip_review_when_its_budget_is_exhausted(tmp_path: Path) -> None:
+    # Ticket fallback evidence and role order are asserted by the Publication
+    # prompt test. Parent budget exhaustion must stop before any remote write.
+    with requirement_review(tmp_path, kind=DeliveryKind.PARENT_ONLY, policy=Policy(parent_rounds=1)) as (kernel, operations):
+        development = operations.until(lambda step: step.call is not None).call
+        operations.runner.authorize_agent(development)
+        kernel.receive(development, wire_json({"result_kind": "development", "summary": "Changed", "human_blockers": None}))
+        review = operations.until(lambda step: step.call is not None).call
+        operations.runner.authorize_agent(review)
+        kernel.receive(review, wire_json(review_result("fail")))
+        operations.until(lambda step: step.kind == "paused")
+        assert "review_budget_exhausted" in kernel.status(review.subject)["gates"]
 
 
 @pytest.mark.parametrize("kind", [DeliveryKind.TICKET, DeliveryKind.PARENT_ONLY])
-def test_ci_uses_separate_cumulative_development_and_parent_review(tmp_path: Path, kind: DeliveryKind, domain_scenario) -> None:
-    scenario = domain_scenario(tmp_path / "scenario", kind, checks=("fail", "none"))
+def test_ci_uses_separate_cumulative_development_and_parent_review(kind: DeliveryKind, request) -> None:
+    scenario = request.getfixturevalue("domain_ticket_before_pr" if kind == DeliveryKind.TICKET else "domain_parent_at_approval")
     if kind == DeliveryKind.PARENT_ONLY:
         # A granted merge must still hand a newly failed check back to CI.
-        scenario.checks[:] = ["none"]
         assert scenario.run().kind == "approval"
         kernel, subject = scenario.kernel, scenario.delivery.key
         assert kernel.control("approve", "original-grant", subject=subject, world=scenario.world()) == "pending"
@@ -72,6 +75,8 @@ def test_ci_uses_separate_cumulative_development_and_parent_review(tmp_path: Pat
             assert tx.one("SELECT final_action FROM runs")[0] is None
             assert tx.one("SELECT grant_id FROM subjects WHERE id=?", (subject,))[0] is None
             assert not tx.rows("SELECT id FROM effects WHERE operation='merge'")
+    else:
+        scenario.checks[:] = ["fail", "none"]
     assert scenario.run(approve=True).kind == "complete"
     if kind == DeliveryKind.PARENT_ONLY:
         pr = scenario.port.pr_by_number(scenario.kernel.status(scenario.delivery.key)["pr_number"])

@@ -1,5 +1,5 @@
 """A Ticket fixes its dependency-visible Run head at first workspace intent."""
-from support.core_operations import prepare_scripted_agent, dependent_ticket
+from support.core_operations import prepare_scripted_agent
 
 from pathlib import Path
 
@@ -23,8 +23,8 @@ def first_development(scenario):
 
 
 @pytest.mark.parametrize("dispatched", [False, True], ids=["prepared", "sent"])
-def test_workspace_intent_keeps_allocated_base_after_run_branch_moves(tmp_path: Path, monkeypatch, dispatched: bool) -> None:
-    scenario, allocated = dependent_ticket(tmp_path)
+def test_workspace_intent_keeps_allocated_base_after_run_branch_moves(dependent_ticket, monkeypatch, dispatched: bool) -> None:
+    scenario, allocated = dependent_ticket
     kernel, subject = scenario.kernel, scenario.delivery.key
     boundary = workspace_intent(scenario, monkeypatch, sent=dispatched)
     original = boundary.effect

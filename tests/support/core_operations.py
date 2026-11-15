@@ -283,7 +283,7 @@ def settle_agent(s, runner, call):
     assert runner.worker_settled(call)
 
 
-def dependent_ticket(tmp_path: Path):
+def _prepare_dependent_ticket(tmp_path: Path):
     scenario = GraphScenario(tmp_path / "dependencies", Requirements.from_wire(native_input()["initial_requirements"]))
     assert scenario.kernel.source_status()["remaining"]["ticket:4"] == "blocked_by_incomplete_tickets"
     assert scenario.run().kind == "complete"
@@ -292,7 +292,7 @@ def dependent_ticket(tmp_path: Path):
     scenario.select("ticket:4")
     assert not Path(scenario.delivery.checkout).exists()
     assert not scenario.port.git.run("for-each-ref", "--format=%(refname)", scenario.delivery.source_ref).stdout
-    return scenario, head
+    return scenario
 
 
 def host_kernel(tmp_path: Path) -> Kernel:

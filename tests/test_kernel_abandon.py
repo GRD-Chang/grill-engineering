@@ -222,10 +222,9 @@ def test_abandon_continuation_reinspects_after_a_late_dirty_observation(tmp_path
     assert not [write for write in scenario.port.writes() if write["operation"] in kernel.REMOTE]
 
 
-def test_managed_abandon_refuses_dirty_before_action_then_recovers_own_ticket(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    scenario, request = managed_abandon_scenario(tmp_path)
+def test_managed_abandon_refuses_dirty_before_action_then_recovers_own_ticket(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, managed_completed_ticket) -> None:
+    scenario, request = managed_completed_ticket
     kernel = scenario.kernel
-    assert scenario.run().kind == "complete"
     completed = kernel.source_status()["completions"]
     assert len(completed) == 1 and completed[0]["subject"] == "ticket:3"
     target_before = scenario.port.remote_commit("refs/heads/run")

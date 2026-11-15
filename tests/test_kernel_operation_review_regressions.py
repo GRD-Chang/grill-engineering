@@ -19,16 +19,18 @@ import os
 from pathlib import Path
 import shutil
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 from agent_run.model import DeliveryKind, Effect, EffectResult
 from support.offline import Scenario
-from support.run_scoped_kernel import domain_scenario
+from support.offline_prefixes import _at_phase, _prepared_stage
+from support.run_scoped_kernel import domain_kernel
 from agent_run.core.operation_contract import ReadUnavailable
 from agent_run.queries.run import read
+from agent_run.adapters import github_commands
 from agent_run.adapters.remote import RemoteEffects
-from support.core_operations import scripted_return
 
 
 def _outage(parent_number: int) -> None:
@@ -104,12 +106,26 @@ def test_a_read_finishing_after_the_absolute_wait_deadline_allocates_no_agent(
     assert (step.kind, step.reason) == ("paused", "supervision_timeout")
 
 
+@pytest.fixture(scope="module")
+def _parent_push_stage(tmp_path_factory):
+    with _prepared_stage(tmp_path_factory, "parent-push",
+                         lambda root: _at_phase(root, DeliveryKind.PARENT_ONLY, "push")) as checkout:
+        yield checkout
+
+
+@pytest.fixture
+def parent_before_push(_parent_push_stage, isolated_user_environment):
+    with _parent_push_stage() as scenario, domain_kernel(scenario.kernel) as kernel:
+        scenario.kernel = kernel
+        yield scenario
+
+
 @pytest.mark.parametrize("command_exit", [0, 7], ids=["actual-zero", "actual-nonzero"])
 @pytest.mark.parametrize("readback_fails", [False, True], ids=["readback-target", "readback-outage"])
 def test_actual_native_push_status_is_audited_once_independently_of_its_readback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command_exit: int, readback_fails: bool, domain_scenario,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command_exit: int, readback_fails: bool, parent_before_push,
 ) -> None:
-    scenario = domain_scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
+    scenario = parent_before_push
     now = [100.25]
     scenario.kernel.clock = lambda: now[0]
     bare = scenario.port.physical.remote
@@ -154,6 +170,7 @@ raise SystemExit(response.returncode)
                            runner_identity={"source": "host"}, remote=str(bare))
     runner = scenario.runner()
     execute, reconcile = runner.ports.execute, runner.ports.reconcile
+    monkeypatch.setattr(github_commands, "time", SimpleNamespace(sleep=lambda _: None))
     observed: list[tuple[Effect, EffectResult | ReadUnavailable]] = []
     grants: list[str] = []
 
@@ -179,14 +196,8 @@ raise SystemExit(response.returncode)
     monkeypatch.setattr(runner.ports, "execute", execute_original)
     monkeypatch.setattr(runner.ports, "reconcile", lambda effect:
                         native.reconcile(effect) if effect.operation == "push" else reconcile(effect))
-    for _ in range(48):
-        step = prepare_scripted_agent(scenario.kernel, runner.run_once())
-        if step.call is not None:
-            scripted_return(scenario.kernel, runner, step.call, scenario.agent)
-        if observed:
-            break
-    else:
-        raise AssertionError("Normal public operations never reached the original push")
+    step = runner.run_once()
+    assert len(observed) == 1
     effect, physical = observed[0]
     assert grants == [effect.effect_id]
     commands = [json.loads(line) for line in trace.read_text().splitlines()]
@@ -230,9 +241,9 @@ raise SystemExit(response.returncode)
 
 
 def test_offline_lost_response_is_unknown_without_an_observed_command_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, domain_scenario,
+    monkeypatch: pytest.MonkeyPatch, parent_before_push,
 ) -> None:
-    scenario = domain_scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
+    scenario = parent_before_push
     scenario.kernel.clock = lambda: 100.25
     scenario.port.lose_response.add("pr_write")
     make_ports = scenario.make_ports

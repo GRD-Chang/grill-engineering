@@ -6,13 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from support.core_operations import CoreOperations, next_call, prepare_scripted_agent
+from support.core_operations import prepare_scripted_agent
 from agent_run.model import Role
 from agent_run.contracts.artifact import parse_artifact, role_schema
 from agent_run.errors import ArtifactContractError
 from agent_run.runtime.codex import _CodexCapture
-from agent_run.model import ParentIssue, Requirements, wire_json
-from support.offline import GraphScenario, review_result
+from agent_run.model import wire_json
+from support.offline import review_result
 from agent_run.config.resources import resolve_resources
 from support.worker_facts import worker_fixture, consume_local_result
 
@@ -89,18 +89,17 @@ def test_native_publication_rejects_contract_drift_and_repairs_same_attempt(tmp_
     # Text/count/length variants belong to test_artifacts; one rejection proves
     # the real Attempt keeps its original raw and repairs without a new budget.
     value = publication("Fixes #2")
-    scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Deliver change"), ()))
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
-    first = next_call(scenario, Role.PUBLICATION)
+    kernel, operations, request = role_fixture(tmp_path, Role.PUBLICATION)
+    first = prepare_scripted_agent(kernel, request).call
     raw = b"\n " + wire_json(value) + b"\n"
-    returned(scenario.kernel, first, raw)
-    step = operations.once()
+    returned(kernel, first, raw)
+    step = prepare_scripted_agent(kernel, operations.once())
     repair = step.call
     assert repair is not None and repair.mode == "output-repair", step
     assert repair.attempt_id == first.attempt_id and repair.invocation_id == first.invocation_id
     assert repair.thread_id == first.thread_id and repair.deadline_at == first.deadline_at
     assert repair.context["readonly"] is True and "invalid_artifact" in repair.context["contract_error"]
-    with scenario.kernel.storage.transaction(write=False) as tx:
+    with kernel.storage.transaction(write=False) as tx:
         attempt = tx.one("SELECT * FROM attempts WHERE id=?", (first.attempt_id,))
         assert attempt["status"] != "consumed" and attempt["outcome"] is None
         saved = tx.one("SELECT raw_id FROM invocation_outputs WHERE invocation=? AND ordinal=?",
@@ -109,10 +108,10 @@ def test_native_publication_rejects_contract_drift_and_repairs_same_attempt(tmp_
         assert tx.one("SELECT source_sequence FROM runs")[0] is not None
         assert not tx.rows("SELECT id FROM effects WHERE operation='publication_commit'")
     valid = b"\n" + wire_json(publication()) + b"\n"
-    returned(scenario.kernel, repair, valid)
+    returned(kernel, repair, valid)
     consumed = operations.once(agent_capacity=0)
     assert consumed.kind == "progress"
-    with scenario.kernel.storage.transaction(write=False) as tx:
+    with kernel.storage.transaction(write=False) as tx:
         outputs = tx.rows("SELECT raw_id FROM invocation_outputs WHERE invocation=? ORDER BY ordinal", (first.invocation_id,))
         assert [tx.get(row[0], first.subject) for row in outputs] == [raw, valid]
         assert tx.one("SELECT status FROM attempts WHERE id=?", (first.attempt_id,))[0] == "consumed"

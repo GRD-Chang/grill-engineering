@@ -1,4 +1,4 @@
-"""Independent copies of two recurring Git/SQLite preconditions.
+"""Independent copies of recurring Git/SQLite preconditions.
 
 The workspace sits at the same worker-private path for each copy: both the
 worktree and the stored Run identify the original checkout by absolute path.
@@ -13,25 +13,20 @@ from tempfile import TemporaryDirectory
 import pytest
 
 from agent_run.core.kernel import Kernel
-from agent_run.model import DeliveryKind
+from agent_run.model import DeliveryKind, Policy
 from support.environment import _apply_test_environment
 from support.offline import OfflinePort, Scenario
+from support.run_scoped_kernel import prepare_domain_history
 
 
 @contextmanager
-def _prepared_stage(tmp_path_factory, kind, phase):
-    with TemporaryDirectory(prefix=phase + "-", dir=tmp_path_factory.getbasetemp()) as raw:
+def _prepared_stage(tmp_path_factory, name, prepare):
+    with TemporaryDirectory(prefix=name + "-", dir=tmp_path_factory.getbasetemp()) as raw:
         root = Path(raw)
         live, prepared = root / "work", root / "prepared"
         with pytest.MonkeyPatch.context() as env:
             _apply_test_environment(root / "user", env)
-            example = Scenario(live, kind)
-            for _ in range(100):
-                if example._progress()["phase"] == phase:
-                    break
-                example.step()
-            else:
-                raise AssertionError(f"Original {kind} never reached {phase}")
+            example = prepare(live)
         live.rename(prepared)
 
         @contextmanager
@@ -41,7 +36,7 @@ def _prepared_stage(tmp_path_factory, kind, phase):
             live.mkdir()
             try:
                 shutil.copytree(prepared, live, symlinks=True, dirs_exist_ok=True)
-                port = OfflinePort(live)
+                port = OfflinePort(example.port.root)
                 kernel = Kernel(example.kernel.storage.path, run_id=example.spec.run_id)
                 yield deepcopy(example, {id(example.port): port, id(example.kernel): kernel})
             finally:
@@ -50,16 +45,41 @@ def _prepared_stage(tmp_path_factory, kind, phase):
         yield checkout
 
 
+def _at_phase(root, kind, phase, *, policy=None):
+    scenario = Scenario(root, kind, policy=policy)
+    with prepare_domain_history(scenario):
+        for _ in range(100):
+            if scenario._progress()["phase"] == phase:
+                return scenario
+            scenario.step()
+    raise AssertionError(f"Original {kind} never reached {phase}")
+
+
 @pytest.fixture(scope="session")
 def _ticket_pr_stage(tmp_path_factory):
-    with _prepared_stage(tmp_path_factory, DeliveryKind.TICKET, "pr") as checkout:
+    with _prepared_stage(tmp_path_factory, "pr", lambda root: _at_phase(root, DeliveryKind.TICKET, "pr")) as checkout:
         yield checkout
 
 
 @pytest.fixture(scope="session")
 def _parent_approval_stage(tmp_path_factory):
-    with _prepared_stage(tmp_path_factory, DeliveryKind.PARENT_ONLY, "approval") as checkout:
+    with _prepared_stage(tmp_path_factory, "approval", lambda root: _at_phase(root, DeliveryKind.PARENT_ONLY, "approval")) as checkout:
         yield checkout
+
+
+@pytest.fixture(scope="session")
+def _parent_without_resync_stage(tmp_path_factory):
+    def prepare(root):
+        return _at_phase(root, DeliveryKind.PARENT_ONLY, "approval", policy=Policy(resync_limit=0))
+
+    with _prepared_stage(tmp_path_factory, "approval-no-resync", prepare) as checkout:
+        yield checkout
+
+
+@pytest.fixture
+def parent_approval_without_resync(_parent_without_resync_stage, isolated_user_environment):
+    with _parent_without_resync_stage() as scenario:
+        yield scenario
 
 
 @pytest.fixture
@@ -72,3 +92,58 @@ def ticket_before_pr(_ticket_pr_stage, isolated_user_environment):
 def parent_at_approval(_parent_approval_stage, isolated_user_environment):
     with _parent_approval_stage() as scenario:
         yield scenario
+
+
+@pytest.fixture(scope="session")
+def _completed_managed_ticket(tmp_path_factory):
+    from support.control_scenarios import managed_abandon_scenario
+
+    def finish_ticket(root):
+        scenario, _ = managed_abandon_scenario(root)
+        assert scenario.run().kind == "complete"
+        return scenario
+
+    with _prepared_stage(tmp_path_factory, "completed-managed-ticket", finish_ticket) as checkout:
+        yield checkout
+
+
+@pytest.fixture
+def managed_completed_ticket(_completed_managed_ticket, isolated_user_environment):
+    with _completed_managed_ticket() as scenario:
+        yield scenario, scenario.kernel.host_request("start")
+
+
+@pytest.fixture(scope="session")
+def _ticket_merge_stage(tmp_path_factory):
+    from support.cleanup_scenarios import _native_scenario
+
+    def before_merge(root):
+        scenario = _native_scenario(root, DeliveryKind.TICKET)
+        for _ in range(60):
+            if scenario._progress()["phase"] == "merge":
+                return scenario
+            scenario.step()
+        raise AssertionError("Ticket never reached merge")
+
+    with _prepared_stage(tmp_path_factory, "before-merge", before_merge) as checkout:
+        yield checkout
+
+
+@pytest.fixture
+def graph_ticket_before_merge(_ticket_merge_stage, isolated_user_environment):
+    with _ticket_merge_stage() as scenario:
+        yield scenario
+
+
+@pytest.fixture(scope="session")
+def _dependency_stage(tmp_path_factory):
+    from support.core_operations import _prepare_dependent_ticket
+
+    with _prepared_stage(tmp_path_factory, "dependency-complete", _prepare_dependent_ticket) as checkout:
+        yield checkout
+
+
+@pytest.fixture
+def dependent_ticket(_dependency_stage, isolated_user_environment):
+    with _dependency_stage() as scenario:
+        yield scenario, scenario.port.remote_commit(scenario.delivery.target_ref)

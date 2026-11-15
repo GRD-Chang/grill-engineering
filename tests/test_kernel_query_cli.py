@@ -95,19 +95,19 @@ def test_status_shows_ticket_progress_without_claiming_whole_delivery_complete(t
 
 
 def test_parent_only_status_keeps_recorded_pass_evidence_and_hides_completed_allowances(
-    tmp_path: Path, capsys,
+    parent_at_approval, capsys,
 ) -> None:
     from io import StringIO
     from agent_run.cli.render import render
-    from support.offline import GraphScenario
 
-    scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Original scope", ()), ()))
+    scenario = parent_at_approval
+    root = scenario.port.root
     # Both languages render the same canonical facts; no new Run or translated
     # Agent evidence is manufactured to exercise a different display channel.
     assert scenario.run().kind == "approval"
-    _assert_approval_query(scenario, tmp_path)
+    _assert_approval_query(scenario, root)
     document = query.read(scenario.kernel.storage.path, "status", storage=scenario.kernel.storage)
-    before = _snapshot(tmp_path)
+    before = _snapshot(root)
     for language, progress, passed in (("zh", "无子任务，直接推进需求", "已记录验收结论: 通过"),
                                       ("en", "No Tickets; working directly on the requirement", "Recorded review: Passed")):
         for style in ("plain", "rich"):
@@ -118,10 +118,10 @@ def test_parent_only_status_keeps_recorded_pass_evidence_and_hides_completed_all
             assert passed in value
             assert value.count("Known synthetic acceptance evidence") == 3
             assert "当前问题" not in value and "Current findings" not in value
-    assert _snapshot(tmp_path) == before
+    assert _snapshot(root) == before
     assert scenario.run(approve=True).kind == "complete"
-    _assert_completed_delivery_query(scenario, tmp_path, DeliveryKind.PARENT_ONLY, "completed")
-    before = _snapshot(tmp_path)
+    _assert_completed_delivery_query(scenario, root, DeliveryKind.PARENT_ONLY, "completed")
+    before = _snapshot(root)
     assert main(["status", scenario.spec.run_id, "--state-dir", str(scenario.kernel.storage.path), "--plain"]) == 0
     output = capsys.readouterr().out
     assert "累计用量" not in output
@@ -136,7 +136,7 @@ def test_parent_only_status_keeps_recorded_pass_evidence_and_hides_completed_all
             assert historical_output.getvalue().count(label) == 3
             assert "W1 D 0/3" in historical_output.getvalue()
             assert "W1 D 1/10 R 1/10" in historical_output.getvalue()
-    assert _snapshot(tmp_path) == before
+    assert _snapshot(root) == before
 
 
 def test_missing_progress_facts_are_not_called_parent_only(tmp_path: Path) -> None:

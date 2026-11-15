@@ -11,8 +11,8 @@ import pytest
 from agent_run.model import DeliveryKind
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
-from agent_run.model import Issue, ParentIssue, ReadWait, Requirements
-from support.offline import GraphScenario, Scenario
+from agent_run.model import ReadWait
+from support.offline import Scenario
 from agent_run.core.operation_contract import ReadUnavailable
 from agent_run.queries.run import read
 from support.core_operations import CoreOperations, scripted_return
@@ -113,32 +113,6 @@ def test_completed_business_operation_retires_read_wait(tmp_path: Path, monkeypa
     assert operations.once().retry_at == 805
     fresh = read(kernel.storage.path, 'status', storage=kernel.storage).data["supervision_windows"][0]
     assert fresh["started_at"] == 800 and fresh["deadline"] == 1400
-
-
-def test_before_final_timeout_is_run_scoped_and_requires_original_executor_exit(tmp_path: Path, monkeypatch) -> None:
-    source = Requirements(ParentIssue(1, "Parent", "Requirement", (2,)), (
-        Issue(2, "Ticket", "Work", "OPEN", frozenset({"ready-for-agent"})),))
-    scenario = GraphScenario(tmp_path / "graph", source)
-    assert scenario.run().kind == "complete"
-    kernel, execution = scenario.kernel, scenario.execution
-    assert kernel.source_status()["final_subject"] is None
-    operations = CoreOperations(kernel, execution, scenario.make_ports)
-    monkeypatch.setattr(operations.runner.ports, "source", unavailable)
-    kernel.clock = lambda: 100
-    assert operations.once().retry_at == 105
-    assert kernel.source_status()["final_subject"] is None
-    kernel.clock = lambda: 700
-    assert operations.once().reason == "supervision_timeout"
-    assert kernel.source_status()["blocked"] == "supervision_timeout"
-    with pytest.raises(KernelError, match="executor_exit_unproven"):
-        kernel.control("resume", "too-early")
-    kernel.control("stop", "retire-synthetic-executor")
-    kernel.confirm_executor_exit(execution)
-    kernel.control("resume", "explicit-resume")
-    assert kernel.source_status()["blocked"] is None
-    replacement = kernel.claim_executor("replacement")
-    fresh = OperationRunner(kernel, replacement, lambda binding: operations.runner.ports)
-    assert fresh.run_once().retry_at == 705
 
 
 def test_waits_do_not_authorize_a_stopped_or_replaced_scope(tmp_path: Path, monkeypatch) -> None:

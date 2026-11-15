@@ -8,9 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 from agent_run.model import EffectResult, Execution, HostObservation
-from agent_run.model import DeliveryKind, Policy
 import agent_run.runtime.executor as executor
-from support.offline import GraphScenario, Scenario
+from support.offline import GraphScenario
 from agent_run.core.operation_contract import ReadUnavailable
 from support.requirements_scenarios import independent_source
 from support.notification import _NoNotifications
@@ -137,8 +136,8 @@ def test_prior_observation_does_not_rearm_or_write_and_other_intent_finishes(tmp
     assert "write_conflict" in s.kernel.status(originals[0]["subject"])["gates"]
 
 
-def test_approval_source_cas_is_deferred_without_consuming_the_observation(tmp_path, monkeypatch):
-    s = admit(Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY), tmp_path)
+def test_approval_source_cas_is_deferred_without_consuming_the_observation(tmp_path, monkeypatch, parent_at_approval):
+    s = admit(parent_at_approval, tmp_path)
     assert s.run().kind == "approval"
     now = [100.25]
     s.kernel.clock = lambda: now[0]
@@ -194,9 +193,8 @@ def test_sent_unknown_read_after_public_stop_adds_no_new_gate(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize("change", ["source", "target"])
-def test_approval_initial_observation_keeps_original_change_gates(tmp_path, monkeypatch, change):
-    s = admit(Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY,
-                       policy=Policy(resync_limit=0)), tmp_path)
+def test_approval_initial_observation_keeps_original_change_gates(tmp_path, monkeypatch, change, parent_approval_without_resync):
+    s = admit(parent_approval_without_resync, tmp_path)
     assert s.run().kind == "approval"
     budget = s.kernel.status(s.delivery.key)["budgets"]
     runner = s.runner()
@@ -250,8 +248,8 @@ def test_formal_host_readwait_observes_second_before_retrying_first(tmp_path, mo
     assert all(state_of(s, item) == ("observed", 1) for item in originals)
 
 
-def test_formal_host_approval_cas_retries_without_consuming_its_observation(tmp_path, monkeypatch):
-    s = admit(Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY), tmp_path)
+def test_formal_host_approval_cas_retries_without_consuming_its_observation(tmp_path, monkeypatch, parent_at_approval):
+    s = admit(parent_at_approval, tmp_path)
     assert s.run().kind == "approval"
     now = [100.25]
     s.kernel.clock = lambda: now[0]

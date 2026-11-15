@@ -4,7 +4,6 @@ from io import StringIO
 
 from agent_run.model import Issue, ParentIssue, Requirements
 import agent_run.queries.run as query
-from support.offline import GraphScenario
 from agent_run.core.operation_contract import ReadUnavailable
 from support.core_operations import CoreOperations
 from agent_run.cli.render import render
@@ -53,10 +52,12 @@ def test_wait_deadline_does_not_invent_a_timeout_and_keeps_all_scopes(tmp_path, 
     assert expired_clock["next_action"] == "agent-run status --repo example/repository -- run"
 
 
-def test_run_timeout_renders_original_evidence_and_resumes_only_after_core_applies_it(tmp_path, monkeypatch):
-    source = Requirements(ParentIssue(1, "Parent", "Requirement", (2,)), (
-        Issue(2, "Ticket", "Work", "OPEN", frozenset({"ready-for-agent"})),))
-    scenario = GraphScenario(tmp_path / "before-final", source)
+def test_run_timeout_renders_original_evidence_and_resumes_only_after_core_applies_it(graph_ticket_before_merge, monkeypatch):
+    import pytest
+    from agent_run.errors import KernelError
+
+    scenario = graph_ticket_before_merge
+    root = scenario.port.root
     assert scenario.run().kind == "complete"
     kernel, execution = scenario.kernel, scenario.execution
     assert kernel.source_status()["final_subject"] is None
@@ -66,10 +67,11 @@ def test_run_timeout_renders_original_evidence_and_resumes_only_after_core_appli
     monkeypatch.setattr(operations.runner.ports, "source", failed)
     kernel.clock = lambda: 100
     assert operations.once().retry_at == 105
+    assert kernel.source_status()["final_subject"] is None
     kernel.clock = lambda: 700
     assert operations.once().reason == "supervision_timeout"
     monkeypatch.setattr(query.time, "time", lambda: 900)
-    document = read_only(kernel, tmp_path)
+    document = read_only(kernel, root)
     data = document.data
     window = data["supervision_windows"][0]
     command = "agent-run resume --repo example/project -- offline-run"
@@ -85,7 +87,7 @@ def test_run_timeout_renders_original_evidence_and_resumes_only_after_core_appli
         output = StringIO()
         render(document, style=style, details=False, stream=output)
         assert command in output.getvalue() and "Original failure / 原始问题" in output.getvalue()
-    history = read_only(kernel, tmp_path, "history").data
+    history = read_only(kernel, root, "history").data
     assert history["supervision_windows"][0] == window
     # The original event is also the human renderer's sole source; there is no second audit projection.
     paused, = [event for event in history["history"]["events"] if event["kind"] == "paused"
@@ -93,15 +95,19 @@ def test_run_timeout_renders_original_evidence_and_resumes_only_after_core_appli
                and event["evidence"].get("scope_id") == window["scope_id"]]
     assert paused["identity"] == "supervision_timeout" and paused["evidence"] == window["timeout"]
     assert paused["status"] is not None and paused["generation"] >= 1
+    assert kernel.source_status()["blocked"] == "supervision_timeout"
+    with pytest.raises(KernelError, match="executor_exit_unproven"):
+        kernel.control("resume", "too-early")
     assert kernel.control("stop", "retire-original-executor") == "applied"
     kernel.confirm_executor_exit(execution)
     assert kernel.control("resume", "explicit-original-resume") == "applied"
-    assert read_only(kernel, tmp_path).data["supervision_windows"] == []
+    assert read_only(kernel, root).data["supervision_windows"] == []
+    assert kernel.source_status()["blocked"] is None
     replacement = kernel.claim_executor("replacement")
     fresh = OperationRunner(kernel, replacement, lambda binding: operations.runner.ports)
     kernel.clock = lambda: 800
     assert fresh.run_once().retry_at == 805
-    assert read_only(kernel, tmp_path).data["supervision_windows"][0]["started_at"] == 800
+    assert read_only(kernel, root).data["supervision_windows"][0]["started_at"] == 800
 
 
 def test_ticket_timeout_keeps_sibling_waits_and_exact_target_resume(tmp_path, monkeypatch):

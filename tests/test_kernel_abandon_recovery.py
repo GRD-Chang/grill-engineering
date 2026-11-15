@@ -10,15 +10,13 @@ from agent_run.errors import KernelError
 from agent_run.model import EffectResult, Execution, HostObservation, World, wire_json
 from agent_run.queries.run import read
 from agent_run.core.operation_contract import EffectIO, Work
-from support.control_scenarios import managed_abandon_scenario
 from support.core_operations import CoreOperations
 from support.requirements_scenarios import independent_source, source_run
 
 
-def recovery_effect(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def recovery_effect(managed_completed_ticket, monkeypatch: pytest.MonkeyPatch):
     """Reach a real recovery effect; interrupt or script only the physical port."""
-    scenario, request = managed_abandon_scenario(tmp_path)
-    assert scenario.run().kind == "complete"
+    scenario, request = managed_completed_ticket
     kernel = scenario.kernel
     kernel.control("stop", "retain-sibling-gate", subject="ticket:4")
     kernel.control_host(request, "abandon", "original-abandon",
@@ -44,9 +42,9 @@ def recovery_effect(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 def test_unproven_sent_recovery_never_replays_and_uses_original_read_window(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, subtests: pytest.Subtests,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, subtests: pytest.Subtests, managed_completed_ticket,
 ) -> None:
-    scenario, effect, operations = recovery_effect(tmp_path, monkeypatch)
+    scenario, effect, operations = recovery_effect(managed_completed_ticket, monkeypatch)
     kernel = scenario.kernel
     now = [1000.25]
     kernel.clock = lambda: now[0]

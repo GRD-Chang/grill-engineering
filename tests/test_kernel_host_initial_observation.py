@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 
 import agent_run.runtime.executor as executor
-from agent_run.model import DeliveryKind, Policy
 from agent_run.model import EffectResult, Execution, HostObservation
 from support.offline import GraphScenario, Scenario
 from support.requirements_scenarios import independent_source
@@ -85,9 +84,9 @@ def test_admitted_run_does_not_starve_later_gated_intent_behind_unknown(
 
 @pytest.mark.parametrize("target_append", [False, True], ids=["unchanged", "target_append"])
 def test_admitted_run_observes_approval_without_pending_intent_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target_append: bool,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target_append: bool, parent_approval_without_resync,
 ) -> None:
-    scenario = Scenario(tmp_path / "approval", DeliveryKind.PARENT_ONLY, policy=Policy(resync_limit=0))
+    scenario = parent_approval_without_resync
     assert scenario.run().kind == "approval"
     kernel, subject = scenario.kernel, scenario.delivery.key
     before = kernel.status(subject)

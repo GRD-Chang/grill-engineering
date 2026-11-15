@@ -4,14 +4,14 @@ import json
 
 import pytest
 
-from agent_run.model import Checks, DeliveryKind
+from agent_run.model import Checks
 from agent_run.core.kernel import Kernel
-from support.offline import Scenario
 from agent_run.core.operation_contract import ReadUnavailable
 
 
-def test_published_ticket_checks_keep_their_window_across_read_failure_and_restart(tmp_path, monkeypatch):
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET, checks=("pending",))
+def test_published_ticket_checks_keep_their_window_across_read_failure_and_restart(monkeypatch, ticket_before_pr):
+    scenario = ticket_before_pr
+    scenario.checks[:] = ["pending"]
     now = [100.25]
     kernel = scenario.kernel
     kernel.clock = lambda: now[0]

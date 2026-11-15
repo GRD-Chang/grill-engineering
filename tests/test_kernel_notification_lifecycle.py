@@ -196,13 +196,21 @@ def test_observed_run_branch_write_does_not_promote_a_superseded_acceptance(
             # The controlled original process has returned and exited before Resume.
             assert scenario.kernel.control("resume", "continue-original-repair", subject=scenario.delivery.key) == "applied"
         step = scenario.step()
-        repairs = [event for event in _project(scenario.kernel, "concise") if event["kind"] == "acceptance_repair"]
-        if repairs and planned is None:
-            planned, = repairs
-            assert planned["live"] is False
+        if planned is None:
+            # The initial failed Final review creates the planned repair.
+            # Earlier Ticket history does not need projecting at every step.
             with scenario.kernel.storage.transaction(write=False) as tx:
-                assert obsolete_progress(tx, [planned], "concise", current_boundary=False) == set()
-                assert obsolete_progress(tx, [planned], "concise", current_boundary=True) == {planned["id"]}
+                consumed = tx.rows("SELECT * FROM history WHERE run_id=? AND subject=? "
+                                   "AND kind='role_consumed' ORDER BY position DESC LIMIT 1",
+                                   (scenario.spec.run_id, scenario.delivery.key))
+                if consumed:
+                    events = project_event(tx, dict(consumed[0]), event_state(tx), "concise")
+                    for event in events:
+                        if event.content["kind"] == "acceptance_repair" and event.visible:
+                            planned = event.content
+                            assert planned["live"] is False
+                            assert obsolete_progress(tx, [planned], "concise", current_boundary=False) == set()
+                            assert obsolete_progress(tx, [planned], "concise", current_boundary=True) == {planned["id"]}
         if issued:
             effect = issued[0]
             break
@@ -230,10 +238,15 @@ def test_observed_run_branch_write_does_not_promote_a_superseded_acceptance(
                 if row["kind"] == "acceptance_passed"]
     for _ in range(100):
         scenario.step()
-        promoted = [event for event in _project(scenario.kernel, "concise") if event["kind"] == "acceptance_passed"]
-        if promoted:
-            promotion, = promoted
-            break
+        with scenario.kernel.storage.transaction(write=False) as tx:
+            rows = tx.rows("SELECT * FROM history WHERE run_id=? AND subject=? AND kind='acceptance_promoted'",
+                           (scenario.spec.run_id, scenario.delivery.key))
+            if rows:
+                row, = rows
+                event, = project_event(tx, dict(row), event_state(tx), "concise")
+                assert event.visible and event.content["kind"] == "acceptance_passed"
+                promotion = event.content
+                break
     else:
         pytest.fail("The current Review never reached formal promotion")
     assert planned is not None and active[0]["id"] == planned["id"]

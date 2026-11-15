@@ -7,11 +7,13 @@ from collections import Counter
 import pytest
 
 from agent_run.cli.render import render
-from agent_run.model import ParentIssue, Requirements, wire_json
+from agent_run.core.kernel import Kernel
+from agent_run.model import DeliveryKind, Role, wire_json
 from agent_run.queries.run import read
-from support.offline import GraphScenario
-from support.run_scoped_kernel import domain_kernel
-from support.notification import recorded_agents as _recorded_agents, continued_round
+from support.offline import review_result
+from support.review_facts import requirement_review
+from support.worker_facts import start_worker, finish_worker
+from support.notification import continued_round
 from support.environment import durable_snapshot as _snapshot
 
 
@@ -20,35 +22,26 @@ from support.environment import durable_snapshot as _snapshot
     ((b"\x1b[31mTEXT-RETURN\x1b[0m\x07", b"null"), "TEXT-RETURN", 1),
 ], ids=["repeated-json", "text-and-null"])
 def test_consumed_review_keeps_each_original_format_return(tmp_path, monkeypatch, returns, marker, count):
-    scenario = GraphScenario(tmp_path / "scenario", Requirements(ParentIssue(1, "Parent", "Scope"), ()))
-    # Produce business facts here; query readonly behavior stays on native Storage.
-    native = scenario.kernel
-    with domain_kernel(scenario.kernel) as scenario.kernel:
-        original = scenario.agent
+    # Generate original invocations and raw returns in Core, then reopen the
+    # native database for the read-only History/CLI projection.
+    with requirement_review(tmp_path / "scenario", kind=DeliveryKind.PARENT_ONLY) as (kernel, operations):
+        development = operations.until(lambda step: step.call is not None).call
+        assert development.role == Role.DEVELOPMENT
+        process = start_worker(kernel, operations, development)
+        finish_worker(kernel, development, process)
         calls = []
-
-        def agent(call):
-            if call.role == "review":
-                scenario.kernel.bind_thread(call, call.reported_thread or "original-review-backend")
-                calls.append(call)
-                if call.output_ordinal < len(returns):
-                    return returns[call.output_ordinal]
-            return original(call)
-
-        _recorded_agents(scenario, monkeypatch, agent)
-        for _ in range(60):
-            step = scenario.step()
-            if step.call is not None and step.call.role == "review" and step.call.output_ordinal == 2:
-                assert scenario.step().kind == "progress"
-                break
-            assert step.kind not in {"paused", "waiting", "approval"}, step
-        else:
-            raise AssertionError("The actual Review did not consume its repaired result")
-        assert len(calls) == 3
+        for ordinal, raw in enumerate((*returns, wire_json(review_result("pass")))):
+            review = operations.until(lambda step: step.call is not None).call
+            assert review.role == Role.REVIEW and review.output_ordinal == ordinal
+            calls.append(review)
+            process = start_worker(kernel, operations, review)
+            kernel.bind_thread(review, review.reported_thread or "original-review-backend")
+            finish_worker(kernel, review, process, raw)
+        assert operations.once().kind == "progress"
         assert len({call.attempt_id for call in calls}) == len({call.invocation_id for call in calls}) == 1
-    scenario.kernel = native
+        native = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
     before = _snapshot(tmp_path)
-    document = read(scenario.kernel.storage.path, 'history', storage=scenario.kernel.storage)
+    document = read(native.storage.path, 'history', storage=native.storage)
     payload = json.dumps(document.data, ensure_ascii=False, sort_keys=True)
     review, = [attempt for attempt in document.data["history"]["attempts"] if attempt["role"] == "review"]
     assert review["status"] == "consumed" and review["outcome"] == "pass"
@@ -79,7 +72,7 @@ def test_consumed_review_keeps_each_original_format_return(tmp_path, monkeypatch
               if event["kind"] == "raw_returned" and event["identity"] == calls[0].invocation_id]
     assert len(events) == 3
     for event in events:
-        page = read(scenario.kernel.storage.path, 'history', after=event['position'] - 1, limit=1, storage=scenario.kernel.storage)
+        page = read(native.storage.path, 'history', after=event['position'] - 1, limit=1, storage=native.storage)
         assert page.data["history"]["attempts"] == [review]
         human = StringIO()
         render(replace(page, language="en"), style="plain", details=True, stream=human)

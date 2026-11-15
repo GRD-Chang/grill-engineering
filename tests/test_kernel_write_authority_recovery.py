@@ -7,7 +7,6 @@ import pytest
 
 from agent_run.errors import KernelError
 from support.offline_api import SyntheticGitHub
-from support.control_scenarios import managed_abandon_scenario
 
 
 def test_write_authority_does_not_cache_permission_before_its_boundary():
@@ -33,10 +32,9 @@ def test_write_authority_does_not_cache_permission_before_its_boundary():
     assert order == ["prepare", "boundary", "final"]
 
 
-def test_real_core_preparation_cannot_write_after_foreign_recovery_transition(tmp_path, monkeypatch):
+def test_real_core_preparation_cannot_write_after_foreign_recovery_transition(monkeypatch, managed_completed_ticket):
     operation = "recovery_comment"
-    scenario, host = managed_abandon_scenario(tmp_path)
-    assert scenario.run().kind == "complete"
+    scenario, host = managed_completed_ticket
     kernel = scenario.kernel
     kernel.control("stop", "retain-independent-ticket", subject="ticket:4")
     assert kernel.control_host(host, "abandon", "recovery-authority-boundary",

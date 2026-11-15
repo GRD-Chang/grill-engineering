@@ -8,23 +8,14 @@ import pytest
 from agent_run.core.operation_contract import ReadUnavailable, RequirementsRead
 from agent_run.errors import KernelError
 from agent_run.model import ReadWait
-from agent_run.model import DeliveryKind
-from support.cleanup_scenarios import _native_scenario
 
 
 class CleanupBoundary(Exception):
     pass
 
 
-def pending_cleanup(tmp_path, monkeypatch, operation="cleanup_worktree", *, sibling=False):
-    """Stop at a real committed intent; never seed or edit persisted state."""
-    if sibling:
-        from support.offline import GraphScenario
-        from support.requirements_scenarios import independent_source
-        s = GraphScenario(tmp_path / "scenario", independent_source(), record_checkpoints=False)
-    else:
-        s = _native_scenario(tmp_path / "scenario", DeliveryKind.TICKET)
-        s.record_checkpoints = False
+def pending_cleanup(s, monkeypatch, operation="cleanup_worktree"):
+    """Stop at the committed cleanup intent before the tested observation."""
     make_ports, execute = s.make_ports, s.port.execute
     captured = []
     physical_ports = []
@@ -50,8 +41,8 @@ def pending_cleanup(tmp_path, monkeypatch, operation="cleanup_worktree", *, sibl
     return s, effect, authority, physical_ports[0], execute
 
 
-def test_reopened_ticket_still_blocks_original_cleanup(tmp_path, monkeypatch):
-    s, effect, authority, ports, execute = pending_cleanup(tmp_path, monkeypatch)
+def test_reopened_ticket_still_blocks_original_cleanup(graph_ticket_before_merge, monkeypatch):
+    s, effect, authority, ports, execute = pending_cleanup(graph_ticket_before_merge, monkeypatch)
     source = ports.source
 
     def changed(parent):
@@ -66,8 +57,8 @@ def test_reopened_ticket_still_blocks_original_cleanup(tmp_path, monkeypatch):
     assert Path(s.delivery.checkout).exists()
 
 
-def test_remote_cleanup_still_requests_complete_delivery(tmp_path, monkeypatch):
-    s, effect, authority, ports, execute = pending_cleanup(tmp_path, monkeypatch, "cleanup_remote_ref")
+def test_remote_cleanup_still_requests_complete_delivery(graph_ticket_before_merge, monkeypatch):
+    s, effect, authority, ports, execute = pending_cleanup(graph_ticket_before_merge, monkeypatch, "cleanup_remote_ref")
     assert isinstance(s.kernel.begin_effect_observation(effect), RequirementsRead)
 
     def denied(request):
@@ -82,7 +73,10 @@ def test_remote_cleanup_still_requests_complete_delivery(tmp_path, monkeypatch):
 
 
 def test_sibling_requirement_refresh_keeps_existing_gate_rules(tmp_path, monkeypatch):
-    s, effect, authority, ports, execute = pending_cleanup(tmp_path, monkeypatch, sibling=True)
+    from support.offline import GraphScenario
+    from support.requirements_scenarios import independent_source
+    scenario = GraphScenario(tmp_path / "scenario", independent_source())
+    s, effect, authority, ports, execute = pending_cleanup(scenario, monkeypatch)
     source = ports.source
     sibling = next(issue for issue in s.requirements.issues if f"ticket:{issue.number}" != effect.subject)
     with s.kernel.storage.transaction(write=False) as tx:

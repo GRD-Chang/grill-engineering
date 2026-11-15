@@ -234,9 +234,8 @@ def test_ready_fifo_is_preserved_while_host_has_no_new_agent_slot(tmp_path):
     assert second.call.subject == "ticket:4"
 
 
-def test_explicit_approval_poll_observes_target_append_without_background_polling(tmp_path):
-    source = Requirements(ParentIssue(1, "Parent", "Original Parent requirement", ()), ())
-    s = GraphScenario(tmp_path / "parent", source, policy=Policy(resync_limit=0))
+def test_explicit_approval_poll_observes_target_append_without_background_polling(parent_approval_without_resync):
+    s = parent_approval_without_resync
     with domain_kernel(s.kernel) as s.kernel:
         ports = Ports(s)
         runner = OperationRunner(s.kernel, s.execution, lambda binding: ports)
@@ -258,12 +257,10 @@ def test_explicit_approval_poll_observes_target_append_without_background_pollin
 
 
 @pytest.mark.parametrize("uncertain", ["unknown", "third"])
-def test_sent_merge_can_settle_a_late_readback_without_new_write_or_attempt(tmp_path, uncertain):
+def test_sent_merge_can_settle_a_late_readback_without_new_write_or_attempt(graph_ticket_before_merge, uncertain):
     from agent_run.model import EffectResult
 
-    source = Requirements(ParentIssue(1, "Parent", "One exact ticket", (2,)),
-                          (Issue(2, "Ticket", "Ticket requirement", "OPEN", frozenset({"ready-for-agent"})),))
-    s = GraphScenario(tmp_path / "graph", source)
+    s = graph_ticket_before_merge
     with domain_kernel(s.kernel) as s.kernel:
         ports = Ports(s)
         runner = OperationRunner(s.kernel, s.execution, lambda binding: ports)
@@ -363,10 +360,8 @@ def test_original_approved_prior_merge_continues_new_review_without_a_new_contro
 
 
 @pytest.mark.parametrize("external_change", ["foreign", "absent"])
-def test_cleanup_records_foreign_observation_and_keeps_absence_admission(tmp_path, external_change):
-    source = Requirements(ParentIssue(1, "Parent", "One ticket", (2,)),
-                          (Issue(2, "Ticket", "Ticket requirement", "OPEN", frozenset({"ready-for-agent"})),))
-    s = GraphScenario(tmp_path / "graph", source)
+def test_cleanup_records_foreign_observation_and_keeps_absence_admission(graph_ticket_before_merge, external_change):
+    s = graph_ticket_before_merge
     with domain_kernel(s.kernel) as s.kernel:
         ports = Ports(s)
         runner = OperationRunner(s.kernel, s.execution, lambda binding: ports)
