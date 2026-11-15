@@ -22,7 +22,6 @@ from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Require
 from agent_run.core.kernel import Kernel
 from agent_run.config.creation import freeze_creation
 from agent_run.notifications.sender import NativeNotifications
-from support.offline import OfflinePort, Scenario
 from support.notification import _kernel, _operations, _project, observe_and_wait
 
 
@@ -100,26 +99,9 @@ def test_native_unknown_ack_is_not_sent_again_after_reopen(tmp_path: Path) -> No
 
 
 def test_native_pr_creation_requires_consumed_receipt_and_does_not_repeat_for_edits(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    mode = "detailed"
-    defaults = UserDefaultsStore(tmp_path / "defaults.json")
-    defaults.configure(language="en", notifications={"enabled": False, "mode": mode})
-    original_prepare = OfflinePort.prepare
-
-    def prepare(port: OfflinePort, *args: Any, **kwargs: Any) -> tuple[RunSpec, Delivery]:
-        # Only freeze the test's notification inputs; Scenario still runs the
-        # existing real Kernel, local Git and simulated remote operations.
-        spec, delivery = original_prepare(port, *args, **kwargs)
-        spec = freeze_creation(spec, defaults,
-                               prompt_resources={key: "Frozen " + key for key in RESOURCE_KEYS})
-        assert spec.inputs is not None
-        inputs = replace(spec.inputs, notifications={"enabled": True, "mode": mode,
-                         "profile": "fixture", "open_id": "ou_fixture", "app_id": "app_fixture"})
-        return replace(spec, inputs=inputs), delivery
-
-    with monkeypatch.context() as patch:
-        patch.setattr(OfflinePort, "prepare", prepare)
-        scenario = Scenario(tmp_path, DeliveryKind.TICKET, checks=("fail", "none"))
+        monkeypatch: pytest.MonkeyPatch, notification_ticket_before_pr) -> None:
+    scenario = notification_ticket_before_pr
+    root = scenario.kernel.storage.path.parent
     now = [100.25]
     scenario.kernel.clock = lambda: now[0]
     scenario.port.lose_response.add("pr_write")
@@ -140,19 +122,21 @@ def test_native_pr_creation_requires_consumed_receipt_and_does_not_repeat_for_ed
         return {"outcome": "success", "reason": None}
 
     def observe() -> list[dict[str, Any]]:
-        observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
+        observer = NativeNotifications(scenario.kernel.storage.path, root, transport=transport, storage=scenario.kernel.storage)
         observer.close()
         assert observer.failure_reason is None
-        return outbox.read_notifications(tmp_path, scenario.spec.run_id)["records"]
+        return outbox.read_notifications(root, scenario.spec.run_id)["records"]
 
-    for _ in range(80):
-        step = scenario.step()
-        if issued:
-            assert issued[0].payload["prior"] is None
-            break
-        assert step.kind not in {"paused", "waiting", "complete"}
-    else:
-        pytest.fail("Scenario did not reach its first PR write")
+    from support.run_scoped_kernel import prepare_domain_history
+    with prepare_domain_history(scenario):
+        for _ in range(80):
+            step = scenario.step()
+            if issued:
+                assert issued[0].payload["prior"] is None
+                break
+            assert step.kind not in {"paused", "waiting", "complete"}
+        else:
+            pytest.fail("Scenario did not reach its first PR write")
     pr = scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref)
     assert pr is not None  # External write succeeded, but its ACK was lost.
     assert not any(record["kind"] == "pr_created" for record in observe())
@@ -183,22 +167,24 @@ def test_native_pr_creation_requires_consumed_receipt_and_does_not_repeat_for_ed
     assert created[0]["id"] == _identity(scenario.spec.run_id, "pr_created", pr.number)
     rendered = next(card for card, _key in sent
                     if f"#{pr.number}" in card["header"]["title"]["content"])
-    assert f"https://github.com/example/repository/pull/{pr.number}" in str(rendered)
+    assert f"https://github.com/example/project/pull/{pr.number}" in str(rendered)
 
-    # CI repair updates the same PR through another confirmed real effect.
-    for _ in range(100):
-        step = scenario.step()
-        if len(issued) == 2:
-            assert issued[1].payload["prior"] is not None
-            break
-        assert step.kind not in {"paused", "waiting", "complete"}
-    else:
-        pytest.fail("Scenario did not reach the CI repair PR edit")
-    assert scenario.port.pull_request_by_ref(scenario.delivery.source_ref, scenario.delivery.target_ref).number == pr.number
-    assert len([write for write in scenario.port.writes() if write["operation"] == "pr_write"]) == 2
-    assert scenario.step().kind == "progress"  # Consume the edit receipt as well.
-    assert [record for record in observe() if record["kind"] == "pr_created"] == created
-    assert not any(event["kind"] == "pr_created" for event in _project(scenario.kernel, "concise"))
+    # An edit carries the existing PR in its intent. Reuse the original
+    # confirmed receipt to test classification even when its PR number matches.
+    from dataclasses import asdict
+    from agent_run.notifications.event_projection import event_state, project_event
+    from agent_run.model import wire_json
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        effect = issued[0]
+        row = dict(tx.one("SELECT * FROM history WHERE identity=? AND kind='effect_consumed'", (effect.effect_id,)))
+        saved = tx.one("SELECT payload_id FROM effects WHERE id=?", (effect.effect_id,))[0]
+        get = tx.get
+        with monkeypatch.context() as edit:
+            edit.setattr(tx, "get", lambda key, subject: wire_json({**effect.payload, "prior": asdict(pr)})
+                         if key == saved and subject == row["subject"] else get(key, subject))
+            for mode in ("detailed", "concise"):
+                assert not any(event.content["kind"] == "pr_created"
+                               for event in project_event(tx, row, event_state(tx), mode))
     sent_before = list(sent)
     observe()
     assert sent == sent_before

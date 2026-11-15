@@ -147,3 +147,56 @@ def _dependency_stage(tmp_path_factory):
 def dependent_ticket(_dependency_stage, isolated_user_environment):
     with _dependency_stage() as scenario:
         yield scenario, scenario.port.remote_commit(scenario.delivery.target_ref)
+
+
+@pytest.fixture(scope="session")
+def _failed_final_review_stage(tmp_path_factory):
+    from support.notification import _enabled_scenario, recorded_agents
+
+    def prepare(root):
+        with pytest.MonkeyPatch.context() as patch:
+            scenario = _enabled_scenario(root, patch, DeliveryKind.FINAL_RUN, reviews=("fail", "pass"))
+            with prepare_domain_history(scenario):
+                recorded_agents(scenario, patch)
+                for _ in range(100):
+                    step = scenario.step()
+                    if step.call is not None and step.call.role == "review":
+                        assert scenario.step().kind == "progress"
+                        return scenario
+                    assert step.kind not in {"paused", "waiting", "approval"}, step
+        raise AssertionError("The original Final review did not return its failure")
+
+    with _prepared_stage(tmp_path_factory, "failed-final-review", prepare) as checkout:
+        yield checkout
+
+
+@pytest.fixture
+def notification_failed_final_review(_failed_final_review_stage, isolated_user_environment):
+    with _failed_final_review_stage() as scenario:
+        native_storage = scenario.kernel.storage
+        with prepare_domain_history(scenario):
+            yield scenario, native_storage
+
+
+@pytest.fixture(scope="session")
+def _notification_pr_stage(tmp_path_factory):
+    from support.notification import _enabled_scenario
+
+    def prepare(root):
+        with pytest.MonkeyPatch.context() as patch:
+            scenario = _enabled_scenario(root, patch, DeliveryKind.TICKET, mode="detailed")
+        with prepare_domain_history(scenario):
+            for _ in range(100):
+                if scenario._progress()["phase"] == "pr":
+                    return scenario
+                scenario.step()
+        raise AssertionError("The original Ticket did not prepare its PR")
+
+    with _prepared_stage(tmp_path_factory, "notification-pr", prepare) as checkout:
+        yield checkout
+
+
+@pytest.fixture
+def notification_ticket_before_pr(_notification_pr_stage, isolated_user_environment):
+    with _notification_pr_stage() as scenario:
+        yield scenario

@@ -4,23 +4,18 @@ import time
 
 import pytest
 
-from agent_run.model import Issue, ParentIssue, Requirements
 from agent_run.notifications.cards import card
 from agent_run.notifications.envelope import event_envelope
 from agent_run.notifications.event_projection import completion_context
 from agent_run.queries.read_facts import read_boundaries
-from support.offline import GraphScenario
 from support.run_scoped_kernel import domain_kernel
 from support.notification import _completions
 
 
-def test_ticket_completion_keeps_original_summary_and_current_parent_progress(tmp_path):
-    scenario = GraphScenario(tmp_path, Requirements(
-        ParentIssue(1, "Overall requirement", "Scope", (2, 3)), (
-            Issue(2, "First task", "First scope", "OPEN", labels=("ready-for-agent",)),
-            Issue(3, "Second task", "Second scope", "OPEN", labels=("ready-for-agent",)),)))
+def test_ticket_completion_keeps_original_summary_and_current_parent_progress(dependent_ticket):
+    scenario, _ = dependent_ticket
     with domain_kernel(scenario.kernel) as scenario.kernel:
-        for number in (2, 3):
+        for completed_count, number in enumerate((3, 4), 1):
             for _ in range(200):
                 if scenario.kernel.status(f"ticket:{number}")["phase"] == "complete":
                     break
@@ -29,31 +24,31 @@ def test_ticket_completion_keeps_original_summary_and_current_parent_progress(tm
             else:
                 raise AssertionError("The real Ticket did not complete")
             completed = _completions(scenario.kernel)
-            assert len(completed) == number - 1
+            assert len(completed) == completed_count
             first = completed[0]
-            assert first["ticket_progress"] == {"completed": number - 1, "total": 2}
+            assert first["ticket_progress"] == {"completed": completed_count, "total": 2}
             assert first["parent_only"] is False
-            assert first["task_title"] == "First task"
-            assert first["url"].endswith("/issues/2")
+            assert first["task_title"] == next(issue.title for issue in scenario.requirements.issues if issue.number == 3)
+            assert first["url"].endswith("/issues/3")
             assert first["summary"] == "Changed synthetic behavior 1"
-            assert first["next_step"] == ("继续处理其他子任务" if number == 2 else "继续完成整体交付；当前步骤见状态查询。")
+            assert first["next_step"] == ("继续处理其他子任务" if completed_count == 1 else "继续完成整体交付；当前步骤见状态查询。")
             assert first["total_seconds"] is None
             rendered = json.dumps(card(first), ensure_ascii=False)
-            assert f"子任务已完成 {number - 1}/2" in rendered
+            assert f"子任务已完成 {completed_count}/2" in rendered
             assert "Changed synthetic behavior 1" in rendered
-            if number == 2:
+            if completed_count == 1:
                 original = first
-                assert scenario.kernel.control("stop", "stop-sibling", subject="ticket:3") == "applied"
+                assert scenario.kernel.control("stop", "stop-sibling", subject="ticket:4") == "applied"
                 paused, = _completions(scenario.kernel)
                 assert paused["id"] == original["id"]
                 assert paused["next_step"] == "agent-run status --repo example/project -- offline-run"
-                assert paused["completion_actions"] == [{"issue": 3, "scope": "local",
+                assert paused["completion_actions"] == [{"issue": 4, "scope": "local",
                     "reasons": ["operator_stopped"],
-                    "next_action": "agent-run resume --repo example/project --ticket 3 -- offline-run"}]
+                    "next_action": "agent-run resume --repo example/project --ticket 4 -- offline-run"}]
                 rendered = json.dumps(card(paused), ensure_ascii=False)
                 assert "operator\\_stopped" in rendered.replace("\\\\", "\\")
-                assert "--ticket 3" in rendered
-                assert scenario.kernel.control("resume", "resume-sibling", subject="ticket:3") == "applied"
+                assert "--ticket 4" in rendered
+                assert scenario.kernel.control("resume", "resume-sibling", subject="ticket:4") == "applied"
             else:
                 assert first["id"] == original["id"]
                 assert first["source_material_id"] == original["source_material_id"]

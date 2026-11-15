@@ -364,54 +364,46 @@ def test_completed_ticket_effort_spans_budget_renewal_without_recounting_resume(
 
 @pytest.mark.parametrize("role", [Role.DEVELOPMENT, Role.REVIEW, Role.PUBLICATION])
 def test_human_result_uses_original_paused_material_even_after_resume(tmp_path, monkeypatch, role):
-    scenario = GraphScenario(tmp_path, Requirements(
-        ParentIssue(1, "Parent", "Original scope", (2,)),
-        (Issue(2, "Ticket", "Original task", "OPEN", labels=("ready-for-agent",)),)))
-    with domain_kernel(scenario.kernel) as scenario.kernel:
+    from agent_run.core.operation_runner import observe_control
+    from support.review_facts import requirement_review
+    from support.worker_facts import start_worker, finish_worker
+    from support.offline import review_result
+
+    with requirement_review(tmp_path, kind=DeliveryKind.TICKET) as (kernel, operations):
         reason = "Original human decision / 保留原文"
-        original = scenario.agent
-
-        def result(call):
-            raw = original(call)
-            if call.role != role:
-                return raw
-            if role == Role.REVIEW:
-                return wire_json({"checks": {lane: {"status": "blocked" if lane == "e2e" else "pass",
-                                                    "evidence": reason if lane == "e2e" else "Passed exact lane",
-                                                    "findings": []} for lane in ("e2e", "standards", "spec")}})
-            return wire_json({"result_kind": "human_blocker", "human_blockers": [reason],
+        for expected in (Role.DEVELOPMENT, Role.REVIEW, Role.PUBLICATION):
+            call = operations.until(lambda step: step.call is not None).call
+            assert call.role == expected
+            process = start_worker(kernel, operations, call)
+            if expected == role:
+                if role == Role.REVIEW:
+                    result = review_result("blocked")
+                    result["checks"]["spec"]["evidence"] = reason
+                else:
+                    result = {"result_kind": "human_blocker", "human_blockers": [reason],
                               **({"summary": None} if role == Role.DEVELOPMENT else
-                                 {"commit_message": None, "pr_title": None, "pr_body_markdown": None})})
-
-        _recorded_agents(scenario, monkeypatch, result)
-        for _ in range(100):
-            step = scenario.step()
-            if step.call is not None and step.call.role == role:
-                call = step.call
-                assert not any(event["kind"] == "stage_end" and event.get("attempt_id") == call.attempt_id
-                               for event in _project(scenario.kernel, "detailed"))
-                assert scenario.step().kind == "paused"
+                                 {"commit_message": None, "pr_title": None, "pr_body_markdown": None})}
+                finish_worker(kernel, call, process, wire_json(result))
                 break
-            assert step.kind not in {"paused", "waiting", "approval"}, step
-        else:
-            raise AssertionError("The selected role never returned its human artifact")
-        results = [event for event in _project(scenario.kernel, "detailed")
+            finish_worker(kernel, call, process, wire_json(review_result("pass")) if expected == Role.REVIEW else None)
+        assert not any(event["kind"] == "stage_end" and event.get("attempt_id") == call.attempt_id
+                       for event in _project(kernel, "detailed"))
+        assert operations.once().kind == "paused"
+        results = [event for event in _project(kernel, "detailed")
                    if event["kind"] == "stage_end" and event.get("attempt_id") == call.attempt_id]
         assert len(results) == 1 and reason in results[0]["summary"]
         assert results[0]["status_code"] == ("review_blocked" if role == Role.REVIEW else "human_blocker")
         assert results[0]["color"] == "yellow" and results[0]["next_step"]
-        assert not any(event["kind"] == "stage_end" for event in _project(scenario.kernel, "concise"))
-        scenario.kernel.control("resume", "answer-original", subject=call.subject,
-                                message="Use the original decision", world=scenario.world())
-        assert [event for event in _project(scenario.kernel, "detailed") if event["id"] == results[0]["id"]] == results
+        assert not any(event["kind"] == "stage_end" for event in _project(kernel, "concise"))
+        kernel.control("resume", "answer-original", subject=call.subject,
+                                message="Use the original decision", world=observe_control(kernel, call.subject, lambda _: operations.runner.ports))
+        assert [event for event in _project(kernel, "detailed") if event["id"] == results[0]["id"]] == results
 
 
-def test_human_revision_after_a_new_generation_is_not_the_old_automatic_repair(tmp_path, monkeypatch, domain_scenario):
+def test_human_revision_after_a_new_generation_is_not_the_old_automatic_repair(monkeypatch, notification_failed_final_review):
     from dataclasses import replace
 
-    # d847's Final fixture retains a real historical Ticket and Completion.
-    # Its prefix has already passed Review; this script begins at Final Review.
-    scenario = domain_scenario(tmp_path, DeliveryKind.FINAL_RUN, reviews=("fail", "pass"))
+    scenario, _ = notification_failed_final_review
     assert scenario.kernel.status("ticket:2")["phase"] == "complete"
     assert len(scenario.kernel.source_status()["completions"]) == 1
     start_views = {}
@@ -421,14 +413,6 @@ def test_human_revision_after_a_new_generation_is_not_the_old_automatic_repair(t
             start_views[call.attempt_id] = _project(scenario.kernel, "detailed")
 
     _recorded_agents(scenario, monkeypatch, started=started)
-    for _ in range(100):
-        step = scenario.step()
-        if step.call is not None and step.call.role == Role.REVIEW:
-            assert scenario.step().kind == "progress"
-            break
-        assert step.kind not in {"paused", "waiting", "approval"}, step
-    else:
-        raise AssertionError("The first overall Review did not return its failure")
     original_generation = scenario.kernel.status("final:1")["generation"]
     planned = [event for event in _project(scenario.kernel, "detailed") if event["kind"] == "acceptance_repair"]
     assert len(planned) == 1 and planned[0]["live"] is False

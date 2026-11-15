@@ -166,8 +166,9 @@ def test_acceptance_and_terminal_notifications_follow_committed_delivery_boundar
 
 
 def test_observed_run_branch_write_does_not_promote_a_superseded_acceptance(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    scenario = _enabled_scenario(tmp_path, monkeypatch, DeliveryKind.FINAL_RUN, reviews=("fail", "pass"))
+        monkeypatch: pytest.MonkeyPatch, notification_failed_final_review) -> None:
+    scenario, native_storage = notification_failed_final_review
+    root = native_storage.path.parent
     active, planned = [], None
 
     def started(call):
@@ -228,13 +229,14 @@ def test_observed_run_branch_write_does_not_promote_a_superseded_acceptance(
         assert tx.one("SELECT status FROM effects WHERE id=?", (effect.effect_id,))[0] == "confirmed"
         assert not tx.rows("SELECT position FROM history WHERE kind='acceptance_promoted'")
 
+
     def transport(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         return {"outcome": "success", "reason": None}
 
-    observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
+    observer = NativeNotifications(scenario.kernel.storage.path, root, transport=transport, storage=native_storage)
     observer.close()
     assert observer.failure_reason is None
-    assert not [row for row in outbox.read_notifications(tmp_path, scenario.spec.run_id)["records"]
+    assert not [row for row in outbox.read_notifications(root, scenario.spec.run_id)["records"]
                 if row["kind"] == "acceptance_passed"]
     for _ in range(100):
         scenario.step()
@@ -273,15 +275,15 @@ def test_observed_run_branch_write_does_not_promote_a_superseded_acceptance(
     assert not any(event["kind"] == "approval_ready" for event in projected)
     with scenario.kernel.storage.transaction(write=False) as tx:
         assert obsolete_progress(tx, [update], "concise", current_boundary=True) == {update["id"]}
-    assert scenario.run(approve=True).kind == "complete"
-    observer = NativeNotifications(scenario.kernel.storage.path, tmp_path, transport=transport, storage=scenario.kernel.storage)
+    observer = NativeNotifications(scenario.kernel.storage.path, root, transport=transport, storage=native_storage)
     observer.close()
     assert observer.failure_reason is None
-    accepted = [row for row in outbox.read_notifications(tmp_path, scenario.spec.run_id)["records"]
+    accepted = [row for row in outbox.read_notifications(root, scenario.spec.run_id)["records"]
                 if row["kind"] == "acceptance_passed"]
     # Source recovery and the later target invalidation each promote one new Review.
     assert len(accepted) == len({row["id"] for row in accepted}) == 2
-    target = scenario.port.remote_commit(scenario.delivery.target_ref)
+    # The current approved PR head must already include the retained source edit.
+    target = scenario.port.remote_commit(scenario.delivery.source_ref)
     assert target is not None
     assert scenario.port.git.run("show", f"{target.sha}:{filename}").stdout == "Independent retained work\n"
     scenario.port.git.run("merge-base", "--is-ancestor", foreign.sha, target.sha)

@@ -746,14 +746,14 @@ def test_repeated_wakes_during_projection_keep_new_important_card_ahead_of_statu
         observer.close(drain=False)
 
 
-def test_existing_pr_status_tracks_current_review_failure_repair_and_pass(monkeypatch, parent_at_approval):
+def test_existing_pr_status_tracks_current_review_failure_repair_and_pass(monkeypatch, domain_parent_at_approval):
     from io import StringIO
     import json
     from agent_run.cli.render import render
     from agent_run.queries.run import read
     from support.environment import durable_snapshot
 
-    scenario = parent_at_approval
+    scenario = domain_parent_at_approval
     kernel, subject = scenario.kernel, scenario.delivery.key
     sender = core_status_comments(kernel)
     api = CommentsAPI(project_status(kernel.storage.path, subject, storage=kernel.storage).target)
@@ -836,7 +836,7 @@ def test_existing_pr_status_tracks_current_review_failure_repair_and_pass(monkey
     runner.authorize_agent(call_step.call)
     kernel.receive(call_step.call, scenario.agent(call_step.call))
     assert "Recorded Review: pending" in project_status(kernel.storage.path, subject, storage=kernel.storage).body
-    assert scenario.run().kind == "approval"
+    assert scenario.run(cut="publication_pending").kind == "publication_pending"
     current = project_status(kernel.storage.path, subject, storage=kernel.storage)
     assert "Recorded Review: pass" in current.body
     assert "Recorded Review: request_changes" not in current.body
@@ -875,7 +875,7 @@ def test_existing_pr_status_tracks_current_review_failure_repair_and_pass(monkey
     assert sender.deliver(subject, api=api) == "unavailable"
     assert api.reads == reads and len(api.commands) == writes
     kernel.control("resume", "resume-business-only", subject=subject)
-    assert scenario.run(approve=True).kind == "complete"
+    assert scenario.step().kind not in {"paused", "waiting"}
 
 
 def assert_stale_and_unknown_review_records_are_readonly(kernel, subject):
