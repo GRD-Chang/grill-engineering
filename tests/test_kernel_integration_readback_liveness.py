@@ -1,15 +1,14 @@
 """A queued integration waiter cannot starve its owner's original readback."""
 import pytest
 
-from support.offline_prefixes import _prepared_stage
 from support.offline import GraphScenario
+from support.offline_prefixes import _prepared_stage
+from support.run_scoped_kernel import prepare_domain_history
 from support.requirements_scenarios import independent_source
 
 
-def _pending_merge_with_waiter(tmp_path):
-    scenario = GraphScenario(tmp_path / 'graph', independent_source())
-    now = [100.25]
-    scenario.kernel.clock = lambda: now[0]
+def _prepare_waiter(scenario):
+    scenario.kernel.clock = lambda: 100.25
     scenario.port.lose_response.add('merge')
     retry = None
     for _ in range(80):
@@ -26,28 +25,36 @@ def _pending_merge_with_waiter(tmp_path):
     assert scenario.kernel.status('ticket:3')['holds_integration']
     assert not scenario.kernel.status('ticket:4')['holds_integration']
     assert len([w for w in scenario.port.writes() if w['operation'] == 'merge']) == 1
-    return scenario
+    return retry, pending['id']
 
 
-@pytest.fixture(scope="module")
-def merge_readback_stage(tmp_path_factory):
-    with _prepared_stage(tmp_path_factory, "merge-with-waiter", _pending_merge_with_waiter) as checkout:
-        yield checkout
+@pytest.fixture(scope='module')
+def _merge_waiter_stage(tmp_path_factory):
+    original = None
+
+    def prepare(root):
+        nonlocal original
+        scenario = GraphScenario(root, independent_source())
+        with prepare_domain_history(scenario):
+            original = _prepare_waiter(scenario)
+        return scenario
+
+    with _prepared_stage(tmp_path_factory, 'merge-waiter', prepare) as checkout:
+        assert original is not None
+        yield checkout, original
 
 
 @pytest.fixture
-def pending_merge(merge_readback_stage, isolated_user_environment):
-    with merge_readback_stage() as scenario:
+def pending_merge_with_waiter(_merge_waiter_stage, isolated_user_environment):
+    checkout, (retry, original) = _merge_waiter_stage
+    with checkout() as scenario:
         now = [100.25]
         scenario.kernel.clock = lambda: now[0]
-        state = scenario.runner().state()
-        assert state.disposition == "waiting" and state.wake_at is not None
-        pending = scenario.kernel.status("ticket:3")["pending_write"]
-        yield scenario, now, state.wake_at, pending["id"]
+        yield scenario, now, retry, original
 
 
-def test_due_original_merge_settles_before_its_integration_waiter(pending_merge):
-    scenario, now, retry, original = pending_merge
+def test_due_original_merge_settles_before_its_integration_waiter(pending_merge_with_waiter):
+    scenario, now, retry, original = pending_merge_with_waiter
     now[0] = retry + 0.01
     step = scenario.step()
     assert (step.kind, step.subject) == ('progress', 'ticket:3')
@@ -70,8 +77,8 @@ def test_due_original_merge_settles_before_its_integration_waiter(pending_merge)
     assert scenario.kernel.status('ticket:4')['holds_integration']
 
 
-def test_retry_and_stop_do_not_grant_the_waiter_or_repeat_a_write(pending_merge):
-    scenario, now, retry, original = pending_merge
+def test_retry_and_stop_do_not_grant_the_waiter_or_repeat_a_write(pending_merge_with_waiter):
+    scenario, now, retry, original = pending_merge_with_waiter
     before = scenario.port.writes()
     runner = scenario.runner()
     state = runner.state()
