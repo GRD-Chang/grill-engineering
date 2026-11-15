@@ -135,8 +135,8 @@ print(json.dumps({'step':step.kind,'status':k.status('ticket:2')}))
 
 
 
-def test_old_pr_intent_is_settled_before_reintegration_after_target_append(tmp_path: Path, monkeypatch, domain_scenario) -> None:
-    scenario = domain_scenario(tmp_path / "scenario", DeliveryKind.TICKET)
+def test_old_pr_intent_is_settled_before_reintegration_after_target_append(monkeypatch, ticket_before_pr) -> None:
+    scenario = ticket_before_pr
     held = advance_to_effect(scenario, monkeypatch, "pr_write", sent=True)
     effect = held.effect
     scenario.port.execute(effect, held.authorize)
@@ -275,8 +275,8 @@ def test_fifo_and_stale_return_release_cannot_steal_new_lease(tmp_path: Path) ->
     assert operations.runner.state().active == (third.lease_id,)
 
 
-def test_final_approval_check_timeout_has_a_finite_action_and_same_grant_resume(tmp_path: Path, domain_scenario) -> None:
-    scenario = domain_scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
+def test_final_approval_check_timeout_has_a_finite_action_and_same_grant_resume(parent_at_approval) -> None:
+    scenario = parent_at_approval
     assert scenario.run().kind == "approval"
     scenario.kernel.control("approve", "approve-exact", subject=scenario.delivery.key, world=scenario.world())
     with pytest.raises(KernelError, match="final_approval_noncancellable"):

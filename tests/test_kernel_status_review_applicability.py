@@ -5,14 +5,12 @@ import json
 
 from agent_run.cli.main import main
 from agent_run.cli.render import render
-from agent_run.model import DeliveryKind
 from agent_run.queries import run as query
 from support.environment import durable_snapshot
-from support.offline import Scenario
 
 
-def test_local_status_does_not_present_the_previous_pass_as_current_after_target_changes(tmp_path, capsys):
-    scenario = Scenario(tmp_path / "run", DeliveryKind.PARENT_ONLY)
+def test_local_status_does_not_present_the_previous_pass_as_current_after_target_changes(tmp_path, capsys, parent_at_approval):
+    scenario = parent_at_approval
     kernel, subject = scenario.kernel, scenario.delivery.key
     assert scenario.run().kind == "approval"
     document = query.read(kernel.storage.path, "status", storage=kernel.storage)
@@ -24,7 +22,7 @@ def test_local_status_does_not_present_the_previous_pass_as_current_after_target
     scenario.port.external_remote_append(scenario.delivery.target_ref,
         {"new-target.txt": "Independent target update\n"}, "status-target-update")
     assert kernel.control("approve", "update-target", subject=subject, world=scenario.world()) == "updating"
-    before = durable_snapshot(tmp_path)
+    before = durable_snapshot(scenario.port.root), durable_snapshot(tmp_path)
     assert main(arguments) == 0
     output = capsys.readouterr().out
     assert "已记录验收结论: 通过" not in output
@@ -32,7 +30,7 @@ def test_local_status_does_not_present_the_previous_pass_as_current_after_target
     job = next(row for row in document.data["subjects"] if row["subject"] == subject)
     assert job["review"] == original  # Original audit evidence stays available.
     assert job["review_state"] == "stale"
-    assert durable_snapshot(tmp_path) == before
+    assert (durable_snapshot(scenario.port.root), durable_snapshot(tmp_path)) == before
 
 
 def _assert_current_view(scenario, state, capsys, *, hidden_finding=None):
@@ -60,8 +58,8 @@ def _assert_current_view(scenario, state, capsys, *, hidden_finding=None):
 
 
 
-def test_source_revision_change_does_not_reuse_the_recorded_pass(tmp_path, capsys):
-    scenario = Scenario(tmp_path / "run", DeliveryKind.PARENT_ONLY)
+def test_source_revision_change_does_not_reuse_the_recorded_pass(capsys, parent_at_approval):
+    scenario = parent_at_approval
     assert scenario.run().kind == "approval"
     original = query.read(scenario.kernel.storage.path, "status", storage=scenario.kernel.storage).data["subjects"][0]["review"]
     scenario.requirements = replace(scenario.requirements,

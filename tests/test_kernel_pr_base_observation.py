@@ -10,7 +10,7 @@ from agent_run.errors import KernelError
 from agent_run.model import DeliveryKind
 from support.run_scoped_kernel import domain_scenario
 from support.offline_api import SyntheticGitHub
-from support.remote_effects import _fixture, _publish_pr
+from support.remote_effects import _fixture, _publish_pr, _pr_effect, existing_pr
 
 
 def test_ticket_ci_repair_finishes_when_the_pr_reports_an_ancestor_base(tmp_path, monkeypatch, domain_scenario):
@@ -53,8 +53,8 @@ def test_ticket_ci_repair_finishes_when_the_pr_reports_an_ancestor_base(tmp_path
 
 @pytest.mark.parametrize('metadata_converges', [False, True])
 def test_pr_edit_uses_the_exact_live_intent_base_without_rewriting_the_reported_base(tmp_path, monkeypatch, metadata_converges):
-    port, git, push, state, calls = _fixture(tmp_path, monkeypatch)
-    original, pr = _publish_pr(port, push)
+    port, git, push, state, calls, pr = existing_pr(tmp_path, monkeypatch)
+    original = _pr_effect(push)
     newer = git.make_commit(push.base.tree, (push.base.sha,), 'A legitimate target append')
     git.run('push', 'origin', newer.sha + ':' + push.target_ref)
     effect = replace(original, effect_id='current-target-edit', pr_number=pr.number, base=newer,
@@ -77,12 +77,11 @@ def test_pr_edit_uses_the_exact_live_intent_base_without_rewriting_the_reported_
     assert admissions == [effect.effect_id]
     assert observed.pr.title == effect.payload['title']
     writes = [json.loads(line) for line in calls.read_text().splitlines() if '--method' in json.loads(line)]
-    assert len(writes) == 2 and 'PATCH' in writes[-1]
+    assert len(writes) == 1 and 'PATCH' in writes[0]
 
 
 def test_delivery_reads_real_refs_and_preserves_the_reported_pr_base(tmp_path, monkeypatch):
-    port, git, push, _state, _calls = _fixture(tmp_path, monkeypatch)
-    _effect, pr = _publish_pr(port, push)
+    port, git, push, _state, _calls, pr = existing_pr(tmp_path, monkeypatch)
     newer = git.make_commit(push.base.tree, (push.base.sha,), 'Target ref advanced')
     git.run('push', 'origin', newer.sha + ':' + push.target_ref)
     facts = port.delivery(DeliveryRead(push.source_ref, push.target_ref, pr.number, (), push.after_sha))
@@ -116,8 +115,8 @@ def test_delivery_accepts_github_repository_spelling_without_rewriting_the_obser
 
 @pytest.mark.parametrize('foreign', ['repository', 'target_ref', 'head', 'actor', 'base', 'missing_target'])
 def test_an_ancestor_base_does_not_authorize_foreign_or_missing_pr_facts(tmp_path, monkeypatch, foreign):
-    port, git, push, state, calls = _fixture(tmp_path, monkeypatch)
-    original, pr = _publish_pr(port, push)
+    port, git, push, state, calls, pr = existing_pr(tmp_path, monkeypatch)
+    original = _pr_effect(push)
     newer = git.make_commit(push.base.tree, (push.base.sha,), 'Current target')
     git.run('push', 'origin', newer.sha + ':' + push.target_ref)
     document = json.loads(state.read_text())
@@ -145,11 +144,11 @@ def test_an_ancestor_base_does_not_authorize_foreign_or_missing_pr_facts(tmp_pat
     assert result.disposition == 'third'
     assert admissions == []
     writes = [json.loads(line) for line in calls.read_text().splitlines() if '--method' in json.loads(line)]
-    assert len(writes) == 1 and 'POST' in writes[0]
+    assert writes == []
 
 
-def test_parent_requires_fresh_review_and_approval_for_the_live_target(tmp_path, monkeypatch, domain_scenario):
-    scenario = domain_scenario(tmp_path / 'scenario', DeliveryKind.PARENT_ONLY)
+def test_parent_requires_fresh_review_and_approval_for_the_live_target(monkeypatch, parent_at_approval):
+    scenario = parent_at_approval
     assert scenario.run().kind == 'approval'
     kernel, subject = scenario.kernel, scenario.delivery.key
     old = scenario.world()
@@ -188,8 +187,7 @@ def test_parent_requires_fresh_review_and_approval_for_the_live_target(tmp_path,
 
 def test_delivery_rejects_refs_that_change_during_the_observation(tmp_path, monkeypatch):
     from agent_run.adapters import remote
-    port, git, push, _state, _calls = _fixture(tmp_path, monkeypatch)
-    _original, pr = _publish_pr(port, push)
+    port, git, push, _state, _calls, pr = existing_pr(tmp_path, monkeypatch)
     later = git.make_commit(push.base.tree, (push.base.sha,), 'Changed during physical read')
     read = remote.read_remote_heads
     observations = []
@@ -207,8 +205,7 @@ def test_delivery_rejects_refs_that_change_during_the_observation(tmp_path, monk
 
 
 def test_merge_rechecks_the_original_target_after_slow_prepare(tmp_path, monkeypatch):
-    port, git, push, _state, calls = _fixture(tmp_path, monkeypatch)
-    _original, pr = _publish_pr(port, push)
+    port, git, push, _state, calls, pr = existing_pr(tmp_path, monkeypatch)
     merge = replace(push, effect_id='original-merge', operation='merge', pr_number=pr.number,
         payload={'method': 'squash', 'parents': [push.base.sha], 'commit_message': pr.title + '\n\n' + pr.body})
     assert port.reconcile(merge).disposition == 'prior'
@@ -224,13 +221,12 @@ def test_merge_rechecks_the_original_target_after_slow_prepare(tmp_path, monkeyp
     assert git.run('ls-remote', 'origin', push.target_ref).stdout.strip() == later.sha + '\t' + push.target_ref
     assert admissions == []
     writes = [json.loads(line) for line in calls.read_text().splitlines() if '--method' in json.loads(line)]
-    assert len(writes) == 1 and not any(call[1].endswith('/merge') for call in writes)
+    assert writes == []
 
 
 @pytest.mark.parametrize('foreign', ['actor', 'parents', 'tree'])
 def test_merged_receipt_still_requires_the_original_actor_parents_and_tree(tmp_path, monkeypatch, foreign):
-    port, git, push, state, calls = _fixture(tmp_path, monkeypatch)
-    _original, pr = _publish_pr(port, push)
+    port, git, push, state, calls, pr = existing_pr(tmp_path, monkeypatch)
     merge = replace(push, effect_id='original-merge', operation='merge', pr_number=pr.number,
         payload={'method': 'merge', 'parents': [push.base.sha, push.after_sha],
                  'commit_message': 'Reviewed exact merge'})

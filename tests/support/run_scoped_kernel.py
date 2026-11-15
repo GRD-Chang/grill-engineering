@@ -5,6 +5,7 @@ physical Host proof. The original Transaction owns accounting and rollback.
 """
 from contextlib import ExitStack, closing, contextmanager
 import sqlite3
+from unittest.mock import patch
 from pathlib import Path
 from threading import RLock
 from types import SimpleNamespace
@@ -20,28 +21,25 @@ from agent_run.storage.sqlite import Transaction
 class ScopedKernel(Kernel):
     """Only transaction injection; every business operation is the real Kernel."""
 
-    def __init__(self, db, run, *, path=Path("/fixture/kernel.sqlite3"), record_owners=True, enforce_readonly=False):
+    def __init__(self, db, run, *, path=Path("/fixture/kernel.sqlite3"), record_owners=True, reader=None):
         self.owners = []
 
         @contextmanager
         def transaction(*, write=True, ordered=True, cancelled=None, deadline=None):
             assert cancelled is None and deadline is None and not db.in_transaction
-            if enforce_readonly:
-                # Reassigning this flag expires every prepared statement, even
-                # when unchanged. Read the private connection's actual mode.
-                if db.execute("PRAGMA query_only").fetchone()[0] != int(not write):
-                    db.execute("PRAGMA query_only=" + ("OFF" if write else "ON"))
-            owner = Transaction(db)
+            assert reader is None or not reader.in_transaction
+            connection = db if write or reader is None else reader
+            owner = Transaction(connection)
             if record_owners:
                 self.owners.append(owner)
             try:
-                db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+                connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
                 yield RunTransaction(owner, run)
                 if owner.failed:
                     raise KernelError("transaction_aborted")
-                db.commit()
+                connection.commit()
             except BaseException:
-                db.rollback()
+                connection.rollback()
                 raise
 
         self.storage = SimpleNamespace(transaction=transaction, path=path, run_id=run)
@@ -96,21 +94,37 @@ def domain_kernel(native):
     """
     path, run = native.storage.path, native.storage.run_id
     assert run is not None
-    with closing(sqlite3.connect(path.absolute().as_uri() + "?mode=rw", uri=True, isolation_level=None)) as db:
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA foreign_keys=ON")
-        db.execute("PRAGMA trusted_schema=OFF")
-        selected = ScopedKernel(db, run, path=path, record_owners=False, enforce_readonly=True)
+    # Separate read/write handles retain prepared statements across alternating
+    # transactions. Each BEGIN still observes the latest committed state.
+    uri = path.absolute().as_uri()
+    with ExitStack() as handles:
+        def connect(mode):
+            db = handles.enter_context(closing(sqlite3.connect(
+                f"{uri}?mode={mode}", uri=True, isolation_level=None)))
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            db.execute("PRAGMA trusted_schema=OFF")
+            return db
+
+        writer, reader = connect("rw"), connect("ro")
+        reader.execute("PRAGMA query_only=ON")
+        selected = ScopedKernel(writer, run, path=path, record_owners=False, reader=reader)
         selected.clock = native.clock
         yield selected
+
+
+@contextmanager
+def prepare_domain_history(scenario):
+    """Commit the preparatory delivery to its own database, then restore native access."""
+    with domain_kernel(scenario.kernel) as kernel, patch.object(scenario, "kernel", kernel):
+        yield
 
 
 @pytest.fixture
 def domain_scenario():
     """Explicit consumer selection; default Scenario remains fully native.
 
-    Final's historical Ticket initialization runs natively inside Scenario;
-    only subsequent business/Git work uses this transaction attachment.
+    The production Core commits each transition in the private SQLite database.
     """
     from support.offline import Scenario
 

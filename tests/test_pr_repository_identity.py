@@ -8,7 +8,6 @@ from agent_run.contracts.pr_observation import pr_target
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.model import Commit, DeliveryKind, PullRequest
-from support.offline import Scenario
 from support.offline_api import SyntheticGitHub
 from support.control_scenarios import _parent_requeue, _retirement
 from support.notification import _project
@@ -88,6 +87,9 @@ def test_case_equivalent_pr_survives_publication_retirement_and_merge_receipts(
 ):
     scenario, old, replacement, world = _parent_requeue(tmp_path, monkeypatch)
     assert old.pr.repository == old.pr.head_repository == "Example/Repository"
+    created = [e for e in _project(scenario.kernel, "detailed") if e["kind"] == "pr_created"]
+    assert len(created) == 1
+    assert created[0]["url"].startswith("https://github.com/Example/Repository/pull/")
     kernel, subject = scenario.kernel, scenario.delivery.key
     assert kernel.control("requeue", "case-equivalent-requeue", subject=subject,
                           replacement=replacement, world=world) == "pending"
@@ -111,17 +113,9 @@ def test_case_equivalent_pr_survives_publication_retirement_and_merge_receipts(
             assert saved["pr"]["repository"] == saved["pr"]["head_repository"] == "Example/Repository"
 
 
-def test_pr_created_notification_preserves_github_repository_spelling(tmp_path, github_repository_spelling):
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
-    assert scenario.run().kind == "approval"
-    created = [e for e in _project(scenario.kernel, "detailed") if e["kind"] == "pr_created"]
-    assert len(created) == 1
-    assert created[0]["url"].startswith("https://github.com/Example/Repository/pull/")
-
-
 @pytest.mark.parametrize("fault", ["head_sha", "actor"])
-def test_mixed_case_publication_receipt_still_rejects_wrong_sha_or_actor(tmp_path, monkeypatch, fault):
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET)
+def test_mixed_case_publication_receipt_still_rejects_wrong_sha_or_actor(monkeypatch, fault, ticket_before_pr):
+    scenario = ticket_before_pr
     execute = scenario.port.execute
 
     def changed_receipt(effect, authorize):

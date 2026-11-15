@@ -1,4 +1,4 @@
-"""Driver bookkeeping only; no Core, Git, Task, Host or Worker execution proof."""
+"""Optional driver checkpoints and isolation of physical precondition copies."""
 import inspect
 from types import SimpleNamespace
 
@@ -89,3 +89,32 @@ def test_enabled_trace_keeps_the_historical_approval_snapshot(monkeypatch):
     assert trace['checkpoints'] == [{'phase': 'approval', 'resource_cleanup': None}]
     assert trace['final']['phase'] == 'complete'
     assert events == ['run', 'prepare', 'status', 'status']
+
+
+def test_prepared_pr_discards_failed_cases_and_reopens_its_original_worktree(_ticket_pr_stage):
+    from pathlib import Path
+
+    class InterruptedCase(Exception):
+        pass
+
+    with pytest.raises(InterruptedCase):
+        with _ticket_pr_stage() as changed:
+            work = Path(changed.delivery.checkout)
+            marker = work / 'changes-from-first-case'
+            marker.write_text('changes remain private to this test')
+            changed.port.lose_response.add('pr_write')
+            changed.role_calls.clear()
+            assert changed.kernel.control('stop', 'first-case') == 'applied'
+            # Entry failure while another copy owns the absolute path must
+            # preserve the active case and leave cleanup to its original owner.
+            with pytest.raises(FileExistsError), _ticket_pr_stage():
+                pytest.fail('Concurrent mutable copies cannot share a checkout')
+            assert marker.exists()
+            raise InterruptedCase
+    assert not work.exists()
+    with _ticket_pr_stage() as fresh:
+        assert Path(fresh.delivery.checkout) == work
+        assert fresh.port.git.run('rev-parse', '--show-toplevel', cwd=work).stdout.strip() == str(work)
+        assert not marker.exists() and not fresh.port.lose_response and fresh.role_calls
+        assert fresh.kernel.status(fresh.delivery.key)['stopped'] is False
+        assert fresh.kernel.status(fresh.delivery.key)['phase'] == 'pr'

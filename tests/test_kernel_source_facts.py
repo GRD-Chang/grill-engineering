@@ -5,12 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.model import DeliveryKind, Policy
+from agent_run.model import Policy
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.model import Issue, ParentIssue, Requirements
 from support.offline import GraphScenario
-from support.run_scoped_kernel import domain_scenario
 from support.core_operations import CoreOperations, scripted_return
 
 
@@ -47,8 +46,8 @@ def test_refresh_receipt_preserves_observed_issue_and_completion_identities(tmp_
 
 
 @pytest.mark.parametrize("head_repository", [None, "foreign/repository"])
-def test_same_branch_in_unknown_or_foreign_repository_cannot_authorize_merge(tmp_path: Path, head_repository: str | None, domain_scenario) -> None:
-    scenario = domain_scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
+def test_same_branch_in_unknown_or_foreign_repository_cannot_authorize_merge(head_repository: str | None, parent_at_approval) -> None:
+    scenario = parent_at_approval
     assert scenario.run().kind == "approval"
     world = scenario.world()
     assert world.pr is not None

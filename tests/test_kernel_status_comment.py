@@ -267,7 +267,7 @@ def test_status_transport_cancel_reaps_its_actual_child_without_retry(tmp_path, 
         os.waitpid(pid, os.WNOHANG)
 
 
-def test_normal_exit_hook_uses_original_handoff_without_claiming_domain_release(tmp_path, monkeypatch):
+def test_normal_exit_hook_uses_original_handoff_without_claiming_domain_release(tmp_path, monkeypatch, parent_at_approval):
     import json
     import os
     import select
@@ -280,7 +280,7 @@ def test_normal_exit_hook_uses_original_handoff_without_claiming_domain_release(
     from agent_run.runtime.process_identity import _process_start_token
     from agent_run.runtime.execution import _cgroup
     from support.systemd_manager import controlled_manager
-    scenario = published(tmp_path)
+    scenario = parent_at_approval
     kernel, subject = scenario.kernel, scenario.delivery.key
     kernel.control("stop", "offline-executor-exit")
     kernel.confirm_executor_exit(scenario.execution)
@@ -544,7 +544,7 @@ def test_preempted_unknown_post_keeps_original_intent_and_never_creates_twice(tm
         release.set()
         observer.close(drain=False)
 
-def test_attach_updates_same_status_only_after_original_domain_and_usage_release(tmp_path, monkeypatch):
+def test_attach_updates_same_status_only_after_original_domain_and_usage_release(tmp_path, monkeypatch, parent_at_approval):
     import json
     import os
     import subprocess
@@ -555,7 +555,7 @@ def test_attach_updates_same_status_only_after_original_domain_and_usage_release
     from agent_run.runtime.handoff import prepare_handoff
     from agent_run.runtime.package_lease import runner_usage_lease
     from support.systemd_manager import controlled_manager
-    scenario = published(tmp_path)
+    scenario = parent_at_approval
     kernel, subject = scenario.kernel, scenario.delivery.key
     kernel.control("stop", "retire-offline-for-managed-release")
     kernel.confirm_executor_exit(scenario.execution)
@@ -746,14 +746,14 @@ def test_repeated_wakes_during_projection_keep_new_important_card_ahead_of_statu
         observer.close(drain=False)
 
 
-def test_existing_pr_status_tracks_current_review_failure_repair_and_pass(tmp_path, monkeypatch):
+def test_existing_pr_status_tracks_current_review_failure_repair_and_pass(monkeypatch, parent_at_approval):
     from io import StringIO
     import json
     from agent_run.cli.render import render
     from agent_run.queries.run import read
     from support.environment import durable_snapshot
 
-    scenario = published(tmp_path)
+    scenario = parent_at_approval
     kernel, subject = scenario.kernel, scenario.delivery.key
     sender = core_status_comments(kernel)
     api = CommentsAPI(project_status(kernel.storage.path, subject, storage=kernel.storage).target)

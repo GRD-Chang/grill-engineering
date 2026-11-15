@@ -12,7 +12,6 @@ from agent_run.contracts.write_authority import WriteAuthority
 from support.remote_effects import publication
 from agent_run.errors import KernelError
 from agent_run.model import DeliveryKind, Role, wire_json
-from support.offline import Scenario
 from support.run_scoped_kernel import domain_scenario
 from support.offline_api import SyntheticGitHub
 
@@ -63,7 +62,7 @@ def test_ticket_squash_uses_the_complete_published_pr_not_the_latest_commit(tmp_
     assert scenario.development_count == (2 if repair else 1)
 
 
-def test_wrong_squash_message_cannot_complete_or_repeat_the_original_merge(tmp_path, monkeypatch):
+def test_wrong_squash_message_cannot_complete_or_repeat_the_original_merge(monkeypatch, ticket_before_pr):
     original = SyntheticGitHub.write
     requested = []
 
@@ -75,7 +74,7 @@ def test_wrong_squash_message_cannot_complete_or_repeat_the_original_merge(tmp_p
         return original(self, endpoint, method, body)
 
     monkeypatch.setattr(SyntheticGitHub, "write", duplicate_body)
-    scenario = Scenario(tmp_path / "ticket", DeliveryKind.TICKET)
+    scenario = ticket_before_pr
     with pytest.raises(KernelError, match="foreign_merge_receipt"):
         scenario.run()
     status = scenario.kernel.status(scenario.delivery.key)
@@ -129,7 +128,7 @@ def test_merge_message_receipt_accepts_only_an_optional_git_terminator(expected,
     assert commit_message_matches(expected, actual) is matches
 
 
-def test_missing_full_message_stays_unknown_until_resume_reads_original_merge(tmp_path, monkeypatch):
+def test_missing_full_message_stays_unknown_until_resume_reads_original_merge(monkeypatch, ticket_before_pr):
     original = SyntheticGitHub.object
     missing = [True]
 
@@ -140,7 +139,7 @@ def test_missing_full_message_stays_unknown_until_resume_reads_original_merge(tm
         return result
 
     monkeypatch.setattr(SyntheticGitHub, "object", read)
-    scenario = Scenario(tmp_path / "ticket", DeliveryKind.TICKET)
+    scenario = ticket_before_pr
     now = [100.25]
     scenario.kernel.clock = lambda: now[0]
     step = scenario.run()
@@ -161,7 +160,7 @@ def test_missing_full_message_stays_unknown_until_resume_reads_original_merge(tm
     assert len([w for w in scenario.port.writes() if w["operation"] == "merge"]) == 1
 
 
-def test_ordinary_parent_merge_keeps_its_own_message_policy(tmp_path, monkeypatch, domain_scenario):
+def test_ordinary_parent_merge_keeps_its_own_message_policy(monkeypatch, parent_at_approval):
     original = SyntheticGitHub.write
     methods = []
 
@@ -172,7 +171,7 @@ def test_ordinary_parent_merge_keeps_its_own_message_policy(tmp_path, monkeypatc
         return original(self, endpoint, method, body)
 
     monkeypatch.setattr(SyntheticGitHub, "write", server_merge_message)
-    scenario = domain_scenario(tmp_path / "parent", DeliveryKind.PARENT_ONLY)
+    scenario = parent_at_approval
     assert scenario.run(approve=True).kind == "complete"
     row, payload, receipt = _merge_record(scenario)
     assert methods == ["merge"] and payload["method"] == "merge" and row["attempts"] == 1

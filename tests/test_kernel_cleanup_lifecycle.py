@@ -78,10 +78,10 @@ def test_completed_final_retires_only_its_recorded_resources(
 
 
 def test_foreign_remote_head_keeps_completed_delivery_and_original_cleanup_intent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, ticket_before_pr,
 ) -> None:
     """02 remote-delete dispatch race: completed business, foreign remote preserved."""
-    scenario = _native_scenario(tmp_path / "scenario", DeliveryKind.TICKET)
+    scenario = ticket_before_pr
     actual_execute = scenario.port.execute
     attempts: list[Effect] = []
     foreign_heads: list[str] = []
@@ -143,10 +143,10 @@ def test_foreign_remote_head_keeps_completed_delivery_and_original_cleanup_inten
 
 
 def test_dirty_checkout_keeps_completed_delivery_and_blocks_later_resource_deletions(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, ticket_before_pr,
 ) -> None:
     """02 dirty completed Ticket: preserve checkout, local ref and remote ref."""
-    scenario = _native_scenario(tmp_path / "scenario", DeliveryKind.TICKET)
+    scenario = ticket_before_pr
     checkout = Path(scenario.delivery.checkout)
     actual_execute = scenario.port.execute
     attempts: list[Effect] = []

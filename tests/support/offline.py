@@ -9,6 +9,7 @@ from __future__ import annotations
 from support.repository_fixture import create_kernel
 from agent_run.core.operation_runner import observe_control
 
+from contextlib import nullcontext
 from dataclasses import asdict, replace
 import json
 from pathlib import Path
@@ -513,8 +514,16 @@ class Scenario:
                         "pr_body_markdown": "Accepted historical Ticket with recorded review, checks and exact Git evidence.",
                         "human_blockers": None}]}}
             producer = Scenario(root, DeliveryKind.TICKET, neutral_script=prefix, record_checkpoints=record_checkpoints)
-        if producer.run().kind != "complete":
-            raise KernelError("historical_source_incomplete")
+        # The historical Ticket is setup for Final. Keep the standalone
+        # scripted/diagnostic path and its checkpoints on native storage.
+        if script is None and not record_checkpoints:
+            from support.run_scoped_kernel import prepare_domain_history
+            preparation = prepare_domain_history(producer)
+        else:
+            preparation = nullcontext()
+        with preparation:
+            if producer.run().kind != "complete":
+                raise KernelError("historical_source_incomplete")
         if script is not None:
             producer.requirements = Requirements.from_wire({"parent": script["parent"], "issues": [script["ticket"]]})
             head = producer.port.remote_commit(producer.delivery.target_ref)

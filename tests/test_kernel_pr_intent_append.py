@@ -7,10 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.model import DeliveryKind
 from agent_run.errors import KernelError
 from agent_run.model import ReadWait
-from support.run_scoped_kernel import domain_scenario
 from support.offline_api import SyntheticGitHub
 from support.effect_boundary import advance_to_effect
 from support.remote_effects import _fixture, _pr_effect
@@ -58,8 +56,8 @@ def test_pr_creation_rechecks_original_anchors_after_authorization(tmp_path: Pat
     assert not any('--method' in json.loads(line) for line in calls.read_text().splitlines())
 
 
-def test_public_stop_during_post_authorization_pr_read_prevents_the_first_post(tmp_path: Path, monkeypatch, domain_scenario) -> None:
-    scenario = domain_scenario(tmp_path / 'scenario', DeliveryKind.TICKET)
+def test_public_stop_during_post_authorization_pr_read_prevents_the_first_post(monkeypatch, ticket_before_pr) -> None:
+    scenario = ticket_before_pr
     held = advance_to_effect(scenario, monkeypatch, 'pr_write')
     effect = held.effect
     with scenario.kernel.storage.transaction(write=False) as tx:
@@ -100,8 +98,8 @@ def test_public_stop_during_post_authorization_pr_read_prevents_the_first_post(t
 
 
 @pytest.mark.parametrize('change', ['source', 'late_pr'])
-def test_final_authorization_refuses_create_facts_changed_during_its_own_read(tmp_path: Path, monkeypatch, change: str, domain_scenario) -> None:
-    scenario = domain_scenario(tmp_path / 'scenario', DeliveryKind.TICKET)
+def test_final_authorization_refuses_create_facts_changed_during_its_own_read(monkeypatch, change: str, ticket_before_pr) -> None:
+    scenario = ticket_before_pr
     held = advance_to_effect(scenario, monkeypatch, 'pr_write')
     effect = held.effect
     preparations, authorizations, reread, changed, refused = [], [], [], [], []
@@ -151,8 +149,8 @@ def test_final_authorization_refuses_create_facts_changed_during_its_own_read(tm
         assert tuple(tx.one('SELECT status,attempts FROM effects WHERE id=?', (effect.effect_id,))) == ('prepared', 0)
 
 
-def test_late_post_during_authorization_is_read_back_without_another_post(tmp_path: Path, monkeypatch, domain_scenario) -> None:
-    scenario = domain_scenario(tmp_path / 'scenario', DeliveryKind.TICKET)
+def test_late_post_during_authorization_is_read_back_without_another_post(monkeypatch, ticket_before_pr) -> None:
+    scenario = ticket_before_pr
     held = advance_to_effect(scenario, monkeypatch, 'pr_write', sent=True)
     effect = held.effect
     api = SyntheticGitHub(scenario.port.git, scenario.port.database, effect.repository,
@@ -180,8 +178,8 @@ def test_late_post_during_authorization_is_read_back_without_another_post(tmp_pa
 
 
 @pytest.mark.parametrize('actor', ['offline-publisher', 'foreign-publisher'])
-def test_late_original_post_remains_an_external_fact_after_intent_retirement(tmp_path: Path, monkeypatch, actor: str, domain_scenario) -> None:
-    scenario = domain_scenario(tmp_path / 'scenario', DeliveryKind.TICKET)
+def test_late_original_post_remains_an_external_fact_after_intent_retirement(monkeypatch, actor: str, ticket_before_pr) -> None:
+    scenario = ticket_before_pr
     held = advance_to_effect(scenario, monkeypatch, 'pr_write', sent=True)
     effect, kernel = held.effect, scenario.kernel
     with kernel.storage.transaction(write=False) as tx:

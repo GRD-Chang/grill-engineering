@@ -64,8 +64,8 @@ def test_offline_bootstrap_outage_preserves_original_wait_and_unstarted_lease(tm
     assert not [row for row in scenario.kernel.history(call.subject) if row['kind'] == 'effect_failed']
 
 
-def test_optional_link_ack_loss_does_not_create_a_required_checks_wait(tmp_path: Path, monkeypatch, domain_scenario) -> None:
-    scenario = domain_scenario(tmp_path / 'optional-link', DeliveryKind.TICKET)
+def test_optional_link_ack_loss_does_not_create_a_required_checks_wait(monkeypatch, ticket_before_pr) -> None:
+    scenario = ticket_before_pr
     scenario.kernel.clock = lambda: 1000.25
     scenario.port.lose_response.add('issue_link')
     execute = scenario.port.execute
@@ -95,8 +95,8 @@ def test_optional_link_ack_loss_does_not_create_a_required_checks_wait(tmp_path:
 
 
 @pytest.mark.parametrize('failure', ['readback', 'response'])
-def test_post_write_outage_keeps_sent_merge_without_command_failure_or_replay(tmp_path: Path, failure: str, monkeypatch, domain_scenario) -> None:
-    scenario = domain_scenario(tmp_path / failure, DeliveryKind.PARENT_ONLY)
+def test_post_write_outage_keeps_sent_merge_without_command_failure_or_replay(failure: str, monkeypatch, parent_at_approval) -> None:
+    scenario = parent_at_approval
     now = [100.25]
     scenario.kernel.clock = lambda: now[0]
     assert scenario.run().kind == 'approval'

@@ -10,7 +10,7 @@
 | 用户与 Git 环境隔离 | `environment`、`workspace` | 每例独立 HOME/XDG、目录和环境；不可变 Git 模板按 worker 创建，每例复制后独立修改 |
 | 准备、准入与脚本化 Agent 返回 | `core_operations`、`agent_continuation` | `Ports` / `setup` 保留真实 Core 选择和有限依赖场景；驱动准备→准入→Invocation，不跳过凭据准备。`host_kernel` / `task_run` / `delivery_run` 仅创建有限 Run，`source_operations` / `next_call` 保留原只读事实和正常角色选择；`settle_agent` 仅为原单元场景的显式合成进程观察，不是 OS/Host 退出证明 |
 | 公共查询、Profile 与 Doctor 前置 | `cli_fixtures`、`environment` | `_create` / `_published` / `_published_profile_task` 保留正常 Core 创建、准确 Task 绑定及冻结配置；`_file_snapshot` 保留原文件字节视图，不与目录级 `durable_snapshot` 混用 |
-| 合成交付世界 | `offline`、`offline_api`、`offline_git` | `Scenario` / `GraphScenario` 使用真实 Kernel、SQLite、私有 Git；Agent 输出和 GitHub 原始对象是合成输入，不是预期结果权威 |
+| 合成交付世界 | `offline`、`offline_api`、`offline_git`、`offline_prefixes` | `Scenario` / `GraphScenario` 使用真实 Kernel、SQLite、私有 Git；Agent 输出和 GitHub 原始对象是合成输入。仅依赖既有 PR 前置或待批准 Parent 的用例可使用 `ticket_before_pr`、`parent_at_approval`。每个 worker 生产一次静止模板，每例在原绝对路径复制独立的 Git、SQLite 和脚本状态，结束时删除副本 |
 | 原生 Worker 与续接前置 | `agent_continuation`、`native_runtime` | `_allocated_worker` 保留正常准备、源观察与原 RAW；`local_codex` 准备原本地脚本/fixture credential，再调用唯一 `execute_codex`。文件生成检查不等于 Worker/沙箱执行或退出证明 |
 | 有限需求场景 | `requirements_scenarios` | `native_input` 每次读取新数据；`independent_source` 仅移除声明的依赖，`source_run` 通过真实 Core 创建库，不补造完成状态 |
 | 有限托管控制与观察前置 | `control_scenarios` | `prepared_control` / `managed_approval` 准备准确 PR、合成 manager/HostObservation 及控制观察；`admit_scenario` / `sent_workspaces` 保留原准入和 unknown-intent。`restorable_public_resume` 只准备原隔离损坏输入和已安装 CLI 命令，恢复断言留在用例。调用方拥有控制、读回与退出断言，不把合成事实当 OS 证明 |

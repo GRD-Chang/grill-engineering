@@ -1,11 +1,10 @@
 """Remote heads and original-intent readback, independent of local Git refs."""
 
-from pathlib import Path
 import json
 
 import pytest
 
-from agent_run.model import DeliveryKind, Effect
+from agent_run.model import Effect
 from agent_run.core.kernel import Kernel
 from support.offline import Scenario
 from support.offline_git import OfflineGit
@@ -20,8 +19,8 @@ def merge_intent(scenario: Scenario, monkeypatch: pytest.MonkeyPatch):
     return boundary.value
 
 
-def test_remote_source_advance_after_approval_prevents_merge_and_close(tmp_path: Path) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.PARENT_ONLY)
+def test_remote_source_advance_after_approval_prevents_merge_and_close(parent_at_approval) -> None:
+    scenario = parent_at_approval
     assert scenario.run().kind == "approval"
     target = scenario.port.remote_commit(scenario.delivery.target_ref)
     source = scenario.port.ref_commit(scenario.delivery.source_ref)
@@ -47,9 +46,9 @@ def test_remote_source_advance_after_approval_prevents_merge_and_close(tmp_path:
 
 @pytest.mark.parametrize("server_committed", [False, True])
 def test_original_merge_readback_distinguishes_server_commit_from_partial_local_mirror(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, server_committed: bool,
+    monkeypatch: pytest.MonkeyPatch, server_committed: bool, ticket_before_pr,
 ) -> None:
-    scenario = Scenario(tmp_path / "scenario", DeliveryKind.TICKET)
+    scenario = ticket_before_pr
     now = [100.25]
     scenario.kernel.clock = lambda: now[0]
     boundary = merge_intent(scenario, monkeypatch)
@@ -109,8 +108,8 @@ def test_original_merge_readback_distinguishes_server_commit_from_partial_local_
         assert pending.value.phase == "reconcile" and pending.value.effect == effect
 
 
-def test_parent_closeout_recovers_both_lost_acks_after_merged_source_ref_is_deleted(tmp_path, monkeypatch):
-    scenario = Scenario(tmp_path / "parent", DeliveryKind.PARENT_ONLY)
+def test_parent_closeout_recovers_both_lost_acks_after_merged_source_ref_is_deleted(monkeypatch, parent_at_approval):
+    scenario = parent_at_approval
     for operation in ("merge", "close"):
         with effect_boundary(scenario, monkeypatch, operation, sent=True):
             with pytest.raises(EffectBoundary) as held:

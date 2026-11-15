@@ -153,17 +153,19 @@ def final_scenario(root: Path, *, policy: Policy | None = None,
         scenario.spec = replace(scenario.spec, inputs=inputs, language=language)
         scenario.kernel = create_kernel(root / 'configured.sqlite3', scenario.spec, requirements=source)
         scenario.execution = scenario.kernel.claim_executor('configured-fixture')
-    operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
-    for _ in range(100):
-        step = operations.once()
-        if step.call is not None:
-            scripted_return(scenario.kernel, operations.runner, step.call, scenario.agent)
-        if scenario.kernel.source_status()['final_subject'] is not None:
-            assert len(scenario.kernel.source_status()['completions']) == 1
-            scenario.select('final:1')  # Assertion/fixture focus, never a Core selection input.
-            scenario.reviews, scenario.checks = list(reviews), list(checks)
-            scenario.development_count = scenario.review_count = scenario.publication_count = 0
-            return scenario
+    from support.run_scoped_kernel import prepare_domain_history
+    with prepare_domain_history(scenario):
+        operations = CoreOperations(scenario.kernel, scenario.execution, scenario.make_ports)
+        for _ in range(100):
+            step = operations.once()
+            if step.call is not None:
+                scripted_return(scenario.kernel, operations.runner, step.call, scenario.agent)
+            if step.reason == 'final_activated':
+                assert len(scenario.kernel.source_status()['completions']) == 1
+                scenario.select(step.subject)
+                scenario.reviews, scenario.checks = list(reviews), list(checks)
+                scenario.development_count = scenario.review_count = scenario.publication_count = 0
+                return scenario
     raise AssertionError(f'Preparatory Ticket did not reach real Final admission: {operations.steps}')
 
 
