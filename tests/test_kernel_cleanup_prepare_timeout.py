@@ -21,6 +21,7 @@ from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 import agent_run.adapters.cleanup as cleanup
 from support.worker_process_timing import wait_until
+from support.run_scoped_kernel import prepare_domain_history
 from support.cleanup_scenarios import _native_scenario, _local_head
 from support.systemd_manager import _diagnostic_tail, _managed_diagnostics
 
@@ -154,13 +155,14 @@ def _exercise(root: Path) -> None:
     scenario = _native_scenario(root / "scenario", DeliveryKind.TICKET)
     kernel, subject = scenario.kernel, scenario.delivery.key
     # Normal Scenario agents feed the same Core runner; stop before cleanup IO.
-    for _ in range(200):
-        if kernel.status(subject)["phase"] == "complete":
-            break
-        step = scenario.step()
-        assert step.kind not in {"paused", "waiting", "approval"}, step
-    else:
-        pytest.fail("Normal producer did not finish Ticket business")
+    with prepare_domain_history(scenario):
+        for _ in range(200):
+            if scenario._progress()["phase"] == "complete":
+                break
+            step = scenario.step()
+            assert step.kind not in {"paused", "waiting", "approval"}, step
+        else:
+            pytest.fail("Normal producer did not finish Ticket business")
     actual_execute, actual_popen = scenario.port.execute, subprocess.Popen
     actual_hold = cleanup._hold_ref
     hook = scenario.port.git.root / ".git" / "hooks" / "reference-transaction"

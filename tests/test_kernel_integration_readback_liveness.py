@@ -1,4 +1,7 @@
 """A queued integration waiter cannot starve its owner's original readback."""
+import pytest
+
+from support.offline_prefixes import _prepared_stage
 from support.offline import GraphScenario
 from support.requirements_scenarios import independent_source
 
@@ -23,11 +26,28 @@ def _pending_merge_with_waiter(tmp_path):
     assert scenario.kernel.status('ticket:3')['holds_integration']
     assert not scenario.kernel.status('ticket:4')['holds_integration']
     assert len([w for w in scenario.port.writes() if w['operation'] == 'merge']) == 1
-    return scenario, now, retry, pending['id']
+    return scenario
 
 
-def test_due_original_merge_settles_before_its_integration_waiter(tmp_path):
-    scenario, now, retry, original = _pending_merge_with_waiter(tmp_path)
+@pytest.fixture(scope="module")
+def merge_readback_stage(tmp_path_factory):
+    with _prepared_stage(tmp_path_factory, "merge-with-waiter", _pending_merge_with_waiter) as checkout:
+        yield checkout
+
+
+@pytest.fixture
+def pending_merge(merge_readback_stage, isolated_user_environment):
+    with merge_readback_stage() as scenario:
+        now = [100.25]
+        scenario.kernel.clock = lambda: now[0]
+        state = scenario.runner().state()
+        assert state.disposition == "waiting" and state.wake_at is not None
+        pending = scenario.kernel.status("ticket:3")["pending_write"]
+        yield scenario, now, state.wake_at, pending["id"]
+
+
+def test_due_original_merge_settles_before_its_integration_waiter(pending_merge):
+    scenario, now, retry, original = pending_merge
     now[0] = retry + 0.01
     step = scenario.step()
     assert (step.kind, step.subject) == ('progress', 'ticket:3')
@@ -50,8 +70,8 @@ def test_due_original_merge_settles_before_its_integration_waiter(tmp_path):
     assert scenario.kernel.status('ticket:4')['holds_integration']
 
 
-def test_retry_and_stop_do_not_grant_the_waiter_or_repeat_a_write(tmp_path):
-    scenario, now, retry, original = _pending_merge_with_waiter(tmp_path)
+def test_retry_and_stop_do_not_grant_the_waiter_or_repeat_a_write(pending_merge):
+    scenario, now, retry, original = pending_merge
     before = scenario.port.writes()
     runner = scenario.runner()
     state = runner.state()

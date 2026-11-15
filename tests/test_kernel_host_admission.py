@@ -170,7 +170,11 @@ def test_complete_run_cannot_be_rebound_until_host_and_usage_retire(tmp_path: Pa
     running = HostObservation("running", request.unit_name, "original", "/host", "boot", 42, "start", usage_ready=True)
     assert scenario.kernel.observe_host(request, running) == "running"
     scenario.execution = Execution(request.run_id, request.owner, request.epoch)
-    assert scenario.run(approve=True).kind == "complete"
+    assert scenario.run().kind == "approval"
+    assert scenario.kernel.control_host(request, "approve", "approve-parent", subject=scenario.delivery.key, world=scenario.world()) == "pending"
+    assert scenario.kernel.active_host_action() == "start" and scenario.kernel.host_request("start") == request
+    assert scenario.run().kind == "complete"
+    assert sum(write["operation"] == "merge" for write in scenario.port.writes()) == 1
     other = create_kernel(scenario.kernel.storage.path, replace(scenario.spec, run_id="replacement"),
         requirements=scenario.requirements)
     assert other.storage.run_id == scenario.kernel.storage.run_id

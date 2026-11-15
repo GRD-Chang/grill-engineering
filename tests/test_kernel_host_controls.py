@@ -64,21 +64,3 @@ def test_busy_host_applies_resume_message_once_and_preserves_the_ticket_queue(tm
     assert kernel.status("ticket:2")["budgets"]["requirements"]["developments_used"] == 1
     applied = [event for event in kernel.history("ticket:2") if event["kind"] == "control_applied" and event["identity"] == "resume-ticket-2"]
     assert len(applied) == 1
-
-
-def test_busy_host_applies_approval_to_the_original_delivery(tmp_path: Path, parent_at_approval) -> None:
-    scenario = parent_at_approval
-    scenario.kernel.control("stop", "retire-fixture")
-    scenario.kernel.confirm_executor_exit(scenario.execution)
-    scenario.kernel.control("resume", "prepare-managed")
-    request = scenario.kernel.admit_host("start", kind="run", command=("native-host",),
-                                         environment_carrier=tmp_path / "carrier", preflight=lambda: None)
-    assert scenario.kernel.dispatch_host(request)
-    running = HostObservation("running", request.unit_name, "original", "/host", "boot", 42, "start", usage_ready=True)
-    assert scenario.kernel.observe_host(request, running) == "running"
-    scenario.execution = Execution(request.run_id, request.owner, request.epoch)
-    assert scenario.run().kind == "approval"
-    assert scenario.kernel.control_host(request, "approve", "approve-parent", subject=scenario.delivery.key, world=scenario.world()) == "pending"
-    assert scenario.kernel.active_host_action() == "start" and scenario.kernel.host_request("start") == request
-    assert scenario.run().kind == "complete"
-    assert sum(write["operation"] == "merge" for write in scenario.port.writes()) == 1

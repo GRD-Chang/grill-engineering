@@ -1142,122 +1142,56 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
             assert len(commands) == 1 and trace == ["fdstore", "barrier", "host_exited", "store_closed"]
 
 
-def test_public_revise_repairs_the_real_final_pr_from_original_feedback_in_the_same_managed_host(
-    git_repo: Path, tmp_path: Path, monkeypatch,
-) -> None:
-    message = "请补充兼容性证据。\r\nPreserve this exact maintainer message."
-    classification = """schema = json.loads(Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text())
-role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commit_message' in schema['properties'] else 'development'
-"""
-    codex = _CODEX[:_CODEX.index("if prompt.startswith")] + classification + _CODEX[_CODEX.index("thread = "):]
-    # A fresh backend session has its own identity even in the same checkout.
-    # The original resume branch still returns the exact requested identity.
-    codex = codex.replace("'managed-entry-' + role)", "'managed-entry-' + role + '-' + os.urandom(16).hex())")
-    codex = codex.replace("'head': head}", "'head': head, 'prompt': prompt}")
-    codex = codex.replace("content = 'Implementation", """if role == 'development' and Path.cwd().name == 'run-publication':
-    assert os.environ['ENTRY_REVISION_MESSAGE'] in prompt
-    requirement = json.loads(subprocess.check_output(['gh', 'issue', 'view', '1', '--repo', 'example/project',
-        '--json', 'number,title,body'], text=True))
-    assert requirement['body'] == 'Deliver each ready Ticket using the exact recorded requirements.'
-    Path('revision-evidence.txt').write_text(json.dumps(os.environ['ENTRY_REVISION_MESSAGE'], ensure_ascii=False) + chr(10))
-content = 'Implementation""")
-    codex = codex.replace("if role == 'development':\n", """if Path('revision-evidence.txt').is_file():
-    content += 'Maintainer compatibility evidence implemented.' + chr(10)
-if role == 'development':
-""")
-    with _approval_read_barrier() as (address, databases, reached, release):
-        _hold_host_operation_return(tmp_path, monkeypatch)
-        monkeypatch.setenv("ENTRY_APPROVAL_CONTROL", address)
-        monkeypatch.setenv("ENTRY_REVISION_MESSAGE", message)
-        environment, state = _control_environment(git_repo, tmp_path, monkeypatch, codex=codex, tickets=(2,))
-        with _local_manager(tmp_path / "manager", environment, host_timeout=150) as (manager, serving, errors, children, trace, commands, output):
-            try:
-                environment["PATH"] = str(Path(manager.systemctl).parent) + os.pathsep + environment["PATH"]
-                def public(*arguments: str):
-                    result = subprocess.run([sys.executable, "-m", 'agent_run', *arguments, "--repo", "example/project", "--json"],
-                        cwd=git_repo, env=environment, text=True, capture_output=True, timeout=20)
-                    return result.returncode, json.loads(result.stdout)
-                preparation_started = time.monotonic()
-                preparation_deadline = preparation_started + 90
-                total_deadline = preparation_started + 150
-                code, accepted = public("run", "1", "--no-notifications")
-                assert code == 0, accepted
-                command = commands[0]
-                kernel = Kernel(Path(command[command.index('--database') + 1]), run_id=next((item.partition('=')[2] for item in command if item.startswith('--run-id='))))
-                databases.append(kernel)
-                # Only the original Host's external reads use the barrier.
-                # This terminal's new Revise still reads the actual fresh world.
-                environment.pop("ENTRY_APPROVAL_CONTROL")
-                # Preparation is bounded within one overall supervision window.
-                # Repair, approval and normal exit share its remaining time.
-                try:
-                    while not reached.wait(0.1):
-                        assert serving.is_alive() and time.monotonic() < preparation_deadline, (kernel.source_status(), output, errors)
-                except AssertionError as error:
-                    error.add_note(json.dumps({'stage': 'first-final-approval-before-revise',
-                        'facts': _managed_diagnostics(kernel.storage.path, kernel.storage.run_id,
-                            tmp_path / 'roles.jsonl'),
-                        'host_stderr': _diagnostic_tail(tmp_path / 'manager' / 'host.stderr')}))
-                    raise
-                preparation_seconds = time.monotonic() - preparation_started
-                (tmp_path / "control-timing.json").write_text(json.dumps({"preparation_seconds": preparation_seconds}))
-                subject = kernel.source_status()["final_subject"]
-                before = kernel.status(subject)
-                assert before["phase"] == "approval"
-                request = kernel.host_request(accepted["action_id"])
-                old_budget = before["budgets"]["integration"]
-                old_pr = next(pr for pr in json.loads(state.read_text())["prs"] if pr["number"] == before["pr_number"])
-                from agent_run.queries.status_comment import project_status
-                projection = project_status(kernel.storage.path, subject, storage=kernel.storage)
-                assert projection.target.pr_number == old_pr["number"]
-                assert projection.target.issue == projection.target.parent_issue == 1
-                assert projection.target.actor == old_pr["user"]["login"]
-                assert "Recorded Review: pass" in projection.body and "Delivery: approval" in projection.body
-                with kernel.storage.transaction(write=False) as tx:
-                    old_threads = [dict(row) for row in tx.all("SELECT * FROM threads ORDER BY id")]
-                    original_requirements = [dict(row) for row in tx.all("SELECT * FROM requirement_versions ORDER BY issue,revision")]
-                control_started = time.monotonic()
-                code, revised = public("revise", accepted["run_id"], "--message", message)
-                assert code == 0, revised
-                assert revised["host"] == "running" and kernel.host_request(accepted["action_id"]) == request
-                current = kernel.status(subject)
-                assert current["phase"] == "development" and current["purpose"] == "integration"
-                assert current["generation"] == before["generation"] and current["pr_number"] == old_pr["number"]
-                budget = current["budgets"]["integration"]
-                assert (budget["window"], budget["developments_used"], budget["reviews_used"]) == (old_budget["window"] + 1, 0, 0)
-                with kernel.storage.transaction(write=False) as tx:
-                    assert [dict(row) for row in tx.all("SELECT * FROM threads ORDER BY id")] == old_threads
-                    assert [dict(row) for row in tx.all("SELECT * FROM requirement_versions ORDER BY issue,revision")] == original_requirements
-                    assert tx.one("SELECT count(*) FROM hosts")[0] == 1
-                    assert tx.one("SELECT count(*) FROM grants WHERE subject=?", (subject,))[0] == 0
-                    event = tx.one("SELECT material_id FROM history WHERE kind='revision_requested' AND identity=?", (revised["action_id"],))
-                    assert tx.get(event[0], subject) == message.encode()
-                release.set()
-                serving.join(timeout=max(0, total_deadline - time.monotonic()))
-                assert not serving.is_alive() and not errors, errors
-                assert children[0].returncode == 0 and len(commands) == 1, output
-                assert kernel.status(subject)["phase"] == "approval"
-                publication = next(Path(tmp_path / "user").glob("**/run-publication/revision-evidence.txt"))
-                assert json.loads(publication.read_text()) == message
-                updated = next(pr for pr in json.loads(state.read_text())["prs"] if pr["number"] == old_pr["number"])
-                assert updated["head"]["sha"] != old_pr["head"]["sha"] and not updated["merged"]
-                assert len(json.loads(state.read_text())["prs"]) == 2  # Original Ticket and original Final PR.
-                roles = [json.loads(line) for line in (tmp_path / "roles.jsonl").read_text().splitlines()]
-                feedback = [event for event in roles if message in event["prompt"] or json.dumps(message, ensure_ascii=False) in event["prompt"]]
-                assert [event["role"] for event in feedback] == ["development", "review", "publication"]
-                assert f"https://github.com/example/project/issues/1" in feedback[0]["prompt"]
-                assert trace == ["fdstore", "barrier", "host_exited", "store_closed"]
-                (tmp_path / "control-timing.json").write_text(json.dumps({"preparation_seconds": preparation_seconds,
-                    "revise_to_approval_seconds": time.monotonic() - control_started,
-                    "total_seconds": time.monotonic() - preparation_started}))
-            finally:
-                release.set()
+def _request_final_revision(public, kernel, accepted, state, message):
+    """Capture the approved PR and verify the new repair window on the same Host."""
+    subject = kernel.source_status()["final_subject"]
+    request = kernel.host_request(accepted["action_id"])
+    before = kernel.status(subject)
+    assert before["phase"] == "approval"
+    old_budget = before["budgets"]["integration"]
+    old_pr = next(pr for pr in json.loads(state.read_text())["prs"] if pr["number"] == before["pr_number"])
+    from agent_run.queries.status_comment import project_status
+    projection = project_status(kernel.storage.path, subject, storage=kernel.storage)
+    assert projection.target.pr_number == old_pr["number"]
+    assert projection.target.issue == projection.target.parent_issue == 1
+    assert projection.target.actor == old_pr["user"]["login"]
+    assert "Recorded Review: pass" in projection.body and "Delivery: approval" in projection.body
+    with kernel.storage.transaction(write=False) as tx:
+        old_threads = [dict(row) for row in tx.all("SELECT * FROM threads ORDER BY id")]
+        original_requirements = [dict(row) for row in tx.all("SELECT * FROM requirement_versions ORDER BY issue,revision")]
+    code, revised = public("revise", accepted["run_id"], "--message", message)
+    assert code == 0, revised
+    assert revised["host"] == "running" and kernel.host_request(accepted["action_id"]) == request
+    current = kernel.status(subject)
+    assert current["phase"] == "development" and current["purpose"] == "integration"
+    assert current["generation"] == before["generation"] and current["pr_number"] == old_pr["number"]
+    budget = current["budgets"]["integration"]
+    assert (budget["window"], budget["developments_used"], budget["reviews_used"]) == (old_budget["window"] + 1, 0, 0)
+    with kernel.storage.transaction(write=False) as tx:
+        assert [dict(row) for row in tx.all("SELECT * FROM threads ORDER BY id")] == old_threads
+        assert [dict(row) for row in tx.all("SELECT * FROM requirement_versions ORDER BY issue,revision")] == original_requirements
+        assert tx.one("SELECT count(*) FROM hosts")[0] == 1
+        assert tx.one("SELECT count(*) FROM grants WHERE subject=?", (subject,))[0] == 0
+        event = tx.one("SELECT material_id FROM history WHERE kind='revision_requested' AND identity=?", (revised["action_id"],))
+        assert tx.get(event[0], subject) == message.encode()
+    return old_pr
 
 
-def test_public_requeue_delivers_fresh_ticket_and_final_generations_in_the_original_managed_host(
-    git_repo: Path, tmp_path: Path, monkeypatch,
-) -> None:
-    fresh_body = "Keep the original deliverable and record this clarified requirement in requeue-evidence.txt."
+def _assert_revised_publication(tmp_path, state, old_pr, message):
+    """Check the original message in the repaired checkout, Worker calls and updated PR."""
+    publication = next(Path(tmp_path / "user").glob("**/run-publication/revision-evidence.txt"))
+    assert json.loads(publication.read_text()) == message
+    updated = next(pr for pr in json.loads(state.read_text())["prs"] if pr["number"] == old_pr["number"])
+    assert updated["head"]["sha"] != old_pr["head"]["sha"] and not updated["merged"]
+    assert len(json.loads(state.read_text())["prs"]) == 2  # Original Ticket and original Final PR.
+    roles = [json.loads(line) for line in (tmp_path / "roles.jsonl").read_text().splitlines()]
+    feedback = [event for event in roles if message in event["prompt"] or json.dumps(message, ensure_ascii=False) in event["prompt"]]
+    assert [event["role"] for event in feedback] == ["development", "review", "publication"]
+    assert f"https://github.com/example/project/issues/1" in feedback[0]["prompt"]
+
+
+def _final_control_backend():
+    """Read the real Ticket/Parent requirements and write the two distinct evidence files."""
     classification = """schema = json.loads(Path(sys.argv[sys.argv.index('--output-schema') + 1]).read_text())
 role = 'review' if 'checks' in schema['properties'] else 'publication' if 'commit_message' in schema['properties'] else 'development'
 """
@@ -1272,6 +1206,17 @@ if role == 'development' and Path.cwd().name.startswith('ticket-'):
         Path('requeue-evidence.txt').write_text(requirement['body'] + chr(10))
 with open(os.environ['ENTRY_ROLE_TRACE'], 'a') as log:""")
     codex = codex.replace("'head': head}", "'head': head, 'prompt': prompt, 'requirement': requirement}")
+    codex = codex.replace("content = 'Implementation", """if role == 'development' and Path.cwd().name == 'run-publication':
+    assert os.environ['ENTRY_REVISION_MESSAGE'] in prompt
+    requirement = json.loads(subprocess.check_output(['gh', 'issue', 'view', '1', '--repo', 'example/project',
+        '--json', 'number,title,body'], text=True))
+    assert requirement['body'] == 'Deliver each ready Ticket using the exact recorded requirements.'
+    Path('revision-evidence.txt').write_text(json.dumps(os.environ['ENTRY_REVISION_MESSAGE'], ensure_ascii=False) + chr(10))
+content = 'Implementation""")
+    codex = codex.replace("if role == 'development':\n", """if Path('revision-evidence.txt').is_file():
+    content += 'Maintainer compatibility evidence implemented.' + chr(10)
+if role == 'development':
+""")
     hold = r'''
 import socket
 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
@@ -1283,7 +1228,14 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
     assert control.recv(1) == b'1'
 '''
     codex = codex.replace("content = 'Implementation", hold + "\ncontent = 'Implementation")
+    return codex
 
+
+def test_public_requeue_and_revise_deliver_fresh_generations_in_the_original_managed_host(
+    git_repo: Path, tmp_path: Path, monkeypatch,
+) -> None:
+    message = "请补充兼容性证据。\r\nPreserve this exact maintainer message."
+    fresh_body = "Keep the original deliverable and record this clarified requirement in requeue-evidence.txt."
     boundary_stage = {"final_generation": None}
     released = threading.Event()
 
@@ -1300,7 +1252,8 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
         monkeypatch.setenv("ENTRY_WORKER_CONTROL", worker_address)
         monkeypatch.setenv("ENTRY_APPROVAL_CONTROL", address)
         monkeypatch.setenv("ENTRY_REQUEUE_BODY", fresh_body)
-        environment, state = _control_environment(git_repo, tmp_path, monkeypatch, codex=codex, tickets=(2,))
+        monkeypatch.setenv("ENTRY_REVISION_MESSAGE", message)
+        environment, state = _control_environment(git_repo, tmp_path, monkeypatch, codex=_final_control_backend(), tickets=(2,))
         with _local_manager(tmp_path / "manager", environment, host_timeout=180) as (manager, serving, errors, children, trace, commands, output):
             started = time.monotonic()
             deadline = started + 180
@@ -1316,6 +1269,17 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                     "--repo", "example/project", "--json"], cwd=git_repo, env=environment,
                     text=True, capture_output=True, timeout=min(20, remaining()))
                 return result.returncode, json.loads(result.stdout)
+
+            def advance_to_approval(generation, stage):
+                timing["stage"] = stage
+                boundary_stage["final_generation"] = generation
+                released.clear()
+                release.set()
+                assert released.wait(min(5, remaining()))
+                release.clear()
+                reached.clear()
+                while not reached.wait(0.1):
+                    assert serving.is_alive() and time.monotonic() < deadline, (kernel.source_status(), output, errors)
 
             try:
                 code, accepted = public("run", "1", "--no-notifications")
@@ -1349,18 +1313,17 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                 assert kernel.host_request(accepted["action_id"]) == request
                 assert kernel.status("ticket:2")["generation"] == 2
                 assert kernel.status("ticket:2")["phase"] == "workspace"
-                boundary_stage["final_generation"] = 1
-                release.set()
-                assert released.wait(min(5, remaining()))
-                release.clear()
-                reached.clear()
-                timing['stage'] = 'final-after-ticket-requeue'
-                while not reached.wait(0.1):
-                    assert serving.is_alive() and time.monotonic() < deadline, (kernel.source_status(), output, errors)
+                advance_to_approval(1, "final-after-ticket-requeue")
                 ticket_to_approval_seconds = time.monotonic() - controlled_at
                 timing["ticket_requeue_to_final_approval_seconds"] = ticket_to_approval_seconds
                 final = kernel.source_status()["final_subject"]
                 assert final is not None and kernel.status(final)["phase"] == "approval"
+                revision_started = time.monotonic()
+                previous_pr = _request_final_revision(public, kernel, accepted, state, message)
+                advance_to_approval(kernel.status(final)["generation"], "final-after-revise")
+                assert kernel.status(final)["phase"] == "approval"
+                _assert_revised_publication(tmp_path, state, previous_pr, message)
+                timing["revise_to_approval_seconds"] = time.monotonic() - revision_started
                 final_before = kernel.status(final)
                 final_delivery = kernel.delivery(final)
                 completions = kernel.source_status()["completions"]
@@ -1384,15 +1347,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
                 assert kernel.source_status()["completions"] == completions
                 with kernel.storage.transaction(write=False) as tx:
                     assert tx.one("SELECT count(*) FROM grants WHERE subject=?", (final,))[0] == 0
-                boundary_stage["final_generation"] = renewed["generation"]
-                released.clear()
-                release.set()
-                assert released.wait(min(5, remaining()))
-                release.clear()
-                reached.clear()
-                timing['stage'] = 'final-after-final-requeue'
-                while not reached.wait(0.1):
-                    assert serving.is_alive() and time.monotonic() < deadline, (kernel.source_status(), output, errors)
+                advance_to_approval(renewed["generation"], "final-after-final-requeue")
                 assert kernel.status(final)["phase"] == "approval"
                 timing["final_requeue_to_approval_seconds"] = time.monotonic() - final_controlled_at
                 assert _git(tmp_path / "origin.git", "rev-parse", final_delivery.source_ref) == original_run_head
