@@ -13,7 +13,7 @@ import math
 from pathlib import Path
 import sqlite3
 import stat
-from time import get_clock_info
+from time import get_clock_info, sleep
 from typing import Iterator
 
 from agent_run.errors import KernelError
@@ -104,7 +104,7 @@ class _ReadBudget:
 def _wait_sidecar_absent(path: Path, sidecar: Path, identity: tuple[int, int], budget: _ReadBudget) -> None:
     # A pending unlink can remain visible to several fresh pathname lookups.
     # Only absence resolves it; an existing replacement is never adopted.
-    for _ in range(32):
+    while True:
         budget.remaining()
         try:
             current = sidecar.stat(follow_symlinks=False)
@@ -117,7 +117,9 @@ def _wait_sidecar_absent(path: Path, sidecar: Path, identity: tuple[int, int], b
         if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 0
                 or (current.st_dev, current.st_ino) != identity):
             raise UnsupportedState(path, 'uncertain_state')
-    raise UnsupportedState(path, 'uncertain_state')
+        # Let the unlinking owner finish within the original allowance. A
+        # rapid fixed number of lookups cannot establish that its time is up.
+        sleep(min(0.001, budget.remaining()))
 
 
 @contextmanager

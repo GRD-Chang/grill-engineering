@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_run.storage import preflight
+from agent_run.storage import preflight, save_order
 from agent_run.storage.sqlite import Storage
 
 
@@ -65,6 +65,14 @@ def test_zero_link_sidecar_recheck_cannot_adopt_existing_or_unreadable_object(tm
     target = Path(str(native.path) + suffix)
     original = Path.stat
     calls = []
+    now, deadline = [100.25], 100.2525
+    monkeypatch.setattr(save_order, 'monotonic', lambda: now[0])
+
+    def pause(delay):
+        assert 0 < delay <= 0.001
+        now[0] += delay
+
+    monkeypatch.setattr(preflight, 'sleep', pause, raising=False)
 
     def observe(path, *args, **kwargs):
         if path != target:
@@ -73,7 +81,8 @@ def test_zero_link_sidecar_recheck_cannot_adopt_existing_or_unreadable_object(tm
         calls.append(path)
         if len(calls) == 1:
             return SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_nlink=0, st_size=32768, st_dev=1, st_ino=2)
-        assert len(calls) <= 33 if outcome == 'zero' else len(calls) == 2
+        if outcome != 'zero':
+            assert len(calls) == 2
         if outcome in {'EACCES', 'EIO', 'ENOTDIR'}:
             raise OSError(getattr(errno, outcome), 'controlled access error')
         if outcome == 'false_ENOENT':
@@ -83,9 +92,12 @@ def test_zero_link_sidecar_recheck_cannot_adopt_existing_or_unreadable_object(tm
 
     monkeypatch.setattr(Path, 'stat', observe)
     with pytest.raises(preflight.UnsupportedState):
-        with preflight.read_state(native.path):
+        with preflight.read_state(native.path, deadline=deadline):
             pytest.fail('unsafe sidecar yielded a connection')
-    assert len(calls) == (33 if outcome == 'zero' else 2)
+    if outcome == 'zero':
+        assert len(calls) > 1 and now[0] == deadline
+    else:
+        assert len(calls) == 2
 
 
 @pytest.mark.parametrize('target', ['database', 'directory'])

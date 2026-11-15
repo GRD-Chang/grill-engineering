@@ -90,10 +90,60 @@ def test_repeated_zero_link_resolves_only_by_absence_before_one_read(database, m
 
 
 @pytest.mark.parametrize('suffix', ['-wal', '-shm'])
+@pytest.mark.parametrize('zero_reads', [2, 40], ids=['one-yield', 'beyond-old-poll-limit'])
+def test_zero_link_observation_yields_before_the_original_sidecar_disappears(database, monkeypatch, suffix, zero_reads):
+    before, now, sleeps = database.read_bytes(), [100.25], []
+    metadata = zero()
+    monkeypatch.setattr(save_order, 'monotonic', lambda: now[0])
+    def values(count, original, path, kwargs):
+        return metadata if count <= zero_reads else original(path, **kwargs)
+    calls = observe(monkeypatch, database, suffix, values)
+    def yield_unlink(seconds):
+        assert 0 < seconds <= 0.001
+        sleeps.append(seconds)
+        now[0] += seconds
+    monkeypatch.setattr(preflight, 'sleep', yield_unlink, raising=False)
+    with preflight.read_state(database, timeout=1, deadline=100.5) as reader:
+        assert reader.execute('SELECT value FROM original').fetchone() == (7,)
+        assert reader.execute('PRAGMA query_only').fetchone() == (1,)
+        with pytest.raises(sqlite3.OperationalError, match='readonly'):
+            reader.execute('UPDATE original SET value=8')
+    assert len(calls) == zero_reads + 1 and len(sleeps) == zero_reads - 1
+    assert now[0] < 100.5 and database.read_bytes() == before
+
+
+@pytest.mark.parametrize('suffix', ['-wal', '-shm'])
+@pytest.mark.parametrize('outcome', ['deadline', 'replacement'])
+def test_zero_link_yield_cannot_extend_the_deadline_or_adopt_a_replacement(database, monkeypatch, suffix, outcome):
+    before, now, sleeps = database.read_bytes(), [100.25], []
+    selected, metadata = Path(str(database) + suffix), zero()
+    monkeypatch.setattr(save_order, 'monotonic', lambda: now[0])
+    def values(count, original, path, kwargs):
+        return original(path, **kwargs) if sleeps else metadata
+    observe(monkeypatch, database, suffix, values)
+    def yield_unlink(seconds):
+        assert 0 < seconds <= 0.001
+        sleeps.append(seconds)
+        if outcome == 'deadline':
+            now[0] = 100.501  # Scheduling delay crosses the original absolute deadline.
+        else:
+            now[0] += seconds
+            selected.write_bytes(b'Replacement sidecar\n')
+    monkeypatch.setattr(preflight, 'sleep', yield_unlink, raising=False)
+    forbid_connect(monkeypatch)
+    with pytest.raises(preflight.UnsupportedState, match='uncertain_state'):
+        with preflight.read_state(database, timeout=1, deadline=100.5):
+            pytest.fail('Expired or replaced sidecar yielded a connection')
+    assert len(sleeps) == 1 and database.read_bytes() == before
+    if outcome == 'replacement':
+        assert selected.read_bytes() == b'Replacement sidecar\n'
+
+
+@pytest.mark.parametrize('suffix', ['-wal', '-shm'])
 @pytest.mark.parametrize('outcome', ['same', 'new_inode', 'new_device', 'symlink', 'fifo',
     'directory', 'hardlink', 'EACCES', 'EIO', 'ENOTDIR', 'false_ENOENT', 'persistent_zero'])
 def test_zero_link_never_adopts_an_existing_or_unreadable_object(database, monkeypatch, suffix, outcome):
-    before = database.read_bytes()
+    before, now, sleeps = database.read_bytes(), [100.25], []
     def values(count, original, path, kwargs):
         if count == 1 or outcome == 'persistent_zero':
             return zero()
@@ -107,12 +157,21 @@ def test_zero_link_never_adopts_an_existing_or_unreadable_object(database, monke
             'directory': dict(st_mode=stat.S_IFDIR | 0o700), 'hardlink': dict(st_nlink=2)}
         return zero(**changes[outcome])
     calls = observe(monkeypatch, database, suffix, values)
-    monkeypatch.setattr(save_order, 'monotonic', lambda: 100.25)
+    monkeypatch.setattr(save_order, 'monotonic', lambda: now[0])
+    def yield_unlink(seconds):
+        assert outcome == 'persistent_zero' and 0 < seconds <= 0.001
+        sleeps.append(seconds)
+        now[0] += seconds
+    monkeypatch.setattr(preflight, 'sleep', yield_unlink, raising=False)
     forbid_connect(monkeypatch)
     with pytest.raises(preflight.UnsupportedState):
-        with preflight.read_state(database):
+        with preflight.read_state(database, **({'deadline': 100.2525} if outcome == 'persistent_zero' else {})):
             pytest.fail('Unresolved sidecar yielded a connection')
-    assert len(calls) == (33 if outcome == 'persistent_zero' else 2)
+    if outcome == 'persistent_zero':
+        assert sleeps and now[0] >= 100.2525
+        assert sum(sleeps) == pytest.approx(0.0025)
+    else:
+        assert len(calls) == 2 and sleeps == []
     assert database.read_bytes() == before
 
 
