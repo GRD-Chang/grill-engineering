@@ -19,7 +19,7 @@ DEPENDENCIES = {
 CHECKS = {
     "Detect changes", "Select checks", "Verify selection", "Test CI selection rules",
     "Test CI evidence rules", "Smoke test installed CLI", "Run sync tests",
-    "Run E2E harness tests", "Run type checks", "Verify independent checks",
+    "Run E2E harness tests", "Run selected private tests", "Run type checks", "Verify independent checks",
     "Test private-only CI selection rules", "Run private-only sync tests",
     "Run private-only E2E harness tests", "Verify private-only checks",
     "Record complete test evidence",
