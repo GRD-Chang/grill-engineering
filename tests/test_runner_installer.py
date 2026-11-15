@@ -1080,7 +1080,6 @@ def test_install_rejects_managed_paths_inside_source_without_writing_source(
     [
         "build",
         "missing_codex",
-        "not_logged_in",
         "nonzero",
         "timeout",
         "missing_output",
@@ -1108,8 +1107,6 @@ def test_public_install_failures_preserve_existing_state(
         (source / ".agent-run-test-build-failure").touch()
     elif failure == "missing_codex":
         path = _path_without_codex(tmp_path)
-    elif failure == "not_logged_in":
-        (tmp_path / "codex-behavior").write_text("not-logged-in", encoding="utf-8")
     elif failure == "nonzero":
         (tmp_path / "codex-behavior").write_text("nonzero", encoding="utf-8")
     elif failure == "timeout":

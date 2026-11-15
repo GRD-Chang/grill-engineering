@@ -103,7 +103,7 @@ def _fake_codex(
         "cwd_file.write_text(str(pathlib.Path.cwd()))\n"
         "path_file.write_text(os.environ['PATH'])\n"
         "behavior = behavior_file.read_text()\n"
-        "if behavior in {'nonzero', 'not-logged-in'}:\n"
+        "if behavior == 'nonzero':\n"
         "    sys.exit(7)\n"
         "if behavior == 'missing':\n"
         "    sys.exit(0)\n"

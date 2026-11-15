@@ -274,16 +274,15 @@ def test_doctor_preserves_current_settings_profile_and_task(
     assert read_binding(task, kernel.storage.path) == binding
 
 
-@pytest.mark.parametrize("module", ["agent_run", 'agent_run'])
 @pytest.mark.parametrize("command", [[], ["doctor"]])
 def test_public_help_is_read_only_without_host_dependencies(
-    tmp_path: Path, module: str, command: list[str],
+    tmp_path: Path, command: list[str],
 ) -> None:
     environment = _isolated_environment(tmp_path / "environment")
     environment.update(PYTHONPATH=str(Path(__file__).parents[1] / "src"),
                        PYTHONDONTWRITEBYTECODE="1", PATH=str(tmp_path / "no-tools"))
     before = _file_snapshot(tmp_path)
-    result = subprocess.run([sys.executable, "-m", module, *command, "--help"],
+    result = subprocess.run([sys.executable, "-m", "agent_run", *command, "--help"],
                             env=environment, cwd=tmp_path, text=True, capture_output=True, timeout=10)
     assert result.returncode == 0, result.stderr
     assert "agent-run" in result.stdout and "--help" in result.stdout
