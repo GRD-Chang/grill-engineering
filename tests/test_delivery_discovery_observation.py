@@ -9,6 +9,7 @@ import pytest
 from agent_run.adapters import github_commands, remote
 from agent_run.core.operation_contract import DeliveryRead, ReadUnavailable
 from agent_run.errors import GitHubReadError
+from support.delivery_packets import rejected_basis
 from support.remote_effects import _fixture, _publish_pr, existing_pr
 from test_delivery_commit_observation import _damage_basis, _reads
 
@@ -68,7 +69,6 @@ def test_incomplete_discovery_identity_uses_original_rest_collection(tmp_path, m
 
 @pytest.mark.parametrize('damage', ['null', 'nodes', 'page', 'owner', 'refs', 'number', 'partial'])
 def test_malformed_or_partial_discovery_never_becomes_absence_or_fallback(tmp_path, monkeypatch, damage):
-    port, _, push, _, calls, _ = existing_pr(tmp_path, monkeypatch)
     def corrupt(body):
         connection = body['data']['repository']['discovery']
         if damage == 'null': body['data']['repository']['discovery'] = None
@@ -78,15 +78,12 @@ def test_malformed_or_partial_discovery_never_becomes_absence_or_fallback(tmp_pa
         elif damage == 'refs': connection['nodes'][0]['baseRefName'] = 'foreign'
         elif damage == 'number': connection['nodes'][0]['number'] = True
         else: body['errors'] = [{'message': 'Permission unavailable'}]
-    _damage_basis(monkeypatch, corrupt)
-    monkeypatch.setattr(remote, 'time', SimpleNamespace(monotonic=remote.time.monotonic, sleep=lambda _: None))
-    start = len(_reads(calls))
+    port, query, commands = rejected_basis(tmp_path, monkeypatch, corrupt, discover=True)
     with pytest.raises(ReadUnavailable) as caught:
-        port.delivery(DeliveryRead(push.source_ref, push.target_ref, None, (), read_checks=False))
+        port.delivery(query)
     assert caught.value.code == ('github_read_failed' if damage == 'partial' else 'github_invalid_response')
-    commands = _reads(calls, start)
     assert len(commands) == (3 if damage == 'partial' else 1)
-    assert all(command[:2] == ['api', 'graphql'] for command in commands)
+    assert all(command[:3] == ['gh', 'api', 'graphql'] for command in commands)
 
 
 def test_discovery_row_is_only_a_number_and_pr_details_are_read_afterwards(tmp_path, monkeypatch):
@@ -102,7 +99,7 @@ def test_discovery_row_is_only_a_number_and_pr_details_are_read_afterwards(tmp_p
 
 @pytest.mark.parametrize('boundary', ['compact', 'third-overflow', 'deadline'])
 def test_discovery_fallback_keeps_original_attempts_and_deadline(tmp_path, monkeypatch, boundary):
-    port, _, _, _, _ = _fixture(tmp_path, monkeypatch)
+    port = remote.RemoteEffects(tmp_path, "example/project", runner_identity={"source": "host"})
     now, calls = [0.], []
     monkeypatch.setattr(remote, 'time', SimpleNamespace(monotonic=lambda: now[0], sleep=lambda n: now.__setitem__(0, now[0] + n)))
     def read(command, **options):

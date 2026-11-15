@@ -101,7 +101,7 @@ def test_next_observation_rereads_objects_refs_pr_and_actor(tmp_path, monkeypatc
 @pytest.mark.parametrize('fault', ['foreign-sha', 'missing-sha', 'invalid-tree', 'missing-tree', 'invalid-type', 'unavailable'])
 def test_completed_read_never_hides_a_later_invalid_or_unavailable_object(tmp_path, monkeypatch, fault):
     port, _git, push, _state, calls, pr = existing_pr(tmp_path, monkeypatch)
-    request = DeliveryRead(push.source_ref, push.target_ref, pr.number, ())
+    request = DeliveryRead(push.source_ref, push.target_ref, pr.number, (), read_checks=False)
     assert port.delivery(request).source == pr.head
     seen = []
     def broken(body):

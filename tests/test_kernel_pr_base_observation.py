@@ -8,7 +8,7 @@ from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.core.operation_contract import DeliveryRead, ReadUnavailable
 from agent_run.errors import KernelError
 from support.offline_api import SyntheticGitHub
-from support.remote_effects import _fixture, _publish_pr, _pr_effect, existing_pr
+from support.remote_effects import _pr_effect, existing_pr
 
 
 def test_ticket_ci_repair_finishes_when_the_pr_reports_an_ancestor_base(monkeypatch, domain_ticket_before_pr):
@@ -93,9 +93,8 @@ def test_delivery_reads_real_refs_and_preserves_the_reported_pr_base(tmp_path, m
 def test_delivery_accepts_github_repository_spelling_without_rewriting_the_observation(tmp_path, monkeypatch):
     # GitHub preserves spelling while the Runner stores a lowercase key.
     api_repository = 'Example-Owner/Greeting-Fixture'
-    port, _git, push, state, calls = _fixture(tmp_path, monkeypatch,
+    port, _git, push, state, calls, published = existing_pr(tmp_path, monkeypatch,
         repository='example-owner/greeting-fixture')
-    _effect, published = _publish_pr(port, push)
     document = json.loads(state.read_text())
     document['prs'][0]['base']['repo']['full_name'] = api_repository
     document['prs'][0]['head']['repo']['full_name'] = api_repository
@@ -146,8 +145,8 @@ def test_an_ancestor_base_does_not_authorize_foreign_or_missing_pr_facts(tmp_pat
     assert writes == []
 
 
-def test_parent_requires_fresh_review_and_approval_for_the_live_target(monkeypatch, parent_at_approval):
-    scenario = parent_at_approval
+def test_parent_requires_fresh_review_and_approval_for_the_live_target(monkeypatch, domain_parent_at_approval):
+    scenario = domain_parent_at_approval
     assert scenario.run().kind == 'approval'
     kernel, subject = scenario.kernel, scenario.delivery.key
     old = scenario.world()

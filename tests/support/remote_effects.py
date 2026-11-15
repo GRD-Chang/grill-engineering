@@ -81,6 +81,14 @@ def _fixture(tmp_path, monkeypatch, *, repository="example/project", actor="publ
     git.run("add", ".")
     git.run("commit", "-m", "publication")
     published = git.commit("HEAD")
+    state, calls = install_remote_gh(tmp_path, remote, monkeypatch, repository=repository, actor=actor)
+    port = RemoteEffects(repo, repository, runner_identity={"source": "host"})
+    effect = Effect("push-1", "ticket:2", "push", repository, "refs/heads/delivery", "refs/heads/main",
+        base.sha, published.sha, published, base, None, actor, {}, Execution("run-1", "worker", 1))
+    return port, git, effect, state, calls
+
+
+def install_remote_gh(tmp_path, remote, monkeypatch, *, repository="example/project", actor="publisher"):
     state = tmp_path / "github.json"
     state.write_text(json.dumps({"prs": [], "comments": [], "events": [], "issue_state": "open"}))
     calls = tmp_path / "calls.jsonl"
@@ -96,10 +104,7 @@ def _fixture(tmp_path, monkeypatch, *, repository="example/project", actor="publ
     monkeypatch.setenv("REMOTE_TEST_BARE", str(remote))
     for name in ("GH_TOKEN", "GITHUB_TOKEN"):
         monkeypatch.delenv(name, raising=False)
-    port = RemoteEffects(repo, repository, runner_identity={"source": "host"})
-    effect = Effect("push-1", "ticket:2", "push", repository, "refs/heads/delivery", "refs/heads/main",
-        base.sha, published.sha, published, base, None, actor, {}, Execution("run-1", "worker", 1))
-    return port, git, effect, state, calls
+    return state, calls
 
 
 def _change(state, **values):
@@ -121,9 +126,9 @@ def _publish_pr(port, effect):
     return effect, result.pr
 
 
-def existing_pr(tmp_path, monkeypatch):
+def existing_pr(tmp_path, monkeypatch, *, repository="example/project", actor="publisher"):
     """Create only the real Git refs and external PR consumed by a read test."""
-    port, git, push, state, calls = _fixture(tmp_path, monkeypatch)
+    port, git, push, state, calls = _fixture(tmp_path, monkeypatch, repository=repository, actor=actor)
     effect = _pr_effect(push)
     git.run('push', 'origin', f'{push.after_sha}:{push.source_ref}')
     pr = PullRequest(17, push.repository, push.source_ref, push.target_ref, push.candidate,

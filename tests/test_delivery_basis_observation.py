@@ -2,7 +2,6 @@
 from dataclasses import replace
 from types import SimpleNamespace
 import subprocess
-import time
 import json
 
 import pytest
@@ -10,7 +9,7 @@ import pytest
 from agent_run.core.operation_contract import DeliveryRead, ReadUnavailable
 from agent_run.adapters import github_commands, remote
 from agent_run.errors import GitHubReadError
-from test_delivery_commit_observation import _damage_basis
+from support.delivery_packets import rejected_basis
 from support.remote_effects import _fixture, existing_pr
 
 
@@ -58,8 +57,6 @@ def test_closed_fork_or_deleted_head_does_not_become_selected_repository(tmp_pat
 
 @pytest.mark.parametrize('part', ['repository', 'object', 'viewer', 'pr', 'base-repository', 'merge-object', 'partial-errors'])
 def test_incomplete_basis_never_supplies_facts_or_writes(tmp_path, monkeypatch, part):
-    port, _, push, _, calls, pr = existing_pr(tmp_path, monkeypatch)
-    start = len(calls.read_text().splitlines())
     def missing(body):
         data = body['data']
         if part == 'repository': data['repository'] = None
@@ -69,12 +66,10 @@ def test_incomplete_basis_never_supplies_facts_or_writes(tmp_path, monkeypatch, 
         elif part == 'merge-object': data['repository']['pullRequest'].update(state='MERGED', mergeCommit=None)
         elif part == 'object': data['repository']['object0'] = None
         else: body['errors'] = [{'message': 'Controlled incomplete permission response'}]
-    monkeypatch.setattr(remote, 'time', SimpleNamespace(monotonic=time.monotonic, sleep=lambda _: None))
-    _damage_basis(monkeypatch, missing)
+    port, query, commands = rejected_basis(tmp_path, monkeypatch, missing)
     with pytest.raises(ReadUnavailable) as caught:
-        port.delivery(DeliveryRead(push.source_ref, push.target_ref, pr.number, (), read_checks=False))
+        port.delivery(query)
     assert caught.value.code == 'github_read_failed'
-    commands = [json.loads(line) for line in calls.read_text().splitlines()[start:]]
     assert len(commands) == 3 and not any('--method' in command for command in commands)
 
 
@@ -111,7 +106,7 @@ def test_app_keeps_original_resolver_and_does_not_query_viewer(tmp_path, monkeyp
 
 @pytest.mark.parametrize('boundary', ['third-overflow', 'compact-single-overflow', 'compact-malformed', 'deadline', 'cancelled'])
 def test_basis_fallback_shares_attempt_and_absolute_deadline_budget(tmp_path, monkeypatch, boundary):
-    port, _, _, _, _ = _fixture(tmp_path, monkeypatch)
+    port = remote.RemoteEffects(tmp_path, "example/project", runner_identity={"source": "host"})
     now, calls = [0.], []
     monkeypatch.setattr(remote, 'time', SimpleNamespace(monotonic=lambda: now[0], sleep=lambda n: now.__setitem__(0, now[0]+n)))
     if boundary == 'cancelled': port.cancelled = lambda: True
@@ -203,15 +198,13 @@ def test_merged_delivery_still_rejects_a_malformed_original_parent_receipt(tmp_p
 
 @pytest.mark.parametrize('damage', ['repository-type', 'pr-repository-type', 'missing-data', 'errors-type'])
 def test_complete_malformed_basis_is_rejected_without_retry(tmp_path, monkeypatch, damage):
-    port, _, push, _, calls, pr = existing_pr(tmp_path, monkeypatch)
-    start = len(calls.read_text().splitlines())
     def malformed(body):
         if damage == 'repository-type': body['data']['repository']['nameWithOwner'] = 42
         elif damage == 'pr-repository-type': body['data']['repository']['pullRequest']['repository']['nameWithOwner'] = 42
         elif damage == 'missing-data': body.pop('data')
         else: body['errors'] = {'message': 'Invalid envelope'}
-    _damage_basis(monkeypatch, malformed)
+    port, query, commands = rejected_basis(tmp_path, monkeypatch, malformed)
     with pytest.raises(ReadUnavailable) as caught:
-        port.delivery(DeliveryRead(push.source_ref, push.target_ref, pr.number, (), read_checks=False))
+        port.delivery(query)
     assert caught.value.code == 'github_invalid_response'
-    assert len(calls.read_text().splitlines()) == start + 1
+    assert len(commands) == 1

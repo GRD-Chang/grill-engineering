@@ -3,6 +3,7 @@ from dataclasses import replace
 import json
 
 import pytest
+from support.github_retries import immediate_read_retries
 
 from agent_run.adapters import remote
 from agent_run.adapters.remote import RemoteEffects
@@ -67,7 +68,7 @@ def test_omitting_checks_saves_only_the_seven_check_reads(published, monkeypatch
     assert not any('--method' in command for command in full_calls + omitted_calls)
 
 
-def test_omitted_checks_outage_does_not_hide_the_next_required_failure(published):
+def test_omitted_checks_outage_does_not_hide_the_next_required_failure(published, immediate_read_retries):
     port, _git, _push, pr, state, calls, request = published
     _change(state, rollup_http=403)
     start = len(_calls(calls))

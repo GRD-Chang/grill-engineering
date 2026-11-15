@@ -16,7 +16,9 @@ from support.core_operations import CoreOperations, ReadOnlyPorts
 from support.offline import fixture_inputs
 from agent_run.runtime.executor import _make_ports
 from support.offline import GraphScenario
-from support.remote_effects import _fixture
+from support.remote_effects import install_remote_gh
+from types import SimpleNamespace
+from agent_run.adapters import github
 
 def ticket_spec() -> RunSpec:
     base = Commit("base", "base-tree")
@@ -87,8 +89,11 @@ def _allocated_worker(tmp_path, monkeypatch):
     assert call is not None
     transport = tmp_path / "transport"
     transport.mkdir()
-    _port, _git, _push, state, _calls = _fixture(transport, monkeypatch)
-    scenario.port.git.run("remote", "add", "offline-remote", str(transport / "origin.git"))
+    # Exercise every source read attempt; backoff timing has its own reader tests.
+    monkeypatch.setattr(github, "time", SimpleNamespace(sleep=lambda _: None))
+    bare = scenario.port.physical.remote
+    state, _calls = install_remote_gh(transport, bare, monkeypatch)
+    scenario.port.git.run("remote", "add", "offline-remote", str(bare))
     scenario.port.git.run("push", "--force", "offline-remote",
                           scenario.initial.sha + ":refs/heads/main",
                           scenario.initial.sha + ":" + scenario.delivery.target_ref,

@@ -19,15 +19,8 @@ from agent_run.errors import KernelError
 from agent_run.adapters.remote import RemoteEffects
 from agent_run.core.operation_contract import ReadUnavailable
 from support.effect_boundary import EffectBoundary, effect_boundary
+from support.github_retries import immediate_read_retries
 from support.remote_effects import _change, _fixture, _pr_effect, _publish_pr, _source_kernel, existing_pr
-
-
-@pytest.fixture
-def immediate_read_retries(monkeypatch):
-    from types import SimpleNamespace
-    from agent_run.adapters import github_commands
-
-    monkeypatch.setattr(github_commands, 'time', SimpleNamespace(sleep=lambda _seconds: None))
 
 
 def test_publish_uses_exact_remote_lease_and_does_not_repeat_a_lost_response(tmp_path, monkeypatch):
@@ -296,16 +289,14 @@ def test_selected_runner_actor_change_cannot_dispatch_original_effect(tmp_path, 
         port.execute(effect, WriteAuthority(lambda: lambda: pytest.fail("actor mismatch must precede authorization")))
 
 
-def test_real_issue_ack_stays_optional_and_once_across_kernel_reopen(tmp_path, monkeypatch):
+def test_real_issue_ack_stays_optional_and_once_across_kernel_reopen(tmp_path, monkeypatch, ticket_before_pr):
     from agent_run.core.kernel import Kernel
-    from agent_run.model import Issue, ParentIssue, Requirements
-    from support.offline import GraphScenario
-    from support.core_operations import Ports, settle_agent
-    _port, _git, _push, state, calls = _fixture(tmp_path, monkeypatch)
+    from support.core_operations import Ports
+    from support.remote_effects import install_remote_gh
+    scenario = ticket_before_pr
+    state, calls = install_remote_gh(tmp_path, scenario.port.physical.remote, monkeypatch,
+                                     repository=scenario.spec.repository)
     _change(state, actor="offline-publisher", lose_operation="issue_link")
-    source = Requirements(ParentIssue(1, "Parent", "Whole requirement", (2,)),
-                          (Issue(2, "Ticket", "Whole ticket", "OPEN", frozenset({"ready-for-agent"})),))
-    scenario = GraphScenario(tmp_path / "scenario", source)
     ports = Ports(scenario)
     original, links = ports.execute, []
     selected = RemoteEffects(scenario.port.git.root, scenario.spec.repository,
@@ -314,7 +305,6 @@ def test_real_issue_ack_stays_optional_and_once_across_kernel_reopen(tmp_path, m
     def execute(effect, authorize):
         if effect.operation != "issue_link":
             return original(effect, authorize)
-        scenario.port.git.run("push", str(tmp_path / "origin.git"), effect.before_sha + ":" + effect.source_ref)
         links.append(effect)
         return selected.execute(effect, authorize)
     monkeypatch.setattr(ports, "execute", execute)
@@ -325,8 +315,7 @@ def test_real_issue_ack_stays_optional_and_once_across_kernel_reopen(tmp_path, m
             if status["phase"] == "complete" and status["resource_cleanup"]["state"] == "complete":
                 return
             step = prepare_scripted_agent(scenario.kernel, runner.run_once())
-            if step.call is not None:
-                settle_agent(scenario, runner, step.call)
+            assert step.call is None
         raise AssertionError("original Ticket did not complete with mandatory cleanup")
     finish_ticket()
     durable = Kernel(scenario.kernel.storage.path, run_id=scenario.kernel.storage.run_id)
@@ -517,26 +506,19 @@ def test_observe_rejects_a_real_old_source_read_when_new_requirements_commit_fir
     assert kernel.source_status() == newer
 
 
-def test_final_observation_proves_real_current_completions_into_remote_run_before_activation(tmp_path, monkeypatch):
-    from agent_run.model import Issue, ParentIssue, Requirements
-    from support.offline import GraphScenario
-    _port, _git, _push, state, calls = _fixture(tmp_path, monkeypatch)
-    source = Requirements(ParentIssue(1, "Parent", "Whole requirement", (2,)),
-                          (Issue(2, "Ticket", "Whole ticket", "OPEN", frozenset({"ready-for-agent"})),))
-    scenario = GraphScenario(tmp_path / "graph", source)
-    from support.core_operations import Ports, settle_agent
-    runner = OperationRunner(scenario.kernel, scenario.execution, lambda binding: Ports(scenario))
-    for _ in range(100):
-        step = prepare_scripted_agent(scenario.kernel, runner.run_once())
-        if step.call is not None:
-            settle_agent(scenario, runner, step.call)
-        status = scenario.kernel.status("ticket:2")
+def test_final_observation_proves_real_current_completions_into_remote_run_before_activation(tmp_path, monkeypatch, graph_ticket_before_merge):
+    from support.remote_effects import install_remote_gh
+    scenario = graph_ticket_before_merge
+    subject = scenario.delivery.key
+    for _ in range(24):
+        scenario.step()
+        status = scenario.kernel.status(subject)
         if status["phase"] == "complete" and status["resource_cleanup"]["state"] == "complete":
             break
     else:
         raise AssertionError("Ticket completion and required cleanup were not reached")
     completed = scenario.kernel.source_status()["completions"]
-    assert len(completed) == 1 and completed[0]["subject"] == "ticket:2"
+    assert len(completed) == 1 and completed[0]["subject"] == subject
     assert scenario.kernel.source_status()["final_subject"] is None
     published_run = scenario.port.remote_commit("refs/heads/run")
     assert published_run is not None and published_run.sha == completed[0]["merge_sha"]
@@ -563,9 +545,12 @@ def test_final_observation_proves_real_current_completions_into_remote_run_befor
     external.run("push", "origin", "HEAD:refs/heads/run")
     assert latest.sha != initial_run.sha != default.sha
     assert scenario.port.git.run("cat-file", "-e", latest.sha + "^{commit}", check=False).returncode != 0
-    monkeypatch.setenv("REMOTE_TEST_BARE", str(remote))
-    _change(state, source_graph={"parent": {"number": 1, "title": "Parent", "body": "Whole requirement", "sub_issues": [2]},
-        "issues": {"2": {"number": 2, "title": "Ticket", "body": "Whole ticket", "state": "CLOSED", "labels": ["ready-for-agent"]}}})
+    state, calls = install_remote_gh(tmp_path, remote, monkeypatch)
+    parent, (ticket,) = scenario.requirements.parent, scenario.requirements.issues
+    _change(state, source_graph={"parent": {"number": parent.number, "title": parent.title,
+        "body": parent.body, "sub_issues": [ticket.number]}, "issues": {str(ticket.number):
+        {"number": ticket.number, "title": ticket.title, "body": ticket.body, "state": "CLOSED",
+         "labels": sorted(ticket.labels)}}})
     selected = RemoteEffects(scenario.port.git.root, "example/project", runner_identity={"source": "host"}, remote="offline-remote")
     role_calls = list(scenario.role_calls)
     before_calls = len(calls.read_text().splitlines()) if calls.exists() else 0

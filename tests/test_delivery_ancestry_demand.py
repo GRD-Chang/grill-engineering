@@ -8,6 +8,7 @@ from dataclasses import replace
 import sqlite3
 
 import pytest
+from support.github_retries import immediate_read_retries
 
 from agent_run.core.operation_contract import DeliveryFacts, DeliveryRead, ReadUnavailable, requested_ancestry
 from agent_run.core.operation_runner import OperationRunner
@@ -83,7 +84,7 @@ def test_missing_source_cannot_be_replaced_with_a_local_head(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize('failure', ['missing-self', 'merge-error'])
-def test_requested_unavailable_relation_is_never_reported_as_false(tmp_path, monkeypatch, failure):
+def test_requested_unavailable_relation_is_never_reported_as_false(tmp_path, monkeypatch, failure, immediate_read_retries):
     port, _, effect, _, _ = _fixture(tmp_path, monkeypatch)
     if failure == 'missing-self':
         pairs = (('f' * 40, 'f' * 40),)
