@@ -12,9 +12,9 @@ from agent_run.config.defaults import UserDefaultsStore
 from agent_run.model import DeliveryKind
 from agent_run.core.kernel import Kernel
 from agent_run.errors import GitHubReadError, KernelError
-from agent_run.core.operation_contract import ReadUnavailable
+from agent_run.core.operation_contract import ReadUnavailable, Work
 from agent_run.config.creation import freeze_creation
-from agent_run.model import Effect, EffectResult
+from agent_run.model import Effect, EffectResult, World
 from support.offline import Scenario
 from support.run_scoped_kernel import domain_kernel
 from support.offline_api import SyntheticGitHub
@@ -123,25 +123,6 @@ def test_unconfigured_run_cannot_publish_with_two_missing_identity_selections(tm
         assert tx.one('SELECT count(*) FROM effects')[0] == 0
 
 
-@pytest.mark.parametrize("changed", ["missing-actor", "missing-selection", "other-selection"])
-def test_remote_intent_requires_the_observed_frozen_runner_identity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: str,
-    domain_publisher,
-) -> None:
-    scenario = domain_publisher
-    reach_phase(scenario, "push")
-    if changed == "missing-actor":
-        scenario.publisher["actor"] = None
-    elif changed == "missing-selection":
-        scenario.publisher["identity"] = None
-    else:
-        scenario.publisher["identity"] = {"source": "pat", "pat": {"env": "OTHER_TOKEN"}}
-    before = scenario.kernel.history(scenario.delivery.key)
-    with pytest.raises(KernelError, match="publisher_identity_unproven"):
-        scenario.runner().run_once()
-    assert scenario.kernel.history(scenario.delivery.key) == before
-
-
 def test_actual_publisher_is_frozen_and_rechecked_before_each_remote_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     domain_publisher,
@@ -175,40 +156,47 @@ def test_actual_publisher_is_frozen_and_rechecked_before_each_remote_write(
 
 @pytest.mark.parametrize("foreign", [False, True])
 def test_close_inherits_only_the_confirmed_original_comment_receipt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, foreign: bool,
+    tmp_path: Path, foreign: bool,
 ) -> None:
-    scenario = publisher_scenario(tmp_path / "scenario", monkeypatch)
-    comment = prepare_comment(scenario, monkeypatch)
+    from support.agent_continuation import ticket_spec
+    from support.core_operations import native_agent_fixture
+
+    spec = ticket_spec()
+    kernel, _ports = native_agent_fixture(tmp_path / "run.sqlite3", spec)
+    delivery, = spec.deliveries
+    subject = delivery.key
+    owner = kernel.claim_executor("publisher")
+    work = Work(owner, "pending", subject, False, True, None, None)
+    with kernel.storage.transaction() as tx:
+        tx.execute("UPDATE subjects SET phase='completion_comment',merge_sha=?,pr_number=17 "
+                   "WHERE run_id=? AND id=?", (delivery.base.sha, spec.run_id, subject))
+        run, job = kernel._owned(tx, subject, owner)
+        world = World(run["parent_revision"], run["graph_revision"], job["revision"], delivery.base,
+                      publisher_actor="actual-runner", publisher_identity={"source": "host"})
+        request = kernel._mechanical(tx, run, job, work, world)
+    comment = request.effect
+    assert comment.operation == "completion_comment"
+    assert kernel._dispatch(comment, owner, world, token=request.token)
     intent = close_intent(comment)
     if foreign:
         intent["merge_sha"] = "another-merge"
-    make_ports = scenario.make_ports
+    kernel._reconcile(request, EffectResult("target", raw={"close_intent": intent}))
 
-    def comment_receipt(binding):
-        ports = make_ports(binding)
-        execute = ports.execute
-
-        def written(effect, authorize):
-            if effect.operation == "completion_comment":
-                assert effect == comment
-                authorize.prepare()()
-                return EffectResult("target", raw={"close_intent": intent})
-            return execute(effect, authorize)
-
-        ports.execute = written
-        return ports
-
-    with monkeypatch.context() as receipt_patch:
-        receipt_patch.setattr(scenario, "make_ports", comment_receipt)
-        assert scenario.runner().run_once().kind == "progress"
+    kernel = Kernel(kernel.storage.path, run_id=spec.run_id)
+    with kernel.storage.transaction() as tx:
+        run, job = kernel._owned(tx, subject, owner)
+        row = tx.one("SELECT * FROM effects WHERE run_id=? AND id=?", (spec.run_id, comment.effect_id))
+        if foreign:
+            with pytest.raises(KernelError, match="foreign_close_intent"):
+                kernel._apply_effect(tx, run, job, row, world)
+        else:
+            assert kernel._apply_effect(tx, run, job, row, world).kind == "progress"
     if foreign:
-        with pytest.raises(KernelError, match="foreign_close_intent"):
-            scenario.runner().run_once()
-        assert scenario.kernel.status(scenario.delivery.key)["phase"] == "completion_comment"
+        assert kernel.status(subject)["phase"] == "completion_comment"
         return
-    assert scenario.runner().run_once().kind == "progress"
-    scenario.kernel = Kernel(scenario.kernel.storage.path, run_id=scenario.kernel.storage.run_id)
-    close = capture_effect(scenario, monkeypatch, "close").effect
+    with kernel.storage.transaction() as tx:
+        run, job = kernel._owned(tx, subject, owner)
+        close = kernel._mechanical(tx, run, job, work, world).effect
     assert close.operation == "close"
     assert close.payload.get("close_intent") == intent
     assert close.actor == comment.actor

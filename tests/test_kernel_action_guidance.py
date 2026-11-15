@@ -20,13 +20,13 @@ from agent_run.cli.main import _parser
 from agent_run.core.kernel import Kernel
 from agent_run.core.operation_runner import OperationRunner
 from agent_run.core.operation_contract import DeliveryFacts
-from agent_run.model import Delivery, DeliveryKind, Issue, ParentIssue, Requirements, RunSpec
+from agent_run.model import Commit, Delivery, DeliveryKind, Issue, ParentIssue, Requirements, RunSpec
 from agent_run.notifications.cards import card
 from agent_run.notifications.envelope import event_envelope
 from agent_run.notifications.event_projection import completion_context, event_state
 from agent_run.queries.read_facts import action_guidance, read_boundaries
 from agent_run.queries.run import read
-from support.offline import GraphScenario, fixture_inputs
+from support.offline import fixture_inputs
 from support.core_operations import ReadOnlyPorts
 
 
@@ -75,21 +75,19 @@ def _displayed_commands(event):
 def test_completed_parent_cleanup_displays_parseable_original_identity(
     tmp_path, shell_argv, language,
 ):
-    scenario = GraphScenario(tmp_path / "physical", Requirements(ParentIssue(1, "Parent", "Scope"), ()))
-    # A fresh public producer, before any work or prepared intent exists.
-    scenario.spec = replace(scenario.spec, run_id="a  b", language=language)
-    scenario.kernel = create_kernel(tmp_path / "wanted" / "kernel.sqlite3",
-                                         scenario.spec, requirements=scenario.requirements)
-    scenario.execution = scenario.kernel.claim_executor("original-owner")
-    assert scenario.run().kind == "approval"
-    assert scenario.kernel.control("approve", "original-approval", subject="parent:1", world=scenario.world()) == "pending"
-    for _ in range(100):
-        if scenario.kernel.status("parent:1")["phase"] == "complete":
-            break
-        assert scenario.step().kind not in {"paused", "waiting", "approval"}
-    else:
-        pytest.fail("normal Parent producer did not reach completion")
-    with scenario.kernel.storage.transaction(write=False) as tx:
+    delivery = Delivery("parent:1", DeliveryKind.PARENT_ONLY, 1, "revision",
+                        Commit("head", "tree"), "refs/heads/run", "refs/heads/main")
+    spec = RunSpec("a  b", "example/project", 1, "parent", "graph", (delivery,), language=language)
+    kernel = create_kernel(tmp_path / "run.sqlite3", spec)
+    # The close -> cleanup transition has its own delivery regression. This
+    # case starts with its persisted projection and follows it to the shell.
+    with kernel.storage.transaction() as tx:
+        tx.execute("UPDATE subjects SET phase='complete' WHERE run_id=? AND id=?", (spec.run_id, delivery.key))
+        tx.execute("INSERT INTO resource_cleanup(run_id,subject,generation,source_ref,source_sha,"
+                   "checkout,workspace_sha,owned_root,common_git_dir) VALUES (?,?,1,?,?,?,?,?,?)",
+                   (spec.run_id, delivery.key, delivery.source_ref, delivery.base.sha, str(tmp_path / "work"),
+                    delivery.base.sha, str(tmp_path), str(tmp_path / ".git")))
+    with kernel.storage.transaction(write=False) as tx:
         view, state = read_boundaries(tx, 0.0), event_state(tx)
         context = completion_context(view, state)
     assert view["delivery_cleanup"]["status"] == "cleanup_pending"
@@ -98,11 +96,11 @@ def test_completed_parent_cleanup_displays_parseable_original_identity(
     assert guidance in _displayed_commands(event)
     argv = shell_argv(guidance)
     parsed = _parser(language).parse_args(argv)
-    assert parsed.command == "resume" and parsed.run_id == "a  b" and parsed.repo == scenario.spec.repository
-    document = read(scenario.kernel.storage.path, 'status', storage=scenario.kernel.storage).data
+    assert parsed.command == "resume" and parsed.run_id == "a  b" and parsed.repo == spec.repository
+    document = read(kernel.storage.path, 'status', storage=kernel.storage).data
     assert document["next_action"] == guidance == document["delivery_cleanup"]["items"][0]["recovery_action"]
     assert document["run_id"] == "a  b" and document["parent"]["number"] == 1
-    assert scenario.kernel.active_host_action() is None
+    assert kernel.active_host_action() is None
 
 
 def _published_task(remote, repository, identity, parent, *, language="en", tickets=False):

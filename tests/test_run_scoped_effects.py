@@ -492,6 +492,20 @@ def test_ticket_completion_rows_cleanup_and_final_action_are_scoped_to_original_
     assert db.execute('PRAGMA foreign_key_check').fetchone() is None
 
 
+@pytest.mark.parametrize("actor,selection", [
+    (None, {"source": "host"}),
+    ("controlled-actor", None),
+    ("controlled-actor", {"source": "pat", "pat": {"env": "OTHER_TOKEN"}}),
+], ids=["missing-actor", "missing-selection", "other-selection"])
+def test_push_intent_requires_the_observed_frozen_runner_identity(scenario, actor, selection):
+    db, kernels = scenario
+    before = _rows(db, "A")
+    with pytest.raises(KernelError, match="publisher_identity_unproven"):
+        _prepare(kernels["A"], "A", operation="push", after=BASE.sha,
+                 world=replace(WORLD, publisher_actor=actor, publisher_identity=selection))
+    assert _rows(db, "A") == before
+
+
 def test_publisher_actor_is_frozen_per_run_and_sibling_actor_cannot_fence_it(scenario):
     db, kernels = scenario
     _prepare(kernels['B'], 'B', operation='push', after=BASE.sha,
