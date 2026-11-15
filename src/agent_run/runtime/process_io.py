@@ -70,6 +70,14 @@ def pump(
         while selector.get_map() or (not stop_at_eof and process.poll() is None):
             if not check():
                 return
+            if not selector.get_map():
+                # All pipes reached EOF. Keep the same bounded checks while
+                # allowing an ordinary child exit to wake the owner early.
+                try:
+                    process.wait(timeout=0.05)
+                except subprocess.TimeoutExpired:
+                    pass
+                continue
             for key, _ in selector.select(timeout=0.05):
                 if key.events == selectors.EVENT_WRITE:
                     try:

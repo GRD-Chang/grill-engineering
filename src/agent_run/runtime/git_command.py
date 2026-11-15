@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import select
 import shutil
 import signal
 import subprocess
@@ -196,13 +197,18 @@ def run_git(
         pidfd = os.pidfd_open(process.pid)
         # The pump must not reap through poll, including after pipe EOF.
         pump(process, stdout=stdout, stderr=stderr, input_data=data, check=check, stop_at_eof=True)
-        while not exited:
+        if not exited:
             if deadline is None:
-                exited = observe(block=True)
+                observe(block=True)
             else:
-                check()
-                if not exited:
-                    time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+                # Pipes can close just before the leader exits. Its existing
+                # pidfd wakes immediately and leaves waitid as the sole reaper.
+                ready = select.poll()
+                ready.register(pidfd, select.POLLIN)
+                while not exited:
+                    check()
+                    if not exited:
+                        ready.poll(min(1000.0, max(0.0, deadline - time.monotonic()) * 1000))
     except subprocess.TimeoutExpired as timeout_error:
         raise GitError(
             f"Git command timed out after {timeout:g} seconds",
