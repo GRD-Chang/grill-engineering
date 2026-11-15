@@ -13,6 +13,8 @@ Agent Run User Defaults 已通过 `settings` 和统一个人 JSON 文件交付�
 
 持续多线监督已接入：开发或审核长调用期间，当前集成 Ticket 的 CI、合入和收尾独立推进；并发为 1 也保留监督。统一 Ticket 工作额度与持久 FIFO 动态补位已接入；单票立即 Stop 已接入同一 Worker 监督和持久租约；运行中定向 Resume 已接入同一 Executor 与 FIFO，见 [ADR 0019](docs/adr/0019-ticket-work-concurrency-and-supervision.md)。下文这些术语描述目标合同。
 
+当前 Runner 的完整 Parent 修复仍采用 [ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md) 的已实现路径：程序准确更新 Run Branch，仅最终 Run PR 承担 Publish 文案、Hosted CI 与人工批准。下文恢复 Run Repair PR 的目标设计尚未实施，不代表当前程序已经创建或等待修复 PR。
+
 本轮架构合同见 [ADR 0024](docs/adr/0024-orchestration-responsibility-separation.md) 与 [ADR 0031](docs/adr/0031-parent-repair-pr-and-repository-ci.md)，修复通路的设计与实施状态见后者；[ADR 0025](docs/adr/0025-parent-repair-without-internal-pr.md) 保留历史取舍。共同 Agent 执行、图调度与交付阶段分界、固定预算归属、Review Context、同类证据适用规则及准确发布对账共同支持三种交付对象。完整 Parent 的修复纳入自身开发、集成和审核，经 Run Repair PR 的检查和合入进入 Run Branch，最终 Run PR 承担默认分支检查与人工批准。Ticket 与 Parent-only 在自身 Job 保存预算，完整 Parent 在 Run Acceptance 保存预算，Repair Job 仅引用所属 Parent 的额度。Review Context 在既有 Semantic Attempt 中固定调用事实并绑定返回结论。修复保留身份、受管工作区、必要本地分支、候选与历史；不兼容读取或迁移旧 Run。审核范围、额度策略、准确成果核验及人工批准合同继续有效。
 
 Publication 在原 Attempt 输入中固定实际发布提交的内容范围、整个 PR 相对目标快照的范围及已有 PR 原文。
