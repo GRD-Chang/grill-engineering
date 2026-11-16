@@ -113,7 +113,7 @@ def test_next_work_reselects_in_same_snapshot_when_read_retry_becomes_due(scenar
     kernel, now = kernels['A'], [100.]
     kernel.clock = lambda: now[0]
     request = kernel.begin_observation(SUBJECT, execution=_execution('A'))
-    waiting = kernel._wait_for_read(request.fence, _execution('A'), 'controlled_read', 'Original read unavailable')
+    waiting = kernel.wait_for_read(request.fence, _execution('A'), 'controlled_read', 'Original read unavailable')
     assert waiting.retry_at == 105.
     now[0] = 104.999
     select, calls = kernel._operation_choice, []
@@ -170,7 +170,7 @@ def test_snapshot_ends_at_same_transaction_mutation_and_new_snapshot_sees_it(sce
         read = snapshot.subject(SUBJECT, job)
         assert read.gates == ()
         if change == 'gate':
-            kernel._gate(tx, SUBJECT, 'human_blocker')
+            kernel._delivery_state().gate(tx, SUBJECT, 'human_blocker')
         elif change == 'source':
             kernel._refresh(tx, _source('A', 'new snapshot'))
         else:
@@ -802,7 +802,7 @@ def test_successful_read_completion_checks_current_facts_without_a_writer(scenar
     kernel.clock = lambda: 100.25
     request = kernel.begin_observation(SUBJECT, execution=execution)
     if has_wait:
-        kernel._wait_for_read(request.fence, execution, 'controlled_read', 'Original read unavailable')
+        kernel.wait_for_read(request.fence, execution, 'controlled_read', 'Original read unavailable')
     before = {run: _rows(db, run) for run in ('A', 'B')}
     transaction, writes = kernel.storage.transaction, []
 
@@ -829,7 +829,7 @@ def test_expired_read_completion_records_original_fractional_window_under_ordere
     now = [100.25]
     kernel.clock = lambda: now[0]
     request = kernel.begin_observation(SUBJECT, execution=execution)
-    kernel._wait_for_read(request.fence, execution, 'controlled_read', 'Original read unavailable')
+    kernel.wait_for_read(request.fence, execution, 'controlled_read', 'Original read unavailable')
     original = dict(db.execute("SELECT * FROM waits WHERE run_id='A'").fetchone())
     before_b = _rows(db, 'B')
     transaction, writes = kernel.storage.transaction, []
@@ -862,7 +862,7 @@ def test_read_timeout_escalation_rechecks_changes_after_read_snapshot(scenario, 
     kernel, execution = kernels['A'], _execution('A')
     kernel.clock = lambda: 100.25
     request = kernel.begin_observation(SUBJECT, execution=execution)
-    kernel._wait_for_read(request.fence, execution, 'controlled_read', 'Original read unavailable')
+    kernel.wait_for_read(request.fence, execution, 'controlled_read', 'Original read unavailable')
     kernel.clock = lambda: 700.25
     transaction, changed = kernel.storage.transaction, False
     before_b = _rows(db, 'B')
@@ -904,7 +904,7 @@ def test_read_completion_storage_failure_preserves_original_error_without_writer
     kernel, execution = kernels['A'], _execution('A')
     kernel.clock = lambda: 100.25
     request = kernel.begin_observation(SUBJECT, execution=execution)
-    kernel._wait_for_read(request.fence, execution, 'controlled_read', 'Original read unavailable')
+    kernel.wait_for_read(request.fence, execution, 'controlled_read', 'Original read unavailable')
     kernel.clock = lambda: 700.25
     transaction, writes = kernel.storage.transaction, []
     before = {run: _rows(db, run) for run in ('A', 'B')}
@@ -939,7 +939,7 @@ def test_step_finish_rechecks_required_changes_under_ordered_writer(scenario, mo
     token = _finish_token(kernel)
     step = Step('progress' if cause == 'stalled' else 'quiescent', SUBJECT)
     if cause == 'wait':
-        kernel._wait_for_read(token, execution, 'controlled_read', 'Original read unavailable')
+        kernel.wait_for_read(token, execution, 'controlled_read', 'Original read unavailable')
     before_b, transaction, records = _rows(db, 'B'), kernel.storage.transaction, []
 
     @contextmanager
@@ -971,7 +971,7 @@ def test_step_finish_reader_exit_does_not_carry_permission_or_clear_later_wait(s
     kernel, execution = kernels['A'], _execution('A')
     token, step = _finish_token(kernel), Step('quiescent', SUBJECT)
     if change != 'wait_added':
-        kernel._wait_for_read(token, execution, 'controlled_read', 'Original read unavailable')
+        kernel.wait_for_read(token, execution, 'controlled_read', 'Original read unavailable')
     before_b, transaction, records = _rows(db, 'B'), kernel.storage.transaction, []
     changed = injecting = False
 
@@ -992,7 +992,7 @@ def test_step_finish_reader_exit_does_not_carry_permission_or_clear_later_wait(s
                 elif change == 'owner':
                     db.execute("UPDATE runs SET executor='successor',epoch=epoch+1 WHERE id='A'")
                 else:
-                    kernel._wait_for_read(token, execution, 'controlled_read', 'New later read unavailable')
+                    kernel.wait_for_read(token, execution, 'controlled_read', 'New later read unavailable')
             finally:
                 injecting = False
 
@@ -1013,7 +1013,7 @@ def test_step_finish_read_failure_never_escalates_or_changes_facts(scenario, mon
     db, kernels = scenario
     kernel, execution = kernels['A'], _execution('A')
     token = _finish_token(kernel)
-    kernel._wait_for_read(token, execution, 'controlled_read', 'Original read unavailable')
+    kernel.wait_for_read(token, execution, 'controlled_read', 'Original read unavailable')
     before = {run: _rows(db, run) for run in ('A', 'B')}
     transaction, records, failure = kernel.storage.transaction, [], OSError('Original finish read failure')
     if failure_at == 'consumer':
@@ -1058,7 +1058,7 @@ def test_step_finish_keeps_original_wait_retirement_predicate(scenario, monkeypa
         # Fixed phase fact for this consumer contract; this grants no approval.
         db.execute("UPDATE subjects SET phase='checks' WHERE run_id='A'")
     token = _finish_token(kernel)
-    kernel._wait_for_read(token, execution, 'controlled_read', 'Original read unavailable')
+    kernel.wait_for_read(token, execution, 'controlled_read', 'Original read unavailable')
     if preserved == 'changed_scope':
         value = json.loads(token)
         value['scope']['delivery']['purpose'] = 'previous-purpose'
@@ -1116,7 +1116,7 @@ def test_source_consumption_checks_original_read_deadline_after_writer_admission
     now = [100.25]
     kernel.clock = lambda: now[0]
     request = kernel.begin_observation(SUBJECT, execution=execution)
-    kernel._wait_for_read(request.fence, execution, 'controlled_read', 'Original read unavailable')
+    kernel.wait_for_read(request.fence, execution, 'controlled_read', 'Original read unavailable')
     original = dict(db.execute("SELECT * FROM waits WHERE run_id='A'").fetchone())
     source = db.execute("SELECT source_sequence,observed_parent_revision FROM runs WHERE id='A'").fetchone()[:]
     before_b = _rows(db, 'B')
@@ -1148,7 +1148,7 @@ def test_observation_consumption_checks_and_uses_one_transaction(scenario, monke
     kernel.clock = lambda: 100.25
     request = kernel.begin_observation(SUBJECT, execution=execution)
     if has_wait:
-        kernel._wait_for_read(request.fence, execution, 'controlled_read', 'Original read unavailable')
+        kernel.wait_for_read(request.fence, execution, 'controlled_read', 'Original read unavailable')
     before = {run: _rows(db, run) for run in ('A', 'B')}
     transaction, modes = kernel.storage.transaction, []
 
@@ -1181,7 +1181,7 @@ def test_delivery_timeout_commits_before_wait_and_preserves_writer_failure(scena
     kernel.clock = lambda: 100.25
     request = kernel.begin_observation(SUBJECT, execution=execution)
     observation = kernel.accept_requirements(request, _source('A'))
-    kernel._wait_for_read(observation.fence, execution, 'controlled_read', 'Original read unavailable')
+    kernel.wait_for_read(observation.fence, execution, 'controlled_read', 'Original read unavailable')
     original = dict(db.execute("SELECT * FROM waits WHERE run_id='A'").fetchone())
     before_b = _rows(db, 'B')
     transaction, modes = kernel.storage.transaction, []
@@ -1226,7 +1226,7 @@ def test_delivery_consumption_rechecks_timeout_under_its_writer(scenario, monkey
     kernel.clock = lambda: 100.25
     request = kernel.begin_observation(SUBJECT, execution=execution)
     observation = kernel.accept_requirements(request, _source('A'))
-    kernel._wait_for_read(observation.fence, execution, 'controlled_read', 'Original read unavailable')
+    kernel.wait_for_read(observation.fence, execution, 'controlled_read', 'Original read unavailable')
     kernel.clock = lambda: 700.25
     transaction, changed, modes = kernel.storage.transaction, False, []
     before_b = _rows(db, 'B')
@@ -1272,7 +1272,7 @@ def test_delivery_consumption_failure_does_not_retry_the_consumer_or_save(scenar
     kernel.clock = lambda: 100.25
     request = kernel.begin_observation(SUBJECT, execution=execution)
     observation = kernel.accept_requirements(request, _source('A'))
-    kernel._wait_for_read(observation.fence, execution, 'controlled_read', 'Original read unavailable')
+    kernel.wait_for_read(observation.fence, execution, 'controlled_read', 'Original read unavailable')
     if failure_at != 'consumer':
         kernel.clock = lambda: 700.25
     transaction, modes = kernel.storage.transaction, []

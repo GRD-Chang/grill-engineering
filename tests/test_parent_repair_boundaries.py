@@ -173,3 +173,33 @@ def test_open_repair_pr_alone_cannot_prove_an_unknown_merge_did_not_happen(tmp_p
     again = port.execute(effect, WriteAuthority(lambda: pytest.fail("Unknown merge must not acquire another write")))
     assert again.disposition == "unknown"
     assert not any('"PUT"' in line and "/merge" in line for line in calls.read_text().splitlines())
+
+
+@pytest.mark.parametrize('changed_basis', ['requirements', 'graph'])
+def test_prepared_repair_cannot_write_after_its_source_contract_changes(
+    tmp_path, monkeypatch, domain_scenario, changed_basis,
+):
+    from agent_run.errors import KernelError
+
+    scenario = domain_scenario(tmp_path / 'source-contract', DeliveryKind.FINAL_RUN,
+                               reviews=('fail', 'pass'), checks=('pass',))
+    held = advance_to_effect(scenario, monkeypatch, 'merge')
+    effect = held.effect
+    before = scenario.kernel.status(effect.subject)
+    writes = scenario.writes()
+    retained = Path(scenario.delivery.checkout) / 'uncommitted-contract-work.txt'
+    retained.write_text('Keep work while the original repair loses authority\n')
+    parent = scenario.requirements.parent
+    assert parent.sub_issue_numbers
+    parent = (replace(parent, body=parent.body + '\nUpdated acceptance requirements.')
+              if changed_basis == 'requirements' else replace(parent, sub_issue_numbers=()))
+    scenario.requirements = replace(scenario.requirements, parent=parent)
+
+    with pytest.raises(KernelError):
+        held.authorize.prepare()()
+
+    assert effect_state(scenario, effect)[1] == 0
+    assert scenario.writes() == writes
+    assert scenario.kernel.status(effect.subject)['budgets'] == before['budgets']
+    assert retained.read_text() == 'Keep work while the original repair loses authority\n'
+    assert not any(row['operation'] == 'merge' and row['intent'] == effect.effect_id for row in scenario.writes())

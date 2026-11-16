@@ -187,7 +187,7 @@ def test_initial_observation_is_rechecked_after_reader_exit(reader, monkeypatch,
                     # Negative concurrent scope input, not a grant or business producer.
                     db.execute('UPDATE subjects SET purpose=? WHERE run_id=? AND id=?', ('integration', s.execution.run_id, subject))
                 else:
-                    kernel._wait_for_read(captured[0].request.fence, s.execution, 'controlled_unavailable', 'Original unavailable read')
+                    kernel.wait_for_read(captured[0].request.fence, s.execution, 'controlled_unavailable', 'Original unavailable read')
                     deadline = db.execute('SELECT deadline FROM waits').fetchone()[0]
                     kernel.clock = lambda: deadline
 
@@ -356,7 +356,7 @@ def test_state_keeps_retry_when_deadline_arrives_after_selection(reader, monkeyp
     kernel, now = s.kernel, [100.0]
     kernel.clock = lambda: now[0]
     request = kernel.begin_observation(s.delivery.key, execution=s.execution)
-    kernel._wait_for_read(request.fence, s.execution, 'controlled_read', 'Original read unavailable')
+    kernel.wait_for_read(request.fence, s.execution, 'controlled_read', 'Original read unavailable')
     retry_at = db.execute('SELECT next_retry_at FROM waits').fetchone()[0]
     now[0] = retry_at - 0.001
     choose, choices = kernel._operation_choice, []
@@ -672,7 +672,7 @@ def test_healthy_read_uses_one_query_only_snapshot(reader, monkeypatch, consumer
     kernel, subject = s.kernel, s.delivery.key
     request = kernel.begin_observation(subject, execution=s.execution)
     if has_wait:
-        kernel._wait_for_read(request.fence, s.execution, 'controlled_read', 'Original read unavailable')
+        kernel.wait_for_read(request.fence, s.execution, 'controlled_read', 'Original read unavailable')
     before = tuple(db.iterdump())
     transaction, modes = kernel.storage.transaction, []
 
@@ -704,7 +704,7 @@ def test_exact_read_deadline_commits_only_under_fresh_writer(reader, monkeypatch
     now = [100.25]  # Business supervision clock in the existing unit seam, not SaveClock.
     kernel.clock = lambda: now[0]
     request = kernel.begin_observation(subject, execution=s.execution)
-    kernel._wait_for_read(request.fence, s.execution, 'controlled_read', 'Original read unavailable')
+    kernel.wait_for_read(request.fence, s.execution, 'controlled_read', 'Original read unavailable')
     window = tuple(db.execute('SELECT * FROM waits').fetchone())
     now[0] = 700.25
     transaction, modes = kernel.storage.transaction, []
@@ -737,7 +737,7 @@ def test_read_to_writer_gap_rechecks_all_current_facts(reader, monkeypatch, cons
     now = [100.25]
     kernel.clock = lambda: now[0]
     request = kernel.begin_observation(subject, execution=s.execution)
-    kernel._wait_for_read(request.fence, s.execution, 'controlled_read', 'Original read unavailable')
+    kernel.wait_for_read(request.fence, s.execution, 'controlled_read', 'Original read unavailable')
     if consumer != 'changed_source':
         now[0] = 700.25
     returned = replace(s.requirements, parent=replace(s.requirements.parent, body='Returned changed requirement'))
@@ -796,7 +796,7 @@ def test_read_escalation_preserves_storage_failure(reader, monkeypatch, consumer
     s, db = reader
     kernel = s.kernel
     request = kernel.begin_observation(s.delivery.key, execution=s.execution)
-    kernel._wait_for_read(request.fence, s.execution, 'controlled_read', 'Original read unavailable')
+    kernel.wait_for_read(request.fence, s.execution, 'controlled_read', 'Original read unavailable')
     kernel.clock = lambda: 700.
     transaction, modes, failure = kernel.storage.transaction, [], OSError('Original storage failure')
     before = tuple(db.iterdump())

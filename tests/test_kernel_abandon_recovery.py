@@ -147,7 +147,7 @@ def test_abandon_read_wait_preserves_action_scope_without_bypassing_ordinary_sto
     kernel.control("stop", "retain-subject-stop", subject="ticket:3")
     assert kernel.control_host(request, "abandon", "original-abandon",
         resource_inspections=()) == "pending"
-    assert kernel._wait_for_read(before_abandon, execution,
+    assert kernel.wait_for_read(before_abandon, execution,
         "github_recovery_observation_pending", "Previous business scope").reason == "observation_superseded"
     with kernel.storage.transaction(write=False) as tx:
         assert not tx.rows("SELECT * FROM waits")
@@ -157,17 +157,17 @@ def test_abandon_read_wait_preserves_action_scope_without_bypassing_ordinary_sto
     assert read(kernel.storage.path, 'status', storage=kernel.storage).data["status"] == "abandonment_pending"
     with pytest.raises(KernelError, match="run_abandoned"):
         kernel.control_host(request, "resume", "cannot-resume-business")
-    waiting = kernel._wait_for_read(token, execution, "github_recovery_observation_pending", "Timeline is not current")
+    waiting = kernel.wait_for_read(token, execution, "github_recovery_observation_pending", "Timeline is not current")
     assert waiting.kind == "waiting" and waiting.retry_at is not None
     assert kernel._guard_automatic_step(token, execution).kind == "waiting"
     assert kernel._guard_automatic_step(token, execution, after_read=True) is None
     with pytest.raises(KernelError, match="executor_fenced"):
-        kernel._wait_for_read(token, replace(execution, epoch=execution.epoch + 1),
+        kernel.wait_for_read(token, replace(execution, epoch=execution.epoch + 1),
                              "github_recovery_observation_pending", "Foreign Executor")
     ordinary, _, ordinary_execution = managed_read_kernel(tmp_path / "ordinary")
     before_stop = ordinary.begin_observation("ticket:3", execution=ordinary_execution).fence
     ordinary.control("stop", "ordinary-local-stop", subject="ticket:3")
-    assert ordinary._wait_for_read(before_stop, ordinary_execution,
+    assert ordinary.wait_for_read(before_stop, ordinary_execution,
         "github_recovery_observation_pending", "Ordinary Stop").kind == "paused"
     with ordinary.storage.transaction(write=False) as tx:
         assert not tx.rows("SELECT * FROM waits")
@@ -182,9 +182,9 @@ def test_explicit_abandon_continuation_clears_only_its_run_scoped_timeout(tmp_pa
     now = [1000.25]
     kernel.clock = lambda: now[0]
     token = kernel.begin_observation(None, execution=execution).fence
-    assert kernel._wait_for_read(token, execution, "github_recovery_observation_pending", "Run read").kind == "waiting"
+    assert kernel.wait_for_read(token, execution, "github_recovery_observation_pending", "Run read").kind == "waiting"
     now[0] = 1600.25
-    assert kernel._wait_for_read(token, execution, "github_recovery_observation_pending", "Run read").reason == "supervision_timeout"
+    assert kernel.wait_for_read(token, execution, "github_recovery_observation_pending", "Run read").reason == "supervision_timeout"
     assert kernel.source_status()["blocked"] == "supervision_timeout"
     assert kernel.observe_host(request, HostObservation("exited", request.unit_name, "original", "/host", "boot", 42, "start",
         exit_status=0, ended_at=now[0], usage_released=True)) == "exited"
@@ -199,7 +199,7 @@ def test_explicit_abandon_continuation_clears_only_its_run_scoped_timeout(tmp_pa
                                                            43, "continued-start", usage_ready=True)) == "running"
     execution = Execution(continuation.run_id, continuation.owner, continuation.epoch)
     token = kernel.begin_observation(None, execution=execution).fence
-    assert kernel._wait_for_read(token, execution, "github_recovery_observation_pending", "Original Run read").retry_at == 1605.25
+    assert kernel.wait_for_read(token, execution, "github_recovery_observation_pending", "Original Run read").retry_at == 1605.25
 
 
 def advance_recovery(kernel, work, world):

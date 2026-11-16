@@ -44,6 +44,8 @@ Ticket、Parent-only 和完整 Parent 的 Final 交付共用一个 Core。
 | 模块 | 负责什么 | 不承担什么 |
 | --- | --- | --- |
 | [`Kernel`](../src/agent_run/core/kernel.py) | 从当前 SQL 事实决定状态迁移、currentness、预算、工作 FIFO、集成单席、控制准入及写入授权 | 不把 Git/GitHub、Agent 调用或等待放进业务写事务 |
+| [`core.repair`](../src/agent_run/core/repair.py)、[`delivery_checks`](../src/agent_run/core/delivery_checks.py) | Parent 修复的候选到回执规则；普通/修复共用准确 Checks 保存及失败转 CI | 不持有完整 Kernel，不独立选工或批准正式写入 |
+| [`attempt_lifecycle`](../src/agent_run/core/attempt_lifecycle.py)、[`attempt_continuation`](../src/agent_run/core/attempt_continuation.py) | 原 Attempt 事实、等待和有界恢复判定、原事务内 Invocation/output/lease 准入 | 不代替物理退出证明，不创建新预算或控制器 |
 | [`Storage / Transaction`](../src/agent_run/storage/sqlite.py) | 事务、关系事实、材料摘要与拥有者核验、有界读取和容量检查 | 不选择后继工作，不重建另一套可变 Run 引擎 |
 | [`OperationRunner`](../src/agent_run/core/operation_runner.py) | 获取冻结配置，协调一次观察、Core 请求、实际操作和结果对账 | 不自行制定业务后继、预算或写权限 |
 | [`executor`](../src/agent_run/runtime/executor.py) | Agent 与 I/O 的物理并发、取消、等待和返回/退出收口 | 不用 Future 完成代替持久租约释放或退出证明 |
@@ -69,6 +71,8 @@ Core 通过 [`operation_contract`](../src/agent_run/core/operation_contract.py) 
 OperationRunner 以冻结的 `OperationBinding` 组合真实端口，将观察和结果交回 Core，自己不读取 SQL。
 `run_once` 返回 AgentPreparation 后由 Executor 准备凭据；Core 原子准入返回 AgentCall 后才派发 Agent，不在 I/O 驱动中等待模型或 CI 完成。
 公开 status/history 只读数据库，不调用这条会接受新观察的运行链路。
+交付能力的调用顺序、有限事务操作、Review 字段责任与结构检查见
+[Core 交付合同](agents/core-delivery.md)。
 
 Core 在消费观察事实的同一事务内核对 ReadFence 和原读取期限。
 Requirements 在有序写入准入后先核对期限，再接受来源变化；Delivery 事实在同一只读快照内核对并组装。

@@ -47,6 +47,17 @@ Host 或 namespace 域退出可以证明原成员已退出，却不能替代每�
 共用的候选、base、generation 和需求范围判定，说明该结论是否仍适用。
 `stale`、`pending`、`unknown` 或 `not_recorded` 不证明当前版本已通过；旧产物仍可审计，
 不能因此将旧 Findings 或通过证据显示为新候选的结论。这是持久事实投影，不是新的实时授权。
+
+Review 的共同字段比较由 `contracts.review_evidence.same_review_candidate` 维护：需求
+`revision`、`candidate_sha`、`candidate_tree`、`expected_tree`、`completion_revision`
+及审核 `base_sha` 必须一致。查询从已记录的 integration snapshot（无 snapshot 时取
+subject 的 integration target/base）取得比较基线；Core 从当次 World 的 target 取得基线。
+该纯比较不读取数据库，也不解释通过结论或授权写入。
+查询还核对原 Review 的角色、Generation、已记录及已观察到的 Parent/Graph/需求版本，
+并从原产物核验 outcome；这些历史适用性不能替代现场观察。Core 的需求/Graph/Completion
+当前性仍由正式推进及写前核验负责，合入另外核对最新 Required Checks、准确 PR/head/base
+和人工 grant。保留两路取证与后继判断，避免将历史状态与实时授权合成带模式开关的接口。
+
 `focus_subject` 仅引用其中一个对象，不复制当前 Worker 或预算。`pending_attempt` 使用真实当前
 Attempt；其 `current_invocation` 指针在 `invocations` 中定位当前调用，不能以最后一条记录替代。
 当前与历史 Attempt 共用 `result` 和 `invocations[].outputs[]` 结构。

@@ -41,7 +41,7 @@ def gate(kernel, code):
     # Synthetic domain input through the sole production gate/history writer,
     # not a fabricated SQL pause or Completion row.
     with kernel.storage.transaction(ordered=False) as tx:
-        kernel._gate(tx, SUBJECT, code)
+        kernel._delivery_state().gate(tx, SUBJECT, code)
 
 
 def observe(kernel, monkeypatch, *, action=RESUME, deadline=101.0):

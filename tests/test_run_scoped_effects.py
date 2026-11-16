@@ -318,12 +318,12 @@ def test_operation_tokens_and_original_read_deadline_do_not_borrow_sibling_facts
     assert kernels["A"]._dispatch(a.effect, a.work.execution, WORLD, token=a.token)
     assert kernels["B"]._dispatch(b.effect, b.work.execution, WORLD, token=b.token)
     before_b = _rows(db, "B")
-    first = kernels["A"]._wait_for_read(a.token, a.work.execution, "read_failed", "controlled outage", readback=a.effect)
+    first = kernels["A"].wait_for_read(a.token, a.work.execution, "read_failed", "controlled outage", readback=a.effect)
     assert first.kind == "waiting"
     wait = db.execute("SELECT started_at,deadline,retry_count FROM waits WHERE run_id='A'").fetchone()
     assert wait[:] == (100., 700., 1)
     kernels["A"].clock = lambda: 120.
-    second = kernels["A"]._wait_for_read(a.token, a.work.execution, "read_failed", "controlled outage", readback=a.effect)
+    second = kernels["A"].wait_for_read(a.token, a.work.execution, "read_failed", "controlled outage", readback=a.effect)
     assert second.kind == "waiting"
     assert db.execute("SELECT started_at,deadline FROM waits WHERE run_id='A'").fetchone()[:] == (100., 700.)
     assert _rows(db, "B") == before_b
@@ -335,7 +335,7 @@ def test_operation_tokens_and_original_read_deadline_do_not_borrow_sibling_facts
     ):
         with pytest.raises(KernelError):
             check()
-    assert kernels["A"]._wait_for_read(b.token, a.work.execution, "read_failed", "stale").reason == "observation_superseded"
+    assert kernels["A"].wait_for_read(b.token, a.work.execution, "read_failed", "stale").reason == "observation_superseded"
     assert {run: _rows(db, run) for run in ("A", "B")} == before
     kernels["A"].clock = lambda: 700.
     assert kernels["A"]._finish_operation_read(a.token, a.work.execution).reason == "supervision_timeout"
@@ -372,7 +372,7 @@ def test_integration_snapshot_insert_and_correlated_update_stay_with_selected_ru
     for run in ("A", "B"):
         insert(db, "resync_allowances", {"run_id": run, "subject": SUBJECT, "generation": 1, "allowance": 3})
         with kernels[run].storage.transaction() as tx:
-            assert kernels[run]._observe_integration_snapshot(tx, kernels[run]._job(tx, SUBJECT), WORLD)
+            assert kernels[run]._delivery_state().observe_integration_snapshot(tx, kernels[run]._job(tx, SUBJECT), WORLD)
     before_b = _rows(db, "B")
     request = _prepare(kernels["A"], "A", operation="integrate", payload={"source_sha": BASE.sha})
     assert kernels["A"]._dispatch(request.effect, request.work.execution, WORLD, token=request.token)
@@ -383,7 +383,7 @@ def test_integration_snapshot_insert_and_correlated_update_stay_with_selected_ru
 
     appended = replace(WORLD, target=Commit("c" * 40, "d" * 40), ancestry=((BASE.sha, "c" * 40),))
     with kernels["A"].storage.transaction() as tx:
-        assert kernels["A"]._observe_integration_snapshot(tx, kernels["A"]._job(tx, SUBJECT), appended)
+        assert kernels["A"]._delivery_state().observe_integration_snapshot(tx, kernels["A"]._job(tx, SUBJECT), appended)
     assert db.execute("SELECT used FROM resync_allowances WHERE run_id='A'").fetchone()[0] == 1
     assert db.execute("SELECT window FROM integration_snapshots WHERE run_id='A' ORDER BY window").fetchall()[1][0] == 2
     assert _rows(db, "B") == before_b

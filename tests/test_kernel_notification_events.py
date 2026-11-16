@@ -108,13 +108,14 @@ def test_late_stopped_activity_does_not_take_the_first_start_or_resume_milestone
     now = [100.0]
     kernel.clock = lambda: now[0]
     if old_observer:
-        record = kernel._event
+        from agent_run.core.delivery_state import DeliveryState
+        record = DeliveryState.event
 
-        def without_observer_trigger(tx, subject, kind, identity, material=None, **kwargs):
+        def without_observer_trigger(state, tx, subject, kind, identity, material=None, **kwargs):
             if kind != "worker_active":
-                record(tx, subject, kind, identity, material, **kwargs)
+                record(state, tx, subject, kind, identity, material, **kwargs)
 
-        monkeypatch.setattr(kernel, "_event", without_observer_trigger)
+        monkeypatch.setattr(DeliveryState, "event", without_observer_trigger)
     operations = CoreOperations(kernel, execution, lambda _binding: ports)
     first = operations.until(lambda step: step.call is not None).call
     assert first is not None and kernel.dispatch_agent(first)
@@ -182,13 +183,14 @@ def test_activity_start_respects_the_original_invocation_deadline(
     now = [100.0]
     kernel.clock = lambda: now[0]
     if old_observer:
-        record = kernel._event
+        from agent_run.core.delivery_state import DeliveryState
+        record = DeliveryState.event
 
-        def without_observer_trigger(tx, subject, kind, identity, material=None, **kwargs):
+        def without_observer_trigger(state, tx, subject, kind, identity, material=None, **kwargs):
             if kind != "worker_active":
-                record(tx, subject, kind, identity, material, **kwargs)
+                record(state, tx, subject, kind, identity, material, **kwargs)
 
-        monkeypatch.setattr(kernel, "_event", without_observer_trigger)
+        monkeypatch.setattr(DeliveryState, "event", without_observer_trigger)
     operations = CoreOperations(kernel, execution, lambda _binding: ports)
     first = operations.until(lambda step: step.call is not None).call
     assert first is not None and kernel.dispatch_agent(first)
@@ -255,15 +257,16 @@ def test_same_protocol_activity_without_observer_trigger_keeps_real_start_and_re
     kernel = scenario.kernel
     now = [100.0]
     kernel.clock = lambda: now[0]
-    record = kernel._event
+    from agent_run.core.delivery_state import DeliveryState
+    record = DeliveryState.event
 
-    def old_observer(tx, subject, kind, identity, material=None, **kwargs):
+    def old_observer(state, tx, subject, kind, identity, material=None, **kwargs):
         # Reproduce the old v21 observer representation only: Core still owns
         # every business transition and the real worker_activity producer.
         if kind != "worker_active":
-            record(tx, subject, kind, identity, material, **kwargs)
+            record(state, tx, subject, kind, identity, material, **kwargs)
 
-    monkeypatch.setattr(kernel, "_event", old_observer)
+    monkeypatch.setattr(DeliveryState, "event", old_observer)
     operations = CoreOperations(kernel, scenario.execution, scenario.make_ports)
     first = operations.until(lambda step: step.call is not None).call
     assert first is not None and kernel.dispatch_agent(first)

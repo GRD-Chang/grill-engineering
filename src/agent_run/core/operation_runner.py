@@ -106,7 +106,7 @@ class OperationRunner:
         try:
             world, fence = _read_observation(self.kernel, self.ports, request)
         except ReadUnavailable as error:
-            raise ReadWait(self.kernel._wait_for_read(request.fence, self.execution, error.code, error.message)) from error
+            raise ReadWait(self.kernel.wait_for_read(request.fence, self.execution, error.code, error.message)) from error
         self.kernel.authorize_agent_observation(call, world, fence)
 
     def worker_settled(self, call: AgentCall | AgentPreparation) -> bool:
@@ -151,6 +151,6 @@ class OperationRunner:
             resources = self.kernel.effect_resources(effect)
             inspections = None if resources is None else self.ports.inspect(resources)
         except ReadUnavailable as error:
-            raise ReadWait(self.kernel._wait_for_read(request.token, self.execution, error.code, error.message)) from error
+            raise ReadWait(self.kernel.wait_for_read(request.token, self.execution, error.code, error.message)) from error
         return lambda: self.kernel.authorize_effect_observation(
             effect, world, fence, prepared=prepared, inspections=inspections)

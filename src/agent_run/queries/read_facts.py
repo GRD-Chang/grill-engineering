@@ -16,6 +16,7 @@ from typing import Any, Mapping, Sequence
 
 from agent_run.contracts.agent_profiles import resolve_profiles
 from agent_run.contracts.policy import positive_seconds
+from agent_run.contracts.review_evidence import same_review_candidate
 from agent_run.errors import AgentProfileError
 from agent_run.model import AgentPreparation, Execution, Purpose, Role, artifact, review_outcome
 from agent_run.queries.execution import recorded_profile
@@ -42,11 +43,10 @@ def recorded_review(tx: Transaction, run: Mapping[str, Any], job: Mapping[str, A
     revision = (_one(tx, 'SELECT revision FROM issue_facts WHERE run_id=? AND issue=?', (job['issue'],))[0]
                 if job["kind"] == "ticket" else run["observed_parent_revision"])
     if (review["role"] != "review" or review["generation"] != job["generation"]
-            or review["revision"] != job["revision"] or review["revision"] != revision
+            or review["revision"] != revision
             or review["parent_revision"] != run["parent_revision"] or review["parent_revision"] != run["observed_parent_revision"]
             or review["graph_revision"] != run["graph_revision"] or review["graph_revision"] != run["observed_graph_revision"]
-            or review["base_sha"] != base or any(review[key] != job[key] for key in (
-                "candidate_sha", "candidate_tree", "expected_tree", "completion_revision"))
+            or not same_review_candidate(review, job, base_sha=base)
             or review["candidate_sha"] is None or review["candidate_tree"] is None):
         return "stale"
     if active and review["status"] in {"allocated", "running", "returned", "continuing"}:

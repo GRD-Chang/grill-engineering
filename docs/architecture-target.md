@@ -4,6 +4,10 @@
 `ed90d14ceb887e54e3a3a4d05374a45db32da499`；本页描述目标，不表示已经完成。
 现行实现见[当前运行架构](architecture.md)，业务术语和角色合同见[产品上下文](../CONTEXT.md)。
 
+Core 交付规则与恢复的已实施维护入口见 [Core 交付合同](agents/core-delivery.md)：
+修复能力、共同 Checks、Attempt 和 Review 同义字段比较各有明确归属，
+共同选工、原事务和逐写授权仍由单一 Core 负责。
+
 ## 决策与职责
 
 保留一个 Core，明确分离当前业务状态、物理执行证据、已提交业务事件。
