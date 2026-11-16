@@ -5,10 +5,7 @@ import time
 from pathlib import Path
 
 
-from agent_run.credential_lifecycle import (
-    ReadCredential,
-    RenewableCredential,
-)
+from agent_run.adapters.auth.credential_lifecycle import ReadCredential, RenewableCredential
 
 
 def test_close_during_retry_joins_renewal_without_another_backoff(

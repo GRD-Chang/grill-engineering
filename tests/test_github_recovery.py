@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from agent_run.contracts.write_authority import WriteAuthority
+
 import json
 import subprocess
 import sys
@@ -7,18 +9,11 @@ from pathlib import Path
 
 import pytest
 
-from support.seeding import write_fixture
-from agent_run.controller import Controller
-from agent_run.git import GitError, GitRepository
-from agent_run.github import GhGitHubReader, GitHubReadError
-from agent_run.github_fixture import FixtureGitHubReader
-from agent_run.github_publish import GhGitHubPublisher
-from agent_run.github_retry import MAX_COMMAND_OUTPUT_BYTES, run_read_command
-from agent_run.models import Repository
-from agent_run.state import MAX_TIMELINE_EVENTS, StateStore
-from agent_run.object_state import save_owned
+from support.github_retries import set_read_retry_sleep
+from support.github_checks import repository_response
 
-from support.state import run_refs
+from agent_run.adapters.github import GhGitHubReader
+from agent_run.adapters.github_commands import MAX_COMMAND_OUTPUT_BYTES, run_read_command
 
 
 def test_github_reader_retries_transient_timeout(
@@ -34,10 +29,10 @@ def test_github_reader_retries_transient_timeout(
                 return subprocess.CompletedProcess(
                     arguments, 1, "", "dial tcp: i/o timeout"
                 )
-        return _repository_response()
+        return _repository_response(arguments)
 
-    monkeypatch.setattr("agent_run.github_retry._run_bounded_command", fake_run)
-    monkeypatch.setattr("agent_run.github_retry.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr('agent_run.adapters.github_commands._run_bounded_command', fake_run)
+    set_read_retry_sleep(monkeypatch, lambda _seconds: None)
 
     reader = GhGitHubReader("example/project")
     assert reader.repository().name_with_owner == "example/project"
@@ -73,8 +68,8 @@ def test_github_read_retries_do_not_classify_stderr(
         attempts += 1
         return subprocess.CompletedProcess(arguments, 1, "", stderr)
 
-    monkeypatch.setattr("agent_run.github_retry._run_bounded_command", fake_run)
-    monkeypatch.setattr("agent_run.github_retry.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr('agent_run.adapters.github_commands._run_bounded_command', fake_run)
+    set_read_retry_sleep(monkeypatch, lambda _seconds: None)
 
     result = run_read_command(["gh", "api", "repos/example/project"])
 
@@ -97,7 +92,7 @@ def test_github_reader_derives_repository_hint_from_origin(
     expected: str | None,
 ) -> None:
     monkeypatch.setattr(
-        "agent_run.github.subprocess.run",
+        'agent_run.adapters.github.subprocess.run',
         lambda *_args, **_kwargs: subprocess.CompletedProcess(
             ["git"], 0, f"{remote}\n", ""
         ),
@@ -106,190 +101,42 @@ def test_github_reader_derives_repository_hint_from_origin(
     assert GhGitHubReader(working_directory=git_repo).repository_hint() == expected
 
 
-def test_github_reader_live_pull_request_returns_integrated_sha(
-    monkeypatch: pytest.MonkeyPatch,
+def test_remote_merge_readback_returns_integrated_sha(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    reader = GhGitHubReader("example/project")
-    monkeypatch.setattr(
-        reader,
-        "repository",
-        lambda: Repository("example/project", "main", "default-sha"),
-    )
-    calls: list[tuple[str, ...]] = []
+    from dataclasses import replace
+    from agent_run.adapters.git_objects import LocalGit
+    from support.remote_effects import _fixture, _publish_pr
 
-    def fake_json(*arguments: str) -> dict[str, object]:
-        calls.append(arguments)
-        if arguments[:1] == ("api",):
-            sha = arguments[1].rsplit("/", 1)[-1]
-            return {
-                "tree": {"sha": f"{sha}-tree"},
-                "parents": [{"sha": "parent-a"}, {"sha": "parent-b"}],
-            }
-        return {
-            "state": "MERGED",
-            "headRefName": "agent-run-repair/run-1",
-            "headRefOid": "head-sha",
-            "headRepository": {"nameWithOwner": "example/project"},
-            "baseRefName": "agent-run/run-1",
-            "baseRefOid": "integrated-sha",
-            "mergeCommit": {"oid": "integrated-sha"},
-        }
+    port, git, push, _state, calls = _fixture(tmp_path, monkeypatch)
+    source_ref = "refs/heads/agent-run-repair/run-1"
+    target_ref = "refs/heads/agent-run/run-1"
+    git.run("push", "origin", push.base.sha + ":" + source_ref, push.base.sha + ":" + target_ref)
+    push = replace(push, source_ref=source_ref, target_ref=target_ref)
+    _original, pr = _publish_pr(port, push)
+    parents = [push.base.sha, push.after_sha]
+    merge = replace(push, effect_id="merge-readback", operation="merge", pr_number=pr.number,
+                    payload={"method": "merge", "parents": parents, "commit_message": "Reviewed merge"})
+    assert port.execute(merge, WriteAuthority(lambda: lambda: None)).disposition == "target"
+    remote = LocalGit(tmp_path / "origin.git")
+    integrated = remote.commit(target_ref)
+    before = len(calls.read_text().splitlines())
 
-    monkeypatch.setattr(reader, "_gh_json", fake_json)
+    readback = port.reconcile(merge)
+    live = readback.pr
 
-    live = reader.live_pull_request(12)
-
-    assert live["integrated_sha"] == "integrated-sha"
-    assert live["head_branch"] == "agent-run-repair/run-1"
-    assert live["head_repository"] == live["base_repository"] == "example/project"
-    assert live["head_tree"] == "head-sha-tree"
-    assert live["integrated_tree"] == "integrated-sha-tree"
-    assert live["integrated_parents"] == ["parent-a", "parent-b"]
-    assert "mergeCommit" in calls[0][-1]
-
-
-def test_git_fetch_retries_transient_timeout(
-    git_repo: Path, monkeypatch
-) -> None:
-    attempts = 0
-
-    def fake_run(arguments, **_kwargs):
-        nonlocal attempts
-        attempts += 1
-        if attempts < 3:
-            return subprocess.CompletedProcess(
-                arguments, 1, "", "dial tcp: i/o timeout"
-            )
-        return subprocess.CompletedProcess(arguments, 0, "", "")
-
-    monkeypatch.setattr("agent_run.github_retry._run_bounded_command", fake_run)
-    monkeypatch.setattr("agent_run.github_retry.time.sleep", lambda _seconds: None)
-
-    GitRepository(git_repo)._fetch_default_branch("main")
-
-    assert attempts == 3
-
-
-def test_publisher_does_not_blindly_retry_a_write(
-    git_repo: Path, monkeypatch
-) -> None:
-    writes = 0
-    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
-    monkeypatch.setattr(
-        "agent_run.github_publish.run_read_command",
-        lambda arguments, **_kwargs: subprocess.CompletedProcess(arguments, 0, "", ""),
-    )
-
-    def fail_write(_arguments, **_kwargs):
-        nonlocal writes
-        writes += 1
-        return subprocess.CompletedProcess([], 1, "", "dial tcp: i/o timeout")
-
-    monkeypatch.setattr("agent_run.github_publish.run_write_command", fail_write)
-
-    with pytest.raises(GitHubReadError, match="dial tcp: i/o timeout") as caught:
-        publisher.ensure_change_branch(
-            branch="agent-run/run-1/example",
-            base_branch="main",
-            expected_base_sha="a" * 40,
-            expected_remote_sha="a" * 40,
-            recovery_remote_sha="a" * 40,
-        )
-    assert caught.value.code == "github_write_failed"
-    assert writes == 1
-
-
-def test_publisher_does_not_write_after_branch_read_exhaustion(
-    git_repo: Path, monkeypatch
-) -> None:
-    reads = 0
-    writes: list[list[str]] = []
-
-    def fake_run(arguments, **_kwargs):
-        nonlocal reads
-        reads += 1
-        return subprocess.CompletedProcess(
-            arguments, 1, "", "HTTP 503: upstream unavailable"
-        )
-
-    monkeypatch.setattr("agent_run.github_retry._run_bounded_command", fake_run)
-    monkeypatch.setattr("agent_run.github_retry.time.sleep", lambda _seconds: None)
-    publisher = GhGitHubPublisher("example/project", GitRepository(git_repo))
-
-    def unexpected_write(arguments, **_kwargs):
-        writes.append(arguments)
-        return subprocess.CompletedProcess(arguments, 0, "", "")
-
-    monkeypatch.setattr("agent_run.github_publish.run_write_command", unexpected_write)
-
-    with pytest.raises(GitHubReadError, match="HTTP 503") as caught:
-        publisher.ensure_change_branch(
-            branch="agent-run/run-1/example",
-            base_branch="main",
-            expected_base_sha="a" * 40,
-            expected_remote_sha="a" * 40,
-            recovery_remote_sha="a" * 40,
-        )
-
-    assert caught.value.code == "github_read_failed"
-    assert reads == 3
-    assert writes == []
-
-
-def test_foreground_run_selection_reuses_one_unfinished_run(git_repo: Path) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"2": _ticket()})
-    states = StateStore(git_repo / ".agent-run")
-    controller = Controller(
-        FixtureGitHubReader(fixture), GitRepository(git_repo), states
-    )
-
-    created, created_resumed = controller.start_or_resume_unfinished(1)
-    reused, reused_resumed = controller.start_or_resume_unfinished(1)
-
-    assert not created_resumed
-    assert reused_resumed
-    assert reused["run_id"] == created["run_id"]
-    assert len(run_refs(git_repo / '.agent-run')) == 1
-
-
-def test_foreground_run_reports_all_conflicting_run_ids(git_repo: Path) -> None:
-    fixture = write_fixture(git_repo / "github.json", issues={"2": _ticket()})
-    states = StateStore(git_repo / ".agent-run")
-    for run_id in ("run-first", "run-second"):
-        states.save_run(
-            run_id,
-            {
-                "run_id": run_id,
-                "repository": "example/project",
-                "parent": {"number": 1},
-                "status": "active",
-                "created_at": run_id,
-            },
-        )
-    controller = Controller(
-        FixtureGitHubReader(fixture), GitRepository(git_repo), states
-    )
-
-    with pytest.raises(ValueError, match="run-first, run-second"):
-        controller.start_or_resume_unfinished(1)
-
-
-def test_timeline_stops_appending_at_the_bounded_capacity(git_repo: Path) -> None:
-    states = StateStore(git_repo / ".agent-run")
-    state: dict[str, object] = {"run_id": "bounded", "status": "starting"}
-
-    for number in range(MAX_TIMELINE_EVENTS + 10):
-        state["status"] = f"state-{number}"
-        if number == 0:
-            states.save_run("bounded", state)
-        else:
-            save_owned(states, "bounded", state, fields={"status"})
-
-    stored = states.load_run("bounded")
-    assert stored is not None
-    assert len(stored["timeline"]) == MAX_TIMELINE_EVENTS
-    assert stored["timeline"][-1]["kind"] == "timeline_capacity"
-    assert stored["timeline_at_capacity"] is True
+    assert readback.disposition == "target" and readback.commit.sha == integrated.sha
+    assert live.number == pr.number and live.state == "MERGED"
+    assert live.source_ref.removeprefix("refs/heads/") == "agent-run-repair/run-1"
+    assert live.head_repository == live.repository == "example/project"
+    assert live.head.tree == push.candidate.tree
+    assert live.merged.tree == integrated.tree
+    assert readback.raw["parents"] == parents
+    assert remote.run("rev-list", "--parents", "-n", "1", integrated.sha).stdout.split()[1:] == parents
+    assert live.base.sha == parents[0]
+    observed = [json.loads(line) for line in calls.read_text().splitlines()][before:]
+    assert any(command[:2] == ["api", f"repos/example/project/git/commits/{integrated.sha}"] for command in observed)
+    assert not any("--method" in command or "--input" in command for command in observed)
 
 
 def test_github_reader_retries_transient_http_status(
@@ -305,37 +152,16 @@ def test_github_reader_retries_transient_http_status(
                 return subprocess.CompletedProcess(
                     arguments, 1, "", "HTTP 503: upstream unavailable"
                 )
-        return _repository_response()
+        return _repository_response(arguments)
 
-    monkeypatch.setattr("agent_run.github_retry._run_bounded_command", fake_run)
-    monkeypatch.setattr("agent_run.github_retry.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr('agent_run.adapters.github_commands._run_bounded_command', fake_run)
+    set_read_retry_sleep(monkeypatch, lambda _seconds: None)
 
     reader = GhGitHubReader("example/project")
     assert reader.repository().name_with_owner == "example/project"
     assert attempts == 3
 
 
-def _repository_response() -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess(
-        ["gh"],
-        0,
-        json.dumps(
-            {
-                "nameWithOwner": "example/project",
-                "defaultBranchRef": {"name": "main"},
-                "sha": "abc123",
-            }
-        ),
-        "",
-    )
-
-
-def _ticket() -> dict[str, object]:
-    return {
-        "number": 2,
-        "title": "Ticket",
-        "body": "Deliver the requested change.",
-        "state": "OPEN",
-        "labels": ["ready-for-agent"],
-        "blocked_by": [],
-    }
+def _repository_response(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+    return repository_response(arguments[1:], repository="example/project", default_branch="main",
+                               refs={"refs/heads/main": "a" * 40})

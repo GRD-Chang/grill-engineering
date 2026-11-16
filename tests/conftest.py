@@ -8,8 +8,19 @@ from pathlib import Path
 import pytest
 
 from support.environment import _apply_test_environment, _inherited_git_override, _user_environment
+from support.installed_runtime import require_current_installation
 
-pytest_plugins = ("support.sharding",)
+pytest_plugins = ("support.reporting", "support.offline_prefixes", "support.review_facts")
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.getgroup('test diagnostics').addoption('--host-loss-io-diagnostics',
+        action='store_true', default=False,
+        help='Measure four managed stories and select the pre-sealed Host-loss diagnostic entry; not acceptance')
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    require_current_installation()
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:

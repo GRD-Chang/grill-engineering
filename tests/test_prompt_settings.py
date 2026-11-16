@@ -9,8 +9,9 @@ import sys
 
 import pytest
 
-from agent_run import prompt_resources
-from agent_run.development_prompts import development_prompt
+import agent_run.config.resources as prompt_resources
+from agent_run.contracts.artifact import role_schema
+from agent_run.core.prompts.development import development_prompt
 
 
 def cli(*arguments: str) -> subprocess.CompletedProcess[str]:
@@ -56,6 +57,7 @@ def test_preview_uses_execution_assembler_and_frozen_resources(tmp_path: Path) -
     preview = cli("preview", "--request", str(request_file), "--role", "development", "--json")
     assert preview.returncode == 0, preview.stdout + preview.stderr
     assert json.loads(preview.stdout)["prompt"] == development_prompt(request)
+    assert json.loads(preview.stdout)["schema"] == role_schema("development")
     assert "个人共用标记" in preview.stdout
     request["_prompt_resources"] = prompt_resources.resolve_resources()
     request_file.write_text(json.dumps(request))
@@ -69,10 +71,10 @@ def test_preview_uses_execution_assembler_and_frozen_resources(tmp_path: Path) -
 
 @pytest.mark.parametrize("language", ["zh", "en"])
 def test_unreadable_override_reports_error(tmp_path: Path, language: str) -> None:
-    from agent_run.user_defaults import UserDefaultsStore
+    from agent_run.config.defaults import UserDefaultsStore
 
     UserDefaultsStore().configure(language=language)
-    directory = prompt_resources.personal_method_directory()
+    directory = prompt_resources.personal_method_directory(language)
     directory.mkdir(parents=True)
     (directory / "acceptance.md").mkdir()
     result = cli("diff", "--json")
@@ -84,20 +86,26 @@ def test_unreadable_override_reports_error(tmp_path: Path, language: str) -> Non
     assert ("普通 Markdown 文件" if language == "zh" else "regular Markdown file") in human.stdout
 
 
+@pytest.mark.parametrize("output_name,role", [
+    ("Development result", "development"), ("Acceptance Artifact", "review"),
+    ("Publication Artifact", "publication"),
+])
 def test_output_repair_preview_is_read_only_and_snapshot_is_required_when_supplied(
-    tmp_path: Path, capsys,
+    tmp_path: Path, capsys, output_name: str, role: str,
 ) -> None:
-    from agent_run.cli import main
-    from agent_run.prompt_context import structured_output_repair_prompt
+    from agent_run.cli.main import main
+    from agent_run.core.prompts.context import structured_output_repair_prompt
 
-    request = {"output_name": "Development result", "contract_error": "字段缺失"}
+    request = {"output_name": output_name, "contract_error": "字段缺失"}
     request_file = tmp_path / "request.json"
     request_file.write_text(json.dumps(request))
     arguments = ["prompts", "preview", "--request", str(request_file),
                  "--role", "output-repair", "--json"]
     assert main(arguments) == 0
-    prompt = json.loads(capsys.readouterr().out)["prompt"]
-    assert prompt == structured_output_repair_prompt("Development result", "字段缺失")
+    result = json.loads(capsys.readouterr().out)
+    prompt = result["prompt"]
+    assert result["schema"] == role_schema(role)
+    assert prompt == structured_output_repair_prompt(output_name, "字段缺失")
     assert "字段缺失" in prompt
     assert not prompt_resources.personal_method_directory().exists()
     request["_prompt_resources"] = {}
@@ -108,7 +116,7 @@ def test_output_repair_preview_is_read_only_and_snapshot_is_required_when_suppli
 
 @pytest.mark.parametrize("failure", ["invalid_utf8", "broken_symlink", "fifo", "missing_builtin", "empty", "oversized"])
 def test_resource_read_errors_reach_public_cli(tmp_path: Path, capsys, monkeypatch, failure: str) -> None:
-    from agent_run.cli import main
+    from agent_run.cli.main import main
 
     directory = prompt_resources.personal_method_directory()
     directory.mkdir(parents=True)
@@ -131,7 +139,7 @@ def test_resource_read_errors_reach_public_cli(tmp_path: Path, capsys, monkeypat
 
 
 def test_help_and_explicit_preview_survive_invalid_personal_config(tmp_path: Path) -> None:
-    from agent_run.user_defaults import UserDefaultsStore
+    from agent_run.config.defaults import UserDefaultsStore
 
     store = UserDefaultsStore()
     store.path.parent.mkdir(parents=True, exist_ok=True)
@@ -162,7 +170,7 @@ def test_help_and_explicit_preview_survive_invalid_personal_config(tmp_path: Pat
 
 @pytest.mark.parametrize("language", ["zh", "en"])
 def test_language_methods_are_independent_and_preview_matches(tmp_path: Path, language: str) -> None:
-    from agent_run.cli import main
+    from agent_run.cli.main import main
 
     assert main(["settings", "configure", "--language", language, "--json"]) == 0
     other = "en" if language == "zh" else "zh"
@@ -170,12 +178,12 @@ def test_language_methods_are_independent_and_preview_matches(tmp_path: Path, la
     other_directory.mkdir(parents=True)
     other_method = other_directory / "acceptance.md"
     other_method.write_text("OTHER LANGUAGE CUSTOM METHOD", encoding="utf-8")
-    assert prompt_resources.resolve_resources()["methods/acceptance"] == prompt_resources.builtin_resources(language)["methods/acceptance"]
+    assert prompt_resources.resolve_resources(language)["methods/acceptance"] == prompt_resources.builtin_resources(language)["methods/acceptance"]
     initialized = cli("init", "--json")
     assert initialized.returncode == 0, initialized.stdout + initialized.stderr
     assert len(json.loads(initialized.stdout)["created"]) == 4
     assert other_method.read_text() == "OTHER LANGUAGE CUSTOM METHOD"
-    directory = prompt_resources.personal_method_directory()
+    directory = prompt_resources.personal_method_directory(language)
     method = directory / "acceptance.md"
     method.write_text("SELECTED LANGUAGE CUSTOM METHOD", encoding="utf-8")
     before = method.stat().st_mtime_ns
@@ -228,10 +236,10 @@ def test_bilingual_resource_manifest_and_format_fields_match() -> None:
 
 @pytest.mark.parametrize("language", ["zh", "en"])
 def test_legacy_files_are_preserved_and_sources_are_explicit(tmp_path: Path, language: str) -> None:
-    from agent_run.user_defaults import UserDefaultsStore
+    from agent_run.config.defaults import UserDefaultsStore
 
     UserDefaultsStore().configure(language=language)
-    directory = prompt_resources.personal_method_directory()
+    directory = prompt_resources.personal_method_directory(language)
     directory.mkdir(parents=True)
     old_names = ("development-common", "development-initial", "development-repair", "review", "publication")
     for name in old_names:
@@ -266,15 +274,14 @@ def test_legacy_files_are_preserved_and_sources_are_explicit(tmp_path: Path, lan
 
 
 def test_preview_and_diff_do_not_execute_workers_or_write_runs(tmp_path: Path, monkeypatch, capsys) -> None:
-    from agent_run.cli import main
-    from agent_run.codex import CodexCliBackend
-    from agent_run.state import StateStore
+    from agent_run.cli.main import main
+    from agent_run.storage.sqlite import Storage
 
     def forbidden(*args, **kwargs):
         pytest.fail("Prompt inspection must not execute a Worker or persist Run state")
 
-    monkeypatch.setattr(CodexCliBackend, "_invoke", forbidden)
-    monkeypatch.setattr(StateStore, "save_run", forbidden)
+    monkeypatch.setattr('agent_run.runtime.codex.execute_selected_codex', forbidden)
+    monkeypatch.setattr(Storage, "transaction", forbidden)
     request_file = tmp_path / "request.json"
     request_file.write_text(json.dumps({"task_issue_url": "https://example.invalid/2"}))
     assert main(["prompts", "diff", "--json"]) == 0
@@ -293,14 +300,14 @@ def test_preview_and_diff_do_not_execute_workers_or_write_runs(tmp_path: Path, m
     ids=["missing-translation", "different-facts", "empty-translation"],
 )
 def test_internal_copy_rejects_incomplete_bilingual_contract(texts) -> None:
-    from agent_run.internal_prompt_text import validate_bilingual_texts
+    from agent_run.contracts.prompt import validate_bilingual_texts
 
     with pytest.raises(ValueError):
         validate_bilingual_texts(texts)
 
 
 def test_internal_copy_accepts_reordered_translated_facts() -> None:
-    from agent_run.internal_prompt_text import validate_bilingual_texts
+    from agent_run.contracts.prompt import validate_bilingual_texts
 
     validate_bilingual_texts({
         "task": {"zh": "任务 {task}，路径 {path}",

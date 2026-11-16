@@ -13,10 +13,11 @@ import urllib.error
 
 import pytest
 
-from agent_run import github_auth, runner_credentials
-from agent_run.github import GitHubReadError
-from agent_run.runner_credentials import RunnerCredentialError, runner_credential_scope
-from agent_run.runner_transport import runner_environment
+import agent_run.adapters.auth.app as github_auth
+import agent_run.adapters.auth.runner_credentials as runner_credentials
+from agent_run.errors import GitHubReadError
+from agent_run.adapters.auth.runner_credentials import RunnerCredentialError, runner_credential_scope
+from agent_run.adapters.auth.runner_transport import runner_environment
 
 
 @pytest.mark.parametrize("renewal", [False, True], ids=["initial", "renewal"])

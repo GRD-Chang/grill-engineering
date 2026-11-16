@@ -4,11 +4,10 @@ import subprocess
 
 import pytest
 
-from agent_run.github_identity import (
-    GitHubIdentityError, describe_identity, native_github_environment, normalize_github_config,
-    resolve_worker_identity, resolve_runner_identity, validate_identity_snapshot, validate_worker_auth,
-)
-from agent_run.user_defaults import UserDefaultsStore
+from agent_run.errors import GitHubIdentityError
+from agent_run.contracts.identity import describe_identity, normalize_github_config, validate_identity_snapshot
+from agent_run.adapters.auth.identity import native_github_environment, resolve_worker_identity, resolve_runner_identity, validate_worker_auth
+from agent_run.config.defaults import UserDefaultsStore
 from support.user_defaults import settings
 
 
@@ -67,15 +66,29 @@ def test_pat_references_refresh_and_never_fallback(tmp_path: Path) -> None:
 
 
 def test_auth_validation_suppresses_secret_tool_output(monkeypatch: pytest.MonkeyPatch) -> None:
-    def failed(command: list, **kwargs: object) -> subprocess.CompletedProcess:
-        assert command == ['gh', 'api', '--hostname', 'github.com', 'user']
+    import agent_run.adapters.auth.identity as identity
+    from agent_run.adapters.auth.native_probe import AuthProbeCapture
+
+    process = object()
+
+    def start(command: list, **kwargs: object):
+        assert command == ['gh', 'api', '--hostname', 'github.com', 'user', '--include', '--silent']
         assert kwargs['env']['GH_TOKEN'] == 'selected-secret'
-        assert kwargs['stderr'] == subprocess.DEVNULL
-        return subprocess.CompletedProcess(command, 1, stderr='selected-secret')
-    monkeypatch.setattr(subprocess, 'run', failed)
+        assert kwargs['stdout'] == kwargs['stderr'] == subprocess.PIPE
+        assert kwargs['start_new_session'] is True
+        return process
+
+    def capture(owned, *, timeout):
+        assert owned is process and timeout == 15
+        return AuthProbeCapture(1, False, 401, False, False)
+
+    monkeypatch.setattr(identity.subprocess, 'Popen', start)
+    monkeypatch.setattr(identity, 'capture_auth_probe', capture)
     with pytest.raises(GitHubIdentityError) as error:
         validate_worker_auth({'source': 'pat', 'pat': {'env': 'PAT'}}, {'PAT': 'selected-secret'})
     assert 'selected-secret' not in str(error.value)
+    assert error.value.__cause__.http_status == 401
+    assert 'selected-secret' not in str(error.value.__cause__)
 
 
 @pytest.mark.parametrize('language', ['zh', 'en'])

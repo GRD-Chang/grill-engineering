@@ -18,6 +18,8 @@ _GIT_LOCATION_VARIABLES = {
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_TEMPLATE_DIR",
+    "GIT_SHALLOW_FILE",
+    "GIT_NAMESPACE",
 }
 
 
@@ -35,6 +37,10 @@ def _user_environment(root: Path) -> dict[str, str]:
         ),
         "GIT_CONFIG_NOSYSTEM": "1",
     }
+    # CI verifies the prepared SQLite before exporting its loader path. Keep
+    # that runtime selection in CLI children without inheriting host secrets.
+    if library_path := os.environ.get("LD_LIBRARY_PATH"):
+        environment["LD_LIBRARY_PATH"] = library_path
     for variable, directory in (
         ("HOME", "home"),
         ("XDG_STATE_HOME", "state"),
@@ -76,3 +82,16 @@ def _assert_python_and_git_environment() -> None:
     assert {
         key: value for key, value in os.environ.items() if key.startswith("GIT_CONFIG")
     } == {"GIT_CONFIG_NOSYSTEM": "1"}
+
+
+def durable_snapshot(root: Path) -> dict[str, bytes]:
+    # SQLite SHM is coordination, not durable business state. Retain all WAL
+    # bytes if present; a read is not allowed to append durable frames.
+    return {str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*")
+            if path.is_file() and not path.name.endswith("-shm") and
+            not (path.name.endswith("-wal") and path.stat().st_size == 0)}
+
+
+def _file_snapshot(root: Path) -> dict[str, bytes]:
+    return {str(path.relative_to(root)): path.read_bytes()
+            for path in root.rglob("*") if path.is_file()}

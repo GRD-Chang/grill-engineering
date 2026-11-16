@@ -8,12 +8,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_run import runner_credentials
-from agent_run.credential_lifecycle import ReadCredential
-from agent_run.github import GitHubReadError
-from agent_run.github_identity import GitHubIdentityError, resolve_runner_identity, resolve_worker_identity
-from agent_run.runner_credentials import runner_credential_scope
-from agent_run.runner_transport import runner_environment, runner_git_environment
+import agent_run.adapters.auth.runner_credentials as runner_credentials
+from agent_run.adapters.auth.credential_lifecycle import ReadCredential
+from agent_run.errors import GitHubReadError
+from agent_run.errors import GitHubIdentityError
+from agent_run.adapters.auth.identity import resolve_runner_identity, resolve_worker_identity
+from agent_run.adapters.auth.runner_credentials import runner_credential_scope
+from agent_run.adapters.auth.runner_transport import runner_environment, runner_git_environment
 from support.user_defaults import settings
 
 
@@ -113,9 +114,9 @@ def test_concurrent_worker_and_runner_scopes_do_not_share_credentials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import json
-    from agent_run import github_auth
-    from agent_run.github_auth_profile import GitHubAppProfile
-    from agent_run.worker_credentials import NativeCredentialDelivery
+    import agent_run.adapters.auth.app as github_auth
+    from agent_run.config.github_app import GitHubAppProfile
+    from agent_run.adapters.auth.worker_credentials import NativeCredentialDelivery
 
     requested = []
     def mint(profile, *, read_only=False, repository=None, process_registry=None):
@@ -142,7 +143,7 @@ def test_concurrent_worker_and_runner_scopes_do_not_share_credentials(
 def test_runner_transient_renewal_keeps_valid_token_then_recovers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from agent_run.github_auth import GitHubCredentialError
+    from agent_run.adapters.auth.app import GitHubCredentialError
 
     now = [time.time()]
     failed = threading.Event()
@@ -189,7 +190,7 @@ def test_runner_transient_renewal_keeps_valid_token_then_recovers(
 
 @pytest.mark.parametrize("interrupt", [False, True])
 def test_runner_initial_failure_cleans_provider_and_preserves_safe_status(tmp_path, monkeypatch, interrupt):
-    from agent_run.github_auth import GitHubCredentialError
+    from agent_run.adapters.auth.app import GitHubCredentialError
 
     cancelled = threading.Event()
 

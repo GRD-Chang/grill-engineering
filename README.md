@@ -7,7 +7,7 @@ English | [简体中文](README.zh-CN.md)
 After [Matt Pocock Skills](https://github.com/mattpocock/skills) breaks your work into GitHub tickets,
 grill-engineering runs Codex to implement and verify them, with less manual coordination between tasks.
 
-[Get started](#get-started) · [Screenshots](#screenshots) · [Feishu notifications](#feishu-notifications) · [Agent guide](docs/agent-guide.en.md)
+[Get started](#get-started) · [Screenshots](#screenshots) · [Feishu notifications](#feishu-notifications) · [Agent guide](docs/agent-guide.en.md) · [Current architecture](docs/architecture.md)
 
 ## Why I built this
 
@@ -30,6 +30,7 @@ agent-run run <parent-issue> --repo OWNER/REPO
 ```
 
 Runner develops in an independent clone of the remote and leaves your local checkout unchanged. You can continue the same repository and Parent task from different directories.
+Complete the [host and repository prerequisites](docs/install.en.md) first. The command starts automatic work and returns an operation receipt; it does not confirm completed delivery or grant final approval. Follow the [one-command flow and recovery reference](docs/agent-run.md#一条命令推进-ticket-交付).
 
 The main workflow:
 
@@ -52,6 +53,8 @@ Individual tickets can look correct while the combined feature still fails. Afte
 integrated, another agent checks the whole feature against the original requirements. Any problems
 go back to a development agent for fixes and another verification pass.
 
+Development and repair use bounded allowances. Ticket review has a configured final-round fallback and optional CI review; a fallback is not a passed review. Whole-Parent acceptance and approval of the current final PR remain required. Pending or unknown checks do not count as passing.
+
 When human input is needed, the run pauses and saves its work. The final PR is merged into the default
 branch after the maintainer reviews and approves it. See the [run reference](docs/agent-run.md) for
 execution and recovery details.
@@ -71,7 +74,7 @@ execution and recovery details.
 
 </details>
 
-The run keeps going after the terminal closes. Use `stop` to pause it and preserve the work,
+Default background runs keep going after the terminal closes. The foreground candidate has different cancellation semantics and remains [unvalidated](docs/productization/quickstart.en.md#5-stop-resume-and-approve-explicitly). Use `stop` to pause it and preserve the work,
 and `resume` to continue later.
 
 ## Feishu notifications
@@ -123,6 +126,12 @@ Let me know when you need input or approval for the final PR.
 The current backend is Codex CLI with GitHub, running on Linux. Your agent can follow the guide to
 install and configure it. Runs use your Codex account quota; models and repair limits can be adjusted
 through [user settings](docs/user-defaults.md).
+
+Windows users can evaluate a WSL2 Linux Guest; macOS users can evaluate a Linux VM Guest.
+Install and run the whole toolchain inside that Guest, including project files, sockets and
+credential references. Native Windows/macOS Workers are unsupported; Guest startup and recovery
+are not yet platform-validated. Follow the [support tiers and read-only diagnostics](docs/productization/support.md#linux-guest-路径与只读诊断)
+before installation. Docker is not the default compatibility path.
 
 For Matt's workflow, see the [upstream guide](https://www.aihero.dev/skills).
 

@@ -2,6 +2,9 @@
 
 [English](install.en.md) | 简体中文
 
+首次使用可先读[一页快速开始](productization/quickstart.md)；
+完整前提与排障仍以本页为准，[支持矩阵](productization/support.md)区分适配代码与真实发行验证。
+
 按本页完成安装和目标仓库检查；运行任务见 [Agent 操作指南](agent-guide.md#运行任务)。
 工具源码目录用于安装；交付使用 Runner 从目标远端建立的独立克隆，用户仓库保持不变。
 
@@ -43,6 +46,9 @@
 完成条件：所选版本已激活，执行环境检查满足；否则报告具体缺项和修复动作。
 生产运行使用安装后的 `agent-run`，不使用源码或 editable 环境代替。
 
+前台候选已有显式入口，但物理 Host 与真实交付仍待验收；见[运行模式](agent-run.md#运行模式与前台候选验收)。
+本节原 systemd 检查针对后台路径，安装成功不代表前台已验证。
+
 ### 环境缺项
 
 Setup 仅在 Linux 运行，自动 APT 准备范围为 **Ubuntu 24.04、Debian 13 的 x86_64 / aarch64**，且 `apt-get` 可用。
@@ -57,20 +63,34 @@ GitHub CLI 不在自动 APT 补装范围：Ubuntu 24.04 原生源中的 gh 2.45.
 软件源候选不可用、版本仍不兼容或包安装失败时按实际错误处理，不能视为执行就绪。
 
 上述范围是自动准备策略，模拟工具测试只验证分支与授权边界，不是完整平台支持证明。
-本轮宿主证据：Ubuntu 24.04 x86_64，CPython 3.11.16、Git 2.43.0、bubblewrap 0.9.0。
-真实 `bwrap --die-with-parent --ro-bind / / --dev /dev --unshare-pid --proc /proc -- /bin/true` 成功；
-`systemctl --user show-environment` 返回 `Failed to connect to bus: Connection refused`，因此 user systemd 未就绪。
-未调用真实模型；完整执行兼容性、Debian 13 与 aarch64 尚未验证，不宣称完整宿主通过。
+后台路径须在实际目标宿主验证：可联系版本 254+ 的 user systemd manager、可用的 `systemd-run`，
+以及 bubblewrap 所需 mount/device/PID namespace。工具在 PATH 上不等于具备这些执行能力。
+须使用实际运行 Runner 的登录用户会话，能够观察对应 cgroup、使用 FD store，且 Python/内核提供
+所需的 pidfd/准确退出观察。云沙箱中的 user manager 或 namespace 失败只说明该环境未就绪，
+不代表所有 Linux 不可用；也不能用容器内工具存在代替真实宿主验证。
+Runner 的 Python 须实际加载包含 WAL-reset 修复的 SQLite：3.51.3 及以上，或官方回补
+3.50.7–3.50.x / 3.44.6–3.44.x，见[状态存储](agents/state-storage.md#sqlite-运行库与资源生命周期)。
+重新安装 Runner 不会升级旧 Run 协议，也不能证明该宿主已通过完整交付验收。
+
+Windows/macOS 用户应先进入自己已准备的 WSL2 / Linux VM Guest，在 Guest 内完成
+本节全部检查；不在 PowerShell 或 macOS 原生 Python 中运行 Worker。
+项目、临时 Unix socket、Runner 数据与所选凭据引用的[Guest 布局及诊断](productization/support.md#linux-guest-路径与只读诊断)
+须先确认。Guest 路径尚未完成受控 Worker/Stop/Resume 平台验收，不能标为已支持；
+不自动安装 VM、开启 systemd 或修改安全设置。
 
 | 缺项 | 处理与复查 |
 | --- | --- |
 | Python / Git | 准备 CPython 3.11+、venv/pip、构建后端和 Git 2.40+；以 Setup 报告核对兼容性 |
 | GitHub CLI | 按 [gh Linux 安装说明](https://github.com/cli/cli/blob/trunk/docs/install_linux.md)准备兼容版本；执行 `gh auth status` |
-| Codex | 按 [Codex 安装说明](https://github.com/openai/codex)安装并登录；核对 `codex exec --help`、`codex exec resume --help` 和 `codex login status` |
+| Codex | 按 [Codex 安装说明](https://github.com/openai/codex)安装并登录；核对 `codex exec --help`、`codex exec resume --help` 和 `codex login status`；登录及所需环境必须对实际 Executor/Worker 子进程可用，不能只在发起终端可用 |
 | user systemd / bubblewrap | 在真实用户登录会话检查 `systemctl --user show-environment`，定位 namespace 或权限问题；修复后重跑 Setup 的执行探针 |
 
 Setup 成功后的短命 systemd 探针用于检查真实执行能力。不要通过关闭全机防护、替换 init 或绕过隔离来通过检查。
 `doctor` 只读检查，不安装或修复；也不证明 Skills 可用、项目测试通过或全部仓库权限满足。
+检查 JSON 的 `status`、`installation_readiness` 和 `execution_readiness`，不能仅凭退出码 0 判断就绪。
+先执行 `doctor --local`；它不验证登录或读取凭据内容。用户允许认证读取时再执行
+`doctor --online --repo OWNER/REPO`，分别验证所选 Runner/Worker host/PAT/App 来源及仓库读取；
+仍不证明全部交付写权限、模型执行或业务完成，不会回退到宿主身份。
 
 ## 目标仓库接入
 
@@ -78,14 +98,47 @@ Setup 成功后的短命 systemd 探针用于检查真实执行能力。不要�
 
 | 检查项 | 完成条件 |
 | --- | --- |
-| 认证与仓库身份 | `codex login status`、`gh auth status` 有效；Git 提交身份与目标 `OWNER/REPO` 正确，宿主 gh 有目标仓库发布所需的写权限 |
+| 认证与仓库身份 | Codex 登录有效，Git 提交身份与目标 `OWNER/REPO` 正确；分别验证 Runner/Worker 所选 host/PAT/App 来源，程序端须有交付写权限。`gh auth status` 只验证宿主来源，不代表所有配置身份 |
 | Skills | 实际运行 Codex 的用户可发现并读取 `implement`、`code-review`、它们引用的 Skills 及项目要求的其他 Skills。Runner 不附带它们；缺失时按 [Matt Skills](https://github.com/mattpocock/skills) 的当前说明准备，已有同名内容先检查并复用 |
 | 项目环境 | 编译、测试和运行依赖已就绪；从配置好项目 PATH/虚拟环境的终端启动，Runner 的 Python 环境不能替代它 |
 | CI | 已有 PR workflow 时，核对其 base 分支覆盖默认分支和 `agent-run/**`，并检查两类分支的必需检查规则；确认无必需检查也可运行，但不报告为 CI 通过 |
 
+完整 Parent 修复通过以**现存**受管 `agent-run/**/run` 分支为 base 的 Run Repair PR 进入 Run。
+配置必过检查时，目标仓库必须为该 PR 触发真实检查；所选 Runner 身份须能读取要求、结果与 PR，
+发布修复分支和 PR，并通过正常规则合入。Runner 按目标分支读取检查，不要求特定名称、去重 Action 或规则豁免。
+首次创建 Run 分支成功不证明修复 PR 可交付；检查未报告或不可读取进入有界等待，
+配置或权限不足时保全候选和原意图，报告准确缺项，经处理后 `resume`。未配置必过检查保持 `none`，不表述为 CI 通过。
+
 ### GitHub 认证：默认无需配置 App
 
 程序端与 Worker 均可在 `settings show/configure` 独立选择 host、PAT 或 App，无配置时默认 host。两端共享凭据定义，程序端选择统一覆盖读取、克隆、发布及远端 Git，该身份须有交付所需权限。已有 App 配置的迁移见个人运行配置。
+
+Required Checks 读取也使用所选 Runner 身份，须能取得当前 head、required context 的 App 绑定、
+完整 rollup 及服务器 latest/suite/status 证据。缺字段、分页不完整或来源不明保持未知，不能按名称或旧成功记录放行。
+
+### GitHub 读取权限与 403 排查
+
+host、PAT、App 都受支持；身份来源不等于权限完备，PR 创建成功也不证明 Required Checks 可完整读取。
+在已有交付写权限之外，接入时还须核对所选 **Runner** 身份对目标仓库的这些读取能力。
+下表是 GitHub 官方 fine-grained PAT / App 权限名称；host 复用的认证可能采用不同授权模型，
+应核实其实际账号、仓库访问和端点能力，不要仅凭错误文字推断当前身份类型或自动切换来源。
+
+| 用途 | 所需仓库权限 | 官方依据 |
+| --- | --- | --- |
+| 产品读取分支 Required Status Checks 保护配置：`GET /repos/{owner}/{repo}/branches/{branch}/protection/required_status_checks` | `Administration: read`；读取现有规则，不要求管理写权限 | [Get status checks protection](https://docs.github.com/en/rest/branches/branch-protection#get-status-checks-protection) |
+| 读取 Actions workflow 配置（GET），以及接入 CI 时核实读取能力 | `Actions: read` | [Get a workflow](https://docs.github.com/en/rest/actions/workflows#get-a-workflow) |
+
+维护者若另行选择**手动 dispatch** workflow，才需相应的 `Actions: write` 及 workflow 的
+`workflow_dispatch` 配置，见 [Create a workflow dispatch event](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event)。
+这不是普通读取检查的要求，也不要求为运行产品授予 `Administration: write`、修改保护规则或绕过批准。
+
+保护规则 GET 返回 `403 Resource not accessible by integration` 时，当前代码会拒绝放行；
+不能将 403 当成 404 或“没有保护／没有必需检查”。由维护者核对实际 Runner 来源、目标仓库范围、
+该端点所需读取权限及组织／安装授权，保留进度，修复原引用后再显式恢复。
+workflow GET 的 `Forbidden` 也须按实际端点、来源和响应调查；目前观测到的失败原因未确定，
+不能只凭 Forbidden 断言缺少某项权限。不要上传 token、私钥或原始认证日志来排查。
+`agent-run doctor --online --repo OWNER/REPO` 成功仅证明该次认证和仓库读取，
+不证明保护规则、Required Checks 全读取权限、写权限或 Worker 环境均已验证。
 
 选择 host 时，由操作者执行 `gh auth login`，再用 `gh auth status` 核对宿主登录状态。程序端选择 PAT 或 App 时无需额外宿主登录；只给 Worker 选择凭据不会改变程序端来源。
 

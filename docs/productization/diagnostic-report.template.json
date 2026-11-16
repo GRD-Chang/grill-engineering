@@ -1,0 +1,13 @@
+{
+  "format": "agent-run-support-v1",
+  "runner_commit": null,
+  "content_sha256": null,
+  "os_family": "unknown",
+  "architecture": "unknown",
+  "versions": {"python": null, "sqlite": null, "git": null, "gh": null, "codex": null, "bwrap": null},
+  "mode": "unknown",
+  "identity_sources": {"runner": "unknown", "worker": "unknown"},
+  "capabilities": {"installation": "unrun", "user_manager": "unrun", "bwrap": "unrun", "worker": "unrun", "repository_access": "unrun"},
+  "failure_stage": "unknown",
+  "error_code": null
+}

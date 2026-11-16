@@ -7,21 +7,17 @@ TEST_RESULTS ?= .test-results
 REPORT_MAKE = $(MAKE)
 .DEFAULT_GOAL := test
 
-# Groups are starting points; shared changes also need their callers' tests.
-TESTS_policy = tests/test_delivery_policy.py tests/test_review_budget.py
-TESTS_state = tests/test_state_store.py tests/test_scope_revision.py tests/test_error_safety.py
-TESTS_prompts = tests/test_codex_prompt_contract.py tests/test_codex_prompt_refinement.py
-TESTS_locator = tests/test_cli.py tests/test_state_store.py tests/test_run_locator*.py tests/test_test_environment.py -k 'locator or selector or test_pytest_isolates'
-TESTS_github = tests/test_github*.py tests/test_required_checks_observation.py tests/test_external_supervision.py
-TESTS_delivery = tests/test_delivery.py tests/test_cli_delivery.py tests/test_cli_mvp.py tests/test_review_budget.py
-TESTS_run = tests/test_run_*.py tests/test_ticket_*.py
-TESTS_executor = tests/test_cli_run*.py tests/test_run_lifecycle.py tests/test_runner_lease.py tests/test_systemd_executor_host.py
+# One current inventory; shared changes also need their callers' tests.
+TEST_SCOPE = $(PYTHON) .github/ci/test_scope.py
+test_scope = $(shell $(TEST_SCOPE) $(1) || echo .invalid-test-selection)
 
-.PHONY: test test-full test-report test-bootstrap test-prepare test-policy test-state test-prompts test-locator test-github test-delivery test-run test-executor typecheck
+.PHONY: test test-full test-report test-bootstrap test-prepare test-native-capabilities test-native-contracts test-policy test-state test-prompts test-locator test-github test-delivery test-run test-executor typecheck
 
 # Shared dependency preparation for local validation and CI.
 test-bootstrap:
 	$(PYTHON) -m pip install --only-binary=:all: --require-hashes -r tests/dev-requirements.txt
+	# setuptools reuses build/lib, including modules removed from src.
+	rm -rf -- build
 	$(PYTHON) -m pip install --no-build-isolation --no-deps .
 	$(MAKE) test-prepare
 
@@ -32,10 +28,14 @@ test-prepare:
 # Local feedback; run the changed module's tests as well.
 test:
 	@echo "本地快速回归：Policy / State / Prompts / Locator；完整套件请运行 make test-full"
-	$(MAKE) test-policy
-	$(MAKE) test-state
-	$(MAKE) test-prompts
-	$(MAKE) test-locator
+	$(PYTHON) -m pytest $(call test_scope,fast) $(PYTEST_ARGS)
+
+# Missing native evidence is a failing precondition, never a pytest skip.
+test-native-capabilities:
+	$(PYTHON) tests/support/report_environment.py --require-native
+
+test-native-contracts: test-native-capabilities
+	$(PYTHON) -m pytest $(call test_scope,native-contract) $(PYTEST_ARGS)
 
 # Complete suite for CI and final validation, with a fixed process limit.
 test-full:
@@ -59,7 +59,7 @@ test-report:
 	@/usr/bin/time -v -o "$(TEST_RESULTS)/resources.txt" $(REPORT_MAKE) test-full PYTEST_ARGS="$(PYTEST_ARGS) --durations=50 --durations-min=0 --junitxml='$(TEST_RESULTS)/junit.xml'" 2>&1 | tee "$(TEST_RESULTS)/pytest.log"
 
 test-policy test-state test-prompts test-locator test-github test-delivery test-run test-executor: test-%:
-	$(PYTHON) -m pytest $(TESTS_$*) $(PYTEST_ARGS)
+	$(PYTHON) -m pytest $(call test_scope,$*) $(PYTEST_ARGS)
 
 typecheck:
 	$(PYTHON) -m mypy src/agent_run

@@ -20,14 +20,15 @@ dev = [
 ]
 
 [project.scripts]
-agent-run = "agent_run.cli:main"
+agent-run = "agent_run.cli.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["agent_run", "agent_run.*"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
-pythonpath = ["src"]
+pythonpath = ["tests"]
 testpaths = ["tests"]
 tmp_path_retention_policy = "failed"
 tmp_path_retention_count = 1

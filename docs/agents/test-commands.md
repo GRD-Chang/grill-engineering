@@ -8,24 +8,30 @@
 pytest 不自动联网补包，缺少或损坏时明确失败并提示准备命令。wheel 默认缓存在 `.test-wheels/`，
 不提交 Git；更新构建依赖时同步 pins/hash 并重新准备，可清理旧缓存。
 自定义目录用 `make test-prepare TEST_WHEELHOUSE=/专用目录`，全量使用同一 `TEST_WHEELHOUSE`；
-直接运行 pytest 时通过 `AGENT_RUN_TEST_WHEELHOUSE` 指定该目录。准备耗时单列，不计入本地全量五分钟预算。
+直接运行 pytest 时通过 `AGENT_RUN_TEST_WHEELHOUSE` 指定该目录。准备耗时单列，不计入本地全量 600 秒上限（争取 300 秒），计入 CI 整条流程 1200 秒上限。
 
 下列入口是相关测试的起点；
 不能仅凭改动文件名判断已经覆盖所有影响。单个用例仍可直接运行
 `python -m pytest tests/文件.py::用例名 -q`。
 
-`make test` 默认依次运行下表前四组快速回归；交付、Run、Executor、安装器等重型测试需显式选择模块或运行 `make test-full`。
-快速回归通过仅代表这四组通过；修改重型模块时仍需运行相关用例，不能仅凭默认入口判定修改正确。
+`make test` 在一次 pytest 中运行 Policy、State、Locator 与轻量 Prompt 合同，重复目标只选择一次。
+Prompt 快速合同使用真实配置/渲染器与静态目录预览；实际角色分配、完整 Final 前置和
+修复范围仍由 `make test-prompts` 与 full 完整运行，不因快速入口缩小而删除。
+当前模块及 Locator 精确用例统一列在 `.github/ci/test_scope.py`；不再靠旧模块名或关键词筛选。
+CI 工具回归将该清单和 consumed CLI 合同与真实完整 collection 对照，缺失消费者明确失败。
+各组独立入口和 `make test-report` 继续可用。
+交付、Run、Executor、安装器等重型测试需显式选择模块或运行 `make test-full`。
+快速回归通过仅代表上述子集通过；修改重型模块时仍需运行相关用例，不能仅凭默认入口判定修改正确。
 
 | 入口 | 验证范围 | 需要补充的直接影响 |
 | --- | --- | --- |
-| `make test-policy` | Delivery Policy、Review Budget | 策略改变时补 Ticket / Parent-only / Run Repair 的实际调用路径 |
-| `make test-state` | StateStore、Scope Revision | 状态结构或持久化语义改变时补 Controller、恢复及相关生命周期 |
-| `make test-prompts` | 最终模型可见的 Worker Prompt 合同 | 请求结构、执行方式改变时补 Codex backend 和实际调用方 |
-| `make test-locator` | Locator、Human Run Selector 与其持久化回归 | 登记时机改变时补 Controller；修改共享选择逻辑时补相关 CLI 动作 |
+| `make test-policy` | 当前 Policy 值、稀疏覆盖与冻结更新 | 策略改变时补 Ticket / Parent-only / Final 的实际预算消费路径 |
+| `make test-state` | 当前 SQLite preflight、Task 准入、错误脱敏 | 状态结构或持久化语义改变时补 Core、恢复及相关生命周期 |
+| `make test-prompts` | 当前角色上下文与冻结 Prompt 的公开预览 | 请求结构、执行方式改变时补真实 Codex backend 和实际调用方 |
+| `make test-locator` | 当前 Repository / Parent / Run 与准确 state 目录选择 | 登记时机改变时补 Task publication；修改共享选择逻辑时补相关 CLI 动作 |
 | `make test-github` | GitHub adapter、Required Checks、外部监督 | 外部契约改变时补 Delivery / Publication 调用方 |
-| `make test-delivery` | Ticket、Parent-only、公开交付流程 | 共享 Engine 变化时补 Run Repair 和恢复路径 |
-| `make test-run` | Run 生命周期、Acceptance、Repair、Publication、任务控制 | Controller / StateStore / CLI 等直接调用方 |
+| `make test-delivery` | Ticket、Parent-only、公开交付流程 | 共享 Core / WriteAuthority 变化时补 Run Repair 和恢复路径 |
+| `make test-run` | Run 生命周期、Acceptance、Repair、Publication、任务控制 | Core / RepositoryRoute / CLI 等直接调用方 |
 | `make test-executor` | CLI 监督、Run Executor、lease、systemd | 进程执行边界变化时补 Codex backend、安装及恢复 |
 
 前四项适合相应模块的局部反馈；后四项覆盖较广，允许超过一分钟。
@@ -36,10 +42,17 @@ CLI、安装器等未单列的模块直接选择其测试文件。公共接口�
 
 提交前优先使用 CI 相同的 CPython 3.11.16 与锁定开发依赖；通过环境报告比较 Git、系统能力及依赖版本。Python 版本号本身不能证明构建支持 memfd/pidfd，部分便携构建缺少这些接口。先激活所选 venv，并确认 `python` 与 `python3` 都来自该环境；仅指定 Make 的 `PYTHON` 不会改变所有外部工具的解释器选择。Git 测试只使用公开支持的命令构造状态，例如通过本地 fetch 生成 `FETCH_HEAD`，不直接将伪引用交给 `update-ref`。不同版本本地通过不代表 CI 已通过，不应固定旧版 Git 来规避兼容性缺陷。
 六 worker 用于重叠 Git、文件和子进程等待，同时会增加 CPU 与内存占用。资源较少或主机繁忙时用 `make test-full TEST_WORKERS=2`。
-CI 使用两个独立的产品测试分片，每台 runner 仍固定两个 worker；不提高单机并发或测试超时。每个 worker 完整收集用例后，按排序后的 nodeid 轮流分配至分片，两个分片互斥且并集为完整套件。参数错误、重复 nodeid 或空分片明确失败。默认本地入口不分片。
+CI 使用一个完整产品测试作业，总计两个 worker；环境安装、CI 规则、安装冒烟和类型检查串行复用同一环境。正常流程不分片、不预跑再排除边界用例。
 本地默认等价命令为 `python -m pytest -q -n 6 --dist worksteal`；直接运行 `pytest` 仍收集完整套件，没有隐含的慢测试过滤。
 `make test-full` 未收到显式 `TMPDIR` 时，在标准且可写的 `/run/user/<uid>` tmpfs 中放置测试临时文件；其他环境沿用 `/tmp`。
 该路径对受控 Worker 子进程可见，避免 `/dev/shm` 在 bubblewrap 的 `/dev` 挂载下不可见；需要对照磁盘临时目录时可显式设置 `TMPDIR=/tmp`。
+GitHub App HTTP 状态回归中的合成私钥也复用 `TMPDIR`；未设置时使用 Python 正常系统临时目录。
+该目录必须已存在、可写且通过产品原有的 Git 仓库外检查；显式配置无效时明确报测试环境前置错误，
+不跳过、不回退或搜索其他位置，也不删除工具提供的 `.git` 标记。普通 CI 可使用已提供且经检查的
+`TMPDIR="$RUNNER_TEMP" python -m pytest tests/test_kernel_live_transport_contracts.py::test_github_app_token_mint_extracts_only_the_http_status`。
+仅在该受控目录满足原保护时运行；没有安全临时根的环境记为 blocked，不调整产品安全设置。
+每次仅创建、验证并清理测试合成文件，不使用真实私钥或发起网络请求。
+
 调试顺序问题用 `make test-full TEST_WORKERS=0`；临时追加过滤或诊断参数，例如
 `make test-policy PYTEST_ARGS='-q --durations=10'`。不要把带 `-k`、`--lf` 等过滤的结果记为全量通过。
 
@@ -51,16 +64,37 @@ Git 初始模板每个 worker 只创建一次，每个用例复制独立文件�
 
 ## CI 对齐与诊断
 
-CI 每个分片的 `Run tests` 使用 `make test-report TEST_WORKERS=2 PYTEST_ARGS='-v --test-shard-count=2 --test-shard-index=0'`（另一分片为 index 1）。
-两个分片全部成功后，必需的 `quality` 检查才允许继续后续检查；任何失败、取消或意外跳过都会使汇总失败。分片各自上传独立诊断，仍保留全部集成测试；单个分片的通过不代表全量通过。
+公开与私有 CI 都使用一个 `product-tests` 作业执行 `make test-report TEST_WORKERS=2 PYTEST_ARGS='-v'`。
+私有根 workflow 另应用冻结 manifest 的既有禁跑函数族；这不是性能优化新增的排除项。
+所有被选中的外围检查在同一作业内串行运行，总测试并发不超过两个 worker。
+`quality` 只核验选择、作业结果和完整证据，不重新安装或执行测试。
+
+产品测试通过后，`.github/ci/ci_evidence.py record` 根据实际 collection 核对完整 JUnit，
+绑定仓库、提交/tree、workflow run/attempt、依赖、原始环境与能力报告。
+完整证据要求正式入口、两个 worker、worksteal，以及全部用例成功；
+缺失、重复、过滤、skip、诊断入口、环境或身份不符均失败。
+证据不能跨候选或 workflow run 复用，不能从收到的附件推断预期覆盖范围。
+
+锁定的 pytest 9 将成功 subtest 计入 suite 的 `tests`，并复用父 `testcase`。
+`support.reporting` 在 JUnit controller 从真实报告统计成功 subtests，写入版本化属性
+`agent-run-pytest-passed-subtests-v1`；解析器要求 `tests = testcase + 显式成功 subtest 数`。
+没有属性的普通报告仍要求两者相等，未知差额不能当作成功。父 nodeid 继续决定完整覆盖，
+成功 subtest 不能补足缺失的父测试；失败、错误、跳过、缺失或重复结果仍拒绝。
+旧 subtest 报告需要重新运行生成属性，不手工补写计数。
+
+CI 规则的定向回归为 `PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s .github/ci -p 'test_*.py' -q`。
+该回归使用六个微型真实 pytest 父测试，覆盖串行和 xdist、参数地址、fixture/unittest
+subtests，另验证实际失败、跳过和 teardown error 报告，以及缺失、重复和非完整结果拒绝。
+pytest 升级时须复验这些实际报告的兼容性。
 本地六 worker 的对应诊断入口是 `make test-report`。已安装 CLI 的 `agent-run --help` 和
 `make typecheck` 仍需单独检查。快速回归与全量的验证范围不同，不能用 `make test` 通过推断 CI 必须通过。
 
 报告包含 Python、SQLite 等环境版本与系统能力、JUnit、最慢用例各阶段耗时、测试输出和 GNU time 资源记录。
 CI 使用 `PYTEST_ARGS='-v'`，逐例记录 nodeid 与结果；即使 job 到时取消、JUnit 和
 资源汇总尚未生成，已有失败也能在上传的测试日志中定位。
-`quality` 的 `Run tests` 是分片状态汇总；排查实际 pytest 失败或取消时，读取同一 run 的
-`product-tests` 作业日志和 `test-diagnostics-shard-0` / `test-diagnostics-shard-1` 附件。
+`quality` 的 `Run tests` 是作业结果和完整覆盖证据汇总；排查实际 pytest 失败或取消时，读取同一 run 的
+`product-tests` 作业日志和 `test-diagnostics` 附件。
+安装冒烟或类型检查失败时，读取 `product-tests` 中对应步骤。测试资源报告只包含 `make test-full`；前置检查、依赖准备与完整 CI 关键路径需另按作业和步骤计量，不能用测试资源报告代表完整 CI 成本。
 默认写入 `.test-results/`，下一次覆盖；需要比较时用独立的 `TEST_RESULTS`。CI 无论成功或失败均上传报告，
 保留七天。JUnit 的用例时间包含 setup/call/teardown；并行用例时间求和不等于墙钟，GNU time 最大 RSS
 也不等于并行进程树内存之和。诊断后清理本次本地报告。

@@ -1,0 +1,130 @@
+{
+  "schema": "kernel-neutral-ticket/1",
+  "id": "normal-final-same-input-v1",
+  "repository": "example/project",
+  "default_branch": "main",
+  "git": {
+    "author_name": "Agent Run Tests",
+    "author_email": "agent-run-tests@example.invalid",
+    "date": "2001-01-01T00:00:00+00:00",
+    "initial_message": "initial",
+    "initial_files": {
+      "README.md": "# fixture\n",
+      "pyproject.toml": "[tool.agent-run.required-checks]\ncode-failure-steps = [\n  \"fixture-ci::fixture-required-check::Run tests\",\n  \"CI::quality::Run tests\",\n]\n"
+    }
+  },
+  "parent": {
+    "number": 1,
+    "title": "Parent spec",
+    "body": "Deliver the ticket set.",
+    "sub_issues": [
+      3
+    ],
+    "sub_issue_order_reliable": true
+  },
+  "ticket": {
+    "number": 3,
+    "title": "Ticket 3",
+    "body": "Deliver ticket 3.",
+    "state": "CLOSED",
+    "labels": [],
+    "blocked_by": []
+  },
+  "policy": {
+    "ticket_review_rounds": 3,
+    "ticket_development_workers": 1,
+    "integration_resync_limit": 3,
+    "ticket_integration_development_limit": 3,
+    "ticket_ci_development_limit": 3,
+    "ticket_ci_review": false,
+    "parent_ci_development_limit": 3,
+    "parent_only_paired_rounds": 10,
+    "run_repair_rounds": 3,
+    "development_thread_policy": "reuse",
+    "invocation_deadlines": {
+      "development": 18000,
+      "review": 7200,
+      "publication": 3600
+    }
+  },
+  "agents": {
+    "development": [],
+    "review": [
+      {
+        "checks": {
+          "e2e": {
+            "status": "pass",
+            "evidence": "操作或命令：执行完整 Run 验收流程；退出码：0；结果：完整 Run 通过。",
+            "findings": []
+          },
+          "standards": {
+            "status": "pass",
+            "evidence": "审查范围或基线：仓库编码规范与完整 Run diff；结论：未发现违反项。",
+            "findings": []
+          },
+          "spec": {
+            "status": "pass",
+            "evidence": "已核对的验收标准：Parent Issue 的全部验收标准；覆盖结论：完整 Run 已覆盖。",
+            "findings": []
+          }
+        }
+      }
+    ],
+    "publication": [
+      {
+        "result_kind": "publication",
+        "commit_message": "feat(run): publish the completed delivery",
+        "pr_title": "feat(run): publish the completed delivery",
+        "pr_body_markdown": "## What Problem This Solves\n\nThe accepted Run needs a human merge boundary.\n\n## Why This Change Was Made\n\nIt makes the completed delivery reviewable.\n\n## User Impact\n\nMaintainers can inspect and approve one final PR.\n\n## Evidence\n\nFresh Run Acceptance passed.",
+        "human_blockers": null
+      }
+    ]
+  },
+  "external": {
+    "required_checks": [
+      "pass"
+    ],
+    "linked_branch_display_outcomes": "linked"
+  },
+  "cut": "completed after Final whole-Run Review, Final Publication, explicit approval, normal merge, Parent close and cleanup; completed Ticket is historical input",
+  "delivery_kind": "full_parent",
+  "completed_ticket_precondition": {
+    "source": "native Ticket producer with full published PR squash narrative",
+    "ticket_number": 3,
+    "commit_message": "feat(ticket): accepted historical fixture\n\nParent Issue: #1\nPrimary Ticket: #3\nDelivery Type: Ticket\n\nAccepted historical Ticket with recorded review, checks and exact Git evidence.",
+    "commit_parents": [
+      "initial"
+    ],
+    "tree_files": {
+      "README.md": "# fixture\n",
+      "pyproject.toml": "[tool.agent-run.required-checks]\ncode-failure-steps = [\n  \"fixture-ci::fixture-required-check::Run tests\",\n  \"CI::quality::Run tests\",\n]\n"
+    },
+    "authority": "accepted Review with exact base/candidate/tree and required checks pass",
+    "review_artifact": {
+      "checks": {
+        "e2e": {
+          "status": "pass",
+          "evidence": "操作或命令：执行完整 Run 验收流程；退出码：0；结果：完整 Run 通过。",
+          "findings": []
+        },
+        "standards": {
+          "status": "pass",
+          "evidence": "审查范围或基线：仓库编码规范与完整 Run diff；结论：未发现违反项。",
+          "findings": []
+        },
+        "spec": {
+          "status": "pass",
+          "evidence": "已核对的验收标准：Parent Issue 的全部验收标准；覆盖结论：完整 Run 已覆盖。",
+          "findings": []
+        }
+      }
+    },
+    "historical_budget": {
+      "development_attempts": 1,
+      "reviewer_invocations": 1,
+      "window": 1
+    },
+    "reported_ticket_pr_number": null,
+    "agent_calls_for_prefix": 0
+  }
+}

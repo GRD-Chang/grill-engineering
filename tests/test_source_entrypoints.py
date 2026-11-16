@@ -15,7 +15,7 @@ def test_raw_source_management_and_probes_without_installed_package(tmp_path: Pa
     source.mkdir()
     for name in ("install.sh", "setup.sh"):
         shutil.copy2(project / name, source / name)
-    shutil.copytree(project / "src/agent_run", source / "src/agent_run",
+    shutil.copytree(project / "src", source / "src",
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     interpreter = tmp_path / "python"
     venv.EnvBuilder(with_pip=False).create(interpreter)
@@ -28,7 +28,7 @@ def test_raw_source_management_and_probes_without_installed_package(tmp_path: Pa
     environment = {key: value for key, value in os.environ.items()
                    if key not in ("PYTHONPATH", "PYTHONHOME")}
     environment["PATH"] = str(tools) + os.pathsep + os.defpath
-    absent = subprocess.run([str(python), "-I", "-c", "import agent_run"],
+    absent = subprocess.run([str(python), "-I", "-c", 'import agent_run as agent_run'],
                             env=environment, capture_output=True, text=True, timeout=10)
     assert absent.returncode != 0
     commands = [
@@ -36,8 +36,8 @@ def test_raw_source_management_and_probes_without_installed_package(tmp_path: Pa
         (["sh", str(source / "install.sh"), "--rollback"], 1, "agent-run install:"),
         (["sh", str(source / "install.sh"), "--uninstall"], 0, "uninstalled"),
         (["sh", str(source / "setup.sh"), "--help"], 0, "--yes"),
-        ([str(python), "-I", str(source / "src/agent_run/runner_probe.py"), "--help"], 0, "usage:"),
-        ([str(python), "-I", str(source / "src/agent_run/runner_setup.py"),
+        ([str(python), "-I", str(source / 'src/agent_run/install/probe.py'), "--help"], 0, "usage:"),
+        ([str(python), "-I", str(source / 'src/agent_run/install/setup.py'),
           str(python), "-c", "print('raw probe ready')"], 0, "raw probe ready"),
     ]
     for command, code, expected in commands:

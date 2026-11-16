@@ -1,0 +1,570 @@
+"""Remote effects through real bare Git and an isolated stateful gh executable."""
+
+from support.repository_fixture import create_kernel
+from support.core_operations import prepare_scripted_agent
+
+from agent_run.contracts.write_authority import WriteAuthority
+from agent_run.core.operation_runner import OperationRunner
+from dataclasses import replace
+import json
+import os
+import shutil
+import sys
+
+import pytest
+
+from agent_run.errors import GitHubReadError
+from agent_run.adapters.git_objects import LocalGit
+from agent_run.errors import KernelError
+from agent_run.adapters.remote import RemoteEffects
+from agent_run.core.operation_contract import ReadUnavailable
+from support.effect_boundary import EffectBoundary, effect_boundary
+from support.github_retries import immediate_read_retries
+from support.remote_effects import _change, _fixture, _pr_effect, _publish_pr, _source_kernel, existing_pr
+
+
+def test_publish_uses_exact_remote_lease_and_does_not_repeat_a_lost_response(tmp_path, monkeypatch):
+    port, git, effect, _state, _calls = _fixture(tmp_path, monkeypatch)
+    real_git = shutil.which("git")
+    pushes = tmp_path / "pushes.jsonl"
+    wrapper = tmp_path / "bin" / "git"
+    wrapper.write_text("#!" + sys.executable + "\n" +
+        "import json,subprocess,sys\n" +
+        "result=subprocess.run([" + repr(real_git) + ",*sys.argv[1:]])\n" +
+        "if sys.argv[1]=='push':\n" +
+        " with open(" + repr(str(pushes)) + ", 'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\n" +
+        " raise SystemExit(1 if result.returncode==0 else result.returncode)\n" +
+        "raise SystemExit(result.returncode)\n")
+    wrapper.chmod(0o755)
+    authorized = []
+    result = port.execute(effect, WriteAuthority(lambda: lambda: authorized.append(effect.effect_id)))
+    assert result.disposition == "target" and result.commit == effect.candidate
+    assert authorized == ["push-1"] and result.raw["write_returncode"] == 1
+    assert len(pushes.read_text().splitlines()) == 1
+    assert git.run("ls-remote", "--refs", "origin", effect.source_ref).stdout.split()[0] == effect.after_sha
+    again = port.execute(effect, WriteAuthority(lambda: lambda: pytest.fail("target readback must not authorize another write")))
+    assert again == port.reconcile(effect) and again.disposition == "target"
+
+
+def test_publish_never_adopts_an_external_remote_head_or_bypasses_current_guard(tmp_path, monkeypatch):
+    port, git, effect, _state, _calls = _fixture(tmp_path, monkeypatch)
+    git.run("push", "origin", effect.before_sha + ":" + effect.source_ref)
+    def stopped():
+        raise KernelError("executor_fenced")
+    with pytest.raises(KernelError, match="executor_fenced"):
+        port.execute(effect, WriteAuthority(lambda: stopped))
+    assert port.reconcile(effect).disposition == "prior"
+    foreign = git.make_commit(effect.base.tree, (effect.before_sha,), "foreign remote actor")
+    git.run("push", "origin", foreign.sha + ":" + effect.source_ref)
+    assert port.execute(effect, WriteAuthority(lambda: lambda: pytest.fail("third value must not be overwritten"))).disposition == "third"
+    assert git.run("ls-remote", "--refs", "origin", effect.source_ref).stdout.split()[0] == foreign.sha
+
+
+def test_pr_ack_loss_and_narrative_update_reconcile_exact_original_identity(tmp_path, monkeypatch):
+    port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
+    assert port.execute(push, WriteAuthority(lambda: lambda: None)).disposition == "target"
+    pr = _pr_effect(push)
+    _change(state, lose_operation="pr")
+    result = port.execute(pr, WriteAuthority(lambda: lambda: None))
+    assert result.disposition == "target" and result.pr.title == "Original title"
+    assert result.pr.body == "Original narrative\r\n中文" and result.pr.head_repository == "example/project"
+    assert result.raw["write_returncode"] == 1
+    assert port.execute(pr, WriteAuthority(lambda: lambda: pytest.fail("must only read original PR"))).disposition == "target"
+    update = replace(pr, effect_id="edit-1", pr_number=17,
+        payload={"title": "Updated title", "body": "Updated body", "prior": {"title": result.pr.title, "body": result.pr.body}})
+    assert port.execute(update, WriteAuthority(lambda: lambda: None)).pr.body == "Updated body"
+    actual = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert sum("POST" in c and c[1].endswith("/pulls") for c in actual) == 1
+    assert sum("PATCH" in c for c in actual) == 1
+
+
+def test_written_pr_target_settles_after_base_append_without_another_write(tmp_path, monkeypatch):
+    port, git, push, state, calls = _fixture(tmp_path, monkeypatch)
+    _change(state, lose_operation="pr")
+    effect, original = _publish_pr(port, push)
+    later = git.make_commit(push.base.tree, (push.base.sha,), "independent base append")
+    git.run("push", "origin", later.sha + ":" + push.target_ref)
+    document = json.loads(state.read_text())
+    document["prs"][0]["base"]["sha"] = later.sha
+    state.write_text(json.dumps(document))
+    readback = port.execute(effect, WriteAuthority(lambda: lambda: pytest.fail("written original target needs no new write authority")))
+    assert readback.disposition == "target" and readback.pr.number == original.number
+    assert readback.pr.base.sha == later.sha and readback.pr.head == original.head
+    update = replace(effect, effect_id="new-narrative", pr_number=original.number,
+        payload={"title": "Next title", "body": "Next narrative", "prior": {"title": original.title, "body": original.body}})
+    assert port.execute(update, WriteAuthority(lambda: lambda: pytest.fail("new write still needs original base"))).disposition == "third"
+    actual = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert sum("--method" in c for c in actual) == 1
+
+
+@pytest.mark.parametrize("lost_response", [True, False], ids=["failed-command", "successful-command"])
+def test_lost_write_response_and_failed_readback_retain_both_observed_outcomes(tmp_path, monkeypatch, lost_response, immediate_read_retries):
+    port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
+    assert port.execute(push, WriteAuthority(lambda: lambda: None)).disposition == "target"
+    pr = _pr_effect(push)
+    _change(state, lose_operation="pr" if lost_response else None, read_error_after_write=True)
+    with pytest.raises(ReadUnavailable) as failed:
+        port.execute(pr, WriteAuthority(lambda: lambda: None))
+    assert failed.value.code == "remote_read_failed"
+    assert failed.value.write_returncode == (1 if lost_response else None)
+    if lost_response:
+        assert "response lost after actual mutation" in failed.value.write_diagnostic
+    else:
+        assert failed.value.write_diagnostic == ""
+    _change(state, read_error=False)
+    assert port.reconcile(pr).disposition == "target"
+    assert port.execute(pr, WriteAuthority(lambda: lambda: pytest.fail("original PR write must not repeat"))).disposition == "target"
+    actual = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert sum("--method" in call for call in actual) == 1
+
+
+@pytest.mark.parametrize("field", ["actor", "head_repository", "title", "closed"])
+def test_pr_foreign_original_facts_cannot_be_overwritten_or_replaced(tmp_path, monkeypatch, field):
+    port, _git, push, state, _calls, _pr = existing_pr(tmp_path, monkeypatch)
+    effect = _pr_effect(push)
+    document = json.loads(state.read_text())
+    pr = document["prs"][0]
+    if field == "actor": pr["user"]["login"] = "external-author"
+    elif field == "head_repository": pr["head"]["repo"]["full_name"] = "external/fork"
+    elif field == "title": pr["title"] = "Unrelated external narrative"
+    else: pr["state"] = "closed"
+    state.write_text(json.dumps(document))
+    assert port.execute(effect, WriteAuthority(lambda: lambda: pytest.fail("foreign PR must not be edited"))).disposition == "third"
+    assert len(json.loads(state.read_text())["prs"]) == 1
+
+
+@pytest.mark.parametrize("method", ["squash", "merge"])
+def test_original_merge_ack_loss_settles_after_later_target_append(tmp_path, monkeypatch, method):
+    port, git, push, state, calls, pr = existing_pr(tmp_path, monkeypatch)
+    parents = [push.base.sha] + ([] if method == "squash" else [push.after_sha])
+    merge = replace(push, effect_id="merge-1", operation="merge", pr_number=pr.number,
+        payload={"method": method, "parents": parents,
+                 "commit_message": pr.title + "\n\n" + pr.body if method == "squash" else "Reviewed merge\n\nOriginal body"})
+    _change(state, lose_operation="merge")
+    result = port.execute(merge, WriteAuthority(lambda: lambda: None))
+    assert result.disposition == "target" and result.raw["write_returncode"] == 1
+    assert result.commit.tree == push.candidate.tree
+    assert result.raw["parents"] == parents and result.pr.merged == result.commit
+    assert result.raw["commit_message"] == merge.payload["commit_message"] + "\n"
+    document = json.loads(state.read_text())
+    for field in ("merged_by", "user"):
+        original = document["prs"][0][field]
+        document["prs"][0][field] = None
+        state.write_text(json.dumps(document))
+        assert port.execute(merge, WriteAuthority(lambda: lambda: pytest.fail("unobservable actor cannot authorize a write"))).disposition == "unknown"
+        document["prs"][0][field] = original
+    state.write_text(json.dumps(document))
+    git.run("fetch", "origin", result.commit.sha)
+    later = git.make_commit(result.commit.tree, (result.commit.sha,), "later independent append")
+    git.run("push", "origin", later.sha + ":" + push.target_ref)
+    document = json.loads(state.read_text())
+    document["prs"][0]["base"]["sha"] = later.sha
+    state.write_text(json.dumps(document))
+    resumed = port.execute(merge, WriteAuthority(lambda: lambda: pytest.fail("unknown merge must not merge twice")))
+    assert resumed.disposition == "target" and resumed.commit == result.commit
+    assert resumed.raw["target_head"] == later.sha and resumed.raw["live_pr_base"] == later.sha
+    assert resumed.pr.base.sha == parents[0] == push.base.sha
+    assert resumed.raw["commit_message"] == result.raw["commit_message"]
+    actual = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert sum(c[1].endswith("/merge") and "PUT" in c for c in actual) == 1
+
+
+@pytest.mark.parametrize("changed", ["pr-title", "pr-body", "original-intent"])
+def test_squash_never_rebinds_an_original_intent_to_other_pr_text(tmp_path, monkeypatch, changed):
+    port, _git, push, state, calls, pr = existing_pr(tmp_path, monkeypatch)
+    original_message = pr.title + "\n\n" + pr.body
+    merge = replace(push, effect_id="original-squash", operation="merge", pr_number=pr.number,
+        payload={"method": "squash", "parents": [push.base.sha], "commit_message": original_message})
+    if changed == "original-intent":
+        # An older frozen intent must not silently adopt the current PR text.
+        merge = replace(merge, payload={**merge.payload, "commit_message": "fix: former local patch"})
+    else:
+        document = json.loads(state.read_text())
+        document["prs"][0]["title" if changed == "pr-title" else "body"] = "External replacement narrative"
+        state.write_text(json.dumps(document))
+    before = dict(merge.payload)
+    result = port.execute(merge, WriteAuthority(lambda: lambda: pytest.fail("other text cannot authorize a squash")))
+    assert result.disposition == "third" and merge.payload == before
+    actual = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert not any(c[1].endswith("/merge") and "PUT" in c for c in actual)
+    assert port.git.run("ls-remote", "origin", push.target_ref).stdout.split()[0] == push.base.sha
+
+
+def test_remote_cas_still_preserves_third_head_appearing_at_dispatch(tmp_path, monkeypatch):
+    port, git, effect, _state, _calls = _fixture(tmp_path, monkeypatch)
+    foreign = git.make_commit(effect.base.tree, (effect.before_sha,), "concurrent remote writer")
+    def race():
+        git.run("push", "origin", foreign.sha + ":" + effect.source_ref)
+        return lambda: None
+    result = port.execute(effect, WriteAuthority(race))
+    assert result.disposition == "third" and result.raw["write_returncode"] != 0
+    assert result.raw["remote_head"] == foreign.sha
+
+
+def test_close_uses_original_comment_watermark_and_rejects_reopened_or_foreign_issue(tmp_path, monkeypatch):
+    port, _git, effect, state, calls = _fixture(tmp_path, monkeypatch)
+    comment = replace(effect, effect_id="comment-1", operation="completion_comment", after_sha=None, pr_number=17,
+        payload={"issue": 2, "merge_sha": effect.after_sha, "gate_mode": "reviewed", "kind": "ticket"})
+    _change(state, lose_operation="comment")
+    result = port.execute(comment, WriteAuthority(lambda: lambda: None))
+    assert result.disposition == "target" and result.raw["write_returncode"] == 1
+    assert result.raw["close_intent"]["baseline_event_id"] == 0
+    assert "PR #17; Run Branch commit" in result.raw["close_intent"]["comment_body"]
+    assert "not yet entered the default branch" in result.raw["close_intent"]["comment_body"]
+    close = replace(comment, effect_id="close-1", operation="close",
+        payload={"issue": 2, "merge_sha": effect.after_sha, "kind": "ticket", "close_intent": result.raw["close_intent"]})
+    _change(state, lose_operation="close")
+    result = port.execute(close, WriteAuthority(lambda: lambda: None))
+    assert result.disposition == "target" and result.raw["event"]["id"] == 1
+    assert port.execute(close, WriteAuthority(lambda: lambda: pytest.fail("observed original close is read-only"))).disposition == "target"
+    document = json.loads(state.read_text())
+    document["events"][0]["actor"] = None
+    state.write_text(json.dumps(document))
+    assert port.execute(close, WriteAuthority(lambda: lambda: pytest.fail("unknown transition actor cannot write"))).disposition == "unknown"
+    document["events"][0]["actor"] = {"login": "publisher"}
+    document["comments"][0]["user"] = None
+    state.write_text(json.dumps(document))
+    assert port.execute(close, WriteAuthority(lambda: lambda: pytest.fail("unknown comment author cannot write"))).disposition == "unknown"
+    assert port.execute(comment, WriteAuthority(lambda: lambda: pytest.fail("unknown comment author cannot be replaced"))).disposition == "unknown"
+    document["comments"][0]["user"] = {"login": "publisher"}
+    document["events"].append({"id": 2, "event": "reopened", "actor": {"login": "external"}, "created_at": "2026-10-21T10:02:00Z"})
+    document["issue_state"] = "open"
+    state.write_text(json.dumps(document))
+    assert port.execute(close, WriteAuthority(lambda: lambda: pytest.fail("do not reclose external reopen"))).disposition == "third"
+    actual = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert sum("POST" in c for c in actual) == 1 and sum("PATCH" in c for c in actual) == 1
+
+
+def test_comment_collections_keep_distinct_issue_pr_and_foreign_identity(tmp_path, monkeypatch):
+    import subprocess
+    port, _git, push, state, _calls, pr = existing_pr(tmp_path, monkeypatch)
+    assert pr.number == 17 and push.subject == "ticket:2"
+    completion = replace(push, effect_id="completion-routing", operation="completion_comment", after_sha=None,
+        pr_number=pr.number, payload={"issue": 2, "merge_sha": push.after_sha, "gate_mode": "reviewed", "kind": "ticket"})
+    result = port.execute(completion, WriteAuthority(lambda: lambda: None))
+    assert result.disposition == "target"
+    document = json.loads(state.read_text())
+    completion_id = document["comments"][0]["id"]
+    foreign = {"id": 90, "body": "<!-- agent-run-status:foreign -->", "user": {"login": "foreign"},
+               "issue_url": "https://api.github.com/repos/example/project/issues/17"}
+    document["comments"].append(foreign)
+    state.write_text(json.dumps(document))
+    def read(repository, number):
+        return subprocess.run(["gh", "api", f"repos/{repository}/issues/{number}/comments?per_page=100",
+                               "--paginate", "--slurp"], text=True, capture_output=True, timeout=5, check=False)
+    issue = read("example/project", 2)
+    pull_request = read("example/project", 17)
+    assert issue.returncode == pull_request.returncode == 0
+    assert [[row["id"] for row in page] for page in json.loads(issue.stdout)] == [[completion_id]]
+    assert json.loads(pull_request.stdout) == [[foreign]]  # Server never sanitizes foreign facts into an empty page.
+    for repository, number in (("example/project", 999), ("foreign/project", 2)):
+        response = read(repository, number)
+        assert response.returncode != 0 and response.stdout == ""
+    payload = tmp_path / "invalid-status.json"
+    payload.write_text(json.dumps({"body": "<!-- agent-run-status:not-a-pr -->"}))
+    rejected = subprocess.run(["gh", "api", "repos/example/project/issues/2/comments", "--method", "POST",
+                               "--input", str(payload)], text=True, capture_output=True, timeout=5, check=False)
+    assert rejected.returncode != 0
+    assert json.loads(state.read_text())["comments"] == document["comments"]
+
+
+def test_unknown_reads_and_unbound_close_never_authorize_a_write(tmp_path, monkeypatch, immediate_read_retries):
+    port, _git, effect, state, calls = _fixture(tmp_path, monkeypatch)
+    close = replace(effect, operation="close", payload={"issue": 2, "merge_sha": effect.after_sha})
+    assert port.execute(close, WriteAuthority(lambda: lambda: pytest.fail("no persisted close intent"))).disposition == "unknown"
+    _change(state, read_error=True)
+    for read in (lambda: port.reconcile(_pr_effect(effect)),
+                 lambda: port.execute(_pr_effect(effect), WriteAuthority(lambda: lambda: pytest.fail("unknown cannot write")))):
+        with pytest.raises(ReadUnavailable) as failure:
+            read()
+        assert failure.value.code == "remote_read_failed"
+    actual = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert not any("--method" in c for c in actual)
+
+
+def test_selected_runner_actor_change_cannot_dispatch_original_effect(tmp_path, monkeypatch):
+    port, _git, effect, state, _calls = _fixture(tmp_path, monkeypatch)
+    _change(state, actor="different-login")
+    with pytest.raises(KernelError, match="remote_actor_changed"):
+        port.execute(effect, WriteAuthority(lambda: lambda: pytest.fail("actor mismatch must precede authorization")))
+
+
+def test_real_issue_ack_stays_optional_and_once_across_kernel_reopen(tmp_path, monkeypatch, ticket_before_pr):
+    from agent_run.core.kernel import Kernel
+    from support.core_operations import Ports
+    from support.remote_effects import install_remote_gh
+    scenario = ticket_before_pr
+    state, calls = install_remote_gh(tmp_path, scenario.port.physical.remote, monkeypatch,
+                                     repository=scenario.spec.repository)
+    _change(state, actor="offline-publisher", lose_operation="issue_link")
+    ports = Ports(scenario)
+    original, links = ports.execute, []
+    selected = RemoteEffects(scenario.port.git.root, scenario.spec.repository,
+                             runner_identity=scenario.spec.inputs.runner_identity,
+                             remote=scenario.spec.inputs.repository_remote)
+    def execute(effect, authorize):
+        if effect.operation != "issue_link":
+            return original(effect, authorize)
+        links.append(effect)
+        return selected.execute(effect, authorize)
+    monkeypatch.setattr(ports, "execute", execute)
+    def finish_ticket():
+        runner = OperationRunner(scenario.kernel, scenario.execution, lambda binding: ports)
+        for _ in range(100):
+            status = scenario.kernel.status("ticket:2")
+            if status["phase"] == "complete" and status["resource_cleanup"]["state"] == "complete":
+                return
+            step = prepare_scripted_agent(scenario.kernel, runner.run_once())
+            assert step.call is None
+        raise AssertionError("original Ticket did not complete with mandatory cleanup")
+    finish_ticket()
+    durable = Kernel(scenario.kernel.storage.path, run_id=scenario.kernel.storage.run_id)
+    assert durable.status("ticket:2")["phase"] == "complete"
+    assert durable.status("ticket:2")["issue_link"]["state"] == "indeterminate"
+    link, = links
+    assert selected.reconcile(link).disposition == "unknown"
+    before_roles = list(scenario.role_calls)
+    before_usage = durable.status("ticket:2")["budgets"]
+    scenario.kernel = durable
+    assert OperationRunner(durable, scenario.execution, lambda binding: ports).run_once(agent_capacity=0).call is None
+    assert scenario.role_calls == before_roles and durable.status("ticket:2")["budgets"] == before_usage
+    actual = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert sum(c[1] == "graphql" and "POST" in c for c in actual) == 1
+    assert len(json.loads(state.read_text()).get("links", [])) == 1
+
+
+@pytest.mark.parametrize("unavailable", [False, True], ids=["linked", "unavailable"])
+def test_original_issue_ack_is_durable_without_replaying_the_optional_write(tmp_path, monkeypatch, unavailable, immediate_read_retries):
+    """Real adapter ACK -> Core receipt -> SQLite reopen, without Agent delivery."""
+    from agent_run.core.kernel import Kernel
+    from agent_run.core.operation_contract import Work
+    from agent_run.model import Delivery, DeliveryKind, RunSpec, World
+    from support.offline import fixture_inputs
+    from support.core_operations import native_agent_fixture
+    port, _git, push, state, calls = _fixture(tmp_path, monkeypatch)
+    assert port.execute(push, WriteAuthority(lambda: lambda: None)).disposition == "target"
+    inputs = replace(fixture_inputs(), runner_identity={"source": "host"})
+    job = Delivery("ticket:2", DeliveryKind.TICKET, 2, "original", push.base, push.source_ref, push.target_ref)
+    kernel, _ports = native_agent_fixture(tmp_path / "kernel.sqlite3",
+        RunSpec("link-run", port.repository, 1, "parent", "graph", (job,), inputs=inputs))
+    execution = kernel.claim_executor("original-link")
+    with kernel.storage.transaction() as tx:
+        run, job = tx.one("SELECT * FROM runs"), kernel._job(tx, "ticket:2")
+        world = World(run["parent_revision"], run["graph_revision"], job["revision"], push.base, push.candidate,
+            publisher_actor=push.actor, publisher_identity=inputs.runner_identity)
+        request = kernel._prepare_effect(tx, run, job, Work(execution, "link", "ticket:2", False, True, None, None),
+            world, "issue_link", before=push.after_sha,
+            payload={"issue": 2, "ref": push.source_ref, "source_head": push.after_sha})
+        tx.execute("INSERT INTO issue_links(run_id,subject,generation,source_ref,source_sha,issue,effect_id) VALUES (?,?,1,?,?,2,?)",
+            (run["id"], "ticket:2", push.source_ref, push.after_sha, request.effect.effect_id))
+        budgets = [tuple(row) for row in tx.all("SELECT * FROM budgets")]
+    _change(state, issue_read_error=unavailable)
+    admission = WriteAuthority(lambda: lambda: kernel._dispatch(request.effect, execution, world, token=request.token))
+    result = port.execute(request.effect, admission)
+    if not unavailable:
+        assert result.raw["acknowledgement"]["data"]["createLinkedBranch"]["linkedBranch"]["ref"] == {
+            "name": "delivery", "target": {"oid": push.after_sha}}
+    kernel.acknowledge_link(request.effect, result)
+    reopened = Kernel(kernel.storage.path, run_id=kernel.storage.run_id)
+    expected = "unavailable" if unavailable else "linked"
+    assert reopened.status("ticket:2")["issue_link"]["state"] == expected
+    assert not reopened._dispatch(request.effect, execution, world, token=request.token)
+    assert reopened._reconcile(request, port.reconcile(request.effect)).kind == "progress"
+    with reopened.storage.transaction(write=False) as tx:
+        assert tuple(tx.one("SELECT status,attempts FROM effects WHERE operation='issue_link'")) == ("confirmed", 1)
+        assert [tuple(row) for row in tx.all("SELECT * FROM budgets")] == budgets
+        assert not tx.rows("SELECT * FROM waits")
+    actual = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert sum(command[1] == "graphql" and "POST" in command for command in actual) == (0 if unavailable else 1)
+    assert len(json.loads(state.read_text()).get("links", [])) == (0 if unavailable else 1)
+
+
+def test_remote_cleanup_uses_selected_runner_transport_and_original_head(tmp_path, monkeypatch):
+    port, git, push, _state, _calls = _fixture(tmp_path, monkeypatch)
+    assert port.execute(push, WriteAuthority(lambda: lambda: None)).disposition == "target"
+    real_git = shutil.which("git")
+    log = tmp_path / "git-environment.jsonl"
+    transport = tmp_path / "transport-bin"
+    transport.mkdir()
+    wrapper = transport / "git"
+    wrapper.write_text("#!" + sys.executable + "\n" +
+        "import json,os,subprocess,sys\n" +
+        "with open(" + repr(str(log)) + ", 'a') as f: f.write(json.dumps({'args':sys.argv[1:],'token':os.environ.get('GH_TOKEN'),'config':os.environ.get('GIT_CONFIG_COUNT')})+'\\n')\n" +
+        # Only the external test server permits file://; production transport
+        # remains restricted by the selected Runner's normal credential leaf.
+        "env=os.environ.copy();env['GIT_ALLOW_PROTOCOL']='file'\n" +
+        "raise SystemExit(subprocess.run([" + repr(real_git) + ",*sys.argv[1:]],env=env).returncode)\n")
+    wrapper.chmod(0o755)
+    # Give the selected transport a new PATH after fixture Git was resolved.
+    monkeypatch.setenv("PATH", str(transport) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("SYNTHETIC_RUNNER_PAT", "frozen-synthetic-test-token")
+    monkeypatch.setenv("GH_TOKEN", "unselected-inherited-test-token")
+    identity = {"source": "pat", "pat": {"env": "SYNTHETIC_RUNNER_PAT"}}
+    selected = RemoteEffects(port.root, port.repository, runner_identity=identity)
+    cleanup = replace(push, effect_id="cleanup-1", operation="cleanup_remote_ref", before_sha=push.after_sha, after_sha=None,
+        payload={"remote": "origin", "branch_ref": push.source_ref, "expected_head": push.after_sha, "github_identity": identity})
+    prepared, authorized = [], []
+    def prepare_delete():
+        prepared.append("delete")
+        return lambda: authorized.append("delete")
+    result = selected.execute(cleanup, WriteAuthority(prepare_delete))
+    # Cleanup authorizes the intent; Git rechecks immediately before spawning.
+    assert result.disposition == "target" and authorized == ["delete", "delete"]
+    assert prepared == ["delete", "delete"]
+    assert git.run("show-ref", "--verify", "--hash", push.source_ref).stdout.strip() == push.after_sha
+    observed = [json.loads(line) for line in log.read_text().splitlines()]
+    def verb(row):
+        args = row["args"]
+        return args[2] if args[0] == "-C" else args[0]
+    remote = [row for row in observed if verb(row) in {"ls-remote", "push"}]
+    assert remote and all(row["token"] == "frozen-synthetic-test-token" and int(row["config"]) > 0 for row in remote)
+    assert sum(verb(row) == "push" for row in remote) == 1
+    assert selected.execute(cleanup, WriteAuthority(lambda: lambda: pytest.fail("absence needs no delete authority"))).disposition == "target"
+
+
+def test_observe_uses_real_requirements_remote_commits_and_required_ci_facts(tmp_path, monkeypatch):
+    port, git, push, state, calls, published = existing_pr(tmp_path, monkeypatch)
+    # A real remote-only append is absent from this managed clone's object DB.
+    other = tmp_path / "external-clone"
+    git.run("clone", "--branch", "delivery", str(tmp_path / "origin.git"), str(other))
+    external = LocalGit(other)
+    external.run("config", "--local", "user.name", "Independent fixture author")
+    external.run("config", "--local", "user.email", "independent-fixture@example.invalid")
+    (other / "external-change").write_text("actual remote-only bytes\n")
+    external.run("add", ".")
+    external.run("commit", "-m", "external source append")
+    latest = external.commit("HEAD")
+    external.run("push", "origin", "HEAD:refs/heads/delivery")
+    assert git.run("cat-file", "-e", latest.sha + "^{commit}", check=False).returncode != 0
+    assert not (port.root / ".git" / "FETCH_HEAD").exists()
+    document = json.loads(state.read_text())
+    document["prs"][0]["head"]["sha"] = latest.sha
+    state.write_text(json.dumps(document))
+    _change(state, checks=[{"name": "Required test", "bucket": "fail", "state": "FAILURE", "workflow": "Original workflow",
+                          "link": "https://external-ci.example/job/1", "description": "Original required failure"}])
+    kernel = _source_kernel(tmp_path, port, push)
+    receipt = kernel.source_status()
+    refs_before = git.run("for-each-ref", "--format=%(refname) %(objectname)").stdout
+    previous_calls = len(calls.read_text().splitlines())
+    monkeypatch.setattr(kernel, "source_status", lambda: pytest.fail("must use this refresh receipt, never latest global status"))
+    execution = kernel.claim_executor("source-observer")
+    runner = OperationRunner(kernel, execution, lambda binding: port)
+    world = runner.observe("parent:1")
+    assert world.parent_revision == receipt["observed_parent_revision"] and world.graph_revision == receipt["observed_graph_revision"]
+    assert world.revision == world.parent_revision and world.completion_revision == "no-tickets"
+    assert world.source == latest and world.target == published.base
+    assert world.pr.number == 17 and world.pr.head_repository == "example/project"
+    assert world.pr.body == "Original narrative\r\n中文"
+    assert world.checks.result == "fail" and world.checks.head_sha == latest.sha
+    assert "Original required failure" in world.checks.logs and "not_collected" in world.checks.logs
+    assert world.publisher_actor == "publisher" and world.publisher_identity == {"source": "host"}
+    assert world.ancestry == ((world.pr.base.sha, world.target.sha),)
+    assert git.commit(latest.sha) == latest
+    assert not (port.root / ".git" / "FETCH_HEAD").exists()
+    assert git.run("for-each-ref", "--format=%(refname) %(objectname)").stdout == refs_before
+    observed = [json.loads(line) for line in calls.read_text().splitlines()][previous_calls:]
+    assert not any("--method" in c for c in observed)
+    assert any(c[:2] == ["api", "graphql"] for c in observed)
+
+
+def test_observe_rejects_a_real_old_source_read_when_new_requirements_commit_first(tmp_path, monkeypatch):
+    from threading import Event, Thread
+    from agent_run.adapters.github import GhGitHubReader
+    from agent_run.adapters.source import read_requirements
+    port, _git, push, state, _calls = _fixture(tmp_path, monkeypatch)
+    kernel = _source_kernel(tmp_path, port, push)
+    before = kernel.source_status()
+    execution = kernel.claim_executor("source-observer")
+    runner = OperationRunner(kernel, execution, lambda binding: port)
+    reached, release = Event(), Event()
+    failures = []
+    source_observation = port.source_observation
+    def delayed(parent, query):
+        result = source_observation(parent, query)  # real fake-gh subprocess reads before the barrier
+        reached.set()
+        assert release.wait(10), "bounded stale reader release"
+        return result
+    monkeypatch.setattr(port, "source_observation", delayed)
+    def old_observer():
+        try:
+            runner.observe("parent:1")
+        except Exception as error:
+            failures.append(error)
+    thread = Thread(target=old_observer)
+    thread.start()
+    try:
+        assert reached.wait(10), "old external source reader reached"
+        _change(state, source_body="New actual requirement")
+        current = GhGitHubReader(port.repository, working_directory=port.root, runner_identity={"source": "host"})
+        newer = kernel.refresh(lambda: read_requirements(current, 1))
+    finally:
+        release.set()
+        thread.join(10)
+    assert not thread.is_alive() and len(failures) == 1
+    assert isinstance(failures[0], KernelError) and failures[0].code == "automatic_step_superseded"
+    assert newer["observed_parent_revision"] != before["observed_parent_revision"]
+    assert kernel.source_status() == newer
+
+
+def test_final_observation_proves_real_current_completions_into_remote_run_before_activation(tmp_path, monkeypatch, graph_ticket_before_merge):
+    from support.remote_effects import install_remote_gh
+    scenario = graph_ticket_before_merge
+    subject = scenario.delivery.key
+    for _ in range(24):
+        scenario.step()
+        status = scenario.kernel.status(subject)
+        if status["phase"] == "complete" and status["resource_cleanup"]["state"] == "complete":
+            break
+    else:
+        raise AssertionError("Ticket completion and required cleanup were not reached")
+    completed = scenario.kernel.source_status()["completions"]
+    assert len(completed) == 1 and completed[0]["subject"] == subject
+    assert scenario.kernel.source_status()["final_subject"] is None
+    published_run = scenario.port.remote_commit("refs/heads/run")
+    assert published_run is not None and published_run.sha == completed[0]["merge_sha"]
+    # Publication advances the separate physical remote, not the observer's
+    # local ref. Import the real completed head before forking this fixture.
+    scenario.port.git.run("fetch", "--no-tags", str(scenario.port.physical.remote),
+                          "refs/heads/run:refs/heads/run")
+    initial_run = scenario.port.git.commit("refs/heads/run")
+    assert initial_run == published_run
+    default = scenario.port.git.commit("refs/heads/main")
+    remote = tmp_path / "final-origin.git"
+    scenario.port.git.run("init", "--bare", str(remote))
+    scenario.port.git.run("remote", "add", "offline-remote", str(remote))
+    scenario.port.git.run("push", "offline-remote", "refs/heads/run", "refs/heads/main")
+    other = tmp_path / "final-external"
+    scenario.port.git.run("clone", "--branch", "run", str(remote), str(other))
+    external = LocalGit(other)
+    external.run("config", "--local", "user.name", "Independent fixture author")
+    external.run("config", "--local", "user.email", "independent-fixture@example.invalid")
+    (other / "external-run-change").write_text("independent completed-run append\n")
+    external.run("add", ".")
+    external.run("commit", "-m", "later run head")
+    latest = external.commit("HEAD")
+    external.run("push", "origin", "HEAD:refs/heads/run")
+    assert latest.sha != initial_run.sha != default.sha
+    assert scenario.port.git.run("cat-file", "-e", latest.sha + "^{commit}", check=False).returncode != 0
+    state, calls = install_remote_gh(tmp_path, remote, monkeypatch)
+    parent, (ticket,) = scenario.requirements.parent, scenario.requirements.issues
+    _change(state, source_graph={"parent": {"number": parent.number, "title": parent.title,
+        "body": parent.body, "sub_issues": [ticket.number]}, "issues": {str(ticket.number):
+        {"number": ticket.number, "title": ticket.title, "body": ticket.body, "state": "CLOSED",
+         "labels": sorted(ticket.labels)}}})
+    selected = RemoteEffects(scenario.port.git.root, "example/project", runner_identity={"source": "host"}, remote="offline-remote")
+    role_calls = list(scenario.role_calls)
+    before_calls = len(calls.read_text().splitlines()) if calls.exists() else 0
+    runner = OperationRunner(scenario.kernel, scenario.execution, lambda binding: selected)
+    world = runner.observe(None)
+    assert world.source == latest and world.target == default
+    assert (completed[0]["merge_sha"], latest.sha) in world.ancestry
+    step = prepare_scripted_agent(scenario.kernel, runner.run_once())
+    assert step.kind == "progress" and step.reason == "final_activated" and step.call is None
+    final = step.subject
+    assert scenario.kernel.delivery(final).base == latest
+    assert scenario.kernel.delivery(final).source_ref == "refs/heads/run"
+    assert scenario.kernel.status(final)["phase"] == "workspace"
+    assert scenario.role_calls == role_calls  # Final activation does not create initial Development.
+    assert scenario.port.git.commit("refs/heads/run") == initial_run
+    actual = [json.loads(line) for line in calls.read_text().splitlines()][before_calls:]
+    assert not any("--method" in c for c in actual)

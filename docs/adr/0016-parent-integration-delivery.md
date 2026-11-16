@@ -4,7 +4,14 @@ status: accepted
 
 # 两种 Parent 在交付边界接纳远端成果并验收最终组合
 
-## 当前修订：取消内部 Repair PR
+## 后续修订：修复 PR 与当前 Core
+
+[ADR 0031](0031-parent-repair-pr-and-repository-ci.md) 已取代下文取消修复 PR、直接更新 Run Branch 的条款。
+当前完整 Parent 修复先做候选整体验收，再由程序通过修复 PR 的检查及普通合入进入 Run；
+仍适用的审核经实际成果核验后提升。最终 PR 保留自己的检查与明确人工批准。
+以下取消内部 PR 的段落保留历史决策，不代表当前写入路径；其余预算、恢复与完整验收约束继续有效。
+
+## 历史修订：取消内部 Repair PR
 
 [ADR 0025](0025-parent-repair-without-internal-pr.md) 完整 Parent 修复改由程序更新 Run Branch，并通过最终 PR 的 CI 与人工批准交付，取代内部 Repair PR 的独立交付要求。下文按当前合同同步；被 ADR 0021 明确取代的 Parent-only 历史条款保留标注。
 

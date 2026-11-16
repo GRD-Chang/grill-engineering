@@ -1,0 +1,89 @@
+{
+  "schema": "kernel-neutral-graph/1",
+  "id": "graph-refresh-same-input-v1",
+  "initial_ticket_input": "normal-ticket-v1.json",
+  "actions": [
+    {
+      "id": "parent-clarification",
+      "parent_body_suffix": "\nClarify the intended outcome.",
+      "ticket_comments": [
+        {
+          "author": "maintainer",
+          "body": "Useful context only."
+        }
+      ],
+      "ticket_assignees": [
+        "maintainer"
+      ],
+      "ticket_updated_at": "2099-01-01T00:00:00Z"
+    },
+    {
+      "id": "add-dependent-ticket",
+      "ticket": {
+        "number": 5,
+        "title": "Deliver newly added ticket",
+        "body": "Implement the dependent behavior.",
+        "state": "OPEN",
+        "labels": [
+          "ready-for-agent"
+        ],
+        "blocked_by": [
+          {
+            "number": 4,
+            "state": "OPEN"
+          }
+        ]
+      }
+    },
+    {
+      "id": "restore-accepted-graph",
+      "remove_ticket_number": 5
+    }
+  ],
+  "cut": "after durable refresh of restored original graph; no Agent allocation or Delivery Engine advancement",
+  "source_contracts": [
+    "test_scope_revision.py::test_parent_revision_drift_is_recorded_without_scope_agent",
+    "test_run_orchestration.py::test_parent_clarification_and_comments_do_not_change_the_ticket_graph",
+    "test_run_orchestration.py::test_graph_change_fails_closed_with_auditable_revisions"
+  ],
+  "initial_requirements": {
+    "repository": "example/project",
+    "parent": {
+      "number": 1,
+      "title": "Parent spec",
+      "body": "Deliver the ticket set.",
+      "sub_issues": [
+        3,
+        4
+      ],
+      "sub_issue_order_reliable": true
+    },
+    "issues": {
+      "3": {
+        "number": 3,
+        "title": "Deliver one ticket",
+        "body": "Implement the requested behavior.\n\n## Acceptance criteria\n\n- It works.",
+        "state": "OPEN",
+        "labels": [
+          "ready-for-agent"
+        ],
+        "blocked_by": []
+      },
+      "4": {
+        "number": 4,
+        "title": "Deliver dependent ticket",
+        "body": "Implement the dependent behavior.",
+        "state": "OPEN",
+        "labels": [
+          "ready-for-agent"
+        ],
+        "blocked_by": [
+          {
+            "number": 3,
+            "state": "OPEN"
+          }
+        ]
+      }
+    }
+  }
+}

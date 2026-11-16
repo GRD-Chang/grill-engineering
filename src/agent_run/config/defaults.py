@@ -1,0 +1,408 @@
+from __future__ import annotations
+
+"""One sparse, user-editable authority for defaults of future Delivery Runs."""
+
+import fcntl
+import json
+import os
+import tempfile
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+from agent_run.contracts.agent_profiles import DEFAULT_PRESET, ProfileOverrides, resolve_profiles
+from agent_run.errors import AgentProfileError
+from agent_run.errors import DeliveryPolicyError
+from agent_run.contracts.policy_values import normalize_policy_overrides, resolve_delivery_policy
+from agent_run.errors import GitHubIdentityError
+from agent_run.contracts.identity import describe_identity, normalize_github_config
+from agent_run.adapters.auth.identity import resolve_worker_identity, resolve_runner_identity
+from agent_run.config.github_app import GitHubAppProfileStore
+from agent_run.config.paths import app_config_root
+from agent_run.contracts.copy import DEFAULT_LANGUAGE, text, validate_language
+from agent_run.errors import ErrorMessage, error_message
+
+_PROFILE_KEYS = frozenset(
+    {"preset", "publication_from_development"}
+    | {f"{role}_{field}" for role in ("development", "review", "publication")
+       for field in ("model", "effort")}
+)
+
+
+class UserDefaultsError(ValueError):
+    """User defaults cannot be parsed or safely updated."""
+
+
+def _profile(raw: object) -> dict[str, Any]:
+    if not isinstance(raw, Mapping):
+        raise UserDefaultsError(error_message("defaults.profile_object"))
+    for key, value in raw.items():
+        if key not in _PROFILE_KEYS:
+            raise UserDefaultsError(error_message("defaults.profile_unknown", field=key))
+        if value is None:
+            raise UserDefaultsError(error_message("defaults.profile_null", field=key))
+    result = dict(raw)
+    preset = result.get("preset")
+    if preset is not None and not isinstance(preset, str):
+        raise UserDefaultsError(error_message("defaults.preset_string"))
+    try:
+        resolve_profiles(preset=preset, overrides={k: v for k, v in result.items() if k != "preset"})
+    except AgentProfileError as error:
+        reason = error.args[0] if error.args and isinstance(error.args[0], ErrorMessage) else str(error)
+        raise UserDefaultsError(error_message("defaults.profile_error", reason=reason)) from error
+    for key, value in result.items():
+        if key.endswith("_model"):
+            result[key] = value.strip()
+    return result
+
+
+def notification_snapshot(raw: object = None, *, disabled: bool = False, mode: str | None = None) -> dict[str, Any]:
+    """Resolve optional notification settings without preventing Run creation."""
+    result: dict[str, Any] = {"enabled": False, "open_id": None, "profile": None, "app_id": None, "mode": "concise"}
+    if disabled:
+        return result
+    try:
+        result.update(_notifications(raw) if raw is not None else {})
+        if mode is not None:
+            result.update(_notifications({"mode": mode}))
+            result["enabled"] = True
+    except UserDefaultsError as error:
+        result["unavailable_reason"] = str(error)
+    return result
+
+
+def _notifications(raw: object) -> dict[str, Any]:
+    if not isinstance(raw, Mapping):
+        raise UserDefaultsError(error_message("defaults.notifications_object"))
+    result: dict[str, Any] = {}
+    for key, value in raw.items():
+        if key == "enabled":
+            if type(value) is not bool:
+                raise UserDefaultsError(error_message("defaults.notifications_bool"))
+        elif key == "mode":
+            if value not in ("concise", "detailed"):
+                raise UserDefaultsError(error_message("defaults.notifications_mode"))
+        elif key in {"open_id", "profile", "app_id"}:
+            if not isinstance(value, str) or not value.strip():
+                raise UserDefaultsError(error_message("defaults.notifications_string", field=key))
+            value = value.strip()
+        else:
+            raise UserDefaultsError(error_message("defaults.notifications_unknown", field=key))
+        result[key] = value
+    return result
+
+
+def _document(raw: object) -> dict[str, Any]:
+    if not isinstance(raw, Mapping):
+        raise UserDefaultsError(error_message("defaults.document_object"))
+    unknown = set(raw) - {"policy", "profile", "notifications", "language", "github"}
+    if unknown:
+        raise UserDefaultsError(error_message("defaults.document_unknown", keys=sorted(unknown)))
+    result: dict[str, Any] = {}
+    if "language" in raw:
+        try:
+            result["language"] = validate_language(raw["language"])
+        except ValueError as error:
+            raise UserDefaultsError(str(error)) from error
+    if "policy" in raw:
+        try:
+            result["policy"] = normalize_policy_overrides(raw["policy"])
+            resolve_delivery_policy(user_defaults=result["policy"])
+        except DeliveryPolicyError as error:
+            reason = error.args[0] if error.args and isinstance(error.args[0], ErrorMessage) else str(error)
+            raise UserDefaultsError(error_message("defaults.policy_error", reason=reason)) from error
+    if "profile" in raw:
+        result["profile"] = _profile(raw["profile"])
+    if "github" in raw:
+        try:
+            result["github"] = normalize_github_config(raw["github"])
+        except GitHubIdentityError as error:
+            raise UserDefaultsError(error.args[0]) from error
+    if "notifications" in raw:
+        result["notifications"] = raw["notifications"]
+    return result
+
+
+def _merge_profile(current: Mapping[str, Any], supplied: Mapping[str, Any]) -> dict[str, Any]:
+    merged = {**current, **supplied}
+    if supplied.get("publication_from_development") is True:
+        for key in ("publication_model", "publication_effort"):
+            merged.pop(key, None)
+    elif any(key in supplied for key in ("publication_model", "publication_effort")):
+        merged.pop("publication_from_development", None)
+    return merged
+
+
+class UserDefaultsStore:
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = path if path is not None else self.default_path()
+
+    @staticmethod
+    def default_path() -> Path:
+        try:
+            return app_config_root() / "user-defaults.json"
+        except ValueError as error:
+            reason = error.args[0] if error.args and isinstance(error.args[0], ErrorMessage) else str(error)
+            raise UserDefaultsError(reason) from error
+
+    def _read(self) -> tuple[dict[str, Any], str]:
+        document = self._read_file(self.path)
+        if document is not None:
+            return document, "user-defaults"
+        legacy_error = None
+        try:
+            document = self._read_file(self.path.with_name("delivery-policy.json"), policy_only=True)
+        except UserDefaultsError as error:
+            document, legacy_error = None, error
+        # A settings writer may have created the authority while fallback was read.
+        # Prefer it even when the old file was missing or invalid; queries never write.
+        current = self._read_file(self.path)
+        if current is not None:
+            return current, "user-defaults"
+        if legacy_error is not None:
+            raise legacy_error
+        return (document, "legacy-delivery-policy") if document is not None else ({}, "builtin")
+
+    @staticmethod
+    def _read_file(path: Path, *, policy_only: bool = False) -> dict[str, Any] | None:
+        try:
+            try:
+                contents = path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                if not path.is_symlink():
+                    return None
+                raise  # A broken config link is not an absent configuration.
+            raw = json.loads(contents)
+            return _document({"policy": raw} if policy_only else raw)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, UserDefaultsError) as error:
+            reason = error.args[0] if error.args and isinstance(error.args[0], ErrorMessage) else str(error)
+            raise UserDefaultsError(error_message("defaults.read_error", path=path, reason=reason)) from error
+
+    def load(self) -> dict[str, Any]:
+        return self._read()[0]
+
+    def language(self, document: dict[str, Any] | None = None) -> str:
+        """Resolve the single personal language setting, never the host locale."""
+        loaded = self.load() if document is None else _document(document)
+        return validate_language(loaded.get("language", DEFAULT_LANGUAGE))
+
+    def _github_description(self, document: dict[str, Any]) -> dict[str, Any]:
+        config = document.get("github", {})
+        legacy = self.path.with_name("github-app.json")
+        if "worker_source" not in config and legacy.exists():
+            return {"worker": {"source": "app"}, "runner": resolve_runner_identity(config),
+                    "migration": "required", "legacy_path": str(legacy),
+                    "notice": text("identity.migration_required", language=self.language(document))}
+        result = describe_identity(
+            resolve_worker_identity(config, app_profile_path=legacy), self.language(document),
+            resolve_runner_identity(config),
+        )
+        result["migration"] = "legacy-ignored" if legacy.exists() else "not-needed"
+        return result
+
+    def _describe(self, document: dict[str, Any], source: str) -> dict[str, Any]:
+        profile = document.get("profile", {})
+        resolved = resolve_profiles(
+            preset=profile.get("preset"),
+            overrides={k: v for k, v in profile.items() if k != "preset"},
+        )
+        sources: dict[str, Any] = {"preset": source if "preset" in profile else "builtin"}
+        for role, values in resolved["profiles"].items():
+            sources[role] = {
+                field: ("development" if role == "publication" and values["reference"] else
+                        source if f"{role}_{option}" in profile else f"preset:{resolved['preset']}")
+                for field, option in (("model", "model"), ("reasoning_effort", "effort"))
+            }
+            sources[role]["reference"] = values["reference"]
+        policy = resolve_delivery_policy(user_defaults=document.get("policy")).snapshot()
+        policy_defaults = document.get("policy", {})
+        policy_sources: dict[str, Any] = {
+            key: source if key in policy_defaults else "builtin"
+            for key in policy if key != "invocation_deadlines"
+        }
+        policy_sources["invocation_deadlines"] = {
+            role: source if role in policy_defaults.get("invocation_deadlines", {}) else "builtin"
+            for role in policy["invocation_deadlines"]
+        }
+        language = self.language(document)
+        notice = text("settings.scope_notice", language=language)
+        legacy = self.path.with_name("delivery-policy.json")
+        source_path = str(self.path) if source == "user-defaults" else None
+        if source == "legacy-delivery-policy":
+            source_path = str(legacy)
+            notice += (
+                f"；兼容读取 {legacy}；首次 settings configure 将保留有效旧设置并迁入 {self.path}，旧文件保留"
+                if language == "zh" else
+                f"; Reading legacy {legacy}; the first settings configure preserves valid settings in "
+                f"{self.path} and keeps the old file"
+            )
+        elif source == "user-defaults" and legacy.exists():
+            notice += (
+                f"；以 {self.path} 为准，旧文件 {legacy} 已忽略并保留"
+                if language == "zh" else
+                f"; {self.path} is authoritative; legacy {legacy} is ignored and preserved"
+            )
+        return {
+            "result": "settings",
+            "path": str(self.path), "source": source,
+            "source_path": source_path,
+            "defaults": document,
+            "policy": policy, "policy_sources": policy_sources,
+            "profile": resolved, "profile_sources": sources,
+            "github": self._github_description(document),
+            "notifications": notification_snapshot(document.get("notifications")),
+            "language": self.language(document),
+            "language_source": source if "language" in document else "builtin",
+            "scope": "future-runs",
+            "notice": notice,
+        }
+
+    def describe(self, document: dict[str, Any] | None = None) -> dict[str, Any]:
+        if document is not None:
+            return self._describe(_document(document), "provided")
+        return self._describe(*self._read())
+
+    def configure(self, *, policy: Mapping[str, Any] | None = None,
+                  profile: Mapping[str, Any] | None = None,
+                  notifications: Mapping[str, Any] | None = None,
+                  github: Mapping[str, Any] | None = None,
+                  language: str | None = None,
+                  migrate_github_app: bool = False) -> dict[str, Any]:
+        supplied = _document({**({"policy": policy} if policy is not None else {}),
+                              **({"profile": profile} if profile is not None else {})})
+        if github:
+            supplied["github"] = normalize_github_config(github)
+        if language is not None:
+            try:
+                supplied["language"] = validate_language(language)
+            except ValueError as error:
+                raise UserDefaultsError(text("settings.invalid_language", language=self.language())) from error
+        if notifications is not None:
+            supplied["notifications"] = _notifications(notifications)
+        if not any(supplied.values()) and not migrate_github_app:
+            raise UserDefaultsError(error_message(
+                "defaults.configure_option", audit="configure requires an explicit option"
+            ))
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.with_suffix(".lock").open("a+", encoding="utf-8") as lock:
+            os.fchmod(lock.fileno(), 0o600)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                current = self.load()
+                merged = dict(current)
+                if migrate_github_app:
+                    legacy = GitHubAppProfileStore(self.path.with_name("github-app.json"))
+                    # Explicit new metadata/source win; legacy materials remain for active executors.
+                    prior_github = current.get("github", {})
+                    migrated: dict[str, Any] = {"worker_source": "app", "app_read_only": False,
+                                                "app_current_repository_only": False}
+                    explicit_github = {**prior_github, **supplied.get("github", {})}
+                    if "app" not in explicit_github and explicit_github.get("worker_source", "app") == "app":
+                        app = legacy.load()
+                        if app is None:
+                            raise GitHubIdentityError(error_message("identity.app_missing"))
+                        migrated["app"] = {"app_id": app.app_id, "installation_id": app.installation_id,
+                                           "private_key_path": str(app.private_key_path)}
+                    merged["github"] = {**migrated, **prior_github}
+
+                if "language" in supplied:
+                    merged["language"] = supplied["language"]
+                if "policy" in supplied:
+                    prior = current.get("policy", {})
+                    update = supplied["policy"]
+                    merged["policy"] = {**prior, **update}
+                    if "invocation_deadlines" in update:
+                        merged["policy"]["invocation_deadlines"] = {
+                            **prior.get("invocation_deadlines", {}), **update["invocation_deadlines"]}
+                if "profile" in supplied:
+                    merged["profile"] = _merge_profile(current.get("profile", {}), supplied["profile"])
+                if "notifications" in supplied:
+                    prior_notifications = current.get("notifications", {})
+                    if not isinstance(prior_notifications, Mapping):
+                        prior_notifications = {}
+                    merged["notifications"] = _notifications({**prior_notifications, **supplied["notifications"]})
+                if "github" in supplied:
+                    merged["github"] = {**merged.get("github", {}), **supplied["github"]}
+                if "github" in merged:
+                    resolve_worker_identity(merged["github"], app_profile_path=self.path.with_name("github-app.json"))
+                    resolve_runner_identity(merged["github"])
+                merged = _document(merged)
+                result = self._describe(merged, "user-defaults")
+                self._write(merged)
+                result["result"] = "configured"
+                result["changed"] = supplied
+                return result
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def resolve_creation(self, *, preset: str | None = None,
+                         overrides: ProfileOverrides | None = None,
+                         document: dict[str, Any] | None = None) -> tuple[str, ProfileOverrides]:
+        loaded = self.load() if document is None else _document(document)
+        profile = loaded.get("profile", {}) if preset is None else {}
+        selected = preset or profile.get("preset", DEFAULT_PRESET)
+        supplied = {k: v for k, v in (overrides or {}).items() if v is not None and v is not False}
+        _profile({"preset": selected, **supplied})
+        merged = _merge_profile({k: v for k, v in profile.items() if k != "preset"}, supplied)
+        resolve_profiles(preset=selected, overrides=merged)
+        return selected, merged
+
+    def _write(self, document: Mapping[str, Any]) -> None:
+        rollback: Path | None = None
+        temporary: Path | None = None
+        replaced = False
+        try:
+            if self.path.exists():
+                descriptor, name = tempfile.mkstemp(
+                    dir=self.path.parent, prefix=".user-defaults.rollback.", suffix=".tmp"
+                )
+                rollback = Path(name)
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(self.path.read_bytes())
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            descriptor, name = tempfile.mkstemp(
+                dir=self.path.parent, prefix=".user-defaults.", suffix=".tmp"
+            )
+            temporary = Path(name)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(document, stream, ensure_ascii=False, indent=2, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path)
+            replaced = True
+            self._sync_directory()
+        except OSError as error:
+            if replaced:
+                try:
+                    if rollback is None:
+                        self.path.unlink()
+                    else:
+                        os.replace(rollback, self.path)
+                except OSError as rollback_error:
+                    recovery_path = rollback
+                    rollback = None  # Preserve recoverable original bytes after rollback failure.
+                    raise OSError(
+                        f"{self.path}: 写入失败且无法恢复原配置: {rollback_error}; "
+                        f"原配置备份: {recovery_path}; 原错误: {error}"
+                    ) from error
+                try:
+                    self._sync_directory()
+                except OSError as sync_error:
+                    raise OSError(
+                        f"{self.path}: 写入失败，已恢复原配置，但无法确认恢复的磁盘持久性: {sync_error}"
+                    ) from error
+            raise
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            if rollback is not None:
+                rollback.unlink(missing_ok=True)
+
+    def _sync_directory(self) -> None:
+        directory = os.open(self.path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)

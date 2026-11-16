@@ -1,0 +1,284 @@
+"""Current publisher witnesses and original comment receipts bind remote writes."""
+
+from support.repository_fixture import create_kernel
+
+from dataclasses import replace
+from functools import partial
+from pathlib import Path
+
+import pytest
+
+from agent_run.config.defaults import UserDefaultsStore
+from agent_run.model import DeliveryKind
+from agent_run.core.kernel import Kernel
+from agent_run.errors import GitHubReadError, KernelError
+from agent_run.core.operation_contract import ReadUnavailable, Work
+from agent_run.config.creation import freeze_creation
+from agent_run.model import Effect, EffectResult, World
+from support.offline import Scenario
+from support.run_scoped_kernel import domain_kernel
+from support.offline_api import SyntheticGitHub
+from support.effect_boundary import EffectBoundary, effect_boundary
+
+
+def publisher_scenario(path: Path, monkeypatch: pytest.MonkeyPatch) -> Scenario:
+    # Declare the synthetic account before any Core observation or API write.
+    monkeypatch.setattr("support.offline.SyntheticGitHub", partial(SyntheticGitHub, actor="actual-runner"))
+    scenario = Scenario(path, DeliveryKind.PARENT_ONLY)
+    remote = scenario.spec.inputs.repository_remote
+    frozen = freeze_creation(scenario.spec, UserDefaultsStore(path / "personal.json"))
+    scenario.spec = replace(frozen, inputs=replace(frozen.inputs, repository_remote=remote))
+    scenario.kernel = create_kernel(path / "frozen.sqlite3", scenario.spec, requirements=scenario.requirements)
+    scenario.execution = scenario.kernel.claim_executor("publisher-owner")
+    scenario.publisher = {"actor": "actual-runner", "identity": {"source": "host"}}
+    make_ports = scenario.make_ports
+
+    def selected(binding):
+        ports = make_ports(binding)
+        delivery = ports.delivery
+        ports.delivery = lambda request: replace(delivery(request), publisher_actor=scenario.publisher["actor"],
+            publisher_identity=scenario.publisher["identity"])
+        return ports
+
+    monkeypatch.setattr(scenario, "make_ports", selected)
+    return scenario
+
+
+@pytest.fixture
+def domain_publisher(tmp_path, monkeypatch):
+    scenario = publisher_scenario(tmp_path / "scenario", monkeypatch)
+    with domain_kernel(scenario.kernel) as scenario.kernel:
+        yield scenario
+
+
+def reach_phase(scenario: Scenario, phase: str) -> None:
+    for _ in range(80):
+        if scenario.kernel.status(scenario.delivery.key)["phase"] == phase:
+            return
+        scenario.step()
+    raise AssertionError("delivery never reached " + phase)
+
+
+def capture_effect(scenario, monkeypatch, operation):
+    with effect_boundary(scenario, monkeypatch, operation):
+        with pytest.raises(EffectBoundary) as boundary:
+            scenario.run()
+    return boundary.value
+
+
+def prepare_comment(scenario: Scenario, monkeypatch) -> Effect:
+    assert scenario.run().kind == "approval"
+    scenario.kernel.control("approve", "original-approval", subject=scenario.delivery.key, world=scenario.world())
+    reach_phase(scenario, "completion_comment")
+    effect = capture_effect(scenario, monkeypatch, "completion_comment").effect
+    assert effect.operation == "completion_comment"
+    return effect
+
+
+def close_intent(effect: Effect) -> dict:
+    return {"run_id": effect.execution.run_id, "subject": effect.subject, "issue": effect.payload["issue"],
+            "merge_sha": effect.payload["merge_sha"], "actor": effect.actor, "pr_number": effect.pr_number,
+            "kind": effect.payload["kind"], "baseline_event_id": 41, "effect_id": effect.effect_id,
+            "comment_id": 52, "comment_created_at": "2026-10-21T00:00:00Z", "comment_body": "Exact original comment"}
+
+
+def test_unconfigured_run_cannot_publish_with_two_missing_identity_selections(tmp_path: Path) -> None:
+    from agent_run.contracts.task import TaskKey
+    from agent_run.errors import GitHubIdentityError
+    from agent_run.model import Commit, Delivery, ParentIssue, Requirements, RunSpec, World
+    from agent_run.storage.routing import RepositoryRoute
+    from support.offline import fixture_inputs
+
+    route = RepositoryRoute(tmp_path / 'state' / 'kernel.sqlite3', tmp_path / 'repository', 'example/project')
+    route.initialize()
+    base = Commit('base', 'tree')
+    delivery = Delivery('parent:1', DeliveryKind.PARENT_ONLY, 1, 'revision', base, 'source', 'target')
+    inputs = fixture_inputs()
+    source = Requirements(ParentIssue(1, 'Parent', 'Original scope'), ())
+    task = TaskKey(route.repository_root, route.repository, 1)
+    spec = RunSpec('publisher-validation', route.repository, 1, 'parent', 'graph', (delivery,),
+        language='en', repository_root=str(route.repository_root),
+        inputs=replace(inputs, worker_identity=None, runner_identity=None))
+    before = route.database.read_bytes()
+    # Missing selections cannot publish even the initial frozen Run. Exercise
+    # its normal atomic producer, without claiming a second fixture Executor.
+    with pytest.raises(GitHubIdentityError):
+        route.create(task, spec, source)
+    assert route.database.read_bytes() == before
+    with route.metadata().transaction(write=False) as tx:
+        for table in ('tasks', 'runs', 'actions', 'hosts', 'invocations', 'effects'):
+            assert tx.one('SELECT count(*) FROM ' + table)[0] == 0
+    assert route.create(task, replace(spec, inputs=inputs), source).created
+    kernel = route.kernel(spec.run_id)
+    # A valid frozen selection still cannot publish from an observation whose
+    # identity is missing; None must not be accepted as matching authority.
+    world = World("parent", "graph", "subject", base,
+                  publisher_actor="offline-publisher", publisher_identity=None)
+    assert world.publisher_actor is not None and world.publisher_identity is None
+    with kernel.storage.transaction(write=False) as tx:
+        run = tx.one("SELECT * FROM runs")
+        with pytest.raises(KernelError, match="publisher_identity_unproven"):
+            kernel._publisher_actor(tx, run, world)
+        assert tx.one('SELECT executor FROM runs')[0] is None
+        assert tx.one('SELECT count(*) FROM effects')[0] == 0
+
+
+def test_actual_publisher_is_frozen_and_rechecked_before_each_remote_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    domain_publisher,
+) -> None:
+    scenario = domain_publisher
+    reach_phase(scenario, "push")
+    boundary = capture_effect(scenario, monkeypatch, "push")
+    effect = boundary.effect
+    assert effect.operation == "push"
+    assert effect.actor == "actual-runner"
+    scenario.publisher["actor"] = "different-account"
+    with pytest.raises(KernelError, match="publisher_identity_changed"):
+        boundary.authorize.prepare()()
+    scenario.publisher["actor"] = "actual-runner"
+    boundary.authorize.prepare()()
+    scenario.publisher["actor"] = "different-account"
+    with pytest.raises(KernelError, match="publisher_identity_changed"):
+        boundary.authorize.prepare()()
+    scenario.publisher["actor"] = "actual-runner"
+    boundary.authorize.prepare()()
+    scenario.port.execute(effect, boundary.authorize)
+    assert scenario.runner().run_once().kind == "progress"
+    assert scenario.runner().run_once().kind == "progress"
+    scenario.publisher["actor"] = "different-account"
+    with pytest.raises(KernelError, match="publisher_identity_changed"):
+        scenario.runner().run_once()
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        local = tx.rows("SELECT actor FROM effects WHERE operation IN ('candidate','integrate','publication_commit')")
+        assert local and all(row[0] is None for row in local)
+
+
+@pytest.mark.parametrize("foreign", [False, True])
+def test_close_inherits_only_the_confirmed_original_comment_receipt(
+    tmp_path: Path, foreign: bool,
+) -> None:
+    from support.agent_continuation import ticket_spec
+    from support.core_operations import native_agent_fixture
+
+    spec = ticket_spec()
+    kernel, _ports = native_agent_fixture(tmp_path / "run.sqlite3", spec)
+    delivery, = spec.deliveries
+    subject = delivery.key
+    owner = kernel.claim_executor("publisher")
+    work = Work(owner, "pending", subject, False, True, None, None)
+    with kernel.storage.transaction() as tx:
+        tx.execute("UPDATE subjects SET phase='completion_comment',merge_sha=?,pr_number=17 "
+                   "WHERE run_id=? AND id=?", (delivery.base.sha, spec.run_id, subject))
+        run, job = kernel._owned(tx, subject, owner)
+        world = World(run["parent_revision"], run["graph_revision"], job["revision"], delivery.base,
+                      publisher_actor="actual-runner", publisher_identity={"source": "host"})
+        request = kernel._mechanical(tx, run, job, work, world)
+    comment = request.effect
+    assert comment.operation == "completion_comment"
+    assert kernel._dispatch(comment, owner, world, token=request.token)
+    intent = close_intent(comment)
+    if foreign:
+        intent["merge_sha"] = "another-merge"
+    kernel._reconcile(request, EffectResult("target", raw={"close_intent": intent}))
+
+    kernel = Kernel(kernel.storage.path, run_id=spec.run_id)
+    with kernel.storage.transaction() as tx:
+        run, job = kernel._owned(tx, subject, owner)
+        row = tx.one("SELECT * FROM effects WHERE run_id=? AND id=?", (spec.run_id, comment.effect_id))
+        if foreign:
+            with pytest.raises(KernelError, match="foreign_close_intent"):
+                kernel._apply_effect(tx, run, job, row, world)
+        else:
+            assert kernel._apply_effect(tx, run, job, row, world).kind == "progress"
+    if foreign:
+        assert kernel.status(subject)["phase"] == "completion_comment"
+        return
+    with kernel.storage.transaction() as tx:
+        run, job = kernel._owned(tx, subject, owner)
+        close = kernel._mechanical(tx, run, job, work, world).effect
+    assert close.operation == "close"
+    assert close.payload.get("close_intent") == intent
+    assert close.actor == comment.actor
+    assert close.effect_id != comment.effect_id
+
+
+def test_same_actor_close_seen_before_first_dispatch_is_not_adopted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    domain_publisher,
+) -> None:
+    scenario = domain_publisher
+    comment = prepare_comment(scenario, monkeypatch)
+    assert scenario.runner().run_once().kind == "progress"
+    assert scenario.runner().run_once().kind == "progress"
+    close = capture_effect(scenario, monkeypatch, "close").effect
+    assert close.operation == "close"
+    # Even the exact actor and prospective target cannot prove a request which
+    # this Run has not dispatched. This is a separate external-store change.
+    scenario.port.objects.set_state(close.payload["issue"], "closed", close.actor)
+    assert scenario.runner().run_once().kind == "paused"
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        original = tx.one("SELECT status,attempts,receipt_id FROM effects WHERE id=?", (close.effect_id,))
+        assert tuple(original) == ("prepared", 0, None)
+    assert "write_conflict" in scenario.kernel.status(scenario.delivery.key)["gates"]
+    assert not any(write["operation"] == "close" for write in scenario.port.writes())
+
+
+def test_rearmed_close_settles_the_original_late_write_without_dispatching_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    domain_publisher,
+) -> None:
+    scenario = domain_publisher
+    comment = prepare_comment(scenario, monkeypatch)
+    assert scenario.runner().run_once().kind == "progress"
+    assert scenario.runner().run_once().kind == "progress"
+    boundary = capture_effect(scenario, monkeypatch, "close")
+    close = boundary.effect
+    assert close.operation == "close"
+
+    def original_state():
+        with scenario.kernel.storage.transaction(write=False) as tx:
+            return tuple(tx.one("SELECT status,attempts,receipt_id FROM effects WHERE id=?", (close.effect_id,)))
+
+    assert original_state() == ("prepared", 0, None)
+    physical_write = SyntheticGitHub.write
+    queued = []
+
+    def queue_original_close(provider, endpoint, method, body):
+        if endpoint == f"repos/{close.repository}/issues/{close.payload['issue']}" and method == "PATCH":
+            # Queue the actual request only after typed final admission. Retain
+            # its real provider/callback so later server completion produces
+            # the original raw transition and write audit, not a new grant.
+            queued.append((provider, endpoint, method, dict(body)))
+            raise GitHubReadError("write_response_unavailable", "Original close request remains in flight")
+        return physical_write(provider, endpoint, method, body)
+
+    with monkeypatch.context() as in_flight:
+        in_flight.setattr(SyntheticGitHub, "write", queue_original_close)
+        with pytest.raises(ReadUnavailable, match="Original close request remains in flight"):
+            scenario.port.execute(close, boundary.authorize)
+    assert len(queued) == 1
+    assert original_state() == ("sent", 1, None)
+    assert not [write for write in scenario.port.writes() if write["operation"] == "close"]
+    prior = scenario.port.reconcile(close)
+    assert prior.disposition == "prior"
+    assert scenario.runner().run_once().kind == "progress"
+    rearmed = capture_effect(scenario, monkeypatch, "close").effect
+    assert rearmed.effect_id == close.effect_id
+    assert rearmed.dispatch_serial == 2
+    assert original_state() == ("prepared", 1, None)
+    # The original dispatched request completes after its earlier prior read.
+    provider, endpoint, method, body = queued[0]
+    assert physical_write(provider, endpoint, method, body).returncode == 0
+    target = scenario.port.reconcile(rearmed)
+    assert target.disposition == "target"
+    assert scenario.runner().run_once().kind == "progress"
+    observed = original_state()
+    assert observed[0:2] == ("observed", 1) and observed[2] is not None
+    assert scenario.kernel.status(scenario.delivery.key)["phase"] == "close"
+    assert scenario.runner().run_once().kind == "progress"
+    assert original_state() == ("confirmed", 1, observed[2])
+    assert scenario.kernel.status(scenario.delivery.key)["phase"] == "complete"
+    with scenario.kernel.storage.transaction(write=False) as tx:
+        assert tuple(tx.one("SELECT status,attempts FROM effects WHERE id=?", (close.effect_id,))) == ("confirmed", 1)
+    assert sum(write["operation"] == "close" for write in scenario.port.writes()) == 1

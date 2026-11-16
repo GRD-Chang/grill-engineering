@@ -5,6 +5,8 @@ import http.server
 import io
 import json
 import os
+import select
+import signal
 import socket
 import ssl
 import subprocess
@@ -17,10 +19,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from agent_run.credential_lifecycle import RenewableCredential, ReadCredential
-from agent_run.github_auth import _GitHubAppCredentialProvider, mint_installation_credential, GitHubCredentialError
-from agent_run.github_auth_profile import GitHubAppProfile
-from agent_run.worker_credentials import NativeCredentialDelivery
+from agent_run.adapters.auth.credential_lifecycle import RenewableCredential, ReadCredential
+from agent_run.adapters.auth.app import _GitHubAppCredentialProvider, mint_installation_credential, GitHubCredentialError
+from agent_run.config.github_app import GitHubAppProfile
+from agent_run.runtime.process_cleanup import capture_process_scope, child_subreaper, descendant_pids
+from agent_run.adapters.auth.worker_credentials import NativeCredentialDelivery
 
 def test_app_credential_lifecycle_close_reclaims_a_blocked_signer_tree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -79,7 +82,7 @@ def test_app_credential_lifecycle_close_reclaims_a_blocked_signer_tree(
             ).encode()
         )
 
-    monkeypatch.setattr("agent_run.github_auth.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr('agent_run.adapters.auth.app.urllib.request.urlopen', fake_urlopen)
     profile = GitHubAppProfile("123", "456", tmp_path / "private.pem")
     profile.private_key_path.write_text("private-key", encoding="utf-8")
     profile.private_key_path.chmod(0o600)
@@ -90,11 +93,14 @@ def test_app_credential_lifecycle_close_reclaims_a_blocked_signer_tree(
     )
     unrelated: subprocess.Popen[str] | None = None
     renewal_thread: threading.Thread | None = None
+    owned_pidfds: dict[int, int] = {}
 
-    try:
-        credentials.start()
-        renewal_thread = credentials._renewal_thread  # noqa: SLF001 - lifecycle seam
+    # Own the detached child's reaping instead of depending on the host's init.
+    with child_subreaper():
+        baseline = capture_process_scope()
         try:
+            credentials.start()
+            renewal_thread = credentials._renewal_thread  # noqa: SLF001 - lifecycle seam
             deadline = time.monotonic() + 2
             while time.monotonic() < deadline and not (
                 parent_pid_path.exists() and child_pid_path.exists()
@@ -105,27 +111,60 @@ def test_app_credential_lifecycle_close_reclaims_a_blocked_signer_tree(
             assert int(invocation_path.read_text(encoding="utf-8")) >= 3
             assert renewal_thread is not None
 
+            for pid_path in (parent_pid_path, child_pid_path):
+                pid = int(pid_path.read_text(encoding="utf-8"))
+                owned_pidfds[pid] = os.pidfd_open(pid)
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
             unrelated = subprocess.Popen(
                 [sys.executable, "-c", "import time; time.sleep(30)"]
             )
             credentials.close()
             assert unrelated.poll() is None
-        finally:
-            if renewal_thread is not None and renewal_thread.is_alive():
-                credentials.close()
-    finally:
-        if unrelated is not None and unrelated.poll() is None:
-            unrelated.terminate()
-        if unrelated is not None:
-            unrelated.wait(timeout=5)
 
-    assert renewal_thread is not None
-    assert not renewal_thread.is_alive()
-    assert credentials._credential is None  # noqa: SLF001 - lifecycle seam
-    for pid_path in (parent_pid_path, child_pid_path):
-        pid = int(pid_path.read_text(encoding="utf-8"))
-        with pytest.raises(ProcessLookupError):
-            os.kill(pid, 0)
+            assert not renewal_thread.is_alive()
+            assert credentials._credential is None  # noqa: SLF001 - lifecycle seam
+            # A pidfd signals real exit even while the orphan is still a zombie.
+            # Keep the signer's existing one-second cleanup bound; no init polling.
+            assert select.select([owned_pidfds[child_pid]], [], [], 1)[0], (
+                "signer child survived credential close"
+            )
+            try:
+                os.waitpid(child_pid, 0)
+            except ChildProcessError:
+                pass  # The provider may already have reaped this owned orphan.
+            for pid in owned_pidfds:
+                with pytest.raises(ProcessLookupError):
+                    os.kill(pid, 0)
+        finally:
+            # Business exit assertions above precede this failure-path safety net.
+            try:
+                credentials.close()
+            finally:
+                # Also own children whose startup failed before PID files/fds were ready.
+                excluded = baseline | ({unrelated.pid} if unrelated is not None else set())
+                for pid in descendant_pids(os.getpid()):
+                    if pid not in excluded and pid not in owned_pidfds:
+                        try:
+                            owned_pidfds[pid] = os.pidfd_open(pid)
+                        except ProcessLookupError:
+                            pass
+                for descriptor in owned_pidfds.values():
+                    try:
+                        signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                # Reap even when signaling reports ESRCH; parents precede children.
+                for pid, descriptor in owned_pidfds.items():
+                    try:
+                        os.waitpid(pid, 0)
+                    except ChildProcessError:
+                        pass
+                    finally:
+                        os.close(descriptor)
+                if unrelated is not None and unrelated.poll() is None:
+                    unrelated.terminate()
+                if unrelated is not None:
+                    unrelated.wait(timeout=5)
 
 
 def test_app_credential_lifecycle_close_after_network_timeout_joins_renewal(
@@ -167,8 +206,8 @@ def test_app_credential_lifecycle_close_after_network_timeout_joins_renewal(
             ).encode()
         )
 
-    monkeypatch.setattr("agent_run.github_auth._create_app_jwt", fake_jwt)
-    monkeypatch.setattr("agent_run.github_auth.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr('agent_run.adapters.auth.app._create_app_jwt', fake_jwt)
+    monkeypatch.setattr('agent_run.adapters.auth.app.urllib.request.urlopen', fake_urlopen)
     credentials = RenewableCredential(
         _GitHubAppCredentialProvider(profile),
         renewal_margin=10**12,
@@ -282,9 +321,9 @@ def test_app_credential_lifecycle_close_interrupts_network_response(
             **options,
         )
 
-    monkeypatch.setattr("agent_run.github_auth.urllib.request.Request", local_request)
+    monkeypatch.setattr('agent_run.adapters.auth.app.urllib.request.Request', local_request)
     monkeypatch.setattr(
-        "agent_run.github_auth._create_app_jwt",
+        'agent_run.adapters.auth.app._create_app_jwt',
         lambda *_arguments, **_options: "jwt",
     )
     original_read = http.client.HTTPResponse.read
@@ -343,7 +382,7 @@ def test_installation_scopes_are_independent(
     profile = GitHubAppProfile("123", "456", tmp_path / "key")
     profile.private_key_path.write_text("test-key")
     profile.private_key_path.chmod(0o600)
-    monkeypatch.setattr("agent_run.github_auth._create_app_jwt", lambda *a, **kw: "jwt")
+    monkeypatch.setattr('agent_run.adapters.auth.app._create_app_jwt', lambda *a, **kw: "jwt")
     requests: list[urllib.request.Request] = []
     granted = {"contents": "write", "metadata": "read", "workflows": "write",
                "profile": "write", "organization_projects": "admin"}
@@ -368,7 +407,7 @@ def test_installation_scopes_are_independent(
                 body["repositories"] = [{"full_name": repository}]
         return io.BytesIO(json.dumps(body).encode())
 
-    monkeypatch.setattr("agent_run.github_auth.urllib.request.urlopen", respond)
+    monkeypatch.setattr('agent_run.adapters.auth.app.urllib.request.urlopen', respond)
     credential = mint_installation_credential(profile, read_only=read_only, repository=repository)
     payload = json.loads(requests[-1].data)
     assert payload.get("permissions") == (expected if read_only else None)
@@ -393,30 +432,39 @@ def test_installation_response_cannot_broaden_selected_scope(
     profile = GitHubAppProfile("123", "456", tmp_path / "key")
     profile.private_key_path.write_text("test-key")
     profile.private_key_path.chmod(0o600)
-    monkeypatch.setattr("agent_run.github_auth._create_app_jwt", lambda *a, **kw: "jwt")
+    monkeypatch.setattr('agent_run.adapters.auth.app._create_app_jwt', lambda *a, **kw: "jwt")
     def respond(request: urllib.request.Request, **kwargs: Any) -> io.BytesIO:
         granted = {"contents": "write", "workflows": "write", "profile": "write"}
         body = {"permissions": granted if request.get_method() == "GET" else permissions,
                 "account": {"login": "acme"}, "token": "secret",
                 "expires_at": "2030-01-01T00:00:00Z"}
         return io.BytesIO(json.dumps(body).encode())
-    monkeypatch.setattr("agent_run.github_auth.urllib.request.urlopen", respond)
+    monkeypatch.setattr('agent_run.adapters.auth.app.urllib.request.urlopen', respond)
     with pytest.raises(GitHubCredentialError, match="read-only"):
         mint_installation_credential(profile, read_only=True)
     with pytest.raises(GitHubCredentialError, match="does not belong"):
         mint_installation_credential(profile, repository="other/repo")
 
 
-def test_renewal_recovers_and_exhaustion_is_sanitized():
+def test_renewal_recovers_and_exhaustion_is_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     now = [100.0]
     delivered = []
     updated = threading.Event()
     failure = threading.Event()
     errors = []
     calls = 0
+    failed_provider = {number: threading.Event() for number in (2, 4)}
+    release_provider = {number: threading.Event() for number in (2, 4)}
+    parked_call = 0
+
     def provider():
         nonlocal calls
         calls += 1
+        if calls in failed_provider:
+            failed_provider[calls].set()
+            assert release_provider[calls].wait(2), "failed provider was not released"
         if calls in (2, 4, 5):
             raise RuntimeError("secret-sensitive-token")
         return ReadCredential("A" if calls == 1 else "B", now[0] + 20)
@@ -426,34 +474,57 @@ def test_renewal_recovers_and_exhaustion_is_sanitized():
     lifecycle = RenewableCredential(provider, on_update=deliver,
         on_exhausted=lambda error: (errors.append(error), failure.set()),
         clock=lambda: now[0], renewal_margin=5, renewal_window=2)
+    original_wait = lifecycle._condition.wait
+
+    def parked_wait(timeout: float | None = None) -> bool:
+        nonlocal parked_call
+        if threading.current_thread() is lifecycle._renewal_thread:
+            # Provider entry and on_update both precede renewal bookkeeping.
+            # Only this wait proves retry_at/the next window is established.
+            parked_call = calls
+            lifecycle._condition.notify_all()
+        return original_wait(timeout)
+
+    monkeypatch.setattr(lifecycle._condition, "wait", parked_wait)
+
+    def advance_after_park(expected_call: int, value: float) -> None:
+        with lifecycle._condition:
+            assert lifecycle._condition.wait_for(
+                lambda: parked_call == expected_call, timeout=2,
+            ), f"renewal did not finish bookkeeping after call {expected_call}"
+            now[0] = value
+            lifecycle._condition.notify_all()
+
     try:
         lifecycle.start()
         updated.clear()
-        now[0] = 115
-        lifecycle.wake()
-        deadline = time.monotonic() + 2
-        while calls < 2 and time.monotonic() < deadline:
-            time.sleep(.001)
+        advance_after_park(1, 115)
+        assert failed_provider[2].wait(2)
         assert calls == 2
         assert delivered == ["A"]
-        now[0] = 116
-        lifecycle.wake()
+        # Controlled regression: the old calls==2 barrier is satisfied while
+        # the failure has not even returned, so advancing time here races.
+        assert parked_call == 1
+        release_provider[2].set()
+        advance_after_park(2, 116)
         assert updated.wait(2)
         assert delivered == ["A", "B"]
-        now[0] = 131
-        lifecycle.wake()
-        deadline = time.monotonic() + 2
-        while calls < 4 and time.monotonic() < deadline:
-            time.sleep(.001)
+        advance_after_park(3, 131)
+        assert failed_provider[4].wait(2)
         assert calls == 4
-        now[0] = 137
-        lifecycle.wake()
+        assert parked_call == 3
+        release_provider[4].set()
+        advance_after_park(4, 137)
         assert failure.wait(2)
         assert "resume" in errors[0]
         assert "secret" not in errors[0]
-    finally:
         lifecycle.close()
-    assert not lifecycle._renewal_thread.is_alive()
+        assert not lifecycle._renewal_thread.is_alive()
+        assert not lifecycle._expiry_thread.is_alive()
+    finally:
+        for release in release_provider.values():
+            release.set()
+        lifecycle.close()
 
 
 def test_expired_old_token_stops_before_retry_window_ends():
@@ -501,7 +572,7 @@ def test_scope_instances_do_not_share_delivered_tokens():
     (lambda: (_ for _ in ()).throw(OSError("secret credential")), "provider unavailable"),
 ])
 def test_initial_credential_failure_has_safe_actionable_category(provider, category):
-    from agent_run.credential_lifecycle import WorkerCredentialError
+    from agent_run.adapters.auth.credential_lifecycle import WorkerCredentialError
     lifecycle = RenewableCredential(provider, on_update=lambda value: None)
     with pytest.raises(WorkerCredentialError, match=category) as caught:
         lifecycle.start()
@@ -518,4 +589,19 @@ def test_private_key_input_is_bounded_and_private(tmp_path, kind):
         key.write_bytes(b"x" * (65537 if kind == "oversized" else 10))
         key.chmod(0o644 if kind == "public" else 0o600)
     with pytest.raises(GitHubCredentialError, match="private key"):
+        mint_installation_credential(GitHubAppProfile("123", "456", key))
+
+
+def test_malformed_private_key_is_rejected_before_issuing_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = tmp_path / "malformed.pem"
+    key.write_text("synthetic malformed private key")
+    key.chmod(0o600)
+
+    def no_request(*args: object, **kwargs: object) -> None:
+        pytest.fail("malformed signing input must not issue an installation credential")
+
+    monkeypatch.setattr('agent_run.adapters.auth.app.urllib.request.urlopen', no_request)
+    with pytest.raises(GitHubCredentialError, match="could not sign GitHub App JWT"):
         mint_installation_credential(GitHubAppProfile("123", "456", key))

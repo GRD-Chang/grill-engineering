@@ -59,14 +59,8 @@ jobs:
   product-tests:
     needs: selection
     if: needs.selection.outputs.product == 'true'
-    # 两个独立 runner；每个仍使用两个 worker，保留有界退出保障。
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      max-parallel: 2
-      matrix:
-        shard: [0, 1]
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -79,30 +73,75 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes bubblewrap
+          sudo apt-get install --no-install-recommends --yes bubblewrap gcc
+
+      - name: Prepare verified SQLite runtime
+        run: python tests/support/prepare_sqlite.py --output-dir "$RUNNER_TEMP/agent-run-sqlite"
 
       - name: Install product and development tools
         run: make test-bootstrap
 
+      - name: Test CI evidence rules
+        id: rules
+        run: PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s .github/ci -p 'test_*.py' -q
+
+      - name: Smoke test installed CLI
+        id: smoke
+        run: agent-run --help
+
+      - name: Run type checks
+        id: types
+        run: make typecheck
+
+      - name: Verify independent checks
+        if: always()
+        env:
+          RULES_RESULT: ${{ steps.rules.outcome }}
+          SMOKE_RESULT: ${{ steps.smoke.outcome }}
+          TYPE_RESULT: ${{ steps.types.outcome }}
+        run: |
+          test "$RULES_RESULT" = success
+          test "$SMOKE_RESULT" = success
+          test "$TYPE_RESULT" = success
+
+      - name: Require native environment capabilities
+        run: |
+          mkdir -p .test-results
+          python tests/support/report_environment.py --require-native > .test-results/native-capabilities.json
+
       - name: Run tests
-        run: make test-report TEST_WORKERS=2 PYTEST_ARGS='-v --test-shard-count=2 --test-shard-index=${{ matrix.shard }}'
+        run: make test-report TEST_WORKERS=2 PYTEST_ARGS='-v'
+
+      - name: Record complete test evidence
+        run: python -B .github/ci/ci_evidence.py record --results .test-results
 
       - name: Upload test diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: test-diagnostics-shard-${{ matrix.shard }}
+          name: test-diagnostics
           path: .test-results/
           include-hidden-files: true
+          overwrite: true
           retention-days: 7
+
+      - name: Remove SQLite test runtime
+        if: always()
+        run: |
+          if [ -d "$RUNNER_TEMP/agent-run-sqlite" ]; then
+            rm -r -- "$RUNNER_TEMP/agent-run-sqlite"
+          fi
 
   quality:
     name: quality
     needs: [selection, product-tests]
-    # 显式汇总 skipped/failed/cancelled，避免依赖失败导致必需检查被跳过。
+    permissions:
+      contents: read
+      actions: read
+    # 保留必需检查；本 job 只验证选择、作业结果及同候选完整证据。
     if: always()
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 5
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -112,32 +151,31 @@ jobs:
           SELECTION_RESULT: ${{ needs.selection.result }}
         run: test "$SELECTION_RESULT" = success
 
-      - name: Set up Python
-        if: needs.selection.outputs.product == 'true'
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - name: Download product test diagnostics
+        if: needs.selection.outputs.product == 'true' && needs.product-tests.result == 'success'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          python-version: "3.11.16"
-
-      - name: Install system dependencies
-        if: needs.selection.outputs.product == 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes bubblewrap
-
-      - name: Install project and development tools
-        if: needs.selection.outputs.product == 'true'
-        run: make test-bootstrap
-
-      - name: Smoke test installed CLI
-        if: needs.selection.outputs.product == 'true'
-        run: agent-run --help
+          name: test-diagnostics
+          path: ${{ runner.temp }}/test-diagnostics
 
       - name: Run tests
-        if: needs.selection.outputs.product == 'true'
         env:
           PRODUCT_RESULT: ${{ needs.product-tests.result }}
-        run: test "$PRODUCT_RESULT" = success
+          PRODUCT_SELECTED: ${{ needs.selection.outputs.product }}
+          CHECKS_SELECTED: ${{ needs.selection.outputs.product == 'true' }}
+        run: python3 -B .github/ci/ci_evidence.py verify --results "$RUNNER_TEMP/test-diagnostics"
 
-      - name: Run type checks
-        if: needs.selection.outputs.product == 'true'
-        run: python -m mypy src/agent_run
+      - name: Report CI costs
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B .github/ci/ci_costs.py --output "$RUNNER_TEMP/ci-costs"
+
+      - name: Upload CI costs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-costs
+          path: ${{ runner.temp }}/ci-costs/
+          overwrite: true
+          retention-days: 7

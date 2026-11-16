@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import agent_run.install.runtime_tree
+import agent_run.runtime.process_cleanup
+
 import json
 import fcntl
 import os
@@ -14,16 +17,11 @@ from typing import Any, Callable, Iterator
 
 import pytest
 
-from agent_run.runner_probe import RunnerProbeBackend, RunnerProbeError
-from agent_run import runner_installer
-from support.seeding import seed_run, write_fixture
+from agent_run.install.probe import RunnerProbeBackend, RunnerProbeError
+import agent_run.install.installer as runner_installer
 from support.fast_runner_installer import build_candidate as fast_build_candidate
 from support.offline_install import offline_pip_environment, prepare_offline_wheels
-
-from support.state import include_in_state_snapshot, read_run, run_refs, snapshot_run, write_run_fixture
-
-
-PROJECT_ROOT = Path(__file__).parents[1]
+from support.offline_install import _source_tree, _fake_codex, _run, _data_root, PROJECT_ROOT
 
 
 @pytest.mark.parametrize(
@@ -85,6 +83,85 @@ def test_build_output_timeout_cleans_process(
     assert started[0].stdout is not None and started[0].stdout.closed
 
 
+def test_build_output_retains_only_the_merged_diagnostic_tail() -> None:
+    limit = runner_installer._MAX_BUILD_OUTPUT_BYTES
+    baseline = agent_run.runtime.process_cleanup.capture_process_scope()
+    process = subprocess.Popen(
+        [sys.executable, '-c',
+         f"import os\nos.write(1, b'x' * {limit + 100})\nos.write(2, b'err-tail')"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
+    )
+    try:
+        assert runner_installer._read_build_output(
+            process, adopted_baseline=baseline,
+        ) == b'x' * (limit - 8) + b'err-tail'
+        assert process.returncode == 0
+    finally:
+        if process.poll() is None:
+            agent_run.runtime.process_cleanup.terminate_process_group(process, adopted_baseline=baseline)
+        process.stdout.close()
+
+
+def test_git_status_detects_clean_and_changed_local_source(git_repo: Path) -> None:
+    assert runner_installer._git_has_changes(git_repo) is False
+    (git_repo / 'new-source.py').write_text('changed = True\n')
+    assert runner_installer._git_has_changes(git_repo) is True
+
+
+@pytest.mark.parametrize('behavior', ['first_byte', 'nonzero', 'read_timeout', 'eof_timeout'])
+def test_git_status_first_byte_deadlines_and_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, behavior: str,
+) -> None:
+    executable = tmp_path / 'git'
+    program = 'import os, signal\n'
+    if behavior == 'first_byte':
+        program += "os.write(1, b'x')\nsignal.pause()\n"
+    elif behavior == 'nonzero':
+        program += 'raise SystemExit(7)\n'
+    else:
+        if behavior == 'eof_timeout':
+            program += 'os.close(1)\n'
+        program += 'signal.pause()\n'
+    executable.write_text(f'#!{sys.executable}\n' + program)
+    executable.chmod(0o700)
+    monkeypatch.setenv('PATH', str(tmp_path))
+    started = []
+    waits = []
+    cleanups = []
+    original_popen = subprocess.Popen
+    original_cleanup = agent_run.runtime.process_cleanup.terminate_process_group
+
+    def start(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        started.append(process)
+        original_wait = process.wait
+
+        def wait(timeout=None):
+            waits.append(timeout)
+            return original_wait(timeout=timeout)
+
+        process.wait = wait
+        return process
+
+    def cleanup(process, **kwargs):
+        try:
+            if not cleanups:
+                assert process.stdout.closed == (behavior == 'nonzero')
+        finally:
+            cleanups.append(process)
+            original_cleanup(process, **kwargs)
+
+    monkeypatch.setattr(runner_installer.subprocess, 'Popen', start)
+    monkeypatch.setattr(runner_installer, '_terminate_process_group', cleanup)
+    assert runner_installer._git_has_changes(tmp_path) is (
+        True if behavior == 'first_byte' else None
+    )
+    assert started[0].poll() is not None
+    assert started[0].stdout.closed
+    if behavior == 'eof_timeout':
+        assert 3 in waits  # EOF starts the original independent exit window.
+
+
 @pytest.mark.parametrize("child_code", [
     "import time; time.sleep(60)",
     "import os\nwhile True: os.write(1, b'backend progress' * 512)",
@@ -104,7 +181,7 @@ def test_build_completed_with_child_holding_output_is_cleaned(
         encoding="utf-8",
     )
     fake_python.chmod(0o755)
-    with runner_installer.child_subreaper():
+    with agent_run.runtime.process_cleanup.child_subreaper():
         assert runner_installer._run_pip_install(fake_python, tmp_path) == 0
     _assert_process_gone(child_pid)
 
@@ -131,171 +208,31 @@ def offline_install_environment(
     return environment
 
 
-def _source_tree(tmp_path: Path, *, real_install: bool = False) -> Path:
-    source = tmp_path / "source"
-    source.mkdir()
-    shutil.copy2(PROJECT_ROOT / "install.sh", source / "install.sh")
-    shutil.copy2(PROJECT_ROOT / "pyproject.toml", source / "pyproject.toml")
-    shutil.copy2(PROJECT_ROOT / "LICENSE", source / "LICENSE")
-    shutil.copytree(
-        PROJECT_ROOT / "src",
-        source / "src",
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.egg-info"),
-    )
-    if not real_install:
-        shutil.copy2(
-            PROJECT_ROOT / "tests" / "support" / "fast_runner_installer.py",
-            source / "fast_runner_installer.py",
-        )
-        (source / "install.sh").write_text(
-            "#!/bin/sh\n"
-            "set -eu\n"
-            'SOURCE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)\n'
-            'exec python3 "$SOURCE_DIR/fast_runner_installer.py" "$@" '
-            '--source "$SOURCE_DIR"\n',
-            encoding="utf-8",
-        )
-    (source / "install.sh").chmod(0o755)
-    return source
-
-
-def _assert_clean_installer_source(source: Path, environment: dict[str, str]) -> None:
-    status = subprocess.run(
-        ["git", "status", "--porcelain"], cwd=source, env=environment,
-        check=True, capture_output=True, text=True,
-    )
-    assert status.stdout == ""
-    assert not (source / "build").exists()
-    assert not (source / "src" / "agent_run" / "__pycache__").exists()
-    assert not list(source.glob("*.egg-info"))
-
-
 @pytest.fixture
 def fast_in_process_build(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(runner_installer, "_build_candidate", fast_build_candidate)
 
 
-def _fake_codex(
-    tmp_path: Path,
-    *,
-    status: str = "ok",
-    behavior: str = "success",
-) -> tuple[Path, Path, Path]:
-    directory = tmp_path / "bin"
-    directory.mkdir()
-    count = tmp_path / "codex-count"
-    status_file = tmp_path / "codex-status"
-    status_file.write_text(status, encoding="utf-8")
-    behavior_file = tmp_path / "codex-behavior"
-    behavior_file.write_text(behavior, encoding="utf-8")
-    pid_file = tmp_path / "codex-pid"
-    descendant_pid_file = tmp_path / "codex-descendant-pid"
-    cwd_file = tmp_path / "codex-cwd"
-    path_file = tmp_path / "codex-path"
-    script = directory / "codex"
-    script.write_text(
-        "#!/usr/bin/env python3\n"
-        "import json\n"
-        "import os\n"
-        "import pathlib\n"
-        "import sys\n"
-        "import time\n"
-        f"count = pathlib.Path({str(count)!r})\n"
-        f"status_file = pathlib.Path({str(status_file)!r})\n"
-        f"behavior_file = pathlib.Path({str(behavior_file)!r})\n"
-        f"pid_file = pathlib.Path({str(pid_file)!r})\n"
-        f"descendant_pid_file = pathlib.Path({str(descendant_pid_file)!r})\n"
-        f"cwd_file = pathlib.Path({str(cwd_file)!r})\n"
-        f"path_file = pathlib.Path({str(path_file)!r})\n"
-        "current = int(count.read_text() if count.exists() else '0')\n"
-        "count.write_text(str(current + 1))\n"
-        "pid_file.write_text(str(os.getpid()))\n"
-        "cwd_file.write_text(str(pathlib.Path.cwd()))\n"
-        "path_file.write_text(os.environ['PATH'])\n"
-        "behavior = behavior_file.read_text()\n"
-        "if behavior in {'nonzero', 'not-logged-in'}:\n"
-        "    sys.exit(7)\n"
-        "if behavior == 'missing':\n"
-        "    sys.exit(0)\n"
-        "if behavior == 'large':\n"
-        "    output = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
-        "    output.write_bytes(b'x' * (16 * 1024 + 1))\n"
-        "    sys.exit(0)\n"
-        "if behavior == 'timeout':\n"
-        "    time.sleep(130)\n"
-        "if behavior == 'sleep':\n"
-        "    time.sleep(2)\n"
-        "if behavior == 'wait-for-release':\n"
-        "    deadline = time.monotonic() + 30\n"
-        "    while not pid_file.with_name('codex-release').exists():\n"
-        "        if time.monotonic() >= deadline:\n"
-        "            sys.exit(8)\n"
-        "        time.sleep(0.01)\n"
-        "if behavior == 'fork-setsid':\n"
-        "    if '--output-last-message' not in sys.argv:\n"
-        "        sys.exit(0)\n"
-        "    child = os.fork()\n"
-        "    if child == 0:\n"
-        "        descendant_pid_file.write_text(str(os.getpid()))\n"
-        "        os.setsid()\n"
-        "        time.sleep(30)\n"
-        "    for _ in range(100):\n"
-        "        if descendant_pid_file.exists():\n"
-        "            break\n"
-        "        time.sleep(0.01)\n"
-        "    output = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
-        "    output.write_text(json.dumps({'status': status_file.read_text()}))\n"
-        "    os._exit(0)\n"
-        "schema = pathlib.Path(sys.argv[sys.argv.index('--output-schema') + 1])\n"
-        "assert json.loads(schema.read_text()) == {\n"
-        "    'type': 'object',\n"
-        "    'additionalProperties': False,\n"
-        "    'properties': {'status': {'type': 'string', 'enum': ['ok']}},\n"
-        "    'required': ['status'],\n"
-        "}\n"
-        "if behavior == 'wrong-result':\n"
-        "    output = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
-        "    output.write_text(json.dumps({'status': 'not-ok'}))\n"
-        "    sys.exit(0)\n"
-        "output = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])\n"
-        "output.write_text(json.dumps({'status': status_file.read_text()}))\n",
-        encoding="utf-8",
-    )
-    script.chmod(0o755)
-    return directory, count, status_file
+def test_real_build_ignores_stale_setuptools_output_without_modifying_source(
+    tmp_path: Path, offline_install_environment: dict[str, str],
+) -> None:
+    source = _source_tree(tmp_path, real_install=True)
+    stale = source / "build" / "lib" / "agent_run" / "retired_module.py"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("raise RuntimeError('obsolete module from a previous build')\n")
+    # A package resource named build is source data, not setuptools output.
+    resource = source / "src" / "agent_run" / "resources" / "build" / "source.md"
+    resource.parent.mkdir(parents=True, exist_ok=True)
+    resource.write_text("Preserve current package data.\n")
+    candidate = tmp_path / "candidate"
 
+    runner_installer._build_candidate(candidate, source)
 
-def _run(
-    source: Path,
-    home: Path,
-    fake_bin: Path,
-    *arguments: str,
-    path: str | None = None,
-    cwd: Path | None = None,
-    environment: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    process_environment = (
-        os.environ.copy() if environment is None else environment.copy()
-    )
-    process_environment.update(
-        {
-            "HOME": str(home),
-            "XDG_DATA_HOME": str(home / "data"),
-            "XDG_CONFIG_HOME": str(home / "config"),
-            "XDG_STATE_HOME": str(home / "state"),
-            "PATH": path
-            if path is not None
-            else f"{fake_bin}{os.pathsep}{process_environment.get('PATH', '')}",
-        }
-    )
-    return subprocess.run(
-        [str(source / "install.sh"), *arguments],
-        cwd=cwd or source,
-        env=process_environment,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    installed = runner_installer._runtime_package(candidate)
+    assert not (installed / "retired_module.py").exists()
+    assert (installed / "resources" / "build" / "source.md").read_bytes() == resource.read_bytes()
+    assert stale.exists()
+    assert not list(tmp_path.glob("build-source-*"))
 
 
 def _signal_at_marker(
@@ -406,10 +343,6 @@ def _path_without_codex(tmp_path: Path) -> str:
     return str(directory)
 
 
-def _data_root(home: Path) -> Path:
-    return home / "data" / "agent-run"
-
-
 def _active_snapshot(home: Path) -> Path:
     return (_data_root(home) / "active" / "current").resolve()
 
@@ -449,6 +382,15 @@ def _file_tree(root: Path) -> dict[str, bytes]:
         for path in sorted(root.rglob("*"))
         if path.is_file() and include_in_state_snapshot(path)
     }
+
+
+def include_in_state_snapshot(path: Path) -> bool:
+    """Keep persistent bytes without importing the retired Run object fixture."""
+    if path.name == "state.sqlite3-shm":
+        return not path.is_file()
+    if path.name == "state.sqlite3-wal" and path.is_file():
+        return path.stat().st_size > 0
+    return True
 
 
 def _managed_state_snapshot(
@@ -593,7 +535,7 @@ def test_install_freezes_source_and_reinstall_same_active_is_idempotent(
 ) -> None:
     source = _source_tree(tmp_path)
     fake_bin, count, _status_file = _fake_codex(tmp_path)
-    probe = source / "src/agent_run/prompt_text_context.py"
+    probe = source / 'src/agent_run/contracts/text_context.py'
     probe.write_text(
         probe.read_text() + '\nTEXTS["context/probe"]["en"] += "\\n候选包探针独有内容"\n',
         encoding="utf-8",
@@ -615,7 +557,7 @@ def test_install_freezes_source_and_reinstall_same_active_is_idempotent(
     first_snapshot = _active_snapshot(home)
     first_manifest = _manifest(first_snapshot)
     first_identity = first_manifest["content_identity"]
-    package = runner_installer.find_runtime_package(first_snapshot)
+    package = agent_run.install.runtime_tree.find_runtime_package(first_snapshot)
     default_method = package / "resources/en/methods/development.md"
     old_method = default_method.read_text(encoding="utf-8")
     assert first_manifest["source_provenance"] == {"kind": "source-directory"}
@@ -722,8 +664,9 @@ def test_probe_timeout_terminates_its_process_group(
     candidate = tmp_path / "candidate" / "lib" / "python3.11" / "site-packages" / "agent_run"
     candidate.mkdir(parents=True)
     (candidate / "__init__.py").write_text("__version__ = 'probe'\n", encoding="utf-8")
-    for module in PROJECT_ROOT.glob("src/agent_run/prompt_text_*.py"):
-        shutil.copyfile(module, candidate / module.name)
+    for module in PROJECT_ROOT.glob("src/agent_run/contracts/text_*.py"):
+        (candidate / "contracts").mkdir(exist_ok=True)
+        shutil.copyfile(module, candidate / "contracts" / module.name)
     fake_codex = tmp_path / "codex"
     fake_codex.write_text(
         "#!/usr/bin/python3\nimport time\ntime.sleep(10)\n", encoding="utf-8"
@@ -741,8 +684,9 @@ def test_probe_success_terminates_descendants_after_codex_exits(
     candidate = tmp_path / "candidate" / "lib" / "python3.11" / "site-packages" / "agent_run"
     candidate.mkdir(parents=True)
     (candidate / "__init__.py").write_text("__version__ = 'probe'\n", encoding="utf-8")
-    for module in PROJECT_ROOT.glob("src/agent_run/prompt_text_*.py"):
-        shutil.copyfile(module, candidate / module.name)
+    for module in PROJECT_ROOT.glob("src/agent_run/contracts/text_*.py"):
+        (candidate / "contracts").mkdir(exist_ok=True)
+        shutil.copyfile(module, candidate / "contracts" / module.name)
     child_pid_file = tmp_path / "child.pid"
     fake_codex = tmp_path / "codex"
     fake_codex.write_text(
@@ -794,7 +738,7 @@ def test_candidate_probe_timeout_cleans_nested_process_and_probe_temporary_files
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = _source_tree(tmp_path)
-    installer = source / "src" / "agent_run" / "runner_installer.py"
+    installer = source / 'src/agent_run/install/installer.py'
     installer.write_text(
         installer.read_text(encoding="utf-8").replace(
             "_CANDIDATE_PROBE_TIMEOUT_SECONDS = 150.0",
@@ -802,7 +746,7 @@ def test_candidate_probe_timeout_cleans_nested_process_and_probe_temporary_files
         ),
         encoding="utf-8",
     )
-    probe = source / "src" / "agent_run" / "runner_probe.py"
+    probe = source / 'src/agent_run/install/probe.py'
     probe.write_text(
         probe.read_text(encoding="utf-8").replace(
             "PROBE_TIMEOUT_SECONDS = 120.0", "PROBE_TIMEOUT_SECONDS = 10.0"
@@ -877,12 +821,49 @@ def test_candidate_probe_timeout_cleans_nested_process_and_probe_temporary_files
     assert not list((_data_root(home) / "snapshots").glob("*"))
 
 
+@pytest.mark.parametrize("output", ["complete", "stdout", "stderr"])
+def test_candidate_probe_captures_both_streams_and_rejects_overflow_without_eof(
+    output: str,
+) -> None:
+    limit = runner_installer._MAX_CANDIDATE_PROBE_OUTPUT_BYTES
+    program = (
+        f"import os\nos.write(1, b'o' * {limit})\nos.write(2, b'e' * {limit})\n"
+        if output == "complete" else
+        f"import os, signal\nos.write({1 if output == 'stdout' else 2}, b'x' * {limit + 1})\n"
+        "signal.pause()\n"
+    )
+    baseline = agent_run.runtime.process_cleanup.capture_process_scope()
+    process = subprocess.Popen(
+        [sys.executable, "-c", program], stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, start_new_session=True,
+    )
+    try:
+        if output == "complete":
+            assert runner_installer._read_candidate_probe_output(
+                process, timeout_seconds=2, adopted_baseline=baseline,
+            ) == (b'o' * limit, b'e' * limit)
+        else:
+            # The writer never closes its pipe: rejection must precede EOF
+            # and report overflow rather than exhausting the read deadline.
+            with pytest.raises(runner_installer.InstallerError, match="output is too large"):
+                runner_installer._read_candidate_probe_output(
+                    process, timeout_seconds=2, adopted_baseline=baseline,
+                )
+        assert process.poll() is not None
+        assert process.stdout.closed and process.stderr.closed
+    finally:
+        if process.poll() is None:
+            agent_run.runtime.process_cleanup.terminate_process_group(process, adopted_baseline=baseline)
+        process.stdout.close()
+        process.stderr.close()
+
+
 def test_candidate_probe_inner_timeout_kills_forked_codex_children(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = _source_tree(tmp_path)
-    installer = source / "src" / "agent_run" / "runner_installer.py"
+    installer = source / 'src/agent_run/install/installer.py'
     installer.write_text(
         installer.read_text(encoding="utf-8").replace(
             "_CANDIDATE_PROBE_TIMEOUT_SECONDS = 150.0",
@@ -890,7 +871,7 @@ def test_candidate_probe_inner_timeout_kills_forked_codex_children(
         ),
         encoding="utf-8",
     )
-    probe = source / "src" / "agent_run" / "runner_probe.py"
+    probe = source / 'src/agent_run/install/probe.py'
     probe.write_text(
         probe.read_text(encoding="utf-8").replace(
             "PROBE_TIMEOUT_SECONDS = 120.0", "PROBE_TIMEOUT_SECONDS = 0.2"
@@ -970,7 +951,7 @@ def test_compatibility_check_executes_candidate_probe_code(
         fake_bin
     )
     first_identity = _manifest(_active_snapshot(home))["content_identity"]
-    probe = source / "src" / "agent_run" / "runner_probe.py"
+    probe = source / 'src/agent_run/install/probe.py'
     probe.write_text(
         probe.read_text(encoding="utf-8").replace(
             "raise SystemExit(main())", "raise SystemExit(3)"
@@ -1002,8 +983,10 @@ def test_candidate_probe_ignores_pythonpath_outside_the_snapshot(
 
     shadow_package = tmp_path / "shadow" / "agent_run"
     shadow_package.mkdir(parents=True)
+    (shadow_package / "install").mkdir()
+    (shadow_package / "install/__init__.py").write_text("\n", encoding="utf-8")
     (shadow_package / "__init__.py").write_text("\n", encoding="utf-8")
-    (shadow_package / "runner_probe.py").write_text(
+    (shadow_package / "install/probe.py").write_text(
         "raise SystemExit(7)\n", encoding="utf-8"
     )
     monkeypatch.setenv("PYTHONPATH", str(shadow_package.parent.parent))
@@ -1024,7 +1007,7 @@ def test_compatibility_check_rejects_schema_drift_in_candidate_probe(
     fake_bin, count, _status_file = _fake_codex(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
-    probe = source / "src" / "agent_run" / "runner_probe.py"
+    probe = source / 'src/agent_run/install/probe.py'
     probe.write_text(
         probe.read_text(encoding="utf-8").replace('"enum": ["ok"]', '"enum": ["wrong"]'),
         encoding="utf-8",
@@ -1097,7 +1080,6 @@ def test_install_rejects_managed_paths_inside_source_without_writing_source(
     [
         "build",
         "missing_codex",
-        "not_logged_in",
         "nonzero",
         "timeout",
         "missing_output",
@@ -1125,13 +1107,11 @@ def test_public_install_failures_preserve_existing_state(
         (source / ".agent-run-test-build-failure").touch()
     elif failure == "missing_codex":
         path = _path_without_codex(tmp_path)
-    elif failure == "not_logged_in":
-        (tmp_path / "codex-behavior").write_text("not-logged-in", encoding="utf-8")
     elif failure == "nonzero":
         (tmp_path / "codex-behavior").write_text("nonzero", encoding="utf-8")
     elif failure == "timeout":
         (tmp_path / "codex-behavior").write_text("timeout", encoding="utf-8")
-        probe = source / "src" / "agent_run" / "runner_probe.py"
+        probe = source / 'src/agent_run/install/probe.py'
         probe.write_text(
             probe.read_text(encoding="utf-8").replace(
                 "PROBE_TIMEOUT_SECONDS = 120.0", "PROBE_TIMEOUT_SECONDS = 0.2"
@@ -1164,7 +1144,7 @@ def _write_activation_fault_sitecustomize(
         "import os\n"
         "import sys\n"
         "\n"
-        "if sys.argv and sys.argv[0].endswith('runner_installer.py'):\n"
+        "if sys.argv and sys.argv[0].endswith('installer.py'):\n"
         f"    fault = {fault!r}\n"
         f"    active = {str(data_root / 'active')!r}\n"
         f"    generations = {str(data_root / 'generations')!r}\n"
@@ -1293,7 +1273,7 @@ def test_public_signal_during_post_activation_cleanup_keeps_new_generation_compl
         "__version__ = 'c'\n", encoding="utf-8"
     )
     marker = tmp_path / "post-activation-cleanup-started"
-    installer = source / "src" / "agent_run" / "runner_installer.py"
+    installer = source / 'src/agent_run/install/installer.py'
     installer.write_text(
         installer.read_text(encoding="utf-8").replace(
             "            try:\n                warnings = [\n",
@@ -1354,7 +1334,7 @@ def test_public_signal_before_candidate_creation_cleans_preexisting_staging(
         "__version__ = 'c'\n", encoding="utf-8"
     )
     marker = tmp_path / "preflight-started"
-    installer = source / "src" / "agent_run" / "runner_installer.py"
+    installer = source / 'src/agent_run/install/installer.py'
     installer.write_text(
         installer.read_text(encoding="utf-8").replace(
             "    _check_prerequisites(source)\n",
@@ -1397,7 +1377,7 @@ def test_public_idempotent_signal_restores_profile_and_entry(
     home = tmp_path / "home"
     home.mkdir()
     marker = tmp_path / "idempotent-cleanup-started"
-    installer = source / "src" / "agent_run" / "runner_installer.py"
+    installer = source / 'src/agent_run/install/installer.py'
     installer.write_text(
         installer.read_text(encoding="utf-8").replace(
             "            try:\n                _ensure_profile(paths)\n                _ensure_stable_entry(paths)\n                warnings = [\n",
@@ -1619,338 +1599,6 @@ def test_profile_path_is_unique_and_available_to_a_login_shell(tmp_path: Path) -
     assert uninstall.returncode == 0, uninstall.stderr
     assert profile_path.read_text(encoding="utf-8") == "before\n"
     assert profile_path.stat().st_mode & 0o777 == 0o644
-
-
-def test_public_quickstart_smoke_uses_login_shell_and_cleans_resources(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    offline_install_environment: dict[str, str], capsys: pytest.CaptureFixture[str],
-) -> None:
-    source = _source_tree(tmp_path, real_install=True)
-    source = source.rename(tmp_path / "源码 archive with spaces")
-    fake_bin, count, _status_file = _fake_codex(tmp_path, behavior="fork-setsid")
-    isolated_environment, tool_directory, markers = (
-        _isolated_quickstart_environment(tmp_path, fake_bin)
-    )
-    # Exercise the new shell boundary with the same real offline build, rather
-    # than adding another heavyweight build. Runtime readiness remains negative
-    # in this deliberately isolated host (no real user systemd or credentials).
-    shutil.copy2(PROJECT_ROOT / "setup.sh", source / "setup.sh")
-    for name in ("uname", "sed", "tr", "awk", "timeout"):
-        executable = shutil.which(name, path=os.defpath)
-        assert executable is not None
-        (tool_directory / name).symlink_to(executable)
-    isolated_environment.update(offline_install_environment)
-    isolated_path = isolated_environment["PATH"]
-    home = Path(isolated_environment["HOME"])
-    home.mkdir()
-    probe_tmp = Path(isolated_environment["TMPDIR"])
-    probe_tmp.mkdir()
-    monkeypatch.setenv("TMPDIR", str(probe_tmp))
-    shell = tool_directory / "bash"
-    git = str(tool_directory / "git")
-    # The real build covers source cleanliness and exact provenance;
-    # a separate initial installation would repeat the same expensive boundary.
-    for arguments in (
-        ["init", "-q", "-b", "main"],
-        ["config", "user.name", "Agent Run Quickstart Tests"],
-        ["config", "user.email", "agent-run-quickstart@example.invalid"],
-        ["add", "."],
-        ["commit", "-qm", "initial source"],
-    ):
-        subprocess.run([git, *arguments], cwd=source, env=isolated_environment, check=True)
-    source_commit = subprocess.run(
-        [git, "rev-parse", "HEAD"], cwd=source, env=isolated_environment,
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
-    provenance = {"kind": "git", "commit": source_commit, "ref": "main", "dirty": False}
-    _assert_clean_installer_source(source, isolated_environment)
-
-    assert shutil.which("agent-run", path=isolated_path) is None
-    pre_login = subprocess.run(
-        [str(shell), "--noprofile", "-c", "command -v agent-run"],
-        env=isolated_environment,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert pre_login.returncode == 1, pre_login.stderr
-    assert pre_login.stdout.strip() == ""
-
-    installed = subprocess.run(
-        [str(tool_directory / "sh"), str(source / "setup.sh"), "--yes"],
-        env=isolated_environment,
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=90,
-    )
-    assert installed.returncode == 2, installed.stdout + installed.stderr
-    assert "Runner 已安装但执行环境未就绪" in installed.stdout
-    assert (_data_root(home) / "active").exists()
-    assert (tmp_path / "codex-path").read_text(encoding="utf-8") == isolated_path
-    _assert_process_gone(tmp_path / "codex-descendant-pid")
-    assert not [marker for marker in markers if marker.exists()]
-    stable_entry = home / ".local" / "bin" / "agent-run"
-    assert stable_entry.is_symlink()
-    assert stable_entry.resolve() == _active_snapshot(home) / "bin" / "agent-run"
-    assert _manifest(_active_snapshot(home))["source_provenance"] == provenance
-    packaged_licenses = list(_active_snapshot(home).glob("lib/python*/site-packages/agent_run-*.dist-info/licenses/LICENSE"))
-    assert len(packaged_licenses) == 1
-    assert packaged_licenses[0].read_bytes() == (PROJECT_ROOT / "LICENSE").read_bytes()
-    package = runner_installer.find_runtime_package(_active_snapshot(home))
-    request_path = tmp_path / "preview-request.json"
-    source_resources = source / "src/agent_run/resources"
-    hidden_resources = source / "resources-hidden-for-installed-check"
-    source_resources.rename(hidden_resources)
-    try:
-        # Reuse this real installed snapshot for both languages and every body;
-        # source-only tests cannot detect a wheel omitting Markdown or JSON.
-        assert "PYTHONPATH" not in isolated_environment
-        for language in ("zh", "en"):
-            configured = subprocess.run(
-                [str(stable_entry), "settings", "configure", "--language", language, "--json"],
-                env=isolated_environment, cwd=tmp_path, capture_output=True, text=True, timeout=15,
-            )
-            assert configured.returncode == 0, configured.stdout + configured.stderr
-            requests = (
-                ("development", "development", {}),
-                ("repair", "development", {
-                    "repair_source": "acceptance", "acceptance_artifact": {"verdict": "reject"},
-                }),
-                ("acceptance", "review", {}),
-                ("publishing", "publication", {"acceptance_artifact": {"verdict": "accept"}}),
-            )
-            # Keep all eight installed-resource previews, but load the real
-            # installed interpreter once per language instead of four times.
-            preview_batch = subprocess.run(
-                [
-                    str(_active_snapshot(home) / "bin" / "python"), "-c",
-                    "import contextlib, io, json, pathlib, sys\n"
-                    "from agent_run.cli import main\n"
-                    "request = pathlib.Path(sys.argv[1])\n"
-                    "results = []\n"
-                    "for body, role, context in json.loads(sys.argv[2]):\n"
-                    "    request.write_text(json.dumps({'acceptance_scope': 'parent_only', **context}))\n"
-                    "    out, err = io.StringIO(), io.StringIO()\n"
-                    "    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):\n"
-                    "        code = main(['prompts', 'preview', '--role', role, '--request', str(request)])\n"
-                    "    results.append((body, code, out.getvalue(), err.getvalue()))\n"
-                    "print(json.dumps(results))\n",
-                    str(request_path), json.dumps(requests),
-                ],
-                env=isolated_environment, cwd=tmp_path, capture_output=True,
-                text=True, timeout=60,
-            )
-            assert preview_batch.returncode == 0, preview_batch.stdout + preview_batch.stderr
-            previews = json.loads(preview_batch.stdout)
-            assert len(previews) == len(requests)
-            for (body, _role, _context), (returned_body, code, output, error) in zip(
-                requests, previews, strict=True
-            ):
-                assert returned_body == body
-                assert code == 0, output + error
-                builtin = (package / f"resources/{language}/methods/{body}.md").read_text(
-                    encoding="utf-8",
-                ).strip()
-                assert builtin and builtin in output
-                language_instruction = "Use English" if language == "en" else "中文"
-                assert language_instruction in output
-    finally:
-        hidden_resources.rename(source_resources)
-
-    _assert_clean_installer_source(source, isolated_environment)
-
-    delivery = tmp_path / "delivery"
-    delivery.mkdir()
-    subprocess.run(
-        [git, "init", "-q", "-b", "main"],
-        cwd=delivery,
-        env=isolated_environment,
-        check=True,
-    )
-    subprocess.run(
-        [git, "config", "user.name", "Agent Run Quickstart Tests"],
-        cwd=delivery,
-        env=isolated_environment,
-        check=True,
-    )
-    subprocess.run(
-        [git, "config", "user.email", "agent-run-quickstart@example.invalid"],
-        cwd=delivery,
-        env=isolated_environment,
-        check=True,
-    )
-    (delivery / "README.md").write_text("# target\n", encoding="utf-8")
-    subprocess.run(
-        [git, "add", "README.md"], cwd=delivery, env=isolated_environment, check=True
-    )
-    subprocess.run(
-        [git, "commit", "-qm", "initial target"],
-        cwd=delivery,
-        env=isolated_environment,
-        check=True,
-    )
-    fixture = write_fixture(
-        delivery / "github.json",
-        issues={
-            "2": {
-                "number": 2,
-                "title": "Target ticket",
-                "body": "Run the target repository.",
-                "state": "OPEN",
-                "labels": ["ready-for-agent"],
-                "blocked_by": [],
-            }
-        },
-    )
-
-    entry_lookup = subprocess.run(
-        [str(shell), "--login", "-c", "command -v agent-run"],
-        env=isolated_environment,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert entry_lookup.returncode == 0, entry_lookup.stderr
-    entry = Path(entry_lookup.stdout.strip())
-    assert entry == home / ".local" / "bin" / "agent-run"
-
-    doctor = subprocess.run(
-        [
-            str(shell),
-            "--login",
-            "-c",
-            'cd "$1" && agent-run doctor --json',
-            "agent-run-quickstart",
-            str(delivery),
-        ],
-        env=isolated_environment,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert doctor.returncode == 0, doctor.stderr
-    doctor_report = json.loads(doctor.stdout)
-    assert doctor_report["checks"]["path"]["status"] == "ok"
-
-    first_run = subprocess.run(
-        [
-            str(shell),
-            "--login",
-            "-c",
-            'cd "$1" && agent-run --help',
-            "agent-run-quickstart",
-            str(delivery),
-        ],
-        env=isolated_environment,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert first_run.returncode == 0, first_run.stderr
-    assert "agent-run" in first_run.stdout
-    assert "start" not in first_run.stdout
-    assert "--new-run" not in first_run.stdout
-    seeded = seed_run(
-        delivery,
-        fixture,
-        extra_env={"XDG_DATA_HOME": str(home / "data")},
-    )
-    assert seeded.returncode == 0, seeded.stderr
-    managed_root = _data_root(home) / "repositories" / "example" / "project"
-    target_state_before_uninstall = _file_tree(managed_root)
-    assert target_state_before_uninstall
-    assert run_refs(managed_root / 'state')
-
-    count_before_repeat = int(count.read_text(encoding="utf-8"))
-    # The public setup above already built and installed the real wheel.
-    # Rebuild only the identical package tree to exercise idempotent activation.
-    with monkeypatch.context() as repeat_environment:
-        for name, value in isolated_environment.items():
-            repeat_environment.setenv(name, value)
-        repeat_environment.setattr(
-            runner_installer, "_build_candidate", fast_build_candidate
-        )
-        assert runner_installer.main(["--source", str(source)]) == 0
-    assert json.loads(capsys.readouterr().out)["idempotent"] is True
-    _assert_process_gone(tmp_path / "codex-descendant-pid")
-    assert int(count.read_text(encoding="utf-8")) == count_before_repeat
-    assert stable_entry.resolve() == _active_snapshot(home) / "bin" / "agent-run"
-    assert _manifest(_active_snapshot(home))["source_provenance"] == provenance
-    _assert_clean_installer_source(source, isolated_environment)
-    profile = (home / ".profile").read_text(encoding="utf-8")
-    assert profile.count("# >>> agent-run managed PATH >>>") == 1
-    assert profile.count("# <<< agent-run managed PATH <<<") == 1
-    assert len(list((_data_root(home) / "snapshots").iterdir())) == 1
-
-    # The real offline build above verifies the installed wheel and resources.
-    # The archive update, failed build and rollback exercise the same installer
-    # transaction with the fast build seam used by the lifecycle tests.
-    first_snapshot = _active_snapshot(home)
-    shutil.rmtree(source / ".git")
-    shutil.copy2(
-        PROJECT_ROOT / "tests/support/fast_runner_installer.py",
-        source / "fast_runner_installer.py",
-    )
-    (source / "install.sh").write_text(
-        "#!/bin/sh\n"
-        "set -eu\n"
-        'SOURCE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)\n'
-        'exec python3 "$SOURCE_DIR/fast_runner_installer.py" "$@" '
-        '--source "$SOURCE_DIR"\n',
-        encoding="utf-8",
-    )
-    (source / "install.sh").chmod(0o755)
-    version_file = source / "src/agent_run/__init__.py"
-    version_file.write_text(version_file.read_text() + "\n# archive update\n")
-    updated = _run(source, home, fake_bin, cwd=tmp_path,
-                   path=isolated_path, environment=isolated_environment)
-    assert updated.returncode == 0, updated.stderr
-    second_snapshot = _active_snapshot(home)
-    assert second_snapshot != first_snapshot
-    assert _manifest(second_snapshot)["source_provenance"] == {"kind": "source-directory"}
-    assert (_data_root(home) / "active/previous").resolve() == first_snapshot
-    failure_marker = source / ".agent-run-test-build-failure"
-    failure_marker.touch()
-    failed = _run(source, home, fake_bin, cwd=tmp_path,
-                  path=isolated_path, environment=isolated_environment)
-    assert failed.returncode == 1, failed.stdout + failed.stderr
-    assert _active_snapshot(home) == second_snapshot
-    assert (_data_root(home) / "active/previous").resolve() == first_snapshot
-    assert not list((_data_root(home) / "staging").iterdir())
-    still_usable = subprocess.run([str(stable_entry), "--help"], cwd=tmp_path,
-                                 env=isolated_environment, capture_output=True, timeout=15)
-    assert still_usable.returncode == 0
-    failure_marker.unlink()
-    rolled_back = _run(source, home, fake_bin, "--rollback", cwd=tmp_path,
-                      path=isolated_path, environment=isolated_environment)
-    assert rolled_back.returncode == 0, rolled_back.stderr
-    assert _active_snapshot(home) == first_snapshot
-    assert (_data_root(home) / "active/previous").resolve() == second_snapshot
-
-    uninstalled = _run(
-        source,
-        home,
-        fake_bin,
-        "--uninstall",
-        path=isolated_path,
-        environment=isolated_environment,
-    )
-    assert uninstalled.returncode == 0, uninstalled.stderr
-    assert not (home / ".local" / "bin" / "agent-run").exists()
-    assert (_data_root(home) / "install.lock").exists()
-    assert not (_data_root(home) / "active").exists()
-    assert not (_data_root(home) / "snapshots").exists()
-    assert not (_data_root(home) / "generations").exists()
-    assert not (_data_root(home) / "staging").exists()
-    profile_path = home / ".profile"
-    if profile_path.exists():
-        profile = profile_path.read_text(encoding="utf-8")
-        assert "# >>> agent-run managed PATH >>>" not in profile
-        assert "# <<< agent-run managed PATH <<<" not in profile
-    assert _file_tree(managed_root) == target_state_before_uninstall
-    assert not [marker for marker in markers if marker.exists()]
-    assert not list(probe_tmp.iterdir())
 
 
 def test_install_result_reports_current_path_across_install_and_update(
@@ -2525,13 +2173,29 @@ def test_rollback_does_not_probe_and_uninstall_preserves_user_data(
     assert second_identity != first_identity
     assert int(count.read_text()) == 2
 
+    entry = home / ".local" / "bin" / "agent-run"
+    settings_environment = {
+        key: value for key, value in os.environ.items() if key not in {"PYTHONPATH", "PYTHONHOME"}
+    }
+    settings_environment.update(HOME=str(home), XDG_CONFIG_HOME=str(home / "config"))
+    configured = subprocess.run(
+        [str(entry), "settings", "configure", "--language", "en", "--worker-github-source", "host", "--json"],
+        env=settings_environment,
+        text=True, capture_output=True, timeout=15,
+    )
+    assert configured.returncode == 0, configured.stdout + configured.stderr
+    assert json.loads(configured.stdout)["github"]["worker"] == {"source": "host"}
+    defaults = home / "config" / "agent-run" / "user-defaults.json"
+    defaults_before = defaults.read_bytes()
+
     rollback = _run(source, home, fake_bin, "--rollback")
     assert rollback.returncode == 0, rollback.stderr
     assert _manifest(_active_snapshot(home))["content_identity"] == first_identity
     assert int(count.read_text()) == 2
+    assert defaults.read_bytes() == defaults_before
 
     config = home / "config" / "agent-run"
-    config.mkdir(parents=True)
+    config.mkdir(parents=True, exist_ok=True)
     (config / "github-app.json").write_text("keep", encoding="utf-8")
     locator = home / "state" / "agent-run"
     locator.mkdir(parents=True)
@@ -2570,6 +2234,7 @@ def test_rollback_does_not_probe_and_uninstall_preserves_user_data(
     assert (managed_workspace / "state" / "run.json").read_text() == "keep records"
     assert managed_locator.read_text() == "keep index"
     assert profile.read_text(encoding="utf-8") == "before\n"
+    assert defaults.read_bytes() == defaults_before
 
     uninstall = _run(source, home, fake_bin, "--uninstall")
     assert uninstall.returncode == 0, uninstall.stderr
@@ -2582,6 +2247,7 @@ def test_rollback_does_not_probe_and_uninstall_preserves_user_data(
     assert (profile.read_text(encoding="utf-8") == "before\n")
     assert (_data_root(home) / "install.lock").exists()
     assert not (home / ".local" / "bin" / "agent-run").exists()
+    assert defaults.read_bytes() == defaults_before
 
 
 def test_non_managed_entry_is_not_overwritten(tmp_path: Path) -> None:
@@ -2718,188 +2384,6 @@ def test_concurrent_management_operations_have_one_winner_and_keep_invariants(
     assert not list((data_root / "staging").iterdir())
 
 
-def test_installed_runner_continues_a_delivery_run_and_does_not_write_incompatible_state(
-    tmp_path: Path,
-) -> None:
-    source = _source_tree(tmp_path)
-    fake_bin, _count, _status_file = _fake_codex(tmp_path)
-    home = tmp_path / "home"
-    home.mkdir()
-    delivery = tmp_path / "delivery"
-    delivery.mkdir()
-    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=delivery, check=True)
-    subprocess.run(
-        ["git", "config", "user.name", "Agent Run Tests"], cwd=delivery, check=True
-    )
-    subprocess.run(
-        ["git", "config", "user.email", "agent-run-tests@example.invalid"],
-        cwd=delivery,
-        check=True,
-    )
-    (delivery / "README.md").write_text("# delivery\n", encoding="utf-8")
-    subprocess.run(["git", "add", "README.md"], cwd=delivery, check=True)
-    subprocess.run(["git", "commit", "-qm", "initial delivery"], cwd=delivery, check=True)
-    fixture = write_fixture(
-        delivery / "github.json",
-        issues={
-            "2": {
-                "number": 2,
-                "title": "Ticket 2",
-                "body": "Implement ticket 2.",
-                "state": "OPEN",
-                "labels": ["ready-for-agent"],
-                "blocked_by": [],
-            }
-        },
-    )
-    assert _run(source, home, fake_bin).returncode == 0
-    cli_environment = os.environ.copy()
-    cli_environment.update(
-        {
-            "HOME": str(home),
-            "XDG_DATA_HOME": str(home / "data"),
-            "PATH": f"{home / '.local' / 'bin'}{os.pathsep}{cli_environment['PATH']}",
-        }
-    )
-    entry = home / ".local" / "bin" / "agent-run"
-    started = seed_run(
-        delivery,
-        fixture,
-        extra_env={"XDG_DATA_HOME": str(home / "data")},
-    )
-    assert started.returncode == 0, started.stderr
-    started_output = json.loads(started.stdout)
-    run_id = started_output["run_id"]
-    state_root = _data_root(home) / "repositories" / "example" / "project" / "state"
-    state_ref = (state_root, str(run_id))
-
-    (source / "src" / "agent_run" / "__init__.py").write_text(
-        "__version__ = 'second'\n", encoding="utf-8"
-    )
-    updated = _run(source, home, fake_bin)
-    assert updated.returncode == 0, updated.stderr
-    continued = subprocess.run(
-        [str(entry), "status", run_id, "--json"],
-        cwd=delivery,
-        env=cli_environment,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert continued.returncode == 0, continued.stderr
-    continued_output = json.loads(continued.stdout)
-    assert continued_output["run_id"] == run_id
-
-    rollback = _run(source, home, fake_bin, "--rollback")
-    assert rollback.returncode == 0, rollback.stderr
-    continued_after_rollback = subprocess.run(
-        [str(entry), "status", run_id, "--json"],
-        cwd=delivery,
-        env=cli_environment,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert continued_after_rollback.returncode == 0, continued_after_rollback.stderr
-    rollback_output = json.loads(continued_after_rollback.stdout)
-    assert rollback_output["run_id"] == run_id
-
-    incompatible = read_run(state_ref)
-    incompatible["schema_version"] = 1
-    write_run_fixture(state_ref, incompatible)
-    before = snapshot_run(state_ref)
-    locator_path = _data_root(home) / "run-locator.json"
-    locator_before = locator_path.read_bytes()
-    target_files_before = {
-        path.relative_to(state_root): path.read_bytes()
-        for path in (state_root).rglob("*")
-        if path.is_file() and include_in_state_snapshot(path)
-    }
-    target_paths_before = sorted(
-        path.relative_to(state_root)
-        for path in (state_root).rglob("*") if include_in_state_snapshot(path)
-    )
-    rejected = subprocess.run(
-        [
-            str(entry),
-            "run",
-            "1",
-            "--json",
-            "--github-fixture",
-            str(fixture),
-        ],
-        cwd=delivery,
-        env=cli_environment,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert rejected.returncode == 2
-    assert json.loads(rejected.stdout)["status"] == "incompatible_run_state"
-    assert snapshot_run(state_ref) == before
-    assert locator_path.read_bytes() == locator_before
-    assert {
-        path.relative_to(state_root): path.read_bytes()
-        for path in (state_root).rglob("*")
-        if path.is_file() and include_in_state_snapshot(path)
-    } == target_files_before
-    assert sorted(
-        path.relative_to(state_root)
-        for path in (state_root).rglob("*") if include_in_state_snapshot(path)
-    ) == target_paths_before
-
-    (source / "src" / "agent_run" / "__init__.py").write_text(
-        "__version__ = 'third'\n", encoding="utf-8"
-    )
-    installed_with_incompatible_state = _run(source, home, fake_bin)
-    assert installed_with_incompatible_state.returncode == 0, installed_with_incompatible_state.stderr
-    rejected_after_install = subprocess.run(
-        [str(entry), "run", "1", "--json", "--github-fixture", str(fixture)],
-        cwd=delivery,
-        env=cli_environment,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert rejected_after_install.returncode == 2
-    assert json.loads(rejected_after_install.stdout)["status"] == "incompatible_run_state"
-    assert snapshot_run(state_ref) == before
-    assert locator_path.read_bytes() == locator_before
-    assert {
-        path.relative_to(state_root): path.read_bytes()
-        for path in (state_root).rglob("*")
-        if path.is_file() and include_in_state_snapshot(path)
-    } == target_files_before
-    assert sorted(
-        path.relative_to(state_root)
-        for path in (state_root).rglob("*") if include_in_state_snapshot(path)
-    ) == target_paths_before
-
-    rolled_back_with_incompatible_state = _run(source, home, fake_bin, "--rollback")
-    assert rolled_back_with_incompatible_state.returncode == 0, rolled_back_with_incompatible_state.stderr
-    rejected_after_rollback = subprocess.run(
-        [str(entry), "run", "1", "--json", "--github-fixture", str(fixture)],
-        cwd=delivery,
-        env=cli_environment,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert rejected_after_rollback.returncode == 2
-    assert json.loads(rejected_after_rollback.stdout)["status"] == "incompatible_run_state"
-    assert snapshot_run(state_ref) == before
-    assert locator_path.read_bytes() == locator_before
-    assert {
-        path.relative_to(state_root): path.read_bytes()
-        for path in (state_root).rglob("*")
-        if path.is_file() and include_in_state_snapshot(path)
-    } == target_files_before
-    assert sorted(
-        path.relative_to(state_root)
-        for path in (state_root).rglob("*") if include_in_state_snapshot(path)
-    ) == target_paths_before
-
-
 def test_probe_missing_candidate_package_fails_before_codex(tmp_path: Path) -> None:
     candidate = tmp_path / "candidate"
     fake_bin, count, _status = _fake_codex(tmp_path)
@@ -2914,9 +2398,10 @@ def test_probe_invalid_candidate_text_fails_before_codex(tmp_path: Path, failure
     package = candidate / "lib/python3.11/site-packages/agent_run"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("__version__ = 'probe'\n", encoding="utf-8")
-    for module in PROJECT_ROOT.glob("src/agent_run/prompt_text_*.py"):
-        shutil.copyfile(module, package / module.name)
-    context = package / "prompt_text_context.py"
+    for module in PROJECT_ROOT.glob("src/agent_run/contracts/text_*.py"):
+        (package / "contracts").mkdir(exist_ok=True)
+        shutil.copyfile(module, package / "contracts" / module.name)
+    context = package / "contracts/text_context.py"
     if failure == "missing":
         context.unlink()
     elif failure == "syntax":

@@ -1,0 +1,156 @@
+"""独立验收的完整角色合同与同次执行续接。"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from agent_run.config.resources import bind_resources, resource
+
+from agent_run.core.prompts.context import (
+    human_continuation,
+    pretty,
+    review_budget,
+    task_brief,
+    uses_short_role_prompt,
+)
+
+
+def review_prompt(request: dict[str, Any]) -> str:
+    request = bind_resources(request)
+    if uses_short_role_prompt(request, reviewer=True):
+        return review_continuation_prompt(request)
+    blocks = (
+        resource(request, "methods/acceptance"),
+        task_brief(request, read_issues=True),
+        _review_object(request),
+        _review_ranges(request),
+        _ci_repair_evidence(request),
+        resource(request, "review/read-only-validation"),
+        _integration_evidence(request),
+        _run_review_scope(request),
+        _previous_review(request),
+        review_budget(request, reviewer=True),
+        human_continuation(request),
+        resource(request, "review/output"),
+    )
+    return "\n\n".join(block for block in blocks if block)
+
+
+def review_continuation_prompt(request: dict[str, Any]) -> str:
+    request = bind_resources(request)
+    blocks = (
+        resource(request, "review/resume"),
+        task_brief(request, read_issues=False),
+        _review_object(request),
+        _review_ranges(request),
+        _ci_repair_evidence(request),
+        _integration_evidence(request),
+        _run_review_scope(request),
+        _previous_review(request),
+        review_budget(request, reviewer=True),
+        human_continuation(request),
+    )
+    return "\n\n".join(block for block in blocks if block)
+
+
+def _review_object(request: dict[str, Any]) -> str:
+    identity = request.get("current_review_identity")
+    facts = identity if isinstance(identity, dict) else {}
+    if request.get("work_source") == "ci":
+        description = resource(request, "review/run-ci-object" if request.get("acceptance_scope") == "run" else "review/ci-object")
+    elif request.get("acceptance_scope") != "run":
+        description = resource(request, "review/commit-object")
+    else:
+        description = (
+            resource(request, "review/run-object")
+        )
+    return "\n".join(
+        [description, *_identity_lines(facts, request)]
+    )
+
+
+def _ci_repair_evidence(request: dict[str, Any]) -> str:
+    if request.get("work_source") != "ci":
+        return ""
+    evidence = request.get("ci_evidence")
+    if not isinstance(evidence, dict):
+        raise ValueError("CI Review requires original ci_evidence")
+    key = "review/ci-repair" if request.get("acceptance_scope") not in {"run", "parent_only"} else "review/parent-ci-repair"
+    return resource(request, key).format(pretty(evidence))
+
+
+def _identity_lines(identity: dict[str, Any], request: dict[str, Any]) -> list[str]:
+    labels = (
+        (resource(request, "review/identity-reviewed-base"), "reviewed_base_sha"),
+        (resource(request, "review/identity-reviewed-candidate"), "reviewed_candidate_sha"),
+        (resource(request, "review/identity-reviewed-tree"), "reviewed_candidate_tree"),
+    )
+    return [
+        f"{label}（{key}）：{identity[key]}"
+        for label, key in labels
+        if key in identity
+    ]
+
+
+def _previous_review(request: dict[str, Any]) -> str:
+    artifact = request.get("previous_acceptance_artifact")
+    parent_ci = request.get("work_source") == "ci" and request.get("acceptance_scope") in {"run", "parent_only"}
+    baseline = request.get("parent_acceptance_baseline") if parent_ci else None
+    blocks = []
+    if parent_ci:
+        blocks.append(resource(request, "review/parent-ci-baseline").format(pretty(baseline))
+                      if isinstance(baseline, dict) else resource(request, "review/initial-baseline"))
+    if isinstance(artifact, dict) and (not isinstance(baseline, dict) or baseline.get("artifact") != artifact):
+        identity = request.get("previous_review_identity")
+        facts = identity if isinstance(identity, dict) else {}
+        blocks.append(resource(request, "review/previous-result").format(
+            "\n".join(_identity_lines(facts, request)), pretty(artifact)
+        ))
+    elif not parent_ci:
+        blocks.append(resource(request, "review/ci-initial-baseline" if request.get("work_source") == "ci" else "review/initial-baseline"))
+    return "\n\n".join(blocks)
+
+
+def _integration_evidence(request: dict[str, Any]) -> str:
+    if isinstance(request.get("integration_record"), dict):
+        key = "review/parent-integration" if request.get("acceptance_scope") == "parent_only" else "review/integration-evidence"
+        return resource(request, key).format(pretty(request["integration_record"]))
+    return ""
+
+
+def _run_review_scope(request: dict[str, Any]) -> str:
+    if request.get("acceptance_scope") != "run":
+        return ""
+    return resource(request, "review/run-complete-scope")
+
+
+def _review_ranges(request: dict[str, Any]) -> str:
+    context = request.get("review_context")
+    if not isinstance(context, dict):
+        return ""
+    # Evidence has role-specific explanations below; render each raw artifact once.
+    facts = context["facts"]
+    displayed_facts = {
+        key: value for key, value in facts.items()
+        if key not in {
+            "current_review_identity", "previous_review_identity", "previous_acceptance_artifact",
+            "ci_evidence", "integration_record",
+            "prior_human_blockers",
+        }
+    }
+    if request.get("work_source") == "ci" and request.get("acceptance_scope") in {"run", "parent_only"}:
+        displayed_facts.pop("parent_acceptance_baseline", None)
+    elif isinstance(displayed_facts.get("parent_acceptance_baseline"), dict):
+        displayed_facts["parent_acceptance_baseline"] = {
+            key: value for key, value in displayed_facts["parent_acceptance_baseline"].items()
+            if key != "artifact"
+        }
+    displayed = {
+        "facts": displayed_facts,
+        "review_range": context["review_range"],
+    }
+    background = {key: request[key] for key in ("base_sha", "candidate_sha", "candidate_tree", "expected_tree")
+                  if key in request}
+    if background:
+        displayed["delivery_identity_background"] = background
+    return resource(request, "review/fixed-range").format(pretty(displayed))

@@ -5,25 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from agent_run import change_delivery, run_acceptance
-from agent_run.agent_schemas import (
-    acceptance_schema,
-    development_or_human_blocker_schema,
-    human_blocker_schema,
-    publication_or_human_blocker_schema,
-)
-from agent_run.artifacts import (
-    MAX_HUMAN_BLOCKER_HISTORY,
-    MAX_HUMAN_BLOCKER_LENGTH,
-    MAX_HUMAN_BLOCKERS,
-    AcceptanceArtifact,
-    PublicationArtifact,
-    append_human_blocker_history,
-    clear_current_human_blocker,
-    parse_human_blockers,
-    parse_development_wire_result,
-    parse_publication_wire_result,
-)
+from agent_run.errors import ArtifactContractError
+from agent_run.contracts.artifact import MAX_HUMAN_BLOCKER_LENGTH, MAX_HUMAN_BLOCKERS, parse_artifact, role_schema
+from agent_run.errors import KernelError
+from agent_run.model import Role, artifact as native_artifact, review_outcome, wire_json
 
 
 PASS_EVIDENCE = {
@@ -68,14 +53,14 @@ Maintainers can deliver the ticket without manual GitHub mutations.
 
 
 def test_publication_artifact_enforces_ticket_narrative_contract() -> None:
-    artifact = PublicationArtifact.parse(publication_data(), primary_ticket=3)
+    artifact = parse_artifact("publication", wire_json(publication_data()))
 
-    assert artifact.commit_message.startswith("feat(delivery):")
-    assert artifact.pr_title == artifact.commit_message
+    assert artifact["commit_message"].startswith("feat(delivery):")
+    assert artifact["pr_title"] == artifact["commit_message"]
 
 
 def test_publication_wire_schema_is_a_flat_strict_object() -> None:
-    schema = publication_or_human_blocker_schema()
+    schema = role_schema("publication")
 
     assert schema["type"] == "object"
     assert schema["additionalProperties"] is False
@@ -96,46 +81,34 @@ def test_publication_wire_schema_is_a_flat_strict_object() -> None:
 
 
 def test_development_wire_schema_and_parser_are_flat_and_mutually_exclusive() -> None:
-    schema = development_or_human_blocker_schema()
+    schema = role_schema("development")
 
     assert schema["type"] == "object"
     assert schema["additionalProperties"] is False
     assert schema["required"] == ["result_kind", "summary", "human_blockers"]
     assert "oneOf" not in schema
-    assert parse_development_wire_result(
-        {
-            "result_kind": "development",
-            "summary": "Implemented the requested change.",
-            "human_blockers": None,
-        }
-    )["summary"] == "Implemented the requested change."
-    with pytest.raises(ValueError, match="must be null"):
-        parse_development_wire_result(
-            {
-                "result_kind": "development",
-                "summary": "Implemented the requested change.",
-                "human_blockers": ["mixed result"],
-            }
-        )
+    assert parse_artifact("development", wire_json({'result_kind': 'development', 'summary': 'Implemented the requested change.', 'human_blockers': None}))["summary"] == "Implemented the requested change."
+    with pytest.raises(ArtifactContractError, match="must be null"):
+        parse_artifact("development", wire_json({'result_kind': 'development', 'summary': 'Implemented the requested change.', 'human_blockers': ['mixed result']}))
 
 
 def test_publication_result_rejects_blockers_and_unexpected_fields() -> None:
     data = publication_data()
     data["human_blockers"] = ["Cannot publish."]
-    with pytest.raises(ValueError, match="must be null"):
-        PublicationArtifact.parse(data, primary_ticket=3)
+    with pytest.raises(ArtifactContractError, match="must be null"):
+        parse_artifact("publication", wire_json(data))
 
     data = publication_data()
     data["extra"] = "unexpected"
-    with pytest.raises(ValueError, match="unexpected fields"):
-        PublicationArtifact.parse(data, primary_ticket=3)
+    with pytest.raises(ArtifactContractError, match="unexpected fields"):
+        parse_artifact("publication", wire_json(data))
 
 
 def test_wire_parser_normalizes_publication_without_requiring_identity() -> None:
     data = publication_data()
     data["commit_message"] = "  feat(delivery): complete one ticket autonomously  "
 
-    normalized = parse_publication_wire_result(data)
+    normalized = parse_artifact("publication", wire_json(data))
 
     assert normalized["result_kind"] == "publication"
     assert normalized["commit_message"] == (
@@ -145,8 +118,8 @@ def test_wire_parser_normalizes_publication_without_requiring_identity() -> None
 
 
 def test_wire_parser_rejects_empty_human_blocker_result() -> None:
-    with pytest.raises(ValueError, match="must contain non-empty strings"):
-        parse_publication_wire_result(human_blocker_data([]))
+    with pytest.raises(ArtifactContractError, match="must contain non-empty strings"):
+        parse_artifact("publication", wire_json(human_blocker_data([])))
 
 
 @pytest.mark.parametrize("field", ["commit_message", "pr_title", "pr_body_markdown"])
@@ -160,8 +133,8 @@ def test_human_blocker_result_requires_null_publication_fields(field: str) -> No
     }
     data[field] = "must not leak publication content"
 
-    with pytest.raises(ValueError, match="must be null"):
-        parse_human_blockers(data)
+    with pytest.raises(ArtifactContractError, match="must be null"):
+        parse_artifact("publication", wire_json(data))
 
 
 def test_human_blocker_result_is_normalized_without_trimming() -> None:
@@ -173,22 +146,22 @@ def test_human_blocker_result_is_normalized_without_trimming() -> None:
         "human_blockers": ["  A maintainer must grant access.  "],
     }
 
-    assert parse_human_blockers(data) == (
+    assert parse_artifact("publication", wire_json(data))["human_blockers"] == [
         "  A maintainer must grant access.  ",
-    )
+    ]
 
 
 def test_human_blocker_rejects_the_removed_legacy_wire_shape() -> None:
-    with pytest.raises(ValueError, match="missing result_kind"):
-        parse_human_blockers({"human_blockers": ["Needs approval."]})
+    with pytest.raises(ArtifactContractError, match="missing fields"):
+        parse_artifact("publication", wire_json({"human_blockers": ["Needs approval."]}))
 
 
 def test_wire_result_requires_every_field() -> None:
     data = publication_data()
     del data["human_blockers"]
 
-    with pytest.raises(ValueError, match="missing fields"):
-        PublicationArtifact.parse(data, primary_ticket=3)
+    with pytest.raises(ArtifactContractError, match="missing fields"):
+        parse_artifact("publication", wire_json(data))
 
 
 @pytest.mark.parametrize(
@@ -206,24 +179,24 @@ def test_publication_artifact_rejects_publisher_owned_facts(
     data = publication_data()
     data["pr_body_markdown"] = f"{machine_fact}\n\n{data['pr_body_markdown']}"
 
-    with pytest.raises(ValueError):
-        PublicationArtifact.parse(data, primary_ticket=3)
+    with pytest.raises(ArtifactContractError):
+        parse_artifact("publication", wire_json(data))
 
 
 def test_run_publication_artifact_rejects_publisher_owned_facts() -> None:
     data = publication_data()
     data["pr_body_markdown"] = f"Delivery Run: run-1\n\n{data['pr_body_markdown']}"
 
-    with pytest.raises(ValueError):
-        PublicationArtifact.parse(data, delivery_run="run-1")
+    with pytest.raises(ArtifactContractError):
+        parse_artifact("publication", wire_json(data))
 
 
 def test_ticket_publication_artifact_rejects_closing_keyword() -> None:
     data = publication_data()
     data["pr_body_markdown"] += "\n\nCloses #3"
 
-    with pytest.raises(ValueError):
-        PublicationArtifact.parse(data, primary_ticket=3)
+    with pytest.raises(ArtifactContractError):
+        parse_artifact("publication", wire_json(data))
 
 
 def passing_acceptance() -> dict[str, object]:
@@ -259,16 +232,11 @@ def human_blocker_data(blockers: list[str]) -> dict[str, object]:
 
 
 def test_acceptance_artifact_has_three_evidence_backed_lanes() -> None:
-    artifact = AcceptanceArtifact.parse(passing_acceptance())
+    artifact = parse_artifact("review", wire_json(passing_acceptance()))
 
-    assert set(artifact.checks) == {"e2e", "standards", "spec"}
-    assert artifact.checks["e2e"]["evidence"] == PASS_EVIDENCE["e2e"]
-    assert all(check["findings"] == [] for check in artifact.checks.values())
-
-
-def test_ticket_and_run_acceptance_share_the_strict_artifact_parser() -> None:
-    assert change_delivery.AcceptanceArtifact is AcceptanceArtifact
-    assert run_acceptance.AcceptanceArtifact is AcceptanceArtifact
+    assert set(artifact["checks"]) == {"e2e", "standards", "spec"}
+    assert artifact["checks"]["e2e"]["evidence"] == PASS_EVIDENCE["e2e"]
+    assert all(check["findings"] == [] for check in artifact["checks"].values())
 
 
 @pytest.mark.parametrize("title", ["修复状态显示", "feat: x", "Restore status reporting"])
@@ -278,9 +246,9 @@ def test_publication_accepts_titles_and_adjusted_template(title: str) -> None:
     data["pr_title"] = title
     data["pr_body_markdown"] = "## 验证\n测试通过。\n\n## 改动\n恢复状态显示。"
 
-    artifact = PublicationArtifact.parse(data, primary_ticket=3)
-    assert artifact.commit_message == artifact.pr_title == title
-    assert artifact.pr_body_markdown == data["pr_body_markdown"]
+    artifact = parse_artifact("publication", wire_json(data))
+    assert artifact["commit_message"] == artifact["pr_title"] == title
+    assert artifact["pr_body_markdown"] == data["pr_body_markdown"]
 
 
 def test_failed_lane_requires_self_contained_findings() -> None:
@@ -293,8 +261,8 @@ def test_failed_lane_requires_self_contained_findings() -> None:
         "findings": [],
     }
 
-    with pytest.raises(ValueError, match="requires findings"):
-        AcceptanceArtifact.parse(data)
+    with pytest.raises(ArtifactContractError, match="requires findings"):
+        parse_artifact("review", wire_json(data))
 
 
 def test_failed_lane_keeps_self_contained_finding() -> None:
@@ -309,9 +277,9 @@ def test_failed_lane_keeps_self_contained_finding() -> None:
         ],
     }
 
-    artifact = AcceptanceArtifact.parse(data)
+    artifact = parse_artifact("review", wire_json(data))
 
-    assert artifact.checks["spec"]["findings"] == checks["spec"]["findings"]
+    assert artifact["checks"]["spec"]["findings"] == checks["spec"]["findings"]
 
 
 @pytest.mark.parametrize(
@@ -336,9 +304,9 @@ def test_all_lane_status_combinations_enforce_the_findings_relationship(
             ),
         }
 
-    artifact = AcceptanceArtifact.parse(data)
+    artifact = parse_artifact("review", wire_json(data))
 
-    assert tuple(artifact.checks[lane]["status"] for lane in checks) == statuses
+    assert tuple(artifact["checks"][lane]["status"] for lane in checks) == statuses
 
 
 @pytest.mark.parametrize("lane", ("e2e", "standards", "spec"))
@@ -359,8 +327,8 @@ def test_lane_rejects_empty_evidence_for_every_status_and_lane(
         ),
     }
 
-    with pytest.raises(ValueError, match="evidence must be a non-empty string"):
-        AcceptanceArtifact.parse(data)
+    with pytest.raises(ArtifactContractError, match="evidence must be a non-empty string"):
+        parse_artifact("review", wire_json(data))
 
 
 @pytest.mark.parametrize("lane", ("e2e", "standards", "spec"))
@@ -372,8 +340,8 @@ def test_pass_lane_accepts_evidence_without_fixed_markers(lane: str) -> None:
     assert isinstance(lane_data, dict)
     lane_data["evidence"] = "The review passed."
 
-    artifact = AcceptanceArtifact.parse(data)
-    assert artifact.checks[lane]["evidence"] == "The review passed."
+    artifact = parse_artifact("review", wire_json(data))
+    assert artifact["checks"][lane]["evidence"] == "The review passed."
 
 
 @pytest.mark.parametrize(
@@ -394,7 +362,7 @@ def test_pass_lane_does_not_grade_values_inside_nonempty_prose(
     assert isinstance(lane_data, dict)
     lane_data["evidence"] = evidence
 
-    assert AcceptanceArtifact.parse(data).checks[lane]["evidence"] == evidence
+    assert parse_artifact("review", wire_json(data))["checks"][lane]["evidence"] == evidence
 
 
 def test_failure_returns_to_development_before_blocked_lanes_route_to_human() -> None:
@@ -412,12 +380,9 @@ def test_failure_returns_to_development_before_blocked_lanes_route_to_human() ->
         "findings": [],
     }
 
-    artifact = AcceptanceArtifact.parse(data)
+    artifact = parse_artifact("review", wire_json(data))
 
-    assert artifact.has_failures is True
-    assert artifact.requires_human is False
-    assert artifact.is_accepted is False
-    assert artifact.outcome == "findings"
+    assert review_outcome(artifact) == "fail"
 
 
 @pytest.mark.parametrize(
@@ -440,8 +405,8 @@ def test_acceptance_artifact_rejects_controller_owned_or_legacy_fields(
     data = passing_acceptance()
     data[legacy_field] = "legacy"
 
-    with pytest.raises(ValueError, match="unexpected fields"):
-        AcceptanceArtifact.parse(data)
+    with pytest.raises(ArtifactContractError, match="unexpected fields"):
+        parse_artifact("review", wire_json(data))
 
 
 def test_blocked_lane_accepts_natural_language_human_handoff() -> None:
@@ -454,10 +419,10 @@ def test_blocked_lane_accepts_natural_language_human_handoff() -> None:
         "findings": [],
     }
 
-    artifact = AcceptanceArtifact.parse(data)
+    artifact = parse_artifact("review", wire_json(data))
 
-    assert artifact.requires_human is True
-    assert artifact.blocker_evidence == (checks["e2e"]["evidence"],)
+    assert review_outcome(artifact) == "blocked"
+    assert tuple(lane["evidence"] for lane in artifact["checks"].values() if lane["status"] == "blocked") == (checks["e2e"]["evidence"],)
 
 
 def test_blocked_lane_does_not_grade_handoff_content() -> None:
@@ -470,7 +435,7 @@ def test_blocked_lane_does_not_grade_handoff_content() -> None:
         "findings": [],
     }
 
-    assert AcceptanceArtifact.parse(data).requires_human
+    assert review_outcome(parse_artifact("review", wire_json(data))) == "blocked"
 
 
 @pytest.mark.parametrize(
@@ -497,8 +462,8 @@ def test_lane_findings_follow_status_and_nonempty_contract(
         "findings": findings,
     }
 
-    with pytest.raises(ValueError, match=error):
-        AcceptanceArtifact.parse(data)
+    with pytest.raises(ArtifactContractError, match=error):
+        parse_artifact("review", wire_json(data))
 
 
 @pytest.mark.parametrize("lane", ("e2e", "standards", "spec"))
@@ -522,8 +487,8 @@ def test_each_lane_enforces_its_status_to_findings_relationship(
         "findings": findings,
     }
 
-    with pytest.raises(ValueError, match=error):
-        AcceptanceArtifact.parse(data)
+    with pytest.raises(ArtifactContractError, match=error):
+        parse_artifact("review", wire_json(data))
 
 
 @pytest.mark.parametrize(
@@ -547,9 +512,9 @@ def test_fail_finding_accepts_free_text(finding: str) -> None:
         "findings": [finding],
     }
 
-    artifact = AcceptanceArtifact.parse(data)
-    assert artifact.checks["e2e"]["findings"] == [finding]
-    assert artifact.outcome == "findings"
+    artifact = parse_artifact("review", wire_json(data))
+    assert artifact["checks"]["e2e"]["findings"] == [finding]
+    assert review_outcome(artifact) == "fail"
 
 
 @pytest.mark.parametrize("scope", ("root", "checks", "lane"))
@@ -567,60 +532,23 @@ def test_acceptance_artifact_rejects_nested_extra_fields(scope: str) -> None:
             assert isinstance(lane, dict)
             lane["extra"] = "unexpected"
 
-    with pytest.raises(ValueError, match="unexpected fields"):
-        AcceptanceArtifact.parse(data)
+    with pytest.raises(ArtifactContractError, match="unexpected fields"):
+        parse_artifact("review", wire_json(data))
 
 
-def test_human_blockers_have_bounded_count_length_and_history() -> None:
+def test_human_blockers_have_bounded_count_and_length() -> None:
     blockers = ["x" * MAX_HUMAN_BLOCKER_LENGTH] * MAX_HUMAN_BLOCKERS
-    assert parse_human_blockers(human_blocker_data(blockers)) == tuple(blockers)
+    assert parse_artifact("publication", wire_json(human_blocker_data(blockers)))["human_blockers"] == blockers
 
-    with pytest.raises(ValueError, match="at most"):
-        parse_human_blockers(human_blocker_data(blockers + ["one too many"]))
-    with pytest.raises(ValueError, match="at most"):
-        parse_human_blockers(
-            human_blocker_data(["x" * (MAX_HUMAN_BLOCKER_LENGTH + 1)])
-        )
-
-    subject: dict[str, object] = {
-        "human_blockers": ["current blocker"],
-        "human_blocker_phase": "developing",
-        "prior_human_blockers": ["current blocker"],
-        "blocked_reason": "agent_requires_human",
-        "human_blocker_history": [
-            {
-                "phase": "legacy",
-                "human_blockers": ["x" * (MAX_HUMAN_BLOCKER_LENGTH + 1)],
-            }
-        ],
-    }
-    for attempt in range(MAX_HUMAN_BLOCKER_HISTORY + 3):
-        append_human_blocker_history(
-            subject, phase=f"attempt-{attempt}", blockers=(f"blocker-{attempt}",)
-        )
-
-    history = subject["human_blocker_history"]
-    assert isinstance(history, list)
-    assert len(history) == MAX_HUMAN_BLOCKER_HISTORY
-    assert history[0]["phase"] == "attempt-3"
-    assert history[-1]["phase"] == (
-        f"attempt-{MAX_HUMAN_BLOCKER_HISTORY + 2}"
-    )
-
-    clear_current_human_blocker(subject)
-    assert "human_blocker_history" in subject
-    for key in (
-        "human_blockers",
-        "human_blocker_phase",
-        "prior_human_blockers",
-        "blocked_reason",
-    ):
-        assert key not in subject
+    with pytest.raises(ArtifactContractError, match="at most"):
+        parse_artifact("publication", wire_json(human_blocker_data(blockers + ["one too many"])))
+    with pytest.raises(ArtifactContractError, match="at most"):
+        parse_artifact("publication", wire_json(human_blocker_data(["x" * (MAX_HUMAN_BLOCKER_LENGTH + 1)])))
 
 
 def test_human_blocker_and_acceptance_schemas_expose_the_new_contract() -> None:
-    blocker_item = human_blocker_schema()["properties"]["human_blockers"]["items"]
-    schema = acceptance_schema()
+    blocker_item = role_schema("publication")["properties"]["human_blockers"]["items"]
+    schema = role_schema("review")
     acceptance_lane = schema["$defs"]["lane"]
 
     assert blocker_item["minLength"] == 1
@@ -636,17 +564,17 @@ def test_human_blocker_and_acceptance_schemas_expose_the_new_contract() -> None:
     for field in (
         acceptance_lane["properties"]["evidence"],
         acceptance_lane["properties"]["findings"]["items"],
-        development_or_human_blocker_schema()["properties"]["summary"],
+        role_schema("development")["properties"]["summary"],
         *(
-            publication_or_human_blocker_schema()["properties"][key]
+            role_schema("publication")["properties"][key]
             for key in ("commit_message", "pr_title", "pr_body_markdown")
         ),
     ):
         assert field["minLength"] == 1
         assert field["pattern"] == r"\S"
     for wire_schema in (
-        development_or_human_blocker_schema(),
-        publication_or_human_blocker_schema(),
+        role_schema("development"),
+        role_schema("publication"),
     ):
         assert wire_schema["properties"]["human_blockers"]["minItems"] == 1
     assert acceptance_lane["properties"]["findings"]["items"]["type"] == "string"
@@ -676,6 +604,65 @@ def test_blocked_acceptance_normalizes_evidence() -> None:
         "findings": [],
     }
 
-    artifact = AcceptanceArtifact.parse(data)
+    artifact = parse_artifact("review", wire_json(data))
 
-    assert artifact.blocker_evidence == (checks["e2e"]["evidence"].strip(),)
+    assert tuple(lane["evidence"] for lane in artifact["checks"].values() if lane["status"] == "blocked") == (checks["e2e"]["evidence"].strip(),)
+
+
+@pytest.mark.parametrize("role", ["development", "review", "publication"])
+@pytest.mark.parametrize("raw", [b"not json", b"\xff", b"[]", b"null", b"{}"])
+def test_invalid_wire_is_a_contract_error_and_uses_the_native_error_boundary(role, raw):
+    with pytest.raises(ArtifactContractError):
+        parse_artifact(role, raw)
+    with pytest.raises(KernelError) as error:
+        native_artifact(Role(role), raw)
+    assert error.value.code == "invalid_artifact"
+    assert isinstance(error.value.__cause__, ArtifactContractError)
+
+
+@pytest.mark.parametrize("role", ["", "publisher", "human_blocker", "Development"])
+def test_only_three_role_names_are_part_of_the_contract(role):
+    with pytest.raises(ArtifactContractError, match="unknown artifact role"):
+        role_schema(role)
+    with pytest.raises(ArtifactContractError, match="unknown artifact role"):
+        parse_artifact(role, b"{}")
+
+
+@pytest.mark.parametrize("role", ["development", "publication"])
+@pytest.mark.parametrize("blockers", [[], [" "], [1], "blocker", ["x"] * 9, ["x" * 2001]])
+def test_both_human_blocker_roles_enforce_the_same_limits(role, blockers):
+    value = {name: None for name in role_schema(role)["required"]}
+    value.update(result_kind="human_blocker", human_blockers=blockers)
+    with pytest.raises(ArtifactContractError):
+        parse_artifact(role, wire_json(value))
+
+
+@pytest.mark.parametrize("role", ["development", "publication"])
+def test_human_blocker_limits_count_original_characters_and_preserve_original_prose(role):
+    value = {name: None for name in role_schema(role)["required"]}
+    value.update(result_kind="human_blocker", human_blockers=[" 界" * 1000] * 8)
+    assert parse_artifact(role, wire_json(value)) == value
+    value["human_blockers"][0] += " "
+    with pytest.raises(ArtifactContractError, match="at most 2000"):
+        parse_artifact(role, wire_json(value))
+
+
+@pytest.mark.parametrize("role", ["development", "review", "publication"])
+def test_schema_results_are_independent_mutable_values(role):
+    first = role_schema(role)
+    first["required"].clear()
+    first["properties"].clear()
+    if "$defs" in first:
+        first["$defs"]["lane"]["properties"].clear()
+    second = role_schema(role)
+    assert second["required"] and second["properties"]
+    if "$defs" in second:
+        assert set(second["$defs"]["lane"]["properties"]) == {"status", "evidence", "findings"}
+
+
+@pytest.mark.parametrize("body", ["## Completed Tickets\n#2", "fIxEd #2", "  resolves #3"])
+def test_publication_rejects_program_owned_sections_and_closing_keyword_variants(body):
+    value = publication_data()
+    value["pr_body_markdown"] = body
+    with pytest.raises(ArtifactContractError):
+        parse_artifact("publication", wire_json(value))

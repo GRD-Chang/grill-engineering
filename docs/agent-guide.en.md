@@ -21,6 +21,12 @@ Read documentation matching the selected source version. Record the tool source 
 
 Read only the relevant branch and its required references. Detailed operation references linked below are currently in Chinese.
 
+The Runner's actual Python interpreter must load SQLite with the WAL-reset fix:
+3.51.3 or later, or the official backports 3.50.7–3.50.x / 3.44.6–3.44.x.
+Check that interpreter with `python -c 'import sqlite3; print(sqlite3.sqlite_version)'`.
+Only `independent-delivery-kernel-v20` is supported; v19 and older data and work are retained but rejected, without conversion, migration or compatible resume.
+See [state storage](agents/state-storage.md). Background execution requires a working user systemd manager version 254+ and the required bubblewrap namespaces; the explicit foreground candidate remains [unvalidated](productization/quickstart.en.md#4-start-a-small-task); installation alone does not establish end-to-end readiness.
+
 ## Run a task
 
 1. Read the Parent Issue's current body and comments to establish scope and acceptance criteria.
@@ -39,6 +45,7 @@ Read only the relevant branch and its required references. Detailed operation re
    On first creation, the managed clone inherits only the effective Git `user.name` and `user.email` from the launch environment, without copying other repository-local Git settings.
    For the same local user, `run` creates or attaches to one unfinished task for the same Repository/Parent, regardless of the launch directory. Follow query instructions when human action is pending.
    If multiple candidates exist, resolve repository and Parent identity rather than choosing the most recent. A command returning does not mean delivery is complete.
+   The [one-command flow](agent-run.md#一条命令推进-ticket-交付) covers Ticket development, review, integration, CI repair, whole-Parent acceptance, and the final PR. Final merge still needs explicit approval for the current delivery.
 
 3. Use `status` for the current work and next action. For process evidence, read
    `agent-run history --parent <parent-issue> --repo OWNER/REPO --json`.
@@ -59,12 +66,14 @@ Run mutation commands from any directory with the actual Parent and `--repo OWNE
 | Human Blocker needs an answer | Show the original question; pass the user's answer unchanged through `resume --message` |
 | `requeue_required` | Check the changed requirements, then `requeue` |
 | Final PR awaits approval | Show the PR, acceptance, and check results; execute `approve` only with explicit approval for that final delivery |
-| Feedback on the overall result | Pass the original feedback through `revise --message` in an allowed state |
-| Pause | Use `stop`; Ctrl-C or closing the terminal only ends observation, while the background task continues |
+| Feedback on the whole multi-ticket Parent | Pass the original feedback through `revise --message` at its final approval phase when current gates allow it; this command does not apply to Parent-only |
+| Pause | Use `stop`, or `stop --ticket N` for one Ticket and `resume --ticket N` to continue it; in background mode Ctrl-C or closing the terminal only ends observation; the foreground cancellation contract requests stop and waits for cleanup, still awaiting validation (see [mode limits](productization/quickstart.en.md#5-stop-resume-and-approve-explicitly)) |
 | Abandon | Follow `abandon` boundaries; preserve uncommitted work by default and require explicit authorization for forced discard |
 
 For exhausted limits, changed scope, or incompatible state, report the decision needed. Recover through the public CLI; never edit persistent run state to bypass gates. See [local state and cleanup](agent-run.md#本地状态与清理) for directory ownership and retention.
 
 For a multi-ticket Parent, Findings and final-PR CI repairs cover the complete Parent and preserve completed Tickets. The program updates the Run Branch after applicable integration and acceptance; only the final Run PR has publication copy, Hosted CI and human approval. There is no internal Repair PR. Ticket PRs and Parent-only delivery retain their own checks and delivery gates.
 
-New Runs use `branch_authority_protocol=3`; old Runs are rejected without migration or deletion of their results. A denied Run Branch update preserves the repair checkout, candidate and write intent and pauses for human action. After the missing permission or repository condition is resolved, continue through `resume`. An unknown push result is reconciled first. Repository write permission alone does not prove that branch rules allow a new head; the Runner does not change rules, force-push or restore an internal PR fallback.
+Old JSON/v6, native v17/v18, sealed and imported states are rejected without migration or deletion of their results. A denied Run Branch update preserves the repair checkout, candidate and write intent and pauses for human action. After the missing permission or repository condition is resolved, continue through `resume`. An unknown push result is reconciled first. Repository write permission alone does not prove that branch rules allow a new head; the Runner does not change rules, force-push or restore an internal PR fallback.
+
+For missing state or checkout materials, preserve and back up what remains, establish exact Host/Worker exit facts, and use only trustworthy original materials. Do not invent history, approvals or frozen settings, or recreate an empty checkout as proof of recovered work. Resume preserves the original semantic work and applicable budget; distinguish request acceptance, Action application, successor Invocation start, and completed delivery in status/history.

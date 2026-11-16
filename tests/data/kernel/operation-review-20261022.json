@@ -1,0 +1,671 @@
+{
+  "schema": "operation-review-evidence/1",
+  "purpose": "Tests-only independent handoff; known red tests are not marked xfail or skipped.",
+  "production_anchor": "2cb42454d3284ab88a18a3a4762e5848c693f57c",
+  "unified_candidate": "259acd4f94b6ce15f3a58810dbc9ee659807b880",
+  "tests_commit_parent": "edbbeb62d27d7a9899cd8ba0ffb0aea68e19524d",
+  "parent_tree": "66c4b42da34632c94243273dabecf728024b4218",
+  "without_bae9d20": "a55c4e60f7c0ab4b4eb05005d0de89f532feb1b6",
+  "composition": [
+    {
+      "source": "12a26ce1bdd1eeb1b3867c903214c2580b0e1152",
+      "source_parents": [
+        "2078a0901b930790c0c3b2c52b9ee44985b30d29"
+      ],
+      "applied": "4d9ea572e1407b4e0cb005ff0b353de086904b5c",
+      "applied_parent": "259acd4f94b6ce15f3a58810dbc9ee659807b880",
+      "stable_patch_id_matches": true
+    },
+    {
+      "source": "395af743f5fbf345f22cbc976ab4b043a7fd88a6",
+      "source_parents": [
+        "12a26ce1bdd1eeb1b3867c903214c2580b0e1152"
+      ],
+      "applied": "23e5ac7da8776722a38193a262bd8a8215a97498",
+      "applied_parent": "4d9ea572e1407b4e0cb005ff0b353de086904b5c",
+      "stable_patch_id_matches": true
+    },
+    {
+      "source": "ec815f19c8efa9e9b83d4a94065add47c0b20905",
+      "source_parents": [
+        "395af743f5fbf345f22cbc976ab4b043a7fd88a6"
+      ],
+      "applied": "e45d9264cf049f0e793c5dca1baa3db5790b14d6",
+      "applied_parent": "23e5ac7da8776722a38193a262bd8a8215a97498",
+      "stable_patch_id_matches": true
+    },
+    {
+      "source": "55185c31be423e7dc1d30d0c053138adbbbe8b27",
+      "source_parents": [
+        "ec815f19c8efa9e9b83d4a94065add47c0b20905"
+      ],
+      "applied": "b7aa7d4bbfe84da48e75bebed341f336ac03abec",
+      "applied_parent": "e45d9264cf049f0e793c5dca1baa3db5790b14d6",
+      "stable_patch_id_matches": true
+    },
+    {
+      "source": "932f7819a6bb7734e6ef34e14125ff2f1552a3d0",
+      "source_parents": [
+        "55185c31be423e7dc1d30d0c053138adbbbe8b27"
+      ],
+      "applied": "062d53f0262321060c806167ae7b1c98fe01aada",
+      "applied_parent": "b7aa7d4bbfe84da48e75bebed341f336ac03abec",
+      "stable_patch_id_matches": true
+    },
+    {
+      "source": "affb1ab2e968e9e3a85f8096b809a70697ae3b14",
+      "source_parents": [
+        "ec815f19c8efa9e9b83d4a94065add47c0b20905"
+      ],
+      "applied": "5d83ce83b5548293ca7a40e7104d73303f4d0b8c",
+      "applied_parent": "062d53f0262321060c806167ae7b1c98fe01aada",
+      "stable_patch_id_matches": true
+    },
+    {
+      "source": "4daab2abb8ad5e2ea73b4e60e0c3d70a519e1d6e",
+      "source_parents": [
+        "ec815f19c8efa9e9b83d4a94065add47c0b20905"
+      ],
+      "applied": "8e5da3ea6c2b21a74efb50a8f291e9ddafd7341d",
+      "applied_parent": "5d83ce83b5548293ca7a40e7104d73303f4d0b8c",
+      "stable_patch_id_matches": true
+    },
+    {
+      "source": "5b8b96488988fa83d99daa6fe12a721a2b824a95",
+      "source_parents": [
+        "ec815f19c8efa9e9b83d4a94065add47c0b20905"
+      ],
+      "applied": "ed78842f66a73bb19f067d076bc74bc5a01409fe",
+      "applied_parent": "8e5da3ea6c2b21a74efb50a8f291e9ddafd7341d",
+      "stable_patch_id_matches": true
+    },
+    {
+      "source": "ef251d0ca8adfb9868967262c447fe1dd4f30033",
+      "source_parents": [
+        "5b8b96488988fa83d99daa6fe12a721a2b824a95"
+      ],
+      "applied": "7bfb7741d3db402ef7f8fb52d2dfe75b1684c0a8",
+      "applied_parent": "ed78842f66a73bb19f067d076bc74bc5a01409fe",
+      "stable_patch_id_matches": true
+    },
+    {
+      "source": "67d5d6cb4688a60a61ff13d50c2feceba1392b70",
+      "source_parents": [
+        "ef251d0ca8adfb9868967262c447fe1dd4f30033"
+      ],
+      "applied": "4f4735ccd3a000a0b848d4b76690ebd1ffb96ce1",
+      "applied_parent": "7bfb7741d3db402ef7f8fb52d2dfe75b1684c0a8",
+      "stable_patch_id_matches": true
+    },
+    {
+      "source": "08543ec66687cea2fa5a2fdcb04633b9be51f099",
+      "source_parents": [
+        "67d5d6cb4688a60a61ff13d50c2feceba1392b70"
+      ],
+      "applied": "776fd48013bf5ab0f0d335acd98ca724f1ca0d0a",
+      "applied_parent": "4f4735ccd3a000a0b848d4b76690ebd1ffb96ce1",
+      "stable_patch_id_matches": true
+    },
+    {
+      "source": "5a978e60f7c32e10f241d0c95d1d1a0b76bc6aa7",
+      "source_parents": [
+        "08543ec66687cea2fa5a2fdcb04633b9be51f099"
+      ],
+      "applied": "5952929fa9b50740c0574f074f5f8fea72410173",
+      "applied_parent": "776fd48013bf5ab0f0d335acd98ca724f1ca0d0a",
+      "stable_patch_id_matches": true
+    },
+    {
+      "source": "527622c60c46a7653d40b4ac8fb3d97244722d94",
+      "source_parents": [
+        "5a978e60f7c32e10f241d0c95d1d1a0b76bc6aa7"
+      ],
+      "applied": "b149f2635bd81eca67ee96cdeabf77e13fa8ba73",
+      "applied_parent": "5952929fa9b50740c0574f074f5f8fea72410173",
+      "stable_patch_id_matches": true
+    },
+    {
+      "source": "de7889e02d2f3ff16cd2cf03b0495d5dfed28658",
+      "source_parents": [
+        "e6894c6810cf5bbcdbd70d8078a01669244c3b2e"
+      ],
+      "applied": "9819bf34296d9f8275f29c2a8ba5cb4615828d9e",
+      "applied_parent": "b149f2635bd81eca67ee96cdeabf77e13fa8ba73",
+      "stable_patch_id_matches": true
+    },
+    {
+      "source": "d8474cada6af8cf9074224b2c525ee79dd06fbc7",
+      "source_parents": [
+        "f32f248134f9d30ead7615e7a960def58b39a374"
+      ],
+      "applied": "a55c4e60f7c0ab4b4eb05005d0de89f532feb1b6",
+      "applied_parent": "9819bf34296d9f8275f29c2a8ba5cb4615828d9e",
+      "stable_patch_id_matches": true
+    },
+    {
+      "source": "bae9d20cf38dc2c3053768707e5a921fae31d5f3",
+      "source_parents": [
+        "932f7819a6bb7734e6ef34e14125ff2f1552a3d0"
+      ],
+      "applied": "edbbeb62d27d7a9899cd8ba0ffb0aea68e19524d",
+      "applied_parent": "a55c4e60f7c0ab4b4eb05005d0de89f532feb1b6",
+      "stable_patch_id_matches": true
+    }
+  ],
+  "environment": {
+    "python": "3.12.14",
+    "sqlite": "3.53.1",
+    "matt_installer_sha256": "b253fb0ec8d188e39d890f9c70ebcf8ef344c148be0d0179be5ad3940b9e2f9d",
+    "matt_ref": "5beb35b040e3de97e54fa9e386d7e42d15c295c2",
+    "installer_ref": "49f948faa9258a0c61caceaf225e179651397431",
+    "check_readable": 27,
+    "applied_skills": [
+      "code-review",
+      "codebase-design",
+      "diagnosing-bugs"
+    ],
+    "isolation": "pytest HOME/XDG isolation; new local Git/SQLite only; no prepared DB changes, user DB, credentials, external service or process sandbox reconfiguration"
+  },
+  "reproduce": {
+    "candidate": "cd project && python -m pytest -q tests/test_kernel_operation_review_regressions.py",
+    "without_bae9d20": "In an isolated worktree at without_bae9d20, copy only this test module from the review commit into project/tests; run python -m pytest -q tests/test_kernel_operation_review_regressions.py -k stop_resume from project. The shared support/core_operations.py already exists in that parent.",
+    "expected_at_handoff": "9 nodes: 4 fail (3 distinct findings), 5 pass. The stop/resume test passes without bae9d20. Do not weaken assertions or add xfail to obtain green.",
+    "module_sha256": "5e71e21834eb5818b72da8460798cb06c3b44a394bba1a194992d795cc5ebecb"
+  },
+  "candidate_results": {
+    "tests": 9,
+    "failures": 4,
+    "skipped": 0,
+    "seconds": 27.191,
+    "nodes": [
+      {
+        "nodeid": "tests/test_kernel_operation_review_regressions.py::test_stop_resume_preserves_the_original_source_wait_deadline",
+        "result": "fail",
+        "seconds": 0.086
+      },
+      {
+        "nodeid": "tests/test_kernel_operation_review_regressions.py::test_a_read_finishing_after_the_absolute_wait_deadline_allocates_no_agent[source]",
+        "result": "fail",
+        "seconds": 0.24
+      },
+      {
+        "nodeid": "tests/test_kernel_operation_review_regressions.py::test_a_read_finishing_after_the_absolute_wait_deadline_allocates_no_agent[delivery]",
+        "result": "fail",
+        "seconds": 0.239
+      },
+      {
+        "nodeid": "tests/test_kernel_operation_review_regressions.py::test_actual_native_push_status_is_audited_once_independently_of_its_readback[readback-target-actual-zero]",
+        "result": "pass",
+        "seconds": 2.298
+      },
+      {
+        "nodeid": "tests/test_kernel_operation_review_regressions.py::test_actual_native_push_status_is_audited_once_independently_of_its_readback[readback-target-actual-nonzero]",
+        "result": "fail",
+        "seconds": 2.263
+      },
+      {
+        "nodeid": "tests/test_kernel_operation_review_regressions.py::test_actual_native_push_status_is_audited_once_independently_of_its_readback[readback-outage-actual-zero]",
+        "result": "pass",
+        "seconds": 6.21
+      },
+      {
+        "nodeid": "tests/test_kernel_operation_review_regressions.py::test_actual_native_push_status_is_audited_once_independently_of_its_readback[readback-outage-actual-nonzero]",
+        "result": "pass",
+        "seconds": 5.791
+      },
+      {
+        "nodeid": "tests/test_kernel_operation_review_regressions.py::test_offline_lost_response_is_unknown_without_an_observed_command_failure",
+        "result": "pass",
+        "seconds": 2.848
+      },
+      {
+        "nodeid": "tests/test_kernel_operation_review_regressions.py::test_formal_graph_completion_final_still_retires_the_remote_run_branch",
+        "result": "pass",
+        "seconds": 7.039
+      }
+    ]
+  },
+  "without_bae9d20_results": {
+    "tests": 1,
+    "failures": 0,
+    "skipped": 0,
+    "seconds": 0.249,
+    "nodes": [
+      {
+        "nodeid": "tests/test_kernel_operation_review_regressions.py::test_stop_resume_preserves_the_original_source_wait_deadline",
+        "result": "pass",
+        "seconds": 0.113
+      }
+    ]
+  },
+  "stop_resume_observed": {
+    "without_bae9d20": {
+      "before": {
+        "started_at": 100.25,
+        "deadline": 700.25
+      },
+      "after": {
+        "started_at": 100.25,
+        "deadline": 700.25
+      }
+    },
+    "with_bae9d20": {
+      "before": {
+        "started_at": 100.25,
+        "deadline": 700.25
+      },
+      "after": {
+        "started_at": 200.25,
+        "deadline": 800.25
+      }
+    }
+  },
+  "native_command_interpretation": {
+    "actual_command": "The executable selected as git forwards the local push, then actually exits 0 or 7. Native RemoteEffects/run_write_command observe that OS process status. No result object or raw returncode is changed in Python.",
+    "trace": "commands.jsonl independently records inner_git_returncode=0 and actual_command_returncode=0/7; the separate bare ref is asserted at effect.after_sha.",
+    "expected_audits": {
+      "command_0_readback_target": 0,
+      "command_0_readback_unavailable": 0,
+      "command_7_readback_target": 1,
+      "command_7_readback_unavailable": 1
+    },
+    "actual_at_handoff": {
+      "command_0_readback_target": 0,
+      "command_0_readback_unavailable": 0,
+      "command_7_readback_target": 0,
+      "command_7_readback_unavailable": 1
+    },
+    "authorization": "The original runner-provided callback is invoked before the native command; one real push only, including recovery readback."
+  },
+  "old_lost_response_nodes": [
+    "tests/test_kernel_configuration.py::test_publication_failure_observation_survives_successful_exact_readback",
+    "tests/test_kernel_public_v9_facts.py::test_publication_actual_failure_is_not_dispatch_count_or_erased_by_successful_readback"
+  ],
+  "old_lost_response_fixture": {
+    "source": "OfflinePort.execute constructs target outcome, inserts the synthetic write journal, then raises LostResponse(\"pr_write took effect; response lost\"). No OS command runs for the synthetic PR write; no write_returncode is supplied. None means unobserved, not zero or nonzero.",
+    "original_assertion_intent": "Keep the original exception diagnostic, exact effect/dispatch identity and single external write after target readback; distinguish diagnostics from dispatch counts. These fixtures do not establish the actual-nonzero-command case.",
+    "old_2078a09": {
+      "physical_exception": [
+        {
+          "type": "LostResponse",
+          "message": "pr_write took effect; response lost",
+          "write_returncode": null
+        }
+      ],
+      "first_step": [
+        "approval",
+        "explicit_approval_required",
+        null
+      ],
+      "second_step": [
+        "approval",
+        "explicit_approval_required",
+        null
+      ],
+      "publication_operation_retries": [
+        {
+          "operation": "pr_write",
+          "dispatch_serial": 1,
+          "status": "confirmed",
+          "evidence": {
+            "message": "pr_write took effect; response lost",
+            "type": "LostResponse"
+          }
+        }
+      ],
+      "diagnostics_retained_after_settlement": [],
+      "pr_write_count": 1
+    },
+    "new_edbbeb62": {
+      "physical_exception": [
+        {
+          "type": "LostResponse",
+          "message": "pr_write took effect; response lost",
+          "write_returncode": null
+        }
+      ],
+      "first_step": [
+        "waiting",
+        "github_convergence",
+        105.25
+      ],
+      "second_step": [
+        "approval",
+        "explicit_approval_required",
+        null
+      ],
+      "publication_operation_retries": [],
+      "diagnostics_retained_after_settlement": [
+        {
+          "code": "write_response_unavailable",
+          "message": "pr_write took effect; response lost"
+        }
+      ],
+      "pr_write_count": 1
+    },
+    "retain_uncertainty": "Keep effect identity, dispatch serial, unknown/sent status, original exception/code/message and eventual original readback. An absent command status must stay absent. Current new code keeps code/message in immutable github_read_observation material after settlement; publication_operation_retries is empty, so the old public failure-row surface changed."
+  },
+  "neutral_final": {
+    "comparison_revisions": {
+      "old": "2078a0901b930790c0c3b2c52b9ee44985b30d29",
+      "new": "a55c4e60f7c0ab4b4eb05005d0de89f532feb1b6"
+    },
+    "identical_fields": [
+      "schema",
+      "input_sha256",
+      "implementation",
+      "cut",
+      "roles",
+      "raw_backend_calls",
+      "status",
+      "approval_required",
+      "budget",
+      "commits",
+      "local_refs",
+      "pull_request",
+      "closed_issues",
+      "native_branch_display",
+      "publication_wire",
+      "cross_architecture_compared",
+      "delivery_kind",
+      "approval_boundary",
+      "source_ref_identity",
+      "known_gaps"
+    ],
+    "different_fields": [
+      "published_refs",
+      "mutations",
+      "post_close_worktrees",
+      "historical_input",
+      "raw_effects"
+    ],
+    "added_fields": [
+      "historical_source"
+    ],
+    "diagnosis": {
+      "historical_input": "Actual authenticated producer replaces a synthetic completed-Git precondition; historical head/budget and all commits are unchanged.",
+      "mutations": "Real historical Ticket PR consumes number 1, so Final uses number 2. New fixture also reaches the existing remote run cleanup.",
+      "published_refs": "Old standalone retains run; repaired standalone deletes it. This is an actual observation difference between those fixture executions, not evidence of a new formal-Final policy.",
+      "post_close_worktrees": "Role checkouts absent and unregistered in both observations; the unequal absolute temporary paths are incidental.",
+      "raw_effects": "Repaired fixture adds a genuine workspace effect and reaches cleanup_remote_ref; generated intent IDs/facts also differ.",
+      "old_standalone_limit": "Old OfflinePort.prepare(FINAL_RUN) directly creates a detached worktree and synthetic completed Git, without a Core workspace effect or actual Completion. Its cleanup reaches cleanup_worktree, then cannot prove the local workspace marker; Scenario.run returns the business complete boundary despite incomplete cleanup.",
+      "formal_contract": "Old test_kernel_cleanup_lifecycle.py::test_completed_delivery_retires_only_its_recorded_resources[final_run] uses Graph -> real Completion -> activate_final and expects cleanup_worktree + cleanup_remote_ref, preserving the unowned local run mirror. New test_formal_graph_completion_final_still_retires_the_remote_run_branch independently reaches the same normal contract through run_once.",
+      "conclusion": "No changed remote run deletion policy demonstrated for formally created Graph/Completion/Final. The neutral fixture difference follows repaired preconditions and completed cleanup. No claim of full neutral equivalence or real online/systemd acceptance."
+    },
+    "old_formal_contract_result": {
+      "revision": "2078a0901b930790c0c3b2c52b9ee44985b30d29",
+      "src_and_test_cleanup_lifecycle_identical_to_259acd4": true,
+      "command": "python -m pytest -q tests/test_kernel_cleanup_lifecycle.py -k \"completed_delivery and final_run\"",
+      "result": "1 passed, 5 deselected",
+      "seconds": 6.46
+    }
+  },
+  "initial_tests_commit": "dbfddc8d9bbe4ce69ee38ac81b2f7715f253acc0",
+  "followup_verification": {
+    "base_tests_commit": "dbfddc8d9bbe4ce69ee38ac81b2f7715f253acc0",
+    "exact_fix_increments": [
+      {
+        "commit": "3f3fcad4eca8d5caaf8c9144b895104e779154a5",
+        "parents": [
+          "bae9d20cf38dc2c3053768707e5a921fae31d5f3"
+        ]
+      },
+      {
+        "commit": "c649dcf949397f0f8de749b3c035b7d7422bd438",
+        "parents": [
+          "3f3fcad4eca8d5caaf8c9144b895104e779154a5"
+        ]
+      },
+      {
+        "commit": "6e981dcdec8986f074a4da0579699cc69bcae9fc",
+        "parents": [
+          "9f8c24eb8e74bf2db65d24c9652468e1f613be8b"
+        ]
+      }
+    ],
+    "local_verification_head": "247a21fb9cbedc438622a67130f6394bfa55de50",
+    "exact_test_overlays": [
+      {
+        "source_commit": "ec872188853c3d261c728a4ecdb86f4118977337",
+        "path": "project/tests/test_kernel_abandon.py",
+        "git_blob": "a00cfebf57df49ea2d5f1ed84c6e6e27c40823ab"
+      },
+      {
+        "source_commit": "ec872188853c3d261c728a4ecdb86f4118977337",
+        "path": "project/tests/test_kernel_abandon_recovery.py",
+        "git_blob": "257764648aa3c11fa9b2121b8095ae5ca973e35a"
+      }
+    ],
+    "command": "python -m pytest -q -n 2 --dist worksteal tests/test_kernel_operation_review_regressions.py tests/test_kernel_control_operation_observation.py tests/test_kernel_operation_read_errors.py tests/test_kernel_offline_operation_runner.py::test_world_before_manual_control_neither_claims_nor_allocates tests/test_kernel_abandon.py::test_abandon_cannot_take_over_an_unsettled_final_merge[unknown] tests/test_kernel_abandon.py::test_abandon_cannot_take_over_an_unsettled_final_merge[third] tests/test_kernel_abandon.py::test_parent_only_default_merge_cannot_be_abandoned[unknown] tests/test_kernel_abandon.py::test_parent_only_default_merge_cannot_be_abandoned[third] tests/test_kernel_abandon_recovery.py::test_unproven_sent_recovery_never_replays_and_uses_original_read_window[reopen_ticket] tests/test_kernel_abandon_recovery.py::test_unproven_sent_recovery_never_replays_and_uses_original_read_window[recovery_comment] tests/test_kernel_operation_integration.py::test_host_real_core_original_merge_readback_final_approval_and_cleanup tests/test_kernel_operation_integration.py::test_real_core_n1_ci_poll_advances_during_independent_long_agent",
+    "results": {
+      "top_level_nodes": 30,
+      "junit_tests_including_subtests": 38,
+      "failed_nodes": 3,
+      "skipped": 0,
+      "passed_subtests": 8,
+      "seconds": 104.046,
+      "nodes": [
+        {
+          "nodeid": "tests/test_kernel_operation_review_regressions.py::test_stop_resume_preserves_the_original_source_wait_deadline",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_control_operation_observation.py::test_managed_control_observes_without_replacing_a_running_host[revise]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_review_regressions.py::test_a_read_finishing_after_the_absolute_wait_deadline_allocates_no_agent[source]",
+          "result": "fail"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_review_regressions.py::test_a_read_finishing_after_the_absolute_wait_deadline_allocates_no_agent[delivery]",
+          "result": "fail"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_review_regressions.py::test_actual_native_push_status_is_audited_once_independently_of_its_readback[readback-target-actual-zero]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_review_regressions.py::test_actual_native_push_status_is_audited_once_independently_of_its_readback[readback-target-actual-nonzero]",
+          "result": "fail"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_review_regressions.py::test_actual_native_push_status_is_audited_once_independently_of_its_readback[readback-outage-actual-zero]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_review_regressions.py::test_actual_native_push_status_is_audited_once_independently_of_its_readback[readback-outage-actual-nonzero]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_review_regressions.py::test_offline_lost_response_is_unknown_without_an_observed_command_failure",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_review_regressions.py::test_formal_graph_completion_final_still_retires_the_remote_run_branch",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_control_operation_observation.py::test_control_observation_never_claims_executor_or_allocates_work",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_control_operation_observation.py::test_control_observation_rejects_changes_during_physical_reads[source]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_control_operation_observation.py::test_control_observation_rejects_changes_during_physical_reads[epoch]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_control_operation_observation.py::test_control_observation_rejects_changes_during_physical_reads[stop]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_control_operation_observation.py::test_control_read_failure_is_a_cli_error_without_a_work_wait_or_claim",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_control_operation_observation.py::test_managed_control_observes_without_replacing_a_running_host[approve]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_abandon.py::test_abandon_cannot_take_over_an_unsettled_final_merge[third]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_abandon.py::test_parent_only_default_merge_cannot_be_abandoned[unknown]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_control_operation_observation.py::test_managed_control_observes_without_replacing_a_running_host[requeue]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_abandon.py::test_parent_only_default_merge_cannot_be_abandoned[third]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_abandon_recovery.py::test_unproven_sent_recovery_never_replays_and_uses_original_read_window[reopen_ticket]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_abandon_recovery.py::test_unproven_sent_recovery_never_replays_and_uses_original_read_window[recovery_comment]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_integration.py::test_host_real_core_original_merge_readback_final_approval_and_cleanup",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_read_errors.py::test_cold_github_import_does_not_cycle_through_operation_runner",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_read_errors.py::test_bootstrap_read_outage_retains_original_wait_and_lease",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_read_errors.py::test_source_read_window_survives_stop_and_a_proven_executor_handoff",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_offline_operation_runner.py::test_world_before_manual_control_neither_claims_nor_allocates[stop]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_offline_operation_runner.py::test_world_before_manual_control_neither_claims_nor_allocates[requirements]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_abandon.py::test_abandon_cannot_take_over_an_unsettled_final_merge[unknown]",
+          "result": "pass"
+        },
+        {
+          "nodeid": "tests/test_kernel_operation_integration.py::test_real_core_n1_ci_poll_advances_during_independent_long_agent",
+          "result": "pass"
+        }
+      ]
+    },
+    "source_mypy": "Success: no issues found in 125 source files",
+    "source_blob_checks": {
+      "kernel.py": "matches exact c649dcf",
+      "operation_runner.py": "matches exact c649dcf",
+      "offline.py": "matches exact 6e981dc"
+    },
+    "conclusions": {
+      "fixed": "Stop/resume original deadline; four Final/Parent late-readback cases; two Abandon original-window cases (8 subtests); manual control observation.",
+      "still_red": "Slow source and delivery reads crossing the absolute wait deadline allocate an Agent; successful readback of actual nonzero command loses the failure audit.",
+      "limited": "One shared choice implementation differentiates explicit manual polls from passive state; late target readback preserves gates and does not grant a new write. Prior/approval behavior is not declared closed. No real online/systemd/sandbox acceptance."
+    },
+    "host_loop_regression": {
+      "module": "tests/test_kernel_operation_review_host.py",
+      "command": "python -m pytest -q tests/test_kernel_operation_review_host.py",
+      "original_edbbeb62_results": {
+        "top_level_nodes": 1,
+        "junit_tests_including_subtests": 1,
+        "failed_nodes": 0,
+        "skipped": 0,
+        "passed_subtests": 0,
+        "seconds": 2.849,
+        "nodes": [
+          {
+            "nodeid": "tests/test_kernel_operation_review_host.py::test_host_quiesces_at_unknown_push_and_resumes_only_its_original_readback",
+            "result": "pass"
+          }
+        ]
+      },
+      "with_exact_fixes_results": {
+        "top_level_nodes": 1,
+        "junit_tests_including_subtests": 1,
+        "failed_nodes": 0,
+        "skipped": 0,
+        "passed_subtests": 0,
+        "seconds": 3.488,
+        "nodes": [
+          {
+            "nodeid": "tests/test_kernel_operation_review_host.py::test_host_quiesces_at_unknown_push_and_resumes_only_its_original_readback",
+            "result": "pass"
+          }
+        ]
+      },
+      "contract": "executor.run exits at unknown push without polling or writing despite now-readable target; explicit subject resume uses original readback, preserves one push and Attempt count, and reaches approval. No Agent is allowed to start in the Host runs. NativeNotifications is replaced by a no-I/O observer; this tests the real Host loop, not an actual systemd service or worker namespace.",
+      "module_sha256_at_initial_measurement": "3538e9c50afe4dcd3834b07b361f835d57f4a6301f114c12b4b97e2cd9919296",
+      "current_module_sha256": "b868ffd248ef1f522ea246583d3837e27f1321aa3b786c0aa8753dd3ac7b965f"
+    }
+  },
+  "third_host_recovery_review": {
+    "nodeid": "tests/test_kernel_operation_review_host.py::test_public_run_reads_a_restored_third_push_before_conflict_resume",
+    "module_sha256": "b868ffd248ef1f522ea246583d3837e27f1321aa3b786c0aa8753dd3ac7b965f",
+    "scope": "Only physical I/O adapters differ for historical/current interfaces. Every recovery operation uses public control/admit_host/dispatch_host/observe_host/control_host and actual executor.run. No direct runner.run_once, Kernel.advance/reconcile, SQL mutation, fabricated Action, or arbitrary Execution is used as a recovery shortcut. The Execution fields come exclusively from the actual Kernel-issued HostLaunch.",
+    "physical_fixture": "OfflinePort actually writes the push once; a supported scripted physical read reports third, then is cleared to expose the exact original target. This is a synthetic external observation, not a claim of an online foreign-ref rollback.",
+    "formal_route_static_check": "lifecycle_cli._run -> submit -> Kernel.admit_host(kind=run) -> issued HostLaunch -> Host entry executor.run. CLI resume reaches _control through submit/control_host; it refreshes requirements but does not reconcile the pending effect first.",
+    "old_formal_source_revision": "2078a0901b930790c0c3b2c52b9ee44985b30d29",
+    "old_source_identical_to_259acd4": {
+      "executor_blob": "ae97367c56aca0cf6aef257ab43860ad0d4f6b9c",
+      "kernel_blob": "cfa07b98c5f581dce3267e651b4775577f59314b"
+    },
+    "old_result": {
+      "nodes": 1,
+      "failures": 0,
+      "skipped": 0,
+      "seconds": 1.998
+    },
+    "unified_before_c649_revision": "3cde81be26c436a87f50af06baba232a3713b2c9",
+    "unified_before_c649_result": {
+      "nodes": 1,
+      "failures": 1,
+      "skipped": 0,
+      "seconds": 2.404
+    },
+    "unified_with_c649_verification_head": "247a21fb9cbedc438622a67130f6394bfa55de50",
+    "unified_with_c649_result": {
+      "nodes": 1,
+      "failures": 1,
+      "skipped": 0,
+      "seconds": 2.636
+    },
+    "old_verified_path": [
+      "Normal Scenario steps perform one original push and persist third/write_conflict with the effect sent.",
+      "Expose the exact original target; direct public Resume correctly rejects unresolved_write_conflict and creates no Action.",
+      "Public Stop -> confirm_executor_exit -> whole-Run Resume retires only fixture ownership; the independent write_conflict remains.",
+      "Public kind=run admission creates a real Action and HostLaunch. Dispatch and controlled physical Host observation bind its exact owner/epoch; no identity is manufactured.",
+      "Actual old executor.run polls the original intent before its quiescent exit: sent -> observed, one push, same Attempt count, conflict gate retained.",
+      "Public control_host(resume) now accepts the observed original; actual executor.run continues it to confirmed/approval without another push or Agent."
+    ],
+    "new_verified_obstruction": {
+      "executor_run_returncode": 0,
+      "physical_readbacks": 0,
+      "effect_status": "sent",
+      "dispatches": 1,
+      "resume_error": "unresolved_write_conflict",
+      "refused_resume_action_created": false,
+      "additional_agent_attempts": 0,
+      "additional_writes": 0
+    },
+    "cause": "The unified Host introduced by affb1ab checks quiescent and returns before scheduling run_once. The old Host performed a subject readback pass before deciding to exit. c649 makes an explicit direct run_once poll available, but normal CLI run still reaches the unchanged early-exit Host. The Resume guard itself already existed in 259/2078.",
+    "expected": "An explicitly requested normal run must be able to settle one original late target readback to observed while preserving write_conflict. Only the separate public Resume may then authorize further work. No new state framework or write-conflict relaxation is proposed.",
+    "limits": "The native public Host protocol and real executor.run are exercised with a controlled manager receipt. Literal CLI process selection/environment handoff and live systemd/bwrap are not revalidated; their routing is inspected in source. This is not a new c649-introduced defect.",
+    "original_nine_regressions_unchanged": true
+  }
+}

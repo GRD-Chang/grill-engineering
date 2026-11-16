@@ -1,0 +1,180 @@
+"""Mechanical Git verbs shared by managed delivery and isolated fixtures."""
+
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+import subprocess
+from typing import Callable, Iterable
+
+from agent_run.errors import GitError
+from agent_run.runtime.git_command import run_git
+
+from agent_run.model import Commit
+from agent_run.errors import KernelError
+
+
+OBJECT_BATCH_FORMAT = "--batch-check=%(objectname) %(objecttype) %(rest)"
+
+
+def object_rows(result: subprocess.CompletedProcess[str], queries: tuple[str, ...]) -> list[list[str]]:
+    """Bind one finite cat-file response to its ordered original queries."""
+    rows = [line.split() for line in result.stdout.splitlines()]
+    if result.returncode or len(rows) != len(queries):
+        raise KernelError("git_operation_failed", "Invalid Git object observation")
+    for query, row in zip(queries, rows):
+        # Missing responses echo the query rather than expanding the format.
+        if row == [query, "missing"]:
+            continue
+        if len(row) != 3 or row[2] != query:
+            raise KernelError("git_operation_failed", "Invalid Git object observation")
+    return rows
+
+
+class LocalGit:
+    def __init__(self, root: Path, authorize: Callable[[], None] | None = None) -> None:
+        self.root = root
+        self.authorize = authorize
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        self.env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                         "GIT_OPTIONAL_LOCKS": "0", "GIT_NO_REPLACE_OBJECTS": "1"})
+
+    def run(self, *arguments: str, cwd: Path | None = None, input_text: str | None = None,
+            check: bool = True) -> subprocess.CompletedProcess[str]:
+        command = ("git", "-C", str(cwd or self.root), *arguments)
+        authorize = None
+        if arguments and (arguments[0] in {"init", "config", "add", "commit", "commit-tree", "reset", "update-ref", "worktree", "switch", "write-tree", "merge-tree", "merge", "push"}
+                          or arguments[0] == "hash-object" and "-w" in arguments):
+            authorize = self.authorize
+        try:
+            result = run_git(list(command), cwd=cwd or self.root, input=input_text,
+                             timeout=30, environment=self.env, authorize=authorize)
+        except GitError as error:
+            raise KernelError("git_operation_failed", str(error)) from error
+        if check and result.returncode:
+            evidence = {"command": command, "returncode": result.returncode,
+                        "stdout": result.stdout, "stderr": result.stderr}
+            raise KernelError("git_operation_failed", repr(evidence)) from GitError(
+                "Git command failed", evidence=evidence)
+        return result
+
+    def _run_in(self, directory: Path, *arguments: str, input: str | None = None,
+                timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+        """The existing exact-object helper's narrow Git command protocol."""
+        result = self.run(*arguments, cwd=directory, input_text=input, check=False)
+        if result.returncode and not (arguments[:2] == ("config", "--get") and result.returncode == 1):
+            raise KernelError("git_operation_failed", result.stderr)
+        return result
+
+    def conflict_checkout(self, checkout: Path, target: str) -> dict[str, object]:
+        result = self.run("merge", "--no-commit", "--no-ff", target, cwd=checkout, check=False)
+        return {"command": ["git", "merge", "--no-commit", "--no-ff", target], "returncode": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr,
+                "head": self.run("rev-parse", "HEAD", cwd=checkout).stdout.strip(),
+                "merge_head": self.run("rev-parse", "-q", "--verify", "MERGE_HEAD", cwd=checkout, check=False).stdout.strip()}
+
+    def commit(self, sha: str) -> Commit:
+        resolved = self.run("rev-parse", "--verify", f"{sha}^{{commit}}").stdout.strip()
+        tree = self.run("rev-parse", f"{resolved}^{{tree}}").stdout.strip()
+        return Commit(resolved, tree)
+
+    def missing_commits(self, shas: Iterable[str]) -> tuple[str, ...]:
+        """Observe commit availability, retaining tag peeling and no tree demand."""
+        heads = tuple(dict.fromkeys(shas))
+        if any(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha) is None for sha in heads):
+            raise KernelError("git_operation_failed", "Expected complete Git object IDs")
+        if not heads:
+            return ()
+        queries = tuple(sha + "^{commit}" for sha in heads)
+        result = self.run("cat-file", OBJECT_BATCH_FORMAT,
+            input_text="".join(query + " " + query + "\n" for query in queries), check=False)
+        rows = object_rows(result, queries)
+        missing = []
+        for sha, query, row in zip(heads, queries, rows):
+            if row == [query, "missing"]:
+                missing.append(sha)
+            elif (row[1:] != ["commit", query] or len(row[0]) != len(sha)
+                    or re.fullmatch(r"[0-9a-f]+", row[0]) is None):
+                raise KernelError("git_operation_failed", "Invalid Git commit observation")
+        return tuple(missing)
+
+    def parents(self, sha: str) -> tuple[str, ...]:
+        return tuple(self.run("show", "-s", "--format=%P", sha).stdout.strip().split())
+
+    def is_ancestor(self, before: str, after: str) -> bool:
+        result = self.run("merge-base", "--is-ancestor", before, after, check=False)
+        if result.returncode not in {0, 1}:
+            raise KernelError("git_ancestry_unknown")
+        return result.returncode == 0
+
+    def make_commit(self, tree: str, parents: Iterable[str], message: str) -> Commit:
+        arguments: list[str] = ["commit-tree", tree]
+        parents = tuple(parents)
+        for parent in parents:
+            arguments.extend(("-p", parent))
+        sha = self.run(*arguments, input_text=message + "\n").stdout.strip()
+        if self.parents(sha) != parents:
+            raise KernelError("commit_parents_changed")
+        return self.commit(sha)
+
+    def check_candidate(self, checkout: Path, *revisions: str, cached: bool = False) -> None:
+        """The same content check before commit and on original-object readback.
+
+        CRLF is a line ending, not trailing whitespace. Spaces before CR and
+        actual conflict markers still fail; no repository setting is changed.
+        """
+        command = ("-c", "core.whitespace=trailing-space,space-before-tab,cr-at-eol",
+                   "diff", "--check", *(("--cached",) if cached else ()), *revisions)
+        result = self.run(*command, cwd=checkout, check=False)
+        if result.returncode:
+            raise GitError("Candidate content check failed", evidence={
+                "command": ["git", *command], "returncode": result.returncode,
+                "stdout": result.stdout, "stderr": result.stderr})
+
+    def candidate(self, checkout: Path, before: str, token: str,
+                  parents: tuple[str, ...]) -> tuple[Commit, bool]:
+        if not parents or parents[0] != before or len(parents) not in {1, 2} or len(set(parents)) != len(parents):
+            raise KernelError("candidate_parent_identity")
+        actual = self.run("rev-parse", "HEAD", cwd=checkout).stdout.strip()
+        merge = self.run("rev-parse", "-q", "--verify", "MERGE_HEAD", cwd=checkout, check=False)
+        if merge.returncode not in {0, 1}:
+            raise KernelError("candidate_merge_unknown")
+        merge_head = merge.stdout.strip() if merge.returncode == 0 else None
+        if actual != before:
+            message = self.run("show", "-s", "--format=%B", actual).stdout.rstrip("\n")
+            if (message != f"candidate {token}" or self.parents(actual) != parents or merge_head is not None
+                    or self.run("status", "--porcelain", "--untracked-files=all", cwd=checkout).stdout):
+                raise KernelError("candidate_checkout_changed")
+            self.check_candidate(checkout, before, actual)
+            return self.commit(actual), False
+        if merge_head != (parents[1] if len(parents) == 2 else None):
+            raise KernelError("candidate_merge_changed")
+        self.run("add", "--all", cwd=checkout)
+        self.check_candidate(checkout, cached=True)
+        tree = self.run("write-tree", cwd=checkout).stdout.strip()
+        if tree == self.commit(before).tree and len(parents) == 1:
+            return self.commit(before), True
+        result = self.make_commit(tree, parents, f"candidate {token}")
+        self.run("reset", "--hard", result.sha, cwd=checkout)
+        return result, False
+
+    def combine(self, candidate: str, target: str, token: str) -> Commit:
+        if self.is_ancestor(target, candidate):
+            return self.commit(candidate)
+        result = self.run("merge-tree", "--write-tree", candidate, target, check=False)
+        if result.returncode:
+            raise KernelError("integration_failed", repr({"command": ["git", "merge-tree", "--write-tree", candidate, target],
+                              "returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr}))
+        tree = result.stdout.splitlines()[0]
+        return self.make_commit(tree, (candidate, target), f"integration {token}")
+
+    def install_checkout(self, checkout: Path, sha: str) -> None:
+        if self.run("status", "--porcelain", cwd=checkout).stdout:
+            raise KernelError("dirty_managed_checkout", str(checkout))
+        self.run("reset", "--hard", sha, cwd=checkout)
+
+    def compare_and_swap(self, ref: str, before: str, after: str) -> None:
+        if not self.is_ancestor(before, after):
+            raise KernelError("non_append_write")
+        self.run("update-ref", ref, after, before)

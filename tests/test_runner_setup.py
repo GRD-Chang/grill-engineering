@@ -40,12 +40,12 @@ def setup_host(tmp_path: Path, request: pytest.FixtureRequest):
     # directly. Representative probe/cleanup cases keep the real boundary;
     # no-argument finalization always uses it, including doctor and unit cleanup.
     probe_dispatch = '' if getattr(request, 'param', False) else '''
-if [ "${1##*/}" = runner_setup.py ] && [ "$#" -gt 1 ]; then
+if [ "${1##*/}" = setup.py ] && [ "$#" -gt 1 ]; then
     shift
     exec "$@" 2>&1
 fi
 '''
-    _script(binaries / 'python3', probe_dispatch + f'if [ "$1" = - ] || [ "${{1##*/}}" = runner_setup.py ]; then exec "{sys.executable}" "$@"; fi\nexit "${{TEST_PYTHON_EXIT:-0}}"\n')
+    _script(binaries / 'python3', probe_dispatch + f'if [ "$1" = - ] || [ "${{1##*/}}" = setup.py ]; then exec "{sys.executable}" "$@"; fi\nexit "${{TEST_PYTHON_EXIT:-0}}"\n')
     _script(binaries / 'git', 'echo "git version ${TEST_GIT_VERSION:-2.43.0}"\n')
     for name in ('gh', 'bwrap', 'openssl', 'codex', 'systemctl', 'systemd-run'):
         _script(binaries / name, 'echo "compatible --paginate --slurp --method --header"\n')
@@ -235,7 +235,7 @@ def test_setup_probe_reaps_escaped_child_after_normal_exit(setup_host):
 
 
 def test_host_package_preparation_respects_runner_usage_lease(setup_host):
-    from agent_run.runner_lease import runner_usage_lease
+    from agent_run.runtime.package_lease import runner_usage_lease
 
     run, binaries, _, log, home = setup_host
     (binaries / 'openssl').unlink()

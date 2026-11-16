@@ -1,0 +1,221 @@
+{
+  "schema": "prebuilt-independent-integration-review/1",
+  "base": "fc853965b451c7cbc886b398caae947b78c4b2a0",
+  "base_tree": "80f76d50fee33737cd9ddba1f8bee5dd9050666f",
+  "owned_inputs": [
+    {
+      "name": "source",
+      "source": "cfa9bbfb2467822401dee38344b514121a62d9d3",
+      "exact_parent": "f943b716f8d66817633869b7d26a215d47b63ab5",
+      "owned_product_paths": [
+        "project/src/agent_run_kernel/migration_conversion.py",
+        "project/src/agent_run_kernel/migration_run_install.py",
+        "project/src/agent_run_kernel/migration_run_ownership.py",
+        "project/src/agent_run_kernel/migration_run_proof.py"
+      ]
+    },
+    {
+      "name": "core",
+      "source": "283a8f3d52ed5324f42831629e6afb492d6332ba",
+      "exact_parent": "937352f139c83ad3e61dfb102719caef476ed694",
+      "owned_product_paths": [
+        "project/src/agent_run_kernel/kernel.py"
+      ]
+    },
+    {
+      "name": "physical",
+      "source": "68928c0f9093893c4a1a015778b2ebf657f03391",
+      "exact_parent": "f943b716f8d66817633869b7d26a215d47b63ab5",
+      "owned_product_paths": [
+        "project/src/agent_run_kernel/local_effects.py"
+      ]
+    },
+    {
+      "name": "core_successor",
+      "source": "da15b91148a27a71eb0b47c0cdc0058c3516a462",
+      "exact_parent": "283a8f3d52ed5324f42831629e6afb492d6332ba",
+      "owned_product_paths": [
+        "project/src/agent_run_kernel/kernel.py"
+      ]
+    },
+    {
+      "name": "source_read_successor",
+      "source": "f3a21bd1932e2e1397fa8eb9ed79f11a13e4b4f0",
+      "exact_parent": "cfa9bbfb2467822401dee38344b514121a62d9d3",
+      "owned_product_paths": [
+        "project/src/agent_run_kernel/migration_run_ownership.py"
+      ]
+    }
+  ],
+  "local_composition": "e3cbb04d80e4e222e0eea9a1275ae335c48bfdee",
+  "local_tree": "6eb1d6460f5640df90b90bc88b1ed667453780e7",
+  "local_applied_commits": [
+    "23bb06b8225ef96b48889ac6a27f0125d1fe3125 fc853965b451c7cbc886b398caae947b78c4b2a0 review composition: exact cfa source owned diff",
+    "4913c80e501e20e80439a39590ec0803e8543617 23bb06b8225ef96b48889ac6a27f0125d1fe3125 review composition: exact 283 Core workspace owned diff",
+    "8eb79dee8a38b728f6d53fc1c627c9921ef9942e 4913c80e501e20e80439a39590ec0803e8543617 review composition: exact 689 physical owned diff",
+    "82a68230e22d0b48c5300479094c32c59fb76b30 8eb79dee8a38b728f6d53fc1c627c9921ef9942e review composition: exact da15 Core owned successor",
+    "e3cbb04d80e4e222e0eea9a1275ae335c48bfdee 82a68230e22d0b48c5300479094c32c59fb76b30 review composition: exact f3a source read successor"
+  ],
+  "preservation": "Source4 modules and physical module were applied as exact owned diff only. Kernel AST differs fromfc only in_mechanical; _owned/_executor_owned and all other Kernel methods retain exactfc bodies. No whole Kernel or branch tree replacement.",
+  "test_dependencies": {
+    "test_kernel_idle_prebuilt.py": "Exactf3a source-owner fixture/test blob; old producer only fixture/start operations, immutable02b008e4 code verified by bundled frozen_v6_runtime. Only2 named new callback cases from this module were selected.",
+    "test_kernel_prebuilt_workspace_integration.py": "Exacte46 physical-owner16 cases, actual getter/install/Git, dummy write authorizer callbacks; physical proof coverage, not Core dispatch coverage.",
+    "test_kernel_prebuilt_actual_integration_review.py": "Independent8 cases use actual installer/getter, Kernel.prepare/dispatch/guard/reconcile, real local Git and public controls; no auth stub. External Requirements are synthetic physical service input; no World/selector/receipt manufactured."
+  },
+  "command": "python -m pytest -q -n 2 --dist=worksteal tests/test_kernel_prebuilt_workspace_integration.py tests/test_kernel_prebuilt_actual_integration_review.py tests/test_kernel_idle_prebuilt.py::test_installed_idle_authentication_never_invokes_a_write_authorizer",
+  "cwd": "/tmp/grill-prebuilt-integration-review-fc853965/project",
+  "tests": 26,
+  "failures": 1,
+  "errors": 0,
+  "skipped": 0,
+  "seconds": 26.214,
+  "nodes": [
+    {
+      "node": "tests/test_kernel_prebuilt_workspace_integration.py::test_real_authenticated_external_change_refuses_writes[different-head]",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_workspace_integration.py::test_real_authenticated_prebuilt_partial_states[False-False]",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_workspace_integration.py::test_real_authenticated_external_change_refuses_writes[different-ref]",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_workspace_integration.py::test_real_authenticated_prebuilt_partial_states[True-False]",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_workspace_integration.py::test_real_authenticator_read_failure_remains_unknown",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_workspace_integration.py::test_real_authenticated_prebuilt_partial_states[False-True]",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_actual_integration_review.py::test_actual_source_binding_dispatches_to_dependency_visible_head[True-False]",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_workspace_integration.py::test_real_authenticated_prebuilt_partial_states[True-True]",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_actual_integration_review.py::test_actual_source_binding_dispatches_to_dependency_visible_head[True-True]",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_workspace_integration.py::test_real_authenticated_lazy_states[False-False-installed0]",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_actual_integration_review.py::test_actual_source_binding_dispatches_to_dependency_visible_head[False-False]",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_workspace_integration.py::test_real_authenticated_lazy_states[True-False-installed0]",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_workspace_integration.py::test_real_authenticated_lazy_states[False-True-installed0]",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_actual_integration_review.py::test_prepared_zero_dispatch_complete_physical_target_is_not_execution",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_workspace_integration.py::test_real_authenticated_lazy_states[True-True-installed0]",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_actual_integration_review.py::test_original_sent_partial_real_binding_converges_without_reallocation",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_workspace_integration.py::test_real_authenticated_equal_h0_h1_creates_only_ref[installed0]",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_actual_integration_review.py::test_partial_prebuilt_original_witness_permits_explicit_abandon_cleanup",
+      "terminal": "failed",
+      "failure": "idle_copy = (SourceSnapshot(source=PosixPath('/tmp/pytest-of-agent/pytest-12/popen-gw1/test_partial_prebuilt_original0/repo/.agent...test-12/popen-gw1/test_partial_prebuilt_original0/private/kernel.sqlite3'), '1e19f9e681b7a929c0921b856307050b0500fcbf')\nmonkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f7cbda72c00>\n\n    def test_partial_prebuilt_original_witness_permits_explicit_abandon_cleanup(idle_copy, monkeypatch):\n        kernel, execution, runner, ports, git, effect, h0, h1 = partial_actual_workspace(idle_copy, monkeypatch)\n        resources = kernel.generation_resources()\n        inspections = ports.inspect(resources)\n        try:\n>           result = kernel.control('abandon', 'abandon-original-prebuilt-partial', resource_inspections=inspections)\n                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n\ntests/test_kernel_prebuilt_actual_integration_review.py:172: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \nsrc/agent_run_kernel/kernel.py:2805: in control\n    return self._control(tx, kind, action_id, subject=subject, world=world, message=message,\nsrc/agent_run_kernel/kernel.py:2861: in _control\n    self._check_resource_inspections(resources, resource_inspections, discard_worktree)\n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ \n\nresources = (ResourceWitness(subject='ticket:2', generation=1, kind='development', checkout='/tmp/pytest-of-agent/pytest-12/popen-...riginal0/private/authority/.git', source_ref='refs/heads/idle-3', head_sha='1e19f9e681b7a929c0921b856307050b0500fcbf'))\ninspections = (ResourceInspection(resource=ResourceWitness(subject='ticket:2', generation=1, kind='development', checkout='/tmp/pyte..., head_sha='1e19f9e681b7a929c0921b856307050b0500fcbf'), disposition='absent', head_sha=None, reason='worktree_absent'))\ndiscard = False\n\n    @staticmethod\n    def _check_resource_inspections(resources: tuple[ResourceWitness, ...], inspections: tuple[ResourceInspection, ...], discard: bool) -> None:\n        if tuple(item.resource for item in inspections) != resources:\n            raise KernelError(\"abandon_resource_boundary\")\n        for item in inspections:\n            if (item.disposition not in {\"clean\", \"dirty\", \"absent\"}\n                    or (item.disposition != \"absent\" and item.head_sha != item.resource.head_sha)):\n>               raise KernelError(\"abandon_resource_unproven\", item.resource.checkout)\nE               agent_run_kernel.model.KernelError: abandon_resource_unproven: /tmp/pytest-of-agent/pytest-12/popen-gw1/test_partial_prebuilt_original0/private/work/ticket-2\n\nsrc/agent_run_kernel/kernel.py:733: KernelError\n\nDuring handling of the above exception, another exception occurred:\n\nidle_copy = (SourceSnapshot(source=PosixPath('/tmp/pytest-of-agent/pytest-12/popen-gw1/test_partial_prebuilt_original0/repo/.agent...test-12/popen-gw1/test_partial_prebuilt_original0/private/kernel.sqlite3'), '1e19f9e681b7a929c0921b856307050b0500fcbf')\nmonkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f7cbda72c00>\n\n    def test_partial_prebuilt_original_witness_permits_explicit_abandon_cleanup(idle_copy, monkeypatch):\n        kernel, execution, runner, ports, git, effect, h0, h1 = partial_actual_workspace(idle_copy, monkeypatch)\n        resources = kernel.generation_resources()\n        inspections = ports.inspect(resources)\n        try:\n            result = kernel.control('abandon', 'abandon-original-prebuilt-partial', resource_inspections=inspections)\n        except KernelError as error:\n>           pytest.fail(f'Normal authenticated H0 checkout / H1 ref cannot enter explicit Abandon: {error.code}; {inspections!r}')\nE           Failed: Normal authenticated H0 checkout / H1 ref cannot enter explicit Abandon: abandon_resource_unproven; (ResourceInspection(resource=ResourceWitness(subject='ticket:2', generation=1, kind='development', checkout='/tmp/pytest-of-agent/pytest-12/popen-gw1/test_partial_prebuilt_original0/private/work/ticket-2', owned_root='/tmp/pytest-of-agent/pytest-12/popen-gw1/test_partial_prebuilt_original0/private/work', common_git_dir='/tmp/pytest-of-agent/pytest-12/popen-gw1/test_partial_prebuilt_original0/private/authority/.git', source_ref='refs/heads/idle-2', head_sha='733dbfc7c544f24070d262794972c51c700382ac'), disposition='foreign', head_sha=None, reason='worktree_registration_changed'), ResourceInspection(resource=ResourceWitness(subject='ticket:3', generation=1, kind='development', checkout='/tmp/pytest-of-agent/pytest-12/popen-gw1/test_partial_prebuilt_original0/private/work/ticket-3', owned_root='/tmp/pytest-of-agent/pytest-12/popen-gw1/test_partial_prebuilt_original0/private/work', common_git_dir='/tmp/pytest-of-agent/pytest-12/popen-gw1/test_partial_prebuilt_original0/private/authority/.git', source_ref='refs/heads/idle-3', head_sha='1e19f9e681b7a929c0921b856307050b0500fcbf'), disposition='absent', head_sha=None, reason='worktree_absent'))\n\ntests/test_kernel_prebuilt_actual_integration_review.py:174: Failed"
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_workspace_integration.py::test_real_authenticated_second_write_fence_and_reentry",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_actual_integration_review.py::test_real_public_stop_fences_the_second_workspace_write",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_workspace_integration.py::test_real_authenticated_write_response_loss[update-ref-prior]",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_actual_integration_review.py::test_real_source_change_retains_first_binding_and_h1_in_replacement",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_workspace_integration.py::test_real_authenticated_write_response_loss[switch-target]",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_idle_prebuilt.py::test_installed_idle_authentication_never_invokes_a_write_authorizer[False]",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_prebuilt_workspace_integration.py::test_real_authenticated_external_change_refuses_writes[dirty]",
+      "terminal": "passed",
+      "failure": null
+    },
+    {
+      "node": "tests/test_kernel_idle_prebuilt.py::test_installed_idle_authentication_never_invokes_a_write_authorizer[True]",
+      "terminal": "passed",
+      "failure": null
+    }
+  ],
+  "finding": {
+    "node": "tests/test_kernel_prebuilt_actual_integration_review.py::test_partial_prebuilt_original_witness_permits_explicit_abandon_cleanup",
+    "normal_story": "Fresh immutable old producer starts legitimate idle source; capture/read_initial_import/install creates private copied prebuiltH0 resource. Real Core creates workspace with before_shaH1 and actual bindingH0. First guarded ref CAS writesH1; switch is interrupted before physical start. Original sent/attempts1, real helper reads prior. Public generation_resources/inspect/abandon then rejects the owned partial resource.",
+    "actual": "ResourceWitness.head_sha=H1 but original checkout remainsH0; resource inspection foreign/worktree_registration_changed; Kernel.control(abandon) rejects abandon_resource_unproven before Action admission. Original checkout/ref and payload remain; this is not evidence deletion or destructive cleanup.",
+    "source_positions": [
+      "kernel.py694-713 _generation_resources emits only current workspace_shaH1",
+      "cleanup_adapter.py inspect_worktree compares registration/HEAD against that witness",
+      "kernel.py727-733 _check_resource_inspections rejects foreign"
+    ],
+    "expected": "The authenticated legal partial workspace needs a usable original resource witness for explicit Abandon/cleanup. Do not silently rewrite, erase originalH0 facts, fabricate Completion or treat a failed Abandon as admitted."
+  },
+  "positive_contracts": "Four physical states classified prior/prior/prior/target; lazy andH0=H1; guarded missing-ref CAS and non-force detached switch; response loss and reentry; dirty/foreign/other rejected and read failure unknown; actualCore before_shaH1, prepared/0 target not execution, same sent intent convergence, real public Stop fences second write. Source DB/sealed snapshot bytes unchanged.",
+  "known_gap_review": "Beforeda15 the independent real source-change node failed with missing prebuilt_workspace; afterda15 it passes, retains originalH1 despite later normal Run ref advance, retains original binding, calls no new getter and keeps original retired material. Source readonly callback fix passes both published cases; actual CAS/switch Core guards still tested.",
+  "typecheck": "Success: no issues in126 src files",
+  "remaining": "One partial-prebuilt Abandon witness gap. This review does not claim native11/oracle/returned-resource acceptance.",
+  "restrictions": "34 restricted proof/DB attacks and2 pending approval operations not executed. No prepared DB edits/recreation, source DB mutations, native11 oracle recreation, system configuration or real network/credentials.",
+  "test_pack_scope": "This commit contains only tests and evidence onfc. To run, separately compose the exact published owned product inputs listed above; do not treat this tests branch as a product integration tree or run unselected dependency tests as if authorized."
+}

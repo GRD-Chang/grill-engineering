@@ -1,0 +1,435 @@
+"""Execute one allocated call, with no role, budget or recovery decisions.
+
+Linux process mechanics adapted from worker_sandbox.run_worker_process and
+executor_host._process_start_token. Those modules are not imported: their
+local imports would bring the legacy State/TaskControl ownership back here.
+This is a local process adapter, not a systemd/cgroup or live Codex adapter.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+import math
+import os
+from pathlib import Path, PurePosixPath
+import select
+import selectors
+import signal
+import subprocess
+import sys
+import time
+from types import MappingProxyType
+from typing import TYPE_CHECKING
+
+from agent_run.errors import bounded_error
+from agent_run.runtime.process_identity import _process_start_token as _start_token
+
+from agent_run.model import AgentCall, ReadWait
+from agent_run.errors import ObservationSuperseded
+from agent_run.storage.sqlite import MATERIAL_LIMIT
+
+if TYPE_CHECKING:
+    from agent_run.runtime.codex import _CodexCapture
+    from agent_run.core.kernel import Kernel
+
+
+_BOOTSTRAP = """\
+import os, sys
+gate = int(sys.argv[1])
+try:
+    released = os.read(gate, 1)
+finally:
+    os.close(gate)
+if released != b"1":
+    raise SystemExit(125)
+os.execvpe(sys.argv[2], sys.argv[2:], os.environ)
+"""
+_CHUNK = 64 * 1024
+
+
+@dataclass(frozen=True)
+class ProcessExit:
+    identity: Mapping[str, int | str]
+    returncode: int
+    raw: bytes
+    stderr: str
+
+
+class ProcessExitUnknown(RuntimeError):
+    """No lease may be released on this unproven process observation."""
+
+
+def _cgroup(pid: int) -> str:
+    try:
+        memberships = Path(f"/proc/{pid}/cgroup").read_text().splitlines()
+    except (OSError, UnicodeError) as error:
+        raise ProcessExitUnknown("Process cgroup is unavailable") from error
+    groups = [line[3:] for line in memberships if line.startswith("0::")]
+    if len(groups) != 1 or not groups[0].startswith("/") or ".." in PurePosixPath(groups[0]).parts:
+        raise ProcessExitUnknown("Process cgroup is ambiguous")
+    return groups[0]
+
+
+def _identity(pid: int, *, foreground: bool = False) -> dict[str, int | str]:
+    host = os.getpid()
+    start, host_start = _start_token(pid), _start_token(host)
+    if start is None or host_start is None or os.getpgid(pid) != pid:
+        raise ProcessExitUnknown("Worker process identity is unavailable")
+    if foreground:
+        namespace, host_namespace = os.readlink(f"/proc/{pid}/ns/pid"), os.readlink("/proc/self/ns/pid")
+        if namespace != host_namespace or _start_token(pid) != start or _start_token(host) != host_start:
+            raise ProcessExitUnknown("Worker namespace identity is unavailable")
+        return {"schema": "linux-namespace-process-v1", "pid": pid, "start_token": start, "pgid": pid,
+                "host_pid": host, "host_start_token": host_start, "pid_namespace": namespace,
+                "host_namespace": host_namespace, "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
+    group, host_group = _cgroup(pid), _cgroup(host)
+    if _start_token(pid) != start or _start_token(host) != host_start:
+        raise ProcessExitUnknown("Process identity changed while reading cgroup")
+    return {
+        "schema": "linux-process-v1", "pid": pid, "start_token": start,
+        "pgid": pid, "host_pid": host, "host_start_token": host_start,
+        "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+        "cgroup": group, "host_cgroup": host_group,
+    }
+
+
+def _terminate(process: subprocess.Popen[bytes], identity: Mapping[str, int | str]) -> None:
+    def require_identity() -> None:
+        current = _start_token(process.pid)
+        if (current is not None and current != identity["start_token"]
+                or current is None and process.poll() is None):
+            raise ProcessExitUnknown("Worker identity changed; no group signal sent")
+
+    require_identity()
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        process.wait(timeout=1)
+        return
+    deadline = time.monotonic() + 0.2
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        require_identity()
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    process.wait(timeout=1)
+
+
+def _drain(
+    process: subprocess.Popen[bytes], prompt: str, deadline: float,
+    kernel: Kernel, call: AgentCall, identity: Mapping[str, int | str],
+    capture: _CodexCapture | None,
+) -> tuple[bytes, str]:
+    raw, errors = bytearray(), bytearray()
+    assert process.stdin is not None and process.stdout is not None and process.stderr is not None
+    remaining_input = memoryview(prompt.encode("utf-8"))
+    with selectors.DefaultSelector() as selector:
+        for stream, label in ((process.stdout, "raw"), (process.stderr, "stderr")):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, label)
+        if remaining_input:
+            os.set_blocking(process.stdin.fileno(), False)
+            selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+        else:
+            process.stdin.close()
+        while selector.get_map() or process.poll() is None:
+            if process.poll() is None:
+                kernel.guard_agent(call)
+                if capture is not None:
+                    capture.guard()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Worker process exceeded its execution deadline")
+            else:
+                # Reap/stop descendants that would otherwise retain our pipes.
+                _terminate(process, identity)
+            for key, _ in selector.select(timeout=0.05):
+                if key.data == "stdin":
+                    try:
+                        written = os.write(key.fd, remaining_input[:_CHUNK])
+                        remaining_input = remaining_input[written:]
+                    except BrokenPipeError:
+                        remaining_input = memoryview(b"")
+                    if not remaining_input:
+                        selector.unregister(key.fileobj)
+                        process.stdin.close()
+                    continue
+                chunk = os.read(key.fd, _CHUNK)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                elif key.data == "raw":
+                    if capture is not None:
+                        capture.feed(chunk)
+                    else:
+                        if len(raw) + len(chunk) > MATERIAL_LIMIT:
+                            raise ValueError("Worker return exceeds the material limit; no truncated return saved")
+                        raw.extend(chunk)
+                else:
+                    errors.extend(chunk)
+                    del errors[:-_CHUNK]
+    return bytes(raw), bounded_error(errors.decode("utf-8", errors="replace"))
+
+
+def execute(
+    kernel: Kernel, call: AgentCall, *, arguments: Sequence[str], cwd: Path,
+    prompt: str, environment: Mapping[str, str], timeout: float,
+    authorize_source: Callable[[], None] | None = None,
+    credential_file: Path | None = None,
+) -> ProcessExit | None:
+    """Run once; a repeated sent/unknown call is observed through Kernel only.
+
+    Real-source drivers must supply their reader -> Kernel.refresh guard.
+    None is reserved for explicitly synthetic inputs. No online identity is
+    discovered, changed, or retried here; credential_file is an existing
+    selected Worker credential reference, never its secret contents.
+    """
+    return _execute(
+        kernel, call, arguments=arguments, cwd=cwd, prompt=prompt,
+        environment=environment, timeout=timeout, authorize_source=authorize_source,
+        credential_file=credential_file,
+    )
+
+
+def _unavailable(
+    kernel: Kernel, call: AgentCall, code: str, evidence: dict[str, object] | str,
+    capture: _CodexCapture | None,
+) -> None:
+    if capture is None:
+        kernel.agent_unavailable(call, code, evidence)
+    else:
+        # Native preparation still owns files/provider resources. Settle only
+        # after its context has closed successfully.
+        capture.unstarted_failure = (code, evidence)
+
+
+def _execute(
+    kernel: Kernel, call: AgentCall, *, arguments: Sequence[str], cwd: Path,
+    prompt: str, environment: Mapping[str, str], timeout: float | None,
+    authorize_source: Callable[[], None] | None,
+    credential_file: Path | None = None, capture: _CodexCapture | None = None,
+) -> ProcessExit | None:
+    started = time.monotonic()
+    try:
+        claimed = kernel.dispatch_agent(call)
+    except BaseException as error:
+        if capture is None:
+            try:
+                kernel.agent_unavailable(call, "worker_preparation_failed",
+                    {"error_type": type(error).__name__}, before_dispatch=True)
+            except BaseException as settlement_error:
+                raise error from settlement_error
+        raise
+    if not claimed:
+        if capture is not None:
+            capture.unstarted_failure = None  # Another launch claim is not ours to settle.
+        return None
+    if capture is not None:
+        capture.dispatch_claimed = True  # Only an acknowledged True claim belongs to this launch.
+    configured = call.deadline_at - kernel.clock()
+    supplied = call.deadline_seconds if timeout is None else timeout
+    try:
+        if not math.isfinite(supplied) or supplied <= 0:
+            raise ValueError("A positive finite execution timeout is required")
+        deadline = min(time.monotonic() + configured, started + supplied)
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Worker deadline expired before preparation")
+    except BaseException as error:
+        _unavailable(kernel, call, "worker_preparation_failed", {"error_type": type(error).__name__}, capture)
+        raise
+    return _run_dispatched(
+        kernel, call, arguments=arguments, cwd=cwd, prompt=prompt,
+        environment=environment, deadline=deadline, authorize_source=authorize_source,
+        credential_file=credential_file, capture=capture,
+    )
+
+
+def _authorize_source(
+    kernel: Kernel, call: AgentCall, authorize_source: Callable[[], None] | None, deadline: float,
+    capture: _CodexCapture | None = None,
+) -> None:
+    if authorize_source is None:
+        return
+    while True:
+        kernel.guard_agent(call)
+        if capture is not None:
+            capture.guard()
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Worker deadline expired during source authorization")
+        try:
+            authorize_source()
+            return
+        except ReadWait as waiting:
+            if waiting.step.kind != "waiting":
+                raise
+            # Keep this call and any bound bootstrap. A short mechanical wait
+            # keeps Stop, credential cancellation and the original deadline live.
+            retry_at = waiting.retry_at
+            while retry_at is not None and kernel.clock() < retry_at:
+                kernel.guard_agent(call)
+                if capture is not None:
+                    capture.guard()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Worker deadline expired during source authorization")
+                time.sleep(min(0.1, remaining, max(0.0, retry_at - kernel.clock())))
+        except ObservationSuperseded:
+            # Only a proved obsolete read can be replaced. Keep this original
+            # call, lease and any bound bootstrap; never retry a Worker launch.
+            kernel.guard_agent(call)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Worker deadline expired during source authorization")
+
+
+def _run_dispatched(
+    kernel: Kernel, call: AgentCall, *, arguments: Sequence[str], cwd: Path,
+    prompt: str, environment: Mapping[str, str], deadline: float,
+    authorize_source: Callable[[], None] | None,
+    credential_file: Path | None, capture: _CodexCapture | None,
+) -> ProcessExit | None:
+    if credential_file is not None:
+        try:
+            with credential_file.open("rb"):
+                pass
+        except OSError:
+            _unavailable(kernel, call, "worker_credentials_unavailable", "Selected Worker credentials are unavailable", capture)
+            return None
+    try:
+        if not arguments:
+            raise ValueError("Worker arguments are required")
+        if not hasattr(os, "pidfd_open"):
+            raise OSError("The local process adapter requires Linux pidfd")
+        _authorize_source(kernel, call, authorize_source, deadline, capture)
+        kernel.guard_agent(call)
+        if capture is not None:
+            capture.guard()
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Worker deadline expired during preparation")
+    except BaseException as error:
+        _unavailable(kernel, call, "github_read_wait" if isinstance(error, ReadWait) else "worker_preparation_failed",
+                     {"error_type": type(error).__name__}, capture)
+        raise
+    gate_read, gate_write = os.pipe()
+    try:
+        if capture is not None:
+            capture.unstarted_failure = None  # Popen may create a child before raising.
+        process = subprocess.Popen(
+            [sys.executable, "-I", "-c", _BOOTSTRAP, str(gate_read), *arguments],
+            cwd=cwd, env=dict(environment), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, start_new_session=True, pass_fds=(gate_read,),
+        )
+    except OSError as error:
+        os.close(gate_write)
+        _unavailable(kernel, call, "worker_start_failed", {"errno": error.errno}, capture)
+        return None
+    except BaseException:
+        os.close(gate_write)
+        kernel.agent_start_unknown(call, {"boundary": "Popen"})
+        raise
+    finally:
+        os.close(gate_read)
+    identity: dict[str, int | str] | None = None
+    pidfd: int | None = None
+    bound = False
+    released = False
+    raw, stderr = b"", ""
+    failure: BaseException | None = None
+    try:
+        pidfd = os.pidfd_open(process.pid)
+        identity = _identity(process.pid, foreground=kernel.host_backend(call.execution) == "foreground")
+        kernel.agent_started(call, identity)
+        bound = True
+        _authorize_source(kernel, call, authorize_source, deadline, capture)
+        kernel.guard_agent(call)
+        if capture is not None:
+            capture.guard()
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Worker deadline expired before process release")
+        kernel.agent_source_ready(call)
+        os.write(gate_write, b"1")
+        released = True
+        os.close(gate_write)
+        gate_write = -1
+        raw, stderr = _drain(process, prompt, deadline, kernel, call, identity, capture)
+    except BaseException as error:
+        failure = error
+    finally:
+        if gate_write >= 0:
+            os.close(gate_write)
+        try:
+            if identity is None:
+                # Without release, EOF makes the bootstrap exit without argv.
+                process.wait(timeout=1)
+            else:
+                _terminate(process, identity)
+            if pidfd is None or not select.select([pidfd], [], [], 1)[0]:
+                raise ProcessExitUnknown("Worker exit has not been observed through its pidfd")
+        except (OSError, subprocess.TimeoutExpired, ProcessExitUnknown) as error:
+            failure = ProcessExitUnknown("Worker exit remains unproven")
+            failure.__cause__ = error
+        finally:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+            if pidfd is not None:
+                os.close(pidfd)
+    if isinstance(failure, ProcessExitUnknown) or identity is None:
+        kernel.agent_start_unknown(call, {"boundary": "process binding/exit", "pid": process.pid})
+        raise failure or ProcessExitUnknown("Worker binding remains unproven")
+    if not bound:
+        # A failed binding commit may have succeeded before its response was
+        # lost. Report the observed facts, never authorize a second process.
+        kernel.agent_start_unknown(call, {
+            "boundary": "durable binding", "process_identity": identity,
+            "observed_exit": process.returncode,
+        })
+        raise failure or ProcessExitUnknown("Worker binding commit is unknown")
+    framed = released and failure is None and process.returncode == 0
+    capture_failed = False
+    if capture is not None and released:
+        capture.diagnostic = {**(capture.diagnostic or {}), "stderr_tail_present": bool(stderr),
+                              "stderr_tail_bytes": len(stderr.encode("utf-8"))}
+        try:
+            raw = capture.finish()
+            framed = True
+        except BaseException as output_error:
+            capture_failed = True
+            framed = False
+            if failure is None:
+                failure = output_error
+            else:
+                failure.add_note(f"Final Worker output unavailable: {type(output_error).__name__}")
+    raw_settlement_failed = False
+    try:
+        if framed:
+            # Actual exit is already proved. Raw settlement is independent
+            # of Stop and of the separate exit-fact transaction below.
+            kernel.receive(call, raw)
+    except BaseException as error:
+        failure = error
+        # This is a Runner storage/response failure, not a failed Worker turn.
+        # Kernel alone can tell whether the raw transaction actually committed.
+        raw_settlement_failed = True
+    finally:
+        assert process.returncode is not None
+        try:
+            kernel.agent_exited(
+                call, identity, process.returncode,
+                failure=None if failure is None else type(failure).__name__,
+                failure_kind=("fatal" if raw_settlement_failed or capture_failed else
+                              capture.failure_kind if capture is not None else "ordinary"),
+                diagnostic=capture.diagnostic if capture is not None else None,
+            )
+        except BaseException as exit_error:
+            if failure is not None:
+                raise failure from exit_error
+            raise
+    if failure is not None:
+        raise failure
+    return ProcessExit(MappingProxyType(identity), process.returncode, raw, stderr)

@@ -45,7 +45,7 @@ agent-run run 330 --worker-github-source pat --github-pat-env DELIVERY_GITHUB_PA
 
 `run` 覆盖只作用于新 Run，不改个人默认。使用环境引用时，启动及恢复命令的环境须包含该变量，后台执行器继承所需环境。Run 固定非秘密来源和引用，秘密值不进入快照或普通输出；修改个人默认不改变已有 Run。文件引用适合在相同路径更换 token；环境引用则在恢复前重新导出同名变量。已有 Run 因凭据不可用暂停时，保留进度与诊断，修复原引用后公开 `resume`，不切换来源、不重置正式批准边界。
 
-`settings show` 的 `github.worker` 与 `github.runner` 分别展示两端有效来源及引用，`capabilities` 说明能力边界；查询不签发凭据、不输出秘密值。`settings show --run` 查看该 Run 固定配置；旧 Run 未保存程序端身份时该项显示未设置，不从当前默认推测。GitHub 写能力不授权 Worker 自行提交、正式发布、自我批准或完成交付，角色合同和 Controller/Publisher 职责继续有效。
+`settings show` 的 `github.worker` 与 `github.runner` 分别展示两端有效来源及引用，`capabilities` 说明能力边界；查询不签发凭据、不输出秘密值。`settings show --run` 查看受支持 v20 Run 的固定配置，不从当前默认推测缺失事实；旧协议不提供兼容查询或恢复，见[状态存储](agents/state-storage.md)。GitHub 写能力不授权 Worker 自行提交、正式发布、自我批准或完成交付，角色合同和 Controller/Publisher 职责继续有效。
 
 ### App 配置与迁移
 
@@ -100,6 +100,20 @@ Runner App 复用相同的签发与续签实现，后续 Controller、Publisher 
 | `parent_ci_development_limit` / `--parent-ci-development-limit` | 3 | 正整数 N；两种 Parent 的 CI Development 与 Review Findings 修改共用累计上限，跨修复工作、最终 PR 与失败版本不重置 |
 
 Ticket 最后一轮 Findings 经开发处理后可走确定性 Fallback。Ticket CI 默认关闭 Review，开启后所有轮次均审核；未经审核的修复不记录 Acceptance。失败版本、提交和 PR 更新不重置累计 CI 开发额度；重复观察不扣费，同语义工作中断续接不重复计数。额度耗尽后显式 resume 只续期 CI 额度，重复请求不重复续期，历史保留。两种 Parent 共用累计 CI 开发额度，始终要求当前完整成果的 Review；修复工作与最终 PR 不分别开户。Parent-only 与 Run 窗口用尽后需要显式恢复，不自动续期。等待、内部子 Agent 和输出格式修复不增加这些业务轮数。
+
+## Required Checks 等待时长
+
+`policy.required_checks_wait_seconds`（CLI `--required-checks-wait-seconds`）控制每个准确 PR/head 的 pending 检查窗口。默认 `2700` 秒（45 分钟）；接受正数秒或带 `s/m/h/d` 的时长，支持小数，最多 `7d`。上限保证监督始终有界；较慢的自托管 CI 可先设为 `2h`，再按项目实际耗时选择。
+
+```bash
+agent-run settings configure --required-checks-wait-seconds 2h
+agent-run run 229 --required-checks-wait-seconds 90m
+agent-run settings show --json
+```
+
+同一字段也可写入个人配置文件的 `policy` 对象；查询统一显示秒。新 Run 按内置默认、个人默认、显式参数的优先级冻结；修改个人默认不热更新已有 Run。旧快照未写此字段时仍采用原来的 45 分钟，不读取未来默认。已有预算检查点，或准确 Required Checks 监督超时边界上的显式 `resume --required-checks-wait-seconds ...`，可改变该对象**后续**窗口。CI 超时恢复仅允许覆盖此字段，须匹配原 PR/head/scope 与超时证据，不能附带修改 Agent 额度等其他策略；其他超时和普通运行中不开放此覆盖。省略参数的 Resume 仍按该对象已冻结值建立新窗口。
+
+已开始的窗口持久保存绝对截止。成功读取、网络未知、进程重启和兄弟 Ticket 推进都不续期；不同 PR/head/scope 各自计时。检查明确失败仍进入原 CI 修复流程，未知不视为成功。超时后同一 head 的检查成功，显式 Resume 可继续核验，不重放已经完成的发布或 CI 修复。调整此时长不增加 Agent 额度、Invocation 时限或写入权限；其他 GitHub 异步状态的收敛窗口保持不变。
 
 ## 开发会话策略
 
@@ -213,9 +227,13 @@ agent-run resume 228 --ticket-review-rounds 4 --development-deadline 6h
 
 `configure <Run>` 仍仅创建该 Run 的新 Profile Revision，影响之后新建的 Thread；已有 Thread、Resume 和 Output Repair 保持绑定。`resume` 只有在预算检查点才接受显式策略覆盖，并以 Run 当前快照补齐未覆盖字段；普通恢复不会更换策略或新增预算。各旧窗口保存自己的策略与用量。开发会话策略不能通过 `resume` 覆盖。
 
-## 兼容与错误处理
+## 配置来源与错误处理
 
-无新文件时，只读兼容旧 `delivery-policy.json`，查询的 `source` 为 `legacy-delivery-policy`。首次通过任一配置命令保存时，将全部旧有效策略保留到新文件。新文件存在后它是唯一权威，旧文件不再参与解析；查询 `legacy_ignored` 明示这一点，可以自行归档旧文件。旧 `policy show/configure` 命令保留，指向同一新文件，不维护另一套默认。
+`user-defaults.json` 是唯一写入权威。仅在它不存在时，只读兼容同目录旧 `delivery-policy.json` 的扁平策略对象，使用现有策略解析与校验规则；两份文件均不存在时使用内置默认值。查询通过 `source: legacy-delivery-policy`、`source_path` 和 `notice` 说明兼容来源与首次保存迁移，不创建或修改配置文件。
+
+首次 `settings configure` 在同一文件锁内保留全部有效旧策略，合并本次修改并原子保存到 `user-defaults.json`。新文件存在后完全优先，旧文件不再参与解析；查询与保存结果的 `notice` 明确旧文件已忽略并保留。迁移不会改写或删除旧文件，也不恢复旧独立 writer。实际读取文件的未知字段、非法值或损坏内容均按现有合同明确报错；损坏的新文件不会回退旧文件。
+
+`settings show/configure` 是个人设置的正式入口；旧 `policy show/configure` 路由已退出。个人配置迁移只影响未来创建的 Run，不迁移旧 Run 或改变其权限。已有 Run 和后续预算窗口继续使用其冻结策略，显式检查点覆盖以该冻结值补齐未提供字段。
 
 策略和模型中的未知字段、null、非法值及文件损坏 JSON 均明确报错，诊断含文件或配置项；不静默恢复默认、不覆盖损坏文件。CLI 更新加文件锁，先完整校验再原子替换；并发 CLI 更新保留彼此未修改字段。写入失败恢复原配置并清理临时文件；若底层存储连回滚也拒绝，错误会报告保留的恢复备份。手工编辑请保存完整 JSON，避免与 CLI 同时写入；外部编辑器不参与 CLI 锁。
 
