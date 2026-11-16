@@ -67,12 +67,12 @@ def test_missing_object_fetch_is_exact_and_does_not_move_refs(tmp_path, monkeypa
     remote.run('config', 'user.email', 'remote@example.invalid')
     missing = remote.make_commit(effect.base.tree, (effect.base.sha,), 'Remote only')
     assert git.run('cat-file', '-e', missing.sha + '^{commit}', check=False).returncode != 0
-    read, fetches = port._read, []
+    read, fetches = port.read, []
     def fetch_read(arguments):
         if arguments[:2] == ['git', 'fetch']:
             fetches.append(tuple(arguments))
         return read(arguments)
-    monkeypatch.setattr(port, '_read', fetch_read)
+    monkeypatch.setattr(port, 'read', fetch_read)
     before = remote.run('show-ref').stdout
     facts = port.delivery(query(effect, (missing.sha,)))
     assert (effect.base.sha, missing.sha) in facts.ancestry
@@ -90,7 +90,7 @@ def test_unverified_self_pair_cannot_be_accepted(tmp_path, monkeypatch, failure)
         fetches.append(sha)
         if failure == 'fetch-error':
             raise GitHubReadError('fixture_fetch_failed', 'Original fetch failed')
-    port.git_writes = SimpleNamespace(fetch=fetch)
+    port.git_reads = SimpleNamespace(fetch=fetch)
     with pytest.raises(ReadUnavailable):
         port.delivery(DeliveryRead('refs/heads/absent-source', 'refs/heads/absent-target', None,
                                    (missing,), read_pr=False))
@@ -116,7 +116,7 @@ def test_object_preparation_preserves_the_selected_writer_refusal(tmp_path, monk
     def fetch(sha):
         fetches.append(sha)
         raise refused
-    port.git_writes = SimpleNamespace(fetch=fetch)
+    port.git_reads = SimpleNamespace(fetch=fetch)
     with pytest.raises(KernelError) as caught:
         port.delivery(DeliveryRead('refs/heads/absent-source', 'refs/heads/absent-target', None,
                                    ('f' * 40,), read_pr=False))

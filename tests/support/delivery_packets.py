@@ -4,14 +4,14 @@ import subprocess
 import time
 from types import SimpleNamespace
 
-from agent_run.adapters import github_commands, remote
+from agent_run.adapters import github_commands, remote_observation as remote
 from agent_run.core.operation_contract import DeliveryRead
 from support.github_delivery import delivery_basis
 
 
 def rejected_basis(tmp_path, monkeypatch, mutation, *, discover=False):
     repository, actor = 'example/project', 'publisher'
-    port = remote.RemoteEffects(tmp_path, repository, runner_identity={'source': 'host'})
+    port = remote.RemoteObservation(tmp_path, repository, runner_identity={'source': 'host'})
     source, target = 'a' * 40, 'b' * 40
     query = DeliveryRead('refs/heads/delivery', 'refs/heads/main', None if discover else 17, (), read_checks=False)
     pr = {'number': 17, 'title': 'Title', 'body': 'Body', 'user': {'login': actor},

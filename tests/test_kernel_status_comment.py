@@ -1,12 +1,13 @@
 """A Status comment is a recoverable projection, never delivery authority."""
 from pathlib import Path
+from functools import partial
 from dataclasses import replace
 from typing import Any
 
 import pytest
 
 from agent_run.core.kernel import Kernel
-from agent_run.queries.status_comment import project_status
+from agent_run.queries.status_comment import project_status, status_binding
 from agent_run.notifications.status_comment import StatusComments
 from agent_run.storage import notification_outbox as outbox
 from support.status_comments import CommentsAPI, core_status_comments
@@ -30,7 +31,7 @@ def sender_inputs(tmp_path, monkeypatch, *, enabled=False):
     monkeypatch.setattr(notifications, "project_status", read)
     monkeypatch.setattr(notifications, "status_subjects", lambda *_args, **_kwargs: [target.subject])
     sender = StatusComments(kernel.storage.path.parent,
-        read_projection=lambda subject: read(kernel.storage.path, subject), read_binding=kernel.operation_binding)
+        read_projection=lambda subject: read(kernel.storage.path, subject), read_binding=partial(status_binding, kernel.storage.path, storage=kernel.storage))
     return kernel, current, sender
 
 
@@ -45,6 +46,13 @@ def test_status_projection_and_intent_are_readonly_and_frozen(parent_at_approval
     assert projection.target.parent_issue == 1
     assert scenario.kernel.operation_binding().inputs.notifications["enabled"] is False
     assert projection.target.actor == "offline-publisher"
+    binding = status_binding(database, storage=scenario.kernel.storage)
+    operation = scenario.kernel.operation_binding()
+    assert binding.repository == operation.repository
+    assert binding.repository_root == operation.repository_root
+    assert binding.runner_identity == operation.inputs.runner_identity
+    assert not hasattr(binding, "inputs")
+    assert projection.head_sha and f"Recorded PR head: `{projection.head_sha}`" in projection.body
     assert "Agent Run Status" in projection.body
     assert "Recorded Review: pass" in projection.body
     assert "Delivery: approval" in projection.body
@@ -68,7 +76,7 @@ def test_status_projection_and_intent_are_readonly_and_frozen(parent_at_approval
     assert len(document["remote_status"]["bindings"]) == 1
     assert document["pending"] == []  # No business effect or second notification event.
     database.write_bytes(b"damaged sqlite")
-    api = CommentsAPI(projection.target)
+    api = CommentsAPI(projection.target, head_sha=projection.head_sha)
     assert sender.deliver(subject, api=api) == "unavailable"
     assert api.reads == 0 and api.commands == []
 
@@ -95,7 +103,7 @@ def test_status_concurrent_sender_and_final_stop_cancel_before_post(tmp_path, mo
         try:
             assert entered.wait(5)
             assert StatusComments(database.parent, read_projection=lambda _: current[0],
-                read_binding=kernel.operation_binding).deliver(subject, api=api) == "busy"
+                read_binding=partial(status_binding, kernel.storage.path, storage=kernel.storage)).deliver(subject, api=api) == "busy"
             kernel.control("stop", "during-status-boundary", subject=subject)
             current[0] = replace(current[0], body="operator_stopped")
         finally:
@@ -111,7 +119,7 @@ def test_status_concurrent_sender_and_final_stop_cancel_before_post(tmp_path, mo
     # retry, not only between outer observation calls.
     import os
     import sys
-    from agent_run.adapters.remote import RemoteEffects
+    from agent_run.adapters.status_comment import StatusCommentTransport
     log, binary = tmp_path / "read-attempts", tmp_path / "bin"
     binary.mkdir()
     fake = binary / "gh"
@@ -120,7 +128,7 @@ def test_status_concurrent_sender_and_final_stop_cancel_before_post(tmp_path, mo
     fake.chmod(0o700)
     monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
     binding = kernel.operation_binding()
-    physical = RemoteEffects(binding.repository_root, binding.repository, runner_identity=binding.inputs.runner_identity)
+    physical = StatusCommentTransport(binding.repository_root, binding.repository, runner_identity=binding.inputs.runner_identity)
     projection = current[0]
     intent = {"comment_id": None, "before": None, "body": "unused"}
     with pytest.raises(ValueError, match="cancelled"):
@@ -308,7 +316,7 @@ def test_normal_exit_hook_uses_original_handoff_without_claiming_domain_release(
 import json,sys
 from pathlib import Path
 import agent_run.notifications.sender as sender
-from agent_run.queries.status_comment import project_status
+from agent_run.queries.status_comment import project_status, status_binding
 def status(database,**kwargs):
  body=project_status(database,sys.argv[1],**kwargs).body
  with Path(sys.argv[2]).open('a') as log:log.write(json.dumps(body)+'\\n')
@@ -551,7 +559,8 @@ def test_attach_updates_same_status_only_after_original_domain_and_usage_release
     command = (sys.executable, "-I", "-c", "raise SystemExit(0)")
     request = kernel.admit_host("original-status-release", kind="run", command=command,
                                environment_carrier=private / "environment.json", preflight=manager.preflight)
-    api = CommentsAPI(project_status(kernel.storage.path, subject, storage=kernel.storage).target)
+    projection = project_status(kernel.storage.path, subject, storage=kernel.storage)
+    api = CommentsAPI(projection.target, head_sha=projection.head_sha)
     original_sender = notifications.NativeNotifications
     monkeypatch.setattr(notifications, "NativeNotifications",
                         lambda *args, **kwargs: original_sender(*args, **kwargs, status_api=api))
@@ -738,7 +747,8 @@ def test_existing_pr_status_tracks_current_review_failure_repair_and_pass(monkey
     scenario = domain_parent_at_approval
     kernel, subject = scenario.kernel, scenario.delivery.key
     sender = core_status_comments(kernel)
-    api = CommentsAPI(project_status(kernel.storage.path, subject, storage=kernel.storage).target)
+    projection = project_status(kernel.storage.path, subject, storage=kernel.storage)
+    api = CommentsAPI(projection.target, head_sha=projection.head_sha)
     assert sender.deliver(subject, api=api) == "confirmed"
     comment_id = api.comments[0]["id"]
     scenario.reviews = ["pass", "fail", "pass"]

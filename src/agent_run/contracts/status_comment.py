@@ -1,5 +1,7 @@
 """Exact publication identity of one non-authoritative Status comment."""
 from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Mapping
 import hashlib
 import json
 
@@ -33,3 +35,12 @@ class StatusTarget:
 class StatusProjection:
     target: StatusTarget
     body: str
+    head_sha: str | None = None
+
+
+@dataclass(frozen=True)
+class StatusBinding:
+    """Frozen transport identity, without Core actions or Worker configuration."""
+    repository_root: Path
+    repository: str
+    runner_identity: Mapping[str, Any]

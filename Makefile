@@ -62,5 +62,6 @@ test-policy test-state test-prompts test-locator test-github test-delivery test-
 	$(PYTHON) -m pytest $(call test_scope,$*) $(PYTEST_ARGS)
 
 typecheck:
+	$(PYTHON) .github/ci/check_boundaries.py
 	$(PYTHON) .github/ci/core_boundaries.py
 	$(PYTHON) -m mypy src/agent_run

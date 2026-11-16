@@ -13,7 +13,7 @@ import pytest
 from agent_run.errors import KernelError
 from agent_run.core.operation_contract import ReadUnavailable
 from agent_run.runtime.execution import execute
-from agent_run.adapters.remote import RemoteEffects
+from agent_run.adapters.operations import NativeOperations
 from support.agent_continuation import _allocated_worker, RAW
 
 @pytest.mark.parametrize("window", [1, 2], ids=["before_popen", "before_release"])
@@ -27,7 +27,7 @@ def test_worker_source_callback_preserves_authority_and_exact_process_settlement
     outcomes, failures = [], []
     held_pidfd = None
     port = operations.runner.ports
-    assert isinstance(port, RemoteEffects)
+    assert isinstance(port, NativeOperations)
     source_observation = port.source_observation
 
     def read(parent, query):
@@ -80,8 +80,8 @@ def test_worker_source_callback_preserves_authority_and_exact_process_settlement
         # A separate actual source reader, as in a concurrent public control,
         # commits while the original Host callback is outside its transaction.
         port = operations.runner.ports
-        assert isinstance(port, RemoteEffects)
-        current = RemoteEffects(port.root, port.repository, runner_identity=port.identity, remote=port.remote)
+        assert isinstance(port, NativeOperations)
+        current = NativeOperations(port.root, port.repository, runner_identity=port.identity, remote=port.remote)
         world = OperationRunner(kernel, scenario.execution, lambda binding: current).observe(call.subject)
         if change == "requirement":
             original = kernel.delivery(call.subject)

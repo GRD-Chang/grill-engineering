@@ -297,7 +297,7 @@ import agent_run.runtime.handoff as native
 from agent_run.cli.main import main
 from agent_run.core.kernel import Kernel
 from agent_run.core.operation_runner import OperationRunner
-from agent_run.adapters.remote import RemoteEffects
+from agent_run.adapters.operations import NativeOperations
 from agent_run.model import Execution
 manager_root=Path(sys.argv[1]); original=adapter.SystemdHost
 adapter.SystemdHost=lambda **kw:original(**kw,cgroup_root=manager_root/'cgroups')
@@ -321,7 +321,7 @@ manager=adapter.SystemdHost(systemctl=str(manager_root/'systemctl'),systemd_run=
 observed=manager.observe(request)
 assert observed.disposition=='running'
 assert kernel.observe_host(request,replace(observed,usage_ready=True,evidence=kernel.host_usage(control['action_id']).evidence))=='running'
-runner=OperationRunner(kernel,Execution(request.run_id,request.owner,request.epoch),lambda binding:RemoteEffects(
+runner=OperationRunner(kernel,Execution(request.run_id,request.owner,request.epoch),lambda binding:NativeOperations(
     binding.repository_root,binding.repository,runner_identity=binding.inputs.runner_identity,remote=binding.inputs.repository_remote))
 trace=[]
 for _ in range(25):

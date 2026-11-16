@@ -25,7 +25,7 @@ from agent_run.errors import KernelError
 from agent_run.core.operation_contract import OperationBinding
 from agent_run.core.operation_runner import OperationRunner
 from agent_run.runtime.handoff import managed_host_environment
-from agent_run.adapters.remote import RemoteEffects
+from agent_run.adapters.operations import NativeOperations
 from agent_run.core.prompts.role import render_role_prompt
 
 
@@ -78,8 +78,8 @@ class _Executor:
         )
 
 
-def _make_ports(binding: OperationBinding) -> RemoteEffects:
-    return RemoteEffects(binding.repository_root, binding.repository,
+def _make_ports(binding: OperationBinding) -> NativeOperations:
+    return NativeOperations(binding.repository_root, binding.repository,
                          runner_identity=binding.inputs.runner_identity, remote=binding.inputs.repository_remote)
 
 

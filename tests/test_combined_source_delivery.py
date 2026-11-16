@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_run.adapters import github, github_commands, remote
+from agent_run.adapters import github, github_commands, remote_observation as remote
 from agent_run.core.operation_contract import DeliveryRead, ReadUnavailable
 from support.remote_effects import _fixture, existing_pr
 

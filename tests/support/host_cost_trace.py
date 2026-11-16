@@ -308,6 +308,7 @@ class HostCosts:
 def observe_host(setattr_, costs):
     """Time existing calls; totals overlap only through explicitly reported nesting."""
     from agent_run.adapters.remote import RemoteEffects
+    from agent_run.adapters.remote_observation import RemoteObservation
     from agent_run.adapters import github_commands
     from agent_run.core.operation_runner import OperationRunner
     from agent_run.runtime import codex, git_command, process_io
@@ -328,7 +329,7 @@ def observe_host(setattr_, costs):
 
     for name, phase in (('source', 'source'), ('delivery', 'delivery'),
                         ('source_observation', 'source'), ('complete_observation', 'delivery')):
-        wrap(RemoteEffects, name, phase, publish=True)
+        wrap(RemoteObservation, name, phase, publish=True)
     wrap(OperationRunner, 'run_once', 'operation', publish=True, category='operation/accept')
     for name in ('state', 'supervise'):
         wrap(OperationRunner, name, 'core.' + name, category='state/supervise')

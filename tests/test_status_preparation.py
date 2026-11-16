@@ -54,14 +54,15 @@ def test_initial_projection_and_atomic_claim_do_not_replace_fresh_admit(prepared
     assert len(f.reads) == 1 and len(records) == 4 and len(f.api.commands) == 1
 
 
-@pytest.mark.parametrize('change', ['body', 'generation', 'pr_number', 'actor', 'run_id', 'binding'])
+@pytest.mark.parametrize('change', ['body', 'generation', 'pr_number', 'actor', 'run_id',
+    'binding', 'binding_repository', 'binding_identity'])
 def test_changes_after_projection_close_before_claim_cannot_dispatch(prepared, monkeypatch, change):
     f = prepared
     projection = f.owner._projection
     def changed(subject):
         result = projection(subject)
         if len(f.reads) == 1:
-            if change == 'binding':
+            if change.startswith('binding'):
                 f.binding[0] = replace(f.binding[0])
                 # Alter only after the initial binding has been captured.
             elif change == 'body':
@@ -71,11 +72,16 @@ def test_changes_after_projection_close_before_claim_cannot_dispatch(prepared, m
                 f.current[0] = replace(result, target=replace(result.target, **{change: value}))
         return result
     monkeypatch.setattr(f.owner, '_projection', changed)
-    if change == 'binding':
+    if change.startswith('binding'):
         original = f.api.object
         def read(endpoint):
             result = original(endpoint)
-            f.binding[0] = replace(f.binding[0], parent_number=2)
+            changes = {
+                'binding': {'repository_root': f.root / 'other-workspace'},
+                'binding_repository': {'repository': 'other/project'},
+                'binding_identity': {'runner_identity': {'source': 'pat', 'pat': {'env': 'CHANGED_STATUS_TOKEN'}}},
+            }[change]
+            f.binding[0] = replace(f.binding[0], **changes)
             return result
         monkeypatch.setattr(f.api, 'object', read)
     assert f.owner.deliver_current(f.subject, api=f.api)[0] == 'unavailable'

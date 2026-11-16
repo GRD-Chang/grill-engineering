@@ -93,11 +93,11 @@ def _allocate(reader):
 def test_complete_read_keeps_source_gate_or_original_wait_window(reader, tmp_path, monkeypatch, failure):
     import sys
     from agent_run.adapters import github_commands
-    from agent_run.adapters.remote import RemoteEffects
+    from agent_run.adapters.remote_observation import RemoteObservation
 
     s, db = reader
     bounded, calls = github_commands._run_bounded_command, []
-    native = RemoteEffects(tmp_path, 'example/project', runner_identity={'source': 'host'})
+    native = RemoteObservation(tmp_path, 'example/project', runner_identity={'source': 'host'})
     code = ("print('{invalid')" if failure == 'malformed' else
             "import sys;sys.stderr.write('HTTP 403 unavailable');raise SystemExit(1)")
 
@@ -1094,7 +1094,7 @@ def test_local_preparation_still_bounds_its_required_source_and_pr_reads(decisio
 def test_mixed_source_failure_never_commits_or_renews_a_supervision_window(
     reader, monkeypatch, tmp_path, next_observation,
 ):
-    from agent_run.adapters.remote import RemoteEffects
+    from agent_run.adapters.remote_observation import RemoteObservation
     from support.remote_effects import _reader
 
     s, db = reader
@@ -1107,7 +1107,7 @@ def test_mixed_source_failure_never_commits_or_renews_a_supervision_window(
     document['graphql_errors'] = [{'message': 'Controlled missing required permission'}]
     state.write_text(json.dumps(document))
     set_read_retry_sleep(monkeypatch, lambda _: None)
-    native = RemoteEffects(tmp_path, 'example/project', runner_identity={'source': 'host'})
+    native = RemoteObservation(tmp_path, 'example/project', runner_identity={'source': 'host'})
     monkeypatch.setattr(s.ports, 'source', native.source)
     before = [tuple(row) for row in db.execute('SELECT * FROM source_observations')]
     assert s.runner().run_once().kind == 'waiting'
@@ -1135,7 +1135,7 @@ def test_mixed_source_failure_never_commits_or_renews_a_supervision_window(
 
 
 def test_final_attempt_overflow_is_incomplete_and_preserves_original_wait(reader, monkeypatch, tmp_path):
-    from agent_run.adapters.remote import RemoteEffects
+    from agent_run.adapters.remote_observation import RemoteObservation
     from test_source_snapshot_observation import _flat
 
     s, db = reader
@@ -1154,7 +1154,7 @@ def test_final_attempt_overflow_is_incomplete_and_preserves_original_wait(reader
         if attempt%3:
             print('HTTP 503 controlled temporary failure',file=sys.stderr);raise SystemExit(1)
 ''' + marker, 1))
-    native = RemoteEffects(tmp_path, 'example/project', runner_identity={'source': 'host'})
+    native = RemoteObservation(tmp_path, 'example/project', runner_identity={'source': 'host'})
     monkeypatch.setattr(s.ports, 'source', native.source)
     before = [tuple(row) for row in db.execute('SELECT * FROM source_observations')]
     assert s.runner().run_once().kind == 'waiting'

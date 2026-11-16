@@ -19,7 +19,8 @@ Status、History、CLI 和通知投影从已提交事实派生，不另存展示
 | 当前本机进程观察，独立于历史 | [`queries/current_observation.py`](../../src/agent_run/queries/current_observation.py)；Core 核验只读绑定，Foreground Host 提供只读物理观察 |
 | JSON、plain、Rich 与 settings 文案 | [`cli/render.py`](../../src/agent_run/cli/render.py) 的 `render`、`render_settings` |
 | 已提交通知事件、里程碑与 Resume 结果 | [`notifications/event_projection.py`](../../src/agent_run/notifications/event_projection.py) |
-| 通知的当前 gate/完成边界与过时进展过滤 | `queries.read_facts.read_boundaries`、[`notifications/progress.py`](../../src/agent_run/notifications/progress.py) |
+| 通知的当前 gate/完成边界及内容 | `queries.read_facts.read_boundaries` 提供事实；[`notifications/boundary_projection.py`](../../src/agent_run/notifications/boundary_projection.py) 解释原历史快照、门禁与经核验终态的卡片内容 |
+| 过时进展过滤 | [`notifications/progress.py`](../../src/agent_run/notifications/progress.py) |
 | 事件观察、outbox 和实际投递 | [`notifications/sender.py`](../../src/agent_run/notifications/sender.py) 的 `NativeNotifications`，以及 `agent_run.storage.notification_outbox` / `adapters.notification_transport` |
 
 `QueryDocument` 是显示结果，不是另一套可保存或推进的 Run。
@@ -128,7 +129,18 @@ Worker 的进程绑定先于最终来源核验和 GO 放行，`worker_started` �
 通知的 concise/detailed 选择、occurrence/dedupe、outbox、Ledger 和 transport
 由通知模块负责；`NativeNotifications` 消费已提交事件与 `read_boundaries`，
 不调用 Kernel 推进业务，也不从渲染后的 Status 文案推断新业务事实。
+门禁与终态的内容、颜色、Resume 表现和原始完成计时由 `boundary_projection` 只读投影；
+`NativeNotifications` 保留分页游标、发生身份、过时取消、投递优先级、原 claim/预算及关闭。
+修改同类卡片表现不需要改变物理投递状态机；投影不分配 occurrence，也不读写 outbox。
 查询入口不接入发送过程，投递 receipt 不能作为工作结果、审核或执行授权。
+
+PR Status 使用 `queries.status_comment.status_binding` 读取最小仓库路径和固定 Runner 身份，
+`StatusComments` 只接收该只读绑定与投影，不持有完整 Kernel 或业务 OperationBinding。
+`adapters.status_comment.StatusCommentTransport` 组合只读 GitHub transport 和唯一的评论 POST/PATCH；
+写前独立重核 PR、当前已发布 head、作者和 marker，之后才持久标记原意图已发送。
+已发送意图先按原 body/评论身份读回，不以新投影覆盖；读回不要求新 head，避免阻断旧写入的结算。
+Abandon 的恢复评论、合入和关闭仍属于业务 Effect；Status 不调用这些写入或其私有对账方法。
+
 
 现有代码核查入口包括 `tests/test_kernel_query_cli.py`、
 `tests/test_kernel_notification_events.py`、`tests/test_kernel_notifications.py`。

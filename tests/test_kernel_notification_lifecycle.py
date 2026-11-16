@@ -122,7 +122,7 @@ def test_acceptance_and_terminal_notifications_follow_committed_delivery_boundar
     from support.status_comments import CommentsAPI
     import shlex
     projection = project_status(scenario.kernel.storage.path, scenario.delivery.key, storage=scenario.kernel.storage)
-    status_api = CommentsAPI(projection.target)
+    status_api = CommentsAPI(projection.target, head_sha=projection.head_sha)
     database_before = scenario.kernel.storage.path.read_bytes()
     quoted = action_guidance("resume", run_id="a'  b", repository=scenario.spec.repository, language="en")
     assert shlex.split(quoted) == ["agent-run", "resume", "--repo", scenario.spec.repository, "--", "a'  b"]

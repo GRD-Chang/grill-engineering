@@ -1,4 +1,5 @@
 """Literal binding of the existing gh fixture, not a new simulator or service."""
+from agent_run.adapters.status_comment import StatusCommentTransport
 import ast
 import json
 import os
@@ -122,10 +123,11 @@ def test_status_graphql_real_remote_keeps_three_rounds_and_exact_write(tmp_path,
         publication.source_ref, publication.target_ref)
     marker = f'<!-- agent-run-status:{target.key}:0123456789abcdef0123456789abcdef -->'
     intent = {'comment_id': None, 'before': None, 'body': marker + '\nExact Status body\n中文'}
+    status = StatusCommentTransport(port.root, port.repository, runner_identity=port.identity)
     baseline = len(calls.read_text().splitlines())
-    assert port.read_status_comment(target, marker, intent, lambda: False) == {'disposition': 'prior'}
+    assert status.read_status_comment(target, marker, intent, lambda: False) == {'disposition': 'prior'}
     admissions = []
-    observed = port.write_status_comment(target, marker, intent,
+    observed = status.write_status_comment(target, marker, intent,
         WriteAuthority(lambda: lambda: admissions.append('admitted')), lambda: False)
     assert admissions == ['admitted']
     assert observed == {'disposition': 'target', 'comment_id': 1, 'write_returncode': 0}
@@ -144,7 +146,7 @@ def test_status_graphql_real_remote_keeps_three_rounds_and_exact_write(tmp_path,
     assert len(document['status_writes']) == 1 and document['status_writes'][0]['method'] == 'POST'
     document['comments'][0]['body'] += '\nHuman edit'
     state.write_text(json.dumps(document))
-    assert port.read_status_comment(target, marker, intent, lambda: False)['disposition'] == 'third'
+    assert status.read_status_comment(target, marker, intent, lambda: False)['disposition'] == 'third'
     fresh = [json.loads(line) for line in calls.read_text().splitlines()][baseline:]
     assert fresh[:-1] == rows and fresh[-1][:2] == ['api', 'graphql']
     assert len(json.loads(state.read_text())['status_writes']) == 1

@@ -7,8 +7,9 @@ import pytest
 from agent_run.errors import KernelError
 from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.model import ResourceWitness
-from agent_run.core.operation_contract import DeliveryRead, OperationPorts
-from agent_run.adapters.remote import RemoteEffects
+from agent_run.core.operation_contract import DeliveryRead, ObservationPorts, OperationPorts
+from agent_run.adapters.operations import NativeOperations
+from agent_run.adapters.remote_observation import RemoteObservation
 from support.remote_effects import publication, existing_pr
 from support.remote_effects import _change, _fixture, _publish_pr
 
@@ -17,7 +18,7 @@ def test_source_and_delivery_facts_need_no_core_or_database(tmp_path, monkeypatc
     port, git, push, state, calls, published = existing_pr(tmp_path, monkeypatch)
     _change(state, source_graph={"parent": {"number": 1, "title": "Parent", "body": "Whole requirement", "sub_issues": []},
                                  "issues": {}})
-    ports: OperationPorts = port
+    ports: ObservationPorts = RemoteObservation(port.root, port.repository, runner_identity=port.identity, remote=port.remote)
     before = git.run("for-each-ref", "--format=%(refname) %(objectname)").stdout
     first = len(calls.read_text().splitlines())
     source = ports.source(1)
@@ -34,7 +35,7 @@ def test_source_and_delivery_facts_need_no_core_or_database(tmp_path, monkeypatc
 
 def test_local_operation_port_preserves_witness_guard_and_original_readback(git_repo, tmp_path):
     git, _local, effect = publication(git_repo, tmp_path)
-    ports: OperationPorts = RemoteEffects(git.root, effect.repository, runner_identity={"source": "host"})
+    ports: OperationPorts = NativeOperations(git.root, effect.repository, runner_identity={"source": "host"})
     witness = ports.prepare_publication(effect)
     work = replace(effect, payload={**effect.payload, "publication_commit_intent": witness})
     assert ports.reconcile(work).disposition == "prior"

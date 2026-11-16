@@ -323,7 +323,22 @@ def test_notification_pages_and_progress_rechecks_keep_same_id_siblings_outside_
     assert projected_rows and all(row['run_id'] == 'A' for row in projected_rows)
     from support.status_comments import core_status_comments
     context = core_status_comments(a)
-    assert context._read_binding().parent_number == 1
+    binding_runs = []
+    transaction = a.storage.transaction
+    @contextmanager
+    def selected_transaction(**kwargs):
+        assert kwargs['write'] is False
+        with transaction(**kwargs) as tx:
+            binding_runs.append(tx.run_id)
+            yield tx
+    with monkeypatch.context() as patch:
+        patch.setattr(a.storage, 'transaction', selected_transaction)
+        binding = context._read_binding()
+    assert binding_runs == ['A']
+    assert binding.repository_root == repository.repository_root
+    assert binding.repository == repository.repository
+    assert binding.runner_identity == a.operation_binding().inputs.runner_identity
+    assert a.operation_binding().parent_number == 1
     assert b.operation_binding().parent_number == 2
     assert status_subjects(repository.database, storage=a.storage) == []
     assert host_exit_current(repository.database, {'run_id': 'B'}, storage=a.storage) is False

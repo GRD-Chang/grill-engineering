@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from agent_run.adapters import remote
+from agent_run.adapters import remote_observation as remote
 from agent_run.core.operation_contract import DeliveryRead, ReadUnavailable
 from agent_run.errors import GitHubReadError
 from support.remote_effects import existing_pr
@@ -166,7 +166,7 @@ def test_new_observation_does_not_reuse_a_previous_parent_tree(tmp_path, monkeyp
         parents['nodes'] = [node for node in parents['nodes'] if node['oid'] != push.base.sha]
 
     _damage_basis(monkeypatch, subset)
-    original, requested = port._api, []
+    original, requested = port.object, []
 
     def unavailable(endpoint, *args, **options):
         requested.append(endpoint)
@@ -174,7 +174,7 @@ def test_new_observation_does_not_reuse_a_previous_parent_tree(tmp_path, monkeyp
             raise GitHubReadError('github_read_failed', 'Original parent is now unavailable')
         return original(endpoint, *args, **options)
 
-    monkeypatch.setattr(port, '_api', unavailable)
+    monkeypatch.setattr(port, 'object', unavailable)
     start = len(_reads(calls))
     with pytest.raises(ReadUnavailable) as caught:
         port.delivery(query)

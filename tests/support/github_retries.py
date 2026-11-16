@@ -7,9 +7,9 @@ import pytest
 
 def set_read_retry_sleep(monkeypatch, sleep):
     """Observe adapter backoff without changing subprocess exit-wait timing."""
-    from agent_run.adapters import github, github_commands, remote
+    from agent_run.adapters import github, github_commands, remote_observation
 
-    for module in (github_commands, github, remote):
+    for module in (github_commands, github, remote_observation):
         monkeypatch.setattr(module, 'time', SimpleNamespace(sleep=sleep, monotonic=monotonic))
 
 

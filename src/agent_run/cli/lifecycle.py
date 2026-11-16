@@ -367,7 +367,7 @@ def execute(parsed: argparse.Namespace, *, language: str,
     from agent_run.core.kernel import Kernel
     from agent_run.errors import KernelError
     from agent_run.cli.selection import control_selection, repository_target, managed_repository_routes
-    from agent_run.adapters.remote import RemoteEffects
+    from agent_run.adapters.remote_observation import RemoteObservation
 
     if parsed.command not in {"run", "resume", "approve", "stop", "revise", "requeue", "abandon"}:
         raise KernelError("lifecycle_not_connected", parsed.command)
@@ -559,7 +559,7 @@ def execute(parsed: argparse.Namespace, *, language: str,
                 remote = inputs.get("repository_remote")
                 if not isinstance(remote, str) or not remote:
                     raise KernelError("creation_repository_remote_required")
-                world = observe_control(kernel, subject, lambda binding: RemoteEffects(
+                world = observe_control(kernel, subject, lambda binding: RemoteObservation(
                     binding.repository_root, binding.repository,
                     runner_identity=binding.inputs.runner_identity, remote=remote))
                 if parsed.command == "requeue":
@@ -643,7 +643,7 @@ def prepare_creation(parent: int, repository: str | None, *, source_directory: P
     from agent_run.config.creation import freeze_creation
     from agent_run.model import RunSpec
     from agent_run.errors import KernelError
-    from agent_run.adapters.remote import RemoteEffects
+    from agent_run.adapters.github_transport import GitHubReadTransport
     from agent_run.adapters.source import read_requirements
     _require_github_host()
     selected = repository or GhGitHubReader(working_directory=source_directory).repository_hint()
@@ -668,11 +668,11 @@ def prepare_creation(parent: int, repository: str | None, *, source_directory: P
     actual_repository = reader.repository()
     if actual_repository.name_with_owner.lower() != workspace.repository:
         raise KernelError("repository_identity_changed")
-    port = RemoteEffects(root, workspace.repository, runner_identity=frozen.inputs.runner_identity)
+    port = GitHubReadTransport(root, workspace.repository, runner_identity=frozen.inputs.runner_identity)
     head = actual_repository.default_head_sha
     if not isinstance(head, str) or not head:
         raise KernelError("missing_target_branch", "The observed default branch has no exact commit")
-    base = port._commit(head)[0]
+    base = port.commit(head)[0]
     jobs = creation_resources(run_id, requirements, base, "refs/heads/" + actual_repository.default_branch, root)
     refs = sorted({job.source_ref for job in jobs})
     for ref in refs:

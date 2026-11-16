@@ -51,7 +51,8 @@ Ticket、Parent-only 和完整 Parent 的 Final 交付共用一个 Core。
 | [`executor`](../src/agent_run/runtime/executor.py) | Agent 与 I/O 的物理并发、取消、等待和返回/退出收口 | 不用 Future 完成代替持久租约释放或退出证明 |
 | [`runtime.handoff`](../src/agent_run/runtime/handoff.py)、[`SystemdHost`](../src/agent_run/adapters/systemd.py) | 环境交接、Runner 使用租约、systemd 启动与原 Host 身份观察 | 不把未知启动或未知退出当成重新启动许可 |
 | [`ForegroundHost`](../src/agent_run/runtime/foreground_host.py)、[`adapters.foreground`](../src/agent_run/adapters/foreground.py) | 显式前台候选的 namespace 启动、握手、原进程身份和退出观察；正常收尾仍待验收 | 不替代 Core 或后台 Host，不把跨 observer 的未知退出当作恢复许可 |
-| [`adapters.source`](../src/agent_run/adapters/source.py)、[`RemoteEffects`](../src/agent_run/adapters/remote.py)、[`LocalEffects`](../src/agent_run/adapters/local_git.py)、[`LocalGit`](../src/agent_run/adapters/git_objects.py) | 真实需求、refs、PR/checks 读取，Git/GitHub 操作、资源检查和准确读回 | 不用读取失败推断不存在，不自行重试未知写入 |
+| [`RemoteObservation`](../src/agent_run/adapters/remote_observation.py)、[`GitHubReadTransport`](../src/agent_run/adapters/github_transport.py) | Source/Delivery 联合和独立观察、完整分页、PR/checks、公开 `commit` 读取；创建 Task 使用只读提交入口 | 不持有业务写入或对账能力，不用部分 JSON 或缺失汇总证明成功 |
+| [`RemoteEffects`](../src/agent_run/adapters/remote.py)、[`LocalEffects`](../src/agent_run/adapters/local_git.py)、[`LocalGit`](../src/agent_run/adapters/git_objects.py) | 已授权 Git/GitHub 操作、资源检查及原意图准确读回，包括退役、重开、恢复评论和清理 | 不制定通知内容，不自行重试未知写入 |
 | [`runtime.codex`](../src/agent_run/runtime/codex.py)、[`core.prompts.role`](../src/agent_run/core/prompts/role.py) | 已分配调用的 Prompt、隔离进程、Thread、原始返回及活动事实 | 不从 Agent 自报完成推导业务通过或合并许可 |
 | [`queries.run`](../src/agent_run/queries/run.py)、[`cli.render`](../src/agent_run/cli/render.py)、[`queries.execution`](../src/agent_run/queries/execution.py) | 同源只读状态、分页历史、冻结设置和显示 | 不恢复执行、不写业务状态、不发送通知 |
 | [`cli.settings`](../src/agent_run/cli/settings.py)、[`config.creation`](../src/agent_run/config/creation.py)、[`cli.profiles`](../src/agent_run/cli/profiles.py) | 个人默认、创建时固定输入和显式 Run Profile 操作 | 不以最新个人默认补造既有 Run 的原配置 |
@@ -66,6 +67,18 @@ installer 继续独占构建、激活、恢复、回滚与卸载，不向诊断�
 
 通知由 [`NativeNotifications`](../src/agent_run/notifications/sender.py) 观察已提交事实，
 使用独立 outbox/transport；查询展示与实际投递分别负责。
+
+门禁和终态卡片内容归 `notifications.boundary_projection`，投递者拥有游标、事件 occurrence、
+claim、原截止时间、预算和关闭。PR Status 以只读 `StatusBinding` 和投影回调获取事实，
+不持有完整 Kernel；`adapters.status_comment.StatusCommentTransport` 只提供评论观察及单次
+POST/PATCH。已发送意图先读回，不能被新文案替换；新写入另外核验最新目标、head、作者和 marker。
+Abandon 的恢复评论仍归原业务 Effect。
+
+正式 `OperationRunner` 由 `adapters.operations.NativeOperations` 组合观察与 Effect 实现；
+只读调用方直接选择观察器或读取传输，不经由持写权限的组合入口。
+`github_commands` 只输出有界、脱敏的错误类别、HTTP 状态和输出形状；认证探针独立解释授权 header。
+`make typecheck` 和完整测试中的 `test_architecture_boundaries.py` 检查这些依赖边界，
+包括函数体内的反向导入。
 
 Core 通过 [`operation_contract`](../src/agent_run/core/operation_contract.py) 给出完整读取和操作请求；
 OperationRunner 以冻结的 `OperationBinding` 组合真实端口，将观察和结果交回 Core，自己不读取 SQL。

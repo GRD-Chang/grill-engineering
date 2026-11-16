@@ -12,7 +12,7 @@ from pathlib import Path
 
 from agent_run.model import DeliveryKind, EffectResult, Execution, HostObservation, Issue, ParentIssue, Policy, Requirements
 from agent_run.runtime.executor import _make_ports
-from agent_run.adapters.remote import RemoteEffects
+from agent_run.adapters.operations import NativeOperations
 import agent_run.cli.lifecycle as lifecycle_cli
 from agent_run.config.defaults import UserDefaultsStore
 from agent_run.core.kernel import Kernel
@@ -181,7 +181,7 @@ def managed_approval(tmp_path, monkeypatch, *, tickets, language="en", interrupt
     assert observed.disposition == "running"
     assert kernel.observe_host(request, replace(observed, usage_ready=True, evidence=sealed)) == "running"
     execution = Execution(request.run_id, request.owner, request.epoch)
-    physical = RemoteEffects(Path(spec.repository_root), spec.repository, runner_identity=spec.inputs.runner_identity)
+    physical = NativeOperations(Path(spec.repository_root), spec.repository, runner_identity=spec.inputs.runner_identity)
     runner = OperationRunner(kernel, execution, lambda binding: physical)
     # This existing fake Agent only makes files/raw bytes. All source, Git, PR,
     # Completion and operation decisions above/below remain production paths.

@@ -140,3 +140,64 @@ def test_command_timeout_keeps_its_retry_budget_and_priority_over_malformed_outp
 def test_cancellation_keeps_priority_over_incomplete_output():
     with pytest.raises(InterruptedError, match='cancelled'):
         commands.run_read_command([sys.executable, '-I', '-c', "print('{}')"], cancelled=lambda: True, complete_stdout=True)
+
+
+@pytest.mark.parametrize(('stderr', 'category', 'status'), [
+    ('gh: dial tcp: no such host; secret-token', 'network', None),
+    ('HTTP/2 403 Forbidden; secret-token', 'command_failed', 403),
+    ('HTTP 503 service unavailable; secret-token', 'command_failed', 503),
+    ('permission denied secret-token', 'command_failed', None),
+])
+def test_command_diagnostic_exposes_only_bounded_safe_facts(stderr, category, status):
+    import subprocess
+
+    response = subprocess.CompletedProcess(['gh'], 1, '{"token":"secret-token"}', stderr)
+    error = commands.read_response_error(response)
+    assert error.code == 'github_read_failed'
+    assert f'category={category}' in str(error)
+    assert 'output_shape=json_object' in str(error)
+    assert ('HTTP ' in str(error)) == (status is not None)
+    if status is not None:
+        assert f'HTTP {status}' in str(error)
+    assert 'secret-token' not in str(error)
+    assert len(str(error)) < 200
+    invalid = commands.read_response_error(response, invalid_json=True)
+    assert invalid.code == 'github_invalid_response'
+    assert 'category=invalid_json' in str(invalid)
+
+
+@pytest.mark.parametrize(('statuses', 'returncode', 'attempts'), [
+    ([403, 403, 0], 0, 3),
+    ([503, 503, 0], 0, 3),
+    ([503, 503, 503], 1, 3),
+])
+def test_read_retry_sequence_remains_separate_from_single_write(monkeypatch, statuses, returncode, attempts):
+    import subprocess
+
+    reads = []
+    def command(arguments, **options):
+        status = statuses[len(reads)]
+        reads.append(status)
+        return subprocess.CompletedProcess(arguments, int(status != 0), '{}', f'HTTP {status}' if status else '')
+
+    monkeypatch.setattr(commands, '_run_bounded_command', command)
+    set_read_retry_sleep(monkeypatch, lambda _: None)
+    assert commands.run_read_command(['gh']).returncode == returncode
+    assert len(reads) == attempts
+    reads.clear()
+    assert commands.run_write_command(['gh'], authorize=lambda: None).returncode == 1
+    assert reads == [statuses[0]]
+
+
+def test_physical_read_diagnostic_keeps_error_code_without_arbitrary_command_text(tmp_path, monkeypatch):
+    import subprocess
+    from agent_run.adapters import github_transport
+
+    monkeypatch.setattr(github_transport, 'run_read_command', lambda *args, **kwargs:
+        subprocess.CompletedProcess(['gh'], 1, '{}', 'HTTP 503 connection reset secret-token'))
+    transport = github_transport.GitHubReadTransport(tmp_path, 'example/project', runner_identity={'source': 'host'})
+    with pytest.raises(GitHubReadError) as caught:
+        transport.read(['gh', 'api', 'user'])
+    assert caught.value.code == 'remote_read_failed'
+    assert 'category=network' in str(caught.value) and 'HTTP 503' in str(caught.value)
+    assert 'secret-token' not in str(caught.value)
