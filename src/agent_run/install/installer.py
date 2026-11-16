@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import platform
@@ -16,7 +15,6 @@ import tempfile
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -28,11 +26,13 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from agent_run.runtime.process_io import CompleteOutput, TailOutput, pump
-from agent_run.config.paths import app_data_root
 from agent_run.runtime.process_cleanup import capture_process_scope, child_subreaper, terminate_process_group as _terminate_process_group
-from agent_run.install.runtime_tree import RuntimeTreeError, find_runtime_package
 from agent_run.runtime.package_lease import RunnerLeaseBusy, RunnerLeaseError, runner_management_lease
 from agent_run.install.distribution import ReleaseError, runtime_digest, verify_release
+from agent_run.install.layout import (
+    InstallPaths, InstallerError, generation_link, manifest_identity, read_active,
+    runtime_identity, runtime_package, validate_snapshot,
+)
 
 
 PATH_BLOCK_START = "# >>> agent-run managed PATH >>>"
@@ -70,41 +70,8 @@ _SAFE_CANDIDATE_PROBE_ERRORS = frozenset(
 )
 
 
-class InstallerError(RuntimeError):
-    """A bounded operational error from the source installer."""
-
-
 class InstallerInterrupted(BaseException):
     """A signal-triggered interruption that still runs installer cleanup."""
-
-
-@dataclass(frozen=True)
-class InstallPaths:
-    data_root: Path
-    snapshots: Path
-    generations: Path
-    staging: Path
-    active: Path
-    lock: Path
-    user_bin: Path
-    stable_entry: Path
-    profile: Path
-
-    @classmethod
-    def from_environment(cls) -> "InstallPaths":
-        data_root = app_data_root()
-        user_bin = (Path.home() / ".local" / "bin").resolve()
-        return cls(
-            data_root=data_root,
-            snapshots=data_root / "snapshots",
-            generations=data_root / "generations",
-            staging=data_root / "staging",
-            active=data_root / "active",
-            lock=data_root / "install.lock",
-            user_bin=user_bin,
-            stable_entry=user_bin / "agent-run",
-            profile=(Path.home() / ".profile").resolve(),
-        )
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
@@ -205,7 +172,7 @@ def _install_transaction(paths: InstallPaths, source: Path) -> dict[str, object]
     verify_release(source)
     source_provenance = _source_provenance(source)
     _check_managed_entry(paths, for_uninstall=False)
-    old_current, old_previous, old_generation = _read_active(paths)
+    old_current, old_previous, old_generation = read_active(paths)
     entry_was_present = paths.stable_entry.exists() or paths.stable_entry.is_symlink()
     profile_backup = _profile_backup(paths.profile)
     pre_cleanup_warnings: list[str] = []
@@ -229,7 +196,7 @@ def _install_transaction(paths: InstallPaths, source: Path) -> dict[str, object]
         if snapshot.exists() or snapshot.is_symlink():
             if not snapshot.is_dir() or snapshot.is_symlink():
                 raise InstallerError("已有 Snapshot 路径不是受管目录")
-            _validate_snapshot(snapshot, identity)
+            validate_snapshot(snapshot, identity)
             _remove_path(candidate)
             if old_current != snapshot:
                 _run_candidate_probe(snapshot)
@@ -323,7 +290,7 @@ def _install_transaction(paths: InstallPaths, source: Path) -> dict[str, object]
 
 def _rollback(paths: InstallPaths) -> dict[str, object]:
     _check_managed_entry(paths, for_uninstall=False)
-    current, previous, generation = _read_active(paths)
+    current, previous, generation = read_active(paths)
     if current is None or previous is None or generation is None:
         raise InstallerError("没有可用的 previous Snapshot，Active Runner 未改变")
     new_generation, activation_warnings = _activate(
@@ -338,8 +305,8 @@ def _rollback(paths: InstallPaths) -> dict[str, object]:
     ]
     return {
         "result": "rolled_back",
-        "active_snapshot": _manifest_identity(previous),
-        "previous_snapshot": _manifest_identity(current),
+        "active_snapshot": manifest_identity(previous),
+        "previous_snapshot": manifest_identity(current),
         "warning": warnings or None,
     }
 
@@ -466,10 +433,10 @@ def _build_candidate(candidate: Path, source: Path) -> tuple[str, str]:
             pass
     if return_code != 0:
         raise InstallerError(_build_failure_message(b"", return_code))
-    package = _runtime_package(candidate)
+    package = runtime_package(candidate)
     if release is not None and runtime_digest(package) != release["runtime_sha256"]:
         raise InstallerError("Installed release runtime differs from its verified source")
-    identity = _runtime_identity(package)
+    identity = runtime_identity(package)
     return identity, f"{sys.version_info.major}.{sys.version_info.minor}"
 
 
@@ -665,35 +632,6 @@ def _safe_candidate_probe_error(error_output: bytes) -> str:
     return "Runner Compatibility Check returned a non-zero exit"
 
 
-def _runtime_package(candidate: Path) -> Path:
-    try:
-        return find_runtime_package(candidate)
-    except RuntimeTreeError as error:
-        raise InstallerError(str(error)) from error
-
-
-def _runtime_identity(package: Path) -> str:
-    digest = hashlib.sha256()
-    for path in sorted(package.rglob("*")):
-        if "__pycache__" in path.parts:
-            continue
-        relative = path.relative_to(package).as_posix().encode("utf-8")
-        digest.update(relative)
-        digest.update(b"\0")
-        if path.is_symlink():
-            digest.update(b"L")
-            digest.update(os.readlink(path).encode("utf-8"))
-        elif path.is_file():
-            digest.update(b"F")
-            digest.update(path.read_bytes())
-        elif path.is_dir():
-            digest.update(b"D")
-        else:
-            raise InstallerError("runtime tree 包含不支持的文件类型")
-        digest.update(b"\0")
-    return f"sha256:{digest.hexdigest()}"
-
-
 def _source_provenance(source: Path) -> dict[str, object]:
     release = verify_release(source)
     if release is not None:
@@ -802,24 +740,6 @@ def _write_manifest(snapshot: Path, manifest: dict[str, object]) -> None:
     destination.chmod(0o600)
 
 
-def _validate_snapshot(snapshot: Path, identity: str) -> None:
-    if _manifest_identity(snapshot) != identity:
-        raise InstallerError("已有 Snapshot manifest 与目录身份不一致")
-    if _runtime_identity(_runtime_package(snapshot)) != identity:
-        raise InstallerError("Snapshot runtime tree 与 manifest identity 不一致")
-
-
-def _manifest_identity(snapshot: Path) -> str:
-    try:
-        loaded: object = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise InstallerError("Snapshot manifest 无法读取") from error
-    identity = loaded.get("content_identity") if isinstance(loaded, dict) else None
-    if not isinstance(identity, str):
-        raise InstallerError("Snapshot manifest 格式无效")
-    return identity
-
-
 def _rewrite_snapshot_entrypoints(snapshot: Path, old_candidate: Path) -> None:
     bin_directory = snapshot / "bin"
     old_path = os.fsencode(str(old_candidate))
@@ -831,35 +751,6 @@ def _rewrite_snapshot_entrypoints(snapshot: Path, old_candidate: Path) -> None:
         rewritten = content.replace(old_path, new_path)
         if rewritten != content:
             entry.write_bytes(rewritten)
-
-
-def _read_active(paths: InstallPaths) -> tuple[Path | None, Path | None, Path | None]:
-    if not paths.active.exists() and not paths.active.is_symlink():
-        return None, None, None
-    if not paths.active.is_symlink():
-        raise InstallerError("Active Runner 不是受管 generation symlink")
-    generation = paths.active.resolve()
-    if not generation.is_dir() or generation.parent != paths.generations.resolve():
-        raise InstallerError("Active Runner generation 无效")
-    current = _generation_link(generation / "current")
-    previous = (
-        _generation_link(generation / "previous")
-        if (generation / "previous").exists() or (generation / "previous").is_symlink()
-        else None
-    )
-    _validate_snapshot(current, _manifest_identity(current))
-    if previous is not None:
-        _validate_snapshot(previous, _manifest_identity(previous))
-    return current, previous, generation
-
-
-def _generation_link(link: Path) -> Path:
-    if not link.is_symlink():
-        raise InstallerError("generation 缺少完整 Snapshot symlink")
-    target = link.resolve()
-    if not target.is_dir():
-        raise InstallerError("generation 指向不存在的 Snapshot")
-    return target
 
 
 def _activate(
@@ -1089,9 +980,9 @@ def _install_result(
         )
     return {
         "result": "installed",
-        "content_identity": _manifest_identity(snapshot),
-        "active_snapshot": _manifest_identity(snapshot),
-        "previous_snapshot": _manifest_identity(previous) if previous is not None else None,
+        "content_identity": manifest_identity(snapshot),
+        "active_snapshot": manifest_identity(snapshot),
+        "previous_snapshot": manifest_identity(previous) if previous is not None else None,
         "entry": str(paths.stable_entry),
         "path_notice": path_notice,
         "idempotent": idempotent,
@@ -1162,12 +1053,12 @@ def _complete_active_generation(paths: InstallPaths, generation: Path) -> bool:
     if not _active_points_to(paths.active, generation) or not generation.is_dir():
         return False
     try:
-        current = _generation_link(generation / "current")
-        _validate_snapshot(current, _manifest_identity(current))
+        current = generation_link(generation / "current")
+        validate_snapshot(current, manifest_identity(current))
         previous_link = generation / "previous"
         if previous_link.exists() or previous_link.is_symlink():
-            previous = _generation_link(previous_link)
-            _validate_snapshot(previous, _manifest_identity(previous))
+            previous = generation_link(previous_link)
+            validate_snapshot(previous, manifest_identity(previous))
     except (InstallerError, OSError, RuntimeError):
         return False
     return True

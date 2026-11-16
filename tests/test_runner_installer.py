@@ -228,7 +228,7 @@ def test_real_build_ignores_stale_setuptools_output_without_modifying_source(
 
     runner_installer._build_candidate(candidate, source)
 
-    installed = runner_installer._runtime_package(candidate)
+    installed = runner_installer.runtime_package(candidate)
     assert not (installed / "retired_module.py").exists()
     assert (installed / "resources" / "build" / "source.md").read_bytes() == resource.read_bytes()
     assert stale.exists()
@@ -1793,7 +1793,7 @@ def test_activation_sync_failure_restores_the_complete_old_generation(
         runner_installer._install(runner_installer.InstallPaths.from_environment(), source)
 
     paths = runner_installer.InstallPaths.from_environment()
-    current, previous, generation = runner_installer._read_active(paths)
+    current, previous, generation = runner_installer.read_active(paths)
     assert current is not None and previous is not None and generation is not None
     assert _manifest(current)["content_identity"] == second_identity
     assert _manifest(previous)["content_identity"] == first_identity
@@ -1882,7 +1882,7 @@ def test_initial_activation_recovery_failure_keeps_a_complete_new_generation(
 
     assert result["warning"] == ["Active Runner 恢复失败，已保留完整新 generation"]
     assert active_replace_calls == 1
-    current, previous, generation = runner_installer._read_active(paths)
+    current, previous, generation = runner_installer.read_active(paths)
     assert current is not None and previous is None and generation is not None
     assert (generation / "current").resolve() == current.resolve()
     assert paths.stable_entry.resolve().is_file()
@@ -1930,7 +1930,7 @@ def test_activation_rename_failure_after_swap_restores_the_old_generation(
     with pytest.raises(OSError, match="injected active rename failure"):
         runner_installer._install(paths, source)
 
-    current, previous, generation = runner_installer._read_active(paths)
+    current, previous, generation = runner_installer.read_active(paths)
     assert current is not None and previous is None and generation is not None
     assert _manifest(current)["content_identity"] == old_identity
     assert (generation / "current").resolve() == current.resolve()
@@ -1985,7 +1985,7 @@ def test_recovery_failure_keeps_a_complete_new_generation_with_warning(
 
     assert result["warning"] == ["Active Runner 恢复失败，已保留完整新 generation"]
     assert active_replace_calls == 2
-    current, previous, generation = runner_installer._read_active(paths)
+    current, previous, generation = runner_installer.read_active(paths)
     assert current is not None and previous is not None and generation is not None
     assert _manifest(current)["content_identity"] != old_identity
     assert _manifest(previous)["content_identity"] == old_identity
@@ -2038,7 +2038,7 @@ def test_activation_directory_open_failure_restores_the_old_generation(
     with pytest.raises(OSError, match="injected directory open failure"):
         runner_installer._install(paths, source)
 
-    current, previous, generation = runner_installer._read_active(paths)
+    current, previous, generation = runner_installer.read_active(paths)
     assert current is not None and previous is None and generation is not None
     assert _manifest(current)["content_identity"] == old_identity
     assert (generation / "current").resolve() == current.resolve()
@@ -2071,7 +2071,7 @@ def test_retired_cleanup_is_retried_before_a_later_build_failure(
     )
     assert _run(source, home, fake_bin).returncode == 0
     paths = runner_installer.InstallPaths.from_environment()
-    current_before, previous_before, _generation_before = runner_installer._read_active(paths)
+    current_before, previous_before, _generation_before = runner_installer.read_active(paths)
     assert current_before is not None and previous_before is not None
     (paths.snapshots / "stale-snapshot").mkdir()
     (paths.generations / "stale-generation").mkdir()
@@ -2092,7 +2092,7 @@ def test_retired_cleanup_is_retried_before_a_later_build_failure(
 
     assert events == ["cleanup", "build"]
     assert "旧 Snapshot 清理失败" in capsys.readouterr().err
-    current_after, previous_after, _generation_after = runner_installer._read_active(paths)
+    current_after, previous_after, _generation_after = runner_installer.read_active(paths)
     assert current_after == current_before
     assert previous_after == previous_before
     assert (paths.snapshots / "stale-snapshot").is_dir()
@@ -2187,12 +2187,17 @@ def test_rollback_does_not_probe_and_uninstall_preserves_user_data(
     assert json.loads(configured.stdout)["github"]["worker"] == {"source": "host"}
     defaults = home / "config" / "agent-run" / "user-defaults.json"
     defaults_before = defaults.read_bytes()
+    method = defaults.parent / "prompts" / "en" / "repair.md"
+    method.parent.mkdir(parents=True, exist_ok=True)
+    method.write_text("Personal repair method\n", encoding="utf-8")
+    method_before = method.read_bytes()
 
     rollback = _run(source, home, fake_bin, "--rollback")
     assert rollback.returncode == 0, rollback.stderr
     assert _manifest(_active_snapshot(home))["content_identity"] == first_identity
     assert int(count.read_text()) == 2
     assert defaults.read_bytes() == defaults_before
+    assert method.read_bytes() == method_before
 
     config = home / "config" / "agent-run"
     config.mkdir(parents=True, exist_ok=True)
@@ -2235,6 +2240,7 @@ def test_rollback_does_not_probe_and_uninstall_preserves_user_data(
     assert managed_locator.read_text() == "keep index"
     assert profile.read_text(encoding="utf-8") == "before\n"
     assert defaults.read_bytes() == defaults_before
+    assert method.read_bytes() == method_before
 
     uninstall = _run(source, home, fake_bin, "--uninstall")
     assert uninstall.returncode == 0, uninstall.stderr
@@ -2248,6 +2254,7 @@ def test_rollback_does_not_probe_and_uninstall_preserves_user_data(
     assert (_data_root(home) / "install.lock").exists()
     assert not (home / ".local" / "bin" / "agent-run").exists()
     assert defaults.read_bytes() == defaults_before
+    assert method.read_bytes() == method_before
 
 
 def test_non_managed_entry_is_not_overwritten(tmp_path: Path) -> None:

@@ -11,6 +11,8 @@
 | 验收对象、只读验证、证据和输出指导 | `contracts/text_review.py`；保留不同验收对象的实际身份与证据边界 |
 | 发布证据、权限、续接和输出指导 | `contracts/text_publication.py`；区分当前通过独立验收和仅有旧审查证据 |
 | 需求范围、权威来源、人工回复及探针 | `contracts/text_context.py`；只共享真正相同的责任，不强行统一不同角色的权限 |
+| 个人方法读取与首次冻结 | `config/resources.py::resolve_resources` 只由预览、展示及 `config/creation.py::freeze_creation` 等入口调用；入口固定语言和完整资源集合后才进入渲染 |
+| 冻结资源读取 | `contracts/prompt.py::resource` 只读取请求快照；`core/prompts/` 不读取个人配置，也不缺省装配资源 |
 | 场景选择与当前事实 | `core/prompts/role.py` 为运行与预览提供唯一组装入口，按职责使用 `development.py`、`review.py`、`publication.py`、`context.py` |
 | 模型输出结构 | `contracts/artifact.py::role_schema`；通过输出 schema 独立传入，预览另列同一 schema，不在内部文案中重复手写完整 JSON 样例 |
 | 输出的业务合法性 | `contracts/artifact.py`；例如结果类别与字段空值、验收状态与 findings 的关系仍由程序校验 |

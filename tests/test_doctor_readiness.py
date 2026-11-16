@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.install.installer import _runtime_identity
+from agent_run.install.layout import runtime_identity
 from support.environment import _user_environment as _isolated_environment
 from support.environment import _file_snapshot
 
@@ -21,7 +21,7 @@ from support.environment import _file_snapshot
 def test_doctor_probe_stream_policy_and_cleanup_order(
     monkeypatch: pytest.MonkeyPatch, mode: str, overflow: bool,
 ) -> None:
-    import agent_run.install.doctor as doctor
+    import agent_run.install.diagnostics as diagnostics
 
     processes = []
     order = []
@@ -38,9 +38,8 @@ def test_doctor_probe_stream_policy_and_cleanup_order(
             assert not process.stdout.closed
         original_cleanup(process, **kwargs)
 
-    monkeypatch.setattr(doctor.subprocess, "Popen", start)
-    monkeypatch.setattr(doctor, "_terminate_process_group", cleanup)
-    monkeypatch.setattr(doctor, "_COMMAND_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr(diagnostics.subprocess, "Popen", start)
+    monkeypatch.setattr(diagnostics, "terminate_process_group", cleanup)
     capture = mode in {"stdout", "merged"}
     program = "import os, sys, signal\n"
     if mode != "discard":
@@ -53,16 +52,17 @@ def test_doctor_probe_stream_policy_and_cleanup_order(
         program += "os.write(1, b'ping')\nos.write(2, b'note')\n"
     arguments = [sys.executable, "-c", program]
     if capture:
-        result = doctor._run_bounded_output_probe(
+        result = diagnostics.run_bounded_probe(
             arguments, input_data=b'ping', max_output_bytes=8,
             timeout_seconds=1, merge_stderr=mode == "merged",
         )
         assert result == ((None, False, b'') if overflow else
                           (0, False, b'pingnote' if mode == "merged" else b'ping'))
     else:
-        assert doctor._run_bounded_probe(
+        assert diagnostics.run_bounded_probe(
             arguments, input_data=b'ping' if mode == "discard_input" else None,
-        ) == (0, False)
+            max_output_bytes=None, timeout_seconds=1,
+        ) == (0, False, b'')
     order.append("returned")
     assert order == ["cleanup", "returned"]
     assert processes[0].poll() is not None
@@ -74,7 +74,7 @@ def test_doctor_probe_stream_policy_and_cleanup_order(
 def test_doctor_probe_early_stdin_close_keeps_result_and_reaps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capture: bool,
 ) -> None:
-    import agent_run.install.doctor as doctor
+    import agent_run.install.diagnostics as diagnostics
 
     ready = tmp_path / "closed"
     processes = []
@@ -92,8 +92,7 @@ def test_doctor_probe_early_stdin_close_keeps_result_and_reaps(
             raise AssertionError("probe did not close its pipes")
         return process
 
-    monkeypatch.setattr(doctor.subprocess, "Popen", start)
-    monkeypatch.setattr(doctor, "_COMMAND_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(diagnostics.subprocess, "Popen", start)
     program = (
         "import os, signal\nfrom pathlib import Path\n"
         "os.close(0)\nos.close(1)\nos.close(2)\n"
@@ -101,11 +100,13 @@ def test_doctor_probe_early_stdin_close_keeps_result_and_reaps(
     )
     arguments = [sys.executable, "-c", program]
     if capture:
-        assert doctor._run_bounded_output_probe(
+        assert diagnostics.run_bounded_probe(
             arguments, input_data=b'ping', timeout_seconds=0.05,
-        ) == (None, False, b'')
+        ) == (None, True, b'')
     else:
-        assert doctor._run_bounded_probe(arguments, input_data=b'ping') == (None, True)
+        assert diagnostics.run_bounded_probe(
+            arguments, input_data=b'ping', max_output_bytes=None, timeout_seconds=0.05,
+        ) == (None, True, b'')
     assert processes[0].poll() is not None
     assert all(stream is None or stream.closed for stream in
                (processes[0].stdin, processes[0].stdout, processes[0].stderr))
@@ -153,7 +154,7 @@ def test_doctor_cli_separates_installation_and_execution_readiness(
         package.mkdir(parents=True)
         (package / "__init__.py").write_text("")
         (snapshot / "manifest.json").write_text(json.dumps({
-            "content_identity": _runtime_identity(package),
+            "content_identity": runtime_identity(package),
         }))
         entry = snapshot / "bin" / "agent-run"
         entry.parent.mkdir()
@@ -287,3 +288,79 @@ def test_public_help_is_read_only_without_host_dependencies(
     assert result.returncode == 0, result.stderr
     assert "agent-run" in result.stdout and "--help" in result.stdout
     assert _file_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("outcome", ["success", "timeout", "overflow"])
+def test_shared_diagnostic_probe_reaps_escaped_descendants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str,
+) -> None:
+    from agent_run.install import diagnostics
+
+    pid_file = tmp_path / "escaped.pid"
+    original_popen = subprocess.Popen
+    processes = []
+
+    def start(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        processes.append(process)
+        deadline = time.monotonic() + 5
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not pid_file.exists():
+            process.kill()
+            process.wait()
+            raise AssertionError("diagnostic did not reach its child boundary")
+        return process
+
+    monkeypatch.setattr(diagnostics.subprocess, "Popen", start)
+    program = (
+        "import subprocess, sys, signal\nfrom pathlib import Path\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import signal; signal.pause()'], "
+        "start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        f"Path({str(pid_file)!r}).write_text(str(child.pid))\n"
+        f"print({'x' * 9 if outcome == 'overflow' else 'ready'!r}, flush=True)\n"
+        + ("signal.pause()\n" if outcome != "success" else "")
+    )
+    try:
+        result = diagnostics.run_bounded_probe(
+            [sys.executable, "-c", program], max_output_bytes=8, timeout_seconds=0.1,
+        )
+        expected = {
+            "success": (0, False, b"ready\n"),
+            "timeout": (None, True, b""),
+            "overflow": (None, False, b""),
+        }
+        assert result == expected[outcome]
+        assert processes[0].poll() is not None
+        assert not Path("/proc", pid_file.read_text()).exists()
+    finally:
+        if pid_file.exists():
+            child = int(pid_file.read_text())
+            try:
+                os.kill(child, 9)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(child, 0)
+            except ChildProcessError:
+                pass
+
+
+def test_shared_diagnostic_timeout_includes_blocked_input(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_run.install import diagnostics
+
+    original_popen = subprocess.Popen
+    processes = []
+
+    def start(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(diagnostics.subprocess, "Popen", start)
+    assert diagnostics.run_bounded_probe(
+        [sys.executable, "-c", "import signal; signal.pause()"],
+        input_data=b"x" * (256 * 1024), timeout_seconds=0.1,
+    ) == (None, True, b"")
+    assert processes[0].poll() is not None
+    assert processes[0].stdin.closed and processes[0].stdout.closed

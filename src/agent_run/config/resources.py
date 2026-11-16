@@ -10,7 +10,6 @@ from agent_run.contracts.prompt import validate_resources
 
 from pathlib import Path
 import stat
-from typing import Any
 
 from agent_run.contracts.copy import DEFAULT_LANGUAGE, validate_language
 from agent_run.errors import ErrorMessage, error_message
@@ -101,26 +100,3 @@ def resolve_resources(language: str | None = None) -> dict[str, str]:
                 )) from error
     validate_resources(resources)
     return resources
-
-
-
-
-def resource(request: dict[str, Any] | None, key: str) -> str:
-    if request is not None and "_prompt_resources" in request:
-        snapshot = request["_prompt_resources"]
-        if not isinstance(snapshot, dict) or key not in snapshot or not isinstance(snapshot[key], str):
-            raise ValueError(error_message(
-                "prompts.error.missing", audit=f"Incompatible prompt resource snapshot: missing {key}",
-                resource=key,
-            ))
-        value = str(snapshot[key])
-        return value.removesuffix("\n") if key in INTERNAL_KEYS else value
-    value = resolve_resources(request.get("language") if request is not None else None)[key]
-    return value.removesuffix("\n") if key in INTERNAL_KEYS else value
-
-
-def bind_resources(request: dict[str, Any]) -> dict[str, Any]:
-    """Resolve current resources once, without changing the caller's request."""
-    if "_prompt_resources" in request:
-        return request
-    return {**request, "_prompt_resources": resolve_resources(request.get("language"))}

@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import runpy
 from string import Formatter
+from typing import Any
 
 from agent_run.contracts.copy import validate_language
 from agent_run.contracts.text_context import TEXTS as CONTEXT
@@ -84,3 +85,15 @@ def validate_resources(snapshot: object) -> None:
         raise ValueError(error_message(
             "prompts.error.snapshot_size", audit="Prompt resource snapshot exceeds 512 KiB"
         ))
+
+
+def resource(request: dict[str, Any], key: str) -> str:
+    """Read an explicitly supplied frozen snapshot without consulting configuration."""
+    snapshot = request.get("_prompt_resources")
+    value = snapshot.get(key) if isinstance(snapshot, dict) else None
+    if not isinstance(value, str):
+        raise ValueError(error_message(
+            "prompts.error.missing", audit=f"Incompatible prompt resource snapshot: missing {key}",
+            resource=key,
+        ))
+    return value.removesuffix("\n") if key in INTERNAL_KEYS else value

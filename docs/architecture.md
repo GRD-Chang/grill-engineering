@@ -56,6 +56,12 @@ Ticket、Parent-only 和完整 Parent 的 Final 交付共用一个 Core。
 
 单一 `agent_run` 包按 core、contracts、config、storage、adapters、runtime、queries、notifications、cli、install 划分职责，承载业务核与正式链路使用的叶模块。
 它们由正式链路使用，不能因包名仍在就解释成另一套交付编排。
+
+安装诊断共用 [`install.diagnostics.run_bounded_probe`](../src/agent_run/install/diagnostics.py)，
+由该入口负责有界输出、原期限和退出前的进程树清理；setup 与 doctor 只组合诊断。
+[`install.layout`](../src/agent_run/install/layout.py) 拥有只读安装路径、Snapshot identity 和完整 active generation 校验；
+installer 继续独占构建、激活、恢复、回滚与卸载，不向诊断暴露私有实现。
+
 通知由 [`NativeNotifications`](../src/agent_run/notifications/sender.py) 观察已提交事实，
 使用独立 outbox/transport；查询展示与实际投递分别负责。
 

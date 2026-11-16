@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_run.config.resources import bind_resources, resource
+from agent_run.contracts.prompt import resource
 
 from agent_run.core.prompts.context import (
     human_continuation,
@@ -72,7 +72,6 @@ def _repair_evidence(request: dict[str, Any]) -> str:
 def development_prompt(
     request: dict[str, Any], *, force_continuation: bool = False
 ) -> str:
-    request = bind_resources(request)
     repair = request.get("repair_source") is not None
     evidence = _repair_evidence(request)
     if request.get("work_source") == "ci" and request.get("repair_source") != "required_checks":

@@ -87,6 +87,9 @@ Windows/macOS 用户应先进入自己已准备的 WSL2 / Linux VM Guest，在 G
 
 Setup 成功后的短命 systemd 探针用于检查真实执行能力。不要通过关闭全机防护、替换 init 或绕过隔离来通过检查。
 `doctor` 只读检查，不安装或修复；也不证明 Skills 可用、项目测试通过或全部仓库权限满足。
+开发新增宿主诊断时，在 `install.diagnostics` 使用 `run_bounded_probe`，并在 setup/doctor 的诊断组合处接入。
+该入口保留输出上限、命令原期限及逃逸后代清理；超时和超限不会返回部分输出。
+受管安装只读事实由 `install.layout.read_active` 校验，读取不进行激活或恢复；不要调用另一模块的私有探针或安装器私有读取。
 检查 JSON 的 `status`、`installation_readiness` 和 `execution_readiness`，不能仅凭退出码 0 判断就绪。
 先执行 `doctor --local`；它不验证登录或读取凭据内容。用户允许认证读取时再执行
 `doctor --online --repo OWNER/REPO`，分别验证所选 Runner/Worker host/PAT/App 来源及仓库读取；

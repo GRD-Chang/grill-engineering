@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from agent_run.config.resources import bind_resources, resource
+from agent_run.contracts.prompt import resource
 
 
 def pretty(value: object) -> str:
@@ -130,8 +130,7 @@ def review_budget(request: dict[str, Any], *, reviewer: bool) -> str:
     return text
 
 
-def structured_output_repair_prompt(output_name: str, contract_error: str, *, request: dict[str, Any] | None = None) -> str:
-    request = bind_resources(request or {})
+def structured_output_repair_prompt(output_name: str, contract_error: str, *, request: dict[str, Any]) -> str:
     roles = {
         "Development result": "development/output-repair",
         "Acceptance Artifact": "review/output-repair",

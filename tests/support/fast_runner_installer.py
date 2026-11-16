@@ -51,7 +51,7 @@ def build_candidate(candidate: Path, source: Path) -> tuple[str, str]:
         encoding="utf-8",
     )
     entry.chmod(0o755)
-    return runner_installer._runtime_identity(package), python_version
+    return runner_installer.runtime_identity(package), python_version
 
 
 if __name__ == "__main__":

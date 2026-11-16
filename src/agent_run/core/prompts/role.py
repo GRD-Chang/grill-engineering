@@ -11,7 +11,6 @@ from agent_run.core.prompts.context import pretty, structured_output_repair_prom
 from agent_run.contracts.prompt import validate_resources
 from agent_run.core.prompts.publication import publication_continuation_prompt, publication_prompt
 from agent_run.core.prompts.review import review_continuation_prompt, review_prompt
-from agent_run.config.resources import selected_language
 
 from agent_run.model import AgentCall, AgentPreparation, DeliveryKind, Purpose, Role
 from agent_run.errors import KernelError
@@ -34,9 +33,11 @@ def prompt_schema(role: str, request: dict[str, Any]) -> dict[str, Any]:
 def render_prompt(request: dict[str, Any], role: str, *, continuation: bool = False) -> str:
     """Shared assembly only: no settings writes, lifecycle or model execution."""
     request = dict(request)
+    validate_language(request.get("language"))
+    validate_resources(request.get("_prompt_resources"))
     if role == "output-repair":
         name, error = request.get("output_name"), request.get("contract_error")
-        language = selected_language(request.get("language"))
+        language = validate_language(request["language"])
         if not isinstance(name, str) or not isinstance(error, str):
             raise ValueError(text("prompts.repair_fields", language=language))
         if continuation:
@@ -86,12 +87,9 @@ def render_prompt(request: dict[str, Any], role: str, *, continuation: bool = Fa
 def render_role_prompt(call: AgentCall | AgentPreparation) -> str:
     """No current settings, Git reads, state writes or successor decisions."""
     context = call.context
-    # Never let the legacy pure renderers' optional resource fallback read a
-    # different personal configuration for an already allocated invocation.
+    # An allocated invocation must carry the complete creation snapshot.
     if "_prompt_resources" not in context:
         raise KernelError("prompt_resources_unavailable")
-    validate_resources(context["_prompt_resources"])
-    validate_language(context["language"])
     if context["role"] != call.role or context["purpose"] != call.purpose:
         raise KernelError("prompt_call_binding")
     if call.mode not in {"fresh", "resume", "output-repair", "execution-recovery"}:
