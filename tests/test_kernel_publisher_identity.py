@@ -1,5 +1,6 @@
 """Current publisher witnesses and original comment receipts bind remote writes."""
 
+from agent_run.runtime.task import create_task, selected_kernel
 from support.repository_fixture import create_kernel
 
 from dataclasses import replace
@@ -103,13 +104,13 @@ def test_unconfigured_run_cannot_publish_with_two_missing_identity_selections(tm
     # Missing selections cannot publish even the initial frozen Run. Exercise
     # its normal atomic producer, without claiming a second fixture Executor.
     with pytest.raises(GitHubIdentityError):
-        route.create(task, spec, source)
+        create_task(route, task, spec, source)
     assert route.database.read_bytes() == before
     with route.metadata().transaction(write=False) as tx:
         for table in ('tasks', 'runs', 'actions', 'hosts', 'invocations', 'effects'):
             assert tx.one('SELECT count(*) FROM ' + table)[0] == 0
-    assert route.create(task, replace(spec, inputs=inputs), source).created
-    kernel = route.kernel(spec.run_id)
+    assert create_task(route, task, replace(spec, inputs=inputs), source).created
+    kernel = selected_kernel(route, spec.run_id)
     # A valid frozen selection still cannot publish from an observation whose
     # identity is missing; None must not be accepted as matching authority.
     world = World("parent", "graph", "subject", base,

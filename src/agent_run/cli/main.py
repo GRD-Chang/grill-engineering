@@ -24,8 +24,9 @@ from agent_run.errors import KernelError
 from agent_run.adapters.systemd import HostUnavailable
 from agent_run.runtime.handoff import HandoffError
 
-from agent_run.cli import selection as cli_selection, settings as personal_settings
-from agent_run.queries.run import QueryDocument, read, header
+from agent_run.runtime import run_selection as cli_selection
+from agent_run.cli import settings as personal_settings
+from agent_run.queries.run import QueryDocument, read, read_route, header
 from agent_run.queries.read_facts import QueryError
 from agent_run.cli.render import render, render_settings, safe_text
 from agent_run.storage.preflight import UnsupportedState
@@ -224,7 +225,7 @@ def main(arguments: Sequence[str] | None = None, *, repository_routes: Sequence[
                 parsed.parent = None
                 routes = repository_routes if repository_routes is not None else cli_selection.managed_repository_routes(parsed)
                 route, location = cli_selection.repository_target(parsed, routes)
-                frozen = route.read(location.run_id, "settings").data
+                frozen = read_route(route, location.run_id, "settings").data
                 parsed.repo = location.task.repository
             return diagnose(as_json=parsed.as_json, local=parsed.local, online=parsed.online,
                             mode=parsed.mode, repository=parsed.repo, frozen=frozen)

@@ -1,5 +1,7 @@
 """Real clone/path seam used by the native public lifecycle entry."""
 from __future__ import annotations
+from agent_run.runtime import run_control
+from agent_run.runtime import host_control
 
 from support.repository_fixture import create_kernel
 
@@ -17,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from agent_run.core.kernel import Kernel
+from agent_run.runtime.task import create_managed_task
 from agent_run.errors import KernelError
 from agent_run.cli.main import main
 from agent_run.runtime.executor import _make_ports
@@ -53,7 +56,7 @@ def test_native_clone_copies_only_original_identity_and_opens_without_legacy_run
 
 
 def test_creation_freezes_three_delivery_resource_kinds_without_creating_worktrees(tmp_path: Path) -> None:
-    from agent_run.cli.lifecycle import creation_resources
+    from agent_run.runtime.task_creation import creation_resources
     from agent_run.model import Commit, DeliveryKind, Issue, ParentIssue, Requirements
     source = Requirements(ParentIssue(1, "Parent", "Exact body", (9, 3)), (
         Issue(9, "Later", "body", "OPEN"), Issue(3, "First", "body", "CLOSED")))
@@ -80,8 +83,9 @@ def test_host_preflight_failure_never_accepts_action_or_creates_environment(tmp_
     import pytest
     from agent_run.model import Commit, Delivery, DeliveryKind, RunSpec
     from agent_run.core.kernel import Kernel
+    from agent_run.runtime.task import create_managed_task
     from agent_run.adapters.systemd import HostUnavailable, SystemdHost
-    from agent_run.cli.lifecycle import submit
+    from agent_run.runtime.host_control import submit
     from agent_run.config.paths import app_runtime_root
     delivery = Delivery("parent:1", DeliveryKind.PARENT_ONLY, 1, "revision", Commit("base", "tree"),
                         "refs/heads/parent", "refs/heads/main")
@@ -106,7 +110,7 @@ def test_prepare_creation_uses_original_defaults_real_remote_and_independent_clo
     import os
     from support.remote_effects import FAKE_GH
     from agent_run.config.defaults import UserDefaultsStore
-    from agent_run.cli.lifecycle import prepare_creation
+    from agent_run.runtime.task_creation import prepare_creation
     from agent_run.model import DeliveryKind
     remote = tmp_path / "origin.git"
     git(git_repo, "init", "--bare", "--initial-branch=main", str(remote))
@@ -184,6 +188,7 @@ def test_existing_run_error_uses_frozen_language_after_personal_language_changes
     from agent_run.config.defaults import UserDefaultsStore
     from agent_run.model import Commit, Delivery, DeliveryKind, RunSpec
     from agent_run.core.kernel import Kernel
+    from agent_run.runtime.task import create_managed_task
     from agent_run.config.creation import freeze_creation
     from agent_run.cli.main import main
     workspace = ManagedWorkspace.for_repository("example/project")
@@ -196,7 +201,7 @@ def test_existing_run_error_uses_frozen_language_after_personal_language_changes
     spec = freeze_creation(RunSpec("run-1", "example/project", 1, "parent", "graph", (delivery,),
                                    repository_root=str(root)), defaults)
     from agent_run.model import ParentIssue, Requirements
-    kernel = Kernel.create_task(workspace.state_root / "kernel.sqlite3", spec,
+    kernel = create_managed_task(workspace.state_root / "kernel.sqlite3", spec,
         requirements=Requirements(ParentIssue(1, "Parent", "Frozen requirement"), ()))
     defaults.configure(language="zh")
     # This is a language/selection test, not a real user-bus release claim.
@@ -205,7 +210,7 @@ def test_existing_run_error_uses_frozen_language_after_personal_language_changes
     import agent_run.cli.lifecycle as lifecycle_cli
     import agent_run.adapters.systemd as host_adapter
     manager, _request, _response, _calls = controlled_manager(tmp_path)
-    monkeypatch.setattr(lifecycle_cli, "_active_runner", lambda: True)
+    monkeypatch.setattr(run_control, "_active_runner", lambda: True)
     monkeypatch.setattr(host_adapter, "SystemdHost", lambda **kwargs: manager)
     before = kernel.source_status()
     assert main(["approve", "run-1", "--repo", "example/project", "--state-dir", str(workspace.state_root)]) == 2
@@ -223,7 +228,7 @@ def test_dispatched_unknown_host_is_attached_without_applying_a_new_action(tmp_p
     import os
     from support.systemd_manager import controlled_manager
     from support.core_operations import host_kernel
-    from agent_run.cli.lifecycle import attach
+    from agent_run.runtime.host_control import attach
     kernel = host_kernel(tmp_path)
     manager, fixture, response, calls = controlled_manager(tmp_path)
     private = tmp_path / "original-host"
@@ -254,7 +259,7 @@ def test_allocated_original_host_continues_its_one_dispatch_and_then_only_attach
     from support.systemd_manager import controlled_manager
     from support.core_operations import host_kernel
     import agent_run.runtime.handoff as native_host
-    from agent_run.cli.lifecycle import attach
+    from agent_run.runtime.host_control import attach
     kernel = host_kernel(tmp_path)
     manager, fixture, response, calls = controlled_manager(tmp_path)
     private = tmp_path / "original-host"
@@ -317,6 +322,7 @@ def _running_public_parent(git_repo: Path, tmp_path: Path, monkeypatch, *, admit
     from agent_run.config.defaults import UserDefaultsStore
     from agent_run.model import Commit, Delivery, DeliveryKind, Issue, ParentIssue, Requirements, RunSpec
     from agent_run.core.kernel import Kernel
+    from agent_run.runtime.task import create_managed_task
     from agent_run.config.creation import freeze_creation
     from support.remote_effects import FAKE_GH
     binary = tmp_path / "source-bin"
@@ -349,7 +355,7 @@ def _running_public_parent(git_repo: Path, tmp_path: Path, monkeypatch, *, admit
                            policy_overrides={"parent_only_paired_rounds": 1, "development_deadline": "7s"})
     assert spec.inputs is not None
     spec = replace(spec, inputs=replace(spec.inputs, repository_remote="origin"))
-    kernel = Kernel.create_task(workspace.state_root / "kernel.sqlite3", spec,
+    kernel = create_managed_task(workspace.state_root / "kernel.sqlite3", spec,
         requirements=Requirements(ParentIssue(1, "Parent", "Frozen requirement", tickets), tuple(
             Issue(number, f"Ticket {number}", "Frozen Ticket requirement", "OPEN", labels=frozenset({"ready-for-agent"}))
             for number in tickets)))
@@ -501,7 +507,7 @@ def test_public_requeue_replaces_the_exact_stale_parent_generation_on_its_origin
         reader = GhGitHubReader("example/project", working_directory=root, runner_identity=identity)
         kernel.refresh(lambda: read_requirements(reader, 1))
         assert kernel.source_status()["blocked"] == "requeue_required"
-        monkeypatch.setattr(lifecycle_cli, "_admit_submit", lambda *_a, **_kw: pytest.fail("Requeue must use the exact ready original Host"))
+        monkeypatch.setattr(host_control, "admit", lambda *_a, **_kw: pytest.fail("Requeue must use the exact ready original Host"))
         assert main(["requeue", "1", "--repo", "example/project", "--json"]) == 0
         result = json.loads(capsys.readouterr().out)
         assert result["action"] == "requeue" and result["host"] == "running" and result["status"] == "action_applied"
@@ -604,7 +610,7 @@ def test_public_idle_requeue_binds_the_exact_replacement_to_the_original_host_in
             return ({"result": "accepted", "status": "action_applied", "run_id": request.run_id,
                      "action_id": action_id, "action": kind, "host": "unknown", "host_unit": request.unit_name}, None)
 
-        monkeypatch.setattr(lifecycle_cli, "_submit", record_host_intent)
+        monkeypatch.setattr(host_control, "launch_admitted", record_host_intent)
         assert main(["requeue", "1", "--repo", "example/project", "--json"]) == 0
         result = json.loads(capsys.readouterr().out)
         assert len(admitted) == 1 and result["host"] == "unknown"
@@ -626,6 +632,7 @@ def test_public_abandon_of_an_unknown_host_only_fences_the_published_task(
     import agent_run.adapters.systemd as host_adapter
     import agent_run.cli.lifecycle as lifecycle_cli
     import agent_run.adapters.remote as remote_effects
+    import agent_run.adapters.remote_observation as remote_observation
     from agent_run.model import HostObservation
     from agent_run.errors import KernelError
     from agent_run.cli.main import main
@@ -643,9 +650,10 @@ def test_public_abandon_of_an_unknown_host_only_fences_the_published_task(
             pytest.fail("Unknown-Host Abandon must not launch, attach, read remote state, or claim cleanup")
 
         monkeypatch.setattr(host_adapter, "SystemdHost", forbidden)
-        monkeypatch.setattr(lifecycle_cli, "_attach_request", forbidden)
-        monkeypatch.setattr(lifecycle_cli, "_admit_submit", forbidden)
+        monkeypatch.setattr(host_control, "select_existing", forbidden)
+        monkeypatch.setattr(host_control, "admit", forbidden)
         monkeypatch.setattr(remote_effects, "RemoteEffects", forbidden)
+        monkeypatch.setattr(remote_observation, "RemoteObservation", forbidden)
         assert main(["abandon", "1", "--repo", "example/project", "--json"]) == 0
         result = json.loads(capsys.readouterr().out)
         assert result["result"] == "accepted" and result["status"] == "action_pending"
@@ -700,7 +708,7 @@ def test_public_abandon_uses_the_original_ready_host_without_a_second_launch(
     from agent_run.cli.main import main
 
     with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, _execution, _world, calls):
-        monkeypatch.setattr(lifecycle_cli, "_admit_submit", lambda *_a, **_kw: pytest.fail("A ready original Host must not be replaced"))
+        monkeypatch.setattr(host_control, "admit", lambda *_a, **_kw: pytest.fail("A ready original Host must not be replaced"))
         assert main(["abandon", "1", "--repo", "example/project", "--json"]) == 0
         result = json.loads(capsys.readouterr().out)
         assert result["result"] == "accepted" and result["status"] == "action_pending"
@@ -739,7 +747,7 @@ def test_public_idle_abandon_records_the_exact_initial_or_continuation_host_inte
             return ({"result": "accepted", "status": "action_" + status, "run_id": request.run_id,
                      "action_id": action_id, "action": kind, "host": "unknown", "host_unit": request.unit_name}, None)
 
-        monkeypatch.setattr(lifecycle_cli, "_submit", record_host_intent)
+        monkeypatch.setattr(host_control, "launch_admitted", record_host_intent)
         assert main(["abandon", "1", "--repo", "example/project", "--discard-worktree", "--json"]) == 0
         result = json.loads(capsys.readouterr().out)
         assert result["result"] == "accepted" and result["host"] == "unknown"

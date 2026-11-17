@@ -10,6 +10,7 @@ import pytest
 from agent_run.adapters.workspace import ManagedWorkspace
 from agent_run.contracts.task import TaskKey
 from agent_run.core.kernel import Kernel
+from agent_run.runtime.task import create_managed_task
 from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
 from agent_run.cli.main import main
 from agent_run.storage.tasks import task_path
@@ -277,7 +278,7 @@ def test_default_parent_selects_the_exact_published_run_and_retains_terminal_his
     successor_spec = RunSpec('published', workspace.repository, 1, 'unread', 'unread',
         (original.delivery('parent:1'),), language='en', repository_root=str(workspace.repository_root),
         inputs=original.operation_binding().inputs)
-    successor = Kernel.create_task(original.storage.path, successor_spec,
+    successor = create_managed_task(original.storage.path, successor_spec,
         requirements=Requirements(ParentIssue(1, 'Parent', 'Requirement'), ()))
     assert original.storage.path == successor.storage.path and successor.storage.run_id == 'published'
     before = _snapshot(workspace.root)

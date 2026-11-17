@@ -1,5 +1,7 @@
 """Current Task reuse and fail-closed admission without an archived producer."""
 
+from agent_run.runtime import run_control
+from agent_run.runtime import host_control
 from dataclasses import replace
 import errno
 import json
@@ -16,6 +18,7 @@ from agent_run.config.creation import freeze_creation
 from agent_run.config.defaults import UserDefaultsStore
 from agent_run.contracts.task import TaskKey
 from agent_run.core.kernel import Kernel
+from agent_run.runtime.task import create_managed_task, open_managed_task
 from agent_run.errors import KernelError
 from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
 from agent_run.storage.preflight import UnsupportedState
@@ -39,7 +42,7 @@ def occupied_task(git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     spec = freeze_creation(RunSpec('original', workspace.repository, 1, 'parent', 'graph',
         (delivery,), repository_root=str(root)), defaults)
     requirements = Requirements(ParentIssue(1, 'Parent', 'Current requirement'), ())
-    kernel = Kernel.create_task(workspace.state_root / 'kernel.sqlite3', spec,
+    kernel = create_managed_task(workspace.state_root / 'kernel.sqlite3', spec,
                                 requirements=requirements)
     manager, fixture, response, calls = controlled_manager(tmp_path)
     request = kernel.admit_host(ORIGINAL_ACTION, kind='run', command=fixture.command,
@@ -52,7 +55,7 @@ def occupied_task(git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     observation = manager.observe(request)
     assert observation.disposition == 'unknown'
     assert kernel.observe_host(request, observation) == 'unknown'
-    monkeypatch.setattr(lifecycle, '_active_runner', lambda: True)
+    monkeypatch.setattr(run_control, '_active_runner', lambda: True)
     monkeypatch.setattr(host_adapter, 'SystemdHost', lambda **_kwargs: manager)
     return kernel, workspace, spec, requirements, manager, calls, request
 
@@ -75,8 +78,8 @@ def admission_snapshot(kernel, workspace):
 def forbid_new_launches(monkeypatch):
     def forbidden(*_args, **_kwargs):
         raise AssertionError('Occupied Task entered creation or new Host submission')
-    monkeypatch.setattr(lifecycle, 'prepare_creation', forbidden)
-    monkeypatch.setattr(lifecycle, '_admit_submit', forbidden)
+    monkeypatch.setattr(run_control, 'prepare_creation', forbidden)
+    monkeypatch.setattr(host_control, 'admit', forbidden)
 
 
 def assert_original_only(kernel, workspace, spec, calls, before):
@@ -95,8 +98,8 @@ def test_unknown_native_host_reuses_original_run_without_a_new_binding(occupied_
     before = admission_snapshot(kernel, workspace)
     task = TaskKey(workspace.repository_root, workspace.repository, 1)
     destination = workspace.state_root / 'replacement' / 'kernel.sqlite3'
-    assert Kernel.open_task(task).storage.path == kernel.storage.path
-    reused = Kernel.create_task(kernel.storage.path, replace(spec, run_id='replacement'), requirements=requirements)
+    assert open_managed_task(task).storage.path == kernel.storage.path
+    reused = create_managed_task(kernel.storage.path, replace(spec, run_id='replacement'), requirements=requirements)
     assert reused.storage.path == kernel.storage.path
     assert not destination.parent.exists()
     carrier = tmp_path / 'second-carrier'
@@ -164,9 +167,9 @@ def test_unreadable_current_task_pointer_refuses_before_new_state(
         else:
             with pytest.raises(KernelError) as refused:
                 if entry == 'open':
-                    Kernel.open_task(task)
+                    open_managed_task(task)
                 elif entry == 'create':
-                    Kernel.create_task(kernel.storage.path, replace(spec, run_id='replacement'), requirements=requirements)
+                    create_managed_task(kernel.storage.path, replace(spec, run_id='replacement'), requirements=requirements)
                 else:
                     kernel.admit_host('second-start', kind='run', command=request.command,
                         environment_carrier=carrier, preflight=manager.preflight)

@@ -58,7 +58,8 @@ RemotePort 与 OfflinePort 使用同一观察解析 source、target、pr_base；
 夹具只声明输入，不选择下一状态、不解释业务规则，不建立通用 completed 工厂。
 
 单线程业务与 Git 消费者可显式选择 `run_scoped_kernel.domain_scenario`：
-先由正常 `RepositoryRoute` 创建原库，再把同一库交给真实 `Transaction` / `RunTransaction`。
+先由 `RepositoryRoute` 定位并初始化原库，通过 `runtime.task.create_task` 发布完整 Task/Run，
+再把同一库交给真实 `Transaction` / `RunTransaction`。路由本身不构造 Kernel 或查询文档。
 Core、OperationRunner、Git 和每次业务提交仍实际执行；事务保留外键、只读拒写、
 材料摘要/预算和错误回滚，fixture 退出关闭连接，不复制完成状态或跨用例共享连接。
 这层负责业务组合，文件准入、保存排序与 OS 资源保护由原生 Storage 测试负责。

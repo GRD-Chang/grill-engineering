@@ -4,6 +4,7 @@ No Host, process, namespace, model, credential or external service is executed.
 The clock substitute proves state/ownership decisions, never kernel clock or
 cross-process FIFO support. Public routing uses the actual managed registry.
 """
+from agent_run.runtime.task import idle_task, open_task
 from contextlib import closing
 from dataclasses import replace
 import json
@@ -17,6 +18,7 @@ from agent_run.cli.main import main
 from agent_run.config.paths import app_data_root
 from agent_run.contracts.task import TaskKey
 from agent_run.core.kernel import Kernel
+from agent_run.runtime.task import create_managed_task
 from agent_run.errors import KernelError
 from agent_run.model import Commit, Delivery, DeliveryKind, HostObservation, ParentIssue, Requirements, RunSpec
 from agent_run.storage import routing, sqlite as storage_module
@@ -54,7 +56,7 @@ def proposal(workspace, name='A', parent=1, *, language='en'):
 
 def create(workspace, name='A', parent=1):
     spec, source = proposal(workspace, name, parent)
-    return Kernel.create_task(workspace.state_root / 'kernel.sqlite3', spec, requirements=source)
+    return create_managed_task(workspace.state_root / 'kernel.sqlite3', spec, requirements=source)
 
 
 def dump(database):
@@ -66,7 +68,7 @@ def test_single_public_schema_idle_task_and_exact_run_owner(managed):
     route = RepositoryRoute.for_workspace(managed)
     route.initialize()
     task = TaskKey(managed.repository_root, managed.repository, 1)
-    route.idle(task)
+    idle_task(route, task)
     assert require_supported_state(route.database) == PROTOCOL == 'independent-delivery-repository-v23'
     assert not hasattr(routing, 'REPOSITORY_PUBLIC_READY')
     before = dump(route.database)
@@ -129,7 +131,7 @@ def test_public_creation_commit_reply_loss_and_competing_proposal_reuse_original
     assert committed == [True] and first.storage.run_id == 'A'
     original = dump(first.storage.path)
     spec, source = proposal(managed, 'loser', language='zh')
-    replacement = Kernel.create_task(first.storage.path, spec, requirements=source)
+    replacement = create_managed_task(first.storage.path, spec, requirements=source)
     assert replacement.storage.run_id == 'A' and dump(first.storage.path) == original
     with RepositoryRoute.for_workspace(managed).metadata().transaction(write=False) as owner:
         assert owner.one('SELECT count(*) FROM runs')[0] == 1
@@ -206,9 +208,9 @@ def test_null_current_on_an_existing_task_never_authorizes_a_fresh_proposal(mana
     before = dump(first.storage.path)
     spec, source = proposal(managed, 'must-not-create')
     with pytest.raises(KernelError, match='task_location_identity'):
-        Kernel.create_task(first.storage.path, spec, requirements=source)
+        create_managed_task(first.storage.path, spec, requirements=source)
     with pytest.raises(KernelError, match='task_location_identity'):
-        route.open_task(task)
+        open_task(route, task)
     assert dump(first.storage.path) == before
     with route.metadata().transaction(write=False) as owner:
         assert owner.one('SELECT count(*) FROM runs')[0] == 1

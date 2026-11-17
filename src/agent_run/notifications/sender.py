@@ -401,7 +401,7 @@ class NativeNotifications:
                 outbox.cancel_item(document, item, "original Host exit no longer current")
 
     def _exit_current(self, event: Mapping[str, Any]) -> bool:
-        from agent_run.queries.host_exit import host_exit_current
+        from agent_run.runtime.host_recovery import host_exit_current
         evidence = event.get("exit_evidence")
         return isinstance(evidence, dict) and host_exit_current(self.database, evidence, **self._storage_options)
 
@@ -518,7 +518,7 @@ class NativeNotifications:
                     identity = hashlib.sha256(event["id"].encode()).hexdigest()[:32]
                     result = self.transport(self.config, card(event), identity, cancel, **options)
                 except Exception as error:
-                    from agent_run.queries.host_exit import HostExitUnavailable
+                    from agent_run.runtime.host_recovery import HostExitUnavailable
                     if event["kind"] == "executor_exit" and isinstance(error, HostExitUnavailable):
                         result = {"outcome": "failed", "reason": bounded_error(str(error)), "not_sent": True}
                     else:

@@ -5,6 +5,7 @@ Task/Run producer still validates and commits every relation. Managed CLI tests
 use their actual workspace bootstrap instead. No guessing or Run reopening is
 provided by this module.
 """
+from agent_run.runtime.task import create_task, selected_kernel
 from dataclasses import replace
 from pathlib import Path
 
@@ -46,8 +47,8 @@ def create_kernel(path: Path, spec: RunSpec, *, requirements: Requirements | Non
     # neighboring fixture files or relax managed-workspace refusal at the CLI.
     if not path.exists() and not path.is_symlink():
         Storage.create(path, namespace=(route.repository, str(route.repository_root)))
-    selected = route.create(TaskKey(route.repository_root, route.repository, spec.parent_issue), spec, requirements)
-    return route.kernel(selected.run_id)
+    selected = create_task(route, TaskKey(route.repository_root, route.repository, spec.parent_issue), spec, requirements)
+    return selected_kernel(route, selected.run_id)
 
 
 def read_binding(task: TaskKey, database: Path) -> tuple[str, Path] | None:
@@ -64,7 +65,7 @@ def read_binding(task: TaskKey, database: Path) -> tuple[str, Path] | None:
 def managed_bindings() -> list[tuple[str, Path]]:
     """Read the product's bounded managed registry in an isolated test HOME."""
     from types import SimpleNamespace
-    from agent_run.cli.selection import managed_repository_routes
+    from agent_run.runtime.run_selection import managed_repository_routes
     routes = managed_repository_routes(SimpleNamespace(repo=None, state_dir=None, data_root=None,
         run_id='explicit-test-registry-enumeration'))
     result = []

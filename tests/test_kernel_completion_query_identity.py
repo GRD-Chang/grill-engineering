@@ -8,6 +8,7 @@ from markdown_it import MarkdownIt
 from agent_run.adapters.workspace import ManagedWorkspace
 from agent_run.cli.main import main
 from agent_run.core.kernel import Kernel
+from agent_run.runtime.task import create_managed_task
 from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
 from agent_run.notifications.event_projection import completion_context, event_state
 from agent_run.notifications.cards import card
@@ -21,7 +22,7 @@ def _create_task(workspace, identity, parent, language="zh"):
         Commit("base", "tree"), "refs/heads/source", "refs/heads/main")
     spec = RunSpec(identity, workspace.repository, parent, "parent", "graph", (delivery,),
                    repository_root=str(workspace.repository_root), language=language, inputs=fixture_inputs())
-    return Kernel.create_task(workspace.state_root / "kernel.sqlite3", spec,
+    return create_managed_task(workspace.state_root / "kernel.sqlite3", spec,
                               requirements=Requirements(ParentIssue(parent, "Parent", "Scope"), ()))
 
 

@@ -13,7 +13,7 @@ import pytest
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.model import RunSpec
-from agent_run.cli.lifecycle import creation_resources
+from agent_run.runtime.task_creation import creation_resources
 from agent_run.adapters.source import read_requirements
 from agent_run.adapters.github import GhGitHubReader
 from support.remote_effects import _fixture, _source_kernel, _publish_pr

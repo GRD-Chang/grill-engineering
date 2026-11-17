@@ -3,6 +3,7 @@
 Core uses the existing controlled transaction seam. Files, flock, outbox and
 sender ownership are real; no namespace, Host or Worker process is launched.
 """
+from agent_run.runtime import host_control
 from contextlib import closing
 import json
 import sqlite3
@@ -15,7 +16,7 @@ import pytest
 from agent_run.adapters.foreground import DomainUnknown, record_root, write_record
 from agent_run.notifications.event_projection import event_state, project_event
 from agent_run.notifications.sender import NativeNotifications
-from agent_run.queries.host_exit import HostExitUnavailable, foreground_exit_notice, host_exit_current
+from agent_run.runtime.host_recovery import HostExitUnavailable, foreground_exit_notice, host_exit_current
 from agent_run.runtime.foreground_host import _settle
 from agent_run.runtime.handoff import _digest, _encode, _runner_witness
 from agent_run.runtime.package_lease import RunnerLeaseBusy, runner_management_lease, runner_usage_lease
@@ -215,6 +216,7 @@ def test_failed_record_removal_defers_notification_and_preserves_the_original_er
     import os
     from pathlib import Path
     from agent_run.cli import lifecycle
+    from agent_run.runtime import host_control
     from agent_run.runtime.foreground_host import ForegroundHost
     f = exited_input
     original = OSError('controlled record removal failure')
@@ -243,14 +245,14 @@ def test_failed_record_removal_defers_notification_and_preserves_the_original_er
             assert not lease.file.closed
             return _settle(kernel, request, f.path, f.record)
 
-    monkeypatch.setattr(lifecycle, '_admit_submit', lambda *_a, **_k: f.request)
+    monkeypatch.setattr(host_control, 'admit', lambda *_a, **_k: f.request)
     monkeypatch.setattr('agent_run.notifications.sender.notify_committed', lambda *_a, **_k: calls.append(True))
     with monkeypatch.context() as patch:
         patch.setattr(Path, 'unlink', remove)
         patch.setattr(os, 'open', opened)
         patch.setattr(os, 'fsync', synced)
         with pytest.raises(OSError) as caught:
-            lifecycle.submit(f.core, 'run', action_id='original', command=f.request.command,
+            host_control.submit(f.core, 'run', action_id='original', command=f.request.command,
                 manager=SettlingHost(environment={}), environment={}, runner_lock=f.lock)
         assert caught.value is original
         assert calls == [] and f.core.host_usage('original').usage_released
@@ -264,7 +266,7 @@ def test_failed_record_removal_defers_notification_and_preserves_the_original_er
         with pytest.raises(HostExitUnavailable):
             host_exit_current(f.original.storage.path, expected, storage=f.original.storage)
     # A later healthy entry completes the original directory sync and wakes history.
-    assert lifecycle.attach(f.core, requested_action='resume', manager=ForegroundHost(environment={}),
+    assert host_control.attach(f.core, requested_action='resume', manager=ForegroundHost(environment={}),
         environment={}, runner_lock=f.lock) is None
     assert calls == [True] and not f.path.exists()
     assert notice(f) == expected

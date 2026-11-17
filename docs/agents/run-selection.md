@@ -1,6 +1,6 @@
 # Run 选择与定位
 
-Run 的身份读取由 [`cli.selection`](../../src/agent_run/cli/selection.py) 维护，CLI 负责参数解析和结果呈现，Core 负责命令准入。
+Run 的身份读取由 [`runtime.run_selection`](../../src/agent_run/runtime/run_selection.py) 组合存储路由，CLI 负责参数解析和结果呈现，Core 负责命令准入。
 这是一条只读边界：发现候选不会创建受管目录、登记 Locator、修复状态或接受 Action。
 
 | 责任 | 维护位置 |

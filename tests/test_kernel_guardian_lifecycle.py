@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_run.cli.lifecycle import _runtime_directory, attach, submit
+from agent_run.runtime.host_control import _runtime_directory, attach, submit
 from agent_run.runtime import handoff as native
 from agent_run.runtime.package_lease import runner_management_lease, runner_usage_lease
 from support.systemd_manager import controlled_manager

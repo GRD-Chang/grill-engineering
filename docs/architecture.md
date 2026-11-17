@@ -14,8 +14,12 @@
 ```mermaid
 flowchart TD
     CLI[cli.main] --> Lifecycle[cli.lifecycle]
-    Lifecycle --> Core[Kernel: Task / Action / Host 准入]
-    Lifecycle --> Host[SystemdHost / ForegroundHost 候选]
+    Lifecycle --> Control[runtime.run_control / host_control]
+    Control --> Task[runtime.task: 工作区组合与 Task 打开]
+    Task --> Creation[core.task_creation / run_creation]
+    Creation --> Store[Storage / Transaction: SQLite 事实]
+    Control --> Core[Kernel: Action / Host 准入]
+    Control --> Host[SystemdHost / ForegroundHost 候选]
     Host --> Executor[runtime.executor: 进程与并发调用]
     Executor --> Runner[OperationRunner: 单次物理操作]
     Runner --> Core
@@ -26,6 +30,7 @@ flowchart TD
     Worker --> Core
     CLI --> Query[queries.run / cli.render]
     Query --> Store
+    Query --> Observe[runtime.inspection: 只读绑定观察]
 ```
 
 Ticket、Parent-only 和完整 Parent 的 Final 交付共用一个 Core。
@@ -47,6 +52,8 @@ Ticket、Parent-only 和完整 Parent 的 Final 交付共用一个 Core。
 | [`core.repair`](../src/agent_run/core/repair.py)、[`delivery_checks`](../src/agent_run/core/delivery_checks.py) | Parent 修复的候选到回执规则；普通/修复共用准确 Checks 保存及失败转 CI | 不持有完整 Kernel，不独立选工或批准正式写入 |
 | [`attempt_lifecycle`](../src/agent_run/core/attempt_lifecycle.py)、[`attempt_continuation`](../src/agent_run/core/attempt_continuation.py) | 原 Attempt 事实、等待和有界恢复判定、原事务内 Invocation/output/lease 准入 | 不代替物理退出证明，不创建新预算或控制器 |
 | [`Storage / Transaction`](../src/agent_run/storage/sqlite.py) | 事务、关系事实、材料摘要与拥有者核验、有界读取和容量检查 | 不选择后继工作，不重建另一套可变 Run 引擎 |
+| [`runtime.task`](../src/agent_run/runtime/task.py)、[`core.task_creation`](../src/agent_run/core/task_creation.py) | 应用入口选择具体工作区；创建业务在同一原事务发布完整 Run 与 Task 绑定；原 proposal 按原 deadline 对账 | 存储路由不构造 Core、查询或具体 Workspace；创建业务不持有完整 Kernel |
+| [`runtime.run_control`](../src/agent_run/runtime/run_control.py)、[`runtime.host_control`](../src/agent_run/runtime/host_control.py) | 原 Action 的准入、启动、附着与回执，前后台使用租约与通知时序 | CLI 不读取 Host 状态表或协调启动；未知退出不释放原租约 |
 | [`OperationRunner`](../src/agent_run/core/operation_runner.py) | 获取冻结配置，协调一次观察、Core 请求、实际操作和结果对账 | 不自行制定业务后继、预算或写权限 |
 | [`executor`](../src/agent_run/runtime/executor.py) | Agent 与 I/O 的物理并发、取消、等待和返回/退出收口 | 不用 Future 完成代替持久租约释放或退出证明 |
 | [`runtime.handoff`](../src/agent_run/runtime/handoff.py)、[`SystemdHost`](../src/agent_run/adapters/systemd.py) | 环境交接、Runner 使用租约、systemd 启动与原 Host 身份观察 | 不把未知启动或未知退出当成重新启动许可 |
@@ -84,6 +91,14 @@ Core 通过 [`operation_contract`](../src/agent_run/core/operation_contract.py) 
 OperationRunner 以冻结的 `OperationBinding` 组合真实端口，将观察和结果交回 Core，自己不读取 SQL。
 `run_once` 返回 AgentPreparation 后由 Executor 准备凭据；Core 原子准入返回 AgentCall 后才派发 Agent，不在 I/O 驱动中等待模型或 CI 完成。
 公开 status/history 只读数据库，不调用这条会接受新观察的运行链路。
+`storage.inspection.capture` 在快照内捕获 Run、Host 和 Invocation 绑定；
+`runtime.inspection` 的只读观察端口只接受捕获值，查询在事务外观察后复核原绑定。
+Host 退出通知的准确证据与当前性核验由 `runtime.host_recovery` 承担，查询不构造具体 Host。
+
+`tests/test_run_architecture.py` 随快速及完整测试执行，拒绝已清理边界中的反向导入，
+包含函数体内与字面量动态导入；错误指出应使用的应用或观察入口。
+该检查限定依赖边界，不能替代事务、准确退出、未知写入对账和行为测试。
+
 交付能力的调用顺序、有限事务操作、Review 字段责任与结构检查见
 [Core 交付合同](agents/core-delivery.md)。
 

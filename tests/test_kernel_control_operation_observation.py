@@ -11,6 +11,7 @@ import pytest
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 import agent_run.cli.lifecycle as lifecycle_cli
+from agent_run.runtime import host_control
 from agent_run.model import Execution
 from agent_run.errors import ObservationSuperseded
 from agent_run.core.operation_contract import ReadUnavailable
@@ -119,7 +120,7 @@ def test_first_public_resume_applies_after_exact_systemd_exit(tmp_path, monkeypa
     with kernel.storage.transaction(write=False) as tx:
         original_attempt = tx.one("SELECT current_attempt FROM subjects WHERE id=?", (subject,))[0]
         original_actions = tx.one("SELECT count(*) FROM actions")[0]
-    manager = lifecycle_cli._manager_for(kernel, _parser("en").parse_args(["resume", request.run_id]), dict(os.environ))
+    manager = host_control.manager_for(kernel, _parser("en").parse_args(["resume", request.run_id]), dict(os.environ))
     response = tmp_path / "manager" / "manager-response.json"
     document = json.loads(response.read_text())
     document["fields"].update(ActiveState="inactive", SubState="dead", MainPID="0",
@@ -233,7 +234,7 @@ def test_public_resume_after_trusted_material_or_checkout_restoration(tmp_path, 
         assert tx.get(inputs["material_id"], inputs["subject"]) == frozen
     # The external manager can now prove the successor; the real Core produces
     # the existing Attempt's next preparation, not another development charge.
-    manager = lifecycle_cli._manager_for(kernel, _parser("en").parse_args(["resume", request.run_id]), environment)
+    manager = host_control.manager_for(kernel, _parser("en").parse_args(["resume", request.run_id]), environment)
     document["fields"].update(Id=successor.unit_name, Description=successor.description,
         InvocationID="3" * 32, ActiveState="active", SubState="running", MainPID=str(os.getpid()))
     response.write_text(json.dumps(document))

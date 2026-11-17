@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent_run.contracts.task import TaskKey
-from agent_run.core.kernel import Kernel
+from agent_run.core.run_creation import create_run, creation_profiles
 from agent_run.core.task_creation import (
     create_repository_task, ensure_idle_task, reconcile_repository_task,
 )
@@ -80,7 +80,7 @@ def scenario(tmp_path):
     with closing(connection(path)) as db:
         db.executescript(REPOSITORY_TASK_SCHEMA)
         writer = Writer(path)
-        kernel = Kernel.__new__(Kernel)
+        kernel = SimpleNamespace()
         kernel.storage = SimpleNamespace(transaction=writer.transaction, path=path)
         kernel.clock = lambda: 100.
         task = TaskKey(tmp_path / 'workspace', 'example/project', 1)
@@ -100,7 +100,7 @@ def source(task):
 
 
 def create(kernel, task, run='A', **kwargs):
-    return create_repository_task(kernel, task, proposal(task, run, **kwargs), source(task))
+    return create_repository_task(kernel.storage, task, proposal(task, run, **kwargs), source(task), clock=kernel.clock)
 
 
 def snapshot(db):
@@ -224,7 +224,7 @@ def test_real_commit_with_lost_reply_is_reconciled_once_on_same_deadline_and_reo
     assert db.execute('SELECT count(*) FROM runs').fetchone()[0] == 1
     assert db.execute('SELECT count(*) FROM task_runs').fetchone()[0] == 1
     before = snapshot(db)
-    assert reconcile_repository_task(kernel, task, 'A').run_id == 'A'
+    assert reconcile_repository_task(kernel.storage, task, 'A').run_id == 'A'
     assert snapshot(db) == before
 
 
@@ -296,7 +296,7 @@ def test_known_foreign_proposal_is_not_unknown_for_an_absent_or_idle_task(scenar
             ensure_idle_task(owner, other)
     before = snapshot(db)
     with pytest.raises(KernelError, match='task_location_identity'):
-        reconcile_repository_task(kernel, other, 'A')
+        reconcile_repository_task(kernel.storage, other, 'A')
     assert snapshot(db) == before
     with pytest.raises(KernelError, match='task_location_identity'):
         create(kernel, other, 'A')
@@ -312,7 +312,7 @@ def test_complete_successor_and_old_proposal_readback_do_not_rebind_current(scen
     db.execute("UPDATE subjects SET phase='complete' WHERE run_id='A'")
     assert create(kernel, task, 'B', language='en').created
     before = snapshot(db)
-    prior = reconcile_repository_task(kernel, task, 'A')
+    prior = reconcile_repository_task(kernel.storage, task, 'A')
     assert prior.run_id == 'A' and prior.current_run == 'B'
     repeated = create(kernel, task, 'A')
     assert repeated.run_id == 'A' and repeated.current_run == 'B' and not repeated.created
@@ -369,7 +369,7 @@ def test_two_real_connections_compete_without_overwriting_winner_or_leaving_lose
             raise AssertionError('Bounded writer barrier was not released')
     first_writer.after_begin = hold_first
     second_writer = Writer(first_writer.path)
-    second_kernel = Kernel.__new__(Kernel)
+    second_kernel = SimpleNamespace()
     second_kernel.storage = SimpleNamespace(transaction=second_writer.transaction, path=first_writer.path)
     second_kernel.clock = lambda: 100.
     def invoke(target, run, language):
@@ -402,7 +402,8 @@ def test_two_real_connections_compete_without_overwriting_winner_or_leaving_lose
 
 def test_caught_sql_failure_poison_is_shared_and_prevents_task_publication(scenario, monkeypatch):
     db, kernel, writer, task = scenario
-    original = kernel._create_run
+    import agent_run.core.task_creation as creation
+    original = creation.create_run
     def poisoned(owner, *args, **kwargs):
         original(owner, *args, **kwargs)
         selected = RunTransaction(owner, 'A')
@@ -411,7 +412,7 @@ def test_caught_sql_failure_poison_is_shared_and_prevents_task_publication(scena
         except sqlite3.OperationalError:
             pass
         assert selected.failed and owner.failed
-    monkeypatch.setattr(kernel, '_create_run', poisoned)
+    monkeypatch.setattr(creation, 'create_run', poisoned)
     with pytest.raises(KernelError, match='transaction_aborted'):
         create(kernel, task)
     assert writer.owners[0].failed
@@ -421,11 +422,12 @@ def test_caught_sql_failure_poison_is_shared_and_prevents_task_publication(scena
 
 def test_creation_views_preserve_original_owner_accumulated_read_budget(scenario, monkeypatch):
     db, kernel, writer, task = scenario
-    original = kernel._create_run
+    import agent_run.core.task_creation as creation
+    original = creation.create_run
     def constrained(owner, *args, **kwargs):
         owner.rows_read = 65536
         original(owner, *args, **kwargs)
-    monkeypatch.setattr(kernel, '_create_run', constrained)
+    monkeypatch.setattr(creation, 'create_run', constrained)
     with pytest.raises(KernelError, match='query_limit'):
         create(kernel, task)
     assert writer.owners[0].rows_read == 65536
@@ -438,16 +440,16 @@ def test_unknown_proposal_or_unbound_header_is_never_adopted(scenario):
         ensure_idle_task(owner, task)
     before = snapshot(db)
     with pytest.raises(KernelError, match='task_creation_unknown'):
-        reconcile_repository_task(kernel, task, 'not-submitted')
+        reconcile_repository_task(kernel.storage, task, 'not-submitted')
     assert snapshot(db) == before
     create(kernel, task)
     before = snapshot(db)
     with pytest.raises(KernelError, match='task_creation_unknown'):
-        reconcile_repository_task(kernel, task, 'unallocated-loser')
+        reconcile_repository_task(kernel.storage, task, 'unallocated-loser')
     assert snapshot(db) == before
     unbound = proposal(task, 'unbound')
     with writer.transaction(ordered=False) as owner:
-        kernel._create_run(owner, unbound, kernel._creation_profiles(unbound),
+        create_run(owner, unbound, creation_profiles(unbound),
             requirements=source(task))
     before = snapshot(db)
     with pytest.raises(KernelError, match='task_creation_unknown'):
@@ -473,7 +475,7 @@ def test_incomplete_creation_request_is_rejected_before_any_task_is_written(scen
     spec = replace(spec, inputs=None) if missing == 'inputs' else replace(spec, repository_root=None)
     before = snapshot(db)
     with pytest.raises(KernelError, match='task_creation_identity'):
-        create_repository_task(kernel, task, spec, source(task))
+        create_repository_task(kernel.storage, task, spec, source(task))
     assert snapshot(db) == before
 
 

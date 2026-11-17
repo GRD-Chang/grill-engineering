@@ -25,6 +25,7 @@ from agent_run.config.paths import app_data_root
 from agent_run.runtime.package_lease import RunnerLeaseBusy, default_runner_lock_path, runner_management_lease
 from agent_run.config.defaults import UserDefaultsStore
 from agent_run.core.kernel import Kernel
+from agent_run.runtime.task import create_managed_task
 from agent_run.adapters.workspace import ManagedWorkspace
 from agent_run.storage.routing import RepositoryRoute
 from support.systemd_manager import controlled_manager
@@ -1688,7 +1689,7 @@ def test_controlled_native_commit_failure_reaps_both_workers_before_disarm_and_p
     _measure_host_calls(tmp_path, monkeypatch, enabled=request.config.getoption('host_loss_io_diagnostics'))
     from uuid import uuid4
     from agent_run.adapters.foreground import read_record, record_root, subreaper
-    from agent_run.cli.lifecycle import prepare_creation
+    from agent_run.runtime.task_creation import prepare_creation
     from support.sqlite_fault_host import command
     from support.sqlite_faults import FaultScope
 
@@ -1732,8 +1733,9 @@ if role == 'development':
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import pytest
-from agent_run.cli.lifecycle import submit
+from agent_run.runtime.host_control import submit
 from agent_run.core.kernel import Kernel
+from agent_run.runtime.task import create_managed_task
 from agent_run.runtime.foreground_host import ForegroundHost
 from support.installed_runtime import require_current_installation
 from support.sqlite_fault_host import command
@@ -1761,7 +1763,7 @@ else:
         environment, _ = _control_environment(git_repo, tmp_path, monkeypatch, codex=codex, tickets=(2, 3))
         database, spec, requirements = prepare_creation(1, 'example/project', source_directory=git_repo,
             defaults=UserDefaultsStore(), disable_notifications=True)
-        kernel = Kernel.create_task(database, spec, requirements=requirements)
+        kernel = create_managed_task(database, spec, requirements=requirements)
         action = uuid4().hex
         lock = default_runner_lock_path(environment)
         scope, digest = FaultScope.create(tmp_path / 'fault-scope', database, spec.run_id, action)

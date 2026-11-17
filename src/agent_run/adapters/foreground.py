@@ -78,7 +78,9 @@ def record_root(lock: Path, *, create: bool = False) -> Path:
 
 
 def read_record(path: Path) -> dict[str, Any]:
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    # Inspect the opened inode before reading it. O_NONBLOCK also prevents a
+    # replaced FIFO from waiting for a writer before fstat can reject it.
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
     with os.fdopen(descriptor, 'rb') as stream:
         info = os.fstat(stream.fileno())
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077

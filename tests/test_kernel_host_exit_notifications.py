@@ -94,7 +94,7 @@ def test_killed_original_host_notice_is_exact_current_and_business_read_only(tmp
             child.kill()
             assert child.wait(timeout=3) == -9
             before = kernel.storage.path.read_bytes()
-            from agent_run.queries.host_exit import host_exit_notice, host_exit_current
+            from agent_run.runtime.host_recovery import host_exit_notice, host_exit_current
             from agent_run.notifications.event_projection import host_exit_event
             notice = host_exit_notice(kernel.storage.path, 'original', handoff.receipt, service_result='signal', exit_code='killed', exit_status='KILL', invocation_id='1' * 32, storage=kernel.storage)
             assert notice is not None
@@ -159,7 +159,7 @@ def test_startup_exit_requires_exact_manager_identity_when_readiness_was_never_r
     tmp_path: Path, monkeypatch,
 ) -> None:
     import subprocess
-    from agent_run.queries.host_exit import host_exit_notice, host_exit_current
+    from agent_run.runtime.host_recovery import host_exit_notice, host_exit_current
     from support.systemd_manager import controlled_manager
     from support.notification import _kernel
 
@@ -241,16 +241,16 @@ def test_enabled_host_arms_only_the_exact_bounded_exit_command_without_private_e
     lock = tmp_path / "runner.lock"
     environment = {"PATH": os.defpath, "PRIVATE_TEST_VALUE": "must-never-enter-unit-properties",
                    "LD_LIBRARY_PATH": "/test/sqlite path%literal/$library"}
-    from agent_run.cli.host_exit import exit_properties
+    from agent_run.runtime.host_exit import exit_properties
     properties = exit_properties(kernel.storage.path, 'enabled', request, lock, environment, storage=kernel.storage)
     command, = [value for value in properties if value.startswith("ExecStopPost=")]
-    assert command.startswith("ExecStopPost=-:") and "from agent_run.cli.host_exit import main" in command
+    assert command.startswith("ExecStopPost=-:") and "from agent_run.runtime.host_exit import main" in command
     assert environment["PRIVATE_TEST_VALUE"] not in " ".join(properties)
     assert "path%%literal/$library" in command
     assert "TimeoutStopSec=70s" in properties and "TimeoutStopFailureMode=kill" in properties
     assert "OOMPolicy=continue" in properties
     import agent_run.runtime.handoff as native_host
-    from agent_run.cli.lifecycle import attach
+    from agent_run.runtime.host_control import attach
     guardians = []
     original_prepare = native_host.prepare_handoff
     def short_handoff(*args, **kwargs):

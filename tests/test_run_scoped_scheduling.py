@@ -11,6 +11,7 @@ import pytest
 
 from agent_run.core import kernel as core
 from agent_run.core.operation_contract import DeliveryFacts, DeliveryRead, ObserveIO, ReadUnavailable, RequirementsRead, Work
+from agent_run.core.source_snapshot import source_revisions
 from agent_run.errors import KernelError
 from agent_run.model import Commit, EffectResult, Execution, ParentIssue, Policy, ReadWait, Requirements, Step, World, wire_json
 from agent_run.storage.run_scope import RunTransaction
@@ -56,7 +57,7 @@ def scenario():
             seed(db, run)
             tx = RunTransaction(owner, run)
             source = _source(run)
-            parent, graph = core.Kernel._source_revisions(core.Kernel.__new__(core.Kernel), source)
+            parent, graph = source_revisions(source)
             profile = tx.put(SUBJECT, "profile", wire_json(inputs.profiles))
             db.execute("UPDATE profile_revisions SET material_id=? WHERE run_id=?", (profile, run))
             values = asdict(inputs)

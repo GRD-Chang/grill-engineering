@@ -14,6 +14,7 @@ from agent_run.config.creation import freeze_creation
 from agent_run.config.defaults import UserDefaultsStore
 from agent_run.contracts.agent_profiles import resolve_profiles
 from agent_run.core.kernel import Kernel
+from agent_run.runtime.task import create_managed_task
 from agent_run.model import Blocker, Commit, Delivery, DeliveryKind, Issue, ParentIssue, Policy, Profile, Requirements, RunSpec
 from agent_run.contracts.prompt import RESOURCE_KEYS
 from agent_run.core.operation_contract import DeliveryFacts
@@ -109,7 +110,7 @@ def _published_profile_task(git_repo: Path) -> Kernel:
                         'refs/heads/parent', 'refs/heads/main')
     spec = freeze_creation(RunSpec('profile-public', workspace.repository, 1, 'parent-v1', 'graph-v1',
         (delivery,), repository_root=str(workspace.repository_root)), defaults)
-    return Kernel.create_task(workspace.state_root / 'kernel.sqlite3', spec,
+    return create_managed_task(workspace.state_root / 'kernel.sqlite3', spec,
         requirements=Requirements(ParentIssue(1, 'Profile Parent', 'Frozen original requirement'), ()))
 
 

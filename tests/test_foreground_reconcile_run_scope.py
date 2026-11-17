@@ -4,6 +4,7 @@ No Host, Worker, namespace, signal, child or external notification is run.
 The observations below are an adapter substitute, not physical exit proof.
 """
 
+from agent_run.runtime.task import create_task, selected_kernel
 from support.repository_fixture import create_kernel
 from contextlib import closing
 from dataclasses import replace
@@ -32,8 +33,8 @@ def create_run(path, root, name, parent, *, route=None):
     source = Requirements(ParentIssue(parent, 'Parent', 'Frozen requirements'), ())
     if route is None:
         return create_kernel(path, spec, requirements=source)
-    assert route.create(TaskKey(root, route.repository, parent), spec, source).created
-    return route.kernel(name)
+    assert create_task(route, TaskKey(root, route.repository, parent), spec, source).created
+    return selected_kernel(route, name)
 
 
 @pytest.fixture

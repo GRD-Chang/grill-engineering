@@ -10,13 +10,13 @@ Status、History、CLI 和通知投影从已提交事实派生，不另存展示
 
 | 事实或输出 | 当前维护归属 |
 | --- | --- |
-| 定位、唯一候选选择与命令分流 | [`cli/selection.py`](../../src/agent_run/cli/selection.py)、[`cli/main.py`](../../src/agent_run/cli/main.py)、[`cli/lifecycle.py`](../../src/agent_run/cli/lifecycle.py)；Task 位置记录由 [`storage/tasks.py`](../../src/agent_run/storage/tasks.py) 维护 |
+| 定位、唯一候选选择与命令分流 | [`runtime/run_selection.py`](../../src/agent_run/runtime/run_selection.py) 组合只读路由；[`cli/main.py`](../../src/agent_run/cli/main.py)、[`cli/lifecycle.py`](../../src/agent_run/cli/lifecycle.py) 解释输入和呈现；Task 位置记录由 [`storage/tasks.py`](../../src/agent_run/storage/tasks.py) 维护 |
 | status/history/settings 的同源只读文档 | [`queries/run.py`](../../src/agent_run/queries/run.py) 的 `read` |
 | 交付对象、gate、预算、候选、PR、当前工作及人工待办 | `queries.run._subject`、`queries.read_facts.read_boundaries`；结构见 [`queries/model.py`](../../src/agent_run/queries/model.py) |
 | 原始调用、Thread/Profile 和物理输出关联 | `queries.run._attempt`、`_invocations`、`queries.execution.recorded_profile` |
 | 原始审计与分页历史 | `queries.run._native_history`、`_control_history`、`_resume_progress` |
 | Worker 活动段与累计 effort | [`queries/execution.py`](../../src/agent_run/queries/execution.py) 的 `activity`、`execution_facts` |
-| 当前本机进程观察，独立于历史 | [`queries/current_observation.py`](../../src/agent_run/queries/current_observation.py)；Core 核验只读绑定，Foreground Host 提供只读物理观察 |
+| 当前本机进程观察，独立于历史 | [`storage/inspection.py`](../../src/agent_run/storage/inspection.py) 捕获绑定，独立的 [`runtime/inspection.py`](../../src/agent_run/runtime/inspection.py) 端口观察；[`queries/current_observation.py`](../../src/agent_run/queries/current_observation.py) 控制读取期限并复核身份 |
 | JSON、plain、Rich 与 settings 文案 | [`cli/render.py`](../../src/agent_run/cli/render.py) 的 `render`、`render_settings` |
 | 已提交通知事件、里程碑与 Resume 结果 | [`notifications/event_projection.py`](../../src/agent_run/notifications/event_projection.py) |
 | 通知的当前 gate/完成边界及内容 | `queries.read_facts.read_boundaries` 提供事实；[`notifications/boundary_projection.py`](../../src/agent_run/notifications/boundary_projection.py) 解释原历史快照、门禁与经核验终态的卡片内容 |
@@ -25,9 +25,15 @@ Status、History、CLI 和通知投影从已提交事实派生，不另存展示
 
 `QueryDocument` 是显示结果，不是另一套可保存或推进的 Run。
 `current_observation` 是本次有界读取，不是保存的状态、执行授权或连续活性保证。
-Core 从原 Run/owner/epoch、HostRequest 和准确当前 AgentCall 核验观察绑定；物理读取在
+存储从原 Run/owner/epoch、HostRequest 和准确当前 Invocation 捕获观察绑定；物理读取在
 SQLite 事务外完成，再读取并比较原绑定。身份变化、读取失败、超出本次 IO 预算或证据不足
 均降为 `unknown`，不结算退出、不改 lease、不推进恢复。
+观察器只接收 `InspectionBindings` 与 `WorkerBinding`，不接收 Kernel、Storage 或事务。
+每个观察调用显式接收同一次读取的绝对 `deadline`；具体来源必须将它用于自身的 I/O 超时，
+不在内部新开期限。默认本地来源不等待进程退出，以非阻塞打开检查保护记录的 inode，
+FIFO 等非法文件立即降为未知。来源选择只组合对象，不执行外部 I/O。
+增加同类观察来源时修改 runtime 的 `inspector_for` 组合点及对应物理实现；
+查询的持久投影和身份复核无需按 backend 增加分支。
 本机 foreground 可提供准确 namespace/start token 绑定的 `running` 或 `exited`；
 远端、不可比较的观察域及尚未接入的 systemd 查询保持 `unknown`，不调用后台管理服务。
 Status 的 `executor_control.live_status` 与准确当前 Invocation 的 `live_status` 从该字段派生；

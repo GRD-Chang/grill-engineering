@@ -1,6 +1,8 @@
 """Configure a published Run through its existing immutable Profile authority."""
 from __future__ import annotations
 
+from agent_run.runtime.task import selected_kernel
+
 import argparse
 import json
 from collections.abc import Sequence
@@ -35,7 +37,7 @@ def add_parser(commands: Any, language: str) -> None:
 
 
 def execute(parsed: argparse.Namespace, *, repository_routes: Sequence[RepositoryRoute] | None = None) -> int:
-    from agent_run.cli.selection import repository_target, managed_repository_routes
+    from agent_run.runtime.run_selection import repository_target, managed_repository_routes
 
     selection = argparse.Namespace(**vars(parsed))
     selection.parent = None
@@ -44,7 +46,7 @@ def execute(parsed: argparse.Namespace, *, repository_routes: Sequence[Repositor
         selection.run_id = None
     routes = repository_routes if repository_routes is not None else managed_repository_routes(selection)
     route, location = repository_target(selection, routes)
-    database, kernel = location.database, route.kernel(location.run_id)
+    database, kernel = location.database, selected_kernel(route, location.run_id)
     expected_run, expected_repository = location.run_id, location.task.repository
     with kernel.storage.transaction(write=False) as tx:
         run = tx.one(*run_statement(tx, "SELECT id,repository,parent_issue,language,repository_root FROM runs WHERE id=?"))

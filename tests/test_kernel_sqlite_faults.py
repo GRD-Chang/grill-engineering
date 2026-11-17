@@ -8,6 +8,7 @@ import sys
 import pytest
 
 from agent_run.core.kernel import Kernel
+from agent_run.runtime.task import create_managed_task
 from agent_run.cli.main import main
 from agent_run.adapters.git_objects import LocalGit
 from agent_run.errors import KernelError
@@ -149,7 +150,7 @@ def test_public_stop_reports_real_commit_interruption_without_partial_action(
     source = Requirements(ParentIssue(1, 'Parent', 'Preserve this original requirement', ()), ())
     delivery = Delivery('parent:1', DeliveryKind.PARENT_ONLY, 1, 'unobserved', base,
         'refs/heads/fault-delivery', 'refs/heads/main', checkout=str(workspace.repository_root))
-    kernel = Kernel.create_task(workspace.state_root / 'kernel.sqlite3',
+    kernel = create_managed_task(workspace.state_root / 'kernel.sqlite3',
         RunSpec('sqlite-fault-run', 'example/project', 1, 'unobserved', 'graph', (delivery,),
             inputs=fixture_inputs(), language='en', repository_root=str(workspace.repository_root)), requirements=source)
     # Exercise the committing revocation path, rather than idle Stop's lawful

@@ -11,7 +11,6 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from functools import cached_property
-import hashlib
 import json
 import math
 from pathlib import Path
@@ -21,14 +20,12 @@ from typing import Any, Callable, Iterator, Literal, Mapping
 from threading import RLock
 from uuid import uuid4
 
-from agent_run.contracts.agent_profiles import ProfileOverrides, resolve_profiles, validate_profile_options
+from agent_run.contracts.agent_profiles import ProfileOverrides, resolve_profiles
 from agent_run.contracts.artifact import commit_message_matches
-from agent_run.contracts.identity import validate_identity_snapshot
 from agent_run.contracts.pr_observation import pr_target
 from agent_run.contracts.repository import same_repository
 from agent_run.contracts.required_checks import same_required_checks
 from agent_run.contracts.review_evidence import same_review_candidate
-from agent_run.contracts.prompt import validate_resources
 from agent_run.contracts.task import TaskKey
 
 from agent_run.model import (
@@ -42,6 +39,9 @@ from agent_run.storage.run_paths import RunPaths, run_paths
 from agent_run.storage.routing import open_run
 from agent_run.core.attempt_continuation import (AttemptContinuationBasis, ContinuationFacts,
                                    bind_attempt_continuation, load_continuation)
+from agent_run.core.task_creation import replaceable_in
+from agent_run.core.run_creation import add_delivery, encode_policy
+from agent_run.core.source_snapshot import record_source, source_revisions, fingerprint
 from agent_run.core.delivery_state import DeliveryState
 from agent_run.core.attempt_lifecycle import (AttemptLifecycle, ContinuationPlan,
     admit_preparation, continuation_wait, inherited_period, worker_failure_policy)
@@ -62,15 +62,6 @@ def identity() -> str:
 
 class _SupervisionWriteRequired(Exception):
     """The original expired read window needs a fresh ordered writer check."""
-
-
-@dataclass(frozen=True)
-class InspectionBindings:
-    """Ephemeral readonly bindings, never a saved state or execution grant."""
-    current: tuple[str, str | None, int]
-    request: HostLaunch | None
-    host: Mapping[str, Any] | None
-    workers: tuple[tuple[AgentCall, Mapping[str, Any]], ...]
 
 
 class _OperationSnapshot:
@@ -1115,129 +1106,10 @@ class Kernel:
         return OperationSupervision(run["concurrency"], tuple(row["id"] for row in active), cancel,
                                     wake_at, tuple(p.reservation_id for p in preparations))
 
-    @classmethod
-    def create_task(cls, path: Path, spec: RunSpec, *, requirements: Requirements) -> Kernel:
-        """Atomically freeze and bind a complete Run in its repository database."""
-        if spec.repository_root is None:
-            raise KernelError("task_workspace_unknown")
-        from agent_run.storage.routing import RepositoryRoute
-        route = RepositoryRoute(path, Path(spec.repository_root), spec.repository)
-        task = TaskKey(route.repository_root, route.repository, spec.parent_issue)
-        from agent_run.adapters.workspace import ManagedWorkspace
-        workspace = ManagedWorkspace.for_repository(task.repository)
-        if route != RepositoryRoute.for_workspace(workspace):
-            raise KernelError("managed_state_identity")
-        cls._creation_profiles(spec)  # Reject invalid frozen input before creating any file.
-        with task_lock(task):
-            if not path.exists() and not path.is_symlink():
-                route.initialize()
-            result = route.create(task, spec, requirements)
-            return route.kernel(result.run_id)
+    _add_delivery = staticmethod(add_delivery)
 
-    @staticmethod
-    def _creation_profiles(spec: RunSpec) -> dict[str, Any]:
-        if not spec.deliveries or len({delivery.key for delivery in spec.deliveries}) != len(spec.deliveries):
-            raise ValueError("one or more uniquely identified deliveries are required")
-        if spec.inputs is None:
-            raise KernelError("creation_inputs_required")
-        profiles = dict(spec.inputs.profiles)
-        validate_profile_options(preset=spec.inputs.profiles.get("preset"))
-        checked = resolve_profiles(current=spec.inputs.profiles)
-        if any(field not in spec.inputs.profiles["profiles"][role.value]
-               or spec.inputs.profiles["profiles"][role.value][field] != checked["profiles"][role.value][field]
-               for role in Role for field in ("model", "reasoning_effort", "reference")):
-            raise KernelError("creation_profile_binding_changed")
-        if spec.language is None:
-            raise KernelError("creation_language_required")
-        validate_resources(dict(spec.inputs.prompt_resources))
-        validate_identity_snapshot(spec.inputs.worker_identity)
-        validate_identity_snapshot(spec.inputs.runner_identity)
-        return profiles
-
-    @classmethod
-    def create(cls, path: Path, spec: RunSpec, *, requirements: Requirements) -> Kernel:
-        """The library creation entry uses the same atomic Task/Run producer."""
-        return cls.create_task(path, spec, requirements=requirements)
-
-    def _create_run(self, tx: Transaction, spec: RunSpec, profiles: Mapping[str, Any], *,
-                    requirements: Requirements,
-                    policy_values: Mapping[str, Any] | None = None) -> None:
-        """Freeze one complete Run on the caller's original writer; no physical I/O."""
-        policy = self._policy_values(spec.policy) if policy_values is None else policy_values
-        if requirements.parent.number != spec.parent_issue:
-            raise KernelError("parent_identity")
-        parent_revision, graph_revision = self._source_revisions(requirements)
-        spec = replace(spec, parent_revision=parent_revision, graph_revision=graph_revision)
-        tickets = {delivery.issue for delivery in spec.deliveries if delivery.kind == DeliveryKind.TICKET}
-        if tickets != set(requirements.parent.sub_issue_numbers):
-            raise KernelError("delivery_scope")
-        if len([delivery for delivery in spec.deliveries if delivery.kind == DeliveryKind.FINAL_RUN]) != bool(tickets):
-            raise KernelError("final_target_required")
-        if tickets:
-            final = next(delivery for delivery in spec.deliveries if delivery.kind == DeliveryKind.FINAL_RUN)
-            if any(delivery.target_ref != final.source_ref or delivery.base != final.base
-                   for delivery in spec.deliveries if delivery.kind == DeliveryKind.TICKET):
-                raise KernelError("run_branch_identity")
-        tx.execute("INSERT INTO runs(id,repository,parent_issue,parent_revision,graph_revision,accepted_parent_revision,concurrency,policy,language,repository_root,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                   (spec.run_id, spec.repository, spec.parent_issue, spec.parent_revision,
-                    spec.graph_revision, spec.parent_revision, spec.policy.concurrency, wire_json(policy),
-                    spec.language, None if spec.repository_root is None else str(Path(spec.repository_root).resolve()), self.clock()))
-        tx = RunTransaction(tx, spec.run_id)
-        for delivery in spec.deliveries:
-            if delivery.kind == DeliveryKind.FINAL_RUN:
-                tx.execute(*run_statement(tx, "INSERT INTO final_target(id,source_ref,target_ref,checkout,owned_root,common_git_dir,run_id) VALUES (?,?,?,?,?,?,?)",
-                    (delivery.key, delivery.source_ref, delivery.target_ref, delivery.checkout, delivery.owned_root, delivery.common_git_dir), run_last=True))
-                continue
-            issue = next((issue for issue in requirements.issues if issue.number == delivery.issue), None)
-            revision = spec.parent_revision if delivery.kind == DeliveryKind.PARENT_ONLY else (
-                "unread" if issue is None else self._fingerprint({"title": issue.title, "body": issue.body}))
-            delivery = replace(delivery, revision=revision, dependencies=())
-            self._add_delivery(tx, spec.run_id, spec.policy, delivery)
-            if delivery.owned_root:
-                tx.execute(*run_statement(tx, "UPDATE subjects SET phase='workspace' WHERE id=? AND run_id=?", (delivery.key,), run_last=True))
-        owner = tx.one(*run_statement(tx, "SELECT id FROM subjects WHERE run_id=? ORDER BY id LIMIT 1", (), run_last=True))[0]
-        self._store_profiles(tx, owner, profiles, {"operation": "create"})
-        if spec.inputs is not None:
-            values: dict[str, Any] = {name: dict(getattr(spec.inputs, name)) for name in (
-                "prompt_resources", "worker_identity", "runner_identity", "notifications", "provenance")}
-            values["repository_remote"] = spec.inputs.repository_remote
-            material = tx.put(owner, "creation_inputs", wire_json(values))
-            tx.execute("INSERT INTO run_inputs VALUES (?,?,?)", (spec.run_id, owner, material))
-        self._refresh(tx, requirements, initial=True)
-
-    def _add_delivery(self, tx: Transaction, run_id: str, policy: Policy, delivery: Delivery) -> None:
-        selected = transaction_scope(tx)
-        if run_id != selected.run_id:
-            raise KernelError("allocation_binding")
-        final = delivery.kind == DeliveryKind.FINAL_RUN
-        tx.execute("""INSERT INTO subjects(
-            id,run_id,kind,issue,revision,phase,purpose,source_ref,target_ref,
-            base_sha,base_tree,source_sha,candidate_sha,candidate_tree,completion_revision,checkout,workspace_sha,owned_root,common_git_dir)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                   (delivery.key, run_id, delivery.kind.value, delivery.issue, delivery.revision,
-                    "integration" if final else "development", Purpose.INTEGRATION.value if final else Purpose.REQUIREMENTS.value,
-                    delivery.source_ref, delivery.target_ref, delivery.base.sha, delivery.base.tree,
-                    delivery.base.sha, delivery.base.sha if final else None, delivery.base.tree if final else None,
-                    delivery.completion_revision, delivery.checkout, delivery.base.sha, delivery.owned_root, delivery.common_git_dir))
-        limits = budget_limits(policy, delivery.kind)
-        for purpose, (development_limit, review_limit) in limits.items():
-            review_required = requires_review(policy, delivery.kind, purpose)
-            tx.execute(*run_statement(tx, 'INSERT INTO budgets(subject,purpose,window,development_limit,review_limit,review_required,run_id) VALUES (?,?,1,?,?,?,?)',
-                (delivery.key, purpose.value, development_limit, review_limit, review_required), run_last=True))
-        tx.execute(*run_statement(tx, 'INSERT INTO resync_allowances(subject,generation,allowance,run_id) VALUES (?,1,?,?)',
-            (delivery.key, policy.resync_limit), run_last=True))
-
-    @staticmethod
-    def _fingerprint(value: Any) -> str:
-        return "sha256:" + hashlib.sha256(wire_json(value)).hexdigest()
-
-    def _source_revisions(self, requirements: Requirements) -> tuple[str, str]:
-        parent = requirements.parent
-        members = sorted(parent.sub_issue_numbers)
-        return (self._fingerprint({"title": parent.title, "body": parent.body}),
-                self._fingerprint({"tickets": members, "dependencies": {
-                    str(issue.number): sorted(blocker.number for blocker in issue.blocked_by)
-                    for issue in requirements.issues if issue.number in members}}))
+    _fingerprint = staticmethod(fingerprint)
+    _source_revisions = staticmethod(source_revisions)
 
     def refresh(self, read: Callable[[], Requirements]) -> dict[str, Any]:
         """Observe real source facts without reopening any operator control."""
@@ -1261,59 +1133,13 @@ class Kernel:
                   (), run_last=True))
         if source.parent.number != run["parent_issue"]:
             raise KernelError("parent_identity")
-        parent_revision, graph_revision = self._source_revisions(source)
-        order = list(source.parent.sub_issue_numbers)
-        if not source.parent.sub_issue_order_reliable:
-            order.sort()
-        raw = wire_json({"parent": asdict(source.parent), "issues": [
-            {**asdict(issue), "labels": sorted(issue.labels)} for issue in source.issues]})
-        if len(raw) > 4 * 1024 * 1024:
-            raise KernelError("source_limit")
-        previous = tx.rows(*run_statement(tx, 'SELECT sequence,body FROM source_observations WHERE run_id=? ORDER BY sequence DESC LIMIT 1',
-                       (), run_last=True))
-        if previous and previous[0]["body"] == raw:
-            return True
-        if readonly:
-            return False
-        tx.execute(*run_statement(tx, 'INSERT INTO source_observations(parent_revision,graph_revision,body,run_id) VALUES (?,?,?,?)',
-            (parent_revision, graph_revision, raw), run_last=True))
-        sequence = tx.one("SELECT last_insert_rowid()")[0]
-        tx.execute(*run_statement(tx, 'INSERT OR IGNORE INTO requirement_versions(issue,revision,title,body,run_id) VALUES (?,?,?,?,?)',
-            (source.parent.number, parent_revision, source.parent.title, source.parent.body), run_last=True))
-        tx.execute(*run_statement(tx, 'DELETE FROM issue_facts WHERE run_id=?',
-            (), run_last=True))
-        tx.execute(*run_statement(tx, 'DELETE FROM dependency_facts WHERE run_id=?',
-            (), run_last=True))
+        observed = record_source(tx, source, initial=initial, readonly=readonly)
+        if isinstance(observed, bool):
+            return observed
+        sequence = observed.sequence
+        parent_revision, graph_revision = observed.parent_revision, observed.graph_revision
+        graph_problem = observed.graph_problem
         by_number = {issue.number: issue for issue in source.issues}
-        for issue in source.issues:
-            revision = self._fingerprint({"title": issue.title, "body": issue.body})
-            tx.execute(*run_statement(tx, 'INSERT OR IGNORE INTO requirement_versions(issue,revision,title,body,run_id) VALUES (?,?,?,?,?)',
-                (issue.number, revision, issue.title, issue.body), run_last=True))
-            tx.execute(*run_statement(tx, 'INSERT INTO issue_facts(issue,revision,state,labels,position,run_id) VALUES (?,?,?,?,?,?)',
-                (issue.number, revision, issue.state.upper(), wire_json(sorted(issue.labels)), order.index(issue.number) if issue.number in order else -1), run_last=True))
-            for blocker in issue.blocked_by:
-                tx.execute(*run_statement(tx, 'INSERT INTO dependency_facts(issue,blocker,state,run_id) VALUES (?,?,?,?)',
-                    (issue.number, blocker.number, blocker.state.upper()), run_last=True))
-        tx.execute(*run_statement(tx, 'UPDATE runs SET source_sequence=?,observed_parent_revision=?,observed_graph_revision=? WHERE id=?',
-            (sequence, parent_revision, graph_revision), run_last=True))
-        if initial:
-            initial_jobs = {row["issue"]: row["id"] for row in tx.all(*run_statement(tx, "SELECT id,issue FROM subjects WHERE kind='ticket' AND run_id=?",
-                                                                   (), run_last=True))}
-            for issue in source.issues:
-                for blocker in issue.blocked_by:
-                    if issue.number in initial_jobs and blocker.number in initial_jobs:
-                        tx.execute(*run_statement(tx, 'INSERT INTO dependencies(subject,predecessor,run_id) VALUES (?,?,?)',
-                            (initial_jobs[issue.number], initial_jobs[blocker.number]), run_last=True))
-        graph_problem = "missing_ticket" if any(number not in by_number for number in order) else None
-        edges = {number: {blocker.number for blocker in by_number[number].blocked_by if blocker.number in order}
-                 for number in order if number in by_number}
-        remaining = set(edges)
-        while remaining:
-            ready = {number for number in remaining if not (edges[number] & remaining)}
-            if not ready:
-                graph_problem = "dependency_cycle"
-                break
-            remaining -= ready
         jobs = tx.all(*run_statement(tx, 'SELECT * FROM subjects WHERE run_id=?',
                    (), run_last=True))
         reopened = any(job["kind"] == DeliveryKind.TICKET and job["phase"] == "complete"
@@ -2334,32 +2160,7 @@ class Kernel:
         with self.storage.transaction(write=False) as tx:
             return self._replaceable_in(tx, task, run_id)
 
-    def _replaceable_in(self, tx: Transaction, task: TaskKey, run_id: str) -> bool:
-        """The original predicate, also usable inside an atomic Task writer."""
-        selected = transaction_scope(tx)
-        if selected.run_id != run_id:
-            raise KernelError("task_location_identity")
-        run = tx.one(*run_statement(tx, "SELECT * FROM runs WHERE id=?", (), run_last=True))
-        if run["id"] != run_id or self._task(run) != task:
-            raise KernelError("task_location_identity")
-        abandoned = self._abandon_action(tx)
-        completed_abandonment = bool(abandoned is not None and abandoned["status"] == "complete")
-        return bool(run['executor'] is None and (completed_abandonment or not tx.rows(*run_statement(tx, "SELECT id FROM subjects WHERE phase!='complete' AND run_id=? LIMIT 1", (), run_last=True))) and (completed_abandonment or not tx.rows(*run_statement(tx, "SELECT id FROM final_target WHERE run_id=? AND id NOT IN (SELECT id FROM subjects WHERE run_id=? AND kind='final_run' AND phase='complete') LIMIT 1", (run_id,)))) and (not self._agent_seats(tx)) and (not tx.rows(*run_statement(tx, "SELECT owner FROM retired_executors WHERE status!='exited' AND run_id=? LIMIT 1", (), run_last=True))) and (not tx.rows(*run_statement(tx, "SELECT owner FROM hosts WHERE (status!='exited' OR usage_released=0) AND run_id=? LIMIT 1", (), run_last=True))) and (not tx.rows(*run_statement(tx, "SELECT id FROM effects WHERE status IN ('prepared','sent','observed') AND operation!='issue_link' AND run_id=? LIMIT 1", (), run_last=True))) and (completed_abandonment or not tx.rows(*run_statement(tx, "SELECT subject FROM resource_cleanup WHERE state!='complete' AND run_id=? LIMIT 1", (), run_last=True))))
-
-    @classmethod
-    def open_task(cls, task: TaskKey) -> Kernel | None:
-        """Read the managed repository's canonical Task pointer, never JSON."""
-        from agent_run.adapters.workspace import ManagedWorkspace
-        from agent_run.storage.routing import RepositoryRoute
-        workspace = ManagedWorkspace.for_repository(task.repository)
-        if workspace.repository_root.resolve() != task.workspace:
-            raise KernelError("task_location_identity")
-        route = RepositoryRoute.for_workspace(workspace)
-        if not route.database.exists() and not route.database.is_symlink():
-            route._require_vacant_root(route.database)
-            return None
-        with task_lock(task):
-            return route.open_task(task)
+    _replaceable_in = staticmethod(replaceable_in)
 
     def active_host_action(self) -> str | None:
         """Read the original Action until its Host and usage are both retired."""
@@ -3627,39 +3428,6 @@ class Kernel:
         return tx.one(*run_statement(tx, 'SELECT i.*,o.*,a.subject,a.role,a.purpose,a.generation,a.parent_revision,a.graph_revision,a.revision,a.current_invocation FROM invocations i JOIN invocation_outputs o ON o.run_id=i.run_id AND o.invocation=i.id JOIN attempts a ON a.run_id=i.run_id AND a.id=i.attempt WHERE i.id=? AND o.ordinal=? AND i.run_id=?',
                   (invocation_id, ordinal), run_last=True))
 
-    def inspection_bindings(self, tx: Transaction) -> InspectionBindings:
-        """Read current Call inputs and reuse formal binding checks; no authority."""
-        if transaction_scope(tx).run_id != self.storage.run_id:
-            raise KernelError("run_scope_changed")
-        run = tx.one(*run_statement(tx, "SELECT id,executor,epoch FROM runs WHERE id=?", (), run_last=True))
-        current = (run['id'], run['executor'], run['epoch'])
-        hosts = tx.rows('SELECT * FROM hosts WHERE run_id=? AND owner=? AND epoch=?', current)
-        if not hosts:return InspectionBindings(current, None, None, ())
-        request = self._host_launch(tx, hosts[0])
-        if (request.run_id, request.owner, request.epoch) != current:
-            raise KernelError('host_binding_changed')
-        self._host(tx, request)
-        workers = []
-        for item in tx.rows('SELECT i.id,max(o.ordinal) AS ordinal FROM subjects s '
-                'JOIN attempts a ON a.run_id=s.run_id AND a.id=s.current_attempt AND a.generation=s.generation '
-                'JOIN invocations i ON i.run_id=a.run_id AND i.id=a.current_invocation '
-                'JOIN invocation_outputs o ON o.run_id=i.run_id AND o.invocation=i.id '
-                'WHERE s.run_id=? AND i.executor=? AND i.epoch=? GROUP BY i.id ORDER BY s.id', current):
-            row = self._invocation_output(tx, item['id'], item['ordinal'])
-            job = self._job(tx, row['subject'])
-            thread = tx.one(*run_statement(tx, 'SELECT * FROM threads WHERE id=? AND run_id=?', (row['thread'],), run_last=True))
-            profile, reference = self._thread_profile(tx, thread)
-            context = json.loads(tx.get(row['context_id'], row['subject']))
-            if not isinstance(context, dict):raise KernelError('invocation_binding')
-            call = AgentCall(row['attempt'], item['id'], row['subject'], Role(row['role']), Purpose(row['purpose']),
-                row['thread'], row['lease'], Execution(job['run_id'], row['executor'], row['epoch']), context,
-                profile, row['deadline_seconds'], row['deadline_at'], row['mode'], row['requested_thread'],
-                item['ordinal'], thread['profile_revision'], reference)
-            if call.execution != Execution(request.run_id, request.owner, request.epoch):
-                raise KernelError('invocation_binding')
-            workers.append((call, dict(self._invocation(tx, call))))
-        return InspectionBindings(current, request, dict(hosts[0]), tuple(workers))
-
     def _invocation(self, tx: Transaction, call: AgentCall) -> sqlite3.Row:
         # Opaque IDs and a reused owner/epoch do not imply the Call's Run.
         # Exact late receipts retain their original Run binding.
@@ -4523,12 +4291,7 @@ class Kernel:
             return repair.base_current(row, world)
         return world.target is not None and row["base_sha"] == world.target.sha
 
-    @staticmethod
-    def _policy_values(policy: Policy) -> dict[str, Any]:
-        values = asdict(policy)
-        for role in Role:
-            del values[role.value + "_profile"]
-        return values
+    _policy_values = staticmethod(encode_policy)
 
     def _policy(self, run: sqlite3.Row) -> Policy:
         return self._decode_policy(run["policy"])

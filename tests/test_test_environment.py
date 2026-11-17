@@ -134,6 +134,7 @@ from pathlib import Path
 from agent_run.adapters.workspace import ManagedWorkspace
 from agent_run.model import Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
 from agent_run.core.kernel import Kernel
+from agent_run.runtime.task import create_managed_task
 from agent_run.adapters.git_objects import LocalGit
 repository = Path(sys.argv[1])
 run_id = "isolation-" + sys.argv[2]
@@ -147,7 +148,7 @@ from dataclasses import replace
 from agent_run.config.creation import freeze_creation
 from agent_run.config.defaults import UserDefaultsStore
 spec = freeze_creation(replace(spec, repository_root=str(managed.ensure_path(str(repository)))), UserDefaultsStore())
-Kernel.create_task(managed.state_root / "kernel.sqlite3", spec,
+create_managed_task(managed.state_root / "kernel.sqlite3", spec,
                    requirements=Requirements(ParentIssue(1, "Parent", "Isolated requirement"), ()))
 print(json.dumps({"run_id": run_id}))
 \"\"\"

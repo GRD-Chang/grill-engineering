@@ -1,5 +1,6 @@
 """A managed profile change belongs to the exact published Task."""
 
+from agent_run.runtime.task import idle_task, selected_kernel
 from support.repository_fixture import create_kernel
 from dataclasses import replace
 from pathlib import Path
@@ -31,10 +32,10 @@ def test_task_profile_revision_requires_exact_binding_and_only_changes_new_threa
         task = TaskKey(tmp_path / 'repository', 'example/project', source.parent.number)
         route = RepositoryRoute(tmp_path / 'idle' / 'kernel.sqlite3', task.workspace, task.repository)
         route.initialize()
-        route.idle(task)
+        idle_task(route, task)
         before = route.database.read_bytes()
         with pytest.raises(KernelError, match='missing_or_ambiguous_fact'):
-            route.kernel('unallocated-profile-run')
+            selected_kernel(route, 'unallocated-profile-run')
         assert route.database.read_bytes() == before
         assert route.task(task).current_run is None
         with route.metadata().transaction(write=False) as tx:

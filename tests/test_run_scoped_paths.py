@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from agent_run.cli.lifecycle import _runtime_directory
+from agent_run.runtime.host_control import _runtime_directory
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.model import Commit, Delivery, DeliveryKind, HostLaunch, ParentIssue, Requirements, RunSpec

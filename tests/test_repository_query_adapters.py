@@ -5,6 +5,7 @@ notification thread, login, model probe, service or protocol activation is run.
 All new nodes are supplied UNRUN by the author for independent execution.
 """
 
+from agent_run.runtime.task import create_task, selected_kernel
 from support.repository_fixture import create_kernel
 from contextlib import closing
 from pathlib import Path
@@ -13,14 +14,15 @@ import sqlite3
 
 import pytest
 
-from agent_run.cli import main as cli_main, profiles as profile_cli, selection
+from agent_run.cli import main as cli_main, profiles as profile_cli
+from agent_run.runtime import run_selection as selection
 from agent_run.config.defaults import UserDefaultsStore
 from agent_run.contracts.task import TaskKey
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
 from agent_run.queries.read_facts import QueryError
-from agent_run.queries.run import header, read
+from agent_run.queries.run import header, read, read_route
 from agent_run.storage import routing
 from agent_run.storage.preflight import UnsupportedState
 from agent_run.storage.routing import RepositoryRoute
@@ -45,7 +47,7 @@ def repository(tmp_path):
     route.initialize()
     for name, parent in (('A', 1), ('B', 2)):
         spec, source = proposal(route.repository_root, name, parent)
-        assert route.create(TaskKey(route.repository_root, route.repository, parent), spec, source).created
+        assert create_task(route, TaskKey(route.repository_root, route.repository, parent), spec, source).created
     return route
 
 
@@ -68,7 +70,7 @@ def test_existing_reader_projects_exact_selected_run_without_fallback_or_write(r
     info = header(repository.database, storage=storage)
     assert info['run_id'] == 'A' and info['parent'] == 1
     assert info['state_dir'] == str(repository.database.parent)
-    assert info['artifacts_dir'] == str(repository.kernel('A').run_paths().artifacts)
+    assert info['artifacts_dir'] == str(selected_kernel(repository, 'A').run_paths().artifacts)
     assert dump(repository.database) == before
     def no_conflicting_read(*args, **kwargs):
         raise AssertionError('Conflicting selector entered a database transaction')
@@ -113,7 +115,7 @@ def test_default_registry_adapter_needs_no_json_publication_or_checkout_to_find_
     route = RepositoryRoute.for_workspace(workspace)
     route.initialize()
     spec, source = proposal(route.repository_root, 'managed-A')
-    route.create(TaskKey(route.repository_root, route.repository, 1), spec, source)
+    create_task(route, TaskKey(route.repository_root, route.repository, 1), spec, source)
     monkeypatch.setattr(selection, '_cwd_repository', lambda: None)
     request = parsed(['runs', '--repo', 'example/project'])
     routes = selection.managed_repository_routes(request)
@@ -148,12 +150,12 @@ def test_run_settings_ignore_later_personal_defaults_and_selected_profile_change
     monkeypatch.setattr(UserDefaultsStore, 'load', no_defaults)
     frozen = cli_main._repository_query(settings, (repository,), 'en').data
     assert frozen == original and frozen['source'] == 'run_snapshot'
-    before_b = repository.read('B', 'settings').data
-    assert repository.kernel('A').configure_task_profiles('new-profile', overrides={'development_model': 'selected-new-model'}) == 2
+    before_b = read_route(repository, 'B', 'settings').data
+    assert selected_kernel(repository, 'A').configure_task_profiles('new-profile', overrides={'development_model': 'selected-new-model'}) == 2
     changed = cli_main._repository_query(settings, (repository,), 'en').data
     assert changed['profile']['profile_revision'] == 2
     assert changed['profile']['profiles']['development']['model'] == 'selected-new-model'
-    assert repository.read('B', 'settings').data == before_b
+    assert read_route(repository, 'B', 'settings').data == before_b
     with repository.at_run('A').transaction(write=False) as tx:
         assert tx.one('SELECT count(*) FROM invocations')[0] == 0
         assert tx.one('SELECT count(*) FROM hosts')[0] == 0

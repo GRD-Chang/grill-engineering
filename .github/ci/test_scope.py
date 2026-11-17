@@ -66,7 +66,7 @@ TEST_GROUPS = {
     'fixed-repair-regression': FIXED_REPAIR_REGRESSION_TESTS,
     'native-contract': NATIVE_CONTRACT_TESTS,
     "policy": ("tests/test_delivery_policy.py", "tests/test_kernel_policy_values.py", "tests/test_budget_policy.py"),
-    "state": ("tests/test_kernel_state_preflight.py", "tests/test_kernel_task_admission.py",
+    "state": ("tests/test_run_architecture.py", "tests/test_kernel_state_preflight.py", "tests/test_kernel_task_admission.py",
               "tests/test_error_safety.py"),
     "prompts": (*PROMPT_CONTRACT_TESTS, "tests/test_kernel_prompt_facts.py"),
     "locator": (

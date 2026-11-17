@@ -12,6 +12,12 @@
 `tasks` 保存准确Task身份和可空的 `current_run`；`task_runs` 绑定历史Run。
 独立idle Task不产生空壳Run、Invocation、预算或执行权。完整冻结Run及必要关系/材料
 与Task绑定在同一短事务中提交；COMMIT未知仅对账原proposal，不重新创建或套用新默认值。
+创建与打开从 [`runtime.task`](../../src/agent_run/runtime/task.py) 进入：应用层选择
+Workspace，`core.task_creation` 使用明确的 Storage 与冻结输入完成绑定，
+`core.run_creation` 与 `core.source_snapshot` 保存创建及需求事实。
+`RepositoryRoute` 只定位、核验和分页发现；查询文档由 `queries.run.read_route` 组合。
+创建失败后的自动读回继续使用原 proposal、实际选中 Run 和原绝对 deadline；
+显式对账可读取已经被后继替换的原 Run，缺失原请求证据仍拒绝，不分配新 ID。
 
 [`storage.preflight`](../../src/agent_run/storage/preflight.py) 只读检查原数据库。
 旧JSON/v6、native v17–v22、早期仓库实验marker、封印和导入状态均拒绝，

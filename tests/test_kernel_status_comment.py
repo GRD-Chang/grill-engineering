@@ -540,7 +540,7 @@ def test_attach_updates_same_status_only_after_original_domain_and_usage_release
     import subprocess
     import sys
     import agent_run.notifications.sender as notifications
-    from agent_run.cli.lifecycle import attach
+    from agent_run.runtime.host_control import attach
     from agent_run.model import HostObservation
     from agent_run.runtime.handoff import prepare_handoff
     from agent_run.runtime.package_lease import runner_usage_lease

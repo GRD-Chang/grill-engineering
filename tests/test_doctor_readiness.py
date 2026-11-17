@@ -236,7 +236,7 @@ def test_doctor_preserves_current_settings_profile_and_task(
     from support.repository_fixture import read_binding
     from support.cli_fixtures import _published_profile_task
 
-    # The existing native fixture uses freeze_creation and Kernel.create_task,
+    # The existing native fixture uses freeze_creation and create_managed_task,
     # never the retired Controller/AgentProfileStore seeder.
     kernel = _published_profile_task(git_repo)
     monkeypatch.setenv("DOCTOR_FIXTURE_PAT", "synthetic-doctor-token")
