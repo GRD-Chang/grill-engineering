@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import re
 import subprocess
 
+from agent_run.adapters.github_network import NETWORK_OVERLAP_BYTES, has_network_failure
 from agent_run.runtime.process_io import TailOutput
 from agent_run.runtime.command import capture_command
 
@@ -92,12 +93,11 @@ class _ErrorEvidence(TailOutput):
     def feed(self, chunk: bytes) -> None:
         # The rolling overlap recognizes fixed tokens across pipe chunks only.
         window = self._tail + chunk
-        self.network_failure |= re.search(
-            rb"dial tcp|no such host|network is unreachable|connection (?:refused|reset)|i/o timeout|TLS handshake timeout",
-            window, re.IGNORECASE,
-        ) is not None
+        self.network_failure |= has_network_failure(window)
         self.rate_limited |= re.search(rb"secondary rate limit|rate limit exceeded", window, re.IGNORECASE) is not None
-        self._tail = window[-64:]
+        # Preserve the existing rate-limit overlap and grow only when a new
+        # network marker needs more bytes to survive a chunk boundary.
+        self._tail = window[-max(64, NETWORK_OVERLAP_BYTES):]
 
 
 def capture_auth_probe(process: subprocess.Popen[bytes], *, timeout: float) -> AuthProbeCapture:

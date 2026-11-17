@@ -131,10 +131,12 @@ def test_command_timeout_keeps_its_retry_budget_and_priority_over_malformed_outp
     monkeypatch.setattr(commands, 'capture_command', expired)
     set_read_retry_sleep(monkeypatch, lambda _: None)
     result = commands.run_read_command([sys.executable, '-I', '-c',
-        "import sys;sys.stdout.buffer.write(b'{\"text\":\"\\xff\"}')"], complete_stdout=True)
+        "import sys;sys.stdout.buffer.write(b'{\"text\":\"\\xff\"}');"
+        "sys.stderr.write('HTTP 403 connection reset')"], complete_stdout=True)
     assert calls == [0, 0, 0] and result.returncode == 1
     assert commands.read_response_error(result).code == 'github_read_failed'
     assert 'category=timeout' in str(commands.read_response_error(result))
+    assert 'category=timeout' in str(commands.read_response_error(result, invalid_json=True))
 
 
 def test_cancellation_keeps_priority_over_incomplete_output():
@@ -170,6 +172,8 @@ def test_command_diagnostic_exposes_only_bounded_safe_facts(stderr, category, st
     ([403, 403, 0], 0, 3),
     ([503, 503, 0], 0, 3),
     ([503, 503, 503], 1, 3),
+    ([-1, -1, -1], 1, 3),  # Network errors retain the same read/write policy.
+    ([-1, 0], 0, 2),
 ])
 def test_read_retry_sequence_remains_separate_from_single_write(monkeypatch, statuses, returncode, attempts):
     import subprocess
@@ -178,7 +182,8 @@ def test_read_retry_sequence_remains_separate_from_single_write(monkeypatch, sta
     def command(arguments, **options):
         status = statuses[len(reads)]
         reads.append(status)
-        return subprocess.CompletedProcess(arguments, int(status != 0), '{}', f'HTTP {status}' if status else '')
+        stderr = 'connection reset' if status == -1 else f'HTTP {status}' if status else ''
+        return subprocess.CompletedProcess(arguments, int(status != 0), '{}', stderr)
 
     monkeypatch.setattr(commands, '_run_bounded_command', command)
     set_read_retry_sleep(monkeypatch, lambda _: None)

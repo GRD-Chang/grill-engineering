@@ -10,6 +10,7 @@ from typing import Any
 from pathlib import Path
 
 from agent_run.adapters.auth.runner_transport import runner_options
+from agent_run.adapters.github_network import has_network_failure
 from agent_run.runtime.command import capture_command
 from agent_run.runtime.process_io import CompleteOutput, CompleteOutputOverflow
 from agent_run.errors import GitHubReadError, redact_transport_output
@@ -40,10 +41,7 @@ def read_response_error(response: subprocess.CompletedProcess[str], *, invalid_j
     # Generic commands consume bounded, already redacted diagnostic text. The
     # authentication probe separately interprets streamed authorization headers.
     diagnostic = response.stderr[-MAX_COMMAND_OUTPUT_BYTES:]
-    network_failure = re.search(
-        r"dial tcp|no such host|network is unreachable|connection (?:refused|reset)|i/o timeout|TLS handshake timeout",
-        diagnostic, re.IGNORECASE,
-    ) is not None
+    network_failure = has_network_failure(diagnostic)
     timed_out = isinstance(response, _TimedOutRead)
     category = ("timeout" if timed_out else "invalid_json" if invalid_json else
                 "network" if network_failure else "command_failed")
