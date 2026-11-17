@@ -7,7 +7,7 @@ def validate_run_repair_document_contract(context: str, operator_guide: str) -> 
     """保留修复 PR 准入、原 Parent 额度与准确候选提升合同。"""
     for document, text, required, forbidden in (
         (
-            "CONTEXT.md", context,
+            "GLOSSARY.md", context,
             (
                 "程序发布以 Run Branch 为 base 的 Run Repair PR",
                 "读取该目标分支的实际 Required Checks",
