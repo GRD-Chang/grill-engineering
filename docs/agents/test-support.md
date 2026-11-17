@@ -140,6 +140,13 @@ Parent push 前与单 Ticket 图的 Final approval 前状态由 `offline_prefixe
 仅复用故障前的历史，被测段仍使用原生存储。图依赖用例负责 Completion→后继 Ticket→
 Final PR 的连接；不确定 Final merge 的恢复用例负责准确合并、关闭与完整资源回收。
 
+Parent 修复的边界变体由 `repair_prefixes` 复用首次 Final Review 前、或修复分支已
+推送但修复 PR 尚未创建的正常历史。模板按 worker 静止准备，每例在同一绝对路径
+复制独立的 Git/SQLite，重建 Kernel 后使用领域事务入口；显式重开继续走原生存储。
+第二种前置只用于默认 Policy、默认开发输入，且断言未消费任何 Checks，副本再指定
+后续外部 Checks。主修复旅程、自定义开发内容和特殊预算仍从各自必要前置验证；
+所有 PR 写入、Checks、故障注入、写前授权、失回复与恢复均在每例独立执行。
+
 公开 Human Resume 与 Abandon 共用 `test_public_parent_integration_human_resume` 的
 真实 Host 旅程：先验证 Final 冲突修复、原 Attempt、线程和预算，再放弃未批准 PR，
 验证 Ticket 回开、恢复/退役回执、写入顺序和真实退出。`managed_abandon_recovery`

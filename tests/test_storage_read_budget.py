@@ -5,7 +5,7 @@ import sqlite3
 import pytest
 
 from agent_run.errors import KernelError
-from agent_run.storage.sqlite import Transaction
+from agent_run.storage.sqlite import QUERY_LIMIT, Transaction
 
 
 @pytest.mark.parametrize('encoding', ['UTF-8', 'UTF-16le', 'UTF-16be'])
@@ -61,6 +61,16 @@ def test_row_rejection_precedes_python_body_conversion():
         with pytest.raises(KernelError, match='query_limit'):
             tx.rows('SELECT body FROM facts ORDER BY rowid', limit=1)
         assert (tx.rows_read, tx.bytes_read) == (0, 0)
+
+
+@pytest.mark.parametrize('counter,value', [('rows_read', 65537), ('bytes_read', QUERY_LIMIT + 1)])
+def test_empty_read_does_not_bypass_an_exhausted_transaction_budget(counter, value):
+    with closing(sqlite3.connect(':memory:')) as connection:
+        tx = Transaction(connection)
+        setattr(tx, counter, value)
+        with pytest.raises(KernelError, match='query_limit'):
+            tx.rows('SELECT 1 WHERE 0')
+        assert getattr(tx, counter) == value
 
 
 @pytest.mark.parametrize('byte_limit', [0, 1])

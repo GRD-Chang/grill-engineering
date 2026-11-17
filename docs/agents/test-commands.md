@@ -44,6 +44,8 @@ CLI、安装器等未单列的模块直接选择其测试文件。公共接口�
 六 worker 用于重叠 Git、文件和子进程等待，同时会增加 CPU 与内存占用。资源较少或主机繁忙时用 `make test-full TEST_WORKERS=2`。
 CI 使用一个完整产品测试作业，总计两个 worker；环境安装、CI 规则、安装冒烟和类型检查串行复用同一环境。正常流程不分片、不预跑再排除边界用例。
 本地默认等价命令为 `python -m pytest -q -n 6 --dist worksteal`；直接运行 `pytest` 仍收集完整套件，没有隐含的慢测试过滤。
+`conftest` 将安装冒烟和已知的长物理旅程提前，以免完整套件最后只剩无法分担的在途用例。
+这只是稳定排序，不改变 collection、断言、worker 上限或 worksteal 的正式证据合同。
 `make test-full` 未收到显式 `TMPDIR` 时，在标准且可写的 `/run/user/<uid>` tmpfs 中放置测试临时文件；其他环境沿用 `/tmp`。
 该路径对受控 Worker 子进程可见，避免 `/dev/shm` 在 bubblewrap 的 `/dev` 挂载下不可见；需要对照磁盘临时目录时可显式设置 `TMPDIR=/tmp`。
 GitHub App HTTP 状态回归中的合成私钥也复用 `TMPDIR`；未设置时使用 Python 正常系统临时目录。

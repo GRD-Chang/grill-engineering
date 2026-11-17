@@ -84,6 +84,13 @@ class Transaction:
     def rows(self, sql: str, parameters: Sequence[Any] = (), *, limit: int = 128) -> list[sqlite3.Row]:
         if not 1 <= limit <= 128:
             raise KernelError("query_limit")
+        # Pending-work probes commonly find nothing. Establish that in SQLite
+        # before preparing the per-column size projection for a wide record.
+        # This reads no selected body into Python and caches no facts; callers
+        # still receive the current transaction's rows and original byte charge.
+        if self.execute(f"SELECT 1 FROM ({sql}) LIMIT 1", parameters).fetchone() is None:
+            self._check_read_budget(0, 0)
+            return []
         description = self.execute(f"SELECT * FROM ({sql}) LIMIT 0", parameters).description
         if description is None:
             raise KernelError("query_shape")
