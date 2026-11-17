@@ -81,6 +81,11 @@ Runner Snapshot，以原版本恢复；安装新 Runner 不意味着能够继续
 结果消费和适用预算变化由 Core 在同一业务事务收口，重复返回不能再次执行或记账。
 原始返回尚未落盘的中断仍属于未知结果，不能假定成功。
 
+Worker 启动绑定或退出证明不确定时，`start_evidence` 保留原边界、身份及原异常和
+直接 cause 的有界分类（类型、Kernel code、OS errno 或 SQLite errorcode），不保存
+异常正文或命令参数。若退出证明失败替换了先前异常，`initial` 另外保留先前分类；
+这些诊断字段不释放未知租约，也不授予重启或结果消费权限。
+
 `RunTransaction.put/get` 按准确Run、拥有者、用途、SHA-256和实际字节数保存及核验材料。
 裸 `Transaction` 只用于显式仓库元数据，不隐含Run选择；各Run view共享原owner的累计读预算和poison。
 材料不借用其他对象的证据，不以截断正文、删除历史或重置预算处理缺损和超限。

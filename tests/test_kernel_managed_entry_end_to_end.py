@@ -1874,6 +1874,8 @@ else:
             receipt = json.loads(resumed.stdout)
             assert receipt['run_id'] == spec.run_id and receipt['host'] == 'exited'
             assert receipt['action_id'] != action and receipt['action'] == 'resume'
+            observations['first_public_resume'] = receipt
+            observations['resume_stderr'] = {'characters': len(resumed.stderr), 'tail': resumed.stderr[-8192:]}
             fresh_read = subprocess.run([sys.executable, '-m', 'agent_run', 'history', spec.run_id,
                 '--repo', 'example/project', '--json'], cwd=git_repo, env=environment,
                 text=True, capture_output=True, timeout=min(20, remaining()))
@@ -1893,7 +1895,14 @@ else:
                            for item in retained['invocations'])
                 output, = current['outputs']
                 assert output['raw_id'] is None and output['raw_return'] is None and output['exit_code'] is None
-                assert retained['status'] == 'consumed' and retained['result']['result_kind'] == 'development'
+                if not (retained['status'] == 'consumed' and retained['result']['result_kind'] == 'development'):
+                    failure = {'subject': subject, 'status': retained['status'],
+                               'resume_stderr': observations['resume_stderr']}
+                    try:
+                        failure['gates'] = kernel.status(subject)['gates']
+                    except Exception as unavailable:
+                        failure['gates_unavailable'] = type(unavailable).__name__
+                    raise AssertionError(failure)
             for subject in before:
                 publication, = [row for row in attempts if row['subject'] == subject and row['role'] == 'publication']
                 assert publication['outcome'] == 'human_blocker'
