@@ -67,6 +67,34 @@ def retain_lease_for_systemd_exit(lease: RunnerLease, notify_socket: str) -> Non
             os.close(write_fd)
 
 
+def release_systemd_exit_lease(notify_socket: str) -> None:
+    """Remove only this unit's named lease and wait for the manager's barrier.
+
+    ExecStopPost keeps its own shared lease until it exits. A retained witness
+    may therefore prove release only after the exact hook process has exited.
+    """
+    address = "\0" + notify_socket[1:] if notify_socket.startswith("@") else notify_socket
+    read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as channel:
+            channel.settimeout(5)
+            channel.connect(address)
+            channel.sendall(b"FDSTOREREMOVE=1\nFDNAME=runner-exit-lease")
+            channel.sendmsg([b"BARRIER=1"],
+                            [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [write_fd]))])
+        os.close(write_fd)
+        write_fd = -1
+        ready, _, _ = select.select([read_fd], [], [], 5)
+        if not ready or os.read(read_fd, 1) != b"":
+            raise RunnerLeaseError("systemd 未确认退出租约释放")
+    except OSError as error:
+        raise RunnerLeaseError("无法释放 systemd 退出租约") from error
+    finally:
+        os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
+
+
 def default_runner_lock_path(environment: dict[str, str] | None = None) -> Path:
     return app_data_root(environment) / "install.lock"
 

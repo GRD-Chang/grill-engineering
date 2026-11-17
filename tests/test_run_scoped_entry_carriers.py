@@ -278,7 +278,7 @@ def test_exit_hook_builder_carries_exact_selection_without_claiming_a_real_host(
     monkeypatch.setattr(host_exit.Kernel, '_from_storage', staticmethod(kernel))
     properties = host_exit.exit_properties(repository.database, 'action', request, tmp_path / 'runner.lock', {}, storage=selected)
     assert '"--run-id=A"' in properties[0]
-    assert properties[1] == 'TimeoutStopSec=5s'
+    assert properties[1] == 'TimeoutStopSec=96s'
     assert selected.run_id == 'A'
     foreign = replace(request, run_id='B')
     with pytest.raises(ValueError, match='binding changed'):

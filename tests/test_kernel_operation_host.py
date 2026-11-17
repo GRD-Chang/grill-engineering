@@ -29,6 +29,8 @@ def test_busy_host_uses_supervision_without_requesting_an_unused_work_choice(tmp
     entered, released, supervised = threading.Event(), threading.Event(), []
 
     class Runner:
+        def prepare_exit(self):
+            return True
         def activate_observation(self):
             pass
         def state(self):
@@ -78,6 +80,8 @@ def test_host_dispatches_call_then_polls_independent_io_and_requires_durable_exi
     class Runner:
         def __init__(self):
             self.binding = binding
+        def prepare_exit(self):
+            return True
         def activate_observation(self):
             assert lifecycle == [], "Host must activate exactly once before its first state read"
             lifecycle.append("activate")

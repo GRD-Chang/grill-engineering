@@ -37,6 +37,7 @@ from support.systemd_manager import SidecarStatTrace, _resumed_ticket_completion
 from support.systemd_manager import _measure_host_calls
 from support.systemd_manager import _commit_resume_timeline_note
 from support.host_cost_trace import note_costs, report_costs
+from support.pending_control import committed_control, pending_public_control
 
 
 FINDING = "Remove obsolete-extra.txt from the final diff; keep the requested implementation."
@@ -1366,13 +1367,26 @@ def test_public_requeue_and_revise_deliver_fresh_generations_in_the_original_man
                 timing["final_requeue_to_approval_seconds"] = time.monotonic() - final_controlled_at
                 assert _git(tmp_path / "origin.git", "rev-parse", final_delivery.source_ref) == original_run_head
                 approve_started = time.monotonic()
-                code, approved = public("approve", accepted["run_id"])
-                assert code == 0 and approved["status"] == "action_pending" and approved["host"] == "running", approved
-                assert kernel.host_request(accepted["action_id"]) == request
-                with kernel.storage.transaction(write=False) as tx:
-                    grant = tx.one("SELECT action,pr_number,head_sha FROM grants WHERE subject=?", (final,))
-                    assert grant["action"] == approved["action_id"] and grant["pr_number"] == final_before["pr_number"]
-                release.set()
+                with pending_public_control("approve", accepted["run_id"], cwd=git_repo, environment=environment,
+                                            timeout=min(20, remaining())) as (control, control_remaining):
+                    # Approve 现等待真实交付；先检查被屏障暂停的原 Host 的授权，
+                    # 再释放执行，最后检查原 CLI 的交付回执。
+                    action = committed_control(kernel, control, "approve", timeout=control_remaining())
+                    assert action["status"] == "pending"
+                    assert serving.is_alive() and children[0].poll() is None
+                    assert kernel.host_request(accepted["action_id"]) == request
+                    with kernel.storage.transaction(write=False) as tx:
+                        grant = tx.one("SELECT action,pr_number,head_sha FROM grants WHERE subject=?", (final,))
+                        assert grant["action"] == action["id"] and grant["pr_number"] == final_before["pr_number"]
+                        assert grant["head_sha"] == original_run_head
+                    release.set()
+                    stdout, stderr = control.communicate(timeout=control_remaining())
+                    assert control.returncode == 0, (stdout, stderr)
+                    approved = json.loads(stdout)
+                    assert approved["result"] == "accepted" and approved["requested_action"] == "approve"
+                    assert approved["action_id"] == action["id"] and approved["status"] == "action_complete", approved
+                    assert approved["requested_action_applied"] and approved["requested_action_succeeded"]
+                    assert approved["request_outcome"] == "delivered" and approved["delivery_completed"]
                 serving.join(timeout=remaining())
                 assert not serving.is_alive() and not errors, errors
                 assert children[0].returncode == 0 and len(commands) == 1, output

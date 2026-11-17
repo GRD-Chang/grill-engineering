@@ -783,6 +783,34 @@ class Kernel:
     def operation_state(self, observation: _ObservationPass | None = None) -> OperationState:
         return self._operation_state(observation)
 
+    def prepare_executor_exit(self, execution: Execution, observation: _ObservationPass | None = None) -> bool:
+        """Recheck quiescence and close control admission in the same commit.
+
+        A control accepted since the Host's last state read gets another loop.
+        A later control cannot attach to an Executor already committed to exit.
+        Physical exit and usage release still require their original witnesses.
+        """
+        with self.storage.transaction(write=False) as tx:
+            run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?', ()))
+            task = self._task(run)
+        with self._task_admission(task):
+            with self.storage.transaction(ordered=False) as tx:
+                run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?', ()))
+                self._host_run(tx, execution.run_id)
+                if (run['executor'], run['epoch']) != (execution.owner, execution.epoch):
+                    return True  # Stop/Abandon already fenced this execution.
+                self._require_current_task(tx, task, execution.run_id)
+                state = self._operation_state_in(tx, observation)
+                if state.disposition not in {'quiescent', 'complete'}:
+                    return False
+                hosts = tx.rows('SELECT nonce,subject FROM hosts WHERE run_id=? AND owner=? AND epoch=?',
+                                (execution.run_id, execution.owner, execution.epoch))
+                if hosts:
+                    tx.execute("INSERT OR IGNORE INTO retired_executors VALUES (?,?,?,'pending')",
+                               (execution.run_id, execution.owner, execution.epoch))
+                    self._delivery_state().event(tx, hosts[0]['subject'], 'host_exit_prepared', hosts[0]['nonce'])
+                return True
+
     def operation_supervision(self) -> OperationSupervision:
         """Observe every current subject without choosing unused future work."""
         with self.storage.transaction(write=False) as tx:
@@ -870,7 +898,27 @@ class Kernel:
         with self.storage.transaction() as tx:
             self._check_operation(tx, work.token if fence is None else fence, work.execution)
             result = (self._advance_cleanup(tx, work, world) if work.cleanup else self._advance(tx, work, world))
+            if not isinstance(result, Step) or result.kind not in {'paused', 'quiescent', 'complete'}:
+                self._confirm_resume_execution(tx, work)
         return self._complete_work(work, result)
+
+    def _confirm_resume_execution(self, tx: Transaction, work: Work) -> None:
+        """Bind a real post-application operation to its latest control intent."""
+        controls = tx.rows(*run_statement(tx,
+            "SELECT a.id,a.kind,a.receipt_id FROM actions a JOIN history h ON h.run_id=a.run_id "
+            "AND h.identity=a.id AND h.kind='control_applied' AND h.material_id=a.receipt_id "
+            "WHERE a.run_id=? AND (a.subject IS NULL OR a.subject=?) ORDER BY h.position DESC LIMIT 1", (work.subject,)))
+        if not controls or controls[0]['kind'] != 'resume':
+            return
+        action = controls[0]
+        if action['receipt_id'] is None or tx.rows(*run_statement(tx,
+                "SELECT position FROM history WHERE run_id=? AND kind='resume_execution' AND identity=? LIMIT 1", (action['id'],))):
+            return
+        assert work.subject is not None
+        proof = tx.put(work.subject, 'resume_execution', wire_json({
+            'action': action['id'], 'receipt': action['receipt_id'], 'execution': asdict(work.execution),
+        }))
+        self._delivery_state().event(tx, work.subject, 'resume_execution', action['id'], proof)
 
     def _effect_work(self, tx: Transaction, work: Work, row: sqlite3.Row) -> PrepareIO | EffectIO:
         effect = self._effect(tx, row, work.execution)
@@ -3274,6 +3322,8 @@ class Kernel:
         run, job = self._owned(tx, subject, execution)
         waiting = self._cleanup_wait(tx, run, job)
         if waiting is not None:
+            if waiting.kind == 'paused' and run['final_action']:
+                self._finish_final_failure(tx, run)
             return waiting
         records = tx.rows(*run_statement(tx, 'SELECT * FROM resource_cleanup WHERE subject=? AND generation=? AND run_id=?',
                       (subject, job["generation"]), run_last=True))
@@ -3295,6 +3345,8 @@ class Kernel:
                 tx.execute(*run_statement(tx, 'UPDATE resource_cleanup SET stage=?,state=?,effect_id=NULL,outcome=NULL WHERE subject=? AND generation=? AND run_id=?',
                     (stage, "complete" if stage == len(self.CLEANUP) else "pending", subject, job["generation"]), run_last=True))
                 self._delivery_state().event(tx, subject, "resource_retired", pending["operation"], pending["receipt_id"])
+                if stage == len(self.CLEANUP):
+                    self._finish_final_success(tx, run, subject)
                 return Step("progress", subject)
             if pending["status"] == "cancelled":
                 tx.execute(*run_statement(tx, 'UPDATE resource_cleanup SET effect_id=NULL WHERE subject=? AND generation=? AND run_id=?',
@@ -3767,6 +3819,72 @@ class Kernel:
                 result.append(gate)
         return result
 
+    def reconcile_final_host_exit(self) -> str | None:
+        """Close an interrupted final Action before an explicit Resume.
+
+        The retained grant and effect intents remain authoritative. Physical
+        retirement only proves that the old operation can no longer finish;
+        its successor still reads back any uncertain external writes.
+        """
+        with self.storage.transaction(write=False) as tx:
+            run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?', ()))
+            run_id, task = run["id"], self._task(run)
+        with self._task_admission(task, wait=False):
+            with self.storage.transaction(ordered=False) as tx:
+                self._require_current_task(tx, task, run_id)
+                run = tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?', ()))
+                if run["final_action"] is None:
+                    return None
+                if (run["executor"] is not None or self._agent_seats(tx)
+                        or tx.rows(*run_statement(tx, "SELECT owner FROM hosts WHERE run_id=? AND (status!='exited' OR usage_released=0) LIMIT 1", ()))
+                        or tx.rows(*run_statement(tx, "SELECT owner FROM retired_executors WHERE run_id=? AND status!='exited' LIMIT 1", ()))):
+                    raise KernelError("executor_exit_unproven")
+                hosts = tx.rows(*run_statement(tx, 'SELECT nonce,observation_id FROM hosts WHERE run_id=? ORDER BY epoch DESC LIMIT 1', ()))
+                if not hosts or hosts[0]["observation_id"] is None:
+                    raise KernelError("executor_exit_unproven")
+                action = tx.one(*run_statement(tx, 'SELECT * FROM actions WHERE run_id=? AND id=?', (run["final_action"],)))
+                if action["kind"] not in {"approve", "resume"} or action["status"] != "pending" or action["subject"] is None:
+                    raise KernelError("final_action_binding")
+                job = self._job(tx, action["subject"])
+                if (job["kind"] == DeliveryKind.TICKET or job["grant_id"] is None
+                        or job["phase"] not in {"merge", "completion_comment", "close"}
+                        and not self._pending_final_cleanup(tx, subject=job['id'])):
+                    raise KernelError("final_action_binding")
+                evidence = tx.put(job["id"], "final_action_host_exit", wire_json({
+                    "action": action["id"], "host_nonce": hosts[0]["nonce"],
+                    "host_observation": hosts[0]["observation_id"], "grant": job["grant_id"],
+                }))
+                self._finish_final_failure(tx, run)
+                self._delivery_state().gate(tx, job["id"], "execution_failed", evidence=evidence)
+                self._delivery_state().event(tx, job["id"], "final_action_interrupted", action["id"], evidence)
+                return str(action["id"])
+
+    def completed_final_action(self, kind: str) -> dict[str, str] | None:
+        """Read a finished final operation, including required resource cleanup."""
+        if kind not in {"approve", "resume"}:
+            return None
+        with self.storage.transaction(write=False) as tx:
+            if (tx.rows(*run_statement(tx, "SELECT id FROM subjects WHERE run_id=? AND phase!='complete' LIMIT 1", ()))
+                    or tx.rows(*run_statement(tx, "SELECT subject FROM resource_cleanup WHERE run_id=? AND state!='complete' LIMIT 1", ()))
+                    or tx.rows(*run_statement(tx, "SELECT id FROM effects WHERE run_id=? AND status IN ('prepared','sent','observed') AND operation!='issue_link' LIMIT 1", ()))):
+                return None
+            jobs = tx.rows(*run_statement(tx, "SELECT id FROM subjects WHERE run_id=? AND kind!='ticket' AND phase='complete' AND grant_id IS NOT NULL", ()))
+            if len(jobs) != 1:
+                return None
+            actions = tx.rows(*run_statement(tx, "SELECT id,kind,subject,status FROM actions WHERE run_id=? AND subject=? AND kind IN ('approve','resume') AND (status='complete' OR (kind='resume' AND status='applied')) ORDER BY rowid DESC LIMIT 1", (jobs[0]["id"],)))
+            if not actions:
+                return None
+            action = actions[0]
+            return {"action_id": str(action["id"]), "action": str(action["kind"]), "subject": str(action["subject"]),
+                    "status": "action_" + str(action["status"])}
+
+    def _pending_final_cleanup(self, tx: Transaction, *, subject: str | None = None) -> list[sqlite3.Row]:
+        """Find retained authorized cleanup, including gaps between Effects."""
+        return tx.rows(*run_statement(tx, "SELECT s.id FROM subjects s JOIN resource_cleanup c "
+            "ON c.run_id=s.run_id AND c.subject=s.id AND c.generation=s.generation "
+            "WHERE s.run_id=? AND s.kind!='ticket' AND s.phase='complete' "
+            "AND s.grant_id IS NOT NULL AND c.state!='complete' AND (? IS NULL OR s.id=?)", (subject, subject)))
+
     def resume_subject(self, *, ticket: int | None = None) -> str | None:
         """Select a recorded Resume scope; control rechecks it under its write lock."""
         with self.storage.transaction(write=False) as tx:
@@ -3775,9 +3893,12 @@ class Kernel:
             if ticket is not None:
                 targets = tx.rows(*run_statement(tx, "SELECT id FROM subjects WHERE kind='ticket' AND issue=? AND run_id=?",
                               (ticket,), run_last=True))
-            elif run["stopped"] or self._host_resume_gates(tx, run):
-                return None
             else:
+                cleanup = self._pending_final_cleanup(tx)
+                if len(cleanup) == 1 and not run["stopped"]:
+                    return str(cleanup[0]["id"])
+                if run["stopped"] or self._host_resume_gates(tx, run):
+                    return None
                 targets = tx.rows(*run_statement(tx, 'SELECT DISTINCT s.id FROM subjects s JOIN gates g ON g.run_id=s.run_id AND g.subject=s.id WHERE s.run_id=? ORDER BY s.id',
                               (), run_last=True))
             if len(targets) != 1:
@@ -3907,7 +4028,7 @@ class Kernel:
         elif kind == "stop":
             if job is None:
                 if not run["stopped"] and run["executor"] is not None:
-                    tx.execute("INSERT INTO retired_executors VALUES (?,?,?,'pending')",
+                    tx.execute("INSERT OR IGNORE INTO retired_executors VALUES (?,?,?,'pending')",
                                (run["id"], run["executor"], run["epoch"]))
                     tx.execute("UPDATE runs SET stopped=1,epoch=epoch+1 WHERE id=?", (run["id"],))
                 else:
@@ -3954,8 +4075,22 @@ class Kernel:
                 if self._agent_seats(tx, subject):
                     raise KernelError("worker_exit_unproven")
                 gates = self._gates(tx, subject)
-                if not gates:
+                cleanup_resume = not gates and bool(self._pending_final_cleanup(tx, subject=subject))
+                if not gates and not cleanup_resume:
                     raise KernelError("no_resumable_boundary")
+                if cleanup_resume:
+                    if run["stopped"] or run["blocked"]:
+                        raise KernelError("no_resumable_boundary")
+                    if (run["executor"] is not None
+                            or self._agent_seats(tx)
+                            or tx.rows(*run_statement(tx, "SELECT owner FROM hosts WHERE run_id=? AND (status!='exited' OR usage_released=0) LIMIT 1", ()))
+                            or tx.rows(*run_statement(tx, "SELECT owner FROM retired_executors WHERE run_id=? AND status!='exited' LIMIT 1", ()))):
+                        raise KernelError("executor_exit_unproven")
+                if self._pending_final_cleanup(tx, subject=subject):
+                    # Explicit recovery reopens observation of the same intent;
+                    # an unknown sent Effect still reads back before any write.
+                    tx.execute(*run_statement(tx, 'UPDATE resource_cleanup SET outcome=NULL WHERE run_id=? AND subject=? AND generation=?',
+                                             (subject, job['generation'])))
                 if message is not None:
                     response = tx.put(subject, "human_response", message.encode())
                     self._delivery_state().event(tx, subject, "human_response", action_id, response)
@@ -4007,7 +4142,8 @@ class Kernel:
                     self._ready(tx, subject, "work_queue")
                 tx.execute(*run_statement(tx, "DELETE FROM waits WHERE subject=? AND kind!='agent_preparation' AND run_id=?",
                     (subject,), run_last=True))
-                if job["grant_id"] and job["phase"] in {"merge", "completion_comment", "close"}:
+                if job["grant_id"] and (job["phase"] in {"merge", "completion_comment", "close"}
+                                        or self._pending_final_cleanup(tx, subject=subject)):
                     tx.execute("UPDATE runs SET final_action=? WHERE id=?", (action_id, run["id"]))
                     tx.execute(*run_statement(tx, "UPDATE actions SET status='pending' WHERE id=? AND run_id=?",
                         (action_id,), run_last=True))
@@ -4211,7 +4347,11 @@ class Kernel:
             raise KernelError("executor_fenced")
         if (run["id"] != execution.run_id or run["executor"] != execution.owner or run["epoch"] != execution.epoch):
             raise KernelError("executor_fenced")
-        hosts = tx.rows("SELECT status,usage_ready FROM hosts WHERE run_id=? AND owner=? AND epoch=?", (execution.run_id, execution.owner, execution.epoch))
+        hosts = tx.rows("SELECT h.status,h.usage_ready,r.owner AS retired_owner FROM hosts h "
+                       "LEFT JOIN retired_executors r ON r.run_id=h.run_id AND r.owner=h.owner AND r.epoch=h.epoch "
+                       "WHERE h.run_id=? AND h.owner=? AND h.epoch=?", (execution.run_id, execution.owner, execution.epoch))
+        if hosts and hosts[0]['retired_owner'] is not None:
+            raise KernelError('executor_fenced')
         if hosts and (hosts[0]["status"] != "running" or not hosts[0]["usage_ready"]):
             raise KernelError("host_usage_unproven")
 
@@ -5470,6 +5610,15 @@ class Kernel:
     def _wait(self, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row | Mapping[str, Any], kind: str, seconds: float) -> Step:
         return self._supervised_wait(tx, run, job["id"], self._automatic_scope(tx, run, job["id"], False), kind, seconds)
 
+    def _finish_final_success(self, tx: Transaction, run: sqlite3.Row, subject: str) -> None:
+        """Finish the exact final Action only after its required cleanup."""
+        if run['final_action'] is None:
+            return
+        action = tx.one(*run_statement(tx, 'SELECT subject FROM actions WHERE run_id=? AND id=?', (run['final_action'],)))
+        if action['subject'] == subject:
+            tx.execute(*run_statement(tx, "UPDATE actions SET status='complete' WHERE run_id=? AND id=?", (run['final_action'],)))
+            tx.execute(*run_statement(tx, 'UPDATE runs SET final_action=NULL WHERE id=?', ()))
+
     def _finish_final_failure(self, tx: Transaction, run: sqlite3.Row, result: str = "failed") -> None:
         selected = transaction_scope(tx)
         if run['id'] != selected.run_id:
@@ -5824,6 +5973,7 @@ class Kernel:
                 tx.execute(*run_statement(tx, "UPDATE resource_cleanup SET outcome='third' WHERE effect_id=? AND run_id=?",
                     (effect.effect_id,), run_last=True))
                 self._delivery_state().event(tx, effect.subject, "cleanup_pending", effect.effect_id, evidence)
+                self._finish_final_failure(tx, tx.one(*run_statement(tx, 'SELECT * FROM runs WHERE id=?', ())))
                 return Step("paused", effect.subject, "cleanup_pending")
             original_target = row["status"] == "prepared" and row["attempts"] > 0 and result.disposition == "target"
             if row["status"] == "prepared" and not original_target:
@@ -6118,13 +6268,11 @@ class Kernel:
                     (subject, job["generation"], job["revision"], run["parent_revision"], run["graph_revision"], job["publication_sha"],
                             job["merge_sha"], job["publication_tree"], job["pr_number"], job["gate_mode"], job["review_attempt"],
                             self._last_attempt(tx, subject, Role.DEVELOPMENT), comment["id"], row["id"]), run_last=True))
-            tx.execute("UPDATE runs SET final_action=NULL WHERE id=?", (run["id"],))
-            if run["final_action"]:
-                tx.execute(*run_statement(tx, "UPDATE actions SET status='complete' WHERE id=? AND run_id=?",
-                    (run["final_action"],), run_last=True))
             if job["owned_root"] and job["common_git_dir"]:
                 tx.execute(*run_statement(tx, 'INSERT OR IGNORE INTO resource_cleanup(subject,generation,source_ref,source_sha,checkout,workspace_sha,owned_root,common_git_dir,run_id) VALUES (?,?,?,?,?,?,?,?,?)',
                     (subject, job["generation"], job["source_ref"], job["publication_sha"], job["checkout"], job["workspace_sha"], job["owned_root"], job["common_git_dir"]), run_last=True))
+            else:
+                self._finish_final_success(tx, run, subject)
         else:
             raise KernelError("unknown_effect", operation)
         tx.execute(*run_statement(tx, "UPDATE effects SET status='confirmed' WHERE id=? AND run_id=?",

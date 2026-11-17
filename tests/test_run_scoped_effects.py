@@ -441,7 +441,7 @@ def test_ticket_completion_rows_cleanup_and_final_action_are_scoped_to_original_
     from support.repository_scope import add_subject
     db, kernels = scenario
     subject = "ticket:2"
-    monkeypatch.setattr(core, "identity", iter(["comment", "close", "comment", "close"]).__next__)
+    monkeypatch.setattr(core, "identity", iter(["comment", "close", *core.Kernel.CLEANUP] * 2).__next__)
     for run in ("A", "B"):
         with kernels[run].storage.transaction() as tx:
             add_subject(db, run, subject)
@@ -458,6 +458,17 @@ def test_ticket_completion_rows_cleanup_and_final_action_are_scoped_to_original_
                 "completion_revision": "no-tickets", "context_id": context, "status": "consumed"})
             insert(db, "actions", {"run_id": run, "id": "same-final-action", "kind": "approve", "subject": subject, "status": "pending"})
             tx.execute("UPDATE runs SET final_action='same-final-action' WHERE id=?", (run,))
+            # Persist the original workspace ownership prerequisite used by
+            # local-ref cleanup, just as the prior development is seeded above.
+            with monkeypatch.context() as workspace_identity:
+                workspace_identity.setattr(core, "identity", lambda: "original-workspace")
+                work = replace(_work(run), subject=subject)
+                header, job = kernels[run]._owned(tx, subject, work.execution)
+                workspace = kernels[run]._prepare_effect(tx, header, job, work, WORLD, "workspace",
+                    before=BASE.sha, payload={"create_ref": True})
+                receipt = tx.put(subject, "effect_receipt", wire_json(asdict(EffectResult("target", commit=BASE))))
+                tx.execute("UPDATE effects SET status='confirmed',receipt_id=? WHERE run_id=? AND id=?",
+                    (receipt, run, workspace.effect.effect_id))
     for run in ("A", "B"):
         sibling = "B" if run == "A" else "A"
         before = _rows(db, sibling)
@@ -486,9 +497,26 @@ def test_ticket_completion_rows_cleanup_and_final_action_are_scoped_to_original_
         record = db.execute("SELECT * FROM completions WHERE run_id=?", (run,)).fetchone()
         assert (record['subject'], record['comment_effect'], record['close_effect'], record['development_attempt']) == (
             subject, 'comment', 'close', 'prior-development')
-        assert db.execute("SELECT status FROM actions WHERE run_id=?", (run,)).fetchone()[0] == 'complete'
+        assert db.execute("SELECT status FROM actions WHERE run_id=?", (run,)).fetchone()[0] == 'pending'
+        assert db.execute("SELECT final_action FROM runs WHERE id=?", (run,)).fetchone()[0] == 'same-final-action'
         assert db.execute("SELECT count(*) FROM resource_cleanup WHERE run_id=?", (run,)).fetchone()[0] == 1
         assert _rows(db, sibling) == before
+        cleanup_work = replace(work, cleanup=True, allow_agent=False)
+        for stage, operation in enumerate(kernel.CLEANUP):
+            with kernel.storage.transaction() as tx:
+                request = kernel._advance_cleanup(tx, cleanup_work, WORLD)
+            assert isinstance(request, EffectIO) and request.effect.operation == operation
+            assert kernel._dispatch(request.effect, work.execution, WORLD, token=request.token)
+            kernel._reconcile(request, EffectResult("target"))
+            with kernel.storage.transaction() as tx:
+                assert kernel._advance_cleanup(tx, cleanup_work, WORLD).kind == "progress"
+            finished = stage == len(kernel.CLEANUP) - 1
+            assert db.execute("SELECT status FROM actions WHERE run_id=?", (run,)).fetchone()[0] == (
+                'complete' if finished else 'pending')
+            assert db.execute("SELECT final_action FROM runs WHERE id=?", (run,)).fetchone()[0] == (
+                None if finished else 'same-final-action')
+            assert _rows(db, sibling) == before
+        assert db.execute("SELECT stage,state FROM resource_cleanup WHERE run_id=?", (run,)).fetchone()[:] == (3, 'complete')
     assert db.execute('PRAGMA foreign_key_check').fetchone() is None
 
 

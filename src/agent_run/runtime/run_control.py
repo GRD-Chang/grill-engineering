@@ -183,6 +183,14 @@ def execute(parsed: argparse.Namespace, *, language: str,
                 abandoned = tx.rows(*run_statement(tx, "SELECT id,status FROM actions WHERE run_id=? AND kind='abandon'", ()), limit=1) if parsed.command == "abandon" else []
                 abandonment = dict(abandoned[0]) if abandoned else None
                 unknown_host = parsed.command == "abandon" and hosts.has_unknown_host(tx)
+            if parsed.command in {"approve", "resume"} and getattr(parsed, "ticket", None) is None:
+                completed = kernel.completed_final_action(parsed.command)
+                if completed is not None:
+                    return {"result": "completed", "status": "action_complete", "run_id": run["id"],
+                            **completed, "host": "unknown", "language": run["language"],
+                            "requested_action": parsed.command, "requested_action_applied": False,
+                            "requested_action_succeeded": True, "request_outcome": "already_completed",
+                            "delivery_completed": True}
             if parsed.command == "stop":
                 subject = None
                 if parsed.ticket is not None:
@@ -261,6 +269,7 @@ def execute(parsed: argparse.Namespace, *, language: str,
                 kernel.refresh(lambda: read_requirements(reader, run["parent_issue"]))
                 source = kernel.source_status()
             if parsed.command == "resume":
+                kernel.reconcile_final_host_exit()
                 subject = kernel.resume_subject(ticket=parsed.ticket)
             else:
                 with kernel.storage.transaction(write=False) as tx:
@@ -323,7 +332,8 @@ def execute(parsed: argparse.Namespace, *, language: str,
                 with kernel.storage.transaction(write=False) as tx:
                     action_status = tx.one(*run_statement(tx, 'SELECT status FROM actions WHERE run_id=? AND id=?', (action_id,)))[0]
                 result = {"result": "accepted", "status": "action_" + action_status, "run_id": run["id"],
-                    "action_id": action_id, "action": parsed.command, "host": "running", "host_unit": request.unit_name, "host_backend": request.backend}
+                    "action_id": action_id, "action": parsed.command, "host_action_id": kernel.host_action(request),
+                    "host": "running", "host_unit": request.unit_name, "host_backend": request.backend}
             else:
                 request = hosts.admit(kernel, parsed.command, action_id=action_id,
                                 command=command(database, action_id, runner_lock, environment,

@@ -87,7 +87,7 @@ class SystemdHost:
                 "--property=RemainAfterExit=no",
                 *(("--property=TimeoutStopSec=5s",) if not exit_properties else ()),
                 "--property=FileDescriptorStoreMax=1", "--property=FileDescriptorStorePreserve=restart",
-                "--property=NotifyAccess=main",
+                "--property=NotifyAccess=exec",
                 f"--property=LoadCredential=agent-run-environment:{request.environment_carrier}",
                 *("--property=" + value for value in exit_properties),
                 "--", *request.command,
@@ -98,11 +98,9 @@ class SystemdHost:
             return HostObservation("unknown", request.unit_name, evidence="launch_not_confirmed")
         return self.observe(request)
 
-    def _fields(self, unit: str) -> dict[str, str]:
+    def _fields(self, unit: str, *, allow_missing: bool = False) -> dict[str, str]:
         result = self._run([self.systemctl, "--user", "show", unit, "--all", "--timestamp=unix",
                             "--property=" + ",".join(_PROPERTIES)])
-        if result.returncode != 0:
-            raise ValueError("Unit observation unavailable")
         fields: dict[str, str] = {}
         for line in result.stdout.decode("utf-8").splitlines():
             key, separator, value = line.partition("=")
@@ -111,6 +109,8 @@ class SystemdHost:
             fields[key] = value
         if not set(_PROPERTIES) <= fields.keys():
             raise ValueError("Incomplete unit observation")
+        if result.returncode != 0 and not (allow_missing and fields["LoadState"] == "not-found"):
+            raise ValueError("Unit observation unavailable")
         return fields
 
     def exit_identity(self, request: HostLaunch, invocation_id: str) -> bool:
@@ -198,3 +198,60 @@ class SystemdHost:
             return count
         except (OSError, ValueError, HostUnavailable):
             return None
+
+    def stop_post_observation(self, request: HostLaunch, original: HostObservation,
+                              invocation_id: str, *, lease_released: bool = False) -> HostObservation:
+        """Bind the manager's main exit to this exact, still-running stop hook.
+
+        This does not claim whole-Host exit: the hook itself still owns a lease.
+        Its final cgroup census and subsequent process exit complete the proof.
+        """
+        from dataclasses import replace
+        fields = self._fields(request.unit_name or "")
+        if (request.backend != "systemd" or not original.usage_ready or original.usage_released
+                or not original.main_pid or not original.start_token
+                or (fields["Id"], fields["Description"], fields["LoadState"], fields["InvocationID"],
+                    fields["ControlGroup"], fields["MainPID"], fields["ControlPID"],
+                    fields["ActiveState"], fields["SubState"])
+                != (request.unit_name, request.description, "loaded", invocation_id, original.cgroup,
+                    "0", str(os.getpid()), "deactivating", "stop-post")
+                or original.invocation_id != invocation_id
+                or original.boot_id != Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+                or lease_released and fields["NFileDescriptorStore"] != "0"):
+            raise HostUnavailable("The original Host stop hook is not established")
+        ended, code, status = fields["ExecMainExitTimestamp"], int(fields["ExecMainCode"]), int(fields["ExecMainStatus"])
+        if (not ended.startswith("@") or int(fields["ExecMainExitTimestampMonotonic"]) <= 0
+                or code not in {1, 2, 3} or status < 0):
+            raise HostUnavailable("The main process exit is unavailable")
+        ended_at = float(ended[1:])
+        if not math.isfinite(ended_at) or ended_at <= 0 or self._fields(request.unit_name or "") != fields:
+            raise HostUnavailable("The main process exit changed")
+        return replace(original, disposition="exited", exit_status=status if code == 1 else -status,
+                       ended_at=ended_at)
+
+    def retained_exit_matches(self, request: HostLaunch, original: HostObservation) -> bool:
+        """Fence a retained proof against a presently loaded foreign/restarted unit.
+
+        A missing unit is acceptable only to a caller that already holds the
+        independent stop-hook/process/lease evidence. It never proves exit here.
+        """
+        try:
+            fields = self._fields(request.unit_name or "", allow_missing=True)
+            if fields["LoadState"] == "not-found":
+                return (fields["Id"] == request.unit_name
+                        and self._fields(request.unit_name or "", allow_missing=True) == fields)
+            if ((fields["Id"], fields["Description"], fields["InvocationID"],
+                 fields["LoadState"], fields["MainPID"], fields["ControlPID"], fields["NFileDescriptorStore"])
+                    != (request.unit_name, request.description, original.invocation_id,
+                        "loaded", "0", "0", "0")
+                    or fields["ControlGroup"] not in {"", original.cgroup}
+                    or (fields["ActiveState"], fields["SubState"]) not in {
+                        ("inactive", "dead"), ("failed", "failed"), ("active", "exited")}):
+                return False
+            code, status = int(fields["ExecMainCode"]), int(fields["ExecMainStatus"])
+            return (code in {1, 2, 3} and (status if code == 1 else -status) == original.exit_status
+                    and fields["ExecMainExitTimestamp"].startswith("@")
+                    and float(fields["ExecMainExitTimestamp"][1:]) == original.ended_at
+                    and self._fields(request.unit_name or "") == fields)
+        except (OSError, ValueError, HostUnavailable):
+            return False

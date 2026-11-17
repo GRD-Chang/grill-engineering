@@ -1,4 +1,4 @@
-"""Compose the exact manager post-exit hook with the bounded sender.
+"""Compose exact manager post-exit evidence with the bounded sender.
 
 Identity and committed fact checks live in host_exit_facts; only this hook
 connects those observations to notification delivery.
@@ -28,26 +28,16 @@ from agent_run.storage.sqlite import Storage
 
 def exit_properties(database: Path, action_id: str, request: HostLaunch, runner_lock: Path,
                     environment: Mapping[str, str], *, storage: Storage) -> tuple[str, ...]:
-    """Arm only this Run's enabled hook, without interpreting the Host command."""
+    """Always arm exit evidence; optional channels only affect notification time."""
     kernel = Kernel._from_storage(open_run(database, storage=storage))
     if kernel.host_request(action_id) != request:
         raise ValueError("Host exit request binding changed")
     with kernel.storage.transaction(write=False) as tx:
         run = tx.one(*run_statement(tx, 'SELECT id FROM runs WHERE id=?', ()))
         originals = tx.rows("SELECT subject,material_id FROM run_inputs WHERE run_id=?", (run["id"],))
-        if not originals:
-            return ()  # No frozen Run inputs; neither channel can be bound.
-        original = originals[0]
-        config = json.loads(tx.get(original["material_id"], original["subject"])).get("notifications")
-    from agent_run.queries.status_comment import status_subjects
-    try:
-        status_subjects(database, **({"storage": storage}))
-        status_enabled = True
-    except (OSError, ValueError, RuntimeError, sqlite3.Error):
-        status_enabled = False
+        config = None if not originals else json.loads(
+            tx.get(originals[0]["material_id"], originals[0]["subject"])).get("notifications")
     feishu_enabled = isinstance(config, dict) and config.get("enabled") is True
-    if not feishu_enabled and not status_enabled:
-        return ()
     if not database.is_absolute() or not runner_lock.is_absolute() or not Path(sys.executable).is_absolute():
         raise ValueError("An exact Host exit command is required")
     bootstrap = ("import sys;sys.path.insert(0,sys.argv[1]);"
@@ -63,12 +53,16 @@ def exit_properties(database: Path, action_id: str, request: HostLaunch, runner_
     if library:
         arguments = ["/usr/bin/env", "LD_LIBRARY_PATH=" + library, *arguments]
     rendered = " ".join(json.dumps(value.replace("%", "%%"), ensure_ascii=False) for value in arguments)
-    return ("ExecStopPost=-:" + rendered, "TimeoutStopSec=70s" if feishu_enabled else "TimeoutStopSec=5s",
+    from agent_run.notifications.sender import CLOSE_TIMEOUT_SECONDS, CLOSE_CLEANUP_TIMEOUT_SECONDS
+    # Reserve 60 seconds beyond the sender's full drain and cleanup allowance
+    # for identity reads, four bounded evidence reads, FD removal and storage.
+    stop_timeout = 60 + (CLOSE_TIMEOUT_SECONDS if feishu_enabled else 1) + CLOSE_CLEANUP_TIMEOUT_SECONDS
+    return ("ExecStopPost=-:" + rendered, f"TimeoutStopSec={stop_timeout:g}s",
             "TimeoutStopFailureMode=kill", "OOMPolicy=continue")
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
-    """Consume one manager exit, never claim startup or change execution state."""
+    """Notify, then leave the final exact stop-hook/lease witness and exit."""
     parser = argparse.ArgumentParser(description="Exact native Host post-exit notification")
     parser.add_argument("--database", type=Path, required=True)
     parser.add_argument("--action", required=True)
@@ -82,6 +76,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return 0
     try:
         credential_directory = os.environ.get("CREDENTIALS_DIRECTORY")
+        notify_socket = os.environ.get("NOTIFY_SOCKET", "")
         if (not args.database.is_absolute() or not args.runner_lock.is_absolute()
                 or not credential_directory or not Path(credential_directory).is_absolute()):
             raise HostExitUnavailable("Host exit credential is unavailable")
@@ -93,32 +88,41 @@ def main(arguments: Sequence[str] | None = None) -> int:
                                                credential=Path(credential_directory) / "agent-run-environment")
             os.environ.clear()
             os.environ.update(inherited.environment)
-            notice = None
-            if abnormal:
-                notice = host_exit_notice(args.database, args.action, inherited.receipt,
-                                          service_result=result, exit_code=code, exit_status=status,
-                                          invocation_id=invocation, **options)
-                if notice is not None:
-                    from agent_run.notifications.sender import deliver_host_exit_notice
-                    deliver_host_exit_notice(args.database, args.database.parent, notice, **options)
-            if notice is None:
-                from agent_run.queries.status_comment import status_subjects
-                try:
-                    status_subjects(args.database, **options)
-                except (OSError, ValueError, RuntimeError, sqlite3.Error):
-                    return 0
+            try:
+                notice = None
+                if abnormal:
+                    notice = host_exit_notice(args.database, args.action, inherited.receipt,
+                                              service_result=result, exit_code=code, exit_status=status,
+                                              invocation_id=invocation, **options)
+                    if notice is not None:
+                        from agent_run.notifications.sender import deliver_host_exit_notice
+                        deliver_host_exit_notice(args.database, args.database.parent, notice, **options)
+                if notice is None:
+                    from agent_run.queries.status_comment import status_subjects
+                    try:
+                        status_subjects(args.database, **options)
+                    except (OSError, ValueError, RuntimeError, sqlite3.Error):
+                        pass
+                    else:
+                        from agent_run.adapters.systemd import SystemdHost
+                        manager = SystemdHost(systemctl=shutil.which("systemctl") or "systemctl",
+                                              systemd_run="systemd-run", environment=os.environ)
+                        if manager.exit_identity(request, invocation):
+                            from agent_run.notifications.sender import notify_committed
+                            notify_committed(args.database, **options)
+            finally:
+                # Evidence is independent of notification configuration/failure.
+                # Nothing after this call may spawn another execution process.
                 from agent_run.adapters.systemd import SystemdHost
+                from agent_run.runtime.systemd_exit import record_exit_witness
                 manager = SystemdHost(systemctl=shutil.which("systemctl") or "systemctl",
                                       systemd_run="systemd-run", environment=os.environ)
-                if manager.exit_identity(request, invocation):
-                    # Stop-post still belongs to the unit. Refresh committed
-                    # facts, never infer empty cgroup or released Runner usage.
-                    from agent_run.notifications.sender import notify_committed
-                    notify_committed(args.database, **options)
+                record_exit_witness(kernel, args.action, manager, inherited.receipt,
+                                    invocation_id=invocation, notify_socket=notify_socket)
         return 0
     except (OSError, ValueError, RuntimeError, sqlite3.Error):
         # Credentials, arbitrary CLI output and native metadata stay private.
-        print("Host exit notification observation unavailable", file=sys.stderr)
+        print("Host exit evidence or notification observation unavailable", file=sys.stderr)
         return 1
 
 

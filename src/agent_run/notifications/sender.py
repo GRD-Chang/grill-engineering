@@ -44,6 +44,7 @@ from agent_run.storage.routing import open_run
 
 
 CLOSE_TIMEOUT_SECONDS = 60.0
+CLOSE_CLEANUP_TIMEOUT_SECONDS = 2 * WORKER_CREDENTIAL_PROVIDER_OPERATION_TIMEOUT_SECONDS + 5
 Send = Callable[..., Mapping[str, Any]]
 
 
@@ -737,7 +738,7 @@ class NativeNotifications:
                 self._call.cancel.set()
             self.condition.notify_all()
         if self.thread is not None:
-            grace = 2 * WORKER_CREDENTIAL_PROVIDER_OPERATION_TIMEOUT_SECONDS + 5 if self.status_enabled else 2
+            grace = CLOSE_CLEANUP_TIMEOUT_SECONDS if self.status_enabled else 2
             cleanup_deadline = monotonic() + grace
             self.thread.join(timeout=grace)
             call = self._call

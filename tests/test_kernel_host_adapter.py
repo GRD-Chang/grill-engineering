@@ -62,7 +62,7 @@ def test_launch_uses_exact_grant_and_unknown_response_never_retries(tmp_path: Pa
     assert "--property=Restart=no" in arguments and "--property=Type=exec" in arguments
     assert "--property=KillMode=control-group" in arguments and "--property=RemainAfterExit=no" in arguments
     assert "--property=FileDescriptorStoreMax=1" in arguments
-    assert "--property=FileDescriptorStorePreserve=restart" in arguments and "--property=NotifyAccess=main" in arguments
+    assert "--property=FileDescriptorStorePreserve=restart" in arguments and "--property=NotifyAccess=exec" in arguments
     assert "--expand-environment=no" in arguments and "--collect" not in arguments
     assert f"--property=LoadCredential=agent-run-environment:{request.environment_carrier}" in arguments
     assert arguments[arguments.index("--") + 1:] == list(request.command)

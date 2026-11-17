@@ -136,8 +136,10 @@ def run(kernel: Kernel, execution: Execution, environment: Mapping[str, str]) ->
                             active[2].set()
                     notifications.observe_committed()
                     if operation is None and not workers and state.disposition in {"quiescent", "complete"}:
-                        drain_notifications = True
-                        return 0
+                        if runner.prepare_exit():
+                            drain_notifications = True
+                            return 0
+                        continue
                     now = kernel.clock()
                     ready = operation is None and (state.disposition == "ready" or state.disposition == "waiting"
                              and state.wake_at is not None and state.wake_at <= now)

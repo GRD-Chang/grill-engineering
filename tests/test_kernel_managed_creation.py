@@ -413,6 +413,12 @@ def test_public_busy_checkpoint_resume_applies_policy_to_the_original_host(
     import json
     from agent_run.model import EffectResult
     from agent_run.cli.main import main
+    from itertools import count
+    from types import SimpleNamespace
+    from agent_run.runtime import action_observation
+    ticks = count()
+    monkeypatch.setattr(action_observation, 'time', SimpleNamespace(
+        monotonic=lambda: next(ticks) * 601.0, sleep=lambda _: None))
     with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, execution, base, calls):
         operations = CoreOperations(kernel, execution, _make_ports)
         original = operations.until(lambda step: step.call is not None).call
@@ -436,9 +442,11 @@ def test_public_busy_checkpoint_resume_applies_policy_to_the_original_host(
             creation_policy = tx.one("SELECT policy FROM runs")[0]
         message = "Continue the original investigation.\r\n保留反馈。"
         assert main(["resume", "1", "--repo", "example/project", "--parent-only-paired-round", "2",
-                     "--development-deadline", "13s", "--message", message, "--new-thread", "--json"]) == 0
+                     "--development-deadline", "13s", "--message", message, "--new-thread", "--json"]) == 2
         output = json.loads(capsys.readouterr().out)
         assert output["result"] == "accepted" and output["host"] == "running"
+        assert output['requested_action_applied'] is True and output['requested_action_succeeded'] is False
+        assert output['request_outcome'] == 'observation_timeout'
         assert output["action_id"] != "original" and kernel.active_host_action() == "original"
         assert kernel.host_request("original") == request
         with kernel.storage.transaction(write=False) as tx:
@@ -458,6 +466,14 @@ def test_public_ordinary_busy_resume_rejects_policy_without_consuming_an_action(
 ) -> None:
     import json
     from agent_run.cli.main import main
+    from itertools import count
+    from types import SimpleNamespace
+    from agent_run.runtime import action_observation
+    # This fixture has no running Executor loop. Confirming its old handshake
+    # alone cannot turn an applied resume into successful execution.
+    ticks = count()
+    monkeypatch.setattr(action_observation, 'time', SimpleNamespace(
+        monotonic=lambda: next(ticks) * 601.0, sleep=lambda _: None))
     with _running_public_parent(git_repo, tmp_path, monkeypatch) as (kernel, request, execution, base, calls):
         operations = CoreOperations(kernel, execution, _make_ports)
         original = operations.until(lambda step: step.call is not None).call
@@ -470,8 +486,10 @@ def test_public_ordinary_busy_resume_rejects_policy_without_consuming_an_action(
         assert kernel.status("parent:1") == before
         with kernel.storage.transaction(write=False) as tx:
             assert tx.one("SELECT count(*) FROM actions")[0] == 1
-        assert main(["resume", "1", "--repo", "example/project", "--message", "Worker setup fixed", "--json"]) == 0
-        assert json.loads(capsys.readouterr().out)["host"] == "running"
+        assert main(["resume", "1", "--repo", "example/project", "--message", "Worker setup fixed", "--json"]) == 2
+        output = json.loads(capsys.readouterr().out)
+        assert output['host'] == 'running' and output['requested_action_applied'] is True
+        assert output['requested_action_succeeded'] is False and output['request_outcome'] == 'observation_timeout'
         continued = operations.until(lambda step: step.call is not None).call
         assert continued is not None and continued.attempt_id == original.attempt_id
         assert continued.deadline_seconds == 7.0 and kernel.host_request("original") == request

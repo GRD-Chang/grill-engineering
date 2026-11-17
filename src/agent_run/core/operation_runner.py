@@ -89,6 +89,9 @@ class OperationRunner:
     def state(self) -> OperationState:
         return self.kernel.operation_state(self._observation)
 
+    def prepare_exit(self) -> bool:
+        return self.kernel.prepare_executor_exit(self.execution, self._observation)
+
     def supervise(self) -> OperationSupervision:
         return self.kernel.operation_supervision()
 

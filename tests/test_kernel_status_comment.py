@@ -262,13 +262,17 @@ def test_normal_exit_hook_uses_original_handoff_without_claiming_domain_release(
     import os
     import select
     import shutil
+    import signal
+    import socket
     import subprocess
     import sys
+    import threading
     from agent_run.model import HostObservation
     from agent_run.runtime.handoff import prepare_handoff
     from agent_run.runtime.package_lease import runner_usage_lease
     from agent_run.runtime.process_identity import _process_start_token
     from agent_run.runtime.execution import _cgroup
+    from agent_run.runtime.systemd_exit import witness_path
     from support.systemd_manager import controlled_manager
     scenario = parent_at_approval
     kernel, subject = scenario.kernel, scenario.delivery.key
@@ -288,15 +292,45 @@ def test_normal_exit_hook_uses_original_handoff_without_claiming_domain_release(
                                environment_carrier=private / "environment.json", preflight=lambda: None)
     child = subprocess.Popen(command, stdout=subprocess.PIPE, start_new_session=True)
     handoff = None
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    listener.bind("")
+    listener.settimeout(5)
+    notify_address = "@" + listener.getsockname()[1:].decode()
+    stored, errors = [], []
+    thread = None
+
+    def remove_store():
+        import array
+        descriptors = array.array("i")
+        try:
+            assert listener.recv(1024) == b"FDSTOREREMOVE=1\nFDNAME=runner-exit-lease"
+            os.close(stored.pop())
+            state = json.loads(response.read_text())
+            state["fields"]["NFileDescriptorStore"] = "0"
+            response.write_text(json.dumps(state))
+            data, ancillary, _, _ = listener.recvmsg(1024, socket.CMSG_SPACE(array.array("i").itemsize))
+            assert data == b"BARRIER=1"
+            for level, kind, value in ancillary:
+                assert (level, kind) == (socket.SOL_SOCKET, socket.SCM_RIGHTS)
+                descriptors.frombytes(value[:len(value) - len(value) % descriptors.itemsize])
+            assert len(descriptors) == 1
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            for descriptor in descriptors:
+                os.close(descriptor)
+
     try:
         assert child.stdout and select.select([child.stdout], [], [], 3)[0]
         assert child.stdout.readline() == b"ready\n"
         token = _process_start_token(child.pid)
         assert token
-        environment = {**os.environ, "PATH": str(Path(manager.systemctl).parent) + os.pathsep + os.environ["PATH"]}
+        environment = {**os.environ, "PATH": str(Path(manager.systemctl).parent) + os.pathsep + os.environ["PATH"],
+                       "CONTROLLED_MANAGER_RESPONSE": str(response), "CONTROLLED_CGROUP_ROOT": str(manager.cgroup_root)}
         output = tmp_path / "normal-status-hook.jsonl"
         with runner_usage_lease(lock) as terminal:
-            handoff = prepare_handoff(request, environment, runner_lock=lock, terminal_lease=terminal, ttl_seconds=.5)
+            stored.append(os.dup(terminal.fileno()))
+            handoff = prepare_handoff(request, environment, runner_lock=lock, terminal_lease=terminal)
             shutil.copyfile(request.environment_carrier, credentials / "agent-run-environment")
             (credentials / "agent-run-environment").chmod(0o600)
             assert kernel.dispatch_host(request)
@@ -310,13 +344,30 @@ def test_normal_exit_hook_uses_original_handoff_without_claiming_domain_release(
             response.write_text(json.dumps(state))
             release.write_text("exit")
             assert child.wait(timeout=3) == 0
-            assert handoff.process.wait(timeout=3) == 1
+            handoff.process.terminate()
+            assert handoff.process.wait(timeout=3) == -signal.SIGTERM
+            original = kernel.host_usage("status-normal-exit")
             before = kernel.storage.path.read_bytes()
             script = '''
-import json,sys
+import json,os,sys
+from functools import partial
 from pathlib import Path
+import agent_run.adapters.systemd as systemd
 import agent_run.notifications.sender as sender
 from agent_run.queries.status_comment import project_status, status_binding
+# Only manager/sysfs facts are controlled. The hook, retained FD release,
+# notify barrier, final census and persisted witness run unchanged.
+response = Path(os.environ['CONTROLLED_MANAGER_RESPONSE'])
+state = json.loads(response.read_text())
+group = next(line[3:] for line in Path('/proc/self/cgroup').read_text().splitlines() if line.startswith('0::'))
+state['fields'].update(ActiveState='deactivating', SubState='stop-post', MainPID='0',
+    ControlPID=str(os.getpid()), ControlGroup=group, ExecMainStatus='0')
+response.write_text(json.dumps(state))
+root = Path(os.environ['CONTROLLED_CGROUP_ROOT'])
+cgroup = root / group.lstrip('/')
+cgroup.mkdir(parents=True, exist_ok=True)
+(cgroup / 'cgroup.procs').write_text(str(os.getpid())+'\\n')
+systemd.SystemdHost = partial(systemd.SystemdHost, cgroup_root=root)
 def status(database,**kwargs):
  body=project_status(database,sys.argv[1],**kwargs).body
  with Path(sys.argv[2]).open('a') as log:log.write(json.dumps(body)+'\\n')
@@ -327,15 +378,25 @@ raise SystemExit(main(sys.argv[3:]))
             args = [sys.executable, "-c", script, subject, str(output), "--database", str(kernel.storage.path),
                     "--action", "status-normal-exit", "--runner-lock", str(lock), "--run-id=" + kernel.storage.run_id]
             hook_environment = {**environment, "CREDENTIALS_DIRECTORY": str(credentials),
-                                "SERVICE_RESULT": "success", "EXIT_CODE": "exited", "EXIT_STATUS": "0", "INVOCATION_ID": "1" * 32}
-            hook = subprocess.run(args, env=hook_environment, capture_output=True, text=True, timeout=10)
-            assert hook.returncode == 0, hook.stderr
-            body, = [json.loads(line) for line in output.read_text().splitlines()]
-            assert "Host exit: exit_unproven" in body  # Main return is not whole-domain release.
+                                "NOTIFY_SOCKET": notify_address, "SERVICE_RESULT": "success", "EXIT_CODE": "exited",
+                                "EXIT_STATUS": "0", "INVOCATION_ID": "1" * 32}
+            # A foreign hook cannot notify or leave a release witness.
             wrong = subprocess.run(args, env={**hook_environment, "INVOCATION_ID": "2" * 32},
                                    capture_output=True, text=True, timeout=10)
-            assert wrong.returncode == 0, wrong.stderr
-            assert len(output.read_text().splitlines()) == 1
+            assert wrong.returncode == 1
+            assert not output.exists() and not witness_path(request).exists()
+            thread = threading.Thread(target=remove_store)
+            thread.start()
+            hook = subprocess.run(args, env=hook_environment, capture_output=True, text=True, timeout=10)
+            assert hook.returncode == 0, hook.stderr
+            thread.join(timeout=3)
+            assert not thread.is_alive() and not errors, errors
+            body, = [json.loads(line) for line in output.read_text().splitlines()]
+            assert "Host exit: exit_unproven" in body  # Main return is not whole-domain release.
+            witness = json.loads(witness_path(request).read_text())
+            assert witness["binding"] == [request.run_id, "status-normal-exit", request.epoch, request.owner, request.nonce]
+            assert witness["manager_lease_released"] is True and witness["cgroup_only_hook"] is True
+            assert kernel.host_usage("status-normal-exit") == original
             assert kernel.storage.path.read_bytes() == before
     finally:
         if child.poll() is None:
@@ -344,6 +405,12 @@ raise SystemExit(main(sys.argv[3:]))
             child.stdout.close()
         if handoff is not None and handoff.process.poll() is None:
             handoff.process.terminate(); handoff.process.wait(timeout=3)
+        listener.close()
+        if thread is not None:
+            thread.join(timeout=6)
+            assert not thread.is_alive()
+        for descriptor in stored:
+            os.close(descriptor)
 
 
 def test_pending_important_card_keeps_its_budget_before_slow_status_and_status_recovers(tmp_path, monkeypatch):

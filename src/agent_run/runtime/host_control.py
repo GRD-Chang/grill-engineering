@@ -119,6 +119,7 @@ def launch_admitted(kernel: Kernel, request: HostLaunch, *, manager: SystemdHost
         action_status = tx.one(*run_statement(tx, 'SELECT status FROM actions WHERE run_id=? AND id=?', (action_id,)))[0]
     return {"result": "accepted", "status": "action_" + action_status, "run_id": request.run_id,
             "action_id": action_id, "action": kind,
+            "host_action_id": action_id,
             "host": "unknown" if observed is None else observed.disposition,
             "host_unit": request.unit_name, "host_backend": request.backend}, observed
 

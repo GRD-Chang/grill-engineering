@@ -416,6 +416,10 @@ def reconcile_handoff(kernel: Kernel, action_id: str, manager: SystemdHost) -> H
     request, original = kernel.host_request(action_id), kernel.host_usage(action_id)
     if original is not None and original.usage_released:
         return original
+    from agent_run.runtime.systemd_exit import reconcile_exit_witness
+    retained = reconcile_exit_witness(kernel, action_id, manager)
+    if retained is not None:
+        return retained
     observation = manager.observe(request)
     accepted = kernel.observe_host(request, observation)
     if accepted != "exited" or observation.disposition != "exited" or original is None:

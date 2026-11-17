@@ -247,7 +247,7 @@ def test_enabled_host_arms_only_the_exact_bounded_exit_command_without_private_e
     assert command.startswith("ExecStopPost=-:") and "from agent_run.runtime.host_exit import main" in command
     assert environment["PRIVATE_TEST_VALUE"] not in " ".join(properties)
     assert "path%%literal/$library" in command
-    assert "TimeoutStopSec=70s" in properties and "TimeoutStopFailureMode=kill" in properties
+    assert "TimeoutStopSec=155s" in properties and "TimeoutStopFailureMode=kill" in properties
     assert "OOMPolicy=continue" in properties
     import agent_run.runtime.handoff as native_host
     from agent_run.runtime.host_control import attach
@@ -268,7 +268,7 @@ def test_enabled_host_arms_only_the_exact_bounded_exit_command_without_private_e
     launch, = [json.loads(line) for line in calls.read_text().splitlines()
                if json.loads(line)[0] == "systemd-run"]
     assert "--property=" + command in launch
-    assert "--property=TimeoutStopSec=70s" in launch and "--property=TimeoutStopSec=5s" not in launch
+    assert "--property=TimeoutStopSec=155s" in launch and "--property=TimeoutStopSec=96s" not in launch
     assert "--property=FileDescriptorStorePreserve=restart" in launch
     assert launch.count("--property=LoadCredential=agent-run-environment:" + str(request.environment_carrier)) == 1
     assert environment["PRIVATE_TEST_VALUE"] not in json.dumps(launch)
@@ -286,7 +286,7 @@ def test_enabled_host_arms_only_the_exact_bounded_exit_command_without_private_e
                            environment_carrier=disabled / "environment.json", preflight=lambda: None)
     status_properties = exit_properties(other.storage.path, 'disabled', off, lock, environment, storage=other.storage)
     assert len([item for item in status_properties if item.startswith("ExecStopPost=")]) == 1
-    assert "TimeoutStopSec=5s" in status_properties and "TimeoutStopSec=70s" not in status_properties
+    assert "TimeoutStopSec=96s" in status_properties and "TimeoutStopSec=155s" not in status_properties
     assert not (disabled / "notifications").exists()
 
 
@@ -344,8 +344,8 @@ def test_real_post_exit_entry_restores_only_original_environment_and_calls_the_o
                                  "--database", str(kernel.storage.path), "--action", "entry", "--runner-lock", str(lock), "--run-id=" + kernel.storage.run_id],
                                 env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         stdout, stderr = hook.communicate(timeout=8)
-        assert hook.returncode == 0, stderr.decode()
-        assert stdout == b"" and stderr == b""
+        assert hook.returncode == 1, stderr.decode()  # No real manager/cgroup/NOTIFY_SOCKET proof in this sender-only case.
+        assert stdout == b"" and b"Host exit evidence or notification observation unavailable" in stderr
         delivered = json.loads(output.read_text())
         assert delivered["database"] == str(kernel.storage.path) and delivered["state_root"] == str(tmp_path)
         assert delivered["notice"]["action_id"] == "entry" and delivered["notice"]["nonce"] == request.nonce
