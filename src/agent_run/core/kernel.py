@@ -5241,7 +5241,7 @@ class Kernel:
             assert world.repair.checks is not None and plan.material is not None
             if not delivery_checks.consume(tx, self._delivery_state(), run, plan.job, world.repair.checks, plan.material):
                 return Step("progress", job["id"])
-            plan = repair.after_checks(self._delivery_state(), tx, run, job, plan)
+            plan = repair.after_checks(self._delivery_state(), tx, run, job, plan, result=world.repair.checks.result)
         if isinstance(plan, repair.EffectPlan):
             return self._prepare_effect(tx, run, job, work, world, plan.operation,
                 before=plan.before, after=plan.after, binding=repair.effect_binding(plan.repair, world, plan.operation), payload=plan.payload)

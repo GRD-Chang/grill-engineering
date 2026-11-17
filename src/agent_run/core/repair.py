@@ -174,6 +174,11 @@ def _basis(row: sqlite3.Row, job: sqlite3.Row, run: sqlite3.Row, world: World) -
         and row['expected_tree'] == job['expected_tree'])
 
 
+def _checks_allow_merge(result: str) -> bool:
+    """Repair policy shared by initial consumption and fresh write authority."""
+    return result in {'pass', 'none'}
+
+
 def authority(tx: Transaction, run: sqlite3.Row, job: sqlite3.Row,
               effect: sqlite3.Row, world: World, *, review_current: bool) -> bool:
     row = current(tx, job['id'])
@@ -192,7 +197,7 @@ def authority(tx: Transaction, run: sqlite3.Row, job: sqlite3.Row,
     if effect['operation'] != 'merge':
         return effect['operation'] == 'push' or child.source is not None and child.source.sha == effect['after_sha']
     checks = child.checks
-    if (not row['checks_id'] or checks is None or checks.result not in {'pass', 'none'}
+    if (not row['checks_id'] or checks is None or not _checks_allow_merge(checks.result)
             or checks.pr_number != row['pr_number'] or checks.head_sha != row['integrated_sha']):
         return False
     recorded = tx.one('SELECT material_id FROM checks WHERE run_id=? AND id=?', (run['id'], row['checks_id']))[0]
@@ -320,9 +325,14 @@ def advance(state: DeliveryState, tx: Transaction, run: sqlite3.Row, job: sqlite
 
 
 def after_checks(state: DeliveryState, tx: Transaction, run: sqlite3.Row, job: sqlite3.Row,
-                 plan: ChecksPlan) -> Step | EffectPlan:
+                 plan: ChecksPlan, *, result: str) -> Step | EffectPlan:
     row = current(tx, job['id'])
     assert row is not None and plan.material is not None
+    # Convergence and CI failure handling precede this policy decision. Keep
+    # the exact recorded evidence even when the repair policy rejects it.
+    if not _checks_allow_merge(result):
+        state.gate(tx, job['id'], 'repair_required_checks_rejected', evidence=plan.material)
+        return Step('paused', job['id'], 'repair_required_checks_rejected')
     if plan.stage == 'checks':
         state.event(tx, job['id'], 'repair_checks_observed', row['id'], plan.material)
         return _phase(tx, run['id'], job['id'], 'repair_merge')
