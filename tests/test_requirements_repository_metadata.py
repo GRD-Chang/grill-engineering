@@ -81,7 +81,7 @@ def test_requirements_identity_is_independent_of_delivery_default_ref_permission
 @pytest.mark.parametrize('damage', ['missing', 'noncommit', 'contents-403'])
 def test_initial_creation_still_requires_the_exact_default_commit(git_repo, tmp_path, monkeypatch, damage):
     from agent_run.adapters.workspace import ManagedWorkspace
-    from agent_run.cli.lifecycle import prepare_creation
+    from agent_run.runtime.task_creation import prepare_creation
     from agent_run.config.defaults import UserDefaultsStore
     from support.workspace import git
 

@@ -31,21 +31,20 @@ from agent_run.notifications.envelope import event_copy, event_envelope
 from agent_run.adapters.notification_transport import send
 from agent_run.runtime.process_identity import _process_start_token
 
-from agent_run.queries.execution import execution_facts
-from agent_run.notifications.event_projection import completion_context, event_state, project_event
-from agent_run.queries.resume_facts import resume_facts
+from agent_run.notifications.event_projection import event_state, project_event
+from agent_run.notifications.boundary_projection import boundary_scopes, project_gate, project_terminal
 from agent_run.notifications.progress import obsolete_progress
 from agent_run.notifications.status_comment import StatusComments
-from agent_run.queries.status_comment import project_status, status_subjects
-from agent_run.core.kernel import Kernel
-from agent_run.adapters.remote import PhysicalAPI
+from agent_run.queries.status_comment import project_status, status_subjects, status_binding
+from agent_run.adapters.status_comment import CommentAPI
 from agent_run.adapters.auth.credential_lifecycle import WORKER_CREDENTIAL_PROVIDER_OPERATION_TIMEOUT_SECONDS
-from agent_run.queries.read_facts import material, read_boundaries
+from agent_run.queries.read_facts import read_boundaries
 from agent_run.storage.sqlite import Storage, Transaction
 from agent_run.storage.routing import open_run
 
 
 CLOSE_TIMEOUT_SECONDS = 60.0
+CLOSE_CLEANUP_TIMEOUT_SECONDS = 2 * WORKER_CREDENTIAL_PROVIDER_OPERATION_TIMEOUT_SECONDS + 5
 Send = Callable[..., Mapping[str, Any]]
 
 
@@ -75,7 +74,7 @@ class NativeNotifications:
     """Deliver only committed native events for one exact Run and owned directory."""
 
     def __init__(self, database: Path, state_root: Path, *, transport: Send = send,
-                 exit_notice: Mapping[str, Any] | None = None, status_api: PhysicalAPI | None = None,
+                 exit_notice: Mapping[str, Any] | None = None, status_api: CommentAPI | None = None,
                  storage: Storage) -> None:
         if (database.is_symlink() or state_root.is_symlink()
                 or not database.is_file() or not state_root.is_dir()
@@ -93,7 +92,7 @@ class NativeNotifications:
         self.feishu_enabled = self.config.get("enabled") is True
         self.status = StatusComments(state_root,
             read_projection=partial(project_status, database, storage=self.storage),
-            read_binding=Kernel._from_storage(self.storage).operation_binding)
+            read_binding=partial(status_binding, database, storage=self.storage))
         self.status_api = status_api
         self.status_failure_reason: str | None = None
         self._status_seen: dict[str, tuple[str, str]] = {}
@@ -154,41 +153,6 @@ class NativeNotifications:
     def _gate_slot(subject: str | None, generation: int | None, reason: str) -> str:
         return hashlib.sha256(json.dumps([subject, generation, reason]).encode()).hexdigest()
 
-    def _terminal_event(self, tx: Transaction, view: dict[str, Any]) -> dict[str, Any] | None:
-        """Describe a committed lifecycle result, without granting completion."""
-        if not view["is_terminal"]:
-            return None
-        if view["status"] == "abandoned":
-            action = view["abandonment"]
-            if action is None or action["status"] != "complete":
-                raise ValueError("abandoned notification has no completed original Action")
-            return event_envelope(self.state, "boundary", ["abandoned", action["action"]],
-                                  event_copy(self.state, "abandoned"), "yellow",
-                                  current=True, terminal=True, status_code="abandoned",
-                                  execution_timing_complete=False)
-        if view["status"] != "completed":
-            return None
-        closures = view["closures"]
-        if len(closures) != 1 or material(tx, closures[0]["receipt_id"], closures[0]["subject"]).get("disposition") != "target":
-            raise ValueError("completed notification has no unique original close receipt")
-        closed = closures[0]
-        number = closed["pr_number"]
-        if type(number) is not int or number <= 0:
-            raise ValueError("completed notification has no original Pull Request")
-        cleanup = view["delivery_cleanup"]
-        pending = cleanup is not None and cleanup["status"] == "cleanup_pending"
-        status = "completed_cleanup" if pending else "completed"
-        summary = event_copy(self.state, "separator").join((
-            event_copy(self.state, "merged", number=number), event_copy(self.state, "closed")))
-        if pending:
-            summary += event_copy(self.state, "cleanup_summary")
-        return event_envelope(self.state, "boundary", [status, closed["effect_id"], closed["receipt_id"]],
-                              event_copy(self.state, "cleanup" if pending else "completed"),
-                              "yellow" if pending else "green", current=True, terminal=True,
-                              status_code="completed", summary=summary,
-                              url=f"https://github.com/{self.binding[0]}/pull/{number}",
-                              execution_timing_complete=False, **completion_context(view, self.state))
-
     def _boundaries(self, document: dict[str, Any]) -> bool:
         """Track notification occurrences, not an alternate writable Run state.
 
@@ -216,39 +180,18 @@ class NativeNotifications:
             if not self._same_binding(*self._run(tx)):
                 raise ValueError("notification Run or recipient binding changed")
             view = read_boundaries(tx, time.time())
-            terminal = self._terminal_event(tx, view)
-            if terminal is not None and view["status"] == "completed":
-                closure = view["closures"][0]
-                original = tx.one(*run_statement(tx, "SELECT * FROM history WHERE run_id=? AND kind='effect_consumed' AND identity=? AND material_id=?", (closure["effect_id"], closure["receipt_id"])))
-                timing = execution_facts(tx, dict(original), whole_run=True)
-                total = timing.pop("execution_seconds", None)
-                terminal.update(timing, total_seconds=total)
+            terminal = project_terminal(tx, view, self.state)
             highwater = view["highwater"]
             if cursor < highwater:
                 rows = tx.rows(*run_statement(tx, 'SELECT position,subject,generation,phase,status FROM history WHERE run_id=? AND position>? AND position<=? ORDER BY position LIMIT 128', (cursor, highwater)), limit=128)
                 if not rows:
                     raise ValueError("notification history cursor has no committed continuation")
                 for row in rows:
-                    if row["status"] is None:
-                        continue
-                    status = json.loads(row["status"])
-                    global_reason = "operator_stopped" if status["stopped"] else status["blocked"]
-                    replace_scope(None, None, [global_reason] if global_reason else [])
-                    if view["generations"].get(row["subject"]) == row["generation"]:
-                        reasons = list(status["gates"])
-                        if row["phase"] == "approval":
-                            reasons.append("final_approval")
-                        replace_scope(row["subject"], row["generation"], reasons)
+                    for subject, generation, reasons in boundary_scopes(dict(row), view["generations"]):
+                        replace_scope(subject, generation, reasons)
                 cursor = rows[-1]["position"]
             actions = {self._gate_slot(item["subject"], item.get("generation"), item["reason"]): item
                        for item in view["actions"]}
-            resumes: dict[str, dict[str, Any]] = {}
-            for key, action in actions.items():
-                if action["subject"] is None:
-                    continue
-                gate_history = tx.rows(*run_statement(tx, "SELECT h.* FROM history h JOIN gates g ON g.run_id=h.run_id AND g.subject=h.subject AND g.code=h.identity AND g.evidence IS h.material_id WHERE h.run_id=? AND h.kind='paused' AND h.subject=? AND h.generation=? AND h.identity=? ORDER BY h.position DESC LIMIT 1", (action["subject"], action.get("generation"), action["reason"])))
-                if gate_history:
-                    resumes[key] = resume_facts(tx, dict(gate_history[0]))
             caught_up = cursor == highwater
             # Never send an intermediate historical gate as a current card.
             # Each call reads at most 128 snapshots, then persists its cursor.
@@ -261,6 +204,8 @@ class NativeNotifications:
                         document["sequence"] += 1
                         slots[key] = {"subject": action["subject"], "generation": action.get("generation"),
                                       "sequence": document["sequence"]}
+            projected = {key: project_gate(tx, view, self.state, action, key, slots[key]["sequence"])
+                         for key, action in actions.items() if caught_up and not slots[key].get("enqueued")}
             document["native_boundary_cursor"] = cursor
             document["native_boundary_catching_up"] = not caught_up
             self._compress_progress(tx, document, view, added=highwater > document.get("native_cursor", 0))
@@ -278,40 +223,10 @@ class NativeNotifications:
         document["active"] = list(actions)
         if not caught_up:
             return True
-        for key, action in actions.items():
-            occurrence = current[key]
+        for key in actions:
             if slots[key].get("enqueued"):
                 continue
-            reason = action["reason"]
-            title_key = ("stopped" if reason == "operator_stopped" else "approval"
-                         if reason == "final_approval" else "human_title"
-                         if reason == "human_blocker" else "execution_failed"
-                         if reason == "execution_failed" else "budget" if "budget" in reason else "timeout"
-                         if reason == "supervision_timeout" else "requeue" if reason == "requeue_required"
-                         else "human_title")
-            event = event_envelope(self.state, "boundary", [key, occurrence],
-                                   event_copy(self.state, title_key),
-                                   "red" if reason in {"execution_failed", "supervision_timeout"} else "yellow",
-                                   current=True,
-                                   slot_id=key, occurrence=occurrence, work_subject=action["subject"],
-                                   generation=action.get("generation"), object=action["object"],
-                                   scope=action["scope"],
-                                   summary="; ".join(str(value) for value in action["reasons"]),
-                                   next_step=action["next_action"])
-            if reason == "final_approval":
-                owner = next(job for job in view["subjects"] if job["subject"] == action["subject"])
-                number = owner["pr_number"]
-                if type(number) is int and number > 0:
-                    event.update(approval_pr=number,
-                                 url=f"https://github.com/{self.state['repository']}/pull/{number}")
-            facts = resumes.get(key)
-            if facts:
-                event.update(facts)
-                event["title"] = event_copy(self.state, "resume_" + facts["resume_outcome"])
-                event["color"] = "red" if facts["resume_outcome"] == "failed" else "yellow"
-                event["summary"] = (event_copy(self.state, "resume_" + facts["resume_outcome"])
-                                    + event_copy(self.state, "separator") + event["summary"])
-            outbox.enqueue(document, event, time.time())
+            outbox.enqueue(document, projected[key], time.time())
             slots[key]["enqueued"] = True
         if terminal is not None:
             receipts = document.setdefault("native_terminal_receipts", [])
@@ -487,7 +402,7 @@ class NativeNotifications:
                 outbox.cancel_item(document, item, "original Host exit no longer current")
 
     def _exit_current(self, event: Mapping[str, Any]) -> bool:
-        from agent_run.queries.host_exit import host_exit_current
+        from agent_run.runtime.host_recovery import host_exit_current
         evidence = event.get("exit_evidence")
         return isinstance(evidence, dict) and host_exit_current(self.database, evidence, **self._storage_options)
 
@@ -604,7 +519,7 @@ class NativeNotifications:
                     identity = hashlib.sha256(event["id"].encode()).hexdigest()[:32]
                     result = self.transport(self.config, card(event), identity, cancel, **options)
                 except Exception as error:
-                    from agent_run.queries.host_exit import HostExitUnavailable
+                    from agent_run.runtime.host_recovery import HostExitUnavailable
                     if event["kind"] == "executor_exit" and isinstance(error, HostExitUnavailable):
                         result = {"outcome": "failed", "reason": bounded_error(str(error)), "not_sent": True}
                     else:
@@ -823,7 +738,7 @@ class NativeNotifications:
                 self._call.cancel.set()
             self.condition.notify_all()
         if self.thread is not None:
-            grace = 2 * WORKER_CREDENTIAL_PROVIDER_OPERATION_TIMEOUT_SECONDS + 5 if self.status_enabled else 2
+            grace = CLOSE_CLEANUP_TIMEOUT_SECONDS if self.status_enabled else 2
             cleanup_deadline = monotonic() + grace
             self.thread.join(timeout=grace)
             call = self._call

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_run.adapters import github_commands, remote
+from agent_run.adapters import github_commands, remote_observation as remote
 from agent_run.core.operation_contract import DeliveryRead, ReadUnavailable
 from agent_run.errors import GitHubReadError
 from support.delivery_packets import rejected_basis
@@ -99,7 +99,7 @@ def test_discovery_row_is_only_a_number_and_pr_details_are_read_afterwards(tmp_p
 
 @pytest.mark.parametrize('boundary', ['compact', 'third-overflow', 'deadline'])
 def test_discovery_fallback_keeps_original_attempts_and_deadline(tmp_path, monkeypatch, boundary):
-    port = remote.RemoteEffects(tmp_path, "example/project", runner_identity={"source": "host"})
+    port = remote.RemoteObservation(tmp_path, "example/project", runner_identity={"source": "host"})
     now, calls = [0.], []
     monkeypatch.setattr(remote, 'time', SimpleNamespace(monotonic=lambda: now[0], sleep=lambda n: now.__setitem__(0, now[0] + n)))
     def read(command, **options):

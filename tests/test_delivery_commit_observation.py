@@ -220,14 +220,14 @@ def test_delivery_cache_cannot_hide_a_malformed_write_readback(tmp_path, monkeyp
     port, _git, push, _state, calls, pr = existing_pr(tmp_path, monkeypatch)
     original = _pr_effect(push)
     assert port.delivery(DeliveryRead(push.source_ref, push.target_ref, pr.number, ())).pr == pr
-    read = port._api
+    read = port.object
     def malformed(endpoint, *args, **kwargs):
         data = read(endpoint, *args, **kwargs)
         if endpoint.endswith('/git/commits/' + pr.base.sha):
             data['sha'] = pr.head.sha
         return data
     start = len(_reads(calls))
-    monkeypatch.setattr(port, '_api', malformed)
+    monkeypatch.setattr(port, 'object', malformed)
     observed = port.reconcile(original)
     assert observed.disposition == 'unknown'
     assert observed.raw['diagnostic'] == 'foreign commit response'

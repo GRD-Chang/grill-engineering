@@ -184,7 +184,7 @@ def test_parent_requires_fresh_review_and_approval_for_the_live_target(monkeypat
 
 
 def test_delivery_rejects_refs_that_change_during_the_observation(tmp_path, monkeypatch):
-    from agent_run.adapters import remote
+    from agent_run.adapters import remote_observation as remote
     port, git, push, _state, _calls, pr = existing_pr(tmp_path, monkeypatch)
     later = git.make_commit(push.base.tree, (push.base.sha,), 'Changed during physical read')
     read = remote.read_remote_heads

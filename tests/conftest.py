@@ -10,7 +10,7 @@ import pytest
 from support.environment import _apply_test_environment, _inherited_git_override, _user_environment
 from support.installed_runtime import require_current_installation
 
-pytest_plugins = ("support.reporting", "support.offline_prefixes", "support.review_facts")
+pytest_plugins = ("support.reporting", "support.offline_prefixes", "support.review_facts", "support.repair_prefixes")
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -25,13 +25,14 @@ def pytest_configure(config: pytest.Config) -> None:
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     # Work stealing initially gives each worker a contiguous part of the
-    # collection. Start the real offline installer smoke early so its long
-    # build does not become the final worker's tail.
+    # collection. Start long physical stories early, while other workers still
+    # have short cases to steal; running them last leaves an unstealable tail.
     smoke = "tests/test_runner_installer.py::test_public_quickstart_smoke_uses_login_shell_and_cleans_resources"
-    for index, item in enumerate(items):
-        if item.nodeid == smoke:
-            items.insert(0, items.pop(index))
-            break
+    journeys = {"tests/test_kernel_managed_entry_end_to_end.py",
+                "tests/test_public_parent_integration_human_resume.py",
+                "tests/test_kernel_foreground_entry.py"}
+    items.sort(key=lambda item: 0 if item.nodeid == smoke else
+               1 if item.nodeid.partition("::")[0] in journeys else 2)
 
 
 @pytest.fixture(autouse=True)

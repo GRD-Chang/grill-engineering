@@ -20,7 +20,7 @@ import json
 
 from agent_run.model import AgentCall, AgentPreparation, Effect, EffectResult, Execution, ReadWait, Step, World
 from agent_run.errors import KernelError
-from agent_run.core.operation_contract import (OperationBinding, OperationPorts, OperationState, OperationSupervision, ReadUnavailable,
+from agent_run.core.operation_contract import (OperationBinding, ObservationPorts, OperationPorts, OperationState, OperationSupervision, ReadUnavailable,
                                  ReadFence, RequirementsRead, DeliveryRead, DeliveryFacts,
                                  LocalCleanupRead,
                                  LocalCleanupObservation,
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from agent_run.core.kernel import Kernel
 
 
-def _read_observation(kernel: Kernel, ports: OperationPorts, request: RequirementsRead) -> tuple[World, ReadFence]:
+def _read_observation(kernel: Kernel, ports: ObservationPorts, request: RequirementsRead) -> tuple[World, ReadFence]:
     stage = getattr(ports, "source_observation", None)
     prepared = None if stage is None else stage(request.parent_number, request.query)
     source = ports.source(request.parent_number) if prepared is None else prepared.source
@@ -40,7 +40,7 @@ def _read_observation(kernel: Kernel, ports: OperationPorts, request: Requiremen
     return kernel.accept_delivery(delivery, facts)
 
 
-def observe_control(kernel: Kernel, subject: str, make_ports: Callable[[OperationBinding], OperationPorts]) -> World:
+def observe_control(kernel: Kernel, subject: str, make_ports: Callable[[OperationBinding], ObservationPorts]) -> World:
     """Explicit physical observation for control; public queries never call it."""
     ports = make_ports(kernel.operation_binding())
     try:
@@ -89,6 +89,9 @@ class OperationRunner:
     def state(self) -> OperationState:
         return self.kernel.operation_state(self._observation)
 
+    def prepare_exit(self) -> bool:
+        return self.kernel.prepare_executor_exit(self.execution, self._observation)
+
     def supervise(self) -> OperationSupervision:
         return self.kernel.operation_supervision()
 
@@ -106,7 +109,7 @@ class OperationRunner:
         try:
             world, fence = _read_observation(self.kernel, self.ports, request)
         except ReadUnavailable as error:
-            raise ReadWait(self.kernel._wait_for_read(request.fence, self.execution, error.code, error.message)) from error
+            raise ReadWait(self.kernel.wait_for_read(request.fence, self.execution, error.code, error.message)) from error
         self.kernel.authorize_agent_observation(call, world, fence)
 
     def worker_settled(self, call: AgentCall | AgentPreparation) -> bool:
@@ -151,6 +154,6 @@ class OperationRunner:
             resources = self.kernel.effect_resources(effect)
             inspections = None if resources is None else self.ports.inspect(resources)
         except ReadUnavailable as error:
-            raise ReadWait(self.kernel._wait_for_read(request.token, self.execution, error.code, error.message)) from error
+            raise ReadWait(self.kernel.wait_for_read(request.token, self.execution, error.code, error.message)) from error
         return lambda: self.kernel.authorize_effect_observation(
             effect, world, fence, prepared=prepared, inspections=inspections)

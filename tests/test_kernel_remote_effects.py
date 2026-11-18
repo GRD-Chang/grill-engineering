@@ -17,6 +17,7 @@ from agent_run.errors import GitHubReadError
 from agent_run.adapters.git_objects import LocalGit
 from agent_run.errors import KernelError
 from agent_run.adapters.remote import RemoteEffects
+from agent_run.adapters.operations import NativeOperations
 from agent_run.core.operation_contract import ReadUnavailable
 from support.effect_boundary import EffectBoundary, effect_boundary
 from support.github_retries import immediate_read_retries
@@ -551,7 +552,7 @@ def test_final_observation_proves_real_current_completions_into_remote_run_befor
         "body": parent.body, "sub_issues": [ticket.number]}, "issues": {str(ticket.number):
         {"number": ticket.number, "title": ticket.title, "body": ticket.body, "state": "CLOSED",
          "labels": sorted(ticket.labels)}}})
-    selected = RemoteEffects(scenario.port.git.root, "example/project", runner_identity={"source": "host"}, remote="offline-remote")
+    selected = NativeOperations(scenario.port.git.root, "example/project", runner_identity={"source": "host"}, remote="offline-remote")
     role_calls = list(scenario.role_calls)
     before_calls = len(calls.read_text().splitlines()) if calls.exists() else 0
     runner = OperationRunner(scenario.kernel, scenario.execution, lambda binding: selected)

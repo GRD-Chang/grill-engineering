@@ -69,8 +69,8 @@ def test_parent_finding_repair_pr_precedes_run_update_and_final_human_approval(t
     assert not any(write["operation"] == "run_branch" for write in scenario.writes())
 
 
-def test_parent_without_finding_or_new_combination_goes_directly_to_final_pr(tmp_path, domain_scenario):
-    scenario = domain_scenario(tmp_path / "direct", DeliveryKind.FINAL_RUN)
+def test_parent_without_finding_or_new_combination_goes_directly_to_final_pr(final_before_review):
+    scenario = final_before_review
     assert _run(scenario).kind == "approval"
     assert _repairs(scenario) == []
     assert scenario.kernel.status(scenario.delivery.key)["repair_history"] == []
@@ -78,10 +78,11 @@ def test_parent_without_finding_or_new_combination_goes_directly_to_final_pr(tmp
     assert len([row for row in scenario.writes() if row["operation"] == "pr_write"]) == 1
 
 
-def test_failed_repair_check_updates_the_same_pr_and_parent_budget(tmp_path, domain_scenario):
-    scenario = domain_scenario(tmp_path / "retry", DeliveryKind.FINAL_RUN,
-        reviews=("fail", "pass"), checks=("fail",),
-        edits=({"repair.txt": "First repaired result\n"}, {"repair.txt": "CI repaired result\n"}))
+def test_failed_repair_check_updates_the_same_pr_and_parent_budget(final_before_review):
+    scenario = final_before_review
+    scenario.reviews[:] = ["fail", "pass"]
+    scenario.checks[:] = ["fail"]
+    scenario.edits = ({"repair.txt": "First repaired result\n"}, {"repair.txt": "CI repaired result\n"})
     state = _until(scenario, lambda state: state["phase"] == "development" and state["purpose"] == "ci")
     original = _repairs(scenario)[0]
     scenario.checks[:] = ["none"]
@@ -101,10 +102,11 @@ def test_failed_repair_check_updates_the_same_pr_and_parent_budget(tmp_path, dom
     assert "修复 PR 检查: 无强制检查" in output.getvalue()
 
 
-def test_final_ci_failure_creates_a_new_repair_pr_without_reusing_merged_record(tmp_path, domain_scenario):
-    scenario = domain_scenario(tmp_path / "final-ci", DeliveryKind.FINAL_RUN,
-        reviews=("fail", "pass"), checks=("pass",),
-        edits=({"repair.txt": "First repair\n"}, {"repair.txt": "Final CI repair\n"}))
+def test_final_ci_failure_creates_a_new_repair_pr_without_reusing_merged_record(final_before_review):
+    scenario = final_before_review
+    scenario.reviews[:] = ["fail", "pass"]
+    scenario.checks[:] = ["pass"]
+    scenario.edits = ({"repair.txt": "First repair\n"}, {"repair.txt": "Final CI repair\n"})
     _until(scenario, lambda state: state["phase"] == "checks")
     first = _repairs(scenario)[0]
     assert scenario.port.pr_by_number(first["number"]).state == "MERGED"
@@ -121,9 +123,8 @@ def test_final_ci_failure_creates_a_new_repair_pr_without_reusing_merged_record(
     assert scenario.port.remote_commit(scenario.delivery.target_ref) == scenario.initial
 
 
-def test_default_append_during_repair_checks_reaccepts_combination_without_extra_development(tmp_path, domain_scenario):
-    scenario = domain_scenario(tmp_path / "drift", DeliveryKind.FINAL_RUN,
-        reviews=("fail", "pass"), checks=("pending",))
+def test_default_append_during_repair_checks_reaccepts_combination_without_extra_development(repair_before_pr):
+    scenario = repair_before_pr
     _until(scenario, lambda state: state["phase"] == "repair_checks")
     repair = _repairs(scenario)[0]
     default = scenario.port.external_append(scenario.delivery.target_ref,
@@ -137,9 +138,8 @@ def test_default_append_during_repair_checks_reaccepts_combination_without_extra
     assert scenario.port.git.run("show", f"{run.sha}:latest-default.txt").stdout == "Independent default work\n"
 
 
-def test_externally_closed_repair_pr_preserves_identity_and_work(tmp_path, domain_scenario):
-    scenario = domain_scenario(tmp_path / "closed", DeliveryKind.FINAL_RUN,
-        reviews=("fail", "pass"), checks=("pending",))
+def test_externally_closed_repair_pr_preserves_identity_and_work(repair_before_pr):
+    scenario = repair_before_pr
     before = _until(scenario, lambda state: state["phase"] == "repair_checks")
     repair = _repairs(scenario)[0]
     note = Path(scenario.delivery.checkout) / "retained-note.txt"

@@ -1,4 +1,4 @@
-"""Exact, read-only CLI Run selection without importing command dispatchers."""
+"""Exact, read-only Run selection without importing command dispatchers."""
 from __future__ import annotations
 
 import argparse
@@ -27,11 +27,13 @@ def _repository(value: str) -> str:
 
 def control_selection(parsed: argparse.Namespace, *, language: str) -> argparse.Namespace:
     """The existing public numeric-Parent/exact-Run convention, without I/O."""
-    from agent_run.cli.settings import _positive
+    from agent_run.contracts.copy import text
     selection = argparse.Namespace(**vars(parsed))
     selection.parent = None
     if selection.run_id.isdecimal():
-        selection.parent = _positive(selection.run_id, language=language)
+        selection.parent = int(selection.run_id)
+        if selection.parent < 1:
+            raise argparse.ArgumentTypeError(text("cli.positive_integer", language=language))
         selection.run_id = None
     return selection
 

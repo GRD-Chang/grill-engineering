@@ -14,7 +14,7 @@ import sys
 
 from agent_run.adapters.git_objects import LocalGit
 from agent_run.adapters.github import GhGitHubReader
-from agent_run.adapters.remote import RemoteEffects
+from agent_run.adapters.operations import NativeOperations
 from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.model import Effect, Execution, PullRequest
 from support.github_requirements import source_issue
@@ -82,7 +82,7 @@ def _fixture(tmp_path, monkeypatch, *, repository="example/project", actor="publ
     git.run("commit", "-m", "publication")
     published = git.commit("HEAD")
     state, calls = install_remote_gh(tmp_path, remote, monkeypatch, repository=repository, actor=actor)
-    port = RemoteEffects(repo, repository, runner_identity={"source": "host"})
+    port = NativeOperations(repo, repository, runner_identity={"source": "host"})
     effect = Effect("push-1", "ticket:2", "push", repository, "refs/heads/delivery", "refs/heads/main",
         base.sha, published.sha, published, base, None, actor, {}, Execution("run-1", "worker", 1))
     return port, git, effect, state, calls

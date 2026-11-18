@@ -80,7 +80,7 @@ def test_executor_discards_a_source_read_superseded_during_real_external_io(tmp_
 
 @pytest.mark.parametrize("code", ["source_observation_changed", "source_subject_changed", "upstream_unavailable"])
 def test_executor_preserves_unproved_or_upstream_read_errors(tmp_path, monkeypatch, code):
-    import agent_run.adapters.remote as external
+    import agent_run.adapters.remote_observation as external
 
     port, _git, push, _state, _calls = _fixture(tmp_path, monkeypatch)
     operations = source_operations(tmp_path, port, push, monkeypatch)
@@ -90,7 +90,7 @@ def test_executor_preserves_unproved_or_upstream_read_errors(tmp_path, monkeypat
     def failed(_observation, _parent):
         raise error
 
-    # Keep the injected error inside RemoteEffects' original error adapter.
+    # Inject inside the actual observation boundary and its error adapter.
     monkeypatch.setattr(external._SourceObservation, "read", failed)
     if isinstance(error, GitHubReadError):
         step = operations.once()

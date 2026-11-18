@@ -129,10 +129,12 @@ def test_installed_foreground_parent_only_public_lifecycle(git_repo, tmp_path, m
             assert durable_snapshot(tmp_path) == before_stop
             child = start('resume', original['run_id'], '--foreground')
             out, err = child.communicate(timeout=90)
-            assert child.returncode == 2, (out, err)
-            rejected = json.loads(out)
-            assert rejected['status'] == 'command_failed'
-            assert rejected['diagnostics'][0]['code'] == 'control_subject_ambiguous'
+            assert child.returncode == 0, (out, err)
+            repeated = json.loads(out)
+            assert repeated['request_outcome'] == 'already_completed'
+            assert repeated['requested_action_applied'] is False
+            assert repeated['requested_action_succeeded'] is True
+            assert repeated['action_id'] == approved['action_id']
             assert logical_state(kernel.storage.path) == durable
             assert kernel.status('parent:1') == after
             assert mutations() == written

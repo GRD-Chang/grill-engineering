@@ -84,6 +84,16 @@
 不得编辑持久运行状态绕过门禁。目录与清理边界见[本地状态与清理](agent-run.md#本地状态与清理)。
 
 恢复以前先确认原 Host/Worker 的准确退出事实；未知启动或退出不能视为已停止。
+本修复版启动的 systemd Host 始终安装退出证据钩子，与通知是否启用无关。
+正常退出和异常退出的证据绑定原 Run、Action 与执行代次；原 unit 或 cgroup 被回收后，
+`approve`、`resume` 可据此核验全部相关进程退出及租约释放，并在同一次命令中继续。
+证据不足或身份不符时保留现场，不启动第二个 Executor；修复版之前启动的 Host 不迁移。
+
+`approve` 等待最终交付与必要清理完成，恢复原最终批准的 `resume` 使用同一完成边界；
+普通 `resume` 需确认意图已应用并且 Executor 已接续执行。JSON 的
+`requested_action_applied` 与 `requested_action_succeeded` 分别表示本次意图是否应用及本次请求是否成功；
+只附着旧 Action 时两者均为 `false`，命令返回非零。已完成操作的重复请求只读回原结果，
+返回 `request_outcome=already_completed`，不新建批准或重复合入、关闭。
 当前数据库、材料及同库Task/Run绑定须保持原身份和关联；不能填空历史、猜测审核或批准，
 也不能把个人默认配置当作该 Run 的原配置。当前协议缺损按实际错误处理，旧协议不转换或迁移。
 

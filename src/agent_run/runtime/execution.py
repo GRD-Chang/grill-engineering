@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 import select
 import selectors
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -26,7 +27,7 @@ from agent_run.errors import bounded_error
 from agent_run.runtime.process_identity import _process_start_token as _start_token
 
 from agent_run.model import AgentCall, ReadWait
-from agent_run.errors import ObservationSuperseded
+from agent_run.errors import KernelError, ObservationSuperseded
 from agent_run.storage.sqlite import MATERIAL_LIMIT
 
 if TYPE_CHECKING:
@@ -58,6 +59,23 @@ class ProcessExit:
 
 class ProcessExitUnknown(RuntimeError):
     """No lease may be released on this unproven process observation."""
+
+
+def _start_failure(error: BaseException | None) -> dict[str, object]:
+    """Keep bounded classifications, never exception text or launch arguments."""
+    result: dict[str, object] = {}
+    for field, failure in (("error", error), ("cause", error.__cause__ if error is not None else None)):
+        if failure is None:
+            continue
+        detail: dict[str, object] = {"type": type(failure).__name__}
+        if isinstance(failure, KernelError):
+            detail["code"] = failure.code
+        elif isinstance(failure, OSError):
+            detail["errno"] = failure.errno
+        elif isinstance(failure, sqlite3.Error):
+            detail["sqlite_errorcode"] = getattr(failure, "sqlite_errorcode", None)
+        result[field] = detail
+    return result
 
 
 def _cgroup(pid: int) -> str:
@@ -340,6 +358,7 @@ def _run_dispatched(
     released = False
     raw, stderr = b"", ""
     failure: BaseException | None = None
+    initial_failure: BaseException | None = None
     try:
         pidfd = os.pidfd_open(process.pid)
         identity = _identity(process.pid, foreground=kernel.host_backend(call.execution) == "foreground")
@@ -358,7 +377,7 @@ def _run_dispatched(
         gate_write = -1
         raw, stderr = _drain(process, prompt, deadline, kernel, call, identity, capture)
     except BaseException as error:
-        failure = error
+        failure = initial_failure = error
     finally:
         if gate_write >= 0:
             os.close(gate_write)
@@ -380,14 +399,18 @@ def _run_dispatched(
             if pidfd is not None:
                 os.close(pidfd)
     if isinstance(failure, ProcessExitUnknown) or identity is None:
-        kernel.agent_start_unknown(call, {"boundary": "process binding/exit", "pid": process.pid})
+        errors = _start_failure(failure)
+        if initial_failure is not None and initial_failure is not failure:
+            errors["initial"] = _start_failure(initial_failure)
+        kernel.agent_start_unknown(call, {"boundary": "process binding/exit", "pid": process.pid,
+                                         **errors})
         raise failure or ProcessExitUnknown("Worker binding remains unproven")
     if not bound:
         # A failed binding commit may have succeeded before its response was
         # lost. Report the observed facts, never authorize a second process.
         kernel.agent_start_unknown(call, {
             "boundary": "durable binding", "process_identity": identity,
-            "observed_exit": process.returncode,
+            "observed_exit": process.returncode, **_start_failure(failure),
         })
         raise failure or ProcessExitUnknown("Worker binding commit is unknown")
     framed = released and failure is None and process.returncode == 0

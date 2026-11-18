@@ -7,7 +7,7 @@ import json
 import pytest
 
 from agent_run.core.operation_contract import DeliveryRead, ReadUnavailable
-from agent_run.adapters import github_commands, remote
+from agent_run.adapters import github_commands, remote_observation as remote
 from agent_run.errors import GitHubReadError
 from support.delivery_packets import rejected_basis
 from support.remote_effects import _fixture, existing_pr
@@ -23,7 +23,7 @@ def test_delivery_basis_uses_one_packet_without_removing_ref_or_check_boundaries
     def read_refs(*args, **kwargs):
         refs.append(1)
         return original(*args, **kwargs)
-    monkeypatch.setattr('agent_run.adapters.remote.read_remote_heads', read_refs)
+    monkeypatch.setattr('agent_run.adapters.remote_observation.read_remote_heads', read_refs)
     facts = port.delivery(query)
     assert facts.source == pr.head and facts.target == pr.base and facts.publisher_actor == 'publisher'
     assert facts.pr == (None if mode == 'without-pr' else pr) and facts.checks is None
@@ -106,7 +106,7 @@ def test_app_keeps_original_resolver_and_does_not_query_viewer(tmp_path, monkeyp
 
 @pytest.mark.parametrize('boundary', ['third-overflow', 'compact-single-overflow', 'compact-malformed', 'deadline', 'cancelled'])
 def test_basis_fallback_shares_attempt_and_absolute_deadline_budget(tmp_path, monkeypatch, boundary):
-    port = remote.RemoteEffects(tmp_path, "example/project", runner_identity={"source": "host"})
+    port = remote.RemoteObservation(tmp_path, "example/project", runner_identity={"source": "host"})
     now, calls = [0.], []
     monkeypatch.setattr(remote, 'time', SimpleNamespace(monotonic=lambda: now[0], sleep=lambda n: now.__setitem__(0, now[0]+n)))
     if boundary == 'cancelled': port.cancelled = lambda: True
@@ -185,13 +185,13 @@ def test_merged_delivery_still_rejects_a_malformed_original_parent_receipt(tmp_p
         payload={'method': 'merge', 'parents': [push.base.sha, push.after_sha], 'commit_message': 'Original merge'})
     result = port.execute(merge, WriteAuthority(lambda: lambda: None))
     assert result.disposition == 'target'
-    api = port._api
+    api = port.object
     def bad_parents(endpoint, *args, **kwargs):
         data = api(endpoint, *args, **kwargs)
         if endpoint.endswith('/git/commits/' + result.commit.sha):
             data['parents'] = [{'sha': push.base.sha[:8]}]
         return data
-    monkeypatch.setattr(port, '_api', bad_parents)
+    monkeypatch.setattr(port, 'object', bad_parents)
     with pytest.raises(ValueError, match='invalid commit identity'):
         port.delivery(DeliveryRead(push.source_ref, push.target_ref, pr.number, ()))
 

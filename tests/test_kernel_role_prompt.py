@@ -47,7 +47,7 @@ def frozen_call(tmp_path: Path) -> tuple[Kernel, AgentPreparation, CoreOperation
 
 
 def test_frozen_development_body_reaches_cli_and_repair_selects_only_its_contract(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys,
 ) -> None:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "personal"))
     kernel, call, operations, defaults = frozen_call(tmp_path)
@@ -56,6 +56,21 @@ def test_frozen_development_body_reaches_cli_and_repair_selects_only_its_contrac
     personal.mkdir(parents=True)
     (personal / "development.md").write_bytes(b"\xff")
     prompt = render_role_prompt(call)
+    from agent_run.cli.main import main
+
+    # Supply the same frozen facts through the public read-only preview entry.
+    request = {**call.context, "thread_id": call.reported_thread,
+               "_invocation_mode": "new-thread", "acceptance_scope": "ticket",
+               "parent_issue_url": "https://github.com/example/repository/issues/1",
+               "task_issue_url": "https://github.com/example/repository/issues/2",
+               "work_source": "ordinary"}
+    request_file = tmp_path / "frozen-request.json"
+    request_file.write_text(json.dumps(request), encoding="utf-8")
+    assert main(["prompts", "preview", "--request", str(request_file),
+                 "--role", "development", "--json"]) == 0
+    preview = json.loads(capsys.readouterr().out)
+    assert preview["prompt"] == prompt
+    assert preview["schema"] == role_schema(call.role.value)
     assert "Frozen development method" in prompt
     assert "Unrelated acceptance method must not leak" not in prompt
     assert "https://github.com/example/repository/issues/1" in prompt

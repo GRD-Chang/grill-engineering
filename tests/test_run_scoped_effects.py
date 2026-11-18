@@ -318,12 +318,12 @@ def test_operation_tokens_and_original_read_deadline_do_not_borrow_sibling_facts
     assert kernels["A"]._dispatch(a.effect, a.work.execution, WORLD, token=a.token)
     assert kernels["B"]._dispatch(b.effect, b.work.execution, WORLD, token=b.token)
     before_b = _rows(db, "B")
-    first = kernels["A"]._wait_for_read(a.token, a.work.execution, "read_failed", "controlled outage", readback=a.effect)
+    first = kernels["A"].wait_for_read(a.token, a.work.execution, "read_failed", "controlled outage", readback=a.effect)
     assert first.kind == "waiting"
     wait = db.execute("SELECT started_at,deadline,retry_count FROM waits WHERE run_id='A'").fetchone()
     assert wait[:] == (100., 700., 1)
     kernels["A"].clock = lambda: 120.
-    second = kernels["A"]._wait_for_read(a.token, a.work.execution, "read_failed", "controlled outage", readback=a.effect)
+    second = kernels["A"].wait_for_read(a.token, a.work.execution, "read_failed", "controlled outage", readback=a.effect)
     assert second.kind == "waiting"
     assert db.execute("SELECT started_at,deadline FROM waits WHERE run_id='A'").fetchone()[:] == (100., 700.)
     assert _rows(db, "B") == before_b
@@ -335,7 +335,7 @@ def test_operation_tokens_and_original_read_deadline_do_not_borrow_sibling_facts
     ):
         with pytest.raises(KernelError):
             check()
-    assert kernels["A"]._wait_for_read(b.token, a.work.execution, "read_failed", "stale").reason == "observation_superseded"
+    assert kernels["A"].wait_for_read(b.token, a.work.execution, "read_failed", "stale").reason == "observation_superseded"
     assert {run: _rows(db, run) for run in ("A", "B")} == before
     kernels["A"].clock = lambda: 700.
     assert kernels["A"]._finish_operation_read(a.token, a.work.execution).reason == "supervision_timeout"
@@ -372,7 +372,7 @@ def test_integration_snapshot_insert_and_correlated_update_stay_with_selected_ru
     for run in ("A", "B"):
         insert(db, "resync_allowances", {"run_id": run, "subject": SUBJECT, "generation": 1, "allowance": 3})
         with kernels[run].storage.transaction() as tx:
-            assert kernels[run]._observe_integration_snapshot(tx, kernels[run]._job(tx, SUBJECT), WORLD)
+            assert kernels[run]._delivery_state().observe_integration_snapshot(tx, kernels[run]._job(tx, SUBJECT), WORLD)
     before_b = _rows(db, "B")
     request = _prepare(kernels["A"], "A", operation="integrate", payload={"source_sha": BASE.sha})
     assert kernels["A"]._dispatch(request.effect, request.work.execution, WORLD, token=request.token)
@@ -383,7 +383,7 @@ def test_integration_snapshot_insert_and_correlated_update_stay_with_selected_ru
 
     appended = replace(WORLD, target=Commit("c" * 40, "d" * 40), ancestry=((BASE.sha, "c" * 40),))
     with kernels["A"].storage.transaction() as tx:
-        assert kernels["A"]._observe_integration_snapshot(tx, kernels["A"]._job(tx, SUBJECT), appended)
+        assert kernels["A"]._delivery_state().observe_integration_snapshot(tx, kernels["A"]._job(tx, SUBJECT), appended)
     assert db.execute("SELECT used FROM resync_allowances WHERE run_id='A'").fetchone()[0] == 1
     assert db.execute("SELECT window FROM integration_snapshots WHERE run_id='A' ORDER BY window").fetchall()[1][0] == 2
     assert _rows(db, "B") == before_b
@@ -441,7 +441,7 @@ def test_ticket_completion_rows_cleanup_and_final_action_are_scoped_to_original_
     from support.repository_scope import add_subject
     db, kernels = scenario
     subject = "ticket:2"
-    monkeypatch.setattr(core, "identity", iter(["comment", "close", "comment", "close"]).__next__)
+    monkeypatch.setattr(core, "identity", iter(["comment", "close", *core.Kernel.CLEANUP] * 2).__next__)
     for run in ("A", "B"):
         with kernels[run].storage.transaction() as tx:
             add_subject(db, run, subject)
@@ -458,6 +458,17 @@ def test_ticket_completion_rows_cleanup_and_final_action_are_scoped_to_original_
                 "completion_revision": "no-tickets", "context_id": context, "status": "consumed"})
             insert(db, "actions", {"run_id": run, "id": "same-final-action", "kind": "approve", "subject": subject, "status": "pending"})
             tx.execute("UPDATE runs SET final_action='same-final-action' WHERE id=?", (run,))
+            # Persist the original workspace ownership prerequisite used by
+            # local-ref cleanup, just as the prior development is seeded above.
+            with monkeypatch.context() as workspace_identity:
+                workspace_identity.setattr(core, "identity", lambda: "original-workspace")
+                work = replace(_work(run), subject=subject)
+                header, job = kernels[run]._owned(tx, subject, work.execution)
+                workspace = kernels[run]._prepare_effect(tx, header, job, work, WORLD, "workspace",
+                    before=BASE.sha, payload={"create_ref": True})
+                receipt = tx.put(subject, "effect_receipt", wire_json(asdict(EffectResult("target", commit=BASE))))
+                tx.execute("UPDATE effects SET status='confirmed',receipt_id=? WHERE run_id=? AND id=?",
+                    (receipt, run, workspace.effect.effect_id))
     for run in ("A", "B"):
         sibling = "B" if run == "A" else "A"
         before = _rows(db, sibling)
@@ -486,9 +497,26 @@ def test_ticket_completion_rows_cleanup_and_final_action_are_scoped_to_original_
         record = db.execute("SELECT * FROM completions WHERE run_id=?", (run,)).fetchone()
         assert (record['subject'], record['comment_effect'], record['close_effect'], record['development_attempt']) == (
             subject, 'comment', 'close', 'prior-development')
-        assert db.execute("SELECT status FROM actions WHERE run_id=?", (run,)).fetchone()[0] == 'complete'
+        assert db.execute("SELECT status FROM actions WHERE run_id=?", (run,)).fetchone()[0] == 'pending'
+        assert db.execute("SELECT final_action FROM runs WHERE id=?", (run,)).fetchone()[0] == 'same-final-action'
         assert db.execute("SELECT count(*) FROM resource_cleanup WHERE run_id=?", (run,)).fetchone()[0] == 1
         assert _rows(db, sibling) == before
+        cleanup_work = replace(work, cleanup=True, allow_agent=False)
+        for stage, operation in enumerate(kernel.CLEANUP):
+            with kernel.storage.transaction() as tx:
+                request = kernel._advance_cleanup(tx, cleanup_work, WORLD)
+            assert isinstance(request, EffectIO) and request.effect.operation == operation
+            assert kernel._dispatch(request.effect, work.execution, WORLD, token=request.token)
+            kernel._reconcile(request, EffectResult("target"))
+            with kernel.storage.transaction() as tx:
+                assert kernel._advance_cleanup(tx, cleanup_work, WORLD).kind == "progress"
+            finished = stage == len(kernel.CLEANUP) - 1
+            assert db.execute("SELECT status FROM actions WHERE run_id=?", (run,)).fetchone()[0] == (
+                'complete' if finished else 'pending')
+            assert db.execute("SELECT final_action FROM runs WHERE id=?", (run,)).fetchone()[0] == (
+                None if finished else 'same-final-action')
+            assert _rows(db, sibling) == before
+        assert db.execute("SELECT stage,state FROM resource_cleanup WHERE run_id=?", (run,)).fetchone()[:] == (3, 'complete')
     assert db.execute('PRAGMA foreign_key_check').fetchone() is None
 
 

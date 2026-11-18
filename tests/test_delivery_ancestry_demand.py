@@ -69,7 +69,7 @@ def test_explicit_empty_and_reflexive_demand_do_not_expand_to_all_pairs(tmp_path
 @pytest.mark.parametrize('endpoint', ['refs/heads/main', 'unknown_ref', 'a' * 39, 'A' * 40])
 def test_bad_demand_is_rejected_before_external_reads(tmp_path, monkeypatch, endpoint):
     port, _, effect, _, _ = _fixture(tmp_path, monkeypatch)
-    monkeypatch.setattr(port, '_commit', lambda *a: pytest.fail('Invalid demand reached GitHub'))
+    monkeypatch.setattr(port, 'commit', lambda *a: pytest.fail('Invalid demand reached GitHub'))
     with pytest.raises(ReadUnavailable, match='exact commit identities'):
         port.delivery(DeliveryRead(effect.source_ref, effect.target_ref, None, (),
             read_pr=False, ancestry_pairs=((endpoint, 'source'),)))

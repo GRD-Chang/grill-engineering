@@ -56,7 +56,8 @@ def test_preview_uses_execution_assembler_and_frozen_resources(tmp_path: Path) -
     request_file.write_text(json.dumps(request))
     preview = cli("preview", "--request", str(request_file), "--role", "development", "--json")
     assert preview.returncode == 0, preview.stdout + preview.stderr
-    assert json.loads(preview.stdout)["prompt"] == development_prompt(request)
+    resources = prompt_resources.resolve_resources(request.get("language"))
+    assert json.loads(preview.stdout)["prompt"] == development_prompt({**request, "_prompt_resources": resources})
     assert json.loads(preview.stdout)["schema"] == role_schema("development")
     assert "个人共用标记" in preview.stdout
     request["_prompt_resources"] = prompt_resources.resolve_resources()
@@ -105,7 +106,9 @@ def test_output_repair_preview_is_read_only_and_snapshot_is_required_when_suppli
     result = json.loads(capsys.readouterr().out)
     prompt = result["prompt"]
     assert result["schema"] == role_schema(role)
-    assert prompt == structured_output_repair_prompt(output_name, "字段缺失")
+    assert prompt == structured_output_repair_prompt(
+        output_name, "字段缺失", request={"_prompt_resources": prompt_resources.resolve_resources()},
+    )
     assert "字段缺失" in prompt
     assert not prompt_resources.personal_method_directory().exists()
     request["_prompt_resources"] = {}
@@ -154,7 +157,8 @@ def test_help_and_explicit_preview_survive_invalid_personal_config(tmp_path: Pat
     preview = cli("preview", "--request", str(request_file), "--role", "development", "--json")
     assert preview.returncode == 0, preview.stdout + preview.stderr
     assert "builtin/en/methods/development.md" in preview.stdout
-    assert json.loads(preview.stdout)["prompt"] == development_prompt(request)
+    resources = prompt_resources.resolve_resources(request.get("language"))
+    assert json.loads(preview.stdout)["prompt"] == development_prompt({**request, "_prompt_resources": resources})
 
     request["_prompt_resources"] = prompt_resources.builtin_resources("en")
     request_file.write_text(json.dumps(request))
@@ -199,7 +203,8 @@ def test_language_methods_are_independent_and_preview_matches(tmp_path: Path, la
     request_file.write_text(json.dumps(request))
     preview = cli("preview", "--role", "development", "--request", str(request_file), "--json")
     assert preview.returncode == 0, preview.stdout + preview.stderr
-    assert json.loads(preview.stdout)["prompt"] == development_prompt(request)
+    resources = prompt_resources.resolve_resources(request.get("language"))
+    assert json.loads(preview.stdout)["prompt"] == development_prompt({**request, "_prompt_resources": resources})
 
 
 def test_bilingual_resource_manifest_and_format_fields_match() -> None:
@@ -313,3 +318,20 @@ def test_internal_copy_accepts_reordered_translated_facts() -> None:
         "task": {"zh": "任务 {task}，路径 {path}",
                  "en": "At {path}, complete {task}"},
     })
+
+
+@pytest.mark.parametrize("role", ["development", "review", "publication", "output-repair"])
+def test_renderer_requires_explicit_frozen_resources_without_personal_resolution(monkeypatch, role) -> None:
+    from agent_run.core.prompts.role import render_prompt
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("The renderer must not resolve current personal resources")
+
+    monkeypatch.setattr(prompt_resources, "resolve_resources", forbidden)
+    with pytest.raises(ValueError, match="snapshot"):
+        render_prompt({"language": "en"}, role)
+    resources = prompt_resources.builtin_resources("en")
+    request = {"language": "en", "_prompt_resources": resources}
+    assert development_prompt(request) == render_prompt(request, "development")
+    with pytest.raises(ValueError, match="must be zh or en"):
+        render_prompt({"_prompt_resources": resources}, "development")

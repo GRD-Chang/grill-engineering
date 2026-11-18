@@ -69,13 +69,13 @@ def test_remote_unavailable_objects_cannot_become_false_or_trigger_spurious_fetc
             return subprocess.CompletedProcess(result.args, 0, '', '')
         return result
     monkeypatch.setattr(port.git, 'run', observe)
-    read = port._read
+    read = port.read
     def transport(arguments, *args, **kwargs):
         if arguments[:2] == ['git', 'fetch']:
             calls.append(('fetch',))
             return ''
         return read(arguments, *args, **kwargs)
-    monkeypatch.setattr(port, '_read', transport)
+    monkeypatch.setattr(port, 'read', transport)
     anchor = 'f' * 40 if failure == 'fetch-success' else effect.after_sha
     query = DeliveryRead(effect.source_ref, effect.target_ref, None, (anchor,),
                          read_pr=False, ancestry_pairs=((anchor, 'source'),))

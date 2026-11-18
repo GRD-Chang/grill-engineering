@@ -3,6 +3,7 @@
 The one public protocol requires explicit Run selection. Tests use typed routes;
 metadata, SQL/WAL, original owner and frozen creation are the exercised seams.
 """
+from agent_run.runtime.task import create_task, idle_task, reconcile_task, selected_kernel
 from dataclasses import replace
 from contextlib import closing
 import sqlite3
@@ -11,6 +12,7 @@ import pytest
 
 from agent_run.contracts.task import TaskKey
 from agent_run.core.kernel import Kernel
+from agent_run.queries.run import read_route
 from agent_run.errors import KernelError
 from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
 from agent_run.storage import routing
@@ -49,7 +51,7 @@ def proposal(route, name='A', *, parent=1, language='zh'):
 
 def create(route, name='A', *, parent=1, language='zh'):
     spec, source = proposal(route, name, parent=parent, language=language)
-    return route.create(task(route, parent), spec, source)
+    return create_task(route, task(route, parent), spec, source)
 
 
 def dump(route):
@@ -59,7 +61,7 @@ def dump(route):
 
 def test_staged_public_gate_is_closed_and_idle_task_is_not_a_run(route, monkeypatch):
     # Historical node retained: the final protocol admits metadata, never an idle Run.
-    route.idle(task(route))
+    idle_task(route, task(route))
     assert route.task(task(route)).current_run is None
     with route.metadata().transaction(write=False) as owner:
         assert type(owner) is Transaction
@@ -81,7 +83,7 @@ def test_staged_public_gate_is_closed_and_idle_task_is_not_a_run(route, monkeypa
 def test_real_storage_creation_opening_queries_and_history_keep_sibling_ids_separate(route):
     assert create(route, 'A', parent=1).created
     assert create(route, 'B', parent=2, language='en').created
-    a, b = route.kernel('A'), route.kernel('B')
+    a, b = selected_kernel(route, 'A'), selected_kernel(route, 'B')
     assert a.storage.run_id == 'A' and b.storage.run_id == 'B'
     assert a.status(SUBJECT)['kind'] == b.status(SUBJECT)['kind'] == 'parent_only'
     assert a.control('stop', 'same-action', subject=SUBJECT) == 'applied'
@@ -94,10 +96,10 @@ def test_real_storage_creation_opening_queries_and_history_keep_sibling_ids_sepa
     later = a.history(SUBJECT, after=first[0]['position'], limit=128)
     assert first and all(row['run_id'] == 'A' and row['position'] > first[0]['position'] for row in later)
     for run, number in (('A', 1), ('B', 2)):
-        document = route.read(run, 'status')
+        document = read_route(route, run, 'status')
         assert document.data['run_id'] == run and document.data['parent']['number'] == number
         with route.at_run(run).transaction(write=False) as tx:
-            header = route.read(run, 'settings')
+            header = read_route(route, run, 'settings')
             assert header.data['run_id'] == run
             assert isinstance(tx, RunTransaction) and tx.run_id == run
     before = dump(route)
@@ -138,20 +140,20 @@ def test_original_frozen_proposal_and_historical_run_are_not_recreated(route):
     assert create(route, 'A', language='en').run_id == 'A'
     assert dump(route) == before
     with pytest.raises(KernelError, match='task_creation_unknown'):
-        route.reconcile(task(route), 'loser')
+        reconcile_task(route, task(route), 'loser')
     with route.at_run('A').transaction() as tx:
         tx.execute("UPDATE subjects SET phase='complete' WHERE run_id='A'")
     assert create(route, 'successor').created
-    old = route.reconcile(task(route), 'A')
+    old = reconcile_task(route, task(route), 'A')
     assert old.run_id == 'A' and old.current_run == 'successor'
     assert route.task(task(route)).current_run == 'successor'
-    assert route.kernel('A').storage.run_id == 'A'
+    assert selected_kernel(route, 'A').storage.run_id == 'A'
     page = route.discover()
     assert [(item.run_id, item.current) for item in page.items] == [('A', False), ('successor', True)]
 
 
 def test_namespace_checks_are_in_original_writer_before_commit_and_rollback_all_foreign_metadata(route):
-    route.idle(task(route))
+    idle_task(route, task(route))
     before = dump(route)
     other = TaskKey(route.repository_root, 'foreign/project', 1)
     from agent_run.core.task_creation import ensure_idle_task
@@ -164,7 +166,7 @@ def test_namespace_checks_are_in_original_writer_before_commit_and_rollback_all_
         foreign.metadata()
     assert dump(route) == before
     with pytest.raises(KernelError, match='task_location_identity'):
-        route.idle(other)
+        idle_task(route, other)
     assert dump(route) == before
 
 
@@ -242,7 +244,7 @@ def test_read_failure_or_missing_database_never_implicitly_initializes_or_create
         elif operation == 'create':
             create(route)
         else:
-            route.reconcile(task(route), 'original-proposal')
+            reconcile_task(route, task(route), 'original-proposal')
     assert failure.value.reason == 'unreadable_state' and failure.value.path == route.database
     assert failure.value.recovery_hint
     assert not route.database.exists() and not route.database.parent.exists()
@@ -305,7 +307,7 @@ def test_real_storage_commit_reply_loss_reconciles_once_without_new_proposal_or_
     if committed:
         result = create(route)
         assert result.created and result.run_id == 'A'
-        assert route.reconcile(task(route), 'A').run_id == 'A'
+        assert reconcile_task(route, task(route), 'A').run_id == 'A'
     else:
         with pytest.raises(KernelError, match='task_creation_unknown'):
             create(route)

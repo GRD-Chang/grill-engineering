@@ -58,7 +58,8 @@ RemotePort 与 OfflinePort 使用同一观察解析 source、target、pr_base；
 夹具只声明输入，不选择下一状态、不解释业务规则，不建立通用 completed 工厂。
 
 单线程业务与 Git 消费者可显式选择 `run_scoped_kernel.domain_scenario`：
-先由正常 `RepositoryRoute` 创建原库，再把同一库交给真实 `Transaction` / `RunTransaction`。
+先由 `RepositoryRoute` 定位并初始化原库，通过 `runtime.task.create_task` 发布完整 Task/Run，
+再把同一库交给真实 `Transaction` / `RunTransaction`。路由本身不构造 Kernel 或查询文档。
 Core、OperationRunner、Git 和每次业务提交仍实际执行；事务保留外键、只读拒写、
 材料摘要/预算和错误回滚，fixture 退出关闭连接，不复制完成状态或跨用例共享连接。
 这层负责业务组合，文件准入、保存排序与 OS 资源保护由原生 Storage 测试负责。
@@ -138,6 +139,13 @@ Parent push 前与单 Ticket 图的 Final approval 前状态由 `offline_prefixe
 准备只读模板，每例复制独立 Git/SQLite，并重建原生 Kernel；Host、重开和故障测试
 仅复用故障前的历史，被测段仍使用原生存储。图依赖用例负责 Completion→后继 Ticket→
 Final PR 的连接；不确定 Final merge 的恢复用例负责准确合并、关闭与完整资源回收。
+
+Parent 修复的边界变体由 `repair_prefixes` 复用首次 Final Review 前、或修复分支已
+推送但修复 PR 尚未创建的正常历史。模板按 worker 静止准备，每例在同一绝对路径
+复制独立的 Git/SQLite，重建 Kernel 后使用领域事务入口；显式重开继续走原生存储。
+第二种前置只用于默认 Policy、默认开发输入，且断言未消费任何 Checks，副本再指定
+后续外部 Checks。主修复旅程、自定义开发内容和特殊预算仍从各自必要前置验证；
+所有 PR 写入、Checks、故障注入、写前授权、失回复与恢复均在每例独立执行。
 
 公开 Human Resume 与 Abandon 共用 `test_public_parent_integration_human_resume` 的
 真实 Host 旅程：先验证 Final 冲突修复、原 Attempt、线程和预算，再放弃未批准 PR，

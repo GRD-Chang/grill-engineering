@@ -24,8 +24,9 @@ from agent_run.errors import KernelError
 from agent_run.adapters.systemd import HostUnavailable
 from agent_run.runtime.handoff import HandoffError
 
-from agent_run.cli import selection as cli_selection, settings as personal_settings
-from agent_run.queries.run import QueryDocument, read, header
+from agent_run.runtime import run_selection as cli_selection
+from agent_run.cli import settings as personal_settings
+from agent_run.queries.run import QueryDocument, read, read_route, header
 from agent_run.queries.read_facts import QueryError
 from agent_run.cli.render import render, render_settings, safe_text
 from agent_run.storage.preflight import UnsupportedState
@@ -125,13 +126,17 @@ def _print_receipt(parsed: argparse.Namespace, output: Mapping[str, Any], langua
     idle = (parsed.command == "stop" and output.get("action") == "stop"
             and output["result"] == "no_op" and output["status"] == "not_running"
             and output.get("action_id") is None and output["host"] == "exited")
+    delivered = output.get("delivery_completed") is True
+    outcome = ("delivered" if delivered else "attached" if output["result"] == "attached" else
+               "resumed" if output.get("request_outcome") == "resumed" else
+               "unsuccessful" if output.get("requested_action_succeeded") is False else "accepted")
     print(safe_text(text("cli.no_active_agent", language=language) if idle else
-                   copy("completed" if completed else "attached" if output["result"] == "attached" else "accepted", command=parsed.command)))
+                   copy("completed" if completed else outcome, command=parsed.command)))
     if not completed and not idle:
         status = {"action_pending": "pending", "action_applied": "applied", "action_complete": "complete",
                   "action_updating": "updating", "action_superseded": "superseded",
                   "action_failed": "failed"}.get(output["status"], "unknown")
-        print(copy("status", status=copy(status)))
+        print(copy("original_status" if output["result"] == "attached" else "status", status=copy(status)))
     host = output["host"] if output["host"] in {"running", "exited"} else "unknown"
     if not idle:
         print(copy("host_" + host))
@@ -153,7 +158,7 @@ def _print_receipt(parsed: argparse.Namespace, output: Mapping[str, Any], langua
         command.append("--help")
     if parent is not None:
         command.extend(("--parent", str(parent)))
-    if not completed and not idle:
+    if not completed and not idle and not delivered:
         print(copy("boundary"))
     print(safe_text(copy("next", command=shlex.join(command))))
 
@@ -209,12 +214,14 @@ def main(arguments: Sequence[str] | None = None, *, repository_routes: Sequence[
                     selection = cli_selection.control_selection(parsed, language=language)
                     route, _ = cli_selection.repository_target(selection, repository_routes)
             output = execute(parsed, language=language, repository_route=route)
+            from agent_run.runtime.action_observation import observe_request
+            output = observe_request(parsed, output, repository_route=route)
             language = output.pop("language", language)
             if parsed.as_json:
                 print(json.dumps(output, ensure_ascii=False, sort_keys=True))
             else:
                 _print_receipt(parsed, output, language)
-            return 0
+            return (0 if output.get("requested_action_succeeded") is True else 2) if parsed.command in {"approve", "resume"} else 0
         if parsed.command == "doctor":
             from agent_run.install.doctor import run as diagnose
             if parsed.state_dir is not None and parsed.run_id is None:
@@ -224,7 +231,7 @@ def main(arguments: Sequence[str] | None = None, *, repository_routes: Sequence[
                 parsed.parent = None
                 routes = repository_routes if repository_routes is not None else cli_selection.managed_repository_routes(parsed)
                 route, location = cli_selection.repository_target(parsed, routes)
-                frozen = route.read(location.run_id, "settings").data
+                frozen = read_route(route, location.run_id, "settings").data
                 parsed.repo = location.task.repository
             return diagnose(as_json=parsed.as_json, local=parsed.local, online=parsed.online,
                             mode=parsed.mode, repository=parsed.repo, frozen=frozen)

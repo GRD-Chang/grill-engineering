@@ -44,6 +44,7 @@ def test_current_command_help_uses_personal_language_without_starting_work(
 ) -> None:
     from agent_run.config.defaults import UserDefaultsStore
     from agent_run.core.kernel import Kernel
+    from agent_run.runtime.task import create_managed_task
     from agent_run.cli.main import main
 
     store = UserDefaultsStore()
@@ -53,7 +54,8 @@ def test_current_command_help_uses_personal_language_without_starting_work(
     def forbidden(*_args, **_kwargs):
         pytest.fail("Help must not create a Run or start a process")
 
-    monkeypatch.setattr(Kernel, "create_task", forbidden)
+    import agent_run.runtime.run_control as control
+    monkeypatch.setattr(control, "create_managed_task", forbidden)
     monkeypatch.setattr(subprocess, "run", forbidden)
     assert main([*arguments, "--help"]) == 0
     captured = capsys.readouterr()
@@ -181,6 +183,7 @@ def test_stop_receipt_uses_frozen_language_and_keeps_internal_identity_only_in_j
     from agent_run.config.creation import freeze_creation
     from agent_run.config.defaults import UserDefaultsStore
     from agent_run.core.kernel import Kernel
+    from agent_run.runtime.task import create_managed_task
     from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
     from agent_run.cli.main import main
 
@@ -194,7 +197,7 @@ def test_stop_receipt_uses_frozen_language_and_keeps_internal_identity_only_in_j
                         "refs/heads/task", "refs/heads/main")
     spec = freeze_creation(RunSpec("private-run-identity", workspace.repository, 12, "parent", "graph", (delivery,),
                                    repository_root=str(root)), store)
-    kernel = Kernel.create_task(workspace.state_root / "kernel.sqlite3", spec,
+    kernel = create_managed_task(workspace.state_root / "kernel.sqlite3", spec,
                                requirements=Requirements(ParentIssue(12, "Original Parent", "Original requirement"), ()))
     # An idle whole-Run Stop is read-only. This receipt represents revocation
     # of an existing owner; it must not claim that the owner has exited.
@@ -242,7 +245,7 @@ def test_ambiguous_run_error_keeps_locations_and_machine_identity_without_repeat
     # the CLI's refusal and private-ID presentation, rather than reuse one Task.
     kernels = [_create(tmp_path / identity, identity) for identity in ("private-one", "private-two")]
     routes = tuple(RepositoryRoute.from_database(kernel.storage.path) for kernel in kernels)
-    monkeypatch.setattr('agent_run.cli.selection.managed_repository_routes', lambda parsed: routes)
+    monkeypatch.setattr('agent_run.runtime.run_selection.managed_repository_routes', lambda parsed: routes)
     before = _snapshot(tmp_path)
     arguments = ["status", "--repo", "example/project", "--parent", "1", "--data-root", str(tmp_path)]
     assert main(arguments) == 2
@@ -278,10 +281,11 @@ def test_receipt_distinguishes_known_failed_action_from_unconfirmed_state(capsys
 def test_ambiguous_databases_in_the_same_directory_have_distinct_copyable_locations(tmp_path: Path, capsys, monkeypatch) -> None:
     from agent_run.cli.main import main
     from agent_run.core.kernel import Kernel
+    from agent_run.runtime.task import create_managed_task
     from agent_run.model import Commit, Delivery, DeliveryKind, ParentIssue, Requirements, RunSpec
     from support.offline import fixture_inputs
     from support.environment import durable_snapshot as _snapshot
-    from agent_run.cli import selection
+    from agent_run.runtime import run_selection as selection
     from agent_run.storage.routing import RepositoryRoute
 
     delivery = Delivery("parent:1", DeliveryKind.PARENT_ONLY, 1, "original", Commit("base", "tree"),

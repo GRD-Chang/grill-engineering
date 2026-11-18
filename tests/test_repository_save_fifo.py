@@ -3,6 +3,7 @@
 Clock substitutes exercise decisions, not actual kernel clock comparability.
 True separate-process/clock/crash/WAL-cost acceptance remains explicitly pending.
 """
+from agent_run.runtime.task import create_task
 from contextlib import closing, contextmanager
 import io
 import json
@@ -205,7 +206,7 @@ def repository(tmp_path, monkeypatch):
             'refs/heads/' + name, 'refs/heads/main')
         spec = RunSpec(name, route.repository, parent, 'r', 'g', (delivery,), language='en',
             repository_root=str(route.repository_root), inputs=fixture_inputs())
-        route.create(TaskKey(route.repository_root, route.repository, parent), spec,
+        create_task(route, TaskKey(route.repository_root, route.repository, parent), spec,
             Requirements(ParentIssue(parent, 'Parent', 'Original input'), ()))
     return route
 

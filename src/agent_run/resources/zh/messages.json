@@ -1174,5 +1174,9 @@
   "presentation.observation.host_exit": "已观察到 Host 域退出；未记录 Worker 退出回执",
   "presentation.observation.unknown": "未知；缺少可比较的本地证据",
   "repair.pr_title": "fix: Parent #{issue} 整体修复 {sequence}",
-  "repair.pr_body": "Parent #{issue} 的 Run Repair PR\n\n候选：`{candidate}`\n\n独立 Parent 验收：`{review}`。本 PR 等待目标 Run 分支的必过检查，通过后由程序合入。最终交付仍需默认分支检查及明确人工批准。"
+  "repair.pr_body": "Parent #{issue} 的 Run Repair PR\n\n候选：`{candidate}`\n\n独立 Parent 验收：`{review}`。本 PR 等待目标 Run 分支的必过检查，通过后由程序合入。最终交付仍需默认分支检查及明确人工批准。",
+  "cli.receipt.delivered": "{command}: 最终交付与必要收尾已完成",
+  "cli.receipt.resumed": "{command}: 本次恢复已应用，Executor 已接续执行",
+  "cli.receipt.unsuccessful": "{command}: 本次请求尚未成功完成；请核对原工作状态",
+  "cli.receipt.original_status": "原请求状态: {status}"
 }

@@ -1,4 +1,5 @@
 """First occurrence of fixed test stages; original Host command/calls stay intact."""
+from agent_run.runtime import host_control
 import json
 import os
 from pathlib import Path
@@ -73,12 +74,12 @@ def install(path: Path) -> int:
 def install_cli(path: Path) -> int:
     """Fixed normal-return boundaries; active exceptions bypass new probes."""
     from agent_run.cli import main as cli_main
-    from agent_run.cli import lifecycle
+    from agent_run.runtime import host_control
     from agent_run.runtime.foreground_host import ForegroundHost
 
     descriptor, record = _recorder(path, cli=True)
     launch = ForegroundHost.launch
-    submit, notify = lifecycle._submit, lifecycle._notify_committed
+    submit, notify = host_control.launch_admitted, host_control.notify_committed
     main = cli_main.main
 
     def observed_launch(self, kernel, request, *args, **kwargs):
@@ -107,7 +108,7 @@ def install_cli(path: Path) -> int:
         return result
 
     ForegroundHost.launch = observed_launch
-    lifecycle._submit, lifecycle._notify_committed = observed_submit, observed_notify
+    host_control.launch_admitted, host_control.notify_committed = observed_submit, observed_notify
     cli_main.main = observed_main
     return descriptor
 

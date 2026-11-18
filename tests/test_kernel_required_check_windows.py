@@ -93,7 +93,7 @@ def test_checks_observations_own_their_original_window(monkeypatch, kind, initia
             if state == "read_error":
                 with kernel.storage.transaction(write=False) as tx:
                     token = kernel._operation_token(tx, subject, False)
-                return kernel._wait_for_read(token, execution, "github_read_failed", "Checks unavailable")
+                return kernel.wait_for_read(token, execution, "github_read_failed", "Checks unavailable")
             result = "fail" if state == "mixed_pending" else state
             details = (("A", "fail"), ("B", "pending")) if state == "mixed_pending" else (("required", result),)
             with kernel.storage.transaction() as tx:

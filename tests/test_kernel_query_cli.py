@@ -494,7 +494,7 @@ def test_parser_errors_use_personal_language_stderr_and_exit_two(
 def test_interrupted_read_returns_130_without_advancing_or_writing(
     tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import agent_run.cli.selection as cli_selection
+    import agent_run.runtime.run_selection as cli_selection
     kernel = _create(tmp_path)
     before = _snapshot(tmp_path)
 

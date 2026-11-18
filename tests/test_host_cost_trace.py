@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_run.adapters.remote import RemoteEffects
+from agent_run.adapters.remote_observation import RemoteObservation
 from agent_run.core.operation_runner import OperationRunner
 from agent_run.storage.sqlite import Storage
 from support import host_cost_trace as costs
@@ -65,11 +65,11 @@ def test_original_calls_keep_arguments_results_and_contextmanager_unwind(trace, 
         finally:
             calls.append('exit')
 
-    monkeypatch.setattr(RemoteEffects, 'source', source)
+    monkeypatch.setattr(RemoteObservation, 'source', source)
     monkeypatch.setattr(Storage, 'transaction', transaction)
     costs.observe_host(monkeypatch.setattr, trace)
     owner = object()
-    assert RemoteEffects.source(owner, 'PRIVATE_ARGUMENT', token='PRIVATE_TOKEN') is sentinel
+    assert RemoteObservation.source(owner, 'PRIVATE_ARGUMENT', token='PRIVATE_TOKEN') is sentinel
     failure = RuntimeError('PRIVATE_FAILURE')
     with pytest.raises(RuntimeError) as caught:
         with Storage.transaction(owner, write=False, deadline=123.25) as tx:
@@ -100,7 +100,7 @@ def test_exit_measurement_watchdog_keeps_original_failure_and_cannot_resume_busi
         if len(writes) == 2:
             raise watchdog
 
-    monkeypatch.setattr(RemoteEffects, 'source', source)
+    monkeypatch.setattr(RemoteObservation, 'source', source)
     costs.observe_host(monkeypatch.setattr, trace)
     monkeypatch.setattr(trace, 'flush', flush)
     # A handled ambient exception is not evidence that it is unwinding.
@@ -108,7 +108,7 @@ def test_exit_measurement_watchdog_keeps_original_failure_and_cannot_resume_busi
         raise RuntimeError('already handled')
     except RuntimeError:
         with pytest.raises(RuntimeError if original_fails else TimeoutError) as caught:
-            RemoteEffects.source(object(), 1)
+            RemoteObservation.source(object(), 1)
             calls.append('resumed')
     assert caught.value is (original if original_fails else watchdog)
     assert calls == ['original']

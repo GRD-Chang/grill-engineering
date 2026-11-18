@@ -102,7 +102,7 @@ def test_removed_stage_commands_are_rejected_by_the_real_cli(command: str) -> No
 
 
 def test_run_repair_docs_describe_direct_delivery_and_exact_candidate_promotion() -> None:
-    context = (PROJECT_ROOT / "CONTEXT.md").read_text(encoding="utf-8")
+    context = (PROJECT_ROOT / "GLOSSARY.md").read_text(encoding="utf-8")
     operator_guide = (PROJECT_ROOT / "docs" / "agent-run.md").read_text(
         encoding="utf-8"
     )

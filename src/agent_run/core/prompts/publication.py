@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_run.config.resources import bind_resources, resource
+from agent_run.contracts.prompt import resource
 
 from agent_run.core.prompts.context import (
     human_continuation,
@@ -18,7 +18,6 @@ from agent_run.core.prompts.context import (
 def publication_prompt(
     request: dict[str, Any], *, final_run: bool = False
 ) -> str:
-    request = bind_resources(request)
     if final_run:
         request = _final_request(request)
     evidence = _publication_evidence(request)
@@ -37,7 +36,6 @@ def publication_prompt(
 def publication_continuation_prompt(
     request: dict[str, Any], *, final_run: bool = False
 ) -> str:
-    request = bind_resources(request)
     if final_run:
         request = _final_request(request)
     blocks = (

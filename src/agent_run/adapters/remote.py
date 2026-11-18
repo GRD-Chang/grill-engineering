@@ -5,224 +5,63 @@ This adapter has no local journal, delivery phase or writable Run representation
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Mapping
+from dataclasses import replace
 from datetime import datetime
-from functools import wraps
 import json
 from pathlib import Path
 import re
-import random
-import time
 import subprocess
 from tempfile import NamedTemporaryFile
-from typing import Any, NoReturn, ParamSpec, Protocol, TYPE_CHECKING, TypeVar
-from urllib.parse import urlencode, urlsplit
+from typing import Any, NoReturn, Protocol
 
 from agent_run.contracts.write_authority import WriteAuthority, admit_write
-from agent_run.contracts.status_comment import StatusTarget
-from agent_run.contracts.repository import same_repository
-from agent_run.adapters.github import GhGitHubReader, _SourceObservation
-from agent_run.adapters import github_commands
-from agent_run.adapters.auth.runner_transport import runner_options
+from agent_run.adapters.github_transport import GitHubReadTransport, ReadAPI, GitReadAPI, _login, _string, _text, _number, _sha
+from agent_run.adapters.operation_errors import EffectReadError, operation_errors as _operation_errors
 from agent_run.errors import GitHubReadError
-from agent_run.errors import bounded_error
 from agent_run.contracts.identity import validate_identity_snapshot
-from agent_run.adapters.github_commands import run_read_command, run_write_command
+from agent_run.adapters.github_commands import run_write_command
 from agent_run.adapters.auth.runner_transport import runner_git_environment
 
 from agent_run.adapters.cleanup import cleanup_remote_ref, inspect_remote_ref
 
 from agent_run.adapters.git_objects import LocalGit
 from agent_run.errors import ObservationSuperseded as ObservationSuperseded
-from agent_run.model import Commit, Effect, EffectResult, PullRequest, Requirements, ResourceInspection, ResourceWitness
+from agent_run.model import Commit, Effect, EffectResult, PullRequest, ResourceInspection, ResourceWitness
 from agent_run.errors import KernelError
 from agent_run.adapters.local_git import LocalEffects
 from agent_run.contracts.pr_observation import pr_target
-from agent_run.adapters.source import (read_remote_heads, read_requirements, read_required_check_facts,
-                             normalize_required_checks)
+from agent_run.adapters.source import read_remote_heads
 
 from agent_run.storage.sqlite import MATERIAL_LIMIT
 
-if TYPE_CHECKING:
-    from agent_run.core.operation_contract import DeliveryFacts, DeliveryRead, PreparedRequirements
 
-
-class EffectReadError(GitHubReadError):
-    """A typed read failure after an actual command's response was observed."""
-
-    def __init__(self, error: GitHubReadError, response: subprocess.CompletedProcess[str]) -> None:
-        super().__init__(error.code, error.message)
-        self.write_returncode = response.returncode
-        self.write_diagnostic = response.stderr[:4096]
-
-
-_Arguments = ParamSpec("_Arguments")
-_Result = TypeVar("_Result")
-
-
-def _operation_errors(method: Callable[_Arguments, _Result]) -> Callable[_Arguments, _Result]:
-    """Translate physical transport failures at the Core port boundary only."""
-    @wraps(method)
-    def invoke(*args: _Arguments.args, **kwargs: _Arguments.kwargs) -> _Result:
-        from agent_run.core.operation_contract import ReadUnavailable
-        try:
-            return method(*args, **kwargs)
-        except GitHubReadError as error:
-            returncode, diagnostic = None, ""
-            if isinstance(error, EffectReadError) and error.write_returncode != 0:
-                returncode, diagnostic = error.write_returncode, bounded_error(error.write_diagnostic)
-            raise ReadUnavailable(error.code, bounded_error(error.message),
-                                  write_returncode=returncode, write_diagnostic=diagnostic) from error
-        except OSError as error:
-            # An interrupted read/transport supplies no observed write status.
-            raise ReadUnavailable("operation_io_unavailable", bounded_error(str(error))) from error
-    return invoke
-
-
-class PhysicalAPI(Protocol):
+class PhysicalAPI(ReadAPI, Protocol):
     """Raw external objects, lists and single writes; no Effect decisions."""
-    def object(self, endpoint: str) -> dict[str, Any]: ...
-    def list(self, endpoint: str) -> list[dict[str, Any]]: ...
     def write(self, endpoint: str, method: str, body: Mapping[str, Any]) -> subprocess.CompletedProcess[str]: ...
 
 
-class PhysicalGit(Protocol):
-    def refs(self) -> dict[str, str]: ...
-    def fetch(self, sha: str) -> None: ...
+class PhysicalGit(GitReadAPI, Protocol):
     def push(self, ref: str, before: str | None, after: str) -> subprocess.CompletedProcess[str]: ...
     def delete(self, ref: str, expected: str) -> subprocess.CompletedProcess[str]: ...
 
 
-@dataclass(frozen=True)
-class _SourceBasis:
-    query: DeliveryRead | None
-    observation: _SourceObservation
-    owner: RemoteEffects
-
-
-_STATUS_COMMENT_QUERY = """query StatusCommentObservation(
-  $owner:String!, $name:String!, $number:Int!, $endCursor:String) {
-  VIEWER
-  repository(owner:$owner,name:$name) { nameWithOwner
-    pullRequest(number:$number) { number author { __typename login }
-      headRefName baseRefName headRepository { nameWithOwner } baseRepository { nameWithOwner }
-      comments(first:100,after:$endCursor) { totalCount pageInfo { endCursor hasNextPage }
-        nodes { fullDatabaseId body author { __typename login } repository { nameWithOwner }
-          pullRequest { number repository { nameWithOwner } } }
-      }
-    }
-  }
-}"""
-
-
-class RemoteEffects:
+class RemoteEffects(GitHubReadTransport):
     """A concrete execute/reconcile port; authorize is required for every write.
 
     The caller supplies the Run's frozen Runner reference and selected repository.
     Writes are never retried here. Exact target readback needs no live write grant.
     Failed reads are unknown, never absence, prior, success or permission to retry.
     """
+    api: PhysicalAPI | None
+
     def __init__(self, root: Path, repository: str, *, runner_identity: Mapping[str, Any],
                  remote: str = "origin", api: PhysicalAPI | None = None,
                  git_writes: PhysicalGit | None = None, cancelled: Callable[[], bool] | None = None) -> None:
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
-            raise ValueError("Expected an exact GitHub owner/repository")
-        if not remote or remote.startswith("-") or "\0" in remote:
-            raise ValueError("Expected a remote name or URL")
-        self.root, self.repository, self.remote = root, repository, remote
-        self.identity = validate_identity_snapshot(runner_identity)
-        self.git = LocalGit(root)
-        self.api = api
+        super().__init__(root, repository, runner_identity=runner_identity, remote=remote,
+                         api=api, git_reads=git_writes, cancelled=cancelled)
         self.git_writes = git_writes
-        self.cancelled = cancelled
 
-    def actor(self, before_attempt: Callable[[], None] | None = None) -> str:
-        """Resolve the selected Runner's actual login, not a fixture identity."""
-        if self.identity["source"] == "app":
-            from agent_run.adapters.auth.app import resolve_app_login
-            from agent_run.config.github_app import GitHubAppProfile
-            profile = self.identity["app_profile"]
-            return resolve_app_login(GitHubAppProfile(profile["app_id"], profile["installation_id"],
-                                                     Path(profile["private_key_path"])))
-        return _text((self._api("user") if before_attempt is None else self._api("user", before_attempt))["login"])
-
-    def read_status_comment(self, target: StatusTarget, marker: str, intent: Mapping[str, Any],
-                            cancelled: Callable[[], bool]) -> dict[str, Any]:
-        """Observe one exact display intent. Foreign/absent is never write authority."""
-        def check_cancel() -> None:
-            if cancelled():
-                raise ValueError("Status delivery cancelled")
-        check_cancel()
-        if not same_repository(target.repository, self.repository):
-            return {"disposition": "third"}
-        actor, pr, rows = self._status_comment_facts(target, check_cancel)
-        check_cancel()
-        if actor != target.actor:
-            return {"disposition": "third"}
-        head, base = pr.get("head", {}), pr.get("base", {})
-        if (not isinstance(head, dict) or not isinstance(base, dict)
-                or not isinstance(head.get("repo"), dict) or not isinstance(base.get("repo"), dict)
-                or pr.get("number") != target.pr_number or _login(pr.get("user")) != target.actor
-                or not isinstance(head["repo"].get("full_name"), str)
-                or not same_repository(head["repo"]["full_name"], self.repository)
-                or not isinstance(base["repo"].get("full_name"), str)
-                or not same_repository(base["repo"]["full_name"], self.repository)
-                or "refs/heads/" + str(head.get("ref")) != target.source_ref
-                or "refs/heads/" + str(base.get("ref")) != target.target_ref):
-            return {"disposition": "third"}
-        check_cancel()
-        prefix = f"<!-- agent-run-status:{target.key}:"
-        found = [row for row in rows if row.get("id") == intent["comment_id"]
-                 or isinstance(row.get("body"), str) and prefix in row["body"]]
-        if not found:
-            return {"disposition": "prior" if intent["comment_id"] is None else "third"}
-        if len(found) != 1:
-            return {"disposition": "third"}
-        row = found[0]
-        issue_path = urlsplit(str(row.get("issue_url", ""))).path.split("/")
-        if (type(row.get("id")) is not int or row["id"] <= 0
-                or intent["comment_id"] is not None and row["id"] != intent["comment_id"]
-                or _login(row.get("user")) != target.actor
-                or len(issue_path) != 6 or issue_path[:2] != ["", "repos"]
-                or issue_path[4:] != ["issues", str(target.pr_number)]
-                or not same_repository("/".join(issue_path[2:4]), self.repository)
-                or not isinstance(row.get("body"), str) or not row["body"].startswith(marker + "\n")):
-            return {"disposition": "third"}
-        disposition = ("target" if row["body"] == intent["body"] else "prior"
-                       if intent["comment_id"] is not None and row["body"] == intent["before"] else "third")
-        return {"disposition": disposition, "comment_id": row["id"]}
-
-    def _status_comment_facts(self, target: StatusTarget, check_cancel: Callable[[], None]
-                              ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
-        """One complete round; initial, pre-write and readback calls stay independent."""
-        if self.api is not None:
-            return (self.actor(check_cancel),
-                    self._api(f"repos/{self.repository}/pulls/{target.pr_number}", check_cancel),
-                    self._pages(f"repos/{self.repository}/issues/{target.pr_number}/comments?per_page=100", check_cancel))
-        app_actor = self.actor(check_cancel) if self.identity["source"] == "app" else None
-        owner, name = self.repository.split("/", 1)
-        query = _STATUS_COMMENT_QUERY.replace("VIEWER", "" if app_actor is not None else "viewer { login }")
-        command = ["gh", "api", "graphql", "--paginate", "--slurp", "-f", "query=" + query,
-                   "-f", "owner=" + owner, "-f", "name=" + name, "-F", "number=" + str(target.pr_number)]
-        pages = json.loads(self._read(command, check_cancel).stdout)
-        check_cancel()
-        return _status_comment_pages(pages, self.repository, app_actor)
-
-    def write_status_comment(self, target: StatusTarget, marker: str, intent: Mapping[str, Any],
-                             authorize: WriteAuthority, cancelled: Callable[[], bool]) -> dict[str, Any]:
-        """Only POST/PATCH this comment. No retry, deletion, merge or Issue mutation."""
-        def boundary() -> None:
-            if self.read_status_comment(target, marker, intent, cancelled)["disposition"] != "prior":
-                raise ValueError("Status comment changed before write")
-        identifier = intent["comment_id"]
-        endpoint, method = (f"issues/{target.pr_number}/comments", "POST") if identifier is None else (f"issues/comments/{identifier}", "PATCH")
-        response = self._write(f"repos/{self.repository}/{endpoint}", method, {"body": intent["body"]}, authorize, boundary)
-        try:
-            result = self.read_status_comment(target, marker, intent, cancelled)
-        except (GitHubReadError, OSError, ValueError) as error:
-            raise EffectReadError(GitHubReadError("status_readback_unavailable", "Status readback unavailable"), response) from error
-        return {**result, "write_returncode": response.returncode}
 
     @_operation_errors
     def execute(self, effect: Effect, authorize: WriteAuthority) -> EffectResult:
@@ -374,13 +213,6 @@ class RemoteEffects:
         except (KernelError, OSError, ValueError, KeyError, TypeError) as error:
             return EffectResult("unknown", raw={"diagnostic": str(error)[:4096]})
 
-    def pull_request(self, number: int) -> PullRequest:
-        """Original PR identity and actual commit trees, for reads and receipts."""
-        return self._pr(self._api(f"repos/{self.repository}/pulls/{number}"))
-
-    def find_pull_request(self, source_ref: str, target_ref: str) -> PullRequest | None:
-        data = self._find_pr(source_ref, target_ref, None)
-        return None if data is None else self._pr(data)
 
     @_operation_errors
     def prepare_retirement(self, effect: Effect) -> dict[str, Any]:
@@ -456,7 +288,7 @@ class RemoteEffects:
         path = self._retirement_path(effect)
         events = [event for event in self._events_at(path) if event["id"] > intent["baseline_event_id"]]
         marker = "<!-- agent-run-retirement:" + effect.effect_id + " -->"
-        comments = [comment for comment in self._pages(path + "/comments?per_page=100")
+        comments = [comment for comment in self.list(path + "/comments?per_page=100")
                     if marker in _string(comment["body"])]
         if not comments:
             return EffectResult("prior" if pr.state == "OPEN" and not events else "third", pr=pr,
@@ -565,7 +397,7 @@ class RemoteEffects:
         issue = self._issue(effect)
         raw: dict[str, Any] = {"issue": effect.payload["issue"], "state": issue["state"].upper(),
                                "prior_close": dict(original)}
-        comments = [comment for comment in self._pages(self._issue_path(effect) + "/comments?per_page=100")
+        comments = [comment for comment in self.list(self._issue_path(effect) + "/comments?per_page=100")
                     if comment["id"] == intent["comment_id"]]
         if (len(comments) != 1 or comments[0]["body"] != intent["comment_body"]
                 or _login(comments[0].get("user")) != intent["actor"]
@@ -634,7 +466,7 @@ class RemoteEffects:
 
     def _reconcile_recovery_comment(self, effect: Effect) -> EffectResult:
         raw = self._recovery_comment_proof(effect)
-        comments = [comment for comment in self._pages(self._issue_path(effect) + "/comments?per_page=100")
+        comments = [comment for comment in self.list(self._issue_path(effect) + "/comments?per_page=100")
                     if self._marker(effect) in comment["body"]]
         if comments:
             # An exact sent write remains a physical fact after later Issue edits.
@@ -688,442 +520,6 @@ class RemoteEffects:
         response = self._write(self._issue_path(effect), "PATCH", {"state": "open"}, authorize, guard)
         return self._readback(effect, response)
 
-    @_operation_errors
-    def source(self, parent_number: int) -> Requirements:
-        reader = GhGitHubReader(self.repository, working_directory=self.root, runner_identity=self.identity,
-                                cancelled=self.cancelled)
-        return read_requirements(reader, parent_number)
-
-    @_operation_errors
-    def source_observation(self, parent_number: int, query: DeliveryRead | None) -> PreparedRequirements:
-        from agent_run.core.operation_contract import PreparedRequirements
-        if type(parent_number) is not int or parent_number < 1:
-            raise ValueError('Parent Issue number must be a positive integer')
-        if query is not None:
-            self._validate_delivery_read(query)
-        reader = GhGitHubReader(self.repository, working_directory=self.root, runner_identity=self.identity,
-                                cancelled=self.cancelled)
-        projection = None
-        if query is not None and self.api is None:
-            projection = self._delivery_projection(None, None, query.pr_number if query.read_pr else None,
-                (query.source_ref, query.target_ref) if query.read_pr and query.pr_number is None else None)
-            declarations, fields, _, arguments = projection
-            for key, ref in (('sourceRef', query.source_ref), ('targetRef', query.target_ref)):
-                declarations.append('$' + key + ':String!')
-                fields.append(key + ':ref(qualifiedName:$' + key + ') { name prefix repository { nameWithOwner } '
-                    'target { __typename oid ... on Commit { tree { oid } } } }')
-                arguments += ['-f', key + '=' + ref]
-        observation = _SourceObservation(reader, delivery_projection=projection)
-        return PreparedRequirements(observation.read(parent_number), _SourceBasis(query, observation, self))
-
-    def _projected_refs(self, envelope: Mapping[str, Any], query: DeliveryRead
-                        ) -> tuple[tuple[str | None, str | None], dict[str, Any]] | None:
-        """Validate ref addressing; short-name fallback requests the exact old reader."""
-        if envelope.get('errors'):
-            return None
-        data = envelope['data']
-        repository = data['repository']
-        if repository is None:
-            raise GitHubReadError('github_read_failed', 'Delivery repository is unavailable')
-        if not same_repository(_text(repository['nameWithOwner']), self.repository):
-            raise ValueError('foreign Delivery repository')
-        refs: list[str | None] = []
-        objects: dict[str, Any] = {}
-        for key, expected in (('sourceRef', query.source_ref), ('targetRef', query.target_ref)):
-            ref = repository[key]
-            if ref is None:
-                refs.append(None)
-                continue
-            if not same_repository(_text(ref['repository']['nameWithOwner']), self.repository):
-                raise ValueError('foreign Delivery ref repository')
-            if _text(ref['prefix']) + _text(ref['name']) != expected:
-                return None
-            value = ref['target']
-            if value is None:
-                raise GitHubReadError('github_read_failed', 'Delivery ref target is unavailable')
-            if value['__typename'] != 'Commit':
-                raise ValueError('Delivery ref does not name a commit')
-            sha, tree = _sha(value['oid']), _sha(value['tree']['oid'])
-            if sha in objects and objects[sha]['tree']['oid'] != tree:
-                raise ValueError('Same commit has contradictory trees')
-            objects[sha] = {'__typename': 'Commit', 'oid': sha, 'tree': {'oid': tree}}
-            refs.append(sha)
-        projected = dict(repository)
-        projected.update({'object' + str(index): objects[sha] for index, sha in enumerate(sorted(objects))})
-        return (refs[0], refs[1]), {'data': {**data, 'repository': projected}}
-
-    @_operation_errors
-    def complete_observation(self, query: DeliveryRead, prepared: PreparedRequirements) -> DeliveryFacts:
-        stage = prepared.physical
-        if not isinstance(stage, _SourceBasis) or stage.owner is not self:
-            raise ValueError('Foreign Source observation')
-        self._validate_delivery_read(query)
-        observation = stage.observation
-        if self.api is not None:
-            return self.delivery(query)
-        observation._remaining()
-        projected = None
-        if query == stage.query and observation.delivery_packet is not None:
-            try:
-                projected = self._projected_refs(observation.delivery_packet, query)
-            except (ValueError, KeyError, TypeError) as error:
-                raise GitHubReadError('github_invalid_response', 'Delivery basis facts are malformed') from error
-        # Mismatched demand discards both facts and errors. No failed Source
-        # attempt can retain a packet. This starts a new Delivery attempt.
-        refs = read_remote_heads(self.root, query.source_ref, query.target_ref,
-            runner_identity=self.identity, remote=self.remote, command=observation.command)
-        if projected is not None and refs != projected[0]:
-            raise GitHubReadError('github_observation_pending', 'GraphQL and Git refs changed during observation')
-        basis, raw_pr, actor = self._delivery_basis(*refs, query.pr_number if query.read_pr else None,
-            (query.source_ref, query.target_ref) if query.read_pr and query.pr_number is None else None,
-            deadline=observation.deadline, attempts=int(observation.combined_attempted),
-            initial=None if projected is None else projected[1])
-        return self._finish_delivery(query, refs, basis, raw_pr, actor)
-
-    def _delivery_projection(self, source_sha: str | None, target_sha: str | None,
-                             pr_number: int | None, discovery: tuple[str, str] | None = None,
-                             *, compact: bool = False,
-                             ) -> tuple[list[str], list[str], list[str], list[str]]:
-        """Build the Delivery fields independently of the request that carries them."""
-        owner, name = self.repository.split('/', 1)
-        identities = sorted({_sha(sha) for sha in (source_sha, target_sha) if sha is not None})
-        if pr_number is not None:
-            _number(pr_number)
-        declarations = ['$owner:String!', '$name:String!']
-        fields = ['id nameWithOwner']
-        arguments = ['-f', 'owner=' + owner, '-f', 'name=' + name]
-        for index, sha in enumerate(identities):
-            key = 'object' + str(index)
-            declarations.append('$' + key + ':GitObjectID!')
-            fields.append(key + ':object(oid:$' + key + ') { __typename oid ... on Commit { tree { oid } } }')
-            arguments += ['-f', key + '=' + sha]
-        if pr_number is not None and not compact:
-            declarations.append('$pr:Int!')
-            fields.append('pullRequest(number:$pr) { number title body state author { login } '
-                'repository { nameWithOwner } baseRepository { nameWithOwner } headRepository { nameWithOwner } '
-                'headRefName headRefOid baseRefName baseRefOid '
-                'mergeCommit { oid parents(first:100) { nodes { oid tree { oid } } } } }')
-            arguments += ['-F', 'pr=' + str(pr_number)]
-        if discovery is not None and not compact:
-            declarations += ['$head:String!', '$base:String!']
-            fields.append('discovery:pullRequests(first:100,headRefName:$head,baseRefName:$base,'
-                'states:[OPEN,CLOSED,MERGED]) { nodes { number headRefName baseRefName '
-                'headRepositoryOwner { login } } pageInfo { hasNextPage } }')
-            arguments += ['-f', 'head=' + discovery[0].removeprefix('refs/heads/'),
-                          '-f', 'base=' + discovery[1].removeprefix('refs/heads/')]
-        root_fields = ['viewer { login }'] if self.identity['source'] == 'host' else []
-        return declarations, fields, root_fields, arguments
-
-    def _parse_delivery_basis(self, envelope: Mapping[str, Any],
-                              source_sha: str | None, target_sha: str | None,
-                              pr_number: int | None, discovery: tuple[str, str] | None = None,
-                              *, compact: bool = False, packet: Callable[..., Any],
-                              ) -> tuple[dict[str, Commit], dict[str, Any] | None, str | None]:
-        """Validate a complete basis and finish its exact PR discovery if needed."""
-        owner = self.repository.split('/', 1)[0]
-        identities = sorted({_sha(sha) for sha in (source_sha, target_sha) if sha is not None})
-        host = self.identity['source'] == 'host'
-        errors = envelope.get('errors', [])
-        if not isinstance(errors, list):
-            raise ValueError('invalid GraphQL errors envelope')
-        if errors or 'data' in envelope and envelope['data'] is None:
-            raise GitHubReadError('github_read_failed', 'Delivery basis is incomplete')
-        data = envelope['data']
-        repository = data['repository']
-        if repository is None:
-            raise GitHubReadError('github_read_failed', 'Delivery repository is unavailable')
-        if not _text(repository['id']) or not same_repository(_text(repository['nameWithOwner']), self.repository):
-            raise ValueError('foreign Delivery repository')
-        commits = {}
-        for index, sha in enumerate(identities):
-            value = repository['object' + str(index)]
-            if value is None:
-                raise GitHubReadError('github_read_failed', 'Exact Delivery commit is unavailable')
-            if value['__typename'] != 'Commit' or _sha(value['oid']) != sha:
-                raise ValueError('foreign Delivery commit')
-            commits[sha] = Commit(sha, _sha(value['tree']['oid']))
-        actor = None
-        if host:
-            if data['viewer'] is None:
-                raise GitHubReadError('github_read_failed', 'Delivery viewer is unavailable')
-            actor = _text(data['viewer']['login'])
-        number = pr_number
-        if discovery is not None:
-            rest = compact
-            matches = []
-            if not compact:
-                connection = repository['discovery']
-                nodes, more = connection['nodes'], connection['pageInfo']['hasNextPage']
-                if not isinstance(nodes, list) or len(nodes) > 100 or type(more) is not bool:
-                    raise ValueError('Malformed PR discovery connection')
-                rest = more
-                for node in nodes:
-                    candidate = _number(node['number'])
-                    if (_text(node['headRefName']) != discovery[0].removeprefix('refs/heads/')
-                            or _text(node['baseRefName']) != discovery[1].removeprefix('refs/heads/')):
-                        raise ValueError('Foreign PR discovery refs')
-                    head_owner = node['headRepositoryOwner']
-                    if head_owner is None:
-                        rest = True  # Legal deleted-head identity, not proof of a foreign owner.
-                    elif _text(head_owner['login']).casefold() == owner.casefold():
-                        matches.append(candidate)
-            if rest:
-                rows = packet(['gh', 'api', self._pr_discovery_endpoint(*discovery),
-                               '--paginate', '--slurp'], pages=True)
-                matches = [_number(row['number']) for row in rows]
-            if len(matches) > 1:
-                raise ValueError('ambiguous original PR')
-            number = matches[0] if matches else None
-        raw_pr = None
-        if number is not None:
-            if compact or discovery is not None:
-                raw_pr = packet(['gh', 'api', f'repos/{self.repository}/pulls/{number}'])
-                if (_number(raw_pr['number']) != number or type(raw_pr.get('merged')) is not bool
-                        or raw_pr['state'] not in {'open', 'closed'}):
-                    raise ValueError('foreign or invalid Delivery PR')
-                _text(raw_pr['title'])
-                _string(raw_pr['body'])
-                for side in ('head', 'base'):
-                    _sha(raw_pr[side]['sha'])
-                    _text(raw_pr[side]['ref'])
-                    repo = raw_pr[side].get('repo')
-                    if side == 'base' and repo is None:
-                        raise GitHubReadError('github_read_failed', 'Delivery PR base repository is unavailable')
-                    if repo is not None:
-                        _text(repo['full_name'])
-                if raw_pr['merged'] and raw_pr.get('merge_commit_sha') is None:
-                    raise GitHubReadError('github_read_failed', 'Delivery merge object is unavailable')
-            else:
-                value = repository['pullRequest']
-                if value is None:
-                    raise GitHubReadError('github_read_failed', 'Known Delivery PR is unavailable')
-                if value['baseRepository'] is None:
-                    raise GitHubReadError('github_read_failed', 'Delivery PR base repository is unavailable')
-                if not same_repository(_text(value['repository']['nameWithOwner']), self.repository):
-                    raise ValueError('foreign Delivery PR repository')
-                state = _text(value['state'])
-                if _number(value['number']) != number or state not in {'OPEN', 'CLOSED', 'MERGED'}:
-                    raise ValueError('foreign or invalid Delivery PR')
-                if state == 'MERGED' and value['mergeCommit'] is None:
-                    raise GitHubReadError('github_read_failed', 'Delivery merge object is unavailable')
-                raw_pr = {'number': number, 'title': _text(value['title']), 'body': _string(value['body']),
-                    'state': 'closed' if state == 'MERGED' else state.lower(), 'user': value['author'],
-                    'head': {'sha': _sha(value['headRefOid']), 'ref': _text(value['headRefName']),
-                             'repo': None if value['headRepository'] is None else
-                                     {'full_name': _text(value['headRepository']['nameWithOwner'])}},
-                    'base': {'sha': _sha(value['baseRefOid']), 'ref': _text(value['baseRefName']),
-                             'repo': {'full_name': _text(value['baseRepository']['nameWithOwner'])}},
-                    'merged': state == 'MERGED',
-                    'merge_commit_sha': None if state != 'MERGED' else _sha(value['mergeCommit']['oid'])}
-                if state == 'MERGED':
-                    # This bounded subset supplies trees by exact OID, not parent
-                    # order. The original merge REST receipt still selects parent 0.
-                    parents = value['mergeCommit']['parents']['nodes']
-                    if not isinstance(parents, list) or len(parents) > 100:
-                        raise ValueError('Malformed merge parent objects')
-                    for parent in parents:
-                        if parent is None:
-                            raise GitHubReadError('github_read_failed', 'Merge parent object is unavailable')
-                        if not isinstance(parent, dict):
-                            raise ValueError('Malformed merge parent object')
-                        if parent['tree'] is None:
-                            raise GitHubReadError('github_read_failed', 'Merge parent tree is unavailable')
-                        parent_commit = Commit(_sha(parent['oid']), _sha(parent['tree']['oid']))
-                        if parent_commit.sha in commits and commits[parent_commit.sha] != parent_commit:
-                            raise ValueError('Same commit has contradictory trees')
-                        commits[parent_commit.sha] = parent_commit
-        return commits, raw_pr, actor
-
-    def _delivery_basis(self, source_sha: str | None, target_sha: str | None,
-                        pr_number: int | None, discovery: tuple[str, str] | None = None,
-                        *, deadline: float | None = None, attempts: int = 0,
-                        initial: Mapping[str, Any] | None = None,
-                        ) -> tuple[dict[str, Commit], dict[str, Any] | None, str | None]:
-        """One fresh bounded projection, never retained beyond this Delivery.
-
-        PR discovery supplies a number only. Complete ref-name/owner matches
-        share the packet; pagination or an unavailable owner uses the original
-        REST collection. An identified PR is then read afresh. Capacity alone
-        permits compact projection. All work shares three whole attempts and a
-        90-second maximum; incomplete packets supply no reusable facts.
-        """
-        projection = self._delivery_projection(source_sha, target_sha, pr_number, discovery)
-        if deadline is None:
-            deadline = time.monotonic() + github_commands.MAX_READ_ATTEMPTS * github_commands.READ_TIMEOUT_SECONDS
-
-        def remaining() -> float:
-            if self.cancelled is not None and self.cancelled():
-                raise InterruptedError('Delivery read cancelled')
-            value = deadline - time.monotonic()
-            if value <= 0:
-                raise GitHubReadError('github_read_failed', 'Delivery basis observation deadline expired')
-            return value
-
-        def before_start() -> None:
-            remaining()
-
-        def cancelled() -> bool:
-            remaining()
-            return False
-
-        def packet(arguments: list[str], *, pages: bool = False) -> Any:
-            try:
-                response = github_commands._run_bounded_command(arguments, cwd=self.root,
-                    timeout=min(github_commands.READ_TIMEOUT_SECONDS, remaining()), complete_stdout=True,
-                    before_start=before_start, cancelled=cancelled, **runner_options(self.identity))
-            except subprocess.TimeoutExpired as error:
-                raise GitHubReadError('github_read_failed', 'Delivery basis command deadline expired') from error
-            remaining()
-            if response.returncode:
-                raise github_commands.read_response_error(response)
-            try:
-                data = json.loads(response.stdout)
-            except (ValueError, RecursionError) as error:
-                raise GitHubReadError('github_invalid_response', 'Delivery basis response is not complete JSON') from error
-            if pages:
-                if not isinstance(data, list) or any(not isinstance(page, list) for page in data):
-                    raise ValueError('Expected paginated PR collection')
-                rows = [row for page in data for row in page]
-                if not all(isinstance(row, dict) for row in rows) or len(json.dumps(rows).encode()) > MATERIAL_LIMIT:
-                    raise ValueError('Invalid or oversized PR collection')
-                return rows
-            if not isinstance(data, dict):
-                raise GitHubReadError('github_invalid_response', 'Expected a complete Delivery object')
-            return data
-
-        compact = False
-        if attempts >= github_commands.MAX_READ_ATTEMPTS and initial is None:
-            raise GitHubReadError('github_read_failed', 'Delivery basis observation attempts exhausted')
-        for attempt in range(attempts - int(initial is not None), github_commands.MAX_READ_ATTEMPTS):
-            remaining()
-            try:
-                declarations, fields, root_fields, arguments = projection
-                query = ('query DeliveryBasis(' + ','.join(declarations) + ') { '
-                    + ' '.join(root_fields) + ' '
-                    + 'repository(owner:$owner,name:$name) { ' + ' '.join(fields) + ' } }')
-                envelope = initial if initial is not None else packet(['gh', 'api', 'graphql', *arguments, '-f', 'query=' + query])
-                initial = None
-                commits, raw_pr, actor = self._parse_delivery_basis(envelope,
-                    source_sha, target_sha, pr_number, discovery, compact=compact, packet=packet)
-                remaining()
-                return commits, raw_pr, actor
-            except github_commands.ReadOutputOverflow as error:
-                if compact or pr_number is None and discovery is None:
-                    raise
-                if attempt == github_commands.MAX_READ_ATTEMPTS - 1:
-                    raise GitHubReadError('github_read_failed', 'Delivery basis needs an unread compact projection') from error
-                compact = True
-                projection = self._delivery_projection(source_sha, target_sha, pr_number, discovery, compact=True)
-            except GitHubReadError as error:
-                if error.code != 'github_read_failed' or attempt == github_commands.MAX_READ_ATTEMPTS - 1:
-                    raise
-                time.sleep(min(2 ** attempt + random.uniform(0, .25), remaining()))
-            except (ValueError, KeyError, TypeError, UnicodeError, RecursionError) as error:
-                raise GitHubReadError('github_invalid_response', 'Delivery basis facts are malformed') from error
-        raise AssertionError('Delivery basis exhausted without a result')
-
-    @_operation_errors
-    def delivery(self, request: DeliveryRead) -> DeliveryFacts:
-        """Read exact Core-supplied refs and immutable ancestry anchors."""
-        self._validate_delivery_read(request)
-        source_sha, target_sha = read_remote_heads(self.root, request.source_ref, request.target_ref,
-                                                  runner_identity=self.identity, remote=self.remote)
-        basis: dict[str, Commit] = {}
-        actor = None
-        if self.api is None:
-            number = request.pr_number if request.read_pr else None
-            if request.read_pr and number is None:
-                basis, raw_pr, actor = self._delivery_basis(source_sha, target_sha, None,
-                    (request.source_ref, request.target_ref))
-            else:
-                basis, raw_pr, actor = self._delivery_basis(source_sha, target_sha, number)
-        else:
-            # PhysicalAPI's existing injected REST interface has no GraphQL port.
-            raw_pr = self._find_pr(request.source_ref, request.target_ref, request.pr_number) if request.read_pr else None
-        return self._finish_delivery(request, (source_sha, target_sha), basis, raw_pr, actor)
-
-    @staticmethod
-    def _validate_delivery_read(request: DeliveryRead) -> None:
-        """Reject unbounded or unrelated repair demand before physical reads."""
-        from agent_run.core.operation_contract import DeliveryRead, ReadUnavailable, requested_ancestry
-        repair = request.repair
-        if repair is not None and (not isinstance(repair, DeliveryRead) or repair.repair is not None
-                                   or repair.target_ref != request.source_ref):
-            raise ReadUnavailable("repair_request_invalid", "Repair must target the Run source and cannot contain another repair")
-        for query in (request,) if repair is None else (request, repair):
-            if type(query.read_checks) is not bool or not query.read_checks and query.check_head is not None:
-                raise ReadUnavailable("checks_request_invalid", "An exact checks head requires a checks observation")
-            requested_ancestry(query, None)
-
-    def _finish_delivery(self, request: DeliveryRead, refs: tuple[str | None, str | None],
-                         basis: Mapping[str, Commit], raw_pr: Mapping[str, Any] | None,
-                         actor: str | None) -> DeliveryFacts:
-        """Complete exact objects, ancestry, checks and the closing ref boundary."""
-        from agent_run.core.operation_contract import DeliveryFacts, requested_ancestry
-        source_sha, target_sha = refs
-        commits: dict[str, Commit] = {}
-        reused: set[str] = set()
-        def read_commit(sha: str) -> Commit:
-            sha = _sha(sha)
-            if sha in commits:
-                reused.add(sha)
-                return commits[sha]
-            return basis[sha] if sha in (source_sha, target_sha) and sha in basis else self._commit(sha)[0]
-        source = None if source_sha is None else read_commit(source_sha)
-        if source is not None:
-            commits[source.sha] = source
-        target = None if target_sha is None else read_commit(target_sha)
-        if target is not None:
-            commits[target.sha] = target
-        pr = None if raw_pr is None else self._pr(raw_pr, read_commit=read_commit, merged_parents=basis)
-        if pr is not None and pr.state == 'MERGED' and pr.base.sha in basis:
-            # A consumed parent tree must match the actual exact Git object,
-            # just like the other API facts reused in this observation.
-            commits[pr.base.sha] = pr.base
-            reused.add(pr.base.sha)
-        checked = requested_ancestry(request, source, target, pr)
-        heads = set(request.anchors) | {head for head in (source_sha, target_sha) if head is not None}
-        if checked is not None:
-            heads.update(head for pair in checked for head in pair)
-        if pr is not None:
-            heads.add(pr.base.sha)
-        # Only exact objects are reused within this observation. Live refs are
-        # still bracketed below; no World or write authority is cached.
-        prepared = sorted({_sha(head) for head in heads})
-        self._prepare_ancestor_objects(prepared)
-        if reused:
-            # Do not let reuse hide inconsistent API tree evidence. Resolve the
-            # exact immutable objects already prepared above, without decoding
-            # commit messages or deriving parents from shallow/grafted history.
-            identities = sorted(reused)
-            objects = self.git.run("log", "--no-patch", "--no-walk=unsorted", "--format=%H %T",
-                "--encoding=UTF-8", "--no-use-mailmap", "--no-show-signature", "--no-notes", "--no-color",
-                *identities, "--").stdout.splitlines()
-            if objects != [sha + " " + commits[sha].tree for sha in identities]:
-                raise GitHubReadError("github_observation_pending", "Commit object and API tree do not agree")
-        pairs = ((before, after) for before in prepared for after in prepared) if request.ancestry_pairs is None else iter(checked or ())
-        ancestry = tuple((before, after) for before, after in pairs
-                         if before == after or self.git.is_ancestor(before, after))
-        checks = None
-        if pr is not None and pr.state == "OPEN":
-            if source is None or pr_target(pr, repository=self.repository, pr_number=request.pr_number,
-                    source_ref=request.source_ref, target_ref=request.target_ref,
-                    source=source, target=target, ancestry=ancestry) is None:
-                raise GitHubReadError("github_observation_pending", "PR and remote ref observations have not converged")
-            if request.read_checks:
-                reader = GhGitHubReader(self.repository, working_directory=self.root, runner_identity=self.identity)
-                checks = normalize_required_checks(read_required_check_facts(
-                    reader, pr.number, expected_head_sha=request.check_head or source.sha))
-        actor = self.actor() if actor is None else actor
-        repair = None if request.repair is None else self.delivery(request.repair)
-        if repair is not None and (repair.target != source or repair.publisher_actor != actor
-                                   or repair.publisher_identity != self.identity):
-            raise GitHubReadError("github_observation_pending", "Repair and Run observations have not converged")
-        if read_remote_heads(self.root, request.source_ref, request.target_ref,
-                runner_identity=self.identity, remote=self.remote) != (source_sha, target_sha):
-            raise GitHubReadError("github_observation_pending", "Remote refs changed during delivery observation")
-        return DeliveryFacts(target, source, pr, checks, ancestry, actor, dict(self.identity), checked,
-                             request.read_checks, repair)
 
     @_operation_errors
     def inspect(self, resources: tuple[ResourceWitness, ...]) -> tuple[ResourceInspection, ...]:
@@ -1141,22 +537,6 @@ class RemoteEffects:
                      else effect.payload["owned_root"]))
         return LocalEffects(self.git, owned_root=root)
 
-    def _prepare_ancestor_objects(self, shas: Iterable[str]) -> None:
-        # Transport only absent immutable objects; refs and FETCH_HEAD stay intact.
-        missing = self.git.missing_commits(shas)
-        for sha in missing:
-            if self.git_writes is None:
-                self._read(["git", "fetch", "--no-tags", "--no-write-fetch-head", "--refmap=", "--", self.remote, sha])
-            else:
-                self.git_writes.fetch(sha)
-        if missing and self.git.missing_commits(missing):
-            raise GitHubReadError("git_ancestry_unknown", "Fetched commit object is unavailable")
-
-    def _ancestor(self, before: str, after: str) -> bool:
-        if before == after:
-            return True
-        self._prepare_ancestor_objects((before, after))
-        return self.git.is_ancestor(before, after)
 
     def _binding(self, effect: Effect) -> None:
         if effect.repository.casefold() != self.repository.casefold():
@@ -1187,7 +567,7 @@ class RemoteEffects:
         try:
             if self.actor() != effect.actor:
                 raise KernelError("remote_actor_changed")
-            issue = self._api(self._issue_path(effect))
+            issue = self.object(self._issue_path(effect))
             if issue["number"] != effect.payload["issue"]:
                 raise ValueError("foreign Issue identity")
         except (GitHubReadError, OSError, ValueError, KeyError, TypeError) as error:
@@ -1222,7 +602,7 @@ class RemoteEffects:
     def _remote_head(self, ref: str) -> str | None:
         if self.git_writes is not None:
             return self.git_writes.refs().get(ref)
-        response = self._read(["git", "ls-remote", "--refs", "--", self.remote, ref])
+        response = self.read(["git", "ls-remote", "--refs", "--", self.remote, ref])
         lines = response.stdout.splitlines()
         if not lines:
             return None
@@ -1242,7 +622,7 @@ class RemoteEffects:
 
     def _pr_target(self, effect: Effect, pr: PullRequest,
                         source: str | None, target: str | None) -> Commit | None:
-        live = None if target is None else self._commit(target)[0]
+        live = None if target is None else self.commit(target)[0]
         ancestry = ((pr.base.sha, target),) if target is not None and self._ancestor(pr.base.sha, target) else ()
         return pr_target(pr, repository=self.repository, pr_number=effect.pr_number,
             source_ref=effect.source_ref, target_ref=effect.target_ref,
@@ -1262,53 +642,6 @@ class RemoteEffects:
             return False
         return replace(after, pr=replace(after.pr, base=before.pr.base)) == before
 
-    def _commit(self, sha: str) -> tuple[Commit, tuple[str, ...], str | None]:
-        data = self._api(f"repos/{self.repository}/git/commits/{_sha(sha)}")
-        if data["sha"] != sha:
-            raise ValueError("foreign commit response")
-        message = data.get("message")
-        return (Commit(sha, _sha(data["tree"]["sha"])), tuple(_sha(p["sha"]) for p in data["parents"]),
-                message if isinstance(message, str) else None)
-
-    def _pr(self, data: Mapping[str, Any], *,
-            read_commit: Callable[[str], Commit] | None = None,
-            merged_parents: Mapping[str, Commit] | None = None) -> PullRequest:
-        commit = (lambda sha: self._commit(sha)[0]) if read_commit is None else read_commit
-        head, base = data["head"], data["base"]
-        repository = _text(base["repo"]["full_name"])
-        head_repository = None if head.get("repo") is None else _text(head["repo"]["full_name"])
-        merged = None
-        base_sha = _sha(base["sha"])
-        if data.get("merged"):
-            # Parent order is separate receipt evidence; keep its original fresh read.
-            merged, parents, _ = self._commit(_sha(data["merge_commit_sha"]))
-            if not parents:
-                raise ValueError("merged commit has no original base parent")
-            # A merged receipt describes the original Git event, not a later
-            # live base-branch pointer. Its actual first parent is that base.
-            base_commit = merged_parents.get(parents[0]) if merged_parents is not None else None
-            if base_commit is None:
-                base_commit = commit(parents[0])
-        else:
-            base_commit = commit(base_sha)
-        return PullRequest(_number(data["number"]), repository, "refs/heads/" + _text(head["ref"]),
-            "refs/heads/" + _text(base["ref"]), commit(_sha(head["sha"])), base_commit,
-            _text(data["title"]), _string(data["body"]), "MERGED" if merged else _text(data["state"]).upper(),
-            _login(data.get("user")), merged, head_repository)
-
-    def _find_pr(self, source_ref: str, target_ref: str, number: int | None) -> dict[str, Any] | None:
-        if number is not None:
-            return self._api(f"repos/{self.repository}/pulls/{number}")
-        prs = self._pages(self._pr_discovery_endpoint(source_ref, target_ref))
-        if len(prs) > 1:
-            raise ValueError("ambiguous original PR")
-        return prs[0] if prs else None
-
-    def _pr_discovery_endpoint(self, source_ref: str, target_ref: str) -> str:
-        query = urlencode({"state": "all", "head": self.repository.split('/')[0] + ':' +
-                           source_ref.removeprefix("refs/heads/"), "base": target_ref.removeprefix("refs/heads/"),
-                           "per_page": 100})
-        return f"repos/{self.repository}/pulls?{query}"
 
     def _reconcile_pr(self, effect: Effect) -> EffectResult:
         data = self._find_pr(effect.source_ref, effect.target_ref, effect.pr_number)
@@ -1342,14 +675,14 @@ class RemoteEffects:
             return EffectResult("prior" if prior is not None and pr.title == prior["title"] and pr.body == prior["body"] else "third", pr=pr)
         source, target = self._remote_heads(effect.source_ref, effect.target_ref)
         if pr.state == "MERGED" and pr.merged is not None:
-            commit, parents, message = self._commit(pr.merged.sha)
+            commit, parents, message = self.commit(pr.merged.sha)
             merger = _login(data.get("merged_by"))
             if merger is None:
                 return EffectResult("unknown", pr=pr, raw={"diagnostic": "Merge actor is not observable"})
             if (merger != effect.actor or parents != tuple(effect.payload["parents"])
                     or pr.base.sha != effect.before_sha or commit.tree != pr.head.tree or target is None):
                 return EffectResult("third", pr=pr)
-            compared = self._api(f"repos/{self.repository}/compare/{commit.sha}...{target}")
+            compared = self.object(f"repos/{self.repository}/compare/{commit.sha}...{target}")
             contained = (compared["status"] in {"identical", "ahead"}
                          and compared["base_commit"]["sha"] == commit.sha
                          and compared["merge_base_commit"]["sha"] == commit.sha)
@@ -1411,7 +744,7 @@ class RemoteEffects:
         return f"repos/{self.repository}/issues/{_number(effect.payload['issue'])}"
 
     def _issue(self, effect: Effect) -> dict[str, Any]:
-        issue = self._api(self._issue_path(effect))
+        issue = self.object(self._issue_path(effect))
         if _number(issue["number"]) != effect.payload["issue"] or issue["state"] not in {"open", "closed"}:
             raise ValueError("foreign or unknown Issue")
         return issue
@@ -1420,7 +753,7 @@ class RemoteEffects:
         return self._events_at(self._issue_path(effect))
 
     def _events_at(self, path: str) -> list[dict[str, Any]]:
-        events = [event for event in self._pages(path + "/events?per_page=100")
+        events = [event for event in self.list(path + "/events?per_page=100")
                   if event.get("event") in {"closed", "reopened"}]
         for event in events:
             _number(event["id"])
@@ -1451,7 +784,7 @@ class RemoteEffects:
                 + json.dumps(dict(intent), sort_keys=True, ensure_ascii=False) + " -->")
 
     def _reconcile_comment(self, effect: Effect) -> EffectResult:
-        comments = [c for c in self._pages(self._issue_path(effect) + "/comments?per_page=100")
+        comments = [c for c in self.list(self._issue_path(effect) + "/comments?per_page=100")
                     if self._marker(effect) in _string(c["body"])]
         if not comments:
             return EffectResult("prior" if self._issue(effect)["state"] == "open" else "third")
@@ -1488,7 +821,7 @@ class RemoteEffects:
         baseline = intent["baseline_event_id"]
         if type(baseline) is not int or baseline < 0:
             raise ValueError("invalid close watermark")
-        comments = self._pages(self._issue_path(effect) + "/comments?per_page=100")
+        comments = self.list(self._issue_path(effect) + "/comments?per_page=100")
         original = [c for c in comments if c["id"] == intent["comment_id"]]
         if len(original) != 1 or original[0]["body"] != intent["comment_body"]:
             return EffectResult("third")
@@ -1513,41 +846,6 @@ class RemoteEffects:
             return EffectResult("third", raw={"event": event})
         return EffectResult("target" if issue["state"] == "closed" else "unknown", raw={"event": event})
 
-    def _read(self, command: list[str], before_attempt: Callable[[], None] | None = None) -> subprocess.CompletedProcess[str]:
-        # API envelopes are structured; fetch output remains diagnostic.
-        complete_stdout = command[:2] == ["gh", "api"]
-        response = (run_read_command(command, cwd=self.root, runner_identity=self.identity, complete_stdout=complete_stdout) if before_attempt is None and self.cancelled is None else
-                    run_read_command(command, cwd=self.root, runner_identity=self.identity, complete_stdout=complete_stdout, before_attempt=before_attempt,
-                                     **({"cancelled": self.cancelled} if self.cancelled is not None else {})))
-        if response.returncode:
-            raise GitHubReadError("remote_read_failed", response.stderr[:4096] or "Remote read failed")
-        return response
-
-    def _api(self, endpoint: str, before_attempt: Callable[[], None] | None = None) -> dict[str, Any]:
-        if before_attempt is not None:
-            before_attempt()
-        data = self.api.object(endpoint) if self.api is not None else json.loads((
-            self._read(["gh", "api", endpoint]) if before_attempt is None else self._read(["gh", "api", endpoint], before_attempt)).stdout)
-        if not isinstance(data, dict):
-            raise ValueError("expected remote object")
-        return data
-
-    def _pages(self, endpoint: str, before_attempt: Callable[[], None] | None = None) -> list[dict[str, Any]]:
-        if before_attempt is not None:
-            before_attempt()
-        if self.api is not None:
-            rows = self.api.list(endpoint)
-            if not all(isinstance(row, dict) for row in rows) or len(json.dumps(rows).encode()) > MATERIAL_LIMIT:
-                raise ValueError("invalid or oversized remote collection")
-            return rows
-        command = ["gh", "api", endpoint, "--paginate", "--slurp"]
-        pages = json.loads((self._read(command) if before_attempt is None else self._read(command, before_attempt)).stdout)
-        if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
-            raise ValueError("expected paginated remote list")
-        rows = [row for page in pages for row in page]
-        if not all(isinstance(row, dict) for row in rows) or len(json.dumps(rows).encode()) > MATERIAL_LIMIT:
-            raise ValueError("invalid or oversized remote collection")
-        return rows
 
     def _write(self, endpoint: str, method: str, body: Mapping[str, Any],
                authorize: WriteAuthority, boundary: Callable[[], None] | None = None) -> subprocess.CompletedProcess[str]:
@@ -1563,129 +861,6 @@ class RemoteEffects:
             return run_write_command(["gh", "api", endpoint, "--method", method, "--input", stream.name],
                                      authorize=lambda: admit_write(authorize, boundary), cwd=self.root, runner_identity=self.identity,
                                      **({"cancelled": self.cancelled} if self.cancelled is not None else {}))
-
-
-def _status_author(value: Any) -> dict[str, str] | None:
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        raise ValueError("Missing Status author")
-    kind, login = _text(value.get("__typename")), _text(value.get("login"))
-    # GraphQL Bot.login is the App slug; REST and the App resolver use [bot].
-    # Other Actor kinds (e.g. Mannequin) cannot adopt a User or Bot identity.
-    if kind == "Mannequin":
-        return None
-    if kind not in {"User", "Bot"}:
-        raise ValueError("Unknown Status author type")
-    if login.endswith("[bot]"):
-        raise ValueError("Invalid GraphQL author login")
-    return {"login": login + "[bot]" if kind == "Bot" else login}
-
-
-def _status_comment_pages(pages: Any, repository: str, app_actor: str | None
-                          ) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
-    """Validate one complete GH pagination result before the existing selector."""
-    if not isinstance(pages, list) or not pages:
-        raise ValueError("Status observation requires complete pages")
-    rows: list[dict[str, Any]] = []
-    identifiers: set[int] = set()
-    cursors: set[str] = set()
-    binding = None
-    for index, page in enumerate(pages):
-        if not isinstance(page, dict) or page.get("errors", []) != []:
-            raise ValueError("Incomplete Status observation")
-        data = page.get("data")
-        repo = data.get("repository") if isinstance(data, dict) else None
-        pr = repo.get("pullRequest") if isinstance(repo, dict) else None
-        if not isinstance(data, dict) or not isinstance(repo, dict) or not isinstance(pr, dict):
-            raise ValueError("Missing Status publication")
-        canonical = _text(repo.get("nameWithOwner"))
-        if not same_repository(canonical, repository):
-            raise ValueError("Status repository changed")
-        actor = app_actor if app_actor is not None else _login(data.get("viewer"))
-        actor = _text(actor)
-        head, base = pr.get("headRepository"), pr.get("baseRepository")
-        if (not isinstance(head, dict) or not isinstance(base, dict) or "author" not in pr
-                or pr["author"] is not None and _login(pr["author"]) is None):
-            raise ValueError("Missing Status publication repository")
-        observed = {"number": _number(pr.get("number")), "user": _status_author(pr.get("author")),
-                    "head": {"ref": _text(pr.get("headRefName")), "repo": {"full_name": _text(head.get("nameWithOwner"))}},
-                    "base": {"ref": _text(pr.get("baseRefName")), "repo": {"full_name": _text(base.get("nameWithOwner"))}}}
-        comments = pr.get("comments")
-        nodes = comments.get("nodes") if isinstance(comments, dict) else None
-        info = comments.get("pageInfo") if isinstance(comments, dict) else None
-        total = comments.get("totalCount") if isinstance(comments, dict) else None
-        if (not isinstance(nodes, list) or len(nodes) > 100 or not isinstance(info, dict)
-                or type(total) is not int or total < 0 or type(info.get("hasNextPage")) is not bool
-                or info["hasNextPage"] != (index < len(pages) - 1)):
-            raise ValueError("Incomplete Status comment pagination")
-        current = (actor, observed, total)
-        if binding is not None and current != binding:
-            raise ValueError("Status publication changed during pagination")
-        binding = current
-        cursor = info.get("endCursor")
-        if nodes:
-            cursor = _text(cursor)
-            if cursor in cursors:
-                raise ValueError("Status comment cursor did not advance")
-            cursors.add(cursor)
-        elif total != 0 or len(pages) != 1 or cursor is not None:
-            raise ValueError("Incomplete Status comment page")
-        for node in nodes:
-            if (not isinstance(node, dict) or "author" not in node
-                    or node["author"] is not None and _login(node["author"]) is None):
-                raise ValueError("Missing Status comment")
-            identifier = node.get("fullDatabaseId")
-            if isinstance(identifier, str) and re.fullmatch(r"[1-9][0-9]*", identifier):
-                identifier = int(identifier)
-            identifier = _number(identifier)
-            if identifier in identifiers:
-                raise ValueError("Duplicate Status comment identity")
-            identifiers.add(identifier)
-            comment_repo, pull = node.get("repository"), node.get("pullRequest")
-            pull_repo = pull.get("repository") if isinstance(pull, dict) else None
-            if not isinstance(comment_repo, dict) or not isinstance(pull, dict) or not isinstance(pull_repo, dict):
-                raise ValueError("Missing Status comment owner")
-            owner = _text(comment_repo.get("nameWithOwner"))
-            if not same_repository(owner, _text(pull_repo.get("nameWithOwner"))):
-                raise ValueError("Inconsistent Status comment owner")
-            rows.append({"id": identifier, "body": _string(node.get("body")), "user": _status_author(node.get("author")),
-                         "issue_url": f"https://api.github.com/repos/{owner}/issues/{_number(pull.get('number'))}"})
-    assert binding is not None
-    if len(rows) != binding[2] or len(json.dumps(rows).encode()) > MATERIAL_LIMIT:
-        raise ValueError("Incomplete or oversized Status comment collection")
-    return binding[0], binding[1], rows
-
-
-def _login(value: Any) -> str | None:
-    login = value.get("login") if isinstance(value, Mapping) else None
-    return login if isinstance(login, str) and login.strip() else None
-
-
-def _string(value: Any) -> str:
-    if not isinstance(value, str):
-        raise ValueError("expected remote string")
-    return value
-
-
-def _text(value: Any) -> str:
-    result = _string(value)
-    if not result.strip():
-        raise ValueError("expected nonempty remote string")
-    return result
-
-
-def _number(value: Any) -> int:
-    if type(value) is not int or value < 1:
-        raise ValueError("expected positive remote integer")
-    return value
-
-
-def _sha(value: Any) -> str:
-    result = _text(value)
-    if not re.fullmatch(r"(?:[a-f0-9]{40}|[a-f0-9]{64})", result):
-        raise ValueError("invalid commit identity")
-    return result
 
 
 def _time(value: Any) -> datetime:

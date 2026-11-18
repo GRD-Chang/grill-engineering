@@ -150,3 +150,13 @@ def test_mixed_case_publication_receipt_still_rejects_wrong_sha_or_actor(monkeyp
 ])
 def test_repository_equivalence_does_not_relax_other_pr_boundaries(observed_pr, changes):
     assert target(replace(observed_pr, **changes), observed_pr) is None
+
+
+@pytest.mark.parametrize("identity", ["owner/..", "owner/.", "owner/repo/extra", " owner/repo", "owner/", "/repo"])
+def test_invalid_repository_never_compares_equal_to_itself(identity):
+    from agent_run.contracts.repository import normalize_repository, same_repository
+
+    with pytest.raises(ValueError, match="Expected a GitHub owner/repository identity"):
+        normalize_repository(identity)
+    assert not same_repository(identity, identity.upper())
+    assert not same_repository(None, identity)

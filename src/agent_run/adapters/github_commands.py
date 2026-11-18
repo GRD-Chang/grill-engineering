@@ -10,6 +10,7 @@ from typing import Any
 from pathlib import Path
 
 from agent_run.adapters.auth.runner_transport import runner_options
+from agent_run.adapters.github_network import has_network_failure
 from agent_run.runtime.command import capture_command
 from agent_run.runtime.process_io import CompleteOutput, CompleteOutputOverflow
 from agent_run.errors import GitHubReadError, redact_transport_output
@@ -30,8 +31,6 @@ class _TimedOutRead(subprocess.CompletedProcess[str]):
 
 def read_response_error(response: subprocess.CompletedProcess[str], *, invalid_json: bool = False) -> GitHubReadError:
     """Fixed safe facts only; no arbitrary command output becomes a diagnostic."""
-    from agent_run.adapters.auth.native_probe import _ErrorEvidence
-
     output = response.stdout.strip()
     try:
         parsed = json.loads(output)
@@ -39,12 +38,14 @@ def read_response_error(response: subprocess.CompletedProcess[str], *, invalid_j
         shape = "text" if output else "empty"
     else:
         shape = "json_array" if isinstance(parsed, list) else "json_object" if isinstance(parsed, dict) else "json_scalar"
-    evidence = _ErrorEvidence()
-    evidence.feed(response.stderr.encode())
+    # Generic commands consume bounded, already redacted diagnostic text. The
+    # authentication probe separately interprets streamed authorization headers.
+    diagnostic = response.stderr[-MAX_COMMAND_OUTPUT_BYTES:]
+    network_failure = has_network_failure(diagnostic)
     timed_out = isinstance(response, _TimedOutRead)
     category = ("timeout" if timed_out else "invalid_json" if invalid_json else
-                "network" if evidence.network_failure else "command_failed")
-    status = re.search(r"\bHTTP[ /](?:[0-9.]+ )?([1-5][0-9]{2})\b", response.stderr, re.IGNORECASE)
+                "network" if network_failure else "command_failed")
+    status = re.search(r"\bHTTP[ /](?:[0-9.]+ )?([1-5][0-9]{2})\b", diagnostic, re.IGNORECASE)
     detail = f"; HTTP {status[1]}" if status else ""
     return GitHubReadError("github_invalid_response" if invalid_json else "github_read_failed",
         f"GitHub observation failed: category={category}; exit={None if timed_out else response.returncode}; output_shape={shape}{detail}")

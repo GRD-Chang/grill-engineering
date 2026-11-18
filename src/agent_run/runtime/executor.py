@@ -25,7 +25,7 @@ from agent_run.errors import KernelError
 from agent_run.core.operation_contract import OperationBinding
 from agent_run.core.operation_runner import OperationRunner
 from agent_run.runtime.handoff import managed_host_environment
-from agent_run.adapters.remote import RemoteEffects
+from agent_run.adapters.operations import NativeOperations
 from agent_run.core.prompts.role import render_role_prompt
 
 
@@ -78,8 +78,8 @@ class _Executor:
         )
 
 
-def _make_ports(binding: OperationBinding) -> RemoteEffects:
-    return RemoteEffects(binding.repository_root, binding.repository,
+def _make_ports(binding: OperationBinding) -> NativeOperations:
+    return NativeOperations(binding.repository_root, binding.repository,
                          runner_identity=binding.inputs.runner_identity, remote=binding.inputs.repository_remote)
 
 
@@ -136,8 +136,10 @@ def run(kernel: Kernel, execution: Execution, environment: Mapping[str, str]) ->
                             active[2].set()
                     notifications.observe_committed()
                     if operation is None and not workers and state.disposition in {"quiescent", "complete"}:
-                        drain_notifications = True
-                        return 0
+                        if runner.prepare_exit():
+                            drain_notifications = True
+                            return 0
+                        continue
                     now = kernel.clock()
                     ready = operation is None and (state.disposition == "ready" or state.disposition == "waiting"
                              and state.wake_at is not None and state.wake_at <= now)

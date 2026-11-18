@@ -5,8 +5,8 @@ import json
 import pytest
 from support.github_retries import immediate_read_retries
 
-from agent_run.adapters import remote
-from agent_run.adapters.remote import RemoteEffects
+from agent_run.adapters import remote_observation as remote
+from agent_run.adapters.remote_observation import RemoteObservation
 from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.core.operation_contract import DeliveryRead, ReadUnavailable
 from agent_run.model import Effect, Execution
@@ -152,7 +152,7 @@ def test_omitting_checks_still_rejects_pr_or_remote_ref_drift(published, monkeyp
 def test_invalid_checks_demand_is_rejected_before_physical_reads(tmp_path, monkeypatch, adapter,
                                                                read_checks, check_head):
     root = tmp_path / 'unopened'
-    port = (RemoteEffects(root, 'example/project', runner_identity={'source': 'host'})
+    port = (RemoteObservation(root, 'example/project', runner_identity={'source': 'host'})
             if adapter == 'remote' else OfflinePort(root))
 
     def forbidden(*args, **kwargs):

@@ -11,6 +11,7 @@ import pytest
 from agent_run.core.kernel import Kernel
 from agent_run.errors import KernelError
 import agent_run.cli.lifecycle as lifecycle_cli
+from agent_run.runtime import host_control
 from agent_run.model import Execution
 from agent_run.errors import ObservationSuperseded
 from agent_run.core.operation_contract import ReadUnavailable
@@ -119,7 +120,7 @@ def test_first_public_resume_applies_after_exact_systemd_exit(tmp_path, monkeypa
     with kernel.storage.transaction(write=False) as tx:
         original_attempt = tx.one("SELECT current_attempt FROM subjects WHERE id=?", (subject,))[0]
         original_actions = tx.one("SELECT count(*) FROM actions")[0]
-    manager = lifecycle_cli._manager_for(kernel, _parser("en").parse_args(["resume", request.run_id]), dict(os.environ))
+    manager = host_control.manager_for(kernel, _parser("en").parse_args(["resume", request.run_id]), dict(os.environ))
     response = tmp_path / "manager" / "manager-response.json"
     document = json.loads(response.read_text())
     document["fields"].update(ActiveState="inactive", SubState="dead", MainPID="0",
@@ -221,9 +222,13 @@ def test_public_resume_after_trusted_material_or_checkout_restoration(tmp_path, 
         saved_checkout.rename(checkout)
     assert database.read_bytes() == backup
     resumed = subprocess.run(command, env=environment, cwd=tmp_path, text=True, capture_output=True, timeout=15)
-    assert resumed.returncode == 0, (resumed.stdout, resumed.stderr)
+    assert resumed.returncode == 2, (resumed.stdout, resumed.stderr)
     result = json.loads(resumed.stdout)
     assert result["result"] == "accepted" and result["action"] == "resume"
+    assert result["requested_action_applied"] is True
+    assert result["requested_action_succeeded"] is False and result["request_outcome"] == "unconfirmed"
+    # This manager records launch but does not execute the admitted Executor.
+    # The public command therefore cannot claim successful continuation yet.
     successor = kernel.host_request(result["action_id"])
     assert kernel.host_dispatched(result["action_id"])
     assert kernel.status(subject)["budgets"] == before["budgets"]
@@ -233,7 +238,7 @@ def test_public_resume_after_trusted_material_or_checkout_restoration(tmp_path, 
         assert tx.get(inputs["material_id"], inputs["subject"]) == frozen
     # The external manager can now prove the successor; the real Core produces
     # the existing Attempt's next preparation, not another development charge.
-    manager = lifecycle_cli._manager_for(kernel, _parser("en").parse_args(["resume", request.run_id]), environment)
+    manager = host_control.manager_for(kernel, _parser("en").parse_args(["resume", request.run_id]), environment)
     document["fields"].update(Id=successor.unit_name, Description=successor.description,
         InvocationID="3" * 32, ActiveState="active", SubState="running", MainPID=str(os.getpid()))
     response.write_text(json.dumps(document))
@@ -297,7 +302,7 @@ import agent_run.runtime.handoff as native
 from agent_run.cli.main import main
 from agent_run.core.kernel import Kernel
 from agent_run.core.operation_runner import OperationRunner
-from agent_run.adapters.remote import RemoteEffects
+from agent_run.adapters.operations import NativeOperations
 from agent_run.model import Execution
 manager_root=Path(sys.argv[1]); original=adapter.SystemdHost
 adapter.SystemdHost=lambda **kw:original(**kw,cgroup_root=manager_root/'cgroups')
@@ -310,7 +315,13 @@ native.handoff_scope=handoff
 output=io.StringIO()
 with redirect_stdout(output):code=main(sys.argv[2:])
 control=json.loads(output.getvalue())
-if code:print(json.dumps({'control':control}));raise SystemExit(code)
+expected=(code==2 and control.get('result')=='accepted' and control.get('action')=='resume'
+    and control.get('requested_action_applied') is True and control.get('requested_action_succeeded') is False
+    and control.get('request_outcome')=='unconfirmed')
+if not expected:
+    print(json.dumps({'control':control,'request_exit_code':code}));raise SystemExit(code or 1)
+# The synthetic manager only records launch. Separately supply its later
+# running witness and drive the real Core; do not turn CLI rejection into success.
 kernel=Kernel(Path(sys.argv[sys.argv.index('--state-dir')+1]),run_id=control['run_id'])
 request=kernel.host_request(control['action_id'])
 response=manager_root/'manager-response.json';state=json.loads(response.read_text())
@@ -321,14 +332,14 @@ manager=adapter.SystemdHost(systemctl=str(manager_root/'systemctl'),systemd_run=
 observed=manager.observe(request)
 assert observed.disposition=='running'
 assert kernel.observe_host(request,replace(observed,usage_ready=True,evidence=kernel.host_usage(control['action_id']).evidence))=='running'
-runner=OperationRunner(kernel,Execution(request.run_id,request.owner,request.epoch),lambda binding:RemoteEffects(
+runner=OperationRunner(kernel,Execution(request.run_id,request.owner,request.epoch),lambda binding:NativeOperations(
     binding.repository_root,binding.repository,runner_identity=binding.inputs.runner_identity,remote=binding.inputs.repository_remote))
 trace=[]
 for _ in range(25):
     step=runner.run_once();trace.append([step.kind,step.reason])
     if step.preparation is not None or step.kind in {'paused','waiting','approval','complete','quiescent'}:break
 else:raise AssertionError('Bounded successor did not reach an observable boundary')
-print(json.dumps({'control':control,'pid':os.getpid(),'trace':trace,'kind':step.kind,'reason':step.reason,
+print(json.dumps({'control':control,'request_exit_code':code,'pid':os.getpid(),'trace':trace,'kind':step.kind,'reason':step.reason,
     'preparation':None if step.preparation is None else {'subject':step.preparation.subject,'role':step.preparation.role,
         'attempt':step.preparation.attempt_id,'context':step.preparation.context}}))
 ''')
@@ -337,6 +348,7 @@ print(json.dumps({'control':control,'pid':os.getpid(),'trace':trace,'kind':step.
     first = subprocess.run(command, cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=25)
     assert first.returncode == 0, (first.stdout, first.stderr)
     refused = json.loads(first.stdout)
+    assert refused["request_exit_code"] == 2
     assert refused["control"]["result"] == "accepted" and refused["kind"] == "paused", refused
     assert refused["reason"] == "write_not_dispatched", refused
     assert not Path(f"/proc/{refused['pid']}").exists()
@@ -370,6 +382,7 @@ print(json.dumps({'control':control,'pid':os.getpid(),'trace':trace,'kind':step.
     second = subprocess.run(command, cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=25)
     assert second.returncode == 0, (second.stdout, second.stderr)
     recovered = json.loads(second.stdout)
+    assert recovered["request_exit_code"] == 2
     assert recovered["control"]["action"] == "resume" and recovered["control"]["result"] == "accepted"
     assert recovered["pid"] != refused["pid"] and not Path(f"/proc/{recovered['pid']}").exists()
     assert recovered["preparation"]["subject"] == subject and recovered["preparation"]["role"] == "review", recovered

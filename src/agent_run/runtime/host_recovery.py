@@ -1,4 +1,4 @@
-"""Read-only original Host exit evidence and committed notification facts.
+"""Recover original Host exit evidence and committed notification facts.
 
 This leaf verifies identity and projects facts; it never calls a sender.
 """

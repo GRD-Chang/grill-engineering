@@ -13,7 +13,8 @@ CONTRACT_TESTS = (
     "tests/test_doctor_readiness.py::test_doctor_cli_separates_installation_and_execution_readiness",
     "tests/test_kernel_query_cli.py::test_history_keeps_raw_feedback_and_pages_without_losing_events",
 )
-PROMPT_CONTRACT_TESTS = ("tests/test_prompt_settings.py", "tests/test_show_prompts_catalog.py")
+PROMPT_CONTRACT_TESTS = ("tests/test_prompt_settings.py", "tests/test_show_prompts_catalog.py",
+                         "tests/test_resource_ownership.py")
 # Small component contracts precede long lifecycle stories; all remain in full coverage.
 # DecisionClock fault tests are storage decisions, not native clock evidence.
 NATIVE_CONTRACT_TESTS = (
@@ -65,7 +66,7 @@ TEST_GROUPS = {
     'fixed-repair-regression': FIXED_REPAIR_REGRESSION_TESTS,
     'native-contract': NATIVE_CONTRACT_TESTS,
     "policy": ("tests/test_delivery_policy.py", "tests/test_kernel_policy_values.py", "tests/test_budget_policy.py"),
-    "state": ("tests/test_kernel_state_preflight.py", "tests/test_kernel_task_admission.py",
+    "state": ("tests/test_run_architecture.py", "tests/test_kernel_state_preflight.py", "tests/test_kernel_task_admission.py",
               "tests/test_error_safety.py"),
     "prompts": (*PROMPT_CONTRACT_TESTS, "tests/test_kernel_prompt_facts.py"),
     "locator": (

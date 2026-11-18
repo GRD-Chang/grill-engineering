@@ -8,23 +8,17 @@ import platform
 import re
 import shutil
 import sqlite3
-import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Any, Mapping
 
-from agent_run.runtime.process_io import CompleteOutput, pump
 from agent_run.config.defaults import UserDefaultsStore
 from agent_run.install.readiness import identity_checks, next_steps, skills_check
 from agent_run.storage.sqlite_runtime import require_wal_runtime
-from agent_run.install.installer import InstallPaths, InstallerError, _read_active
+from agent_run.install.layout import InstallPaths, InstallerError, read_active
+from agent_run.install.diagnostics import run_bounded_probe
 from agent_run.adapters.systemd import HostUnavailable, SystemdHost
-from agent_run.runtime.process_cleanup import capture_process_scope, child_subreaper, terminate_process_group as _terminate_process_group
-
-_COMMAND_TIMEOUT_SECONDS = 3
-_MAX_SIGNATURE_OUTPUT_BYTES = 4096
-
+from agent_run.runtime.process_cleanup import child_subreaper
 
 def run(*, as_json: bool = False, local: bool = False, online: bool = False,
         mode: str = "background", repository: str | None = None,
@@ -192,7 +186,7 @@ def _tool_check(
     executable = shutil.which(command)
     if executable is None:
         return {"status": "missing", "path": None}
-    returncode, timed_out = _run_bounded_probe([executable, *version_arguments])
+    returncode, timed_out, _ = run_bounded_probe([executable, *version_arguments], max_output_bytes=None)
     if returncode is None:
         return {
             "status": "timeout" if timed_out else "unavailable",
@@ -209,7 +203,7 @@ def _git_check() -> dict[str, object]:
     if executable is None:
         return {"status": "missing", "path": None}
     tool: dict[str, object] = {"status": "ok", "path": executable}
-    code, timed_out, output = _run_bounded_output_probe(
+    code, timed_out, output = run_bounded_probe(
         [executable, "--version"], input_data=b""
     )
     if code != 0:
@@ -228,7 +222,7 @@ def _codex_check(*, authenticate: bool = True) -> dict[str, object]:
     required = (b"--json", b"--output-last-message", b"--output-schema",
                 b"--dangerously-bypass-approvals-and-sandbox", b"--model", b"--config")
     for command in (["exec", "--help"], ["exec", "resume", "--help"]):
-        code, timed_out, output = _run_bounded_output_probe(
+        code, timed_out, output = run_bounded_probe(
             [executable, *command], input_data=b"", max_output_bytes=16 * 1024
         )
         flags = required + ((b"--cd", b"--color") if command == ["exec", "--help"] else ())
@@ -237,7 +231,7 @@ def _codex_check(*, authenticate: bool = True) -> dict[str, object]:
                     "reason": "Codex exec/resume 缺少生产调用选项；请更新 Codex"}
     if not authenticate:
         return {**tool, "logged_in": None, "authentication": "not_checked"}
-    code, timed_out = _run_bounded_probe([executable, "login", "status"])
+    code, timed_out, _ = run_bounded_probe([executable, "login", "status"], max_output_bytes=None)
     return {**tool, "status": "ok" if code == 0 else (
         "timeout" if timed_out else "not_logged_in"), "logged_in": code == 0,
         "reason": None if code == 0 else "请自行执行 codex login，然后重跑 doctor"}
@@ -250,23 +244,14 @@ def _bubblewrap_check() -> dict[str, object]:
         return tool
     # Exercise the mount, device and PID namespace operations used by Workers,
     # without a model call or writes to the host filesystem.
-    code, timed_out = _run_bounded_probe([
+    code, timed_out, _ = run_bounded_probe([
         executable, "--die-with-parent", "--ro-bind", "/", "/",
         "--dev", "/dev", "--unshare-pid", "--proc", "/proc", "--",
         "/bin/true",
-    ])
+    ], max_output_bytes=None)
     return {**tool, "status": "ok" if code == 0 else (
         "timeout" if timed_out else "unavailable"), "reason": None if code == 0 else
         "bubblewrap 无法创建 Worker 所需 mount/device/PID namespace；请检查宿主策略"}
-
-
-def _run_bounded_probe(
-    arguments: list[str], *, input_data: bytes | None = None
-) -> tuple[int | None, bool]:
-    code, timed_out, _ = _probe_command(
-        arguments, input_data=input_data, timeout_seconds=_COMMAND_TIMEOUT_SECONDS,
-    )
-    return code, timed_out
 
 
 def _github_check(*, authenticate: bool = True) -> dict[str, object]:
@@ -276,7 +261,7 @@ def _github_check(*, authenticate: bool = True) -> dict[str, object]:
     executable = tool.get("path")
     if not isinstance(executable, str):
         return {"status": "unavailable", "logged_in": False}
-    code, timed_out, output = _run_bounded_output_probe(
+    code, timed_out, output = run_bounded_probe(
         [executable, "api", "--help"], input_data=b"", max_output_bytes=32 * 1024,
     )
     if code != 0 or any(flag not in output for flag in (b"--paginate", b"--slurp", b"--method", b"--header")):
@@ -284,7 +269,7 @@ def _github_check(*, authenticate: bool = True) -> dict[str, object]:
                 "logged_in": False, "reason": "gh api 缺少生产调用选项；请更新 GitHub CLI"}
     if not authenticate:
         return {**tool, "logged_in": None, "authentication": "not_checked"}
-    returncode, timed_out = _run_bounded_probe([executable, "auth", "status"])
+    returncode, timed_out, _ = run_bounded_probe([executable, "auth", "status"], max_output_bytes=None)
     if returncode is None:
         return {
             **tool,
@@ -301,7 +286,7 @@ def _github_check(*, authenticate: bool = True) -> dict[str, object]:
 def _active_runner_check() -> dict[str, object]:
     paths = InstallPaths.from_environment()
     try:
-        current, previous, generation = _read_active(paths)
+        current, previous, generation = read_active(paths)
     except (InstallerError, OSError, RuntimeError, ValueError):
         return {"status": "invalid"}
     if current is None or generation is None:
@@ -362,71 +347,6 @@ def _is_managed_entry(paths: InstallPaths) -> bool:
         and expected.is_file()
         and os.access(expected, os.X_OK)
     )
-
-
-def _run_bounded_output_probe(
-    arguments: list[str], *, input_data: bytes,
-    max_output_bytes: int = _MAX_SIGNATURE_OUTPUT_BYTES,
-    timeout_seconds: float = _COMMAND_TIMEOUT_SECONDS,
-    merge_stderr: bool = False,
-) -> tuple[int | None, bool, bytes]:
-    """Run a tiny probe while keeping captured output and descendants bounded."""
-    return _probe_command(
-        arguments, input_data=input_data, max_output_bytes=max_output_bytes,
-        timeout_seconds=timeout_seconds, merge_stderr=merge_stderr,
-    )
-
-
-def _probe_command(
-    arguments: list[str], *, input_data: bytes | None,
-    timeout_seconds: float, max_output_bytes: int | None = None, merge_stderr: bool = False,
-) -> tuple[int | None, bool, bytes]:
-    class ProbeOutput(CompleteOutput):
-        def feed(self, chunk: bytes) -> None:
-            super().feed(chunk)
-            if self.overflow:
-                raise OverflowError("Diagnostic probe output exceeds its limit")
-
-    process: subprocess.Popen[bytes] | None = None
-    output = ProbeOutput(max_output_bytes) if max_output_bytes is not None else None
-    adopted_baseline = capture_process_scope()
-    try:
-        process = subprocess.Popen(
-            arguments, stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE if output is not None else subprocess.DEVNULL,
-            stderr=subprocess.STDOUT if merge_stderr else subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        if output is not None:
-            assert process.stdin is not None and input_data is not None
-            process.stdin.write(input_data)
-            process.stdin.close()
-        deadline = time.monotonic() + timeout_seconds
-
-        def check() -> bool:
-            if time.monotonic() >= deadline:
-                raise subprocess.TimeoutExpired(arguments, timeout_seconds)
-            return True
-
-        pump(process, stdout=output, check=check,
-             input_data=input_data if output is None else None)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise subprocess.TimeoutExpired(arguments, timeout_seconds)
-        returncode = process.wait(timeout=remaining)
-        return returncode, False, output.finish() if output is not None else b""
-    except subprocess.TimeoutExpired:
-        return None, True, b""
-    except (OSError, subprocess.SubprocessError, OverflowError):
-        return None, False, b""
-    finally:
-        if process is not None:
-            try:
-                _terminate_process_group(process, adopted_baseline=adopted_baseline)
-            finally:
-                for stream in (process.stdin, process.stdout, process.stderr):
-                    if stream is not None:
-                        stream.close()
 
 
 def _check_is_ok(value: object) -> bool:

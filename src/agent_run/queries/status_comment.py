@@ -7,7 +7,7 @@ import sqlite3
 import time
 
 from agent_run.storage.run_scope import run_statement
-from agent_run.contracts.status_comment import StatusProjection, StatusTarget
+from agent_run.contracts.status_comment import StatusBinding, StatusProjection, StatusTarget
 from agent_run.contracts.repository import same_repository
 from agent_run.queries.read_facts import material, read_boundaries, recorded_review
 from agent_run.storage.sqlite import Storage, Transaction
@@ -22,6 +22,21 @@ def _run(tx: Transaction, database: Path) -> sqlite3.Row:
     if not run_is_current(tx):
         raise ValueError("Status Task binding changed")
     return run
+
+
+def status_binding(database: Path, *, storage: Storage) -> StatusBinding:
+    """Read only the selected Task's physical Status configuration."""
+    with open_run(database, storage=storage).transaction(write=False) as tx:
+        run = _run(tx, database.absolute())
+        if run["source_sequence"] is None:
+            raise ValueError("Status source is not configured")
+        row = tx.one("SELECT subject,material_id FROM run_inputs WHERE run_id=?", (run["id"],))
+        inputs = json.loads(tx.get(row["material_id"], row["subject"]))
+        root = Path(run["repository_root"])
+        if (root.resolve() != root or not isinstance(inputs, dict)
+                or not inputs.get("repository_remote") or not isinstance(inputs.get("runner_identity"), dict)):
+            raise ValueError("Status transport binding is invalid")
+        return StatusBinding(root, run["repository"], inputs["runner_identity"])
 
 
 def status_subjects(database: Path, *, storage: Storage) -> list[str]:
@@ -105,4 +120,4 @@ def project_status(database: Path, subject: str, *, storage: Storage) -> StatusP
         if remaining is not None:
             actions.extend(item["recovery_action"] for item in remaining["items"]
                            if item["kind"] == job["kind"] and item["branch"] == target.source_ref)
-        return StatusProjection(target, render_status_body(target, job["kind"], lines, actions))
+        return StatusProjection(target, render_status_body(target, job["kind"], lines, actions), pr["head"]["sha"])

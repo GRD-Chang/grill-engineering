@@ -10,23 +10,30 @@ Status、History、CLI 和通知投影从已提交事实派生，不另存展示
 
 | 事实或输出 | 当前维护归属 |
 | --- | --- |
-| 定位、唯一候选选择与命令分流 | [`cli/selection.py`](../../src/agent_run/cli/selection.py)、[`cli/main.py`](../../src/agent_run/cli/main.py)、[`cli/lifecycle.py`](../../src/agent_run/cli/lifecycle.py)；Task 位置记录由 [`storage/tasks.py`](../../src/agent_run/storage/tasks.py) 维护 |
+| 定位、唯一候选选择与命令分流 | [`runtime/run_selection.py`](../../src/agent_run/runtime/run_selection.py) 组合只读路由；[`cli/main.py`](../../src/agent_run/cli/main.py)、[`cli/lifecycle.py`](../../src/agent_run/cli/lifecycle.py) 解释输入和呈现；Task 位置记录由 [`storage/tasks.py`](../../src/agent_run/storage/tasks.py) 维护 |
 | status/history/settings 的同源只读文档 | [`queries/run.py`](../../src/agent_run/queries/run.py) 的 `read` |
 | 交付对象、gate、预算、候选、PR、当前工作及人工待办 | `queries.run._subject`、`queries.read_facts.read_boundaries`；结构见 [`queries/model.py`](../../src/agent_run/queries/model.py) |
 | 原始调用、Thread/Profile 和物理输出关联 | `queries.run._attempt`、`_invocations`、`queries.execution.recorded_profile` |
 | 原始审计与分页历史 | `queries.run._native_history`、`_control_history`、`_resume_progress` |
 | Worker 活动段与累计 effort | [`queries/execution.py`](../../src/agent_run/queries/execution.py) 的 `activity`、`execution_facts` |
-| 当前本机进程观察，独立于历史 | [`queries/current_observation.py`](../../src/agent_run/queries/current_observation.py)；Core 核验只读绑定，Foreground Host 提供只读物理观察 |
+| 当前本机进程观察，独立于历史 | [`storage/inspection.py`](../../src/agent_run/storage/inspection.py) 捕获绑定，独立的 [`runtime/inspection.py`](../../src/agent_run/runtime/inspection.py) 端口观察；[`queries/current_observation.py`](../../src/agent_run/queries/current_observation.py) 控制读取期限并复核身份 |
 | JSON、plain、Rich 与 settings 文案 | [`cli/render.py`](../../src/agent_run/cli/render.py) 的 `render`、`render_settings` |
 | 已提交通知事件、里程碑与 Resume 结果 | [`notifications/event_projection.py`](../../src/agent_run/notifications/event_projection.py) |
-| 通知的当前 gate/完成边界与过时进展过滤 | `queries.read_facts.read_boundaries`、[`notifications/progress.py`](../../src/agent_run/notifications/progress.py) |
+| 通知的当前 gate/完成边界及内容 | `queries.read_facts.read_boundaries` 提供事实；[`notifications/boundary_projection.py`](../../src/agent_run/notifications/boundary_projection.py) 解释原历史快照、门禁与经核验终态的卡片内容 |
+| 过时进展过滤 | [`notifications/progress.py`](../../src/agent_run/notifications/progress.py) |
 | 事件观察、outbox 和实际投递 | [`notifications/sender.py`](../../src/agent_run/notifications/sender.py) 的 `NativeNotifications`，以及 `agent_run.storage.notification_outbox` / `adapters.notification_transport` |
 
 `QueryDocument` 是显示结果，不是另一套可保存或推进的 Run。
 `current_observation` 是本次有界读取，不是保存的状态、执行授权或连续活性保证。
-Core 从原 Run/owner/epoch、HostRequest 和准确当前 AgentCall 核验观察绑定；物理读取在
+存储从原 Run/owner/epoch、HostRequest 和准确当前 Invocation 捕获观察绑定；物理读取在
 SQLite 事务外完成，再读取并比较原绑定。身份变化、读取失败、超出本次 IO 预算或证据不足
 均降为 `unknown`，不结算退出、不改 lease、不推进恢复。
+观察器只接收 `InspectionBindings` 与 `WorkerBinding`，不接收 Kernel、Storage 或事务。
+每个观察调用显式接收同一次读取的绝对 `deadline`；具体来源必须将它用于自身的 I/O 超时，
+不在内部新开期限。默认本地来源不等待进程退出，以非阻塞打开检查保护记录的 inode，
+FIFO 等非法文件立即降为未知。来源选择只组合对象，不执行外部 I/O。
+增加同类观察来源时修改 runtime 的 `inspector_for` 组合点及对应物理实现；
+查询的持久投影和身份复核无需按 backend 增加分支。
 本机 foreground 可提供准确 namespace/start token 绑定的 `running` 或 `exited`；
 远端、不可比较的观察域及尚未接入的 systemd 查询保持 `unknown`，不调用后台管理服务。
 Status 的 `executor_control.live_status` 与准确当前 Invocation 的 `live_status` 从该字段派生；
@@ -47,6 +54,17 @@ Host 或 namespace 域退出可以证明原成员已退出，却不能替代每�
 共用的候选、base、generation 和需求范围判定，说明该结论是否仍适用。
 `stale`、`pending`、`unknown` 或 `not_recorded` 不证明当前版本已通过；旧产物仍可审计，
 不能因此将旧 Findings 或通过证据显示为新候选的结论。这是持久事实投影，不是新的实时授权。
+
+Review 的共同字段比较由 `contracts.review_evidence.same_review_candidate` 维护：需求
+`revision`、`candidate_sha`、`candidate_tree`、`expected_tree`、`completion_revision`
+及审核 `base_sha` 必须一致。查询从已记录的 integration snapshot（无 snapshot 时取
+subject 的 integration target/base）取得比较基线；Core 从当次 World 的 target 取得基线。
+该纯比较不读取数据库，也不解释通过结论或授权写入。
+查询还核对原 Review 的角色、Generation、已记录及已观察到的 Parent/Graph/需求版本，
+并从原产物核验 outcome；这些历史适用性不能替代现场观察。Core 的需求/Graph/Completion
+当前性仍由正式推进及写前核验负责，合入另外核对最新 Required Checks、准确 PR/head/base
+和人工 grant。保留两路取证与后继判断，避免将历史状态与实时授权合成带模式开关的接口。
+
 `focus_subject` 仅引用其中一个对象，不复制当前 Worker 或预算。`pending_attempt` 使用真实当前
 Attempt；其 `current_invocation` 指针在 `invocations` 中定位当前调用，不能以最后一条记录替代。
 当前与历史 Attempt 共用 `result` 和 `invocations[].outputs[]` 结构。
@@ -117,7 +135,18 @@ Worker 的进程绑定先于最终来源核验和 GO 放行，`worker_started` �
 通知的 concise/detailed 选择、occurrence/dedupe、outbox、Ledger 和 transport
 由通知模块负责；`NativeNotifications` 消费已提交事件与 `read_boundaries`，
 不调用 Kernel 推进业务，也不从渲染后的 Status 文案推断新业务事实。
+门禁与终态的内容、颜色、Resume 表现和原始完成计时由 `boundary_projection` 只读投影；
+`NativeNotifications` 保留分页游标、发生身份、过时取消、投递优先级、原 claim/预算及关闭。
+修改同类卡片表现不需要改变物理投递状态机；投影不分配 occurrence，也不读写 outbox。
 查询入口不接入发送过程，投递 receipt 不能作为工作结果、审核或执行授权。
+
+PR Status 使用 `queries.status_comment.status_binding` 读取最小仓库路径和固定 Runner 身份，
+`StatusComments` 只接收该只读绑定与投影，不持有完整 Kernel 或业务 OperationBinding。
+`adapters.status_comment.StatusCommentTransport` 组合只读 GitHub transport 和唯一的评论 POST/PATCH；
+写前独立重核 PR、当前已发布 head、作者和 marker，之后才持久标记原意图已发送。
+已发送意图先按原 body/评论身份读回，不以新投影覆盖；读回不要求新 head，避免阻断旧写入的结算。
+Abandon 的恢复评论、合入和关闭仍属于业务 Effect；Status 不调用这些写入或其私有对账方法。
+
 
 现有代码核查入口包括 `tests/test_kernel_query_cli.py`、
 `tests/test_kernel_notification_events.py`、`tests/test_kernel_notifications.py`。

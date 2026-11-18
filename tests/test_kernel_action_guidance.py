@@ -1,5 +1,7 @@
 """Displayed actions select the original Task through the real CLI grammar."""
 
+from agent_run.runtime import run_control
+from agent_run.runtime import host_control
 from support.repository_fixture import create_kernel
 from dataclasses import replace
 from hashlib import sha256
@@ -18,6 +20,7 @@ from agent_run.cli import lifecycle
 from agent_run.cli.main import main
 from agent_run.cli.main import _parser
 from agent_run.core.kernel import Kernel
+from agent_run.runtime.task import create_managed_task
 from agent_run.core.operation_runner import OperationRunner
 from agent_run.core.operation_contract import DeliveryFacts
 from agent_run.model import Commit, Delivery, DeliveryKind, Issue, ParentIssue, Requirements, RunSpec
@@ -60,8 +63,8 @@ def unavailable_manager(tmp_path, monkeypatch):
         return SystemdHost(systemctl=str(tmp_path / "absent-systemctl"),
                            systemd_run=str(tmp_path / "absent-systemd-run"), environment=environment)
 
-    monkeypatch.setattr(lifecycle, "_active_runner", lambda: True)
-    monkeypatch.setattr(lifecycle, "_manager_for", manager)
+    monkeypatch.setattr(run_control, "_active_runner", lambda: True)
+    monkeypatch.setattr(host_control, "manager_for", manager)
     return selected
 
 
@@ -118,7 +121,7 @@ def _published_task(remote, repository, identity, parent, *, language="en", tick
     spec = RunSpec(identity, workspace.repository, parent, "parent", "graph", jobs,
                    repository_root=str(workspace.repository_root), language=language, inputs=fixture_inputs())
     directory = sha256(identity.encode()).hexdigest()[:16]
-    return Kernel.create_task(workspace.state_root / "kernel.sqlite3", spec, requirements=source)
+    return create_managed_task(workspace.state_root / "kernel.sqlite3", spec, requirements=source)
 
 
 @pytest.mark.parametrize("identity,language,local", [

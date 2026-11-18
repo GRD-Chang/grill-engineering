@@ -11,7 +11,7 @@ from support.systemd_manager import _CODEX, _control_environment, _git
 
 def test_status_writes_change_check_diagnostics_without_changing_delivery_identity(git_repo, tmp_path, monkeypatch):
     from agent_run.adapters.git_objects import LocalGit
-    from agent_run.adapters.remote import RemoteEffects
+    from agent_run.adapters.operations import NativeOperations
     from agent_run.contracts.write_authority import WriteAuthority
     from agent_run.contracts.required_checks import same_required_checks
     from agent_run.core.operation_contract import DeliveryRead
@@ -26,7 +26,7 @@ def test_status_writes_change_check_diagnostics_without_changing_delivery_identi
     _git(git_repo, 'commit', '--allow-empty', '-m', 'Actual candidate')
     _git(git_repo, 'push', str(tmp_path / 'origin.git'), 'HEAD:refs/heads/candidate')
     candidate = git.commit('HEAD')
-    port = RemoteEffects(git_repo, 'example/project', runner_identity={'source': 'host'}, remote=str(tmp_path / 'origin.git'))
+    port = NativeOperations(git_repo, 'example/project', runner_identity={'source': 'host'}, remote=str(tmp_path / 'origin.git'))
     execution = Execution('run-1', 'worker', 1)
     effect = Effect('create-pr', 'ticket:2', 'pr_write', 'example/project', 'refs/heads/candidate',
                     'refs/heads/main', candidate.sha, candidate.sha, None, base, None, 'publisher',

@@ -172,9 +172,9 @@ def test_same_feedback_identity_in_sibling_history_does_not_suppress_or_supply_c
                 SUBJECT: {"generation": 1, "attempt": None, "role": "development"}}}))
             tx.execute("INSERT INTO actions(id,run_id,kind,payload_id,status,receipt_id) VALUES (?,?, 'resume',?,'applied',?)",
                 ("same-action", run, payload, receipt))
-            kernels[run]._event(tx, SUBJECT, "run_feedback_pending", "same-action", payload)
+            kernels[run]._delivery_state().event(tx, SUBJECT, "run_feedback_pending", "same-action", payload)
             if run == "B":
-                kernels[run]._event(tx, SUBJECT, "run_feedback_bound", "same-action", receipt)
+                kernels[run]._delivery_state().event(tx, SUBJECT, "run_feedback_bound", "same-action", receipt)
     before_b = _rows(db, "B")
     result = _allocate(kernels["A"], "A").preparation
     assert result is not None and result.context["human_responses"] == ["original A"]

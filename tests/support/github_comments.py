@@ -53,7 +53,7 @@ def status_comment_pages(document, fields, pull, *, repository, actor):
     else:
         rows, _ = comment_request(document, f'repos/{repository}/issues/{number}/comments',
                                   'GET', {}, repository=repository, actor=actor, slurp=False)
-        binding = {key: pull[key] for key in ('number', 'author', 'headRefName', 'baseRefName',
+        binding = {key: pull[key] for key in ('number', 'author', 'headRefName', 'headRefOid', 'baseRefName',
                                              'headRepository', 'baseRepository')}
         binding['author'] = author(binding['author'])
         nodes = [{'fullDatabaseId': str(row['id']) if row.get('id') is not None else None,

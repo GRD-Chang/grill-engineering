@@ -23,9 +23,8 @@ from agent_run.queries.read_facts import QueryError as QueryError, all_rows as _
 from agent_run.queries.read_facts import action_guidance, recorded_review
 from agent_run.queries.read_facts import _one, _rows
 from agent_run.storage.run_scope import run_statement
-from agent_run.storage.routing import open_run
+from agent_run.storage.routing import RepositoryRoute, open_run
 from agent_run.queries.current_observation import capture as capture_observation, read_current
-from agent_run.core.kernel import Kernel
 
 
 @dataclass(frozen=True)
@@ -458,18 +457,17 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
         if storage is None:
             require_supported_state(path)
         selected = open_run(path, run_id=expected_run, storage=storage)
-        kernel = Kernel._from_storage(selected)
         with selected.transaction(write=False) as tx:
             document = read_snapshot(tx, path, kind, after=after, limit=limit,
                                      expected_run=expected_run, expected_repository=expected_repository)
             if kind == "settings":return document
-            observation = capture_observation(kernel, tx)
+            observation = capture_observation(selected, tx)
             run = tx.one(*run_statement(tx, 'SELECT id,executor,epoch FROM runs WHERE id=?', (), run_last=True))
             scope = (run['id'], run['executor'], run['epoch'])
         # The public RepositoryRoute and explicit Storage entry share this path.
         # Physical read-only inspection occurs after the SQLite snapshot closes.
         data = dict(document.data)
-        data['current_observation'] = current = read_current(kernel, observation, scope)
+        data['current_observation'] = current = read_current(selected, observation, scope)
         if kind == 'status':
             data['executor_control']['live_status'] = current['host']['disposition']
             for job in data['subjects']:
@@ -490,3 +488,12 @@ def read(path: Path, kind: Literal["status", "history", "settings"], *, after: i
         raise _state_error(path, error) from error
     except (sqlite3.Error, OSError, ValueError, KeyError, TypeError) as error:
         raise _state_error(path, error) from error
+
+
+def read_route(route: RepositoryRoute, run_id: str, kind: Literal["status", "history", "settings"], *,
+               after: int = 0, limit: int | None = None) -> QueryDocument:
+    """Compose routing and read-only projections outside the storage owner."""
+    if kind not in {"status", "history", "settings"}:
+        raise ValueError("Unknown Run query")
+    return read(route.database, kind, storage=route.at_run(run_id), after=after, limit=limit,
+                expected_run=run_id, expected_repository=route.repository)

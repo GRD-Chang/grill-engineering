@@ -12,6 +12,12 @@
 `tasks` 保存准确Task身份和可空的 `current_run`；`task_runs` 绑定历史Run。
 独立idle Task不产生空壳Run、Invocation、预算或执行权。完整冻结Run及必要关系/材料
 与Task绑定在同一短事务中提交；COMMIT未知仅对账原proposal，不重新创建或套用新默认值。
+创建与打开从 [`runtime.task`](../../src/agent_run/runtime/task.py) 进入：应用层选择
+Workspace，`core.task_creation` 使用明确的 Storage 与冻结输入完成绑定，
+`core.run_creation` 与 `core.source_snapshot` 保存创建及需求事实。
+`RepositoryRoute` 只定位、核验和分页发现；查询文档由 `queries.run.read_route` 组合。
+创建失败后的自动读回继续使用原 proposal、实际选中 Run 和原绝对 deadline；
+显式对账可读取已经被后继替换的原 Run，缺失原请求证据仍拒绝，不分配新 ID。
 
 [`storage.preflight`](../../src/agent_run/storage/preflight.py) 只读检查原数据库。
 旧JSON/v6、native v17–v22、早期仓库实验marker、封印和导入状态均拒绝，
@@ -74,6 +80,11 @@ Runner Snapshot，以原版本恢复；安装新 Runner 不意味着能够继续
 各角色的原始返回落盘与阶段消费是不同事务边界；重开后优先复用已存结果。
 结果消费和适用预算变化由 Core 在同一业务事务收口，重复返回不能再次执行或记账。
 原始返回尚未落盘的中断仍属于未知结果，不能假定成功。
+
+Worker 启动绑定或退出证明不确定时，`start_evidence` 保留原边界、身份及原异常和
+直接 cause 的有界分类（类型、Kernel code、OS errno 或 SQLite errorcode），不保存
+异常正文或命令参数。若退出证明失败替换了先前异常，`initial` 另外保留先前分类；
+这些诊断字段不释放未知租约，也不授予重启或结果消费权限。
 
 `RunTransaction.put/get` 按准确Run、拥有者、用途、SHA-256和实际字节数保存及核验材料。
 裸 `Transaction` 只用于显式仓库元数据，不隐含Run选择；各Run view共享原owner的累计读预算和poison。

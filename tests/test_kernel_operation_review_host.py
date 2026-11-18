@@ -5,8 +5,10 @@ operational observation. Git/SQLite and the admitted executor.run loop remain re
 controlled systemd process and OS sandbox acceptance are separate obligations.
 """
 from support.core_operations import prepare_scripted_agent
+from dataclasses import replace
 import os
 from pathlib import Path
+import time
 
 import pytest
 
@@ -186,7 +188,22 @@ def test_public_run_reads_a_restored_third_push_before_conflict_resume(
             assert not tx.rows("SELECT id FROM actions WHERE id='still-unresolved-after-run'")
     assert state == ("observed", 1), {"effect": state, "physical_readbacks": readbacks}
     assert original["id"] in readbacks
-    assert kernel.control_host(request, "resume", "resume-confirmed-original", subject=scenario.delivery.key) == "applied"
+    # The observation-only Executor has returned and fenced further controls.
+    # A Resume needs its exact exit/release observation and a successor Host;
+    # a stale request must never grant work to the old execution generation.
+    with pytest.raises(KernelError, match="executor_fenced"):
+        kernel.control_host(request, "resume", "stale-conflict-resume", subject=scenario.delivery.key)
+    running = kernel.host_usage("run-to-read-original")
+    assert running is not None
+    assert kernel.observe_host(request, replace(running, disposition="exited", exit_status=0,
+        ended_at=time.time(), usage_released=True)) == "exited"
+    successor = kernel.admit_host("resume-confirmed-original", kind="resume", command=("fixture-native-host",),
+        subject=scenario.delivery.key, environment_carrier=tmp_path / "resume-carrier", preflight=lambda: None)
+    assert successor.owner != request.owner and successor.epoch > request.epoch
+    assert kernel.dispatch_host(successor)
+    assert kernel.observe_host(successor, replace(running, unit_name=successor.unit_name,
+        invocation_id="controlled-" + successor.nonce)) == "running"
+    scenario.execution = Execution(successor.run_id, successor.owner, successor.epoch)
     assert executor.run(kernel, scenario.execution, {}) == 0
     assert kernel.status(scenario.delivery.key)["phase"] == "approval"
     assert sum(row["operation"] == "push" for row in scenario.port.writes()) == 1

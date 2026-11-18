@@ -14,7 +14,8 @@ ROOT = Path(__file__).resolve().parent
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(ROOT / "src"))
 
-from agent_run.config.resources import resource, resolve_resources
+from agent_run.config.resources import resolve_resources
+from agent_run.contracts.prompt import resource
 from agent_run.contracts.artifact import role_schema
 from agent_run.core.prompts.role import prompt_schema, render_prompt
 from agent_run.install.probe import PROBE_SCHEMA

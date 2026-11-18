@@ -5,6 +5,7 @@ The source defaults to one repository protocol. Synthetic exit entry tests stop 
 opening seam; they are not a systemd/foreground execution or receipt proof.
 """
 
+from agent_run.runtime.task import create_task, open_task, selected_kernel
 from support.repository_fixture import create_kernel
 from contextlib import closing, contextmanager
 from dataclasses import replace
@@ -15,7 +16,8 @@ import sqlite3
 
 import pytest
 
-from agent_run.cli import host_exit, lifecycle
+from agent_run.runtime import host_exit, run_control, host_control
+from agent_run.cli import lifecycle
 from agent_run.cli.main import _parser
 from agent_run.contracts.task import TaskKey
 from agent_run.core.kernel import Kernel
@@ -25,7 +27,7 @@ from agent_run.notifications.envelope import event_envelope
 from agent_run.notifications.event_projection import event_state, project_event
 from agent_run.notifications.progress import _source, obsolete_progress
 from agent_run.notifications.sender import NativeNotifications
-from agent_run.queries.host_exit import host_exit_current
+from agent_run.runtime.host_recovery import host_exit_current
 from agent_run.queries.status_comment import status_subjects
 from agent_run.runtime import executor
 from agent_run.storage import routing, tasks
@@ -52,7 +54,7 @@ def repository(tmp_path):
     route.initialize()
     for name, parent in (('A', 1), ('B', 2)):
         spec, source = proposal(route.repository_root, name, parent)
-        assert route.create(TaskKey(route.repository_root, route.repository, parent), spec, source).created
+        assert create_task(route, TaskKey(route.repository_root, route.repository, parent), spec, source).created
     return route
 
 
@@ -73,7 +75,7 @@ def test_existing_handle_is_carried_unchanged_and_never_reopened_as_an_unscoped_
 @pytest.mark.parametrize('has_executor', [False, True], ids=['idle', 'executor'])
 def test_current_public_stop_keeps_durable_fence_and_exact_selected_run_without_host(tmp_path, monkeypatch, has_executor):
     from agent_run.adapters import workspace as workspace_module
-    from agent_run.cli import selection
+    from agent_run.runtime import run_selection as selection
     from agent_run.runtime import package_lease
     from agent_run.notifications import sender
     database = tmp_path / 'legacy' / 'kernel.sqlite3'
@@ -169,10 +171,10 @@ def test_internal_public_route_stays_closed_before_lease_io_or_control(repositor
 def test_direct_creation_assembly_is_also_closed_before_preparation(repository, monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError('Foreign repository route reached creation preparation')
-    monkeypatch.setattr(lifecycle, 'prepare_creation', forbidden)
+    monkeypatch.setattr(run_control, 'prepare_creation', forbidden)
     parsed = _parser('en').parse_args(['run', '1', '--repo', 'example/project'])
     with pytest.raises(KernelError, match='managed_state_identity'):
-        lifecycle._run(parsed, manager=None, environment={}, runner_lock=Path('/not-opened'),
+        run_control._run(parsed, manager=None, environment={}, runner_lock=Path('/not-opened'),
             repository_route=repository)
 
 
@@ -190,18 +192,18 @@ def test_task_observation_uses_canonical_sql_and_original_replaceability_without
         raise AssertionError('Repository mode consulted a JSON Task publication')
     assert not hasattr(tasks, 'read_task')
     task = TaskKey(repository.repository_root, repository.repository, 1)
-    current = repository.open_task(task)
+    current = open_task(repository, task)
     assert current is not None and current.storage.run_id == 'A'
     with current.storage.transaction(write=False) as tx:
         assert run_is_current(tx)
     with current.storage.transaction() as tx:
         tx.execute("UPDATE subjects SET phase='complete' WHERE run_id='A'")
-    assert repository.open_task(task) is None
+    assert open_task(repository, task) is None
     spec, source = proposal(repository.repository_root, 'successor', 1)
-    assert repository.create(task, spec, source).created
+    assert create_task(repository, task, spec, source).created
     with current.storage.transaction(write=False) as tx:
         assert not run_is_current(tx)
-    assert repository.open_task(task).storage.run_id == 'successor'
+    assert open_task(repository, task).storage.run_id == 'successor'
     assert status_subjects(repository.database, storage=repository.at_run('B')) == []
 
 
@@ -276,7 +278,7 @@ def test_exit_hook_builder_carries_exact_selection_without_claiming_a_real_host(
     monkeypatch.setattr(host_exit.Kernel, '_from_storage', staticmethod(kernel))
     properties = host_exit.exit_properties(repository.database, 'action', request, tmp_path / 'runner.lock', {}, storage=selected)
     assert '"--run-id=A"' in properties[0]
-    assert properties[1] == 'TimeoutStopSec=5s'
+    assert properties[1] == 'TimeoutStopSec=96s'
     assert selected.run_id == 'A'
     foreign = replace(request, run_id='B')
     with pytest.raises(ValueError, match='binding changed'):
@@ -284,7 +286,7 @@ def test_exit_hook_builder_carries_exact_selection_without_claiming_a_real_host(
 
 
 def test_notification_pages_and_progress_rechecks_keep_same_id_siblings_outside_the_selected_snapshot(repository, monkeypatch):
-    a, b = repository.kernel('A'), repository.kernel('B')
+    a, b = selected_kernel(repository, 'A'), selected_kernel(repository, 'B')
     a.control('stop', 'same-action', subject=SUBJECT)
     b.control('stop', 'same-action', subject=SUBJECT)
     with a.storage.transaction(write=False) as tx:
@@ -323,7 +325,22 @@ def test_notification_pages_and_progress_rechecks_keep_same_id_siblings_outside_
     assert projected_rows and all(row['run_id'] == 'A' for row in projected_rows)
     from support.status_comments import core_status_comments
     context = core_status_comments(a)
-    assert context._read_binding().parent_number == 1
+    binding_runs = []
+    transaction = a.storage.transaction
+    @contextmanager
+    def selected_transaction(**kwargs):
+        assert kwargs['write'] is False
+        with transaction(**kwargs) as tx:
+            binding_runs.append(tx.run_id)
+            yield tx
+    with monkeypatch.context() as patch:
+        patch.setattr(a.storage, 'transaction', selected_transaction)
+        binding = context._read_binding()
+    assert binding_runs == ['A']
+    assert binding.repository_root == repository.repository_root
+    assert binding.repository == repository.repository
+    assert binding.runner_identity == a.operation_binding().inputs.runner_identity
+    assert a.operation_binding().parent_number == 1
     assert b.operation_binding().parent_number == 2
     assert status_subjects(repository.database, storage=a.storage) == []
     assert host_exit_current(repository.database, {'run_id': 'B'}, storage=a.storage) is False

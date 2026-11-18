@@ -64,7 +64,7 @@ def test_resync_charges_only_external_completed_snapshots_and_resume_only_renews
         def observe():
             with kernel.storage.transaction() as tx:
                 job = tx.one("SELECT * FROM subjects WHERE run_id=? AND id=?", (run, subject))
-                accepted = kernel._observe_integration_snapshot(tx, job, world)
+                accepted = kernel._delivery_state().observe_integration_snapshot(tx, job, world)
                 return accepted, kernel._resync_state(tx, subject)
 
         accepted, state = observe()

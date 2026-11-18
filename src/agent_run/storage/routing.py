@@ -12,21 +12,25 @@ import sqlite3
 import os
 import stat
 from pathlib import Path
-from typing import Literal, TYPE_CHECKING
+from typing import Protocol
 
 from agent_run.contracts.repository import normalize_repository
 from agent_run.contracts.task import TaskKey
 from agent_run.errors import KernelError
-from agent_run.model import Requirements, RunSpec
 from agent_run.storage.sqlite import Storage, Transaction
 from agent_run.storage.tasks import read_repository_task
 from agent_run.storage.preflight import UnsupportedState
 
-if TYPE_CHECKING:
-    from agent_run.adapters.workspace import ManagedWorkspace
-    from agent_run.core.kernel import Kernel
-    from agent_run.core.task_creation import TaskRun
-    from agent_run.queries.run import QueryDocument
+class WorkspaceLocation(Protocol):
+    """Only identity and paths are needed to locate repository storage."""
+    @property
+    def state_root(self) -> Path: ...
+
+    @property
+    def repository_root(self) -> Path: ...
+
+    @property
+    def repository(self) -> str: ...
 
 
 
@@ -79,7 +83,7 @@ class RepositoryRoute:
     repository: str
 
     @classmethod
-    def for_workspace(cls, workspace: ManagedWorkspace) -> RepositoryRoute:
+    def for_workspace(cls, workspace: WorkspaceLocation) -> RepositoryRoute:
         """Canonical assembly from trusted workspace metadata, not directory discovery."""
         return cls(workspace.state_root / "kernel.sqlite3", workspace.repository_root, workspace.repository)
 
@@ -180,63 +184,6 @@ class RepositoryRoute:
         with metadata.transaction(write=False) as owner:
             self._location(owner, run_id)
         return metadata.at_run(run_id)
-
-    def kernel(self, run_id: str) -> Kernel:
-        from agent_run.core.kernel import Kernel
-        return Kernel._from_storage(self.at_run(run_id))
-
-    def open_task(self, task: TaskKey) -> Kernel | None:
-        """The existing replaceability predicate in one canonical metadata snapshot.
-
-        This observation neither binds nor replaces. Atomic create rechecks the
-        pointer and predicate in its original writer after external preparation.
-        Missing/unreadable database or incomplete facts do not mean new work.
-        """
-        from agent_run.core.kernel import Kernel
-        from agent_run.storage.run_scope import RunTransaction
-        self._task(task)
-        if not self.database.exists() and not self.database.is_symlink():
-            self._require_vacant_root(self.database)
-            return None
-        metadata = self.metadata()
-        with metadata.transaction(write=False) as owner:
-            row = read_repository_task(owner, task)
-            if row is None or row["current_run"] is None:
-                return None
-            run_id = row["current_run"]
-            if self._location(owner, run_id).task != task:
-                raise KernelError("task_location_identity")
-            if Kernel._from_storage(metadata)._replaceable_in(RunTransaction(owner, run_id), task, run_id):
-                return None
-        return Kernel._from_storage(metadata.at_run(run_id))
-
-    def read(self, run_id: str, kind: Literal["status", "history", "settings"], *,
-             after: int = 0, limit: int | None = None) -> QueryDocument:
-        """A display consumer only; creation/control never parse this projection."""
-        from agent_run.queries.run import read
-        if kind not in {"status", "history", "settings"}:
-            raise ValueError("Unknown Run query")
-        return read(self.database, kind, storage=self.at_run(run_id),
-            after=after, limit=limit, expected_run=run_id, expected_repository=self.repository)
-
-    def idle(self, task: TaskKey) -> None:
-        from agent_run.core.task_creation import ensure_idle_task
-        self._task(task)
-        with self.metadata().transaction(ordered=False) as owner:
-            ensure_idle_task(owner, task)
-
-    def create(self, task: TaskKey, spec: RunSpec, requirements: Requirements) -> TaskRun:
-        from agent_run.core.kernel import Kernel
-        from agent_run.core.task_creation import create_repository_task
-        self._task(task)
-        return create_repository_task(Kernel._from_storage(self.metadata()), task, spec, requirements)
-
-    def reconcile(self, task: TaskKey, proposal_run_id: str, *, deadline: float | None = None) -> TaskRun:
-        from agent_run.core.kernel import Kernel
-        from agent_run.core.task_creation import reconcile_repository_task
-        self._task(task)
-        return reconcile_repository_task(Kernel._from_storage(self.metadata()), task,
-            proposal_run_id, deadline=deadline)
 
     def discover(self, *, after: str = "", limit: int = 128,
                  run_id: str | None = None, parent: int | None = None) -> RunPage:

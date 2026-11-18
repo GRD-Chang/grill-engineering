@@ -3,6 +3,7 @@
 The manager supplies explicit synthetic Host observations. These tests prove
 neither physical namespace exit nor native ordered-save/Host admission.
 """
+from agent_run.runtime import run_control
 from contextlib import closing, contextmanager, nullcontext
 import fcntl
 import json
@@ -16,6 +17,7 @@ import pytest
 
 from agent_run.adapters.workspace import ManagedWorkspace
 from agent_run.cli import lifecycle
+from agent_run.runtime import host_control
 from agent_run.cli.main import _parser
 from agent_run.model import HostObservation
 from agent_run.notifications import sender
@@ -69,9 +71,9 @@ def boundary(tmp_path, monkeypatch):
         route = RepositoryRoute(kernel.storage.path, workspace.repository_root, workspace.repository)
         monkeypatch.setattr(ManagedWorkspace, 'for_repository', staticmethod(lambda *_a: workspace))
         monkeypatch.setattr('agent_run.adapters.workspace.workspace_for_root', lambda *_a: workspace)
-        monkeypatch.setattr(RepositoryRoute, 'open_task', lambda *_a: kernel)
-        monkeypatch.setattr(RepositoryRoute, 'kernel', lambda *_a: kernel)
-        monkeypatch.setattr(lifecycle, '_active_runner', lambda: True)
+        monkeypatch.setattr('agent_run.runtime.task.open_task', lambda *_a: kernel)
+        monkeypatch.setattr('agent_run.runtime.task.selected_kernel', lambda *_a: kernel)
+        monkeypatch.setattr(run_control, '_active_runner', lambda: True)
         yield kernel, lock, held, notices, route, original_lease
 
 
@@ -131,16 +133,16 @@ def test_foreground_notification_runs_after_this_callers_real_leases_close(
 ):
     kernel, lock, held, notices, route, original_lease = boundary
     manager = _ObservedForeground(lock)
-    monkeypatch.setattr(lifecycle, '_manager_for', lambda *_a: manager)
+    monkeypatch.setattr(host_control, 'manager_for', lambda *_a: manager)
     if entry == 'attach':
         _admit(kernel, tmp_path)
     parent = original_lease(lock) if other_lease else nullcontext()
     with parent:
         if entry == 'submit':
-            result = lifecycle.submit(kernel, 'run', action_id='original', command=('controlled-host',),
+            result = host_control.submit(kernel, 'run', action_id='original', command=('controlled-host',),
                 manager=manager, environment=dict(os.environ), runner_lock=lock)
         elif entry == 'attach':
-            result = lifecycle.attach(kernel, requested_action='resume', manager=manager,
+            result = host_control.attach(kernel, requested_action='resume', manager=manager,
                                       environment=dict(os.environ), runner_lock=lock)
         else:
             parsed = _parser('en').parse_args(['run', '1', '--repo', 'example/project', '--foreground'])
@@ -158,7 +160,7 @@ def test_foreground_retirement_and_notification_errors_preserve_the_original_exc
     kernel, lock, held, notices, route, _ = boundary
     original = OSError('original foreground operation failure')
     manager = _ObservedForeground(lock, failure=original, retire=retired)
-    monkeypatch.setattr(lifecycle, '_manager_for', lambda *_a: manager)
+    monkeypatch.setattr(host_control, 'manager_for', lambda *_a: manager)
     if entry == 'attach':
         _admit(kernel, tmp_path)
     notify_calls = []
@@ -170,10 +172,10 @@ def test_foreground_retirement_and_notification_errors_preserve_the_original_exc
     monkeypatch.setattr(sender, 'notify_committed', failed_notification)
     with pytest.raises(OSError) as caught:
         if entry == 'submit':
-            lifecycle.submit(kernel, 'run', action_id='original', command=('controlled-host',),
+            host_control.submit(kernel, 'run', action_id='original', command=('controlled-host',),
                 manager=manager, environment=dict(os.environ), runner_lock=lock)
         elif entry == 'attach':
-            lifecycle.attach(kernel, requested_action='resume', manager=manager, environment=dict(os.environ), runner_lock=lock)
+            host_control.attach(kernel, requested_action='resume', manager=manager, environment=dict(os.environ), runner_lock=lock)
         else:
             parsed = _parser('en').parse_args(['run', '1', '--repo', 'example/project', '--foreground'])
             lifecycle.execute(parsed, language='en', repository_route=route)
@@ -187,7 +189,7 @@ def test_run_keeps_its_original_attached_exit_without_launching_again(boundary, 
     kernel, lock, held, notices, route, _ = boundary
     request = _admit(kernel, tmp_path)
     manager = _ObservedForeground(lock)
-    monkeypatch.setattr(lifecycle, '_manager_for', lambda *_a: manager)
+    monkeypatch.setattr(host_control, 'manager_for', lambda *_a: manager)
     parsed = _parser('en').parse_args(['run', '1', '--repo', 'example/project', '--foreground'])
     result = lifecycle.execute(parsed, language='en', repository_route=route)
     assert result['result'] == 'attached' and result['action_id'] == 'original'
@@ -213,7 +215,7 @@ def test_empty_foreground_attach_offers_history_recovery_without_new_core_facts(
     kernel, lock, held, notices, _, _ = boundary
     with kernel.storage.transaction(write=False) as tx:
         before = [tuple(row) for row in tx.rows('SELECT * FROM history ORDER BY position')]
-    result = lifecycle.attach(kernel, requested_action='resume', manager=_ObservedForeground(lock),
+    result = host_control.attach(kernel, requested_action='resume', manager=_ObservedForeground(lock),
                               environment={}, runner_lock=lock)
     assert result is None and notices == [(kernel.storage.path, 'run-native', [True], True)]
     with kernel.storage.transaction(write=False) as tx:
@@ -228,7 +230,7 @@ def test_failed_foreground_call_does_not_infer_physical_cleanup_from_host_usage(
     kernel, lock, held, notices, route, _ = boundary
     original = OSError('original operation failure after committed retirement')
     manager = _ObservedForeground(lock, failure=original)
-    monkeypatch.setattr(lifecycle, '_manager_for', lambda *_a: manager)
+    monkeypatch.setattr(host_control, 'manager_for', lambda *_a: manager)
     if entry == 'attach':
         _admit(kernel, tmp_path)
     rechecks = []
@@ -240,10 +242,10 @@ def test_failed_foreground_call_does_not_infer_physical_cleanup_from_host_usage(
     monkeypatch.setattr(kernel, 'host_usage', unavailable)
     with pytest.raises(OSError) as caught:
         if entry == 'submit':
-            lifecycle.submit(kernel, 'run', action_id='original', command=('controlled-host',),
+            host_control.submit(kernel, 'run', action_id='original', command=('controlled-host',),
                 manager=manager, environment=dict(os.environ), runner_lock=lock)
         elif entry == 'attach':
-            lifecycle.attach(kernel, requested_action='resume', manager=manager,
+            host_control.attach(kernel, requested_action='resume', manager=manager,
                              environment=dict(os.environ), runner_lock=lock)
         else:
             parsed = _parser('en').parse_args(['run', '1', '--repo', 'example/project', '--foreground'])
@@ -260,7 +262,7 @@ def test_execute_keeps_retired_attach_notification_until_after_later_control_err
     request = _admit(kernel, tmp_path)
     manager = _ObservedForeground(lock)
     original = OSError('original later control read failed')
-    monkeypatch.setattr(lifecycle, '_manager_for', lambda *_a: manager)
+    monkeypatch.setattr(host_control, 'manager_for', lambda *_a: manager)
 
     def failed_selection(**_kwargs):
         assert not _exclusive_available(lock), 'subsequent control ran after releasing its outer lease'
@@ -281,7 +283,7 @@ def test_notification_diagnostic_failure_preserves_the_original_control_error(
     kernel, lock, held, _notices, route, _ = boundary
     original = OSError('original control failure after successful physical settlement')
     manager = _ObservedForeground(lock)
-    monkeypatch.setattr(lifecycle, '_manager_for', lambda *_a: manager)
+    monkeypatch.setattr(host_control, 'manager_for', lambda *_a: manager)
     _admit(kernel, tmp_path)
 
     def unavailable(*_a, **_k):
@@ -296,7 +298,7 @@ def test_notification_diagnostic_failure_preserves_the_original_control_error(
     monkeypatch.setattr(sender, 'notify_committed', unavailable)
     monkeypatch.setattr(kernel, 'resume_subject', failed_control)
     with monkeypatch.context() as patch:
-        patch.setattr(lifecycle.sys, 'stderr', SimpleNamespace(write=broken_write))
+        patch.setattr(host_control.sys, 'stderr', SimpleNamespace(write=broken_write))
         with pytest.raises(OSError) as caught:
             parsed = _parser('en').parse_args(['resume', 'run-native', '--repo', 'example/project', '--foreground'])
             lifecycle.execute(parsed, language='en', repository_route=route)
@@ -311,7 +313,7 @@ def test_notification_and_diagnostic_failure_preserve_successful_receipt(
 ):
     kernel, lock, held, _notices, route, _ = boundary
     manager = _ObservedForeground(lock)
-    monkeypatch.setattr(lifecycle, '_manager_for', lambda *_a: manager)
+    monkeypatch.setattr(host_control, 'manager_for', lambda *_a: manager)
     if entry == 'attach':
         _admit(kernel, tmp_path)
 
@@ -323,12 +325,12 @@ def test_notification_and_diagnostic_failure_preserve_successful_receipt(
 
     monkeypatch.setattr(sender, 'notify_committed', unavailable)
     with monkeypatch.context() as patch:
-        patch.setattr(lifecycle.sys, 'stderr', SimpleNamespace(write=broken_write))
+        patch.setattr(host_control.sys, 'stderr', SimpleNamespace(write=broken_write))
         if entry == 'submit':
-            result = lifecycle.submit(kernel, 'run', action_id='original', command=('controlled-host',),
+            result = host_control.submit(kernel, 'run', action_id='original', command=('controlled-host',),
                 manager=manager, environment=dict(os.environ), runner_lock=lock)
         elif entry == 'attach':
-            result = lifecycle.attach(kernel, requested_action='resume', manager=manager,
+            result = host_control.attach(kernel, requested_action='resume', manager=manager,
                 environment=dict(os.environ), runner_lock=lock)
         else:
             parsed = _parser('en').parse_args(['run', '1', '--repo', 'example/project', '--foreground'])
@@ -367,7 +369,7 @@ def test_empty_foreground_entry_recovers_committed_exit_before_its_first_outbox_
 
     manager = ForegroundHost(environment={})
     monkeypatch.setattr(manager, 'preflight', lambda: None)  # No native namespace is claimed.
-    monkeypatch.setattr(lifecycle, '_manager_for', lambda *_a: manager)
+    monkeypatch.setattr(host_control, 'manager_for', lambda *_a: manager)
     monkeypatch.setattr(sender, 'status_subjects', lambda *_a, **_k: [])
     real_notify, real_sender = notify_owned_history, sender.NativeNotifications
     delivered = []
@@ -389,7 +391,7 @@ def test_empty_foreground_entry_recovers_committed_exit_before_its_first_outbox_
 
     monkeypatch.setattr(sender, 'notify_committed', notify)
     if entry == 'attach':
-        assert lifecycle.attach(kernel, requested_action='resume', manager=manager,
+        assert host_control.attach(kernel, requested_action='resume', manager=manager,
                                 environment=dict(os.environ), runner_lock=lock) is None
     else:
         failure = OSError('later control selection unavailable')

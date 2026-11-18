@@ -25,6 +25,7 @@ from agent_run.config.paths import app_data_root
 from agent_run.runtime.package_lease import RunnerLeaseBusy, default_runner_lock_path, runner_management_lease
 from agent_run.config.defaults import UserDefaultsStore
 from agent_run.core.kernel import Kernel
+from agent_run.runtime.task import create_managed_task
 from agent_run.adapters.workspace import ManagedWorkspace
 from agent_run.storage.routing import RepositoryRoute
 from support.systemd_manager import controlled_manager
@@ -36,6 +37,7 @@ from support.systemd_manager import SidecarStatTrace, _resumed_ticket_completion
 from support.systemd_manager import _measure_host_calls
 from support.systemd_manager import _commit_resume_timeline_note
 from support.host_cost_trace import note_costs, report_costs
+from support.pending_control import committed_control, pending_public_control
 
 
 FINDING = "Remove obsolete-extra.txt from the final diff; keep the requested implementation."
@@ -1365,13 +1367,26 @@ def test_public_requeue_and_revise_deliver_fresh_generations_in_the_original_man
                 timing["final_requeue_to_approval_seconds"] = time.monotonic() - final_controlled_at
                 assert _git(tmp_path / "origin.git", "rev-parse", final_delivery.source_ref) == original_run_head
                 approve_started = time.monotonic()
-                code, approved = public("approve", accepted["run_id"])
-                assert code == 0 and approved["status"] == "action_pending" and approved["host"] == "running", approved
-                assert kernel.host_request(accepted["action_id"]) == request
-                with kernel.storage.transaction(write=False) as tx:
-                    grant = tx.one("SELECT action,pr_number,head_sha FROM grants WHERE subject=?", (final,))
-                    assert grant["action"] == approved["action_id"] and grant["pr_number"] == final_before["pr_number"]
-                release.set()
+                with pending_public_control("approve", accepted["run_id"], cwd=git_repo, environment=environment,
+                                            timeout=min(20, remaining())) as (control, control_remaining):
+                    # Approve 现等待真实交付；先检查被屏障暂停的原 Host 的授权，
+                    # 再释放执行，最后检查原 CLI 的交付回执。
+                    action = committed_control(kernel, control, "approve", timeout=control_remaining())
+                    assert action["status"] == "pending"
+                    assert serving.is_alive() and children[0].poll() is None
+                    assert kernel.host_request(accepted["action_id"]) == request
+                    with kernel.storage.transaction(write=False) as tx:
+                        grant = tx.one("SELECT action,pr_number,head_sha FROM grants WHERE subject=?", (final,))
+                        assert grant["action"] == action["id"] and grant["pr_number"] == final_before["pr_number"]
+                        assert grant["head_sha"] == original_run_head
+                    release.set()
+                    stdout, stderr = control.communicate(timeout=control_remaining())
+                    assert control.returncode == 0, (stdout, stderr)
+                    approved = json.loads(stdout)
+                    assert approved["result"] == "accepted" and approved["requested_action"] == "approve"
+                    assert approved["action_id"] == action["id"] and approved["status"] == "action_complete", approved
+                    assert approved["requested_action_applied"] and approved["requested_action_succeeded"]
+                    assert approved["request_outcome"] == "delivered" and approved["delivery_completed"]
                 serving.join(timeout=remaining())
                 assert not serving.is_alive() and not errors, errors
                 assert children[0].returncode == 0 and len(commands) == 1, output
@@ -1688,7 +1703,7 @@ def test_controlled_native_commit_failure_reaps_both_workers_before_disarm_and_p
     _measure_host_calls(tmp_path, monkeypatch, enabled=request.config.getoption('host_loss_io_diagnostics'))
     from uuid import uuid4
     from agent_run.adapters.foreground import read_record, record_root, subreaper
-    from agent_run.cli.lifecycle import prepare_creation
+    from agent_run.runtime.task_creation import prepare_creation
     from support.sqlite_fault_host import command
     from support.sqlite_faults import FaultScope
 
@@ -1732,8 +1747,9 @@ if role == 'development':
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import pytest
-from agent_run.cli.lifecycle import submit
+from agent_run.runtime.host_control import submit
 from agent_run.core.kernel import Kernel
+from agent_run.runtime.task import create_managed_task
 from agent_run.runtime.foreground_host import ForegroundHost
 from support.installed_runtime import require_current_installation
 from support.sqlite_fault_host import command
@@ -1761,7 +1777,7 @@ else:
         environment, _ = _control_environment(git_repo, tmp_path, monkeypatch, codex=codex, tickets=(2, 3))
         database, spec, requirements = prepare_creation(1, 'example/project', source_directory=git_repo,
             defaults=UserDefaultsStore(), disable_notifications=True)
-        kernel = Kernel.create_task(database, spec, requirements=requirements)
+        kernel = create_managed_task(database, spec, requirements=requirements)
         action = uuid4().hex
         lock = default_runner_lock_path(environment)
         scope, digest = FaultScope.create(tmp_path / 'fault-scope', database, spec.run_id, action)
@@ -1872,6 +1888,8 @@ else:
             receipt = json.loads(resumed.stdout)
             assert receipt['run_id'] == spec.run_id and receipt['host'] == 'exited'
             assert receipt['action_id'] != action and receipt['action'] == 'resume'
+            observations['first_public_resume'] = receipt
+            observations['resume_stderr'] = {'characters': len(resumed.stderr), 'tail': resumed.stderr[-8192:]}
             fresh_read = subprocess.run([sys.executable, '-m', 'agent_run', 'history', spec.run_id,
                 '--repo', 'example/project', '--json'], cwd=git_repo, env=environment,
                 text=True, capture_output=True, timeout=min(20, remaining()))
@@ -1891,7 +1909,14 @@ else:
                            for item in retained['invocations'])
                 output, = current['outputs']
                 assert output['raw_id'] is None and output['raw_return'] is None and output['exit_code'] is None
-                assert retained['status'] == 'consumed' and retained['result']['result_kind'] == 'development'
+                if not (retained['status'] == 'consumed' and retained['result']['result_kind'] == 'development'):
+                    failure = {'subject': subject, 'status': retained['status'],
+                               'resume_stderr': observations['resume_stderr']}
+                    try:
+                        failure['gates'] = kernel.status(subject)['gates']
+                    except Exception as unavailable:
+                        failure['gates_unavailable'] = type(unavailable).__name__
+                    raise AssertionError(failure)
             for subject in before:
                 publication, = [row for row in attempts if row['subject'] == subject and row['role'] == 'publication']
                 assert publication['outcome'] == 'human_blocker'

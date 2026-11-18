@@ -10,10 +10,10 @@ from typing import Any, cast
 import re
 import uuid
 
-from agent_run.contracts.status_comment import StatusProjection
+from agent_run.contracts.status_comment import StatusBinding, StatusProjection
 from agent_run.contracts.write_authority import WriteAuthority
-from agent_run.core.operation_contract import OperationBinding
-from agent_run.adapters.remote import EffectReadError, PhysicalAPI, RemoteEffects
+from agent_run.adapters.operation_errors import EffectReadError
+from agent_run.adapters.status_comment import CommentAPI, StatusCommentTransport
 from agent_run.adapters.auth.app import GitHubCredentialError
 from agent_run.errors import GitHubReadError, KernelError
 from agent_run.runtime.process_identity import _process_binding_status, _process_start_token
@@ -23,7 +23,7 @@ from agent_run.storage import notification_outbox as outbox
 class StatusComments:
     """Own durable comment delivery; callers supply fresh, read-only Run facts."""
     def __init__(self, state_root: Path, *, read_projection: Callable[[str], StatusProjection],
-                 read_binding: Callable[[], OperationBinding]) -> None:
+                 read_binding: Callable[[], StatusBinding]) -> None:
         self.state_root = state_root.absolute()
         self._projection = read_projection
         self._read_binding = read_binding
@@ -107,7 +107,7 @@ class StatusComments:
         entry["intent"] = intent
         return cast(dict[str, Any], deepcopy(intent))
 
-    def deliver(self, subject: str, *, api: PhysicalAPI | None = None,
+    def deliver(self, subject: str, *, api: CommentAPI | None = None,
                 cancelled: Callable[[], bool] = lambda: False) -> str:
         """Direct delivery retains its best-effort projection failure result."""
         deadline = time.monotonic() + outbox.DELIVERY_LIFETIME_SECONDS
@@ -118,7 +118,7 @@ class StatusComments:
         return self._deliver_projection(subject, projection, deadline, api=api, cancelled=cancelled)
 
     def deliver_current(self, subject: str, *, previous: tuple[str, str] | None = None,
-                        api: PhysicalAPI | None = None,
+                        api: CommentAPI | None = None,
                         cancelled: Callable[[], bool] = lambda: False) -> tuple[str, tuple[str, str]]:
         """One bounded opportunity; the existing sender supplies scheduling/cancellation.
 
@@ -136,7 +136,7 @@ class StatusComments:
         return self._deliver_projection(subject, projection, deadline, api=api, cancelled=cancelled), fingerprint
 
     def _deliver_projection(self, subject: str, projection: StatusProjection, deadline: float, *,
-                            api: PhysicalAPI | None, cancelled: Callable[[], bool]) -> str:
+                            api: CommentAPI | None, cancelled: Callable[[], bool]) -> str:
         """Use this entry's just-closed projection; only fresh admit permits a write."""
         claim = None
         def stopped() -> bool:
@@ -163,8 +163,8 @@ class StatusComments:
                 intent = deepcopy(current_intent)
                 marker = entry["marker"]
             binding = self._read_binding()
-            remote = RemoteEffects(binding.repository_root, binding.repository,
-                                   runner_identity=binding.inputs.runner_identity, api=api, cancelled=stopped)
+            remote = StatusCommentTransport(binding.repository_root, binding.repository,
+                                   runner_identity=binding.runner_identity, api=api, cancelled=stopped)
             def admit() -> None:
                 # Slow transport/credential preparation and remote reads are
                 # already finished. No remote I/O follows this final check.
@@ -180,7 +180,7 @@ class StatusComments:
             observed = remote.read_status_comment(target, marker, intent, stopped)
             if observed["disposition"] == "prior" and not intent["sent"]:
                 try:
-                    observed = remote.write_status_comment(target, marker, intent, WriteAuthority(lambda: admit), stopped)
+                    observed = remote.write_status_comment(target, marker, intent, WriteAuthority(lambda: admit), stopped, expected_head=projection.head_sha)
                 except EffectReadError as error:
                     observed = {"disposition": "unknown", "write_returncode": error.write_returncode}
             with outbox.transaction(self.state_root, target.run_id) as document:

@@ -219,7 +219,7 @@ def test_original_gate_revokes_go_but_late_raw_and_exit_settle_only_their_lease(
     call, process = _start(kernel, preparations["A"])
     # Exercise the existing domain gate, not an unconverted public Stop router.
     with kernel.storage.transaction() as tx:
-        kernel._gate(tx, SUBJECT, "operator_stopped")
+        kernel._delivery_state().gate(tx, SUBJECT, "operator_stopped")
     with pytest.raises(KernelError, match="agent_authority_changed"):
         kernel.agent_source_ready(call)
     kernel.receive(call, b"original exact late raw")

@@ -7,7 +7,8 @@ import subprocess
 import pytest
 
 from agent_run.adapters import github_commands
-from agent_run.adapters.remote import EffectReadError, RemoteEffects
+from agent_run.adapters.operation_errors import EffectReadError
+from agent_run.adapters.status_comment import StatusCommentTransport
 from agent_run.contracts.status_comment import StatusTarget
 from agent_run.contracts.write_authority import WriteAuthority, admit_write
 from agent_run.errors import GitHubReadError
@@ -19,7 +20,7 @@ def observation(tmp_path, monkeypatch):
                           "publisher", "effect", "receipt", "refs/heads/source", "refs/heads/main")
     marker = f"<!-- agent-run-status:{target.key}:create -->"
     intent = {"comment_id": None, "before": None, "body": marker + "\nCurrent status"}
-    port = RemoteEffects(tmp_path, target.repository, runner_identity={"source": "host"})
+    port = StatusCommentTransport(tmp_path, target.repository, runner_identity={"source": "host"})
     calls, responses = [], []
 
     def read(command, before_attempt=None):
@@ -33,7 +34,7 @@ def observation(tmp_path, monkeypatch):
             raise value
         return subprocess.CompletedProcess(command, 0, json.dumps(value), "")
 
-    monkeypatch.setattr(port, "_read", read)
+    monkeypatch.setattr(port.reads, "read", read)
     return port, target, marker, intent, calls, responses
 
 
@@ -51,7 +52,7 @@ def pages(target, rows):
         result.append({"data": {"viewer": {"login": target.actor}, "repository": {
             "nameWithOwner": target.repository,
             "pullRequest": {"number": target.pr_number, "author": {"__typename": "User", "login": target.actor},
-                "headRefName": target.source_ref.removeprefix("refs/heads/"),
+                "headRefName": target.source_ref.removeprefix("refs/heads/"), "headRefOid": "1" * 40,
                 "baseRefName": target.target_ref.removeprefix("refs/heads/"),
                 "headRepository": {"nameWithOwner": target.repository},
                 "baseRepository": {"nameWithOwner": target.repository},
@@ -65,7 +66,7 @@ def pages(target, rows):
 def test_status_round_uses_one_complete_request_and_reloads_next_round(observation, source):
     port, target, marker, intent, calls, responses = observation
     if source == "pat":
-        port.identity = {"source": "pat", "pat": {"env": "STATUS_TEST_TOKEN"}}
+        port.reads.identity = {"source": "pat", "pat": {"env": "STATUS_TEST_TOKEN"}}
     responses.extend([pages(target, []), pages(target, [comment(target, 71, intent["body"])])])
     assert port.read_status_comment(target, marker, intent, lambda: False) == {"disposition": "prior"}
     assert len(calls) == 1
@@ -116,7 +117,7 @@ def test_status_batch_unavailable_readback_keeps_original_write_result(observati
 def test_status_repository_variables_remain_literal_strings(observation, owner, name):
     port, target, marker, intent, calls, responses = observation
     target = replace(target, repository=f"{owner}/{name}")
-    port.repository = target.repository
+    port.reads.repository = target.repository
     responses.append(pages(target, []))
     assert port.read_status_comment(target, marker, intent, lambda: False)["disposition"] == "prior"
     command, = calls
@@ -127,7 +128,7 @@ def test_status_repository_variables_remain_literal_strings(observation, owner, 
 def test_status_app_keeps_actual_resolver_and_does_not_require_viewer(observation, monkeypatch):
     port, target, marker, intent, calls, responses = observation
     target = replace(target, actor="publisher[bot]")
-    port.identity = {"source": "app", "app_profile": {"app_id": "1", "installation_id": "2",
+    port.reads.identity = {"source": "app", "app_profile": {"app_id": "1", "installation_id": "2",
         "private_key_path": "/nonexistent/status-test-key"}, "app_read_only": False,
         "app_current_repository_only": False}
     resolved = []
@@ -335,3 +336,29 @@ def test_status_failed_complete_read_is_not_split_or_retried(observation, error)
         port.read_status_comment(target, marker, intent, lambda: False)
     assert caught.value is error
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("head", ["1" * 40, "2" * 40, None])
+def test_status_write_rechecks_exact_head_without_changing_readback_identity(observation, monkeypatch, head):
+    port, target, marker, intent, calls, responses = observation
+    packet = pages(target, [])
+    packet[0]["data"]["repository"]["pullRequest"]["headRefOid"] = head
+    responses.extend([packet, pages(target, [comment(target, 71, intent["body"])])])
+    writes = []
+    def write(endpoint, method, body, authorize, boundary):
+        admit_write(authorize, boundary)
+        writes.append(method)
+        return subprocess.CompletedProcess([], 0, "", "")
+    monkeypatch.setattr(port, "_write", write)
+    authority = WriteAuthority(lambda: lambda: None)
+    if head == "1" * 40:
+        assert port.write_status_comment(target, marker, intent, authority, lambda: False,
+                                         expected_head="1" * 40)["disposition"] == "target"
+        assert writes == ["POST"]
+    else:
+        with pytest.raises(ValueError, match="changed before write"):
+            port.write_status_comment(target, marker, intent, authority, lambda: False,
+                                      expected_head="1" * 40)
+        assert writes == []
+        # An already-sent exact body still reconciles independently of new head.
+        assert port.read_status_comment(target, marker, intent, lambda: False)["disposition"] == "target"

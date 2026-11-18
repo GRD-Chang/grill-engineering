@@ -2,7 +2,7 @@
 
 本页及链接文档中的源码、测试命令以本文件所在目录为工作目录。
 安装、接入目标仓库或运行交付时，先读 [Agent 操作指南](docs/agent-guide.md)。
-探索或修改代码前，按任务读取 [CONTEXT.md](CONTEXT.md) 与 `docs/adr/` 中的相关决策；领域术语沿用产品上下文。
+探索或修改代码前，按任务读取 [GLOSSARY-MAP.md](GLOSSARY-MAP.md) 中对应词汇表与 `docs/adr/` 中的相关决策。
 
 ## 测试
 

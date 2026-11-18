@@ -11,19 +11,17 @@ import pytest
 
 from agent_run.core.kernel import Kernel
 from agent_run.core.operation_contract import ReadUnavailable
-from agent_run.model import DeliveryKind
 from support.effect_boundary import advance_to_effect, effect_state
-from support.run_scoped_kernel import domain_scenario
 from support.parent_repair import _repairs, _requests, _run, _until
 
 
 @pytest.mark.parametrize("sent", [False, True], ids=["prepared", "sent-not-applied"])
 @pytest.mark.parametrize("changed_ref", ["target_ref", "source_ref", "repair_source"], ids=["default", "run", "repair-source"])
 def test_repair_merge_intent_cannot_authorize_a_new_combination(
-    tmp_path, monkeypatch, domain_scenario, changed_ref, sent,
+    monkeypatch, repair_before_pr, changed_ref, sent,
 ):
-    scenario = domain_scenario(tmp_path / "write-fence", DeliveryKind.FINAL_RUN,
-                               reviews=("fail", "pass"), checks=("pass",))
+    scenario = repair_before_pr
+    scenario.checks[:] = ["pass"]
     held = advance_to_effect(scenario, monkeypatch, "merge", sent=sent)
     effect = held.effect
     assert effect.payload["repair_id"]
@@ -52,10 +50,10 @@ def test_repair_merge_intent_cannot_authorize_a_new_combination(
 
 @pytest.mark.parametrize("changed_basis", ["run", "requirements"])
 def test_lost_repair_merge_receipt_is_settled_before_reaccepting_changed_basis(
-    tmp_path, monkeypatch, domain_scenario, changed_basis,
+    monkeypatch, repair_before_pr, changed_basis,
 ):
-    scenario = domain_scenario(tmp_path / "lost-merge", DeliveryKind.FINAL_RUN,
-                               reviews=("fail", "pass"), checks=("none",))
+    scenario = repair_before_pr
+    scenario.checks[:] = ["none"]
     held = advance_to_effect(scenario, monkeypatch, "merge", sent=True)
     effect, authority = held.effect, held.authorize
     before = scenario.kernel.status(scenario.delivery.key)
@@ -120,10 +118,10 @@ def test_lost_repair_merge_receipt_is_settled_before_reaccepting_changed_basis(
 
 @pytest.mark.parametrize("missing", ["ancestry", "checks-demand"])
 def test_core_rejects_incomplete_repair_read_without_changing_retained_work(
-    tmp_path, domain_scenario, missing,
+    repair_before_pr, missing,
 ):
-    scenario = domain_scenario(tmp_path / "incomplete-child", DeliveryKind.FINAL_RUN,
-                               reviews=("fail", "pass"), checks=("none",))
+    scenario = repair_before_pr
+    scenario.checks[:] = ["none"]
     _until(scenario, lambda state: state["phase"] == "repair_checks")
     ports = scenario.make_ports(scenario.kernel.operation_binding())
     request = scenario.kernel.begin_observation(scenario.delivery.key)
@@ -141,9 +139,8 @@ def test_core_rejects_incomplete_repair_read_without_changing_retained_work(
     assert scenario.writes() == writes
 
 
-def test_repair_source_rewrite_is_preserved_as_an_identity_boundary(tmp_path, domain_scenario):
-    scenario = domain_scenario(tmp_path / "rewrite", DeliveryKind.FINAL_RUN,
-                               reviews=("fail", "pass"), checks=("pending",))
+def test_repair_source_rewrite_is_preserved_as_an_identity_boundary(repair_before_pr):
+    scenario = repair_before_pr
     before = _until(scenario, lambda state: state["phase"] == "repair_checks")
     repair = before["repair_pr"]
     response = scenario.port.physical.push(repair["source_ref"], repair["published_sha"], scenario.initial.sha)
@@ -173,3 +170,33 @@ def test_open_repair_pr_alone_cannot_prove_an_unknown_merge_did_not_happen(tmp_p
     again = port.execute(effect, WriteAuthority(lambda: pytest.fail("Unknown merge must not acquire another write")))
     assert again.disposition == "unknown"
     assert not any('"PUT"' in line and "/merge" in line for line in calls.read_text().splitlines())
+
+
+@pytest.mark.parametrize('changed_basis', ['requirements', 'graph'])
+def test_prepared_repair_cannot_write_after_its_source_contract_changes(
+    monkeypatch, repair_before_pr, changed_basis,
+):
+    from agent_run.errors import KernelError
+
+    scenario = repair_before_pr
+    scenario.checks[:] = ["pass"]
+    held = advance_to_effect(scenario, monkeypatch, 'merge')
+    effect = held.effect
+    before = scenario.kernel.status(effect.subject)
+    writes = scenario.writes()
+    retained = Path(scenario.delivery.checkout) / 'uncommitted-contract-work.txt'
+    retained.write_text('Keep work while the original repair loses authority\n')
+    parent = scenario.requirements.parent
+    assert parent.sub_issue_numbers
+    parent = (replace(parent, body=parent.body + '\nUpdated acceptance requirements.')
+              if changed_basis == 'requirements' else replace(parent, sub_issue_numbers=()))
+    scenario.requirements = replace(scenario.requirements, parent=parent)
+
+    with pytest.raises(KernelError):
+        held.authorize.prepare()()
+
+    assert effect_state(scenario, effect)[1] == 0
+    assert scenario.writes() == writes
+    assert scenario.kernel.status(effect.subject)['budgets'] == before['budgets']
+    assert retained.read_text() == 'Keep work while the original repair loses authority\n'
+    assert not any(row['operation'] == 'merge' and row['intent'] == effect.effect_id for row in scenario.writes())

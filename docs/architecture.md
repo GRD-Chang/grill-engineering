@@ -14,8 +14,12 @@
 ```mermaid
 flowchart TD
     CLI[cli.main] --> Lifecycle[cli.lifecycle]
-    Lifecycle --> Core[Kernel: Task / Action / Host 准入]
-    Lifecycle --> Host[SystemdHost / ForegroundHost 候选]
+    Lifecycle --> Control[runtime.run_control / host_control]
+    Control --> Task[runtime.task: 工作区组合与 Task 打开]
+    Task --> Creation[core.task_creation / run_creation]
+    Creation --> Store[Storage / Transaction: SQLite 事实]
+    Control --> Core[Kernel: Action / Host 准入]
+    Control --> Host[SystemdHost / ForegroundHost 候选]
     Host --> Executor[runtime.executor: 进程与并发调用]
     Executor --> Runner[OperationRunner: 单次物理操作]
     Runner --> Core
@@ -26,6 +30,7 @@ flowchart TD
     Worker --> Core
     CLI --> Query[queries.run / cli.render]
     Query --> Store
+    Query --> Observe[runtime.inspection: 只读绑定观察]
 ```
 
 Ticket、Parent-only 和完整 Parent 的 Final 交付共用一个 Core。
@@ -44,25 +49,58 @@ Ticket、Parent-only 和完整 Parent 的 Final 交付共用一个 Core。
 | 模块 | 负责什么 | 不承担什么 |
 | --- | --- | --- |
 | [`Kernel`](../src/agent_run/core/kernel.py) | 从当前 SQL 事实决定状态迁移、currentness、预算、工作 FIFO、集成单席、控制准入及写入授权 | 不把 Git/GitHub、Agent 调用或等待放进业务写事务 |
+| [`core.repair`](../src/agent_run/core/repair.py)、[`delivery_checks`](../src/agent_run/core/delivery_checks.py) | Parent 修复的候选到回执规则；普通/修复共用准确 Checks 保存及失败转 CI | 不持有完整 Kernel，不独立选工或批准正式写入 |
+| [`attempt_lifecycle`](../src/agent_run/core/attempt_lifecycle.py)、[`attempt_continuation`](../src/agent_run/core/attempt_continuation.py) | 原 Attempt 事实、等待和有界恢复判定、原事务内 Invocation/output/lease 准入 | 不代替物理退出证明，不创建新预算或控制器 |
 | [`Storage / Transaction`](../src/agent_run/storage/sqlite.py) | 事务、关系事实、材料摘要与拥有者核验、有界读取和容量检查 | 不选择后继工作，不重建另一套可变 Run 引擎 |
+| [`runtime.task`](../src/agent_run/runtime/task.py)、[`core.task_creation`](../src/agent_run/core/task_creation.py) | 应用入口选择具体工作区；创建业务在同一原事务发布完整 Run 与 Task 绑定；原 proposal 按原 deadline 对账 | 存储路由不构造 Core、查询或具体 Workspace；创建业务不持有完整 Kernel |
+| [`runtime.run_control`](../src/agent_run/runtime/run_control.py)、[`runtime.host_control`](../src/agent_run/runtime/host_control.py) | 原 Action 的准入、启动、附着与回执，前后台使用租约与通知时序 | CLI 不读取 Host 状态表或协调启动；未知退出不释放原租约 |
 | [`OperationRunner`](../src/agent_run/core/operation_runner.py) | 获取冻结配置，协调一次观察、Core 请求、实际操作和结果对账 | 不自行制定业务后继、预算或写权限 |
 | [`executor`](../src/agent_run/runtime/executor.py) | Agent 与 I/O 的物理并发、取消、等待和返回/退出收口 | 不用 Future 完成代替持久租约释放或退出证明 |
 | [`runtime.handoff`](../src/agent_run/runtime/handoff.py)、[`SystemdHost`](../src/agent_run/adapters/systemd.py) | 环境交接、Runner 使用租约、systemd 启动与原 Host 身份观察 | 不把未知启动或未知退出当成重新启动许可 |
 | [`ForegroundHost`](../src/agent_run/runtime/foreground_host.py)、[`adapters.foreground`](../src/agent_run/adapters/foreground.py) | 显式前台候选的 namespace 启动、握手、原进程身份和退出观察；正常收尾仍待验收 | 不替代 Core 或后台 Host，不把跨 observer 的未知退出当作恢复许可 |
-| [`adapters.source`](../src/agent_run/adapters/source.py)、[`RemoteEffects`](../src/agent_run/adapters/remote.py)、[`LocalEffects`](../src/agent_run/adapters/local_git.py)、[`LocalGit`](../src/agent_run/adapters/git_objects.py) | 真实需求、refs、PR/checks 读取，Git/GitHub 操作、资源检查和准确读回 | 不用读取失败推断不存在，不自行重试未知写入 |
+| [`RemoteObservation`](../src/agent_run/adapters/remote_observation.py)、[`GitHubReadTransport`](../src/agent_run/adapters/github_transport.py) | Source/Delivery 联合和独立观察、完整分页、PR/checks、公开 `commit` 读取；创建 Task 使用只读提交入口 | 不持有业务写入或对账能力，不用部分 JSON 或缺失汇总证明成功 |
+| [`RemoteEffects`](../src/agent_run/adapters/remote.py)、[`LocalEffects`](../src/agent_run/adapters/local_git.py)、[`LocalGit`](../src/agent_run/adapters/git_objects.py) | 已授权 Git/GitHub 操作、资源检查及原意图准确读回，包括退役、重开、恢复评论和清理 | 不制定通知内容，不自行重试未知写入 |
 | [`runtime.codex`](../src/agent_run/runtime/codex.py)、[`core.prompts.role`](../src/agent_run/core/prompts/role.py) | 已分配调用的 Prompt、隔离进程、Thread、原始返回及活动事实 | 不从 Agent 自报完成推导业务通过或合并许可 |
 | [`queries.run`](../src/agent_run/queries/run.py)、[`cli.render`](../src/agent_run/cli/render.py)、[`queries.execution`](../src/agent_run/queries/execution.py) | 同源只读状态、分页历史、冻结设置和显示 | 不恢复执行、不写业务状态、不发送通知 |
 | [`cli.settings`](../src/agent_run/cli/settings.py)、[`config.creation`](../src/agent_run/config/creation.py)、[`cli.profiles`](../src/agent_run/cli/profiles.py) | 个人默认、创建时固定输入和显式 Run Profile 操作 | 不以最新个人默认补造既有 Run 的原配置 |
 
 单一 `agent_run` 包按 core、contracts、config、storage、adapters、runtime、queries、notifications、cli、install 划分职责，承载业务核与正式链路使用的叶模块。
 它们由正式链路使用，不能因包名仍在就解释成另一套交付编排。
+
+安装诊断共用 [`install.diagnostics.run_bounded_probe`](../src/agent_run/install/diagnostics.py)，
+由该入口负责有界输出、原期限和退出前的进程树清理；setup 与 doctor 只组合诊断。
+[`install.layout`](../src/agent_run/install/layout.py) 拥有只读安装路径、Snapshot identity 和完整 active generation 校验；
+installer 继续独占构建、激活、恢复、回滚与卸载，不向诊断暴露私有实现。
+
 通知由 [`NativeNotifications`](../src/agent_run/notifications/sender.py) 观察已提交事实，
 使用独立 outbox/transport；查询展示与实际投递分别负责。
+
+门禁和终态卡片内容归 `notifications.boundary_projection`，投递者拥有游标、事件 occurrence、
+claim、原截止时间、预算和关闭。PR Status 以只读 `StatusBinding` 和投影回调获取事实，
+不持有完整 Kernel；`adapters.status_comment.StatusCommentTransport` 只提供评论观察及单次
+POST/PATCH。已发送意图先读回，不能被新文案替换；新写入另外核验最新目标、head、作者和 marker。
+Abandon 的恢复评论仍归原业务 Effect。
+
+正式 `OperationRunner` 由 `adapters.operations.NativeOperations` 组合观察与 Effect 实现；
+只读调用方直接选择观察器或读取传输，不经由持写权限的组合入口。
+`github_commands` 只输出有界、脱敏的错误类别、HTTP 状态和输出形状；认证探针独立解释授权 header。
+`make typecheck` 和完整测试中的 `test_architecture_boundaries.py` 检查这些依赖边界，
+包括函数体内的反向导入。
 
 Core 通过 [`operation_contract`](../src/agent_run/core/operation_contract.py) 给出完整读取和操作请求；
 OperationRunner 以冻结的 `OperationBinding` 组合真实端口，将观察和结果交回 Core，自己不读取 SQL。
 `run_once` 返回 AgentPreparation 后由 Executor 准备凭据；Core 原子准入返回 AgentCall 后才派发 Agent，不在 I/O 驱动中等待模型或 CI 完成。
 公开 status/history 只读数据库，不调用这条会接受新观察的运行链路。
+`storage.inspection.capture` 在快照内捕获 Run、Host 和 Invocation 绑定；
+`runtime.inspection` 的只读观察端口只接受捕获值，查询在事务外观察后复核原绑定。
+Host 退出通知的准确证据与当前性核验由 `runtime.host_recovery` 承担，查询不构造具体 Host。
+
+`tests/test_run_architecture.py` 随快速及完整测试执行，拒绝已清理边界中的反向导入，
+包含函数体内与字面量动态导入；错误指出应使用的应用或观察入口。
+该检查限定依赖边界，不能替代事务、准确退出、未知写入对账和行为测试。
+
+交付能力的调用顺序、有限事务操作、Review 字段责任与结构检查见
+[Core 交付合同](agents/core-delivery.md)。
 
 Core 在消费观察事实的同一事务内核对 ReadFence 和原读取期限。
 Requirements 在有序写入准入后先核对期限，再接受来源变化；Delivery 事实在同一只读快照内核对并组装。

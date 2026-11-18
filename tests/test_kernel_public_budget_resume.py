@@ -12,6 +12,7 @@ import sys
 import time
 
 from agent_run.core.kernel import Kernel
+from support.pending_control import committed_control, pending_public_control
 from support.systemd_manager import (
     _CODEX, _approval_read_barrier, _control_environment, _git, _local_manager,
 )
@@ -94,21 +95,31 @@ if role == 'development':
                     assert artifact["checks"]["spec"]["findings"] == [FINDING]
                 assert json.loads(state.read_text())["prs"] == []
                 checkpoint_seconds = time.monotonic() - started
-                resumed = public("resume", accepted["run_id"], "--parent-only-paired-round", "2",
-                                 "--development-deadline", "90s")
-                assert resumed["result"] == "accepted" and resumed["host"] == "running"
-                assert kernel.host_request(accepted["action_id"]) == original
-                renewed = kernel.status("parent:1")
-                assert renewed["generation"] == before["generation"] and renewed["candidate"] == before["candidate"]
-                budget = renewed["budgets"]["requirements"]
-                assert (budget["window"], budget["developments_used"], budget["reviews_used"],
-                        budget["development_limit"], budget["review_limit"]) == (2, 0, 0, 2, 2)
-                with kernel.storage.transaction(write=False) as tx:
-                    assert [dict(row) for row in tx.all("SELECT * FROM invocations ORDER BY id")] == old_invocations
-                    assert tx.one("SELECT policy FROM runs")[0] == old_policy
-                    assert dict(tx.one("SELECT * FROM budgets WHERE subject='parent:1' AND purpose='requirements' AND window=1")) == dict(prior_window, current=0)
-                    assert tx.one("SELECT count(*) FROM hosts")[0] == 1
-                release.set()
+                with pending_public_control("resume", accepted["run_id"], "--parent-only-paired-round", "2",
+                                            "--development-deadline", "90s", cwd=git_repo, environment=environment,
+                                            timeout=min(20, max(0.1, deadline - time.monotonic()))) as (control, control_remaining):
+                    action = committed_control(kernel, control, "resume", timeout=control_remaining())
+                    assert action["status"] == "applied"
+                    assert serving.is_alive() and children[0].poll() is None
+                    assert kernel.host_request(accepted["action_id"]) == original
+                    renewed = kernel.status("parent:1")
+                    assert renewed["generation"] == before["generation"] and renewed["candidate"] == before["candidate"]
+                    budget = renewed["budgets"]["requirements"]
+                    assert (budget["window"], budget["developments_used"], budget["reviews_used"],
+                            budget["development_limit"], budget["review_limit"]) == (2, 0, 0, 2, 2)
+                    with kernel.storage.transaction(write=False) as tx:
+                        assert [dict(row) for row in tx.all("SELECT * FROM invocations ORDER BY id")] == old_invocations
+                        assert tx.one("SELECT policy FROM runs")[0] == old_policy
+                        assert dict(tx.one("SELECT * FROM budgets WHERE subject='parent:1' AND purpose='requirements' AND window=1")) == dict(prior_window, current=0)
+                        assert tx.one("SELECT count(*) FROM hosts")[0] == 1
+                    release.set()
+                    stdout, stderr = control.communicate(timeout=control_remaining())
+                    assert control.returncode == 0, (stdout, stderr)
+                    resumed = json.loads(stdout)
+                    assert resumed["requested_action"] == "resume"
+                    assert resumed["result"] == "accepted" and resumed["action_id"] == action["id"]
+                    assert resumed["requested_action_applied"] and resumed["requested_action_succeeded"]
+                    assert resumed["request_outcome"] == "resumed" and resumed["executor_started"]
                 serving.join(timeout=max(0, deadline - time.monotonic()))
                 assert not serving.is_alive() and not errors, (errors, output)
                 assert len(commands) == len(children) == 1 and children[0].returncode == 0

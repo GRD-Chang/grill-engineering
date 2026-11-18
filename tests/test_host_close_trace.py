@@ -10,7 +10,8 @@ from types import SimpleNamespace
 import pytest
 
 from agent_run.core.operation_runner import OperationRunner
-from agent_run.cli import lifecycle, main as cli_main
+from agent_run.cli import main as cli_main
+from agent_run.runtime import host_control
 from agent_run.model import Step
 from agent_run.notifications.sender import NativeNotifications
 from agent_run.runtime.foreground_host import ForegroundHost
@@ -247,8 +248,8 @@ def install_cli(tmp_path, monkeypatch, calls, *, fail_at=None, failure=None, res
             return result
         return call
     monkeypatch.setattr(ForegroundHost, 'launch', original('launch'))
-    monkeypatch.setattr(lifecycle, '_submit', original('submit'))
-    monkeypatch.setattr(lifecycle, '_notify_committed', original('notify'))
+    monkeypatch.setattr(host_control, 'launch_admitted', original('submit'))
+    monkeypatch.setattr(host_control, 'notify_committed', original('notify'))
     monkeypatch.setattr(cli_main, 'main', original('main'))
     path = tmp_path / 'cli.jsonl'
     return path, host_close_trace.install_cli(path)
@@ -262,8 +263,8 @@ def test_cli_records_original_calls_identity_and_no_sensitive_arguments(tmp_path
     try:
         assert not os.get_inheritable(fd)
         assert ForegroundHost.launch(manager, kernel, request, lock='secret-lock', lease=kernel) == result
-        assert lifecycle._submit(kernel, request, manager=manager) == result
-        assert lifecycle._notify_committed(kernel) == result
+        assert host_control.launch_admitted(kernel, request, manager=manager) == result
+        assert host_control.notify_committed(kernel) == result
         assert cli_main.main(['secret-cli'], repository_routes=kernel) == result
         assert calls[0] == ('launch', (manager, kernel, request), {'lock': 'secret-lock', 'lease': kernel})
         assert calls[1] == ('submit', (kernel, request), {'manager': manager})
@@ -291,8 +292,8 @@ def test_cli_business_exception_keeps_original_object_with_benign_diagnostic_fai
     invoke = {
         'launch': lambda: ForegroundHost.launch(object(), object(), SimpleNamespace(run_id='run', nonce='nonce')),
         'main': lambda: cli_main.main(['secret']),
-        'submit': lambda: lifecycle._submit('secret', private='secret'),
-        'notify': lambda: lifecycle._notify_committed('secret'),
+        'submit': lambda: host_control.launch_admitted('secret', private='secret'),
+        'notify': lambda: host_control.notify_committed('secret'),
     }[where]
     try:
         with pytest.raises(RuntimeError) as caught:
@@ -321,8 +322,8 @@ def test_cli_return_diagnostic_control_error_never_retries_original_call(tmp_pat
     invoke = {
         'launch': lambda: ForegroundHost.launch(object(), object(), SimpleNamespace(run_id='run', nonce='nonce')),
         'main': lambda: cli_main.main(['secret']),
-        'submit': lambda: lifecycle._submit('secret', private='secret'),
-        'notify': lambda: lifecycle._notify_committed('secret'),
+        'submit': lambda: host_control.launch_admitted('secret', private='secret'),
+        'notify': lambda: host_control.notify_committed('secret'),
     }[where]
     try:
         with pytest.raises(error_type) as caught:
@@ -339,7 +340,7 @@ def test_new_cli_boundaries_keep_original_call_failure(tmp_path, monkeypatch, wh
     path, fd = install_cli(tmp_path, monkeypatch, calls, fail_at=where, failure=failure)
     try:
         with pytest.raises(error_type) as caught:
-            getattr(lifecycle, '_submit' if where == 'submit' else '_notify_committed')('private')
+            getattr(host_control, 'launch_admitted' if where == 'submit' else 'notify_committed')('private')
         assert caught.value is failure and len(calls) == 1
         stages = [json.loads(line)['stage'] for line in path.read_text().splitlines()]
         assert stages == ([] if where == 'submit' else ['notify_enter'])
@@ -369,7 +370,7 @@ def test_new_boundary_probe_failure_propagates_without_fallback(
     monkeypatch.setattr(host_close_trace.os, 'write', failed_write if source == 'write' else write)
     try:
         with pytest.raises(error_type) as caught:
-            getattr(lifecycle, '_submit' if stage == 'submit_return' else '_notify_committed')('private')
+            getattr(host_control, 'launch_admitted' if stage == 'submit_return' else 'notify_committed')('private')
         assert caught.value is failure
         assert len(calls) == (0 if stage == 'notify_enter' else 1)
     finally:
@@ -393,7 +394,7 @@ def test_active_exception_completely_bypasses_new_boundary_probes(
     monkeypatch.setattr(host_close_trace, 'cpu_snapshot', forbidden)
     monkeypatch.setattr(host_close_trace.os, 'write', forbidden)
     def invoke():
-        call = getattr(lifecycle, '_submit' if where == 'submit' else '_notify_committed')
+        call = getattr(host_control, 'launch_admitted' if where == 'submit' else 'notify_committed')
         if context == 'finally':
             try:
                 raise original

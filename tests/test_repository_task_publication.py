@@ -4,6 +4,7 @@ No Host, Worker, child, systemd, external service, or physical exit is run.
 Terminal qualification fixtures exercise the existing predicate; they are not
 proof of a real delivered/merged PR. This file is supplied UNRUN by the author.
 """
+from agent_run.runtime.task import create_task, reconcile_task, selected_kernel
 from contextlib import contextmanager, closing
 from dataclasses import replace
 from pathlib import Path
@@ -12,7 +13,7 @@ import sqlite3
 
 import pytest
 
-from agent_run.cli.selection import repository_candidates, select_repository
+from agent_run.runtime.run_selection import repository_candidates, select_repository
 from agent_run.core import kernel as core
 from agent_run.contracts.task import TaskKey
 from agent_run.errors import KernelError
@@ -38,7 +39,7 @@ def proposal(route, name, parent=1, *, language='en'):
 
 def create(route, name, parent=1, *, language='en'):
     spec, source = proposal(route, name, parent, language=language)
-    return route.create(TaskKey(route.repository_root, route.repository, parent), spec, source)
+    return create_task(route, TaskKey(route.repository_root, route.repository, parent), spec, source)
 
 
 @pytest.fixture
@@ -71,7 +72,7 @@ def admit(kernel, directory, action='same-host'):
 
 
 def test_normal_task_controls_profiles_and_host_intent_use_only_canonical_current_rows(repository, tmp_path):
-    a, b = repository.kernel('A'), repository.kernel('B')
+    a, b = selected_kernel(repository, 'A'), selected_kernel(repository, 'B')
     # Normal synthetic claims make both Stops actual fences. Their original
     # exit producer must settle each Run before Resume may admit another Host.
     executions = (a.claim_executor('same-executor'), b.claim_executor('same-executor'))
@@ -105,7 +106,7 @@ def test_normal_task_controls_profiles_and_host_intent_use_only_canonical_curren
 
 
 def test_foreign_host_request_is_refused_before_task_lock_or_audit(repository, tmp_path, monkeypatch):
-    a, b = repository.kernel('A'), repository.kernel('B')
+    a, b = selected_kernel(repository, 'A'), selected_kernel(repository, 'B')
     request = admit(a, tmp_path)
     before = dump(repository)
     def forbidden(*args, **kwargs):
@@ -117,7 +118,7 @@ def test_foreign_host_request_is_refused_before_task_lock_or_audit(repository, t
 
 
 def test_control_and_failed_executor_settle_only_the_original_run_with_synthetic_observation(repository, tmp_path):
-    a = repository.kernel('A')
+    a = selected_kernel(repository, 'A')
     request = admit(a, tmp_path)
     assert a.dispatch_host(request)
     observation = HostObservation('running', request.unit_name, invocation_id='synthetic-invocation',
@@ -125,7 +126,7 @@ def test_control_and_failed_executor_settle_only_the_original_run_with_synthetic
     assert a.observe_host(request, observation) == 'running'
     assert a.control_host(request, 'stop', 'host-stop', subject=SUBJECT) == 'applied'
     execution = Execution(request.run_id, request.owner, request.epoch)
-    sibling = repository.kernel('B').status(SUBJECT)
+    sibling = selected_kernel(repository, 'B').status(SUBJECT)
     with a.executor_scope(execution) as fail:
         fail(RuntimeError('Controlled non-physical failure'))
     with a.storage.transaction(write=False) as tx:
@@ -133,7 +134,7 @@ def test_control_and_failed_executor_settle_only_the_original_run_with_synthetic
         assert tx.one('SELECT count(*) FROM retired_executors WHERE run_id=?', ('A',))[0] == 1
         assert tx.one('SELECT count(*) FROM retired_executors WHERE run_id=?', ('B',))[0] == 0
         assert tx.one('SELECT count(*) FROM invocations')[0] == 0
-    assert repository.kernel('B').status(SUBJECT) == sibling
+    assert selected_kernel(repository, 'B').status(SUBJECT) == sibling
 
 
 def qualify_terminal_fixture(route, run):
@@ -146,7 +147,7 @@ def qualify_terminal_fixture(route, run):
 def test_terminal_stop_keeps_the_original_complete_predicate_without_new_action(repository):
     qualify_terminal_fixture(repository, 'A')
     before = dump(repository)
-    assert repository.kernel('A').stop_task('complete-noop') == 'complete'
+    assert selected_kernel(repository, 'A').stop_task('complete-noop') == 'complete'
     assert dump(repository) == before
 
 
@@ -160,7 +161,7 @@ def test_foreign_task_current_pointer_is_refused_by_the_same_database_constraint
 
 
 def test_unreadable_current_pointer_keeps_original_failed_executor_barrier_without_claiming_exit(repository, tmp_path, monkeypatch):
-    a = repository.kernel('A')
+    a = selected_kernel(repository, 'A')
     request = admit(a, tmp_path)
     assert a.dispatch_host(request)
     observation = HostObservation('running', request.unit_name, invocation_id='synthetic-invocation',
@@ -189,7 +190,7 @@ def test_unreadable_current_pointer_keeps_original_failed_executor_barrier_witho
 
 @pytest.mark.parametrize('operation', ['stop', 'abandon', 'configure', 'admit'])
 def test_pointer_advancement_between_observation_and_writer_never_mutates_the_historical_run(repository, tmp_path, monkeypatch, operation):
-    a = repository.kernel('A')
+    a = selected_kernel(repository, 'A')
     original = core.Kernel._task_admission
     after_winner = []
     @contextmanager
@@ -214,7 +215,7 @@ def test_pointer_advancement_between_observation_and_writer_never_mutates_the_hi
 
 
 def test_profile_mutations_share_original_owner_and_poison_rollback_with_the_current_guard(repository, monkeypatch):
-    a = repository.kernel('A')
+    a = selected_kernel(repository, 'A')
     original = core.Kernel._configure_profiles_in
     before = dump(repository)
     def caught_failure(kernel, tx, action, **kwargs):
@@ -236,7 +237,7 @@ def test_first_resume_selector_finds_current_run_without_a_json_publication_or_e
     selected = select_repository(request, repository_candidates(request, (repository,)))
     assert len(selected) == 1 and selected[0].run_id == 'A' and selected[0].current
     assert selected[0].task == TaskKey(repository.repository_root, repository.repository, 1)
-    assert repository.kernel(selected[0].run_id).storage.path == repository.database
+    assert selected_kernel(repository, selected[0].run_id).storage.path == repository.database
     # No CLI/Host is enabled or run by a successful metadata selection.
     assert not hasattr(routing, 'REPOSITORY_PUBLIC_READY')
     with repository.at_run('A').transaction(write=False) as tx:
@@ -324,7 +325,7 @@ def test_committed_creation_reply_loss_is_discoverable_as_original_proposal_not_
     request = parsed(parent=3)
     selected = select_repository(request, repository_candidates(request, (reopened,)))
     assert [item.run_id for item in selected] == ['original-proposal']
-    assert reopened.reconcile(selected[0].task, 'original-proposal').run_id == 'original-proposal'
+    assert reconcile_task(reopened, selected[0].task, 'original-proposal').run_id == 'original-proposal'
     assert create(reopened, 'loser', 3, language='zh').run_id == 'original-proposal'
     with reopened.at_run('original-proposal').transaction(write=False) as tx:
         assert tx.one('SELECT language FROM runs WHERE id=?', ('original-proposal',))[0] == 'en'

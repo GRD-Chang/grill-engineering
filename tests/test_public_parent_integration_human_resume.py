@@ -26,6 +26,7 @@ from support.fixture_text import replace_once
 from support.managed_abandon_transport import install_currentness
 from support.managed_abandon_recovery import abandon_at_approval, final_approval_hold, report_abandon_failure
 from support.offline import OfflinePort, review_result
+from support.pending_control import committed_control, pending_public_control
 from support.repository_fixture import create_kernel
 from support.run_scoped_kernel import ScopedKernel
 from support.systemd_manager import _CODEX, _approval_read_barrier, _control_environment, _git, _local_manager
@@ -232,14 +233,26 @@ def test_public_resume_repairs_final_then_abandon_recovers_the_completed_ticket(
                 sibling.control('stop', 'preserve-sibling-gate', subject='parent:10001')
                 sibling_rows = _rows(sibling)
                 assert sibling.status('parent:10001')['gates']
-                resumed = public('resume', accepted['run_id'], '--new-thread', '--message', MESSAGE)
-                assert resumed['result'] == 'accepted' and resumed['host'] == 'running'
-                assert reopened.host_request(accepted['action_id']) == original_host
-                assert reopened.status('final:1')['budgets'] == before['budgets']
-                assert _git(checkout, 'rev-parse', 'MERGE_HEAD') == merge_head
-                assert (checkout / 'retained-evidence.txt').read_text() == 'Original integration investigation\n'
-                assert _rows(sibling) == sibling_rows
-                release.set()
+                with pending_public_control('resume', accepted['run_id'], '--new-thread', '--message', MESSAGE,
+                                            cwd=git_repo, environment=environment,
+                                            timeout=min(20, remaining())) as (control, control_remaining):
+                    action = committed_control(reopened, control, 'resume', timeout=control_remaining())
+                    assert action['status'] == 'applied'
+                    assert serving.is_alive() and children[0].poll() is None
+                    assert reopened.host_request(accepted['action_id']) == original_host
+                    assert reopened.status('final:1')['budgets'] == before['budgets']
+                    assert _git(checkout, 'rev-parse', 'MERGE_HEAD') == merge_head
+                    assert (checkout / 'retained-evidence.txt').read_text() == 'Original integration investigation\n'
+                    assert _rows(sibling) == sibling_rows
+                    release.set()
+                    stdout, stderr = control.communicate(timeout=control_remaining())
+                    assert control.returncode == 0, (stdout, stderr)
+                    resumed = json.loads(stdout)
+                    assert resumed['requested_action'] == 'resume'
+                    assert resumed['result'] == 'accepted' and resumed['host'] == 'running'
+                    assert resumed['action_id'] == action['id']
+                    assert resumed['requested_action_applied'] and resumed['requested_action_succeeded']
+                    assert resumed['request_outcome'] == 'resumed' and resumed['executor_started']
                 continued, channel = next_worker()
                 with closing(channel):
                     assert continued['role'] == 'development' and continued['checkout'] == first['checkout']

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_run.config.resources import bind_resources, resource
+from agent_run.contracts.prompt import resource
 
 from agent_run.core.prompts.context import (
     human_continuation,
@@ -16,7 +16,6 @@ from agent_run.core.prompts.context import (
 
 
 def review_prompt(request: dict[str, Any]) -> str:
-    request = bind_resources(request)
     if uses_short_role_prompt(request, reviewer=True):
         return review_continuation_prompt(request)
     blocks = (
@@ -37,7 +36,6 @@ def review_prompt(request: dict[str, Any]) -> str:
 
 
 def review_continuation_prompt(request: dict[str, Any]) -> str:
-    request = bind_resources(request)
     blocks = (
         resource(request, "review/resume"),
         task_brief(request, read_issues=False),

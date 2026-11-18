@@ -3,6 +3,7 @@
 HostObservation is the original explicit synthetic observation, not an OS Host.
 Callers execute and independently assert their own control and readback paths.
 """
+from agent_run.runtime import run_control
 from dataclasses import replace
 import json
 import os
@@ -12,10 +13,12 @@ from pathlib import Path
 
 from agent_run.model import DeliveryKind, EffectResult, Execution, HostObservation, Issue, ParentIssue, Policy, Requirements
 from agent_run.runtime.executor import _make_ports
-from agent_run.adapters.remote import RemoteEffects
+from agent_run.adapters.operations import NativeOperations
 import agent_run.cli.lifecycle as lifecycle_cli
+from agent_run.runtime import task_creation
 from agent_run.config.defaults import UserDefaultsStore
 from agent_run.core.kernel import Kernel
+from agent_run.runtime.task import create_managed_task
 from agent_run.core.operation_runner import OperationRunner
 from support.systemd_manager import controlled_manager
 from support.core_operations import CoreOperations, prepare_scripted_agent
@@ -147,9 +150,9 @@ def managed_approval(tmp_path, monkeypatch, *, tickets, language="en", interrupt
     state.write_text(json.dumps({"prs": [], "comments": [], "events": [], "issue_state": "open", "source_graph": graph}))
     defaults = UserDefaultsStore()
     defaults.configure(language=language, profile={"preset": "economy"})
-    database, spec, source = lifecycle_cli.prepare_creation(1, "example/project", source_directory=git.root,
+    database, spec, source = task_creation.prepare_creation(1, "example/project", source_directory=git.root,
         defaults=defaults, remote_url=str(transport / "origin.git"))
-    kernel = Kernel.create_task(database, spec, requirements=source)
+    kernel = create_managed_task(database, spec, requirements=source)
     manager_root = tmp_path / "manager"
     manager_root.mkdir()
     manager, _, response, manager_calls = controlled_manager(manager_root)
@@ -181,7 +184,7 @@ def managed_approval(tmp_path, monkeypatch, *, tickets, language="en", interrupt
     assert observed.disposition == "running"
     assert kernel.observe_host(request, replace(observed, usage_ready=True, evidence=sealed)) == "running"
     execution = Execution(request.run_id, request.owner, request.epoch)
-    physical = RemoteEffects(Path(spec.repository_root), spec.repository, runner_identity=spec.inputs.runner_identity)
+    physical = NativeOperations(Path(spec.repository_root), spec.repository, runner_identity=spec.inputs.runner_identity)
     runner = OperationRunner(kernel, execution, lambda binding: physical)
     # This existing fake Agent only makes files/raw bytes. All source, Git, PR,
     # Completion and operation decisions above/below remain production paths.
@@ -205,7 +208,7 @@ def managed_approval(tmp_path, monkeypatch, *, tickets, language="en", interrupt
                 break
     else:
         raise AssertionError("The managed Run never reached its real approval")
-    monkeypatch.setattr(lifecycle_cli, "_active_runner", lambda: True)
+    monkeypatch.setattr(run_control, "_active_runner", lambda: True)
     import agent_run.adapters.systemd as adapter
     monkeypatch.setattr(adapter, "SystemdHost", lambda **kwargs: manager)
     return kernel, runner, physical, state, calls, request, subject, source

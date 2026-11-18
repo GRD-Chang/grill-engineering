@@ -1,4 +1,4 @@
-"""Bounded probes for the shell bootstrap, using the existing doctor boundary."""
+"""Bounded host checks for the shell bootstrap."""
 from __future__ import annotations
 
 import json
@@ -14,14 +14,15 @@ if __package__ in (None, ""):
     sys.dont_write_bytecode = True
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from agent_run.install.doctor import _run_bounded_output_probe
+from agent_run.install.diagnostics import run_bounded_probe
+from agent_run.install.layout import InstallPaths
 from agent_run.runtime.process_cleanup import child_subreaper
 
 
 def _probe(arguments: list[str], *, timeout: float = 5) -> tuple[int | None, bytes]:
     if shutil.which(arguments[0]) is None:
         return 127, f"未找到探针工具：{arguments[0]}\n".encode()
-    code, timed_out, output = _run_bounded_output_probe(
+    code, timed_out, output = run_bounded_probe(
         arguments, input_data=b"", max_output_bytes=32 * 1024,
         timeout_seconds=timeout, merge_stderr=True,
     )
@@ -49,7 +50,7 @@ def _finish() -> int:
         if not probe_ready:
             for operation in ("stop", "reset-failed"):
                 _probe(["systemctl", "--user", operation, unit])
-    entry = Path.home() / ".local/bin/agent-run"
+    entry = InstallPaths.from_environment().stable_entry
     code, output = _probe([str(entry), "doctor", "--json"], timeout=90)
     text = output.decode("utf-8", "replace")
     print(text, end="")

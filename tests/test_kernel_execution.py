@@ -8,6 +8,7 @@ import json
 import os
 import select
 import signal
+import sqlite3
 import subprocess
 import sys
 from typing import Any
@@ -283,6 +284,105 @@ def test_committed_binding_response_loss_settles_actual_exit_and_resumes_same_at
     assert result is not None and result.returncode == 0
     assert canary.read_text() == "ran\n"
     assert reopened.status(call.subject)["budgets"]["requirements"]["developments_used"] == 1
+
+
+@pytest.mark.parametrize('failure_kind', ['kernel', 'sqlite'])
+def test_uncommitted_binding_failure_retains_code_without_releasing_unknown_lease(tmp_path: Path, failure_kind) -> None:
+    path, kernel, call, _ = allocated(tmp_path)
+    canary = tmp_path / 'must-not-run'
+    message = 'private diagnostic text must not be persisted'
+    if failure_kind == 'kernel':
+        failure = KernelError('storage_busy', message)
+        expected = {'type': 'KernelError', 'code': 'storage_busy'}
+    else:
+        failure = sqlite3.OperationalError(message)
+        failure.sqlite_errorcode = sqlite3.SQLITE_IOERR
+        expected = {'type': 'OperationalError', 'sqlite_errorcode': sqlite3.SQLITE_IOERR}
+
+    class RejectedBinding(Kernel):
+        def agent_started(self, exact_call, identity):
+            raise failure
+
+    with pytest.raises(type(failure), match='private diagnostic text'):
+        execute(RejectedBinding(path, run_id=kernel.storage.run_id), call,
+            arguments=[sys.executable, '-I', '-c', f'from pathlib import Path; Path({str(canary)!r}).touch()'],
+            cwd=tmp_path, prompt='', environment={'PATH': os.defpath}, timeout=5)
+    assert not canary.exists()
+    with kernel.storage.transaction(write=False) as tx:
+        output = tx.one('SELECT process_identity,dispatch_state,start_evidence FROM invocation_outputs WHERE invocation=?',
+                        (call.invocation_id,))
+        evidence = json.loads(tx.get(output['start_evidence'], call.subject))
+        assert output['process_identity'] is None and output['dispatch_state'] == 'unknown'
+    assert evidence['boundary'] == 'durable binding'
+    assert evidence['error'] == expected
+    assert 'private diagnostic text' not in json.dumps(evidence)
+    assert not kernel.worker_settled(call) and kernel.operation_state().active == (call.lease_id,)
+
+
+@pytest.mark.parametrize('wrapped', [False, True])
+def test_identity_observation_failure_retains_errno_and_no_raw_message(tmp_path: Path, monkeypatch, wrapped) -> None:
+    import errno
+    import agent_run.runtime.execution as execution
+
+    _, kernel, call, _ = allocated(tmp_path)
+
+    def unavailable(*args, **kwargs):
+        try:
+            raise OSError(errno.EIO, 'private observation text must not be persisted')
+        except OSError as error:
+            if wrapped:
+                raise execution.ProcessExitUnknown('unproven identity observation') from error
+            raise
+
+    monkeypatch.setattr(execution, '_identity', unavailable)
+    with pytest.raises(execution.ProcessExitUnknown if wrapped else OSError):
+        execute(kernel, call, arguments=[sys.executable, '-I', '-c', 'raise SystemExit(99)'],
+                cwd=tmp_path, prompt='', environment={'PATH': os.defpath}, timeout=5)
+    with kernel.storage.transaction(write=False) as tx:
+        output = tx.one('SELECT start_evidence FROM invocation_outputs WHERE invocation=?', (call.invocation_id,))
+        evidence = json.loads(tx.get(output['start_evidence'], call.subject))
+    assert evidence['boundary'] == 'process binding/exit'
+    if wrapped:
+        assert evidence['error'] == {'type': 'ProcessExitUnknown'}
+        assert evidence['cause'] == {'type': 'OSError', 'errno': errno.EIO}
+    else:
+        assert evidence['error'] == {'type': 'OSError', 'errno': errno.EIO}
+    assert 'private observation text' not in json.dumps(evidence)
+    assert not kernel.worker_settled(call)
+
+
+@pytest.mark.parametrize('fault', ['pidfd', 'binding-and-cleanup'])
+def test_exit_proof_failure_does_not_erase_the_first_start_error(tmp_path: Path, monkeypatch, fault) -> None:
+    import errno
+    import agent_run.runtime.execution as execution
+
+    path, kernel, call, _ = allocated(tmp_path)
+    if fault == 'pidfd':
+        def unavailable(pid):
+            raise OSError(errno.EMFILE, 'private pidfd diagnostic')
+        monkeypatch.setattr(execution.os, 'pidfd_open', unavailable)
+        expected = {'type': 'OSError', 'errno': errno.EMFILE}
+    else:
+        class RejectedBinding(Kernel):
+            def agent_started(self, exact_call, identity):
+                raise KernelError('worker_host_binding', 'private binding diagnostic')
+        kernel = RejectedBinding(path, run_id=kernel.storage.run_id)
+        terminate = execution._terminate
+        def cleanup_failed(process, identity):
+            terminate(process, identity)  # Reap the real child before injecting lost cleanup proof.
+            raise OSError(errno.EIO, 'private cleanup diagnostic')
+        monkeypatch.setattr(execution, '_terminate', cleanup_failed)
+        expected = {'type': 'KernelError', 'code': 'worker_host_binding'}
+    with pytest.raises(execution.ProcessExitUnknown):
+        execute(kernel, call, arguments=[sys.executable, '-I', '-c', 'raise SystemExit(99)'],
+                cwd=tmp_path, prompt='', environment={'PATH': os.defpath}, timeout=5)
+    with kernel.storage.transaction(write=False) as tx:
+        output = tx.one('SELECT start_evidence FROM invocation_outputs WHERE invocation=?', (call.invocation_id,))
+        evidence = json.loads(tx.get(output['start_evidence'], call.subject))
+    assert evidence['error'] == {'type': 'ProcessExitUnknown'}
+    assert evidence['initial']['error'] == expected
+    assert 'private' not in json.dumps(evidence)
+    assert not kernel.worker_settled(call) and kernel.operation_state().active == (call.lease_id,)
 
 
 @pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="requires Linux pidfd")

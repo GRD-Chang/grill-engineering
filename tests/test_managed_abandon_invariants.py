@@ -1,13 +1,14 @@
 """Actual local service mutations; display-journal input is controlled, not a native Host proof."""
 from copy import deepcopy
 from dataclasses import replace
+from agent_run.adapters.status_comment import StatusCommentTransport
 import json
 import subprocess
 
 import pytest
 
 from agent_run.adapters.git_objects import LocalGit
-from agent_run.adapters.remote import RemoteEffects
+from agent_run.adapters.operations import NativeOperations
 from agent_run.contracts.status_comment import StatusProjection, StatusTarget
 from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.model import Effect, Execution
@@ -27,7 +28,7 @@ def completed_pr_activity(git_repo, tmp_path, monkeypatch):
     _git(git_repo, 'commit', '--allow-empty', '-m', 'Actual completed Ticket')
     _git(git_repo, 'push', str(remote), 'HEAD:refs/heads/candidate')
     candidate = git.commit('HEAD')
-    port = RemoteEffects(git_repo, 'example/project', runner_identity={'source': 'host'}, remote=str(remote))
+    port = NativeOperations(git_repo, 'example/project', runner_identity={'source': 'host'}, remote=str(remote))
     publication = Effect('publish-ticket', 'ticket:2', 'pr_write', 'example/project', 'refs/heads/candidate',
         'refs/heads/run', candidate.sha, candidate.sha, None, base, None, 'publisher',
         {'title': 'Original', 'body': 'Original', 'prior': None}, Execution('run-1', 'worker', 1))
@@ -43,10 +44,12 @@ def completed_pr_activity(git_repo, tmp_path, monkeypatch):
     journal = {'pending': [], 'records': [], 'seen': []}
     entry = StatusComments._entry(journal, projection)
 
+    status = StatusCommentTransport(port.root, port.repository, runner_identity=port.identity)
+
     def display(current):
         intent = StatusComments._stage_entry(entry, current)
         assert intent is not None
-        observed = port.write_status_comment(target, entry['marker'], intent,
+        observed = status.write_status_comment(target, entry['marker'], intent,
                                              WriteAuthority(lambda: lambda: None), lambda: False)
         assert observed['disposition'] == 'target'
         # Record only the actual adapter result; this controlled display input

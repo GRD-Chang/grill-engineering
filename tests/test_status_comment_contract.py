@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_run.adapters.remote import RemoteEffects
+from agent_run.adapters.status_comment import StatusCommentTransport
 from agent_run.contracts.status_comment import StatusProjection, StatusTarget
 from agent_run.contracts.write_authority import WriteAuthority
 from agent_run.notifications.status_comment import StatusComments
@@ -199,7 +199,7 @@ def test_app_403_is_scoped_display_failure_before_dispatch(tmp_path, monkeypatch
     identity = {'source': 'app', 'app_profile': {'app_id': '123', 'installation_id': '456',
         'private_key_path': str(tmp_path / 'unread-key.pem')},
         'app_read_only': False, 'app_current_repository_only': True}
-    binding[0] = replace(binding[0], inputs=replace(binding[0].inputs, runner_identity=identity))
+    binding[0] = replace(binding[0], runner_identity=identity)
     def denied(profile):
         assert profile.app_id == '123' and profile.installation_id == '456'
         raise GitHubCredentialError('synthetic-secret', http_status=403)
@@ -226,7 +226,7 @@ def test_remote_status_rejects_foreign_comments_and_publication(tmp_path, monkey
     marker = entry['marker']
     intent = {'comment_id': 77, 'before': comments[0]['body'], 'body': marker + '\nNew status'}
     api = CommentsAPI(target)
-    remote = RemoteEffects(tmp_path, target.repository, runner_identity={'source': 'host'}, api=api)
+    remote = StatusCommentTransport(tmp_path, target.repository, runner_identity={'source': 'host'}, api=api)
     api.comments = [{'id': n, 'body': 'other', 'user': {'login': 'other'}} for n in range(200, 351)] + comments
     assert remote.read_status_comment(target, marker, intent, lambda: False)['disposition'] == 'prior'
     cases = [[]]
@@ -281,7 +281,7 @@ def test_remote_status_repository_case_preserves_identity(tmp_path, monkeypatch,
                 row[side]['repo']['full_name'] = target.repository.upper()
         return row
     api.object = repository_case
-    remote = RemoteEffects(tmp_path, target.repository, runner_identity={'source': 'host'}, api=api)
+    remote = StatusCommentTransport(tmp_path, target.repository, runner_identity={'source': 'host'}, api=api)
     assert remote.write_status_comment(target, marker, intent, WriteAuthority(lambda: lambda: None), lambda: False)['disposition'] == 'target'
     for invalid in ('foreign/repository', 'example/other', None, 17):
         def foreign(endpoint):

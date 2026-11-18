@@ -2,34 +2,31 @@
 from functools import partial
 from pathlib import Path
 
-from agent_run.contracts.status_comment import StatusProjection, StatusTarget
+from agent_run.contracts.status_comment import StatusBinding, StatusProjection, StatusTarget
 from agent_run.core.kernel import Kernel
-from agent_run.core.operation_contract import OperationBinding
-from agent_run.model import CreationInputs
 from agent_run.notifications.status_comment import StatusComments
-from agent_run.queries.status_comment import project_status
+from agent_run.queries.status_comment import project_status, status_binding
 
 
 def core_status_comments(kernel: Kernel) -> StatusComments:
     """Wire real read-only Core facts for the retained integration stories."""
     return StatusComments(kernel.storage.path.parent,
         read_projection=partial(project_status, kernel.storage.path, storage=kernel.storage),
-        read_binding=kernel.operation_binding)
+        read_binding=partial(status_binding, kernel.storage.path, storage=kernel.storage))
 
 
-def display_inputs(root: Path) -> tuple[StatusProjection, OperationBinding]:
+def display_inputs(root: Path) -> tuple[StatusProjection, StatusBinding]:
     """Recorded display inputs, without claiming a Core publication happened."""
     target = StatusTarget('example/project', 'frozen-run', 1, 'parent:1', 1, 1, 7,
         'offline-publisher', 'publication', 'receipt', 'refs/heads/work', 'refs/heads/main')
-    inputs = CreationInputs(profiles={}, prompt_resources={}, worker_identity={},
-        runner_identity={'source': 'host'}, notifications={}, provenance={})
-    return StatusProjection(target, 'original'), OperationBinding(root, target.repository, 1, inputs)
+    return StatusProjection(target, 'original'), StatusBinding(root, target.repository, {'source': 'host'})
 
 
 class CommentsAPI:
     """Independent remote objects; successful writes may lose their response."""
-    def __init__(self, target):
+    def __init__(self, target, *, head_sha=None):
         self.target = target
+        self.head_sha = head_sha
         self.comments = []
         self.commands = []
         self.reads = 0
@@ -43,7 +40,7 @@ class CommentsAPI:
             return {"login": "offline-publisher"}
         assert endpoint == f"repos/{self.target.repository}/pulls/{self.target.pr_number}"
         return {"number": self.target.pr_number, "user": {"login": "offline-publisher"},
-                "head": {"ref": self.target.source_ref.removeprefix("refs/heads/"),
+                "head": {"ref": self.target.source_ref.removeprefix("refs/heads/"), "sha": self.head_sha,
                          "repo": {"full_name": self.target.repository}},
                 "base": {"ref": self.target.target_ref.removeprefix("refs/heads/"),
                          "repo": {"full_name": self.target.repository}}}
@@ -99,7 +96,7 @@ def assert_completed_ticket_sender(scenario, *, summary, completed):
                    if row["outcome"] == "sending"]
         captured.append((active, rendered))
         return {"outcome": "success", "reason": None}
-    api = CommentsAPI(project_status(database, subject, storage=scenario.kernel.storage).target)
+    api = CommentsAPI(projection.target, head_sha=projection.head_sha)
     observer = NativeNotifications(database, database.parent, status_api=api, transport=transport, storage=scenario.kernel.storage)
     try:
         observer.close()

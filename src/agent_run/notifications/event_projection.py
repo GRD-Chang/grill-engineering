@@ -218,7 +218,7 @@ def _result(tx: Transaction, row: Mapping[str, Any], subject: Mapping[str, Any],
 def _project(tx: Transaction, row: Mapping[str, Any], state: dict[str, Any], mode: str) -> list[EventProjection]:
     """Project this original history record without changing its source facts."""
     if row['kind'] == 'host_interrupted':
-        from agent_run.queries.host_exit import retired_foreground_exit_notice
+        from agent_run.runtime.host_recovery import retired_foreground_exit_notice
         notice = retired_foreground_exit_notice(tx, nonce=row['identity'])
         return [] if notice is None else [EventProjection(_host_exit_envelope(state, notice), True)]
     if row["kind"] not in {"worker_started", "worker_active", "role_consumed", "paused", "effect_consumed", "acceptance_promoted", "boundary_update"}:
@@ -329,7 +329,7 @@ def project_event(tx: Transaction, row: Mapping[str, Any], state: dict[str, Any]
 
 def host_exit_event(database: Path, notice: Mapping[str, Any], *, storage: Storage) -> dict[str, Any] | None:
     """Use the original notification envelope and stable Host exit identity."""
-    from agent_run.queries.host_exit import host_exit_current
+    from agent_run.runtime.host_recovery import host_exit_current
 
     options: dict[str, Any] = {"storage": storage}
     if not host_exit_current(database, notice, **options):
