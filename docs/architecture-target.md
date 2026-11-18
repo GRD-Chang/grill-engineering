@@ -2,7 +2,7 @@
 
 状态：方向已采用，分阶段实施。分析基底为
 `ed90d14ceb887e54e3a3a4d05374a45db32da499`；本页描述目标，不表示已经完成。
-现行实现见[当前运行架构](architecture.md)，业务术语和角色合同见[产品上下文](../GLOSSARY.md)。
+现行实现见[当前运行架构](architecture.md)，业务术语和角色合同从[产品词汇索引](../GLOSSARY-MAP.md)进入。
 
 Core 交付规则与恢复的已实施维护入口见 [Core 交付合同](agents/core-delivery.md)：
 修复能力、共同 Checks、Attempt 和 Review 同义字段比较各有明确归属，

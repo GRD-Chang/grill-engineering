@@ -49,9 +49,10 @@ Parent 修复 PR 使用同一数据库的 `run_repairs` 关系保存准确分支
 | 控制、宿主与审计 | `actions`、`hosts`、`retired_executors`、`history` |
 | 有拥有者和用途的原格式材料 | `material` |
 
-业务阶段与 gate 分开；暂停保留继续工作，定向 resume 只解除获准条件，
-不能清除兄弟门禁或 Run 全局控制。仍有暂停时不能准入下一段工作，
-仅补齐继续阶段不会替换已有的准确外部诊断；拥有者关系不授予执行权限。
+`subjects.phase` 与 `subjects.purpose` 保存继续工作的阶段及用途，`gates` 记录对象门禁与证据，
+`runs.stopped` 与 `runs.blocked` 则记录 Run 级控制。暂停保留原阶段，定向 resume 只解除获准条件，
+其余对象的门禁与 Run 级控制继续生效。确有暂停时，恢复准入须等待该条件解除。
+补齐继续阶段时保留已有的准确外部诊断，执行权限仍由准入重新核验。
 普通预算窗口、CI、集成开发及 resync 保留原归属与续期规则。
 预算保留用途、窗口、累计用量及原证据，显式续期或同次中断续接不能重复记账。
 
@@ -59,6 +60,8 @@ Attempt、Invocation 和 Thread 各有独立 `id`，通过明确外键关联。
 域内关系以准确Run复合键关联，物理输出以 `(run_id, invocation, ordinal)` 标识；原始返回、进程身份与活动事实属于准确输出，
 不从后来的当前对象重建早先调用或审核依据。Attempt 的 `thread_id` 和 `opening_id`
 由 continuation 入口绑定，分别引用 Thread 和不可变 Opening 材料。
+`subjects.current_attempt` 指向本代次的当前 Attempt。完整 Parent 的集成开发归 `final_run` subject，
+实际角色以 Attempt 的 `role` 为准。
 
 凭据准备只在现有 `waits(kind=agent_preparation)` 预留准确 Attempt 的工作席位，
 固定绝对截止最多 600 秒；读取、重试和兄弟进度不续期。准备席位与真实 lease
@@ -77,9 +80,10 @@ Runner Snapshot，以原版本恢复；安装新 Runner 不意味着能够继续
 明确指定但无法解析的需求/图 revision 必须拒绝，不能降为空引用。
 批准、关闭 intent/receipt 及结果未知时的读回边界继续保留。
 
-各角色的原始返回落盘与阶段消费是不同事务边界；重开后优先复用已存结果。
-结果消费和适用预算变化由 Core 在同一业务事务收口，重复返回不能再次执行或记账。
-原始返回尚未落盘的中断仍属于未知结果，不能假定成功。
+`invocation_outputs.raw_id` 引用每次物理输出，`attempts.result_id` 引用可由原阶段消费的语义返回。
+当前语义返回解绑后，原物理输出仍保留。落盘与阶段消费分事务提交。重开时优先消费已存结果，
+结果消费与适用预算变化在原业务事务一并收口。进程中断且原始返回尚未落盘时，结果仍未知。
+已保存结果的接续和 Human Blocker 的处理见 [Attempt 生命周期](attempt-lifecycle.md#各类续接的边界)。
 
 Worker 启动绑定或退出证明不确定时，`start_evidence` 保留原边界、身份及原异常和
 直接 cause 的有界分类（类型、Kernel code、OS errno 或 SQLite errorcode），不保存

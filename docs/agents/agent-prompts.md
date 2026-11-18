@@ -17,7 +17,7 @@
 
 本文承接 相关设计记录 的角色合同和
 相关设计记录 的审查优化，采用本轮确认的工作语言、
-Skill 例外、明确需求链接及修复风险审查例外。领域定义见 [GLOSSARY.md](../../GLOSSARY.md)，
+Skill 例外、明确需求链接及修复风险审查例外。领域定义见 [Worker 与调用](../domain/worker.md)，
 权限边界见 [ADR 0001](../adr/0001-trusted-codex-yolo-boundary.md)，
 审查结果字段见 [Acceptance Artifact Schema](../acceptance-artifact-schema.md)。
 
