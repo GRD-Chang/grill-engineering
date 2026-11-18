@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" xml:lang="en" viewBox="0 0 1120 336" width="1120" height="336" role="img" aria-labelledby="title description">
+  <title id="title">Bulk import ticket dependencies</title>
+  <desc id="description">CSV parsing and error reporting can proceed in parallel. The import page depends on both tickets and starts once both are complete.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0 L8 4 L0 8 Z" fill="#526780"/>
+    </marker>
+    <style>
+      text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; fill: #182739; }
+      .heading { font-size: 32px; font-weight: 700; }
+      .label { font-size: 19px; font-weight: 600; fill: #41638c; }
+      .name { font-size: 25px; font-weight: 650; }
+      .muted { font-size: 19px; fill: #4a6078; }
+      .connector { fill: none; stroke: #526780; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
+    </style>
+  </defs>
+
+  <rect x="1" y="1" width="1118" height="334" rx="22" fill="#f7f9fd" stroke="#d9e3ef"/>
+  <text class="heading" x="44" y="60">Bulk Import Ticket Dependencies</text>
+
+  <rect x="44" y="93" width="425" height="199" rx="16" fill="#edf3fc" stroke="#d2dff0"/>
+  <text class="label" x="66" y="123">Two tickets can run in parallel</text>
+
+  <rect x="66" y="141" width="379" height="55" rx="10" fill="#fff" stroke="#c9d8ea"/>
+  <rect x="66" y="214" width="379" height="55" rx="10" fill="#fff" stroke="#c9d8ea"/>
+  <text class="label" x="88" y="175">Ticket A</text>
+  <text class="name" x="197" y="177">CSV Parsing</text>
+  <text class="label" x="88" y="248">Ticket B</text>
+  <text class="name" x="197" y="250">Error Reporting</text>
+
+  <path class="connector" d="M445 168.5 H526 Q539 168.5 539 181.5 V191.5 Q539 205 552 205 H578"/>
+  <path class="connector" d="M445 241.5 H526 Q539 241.5 539 228.5 V218.5 Q539 205 552 205 H578"/>
+  <circle cx="578" cy="205" r="4" fill="#526780"/>
+  <path class="connector" d="M578 205 H691" marker-end="url(#arrow)"/>
+  <text class="muted" x="616" y="186" text-anchor="middle">Both complete</text>
+
+  <rect x="704" y="149" width="372" height="112" rx="14" fill="#fff" stroke="#a9c2e8" stroke-width="1.5"/>
+  <text class="label" x="730" y="184">Ticket C</text>
+  <text class="name" x="730" y="217">Import Page</text>
+  <text class="muted" x="730" y="246">Depends on A and B</text>
+</svg>
