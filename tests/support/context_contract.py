@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+RUN_REPAIR_DECISION_PATH = "docs/adr/0031-parent-repair-pr-and-repository-ci.md"
+RUN_REPAIR_OPERATOR_GUIDE_PATH = "docs/agent-run.md"
 
-def validate_run_repair_document_contract(context: str, operator_guide: str) -> None:
+
+def validate_run_repair_document_contract(decision: str, operator_guide: str) -> None:
     """保留修复 PR 准入、原 Parent 额度与准确候选提升合同。"""
     for document, text, required, forbidden in (
         (
-            "GLOSSARY.md", context,
+            RUN_REPAIR_DECISION_PATH, decision,
             (
                 "程序发布以 Run Branch 为 base 的 Run Repair PR",
                 "读取该目标分支的实际 Required Checks",
@@ -19,7 +22,7 @@ def validate_run_repair_document_contract(context: str, operator_guide: str) -> 
             ("一个 Cycle 可依次包含多个 Run Repair Job", "轮转出后继 Job"),
         ),
         (
-            "docs/agent-run.md", operator_guide,
+            RUN_REPAIR_OPERATOR_GUIDE_PATH, operator_guide,
             (
                 "Candidate 通过后由程序核验准确源与默认分支必要祖先关系",
                 "发布修复分支和以 Run Branch 为 base 的 Run Repair PR",

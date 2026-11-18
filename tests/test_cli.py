@@ -11,7 +11,11 @@ import pytest
 
 
 import agent_run.install.doctor as doctor
-from support.context_contract import validate_run_repair_document_contract
+from support.context_contract import (
+    RUN_REPAIR_DECISION_PATH,
+    RUN_REPAIR_OPERATOR_GUIDE_PATH,
+    validate_run_repair_document_contract,
+)
 from support.readiness import fake_readiness_tools
 
 
@@ -102,9 +106,6 @@ def test_removed_stage_commands_are_rejected_by_the_real_cli(command: str) -> No
 
 
 def test_run_repair_docs_describe_direct_delivery_and_exact_candidate_promotion() -> None:
-    context = (PROJECT_ROOT / "GLOSSARY.md").read_text(encoding="utf-8")
-    operator_guide = (PROJECT_ROOT / "docs" / "agent-run.md").read_text(
-        encoding="utf-8"
-    )
-
-    validate_run_repair_document_contract(context, operator_guide)
+    decision = (PROJECT_ROOT / RUN_REPAIR_DECISION_PATH).read_text(encoding="utf-8")
+    operator_guide = (PROJECT_ROOT / RUN_REPAIR_OPERATOR_GUIDE_PATH).read_text(encoding="utf-8")
+    validate_run_repair_document_contract(decision, operator_guide)
