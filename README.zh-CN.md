@@ -2,130 +2,116 @@
 
 [English](README.md) | 简体中文
 
-![一条命令启动任务自动开发、验收与循环修复，整体验收后由你批准。](docs/images/automation-overview.png)
+**用一条命令，把 GitHub 任务推进到可以审阅和批准的 PR。**
 
-用 [Matt Pocock Skills](https://github.com/mattpocock/skills) 拆好 GitHub Tickets 后，
-agent-run 自动调用 Codex 完成开发和验收，减少逐个任务手动推进的工作。
+可以先用 `grill-me` 或 `grill-with-docs` 把需求讨论清楚，再用 `to-spec` 和 `to-tickets` 把确认的规格和子任务放到 GitHub。 [Matt Pocock Skills](https://github.com/mattpocock/skills)
 
-[安装和使用](#安装和使用) · [运行截图](#运行截图) · [飞书通知](#飞书通知) · [Agent 操作指南](docs/agent-guide.md) · [当前架构](docs/architecture.md)
+`agent-run` 接手准备好的 GitHub Issue，调度 Codex 开发和独立验收。子任务按依赖并行推进，集成后再对照原需求验收整个功能。程序跟进合并前检查，最后由你批准合入默认分支。
 
-## 为什么做这个
-
-用 Matt 的 `grill-me`、`grill-with-docs` 讨论需求，再通过 `to-spec`、`to-tickets`
-把任务拆到 GitHub 上以后，实际开发中还有两个问题：
-
-1. 任务拆好了，仍需要人工逐轮推进开发，跟进修复，再处理 PR 和合并。
-2. Agent 开发的结果不一定正确。即使报告完成，也可能有 bug、遗漏需求，或者改坏原有功能，需要另外检查。
-
-## grill-engineering 怎么做
-
-agent-run 把拆好的任务交给 Codex 自动推进，减少人工安排下一张任务、跟进修复和合并的工作。
-同时，它会单独调用 Codex 做验收，检查开发结果是否符合需求，把发现的问题交回开发 Agent 修复。
-开发、验收、修复和复验因此可以自动循环进行。
-
-确定需求和任务拆分、完成环境配置后，在终端执行：
-
-```bash
-agent-run run <parent-issue> --repo OWNER/REPO
-```
-
-Runner 独立克隆远端代码进行开发，用户本地仓库保持不变。相同仓库和 Parent 的任务可从不同目录继续。
-先完成[宿主与仓库接入检查](docs/install.md)。命令启动自动推进，返回的是操作回执，
-不代表交付完成，也不授予最终合并批准。各阶段与恢复入口见[一条命令流程](docs/agent-run.md#一条命令推进-ticket-交付)。
-
-下面是主要流程：
-
-```mermaid
-flowchart TD
-    A[按依赖选择 Ticket] --> B[Codex 开发 Agent]
-    B -->|提交开发结果| C{独立 Codex Agent 验收}
-    C -->|发现问题，交回修复| B
-    C -->|通过| D[子任务 PR、检查与合并]
-    D --> E{所有 Ticket 已完成？}
-    E -->|否| A
-    E -->|是| F{独立 Codex Agent 整体验收}
-    F -->|发现问题，交回修复| G[Codex 开发 Agent]
-    G -->|提交修复结果，再次验收| F
-    F -->|通过| H[最终 PR、检查与人工批准]
-    H --> I[合入主分支]
-```
-
-每个 Ticket 单独完成，不代表合在一起就能正常工作。所以最后还会对照最初的需求，
-验收整个功能。发现问题后，同样交回开发 Agent 修复，再验收修复结果。
-
-开发和修复使用有界额度。Ticket 普通审核存在配置规定的末轮 fallback，CI 审核可选；
-fallback 不能称为审核通过。完整 Parent 验收和当前最终 PR 的人工批准仍必需，
-pending 或 unknown 检查不能当作通过。
-
-需要人工处理时，任务会暂停并保存已有工作。最终 PR 由维护者审阅和批准后合入主分支。
-具体的运行和恢复规则见[运行说明](docs/agent-run.md)。
-
-## 运行截图
-
-用 `status` 看现在做到哪了、有没有问题需要你处理。下面是一个示例任务的终端画面：
-
-![agent-run status：任务正在开发，显示进度、模型和剩余额度](docs/images/status.png)
-
-`history` 可以回看每轮开发、验收用了多久，以及 PR 检查和合并的记录。
-
-<details>
-<summary>查看一次真实测试任务的 history</summary>
-
-![agent-run history：开发、验收、PR 检查、人工批准和最终合并记录](docs/images/history.png)
-
-</details>
-
-默认后台模式运行期间可以关掉终端，之后再回来查状态；前台候选的不同边界与待验收状态见[运行模式](docs/agent-run.md#运行模式与前台候选验收)。如果想让任务停下来，需要用 `stop`；
-程序会保存现场，之后可以用 `resume` 继续。
-
-## 飞书通知
-
-不用一直打开终端查看进度。启用飞书通知后，子任务完成、需要你补充信息或批准最终 PR 时，
-会收到消息；整个任务完成后也会通知你。
-
-默认使用精简模式，只发送关键进展和需要人工处理的消息。想了解每轮开发、验收和自动修复的过程，
-可以切换到详细模式。卡片会显示已有的工作摘要和执行耗时，并提供对应 Issue 或 PR 的链接。
-
-<p align="center">
-  <img src="docs/images/feishu-delivery.jpg" width="460" alt="飞书通知：请求批准合并 PR，以及任务完成后的执行耗时与任务历时">
-</p>
-
-<details>
-<summary>查看详细模式下的开发、验收与修复通知</summary>
-
-详细模式会显示每轮开发的开始时间、完成摘要和执行耗时。
-
-<p align="center">
-  <img src="docs/images/feishu-development.png" width="460" alt="飞书通知：开发 Agent 开始执行，以及开发完成后的工作摘要与本轮执行耗时">
-</p>
-
-验收发现问题时，还会显示问题和接下来的自动修复安排。
-
-<p align="center">
-  <img src="docs/images/feishu-verification.jpg" width="460" alt="飞书通知：验收发现问题后自动修复，以及子任务完成后的进度与执行耗时">
-</p>
-
-</details>
-
-飞书通知为可选功能，默认关闭，配置方法见[飞书通知说明](docs/notifications.md)。
+[安装和使用](#安装和使用) · [交付流程](#交付流程) · [运行截图](#运行截图) · [飞书通知](#飞书通知) · [当前架构](#当前架构)
 
 ## 安装和使用
 
-安装和使用的具体步骤写在 [Agent 操作指南](docs/agent-guide.md)里。
-把下面这段话交给你的 Agent，填上项目路径和总任务的 Issue 链接即可：
+按 [Agent 操作指南](docs/agent-guide.md)完成安装、认证和目标仓库接入。准备好总任务（Parent Issue）后，可以从任意目录启动。这里以编号 `123` 为例。
+
+```bash
+agent-run run 123 --repo OWNER/REPO
+```
+
+Runner 独立克隆远端仓库，基于已推送的代码交付。你可以继续在自己的 checkout 里工作，也可以从其他目录查询和控制同一个任务。
+
+<details>
+<summary>把安装和首次启动交给你的 Agent</summary>
 
 ```text
 请阅读 https://github.com/GRD-Chang/grill-engineering/blob/main/docs/agent-guide.md，
-帮我安装 agent-run，检查这个仓库和 GitHub Tickets 是否可以运行，然后启动任务。
+帮我安装 agent-run、检查仓库和 GitHub 任务是否就绪，然后启动运行。
 目标仓库路径：<本地路径>
 总任务（Parent Issue）：<GitHub Issue URL>
 需要我补充信息或批准最终 PR 时，告诉我。
 ```
 
-目前使用 Codex CLI 和 GitHub，需要在 Linux 上运行。安装和环境配置由 Agent 按指南完成。
-运行会消耗 Codex 账号额度，模型和修复轮次可以在[个人运行配置](docs/user-defaults.md)中调整。
+</details>
 
-Matt Skills 的使用方法见[上游说明](https://www.aihero.dev/skills)。
+运行环境为 Linux、Codex CLI 和 GitHub。前台运行、Windows WSL2 和 Mac 上的 Linux 虚拟机仍待验收，具体状态见[支持矩阵](docs/productization/support.md)。运行使用你的 Codex 账号额度，角色模型、修复轮次和等待时长可在[个人运行配置](docs/user-defaults.md)中调整。
+
+## 交付流程
+
+### 示例中的 Ticket 依赖
+
+假设你要给联系人管理加一个批量导入功能。用户在页面上传一份 CSV，就能一次录入多位联系人。如果文件里有错误，页面要告诉用户哪一行出了什么问题。
+
+这个需求可以拆成图中的三张 Ticket。CSV 解析负责读取每行数据，错误提示负责把问题说明白，这两项可以并行开发。导入界面等两项完成后再把它们接到上传页面上。
+
+![批量导入的 Ticket 依赖图。CSV 解析和错误提示可并行，导入界面等待两项都完成。](docs/images/import-ticket-dag.zh-CN.svg)
+
+### 从就绪 Ticket 到最终合并
+
+`agent-run` 从 GitHub 读取任务与依赖，在本地调度开发和独立验收。就绪 Ticket 可以并行推进，各自在本地集成并通过 GitHub PR 检查后，依次合入本次运行的集成分支（Run Branch）。
+
+![蓝色是本地 Runner 与 Agent，紫色是 GitHub。并行 Ticket 分别循环开发与独立验收，通过后各自排队集成。集成失败交回开发 Agent，修复后重做集成。Ticket PR 的 CI 失败回到该 Ticket 的开发 Agent，图中以 A 为例。整体验收发现问题或最终 PR 的 CI 失败时进入整体修复，修复候选经独立验收和修复 PR 检查后合入 Run Branch。最终 PR 检查通过并由维护者批准后，合入默认分支。](docs/images/delivery-workflow.zh-CN.svg)
+
+验收 Agent 在只读工作区核对需求、代码规范和端到端行为。以联系人导入为例，三张 Ticket 都合入 Run Branch 后，整体验收 Agent 会从导入页面上传两份 CSV。一份数据完整，确认联系人能成功录入。另一份在第 3 行缺少姓名，确认页面会提示「第 3 行缺少姓名」。
+
+等待 CI 时，其他 Ticket 仍可开发和验收。Ticket PR 的必需检查失败后，该 Ticket 的开发 Agent 根据检查结果和可取得的日志修复，按配置验收，再重新排队集成并检查新提交。Parent 的修复候选必须独立验收。 [Ticket CI 修复](docs/adr/0021-ticket-ci-development-loop.md) · [Parent 修复 PR](docs/adr/0031-parent-repair-pr-and-repository-ci.md)
+
+如果需求只用一张 Issue 就能讲清楚，可以直接运行这个总任务，走完整开发、独立验收和最终 PR 的流程。开发和修复有轮次上限，等待检查有时限。需要人工继续时，Runner 保存进度，`status` 提示下一步。 [验收、预算与恢复规则](docs/agent-run.md)
+
+## 运行截图
+
+后台运行时可以关闭发起终端。回来用 `status` 看进度、正在工作的 Agent 和需要处理的事项。用 `history` 查看开发、验收、PR 检查与合并记录。
+
+![agent-run status 显示开发进度、模型和剩余额度](docs/images/status.png)
+
+<details>
+<summary>查看一次真实测试任务的 history</summary>
+
+![agent-run history 显示开发、验收、PR 检查、人工批准和合并记录](docs/images/history.png)
+
+</details>
+
+- **停下再继续。** 用 `stop` 暂停当前 Run，稍后用 `resume` 接续，保留已保存的成果、证据和额度。
+- **只处理一张 Ticket。** 用 `stop --ticket` 停止指定子任务，用 `resume --ticket` 在可恢复时继续它。其他独立工作可以继续推进。
+- **决定是否合并。** 检查和验收满足条件后，先在 GitHub 审阅最终 PR，再用 `approve` 批准当前版本。
+
+查看[命令的准入条件与恢复规则](docs/agent-run.md#命令边界与状态轮转)。
+
+## 飞书通知
+
+启用后，子任务完成、需要你补充信息或批准最终 PR 时，飞书会发来提示。卡片附有对应 Issue 或 PR 的链接，有记录时也会显示工作摘要和耗时。任务完成后也会通知你。
+
+<p align="center">
+  <img src="docs/images/feishu-delivery.jpg" width="460" alt="飞书通知显示最终 PR 的批准请求和任务完成后的耗时">
+</p>
+
+<details>
+<summary>查看详细模式下的开发和验收通知</summary>
+
+<p align="center">
+  <img src="docs/images/feishu-development.png" width="460" alt="飞书通知显示开发开始、工作摘要和本轮执行耗时">
+</p>
+
+<p align="center">
+  <img src="docs/images/feishu-verification.jpg" width="460" alt="飞书通知显示验收发现的问题、自动修复安排和子任务完成进度">
+</p>
+
+</details>
+
+飞书默认关闭，启用后默认使用精简模式。需要跟进每轮开发、验收和修复时，可以切换到详细模式。配置见[飞书通知说明](docs/notifications.md)。
+
+## 当前架构
+
+![agent-run 运行架构。运行控制将动作提交给 Core 并通过 Host 托管 Executor，Executor 执行任务并反馈结果，查询从本地 SQLite 读取已保存的事实。](docs/images/runtime-architecture.zh-CN.svg)
+
+| 模块 | 负责什么 |
+| --- | --- |
+| CLI 与运行控制 | 接收 `run`、`stop`、`resume` 和 `approve` 等命令，核对并提交本次动作。 |
+| Core | 根据依赖、已保存状态和外部事实决定下一步，管理预算及正式操作的授权。 |
+| Executor Host 与 Executor | Host 启动、观察和回收任务进程。Executor 运行 Worker，执行实际的 Git 和 GitHub 操作，将结果交回 Core。 |
+| Codex Worker 与 Git / GitHub 适配器 | Worker 分角色开发、验收和准备发布文案。适配器读取远端事实，由程序执行获准的 PR、合并等写入。 |
+| SQLite 与只读查询 | 保存 Run 进度、候选版本、验收证据和操作记录，供 `status`、`history` 读取。 |
+
+恢复时，程序核对原执行者是否已退出，优先使用已保存的结果。若 GitHub 写入的响应丢失，程序先查询远端实际结果，再决定是否继续原操作。 [当前运行架构](docs/architecture.md)
 
 ## 致谢
 

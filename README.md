@@ -2,138 +2,116 @@
 
 English | [简体中文](README.zh-CN.md)
 
-![One command starts automated ticket development, verification, repair, and full acceptance before your approval.](docs/images/automation-overview.png)
+**Turn a GitHub task into a PR you can review and approve with one command.**
 
-After [Matt Pocock Skills](https://github.com/mattpocock/skills) breaks your work into GitHub tickets,
-grill-engineering runs Codex to implement and verify them, with less manual coordination between tasks.
+Use `grill-me` or `grill-with-docs` to work through the requirements, then use `to-spec` and `to-tickets` to put the agreed spec and tickets on GitHub. [Matt Pocock Skills](https://github.com/mattpocock/skills)
 
-[Get started](#get-started) · [Screenshots](#screenshots) · [Feishu notifications](#feishu-notifications) · [Agent guide](docs/agent-guide.en.md) · [Current architecture](docs/architecture.md)
+`agent-run` takes a prepared GitHub issue and coordinates Codex development and independent review. Tickets run in parallel as their dependencies allow. Once they are integrated, another agent verifies the whole feature against the original requirements. The runner follows the required checks, and you approve the final merge into the default branch.
 
-## Why I built this
-
-Matt's `grill-me` and `grill-with-docs` help work through an idea. `to-spec` and `to-tickets`
-turn it into a spec and tickets on GitHub. During development, two problems remain:
-
-1. Someone still has to keep the work moving: start the next ticket, follow up on fixes, and handle PRs and merges.
-2. An agent can report completion while leaving bugs, missing requirements, or breaking existing behavior. Its work needs to be checked.
-
-## How grill-engineering works
-
-The `agent-run` command runs Codex to implement the tickets in dependency order. A separate Codex agent
-checks the results against the requirements and sends any problems back to the development agent.
-Implementation, verification, and fixes run in a loop, managed by the program.
-
-Once the requirements, tickets, and environment are ready, run this from any directory:
-
-```bash
-agent-run run <parent-issue> --repo OWNER/REPO
-```
-
-Runner develops in an independent clone of the remote and leaves your local checkout unchanged. You can continue the same repository and Parent task from different directories.
-Complete the [host and repository prerequisites](docs/install.en.md) first. The command starts automatic work and returns an operation receipt; it does not confirm completed delivery or grant final approval. Follow the [one-command flow and recovery reference](docs/agent-run.md#一条命令推进-ticket-交付).
-
-The main workflow:
-
-```mermaid
-flowchart TD
-    A[Select a ready ticket] --> B[Codex development agent]
-    B -->|Submit work| C{Independent Codex verification}
-    C -->|Send problems back for fixes| B
-    C -->|Pass| D[Ticket PR, checks, and merge]
-    D --> E{All tickets completed?}
-    E -->|No| A
-    E -->|Yes| F{Independent verification of the whole feature}
-    F -->|Send problems back for fixes| G[Codex development agent]
-    G -->|Submit fixes for verification| F
-    F -->|Pass| H[Final PR, checks, and human approval]
-    H --> I[Merge into the default branch]
-```
-
-Individual tickets can look correct while the combined feature still fails. After all tickets are
-integrated, another agent checks the whole feature against the original requirements. Any problems
-go back to a development agent for fixes and another verification pass.
-
-Development and repair use bounded allowances. Ticket review has a configured final-round fallback and optional CI review; a fallback is not a passed review. Whole-Parent acceptance and approval of the current final PR remain required. Pending or unknown checks do not count as passing.
-
-When human input is needed, the run pauses and saves its work. The final PR is merged into the default
-branch after the maintainer reviews and approves it. See the [run reference](docs/agent-run.md) for
-execution and recovery details.
-
-## Screenshots
-
-`status` shows what is running and whether anything needs attention. Here is an example task:
-
-![agent-run status showing development progress, model, and remaining budget](docs/images/status.en.png)
-
-`history` shows the time spent on each development and verification round, along with PR checks and merges.
-
-<details>
-<summary>View the history of a real test run</summary>
-
-![agent-run history showing development, verification, PR checks, human approval, and the final merge](docs/images/history.en.png)
-
-</details>
-
-Default background runs keep going after the terminal closes. The foreground candidate has different cancellation semantics and remains [unvalidated](docs/productization/quickstart.en.md#5-stop-resume-and-approve-explicitly). Use `stop` to pause it and preserve the work,
-and `resume` to continue later.
-
-## Feishu notifications
-
-Follow progress without keeping a terminal open. Once enabled, Feishu sends you a message when a ticket
-finishes, your input or approval is needed, or the whole task is complete.
-
-Concise mode is the default, covering key progress and anything that needs your attention. Switch to
-detailed mode to follow each development, verification, and repair round. Cards include available work
-summaries and execution times, with links to the relevant issue or PR.
-
-<p align="center">
-  <img src="docs/images/feishu-delivery.en.jpg" width="460" alt="Feishu cards requesting PR approval and reporting completion, with Agent execution time and elapsed time">
-</p>
-
-<details>
-<summary>View development, verification, and repair notifications in detailed mode</summary>
-
-Detailed mode shows when each development round starts, what it delivers, and how long it takes.
-
-<p align="center">
-  <img src="docs/images/feishu-development.en.jpg" width="460" alt="Feishu cards showing a development round starting and finishing, with a work summary and execution time">
-</p>
-
-When verification finds problems, it also shows the findings and the automatic fixes that follow.
-
-<p align="center">
-  <img src="docs/images/feishu-verification.en.jpg" width="460" alt="Feishu cards showing a verification issue queued for automatic repair, followed by ticket completion">
-</p>
-
-</details>
-
-Feishu notifications are optional and off by default; see the
-[notification guide (Chinese)](docs/notifications.md) for setup.
+[Get started](#get-started) · [Delivery workflow](#delivery-workflow) · [Screenshots](#screenshots) · [Feishu notifications](#feishu-notifications) · [Current architecture](#current-architecture)
 
 ## Get started
 
-Give your agent the following prompt with your repository path and parent issue URL.
-The [agent guide](docs/agent-guide.en.md) covers installation, setup, and running tasks.
+Follow the [Agent guide](docs/agent-guide.en.md) to install `agent-run`, authenticate, and connect the target repository. Once your parent issue is ready, run the command from any directory. This example uses issue `123`.
+
+```bash
+agent-run run 123 --repo OWNER/REPO
+```
+
+The runner works in a separate clone of the remote repository, starting from pushed code. You can keep working in your own checkout and inspect or control the same run from another directory.
+
+<details>
+<summary>Ask your agent to install and start a run</summary>
 
 ```text
 Read https://github.com/GRD-Chang/grill-engineering/blob/main/docs/agent-guide.en.md.
-Install agent-run, check that this repository and its GitHub tickets are ready, then start the run.
+Install agent-run, check that the repository and GitHub task are ready, and start the run.
 Repository path: <local path>
 Parent issue: <GitHub issue URL>
 Let me know when you need input or approval for the final PR.
 ```
 
-The current backend is Codex CLI with GitHub, running on Linux. Your agent can follow the guide to
-install and configure it. Runs use your Codex account quota; models and repair limits can be adjusted
-through [user settings](docs/user-defaults.md).
+</details>
 
-Windows users can evaluate a WSL2 Linux Guest; macOS users can evaluate a Linux VM Guest.
-Install and run the whole toolchain inside that Guest, including project files, sockets and
-credential references. Native Windows/macOS Workers are unsupported; Guest startup and recovery
-are not yet platform-validated. Follow the [support tiers and read-only diagnostics](docs/productization/support.md#linux-guest-路径与只读诊断)
-before installation. Docker is not the default compatibility path.
+The runtime uses Linux, Codex CLI, and GitHub. Foreground execution, WSL2 on Windows, and Linux virtual machines on macOS still await validation. See the [support matrix](docs/productization/support.md). Runs use your Codex account quota. You can set models for each role, repair limits, and wait times in [user settings](docs/user-defaults.md).
 
-For Matt's workflow, see the [upstream guide](https://www.aihero.dev/skills).
+## Delivery workflow
+
+### Example ticket dependencies
+
+Suppose you want to add bulk import to a contacts app. A user uploads a CSV to add several contacts at once. If the file contains an error, the page should say which row has a problem and what went wrong.
+
+You can split the work into the three tickets below. CSV parsing reads the rows, while error reporting turns problems into clear messages. These two tickets can run in parallel. Once both are complete, the import page can connect them to the upload flow.
+
+![Bulk import ticket dependencies. CSV parsing and error reporting can run in parallel. The import page waits for both.](docs/images/import-ticket-dag.en.svg)
+
+### From ready tickets to final merge
+
+`agent-run` reads issues and dependencies from GitHub and schedules development and independent review locally. Ready tickets can proceed in parallel. Each ticket is integrated locally and checked on GitHub before it merges into the run's integration branch, called the Run Branch.
+
+![Blue nodes are local runner and agent operations. Purple nodes are GitHub operations. Tickets go through development and independent review, then queue for integration. Local integration failures return to a development agent for repair. Ticket PR CI failures return to the agent for that ticket, as shown with Ticket A. Full acceptance findings or final PR CI failures trigger run-level repair. An independent reviewer verifies the fix before the repair PR is checked and merged into the Run Branch. The maintainer approves the final PR after its checks pass.](docs/images/delivery-workflow.en.svg)
+
+Review agents check requirements, code standards, and end-to-end behavior from read-only workspaces. In the contacts example, once all three tickets are merged into the Run Branch, a separate agent tests the import page with two CSVs. It uploads a valid file and checks that the contacts are added. It then uploads a file with a missing name on row 3 and checks that the page says “Row 3 is missing a name.”
+
+Other tickets can continue through development and review while CI runs. When a required check fails on a ticket PR, that ticket's development agent uses the check results and any available logs to fix it. The fix goes through review if configured, then the ticket queues for integration again and the new commit is checked. Run-level fixes always require independent acceptance. [Ticket CI repair](docs/adr/0021-ticket-ci-development-loop.md) · [Run repair PRs](docs/adr/0031-parent-repair-pr-and-repository-ci.md)
+
+If the requirements fit in a single issue, run it directly. It goes through development, independent acceptance, and a final PR. Development and repair have round limits, and checks have time limits. When human input is needed, the runner saves progress and `status` shows what to do next. [Acceptance, limits, and recovery](docs/agent-run.md)
+
+## Screenshots
+
+Background runs continue after the terminal closes. Use `status` to see progress, active agents, and anything that needs attention. Use `history` to see development, review, PR checks, and merges.
+
+![agent-run status showing development progress, model, and remaining budget](docs/images/status.en.png)
+
+<details>
+<summary>View the history of a real test run</summary>
+
+![agent-run history showing development, review, PR checks, human approval, and the final merge](docs/images/history.en.png)
+
+</details>
+
+- **Pause and continue.** Use `stop` to pause a run and `resume` to pick up where it left off with its saved work, evidence, and budget.
+- **Handle one ticket.** Use `stop --ticket` to pause a specific ticket and `resume --ticket` to continue when it is ready to resume. Other independent work can keep going.
+- **Decide whether to merge.** Once checks and acceptance are complete, review the final PR on GitHub and use `approve` to approve its current version.
+
+See the [command requirements and recovery rules](docs/agent-run.md#命令边界与状态轮转).
+
+## Feishu notifications
+
+When enabled, Feishu sends you a message when a ticket finishes, the runner needs your input or final PR approval, or the whole run completes. Cards link to the relevant issue or PR and include work summaries and elapsed time when available.
+
+<p align="center">
+  <img src="docs/images/feishu-delivery.en.jpg" width="460" alt="Feishu cards requesting final PR approval and reporting completion with elapsed time">
+</p>
+
+<details>
+<summary>View development and review notifications in detailed mode</summary>
+
+<p align="center">
+  <img src="docs/images/feishu-development.en.jpg" width="460" alt="Feishu cards showing a development round starting and finishing, with a work summary and execution time">
+</p>
+
+<p align="center">
+  <img src="docs/images/feishu-verification.en.jpg" width="460" alt="Feishu cards showing review findings queued for repair and the ticket completing">
+</p>
+
+</details>
+
+Feishu notifications are off by default. When enabled, they use concise mode. Switch to detailed mode to follow each round of development, review, and repair. [Feishu notification guide](docs/notifications.md)
+
+## Current architecture
+
+![agent-run architecture. Run Control submits commands to Core and uses the Executor Host to manage the task executor. The executor runs agents and Git or GitHub operations, then reports results. Read-only views use facts saved in local SQLite.](docs/images/runtime-architecture.en.svg)
+
+| Module | Responsibility |
+| --- | --- |
+| CLI and Run Control | Receive commands such as `run`, `stop`, `resume`, and `approve`, then validate and submit each action. |
+| Core | Decide what happens next from dependencies, saved state, and observed results. Manage budgets and authorize writes. |
+| Executor Host and Executor | The host starts, monitors, and reaps task processes. The executor runs workers and Git or GitHub operations, then reports results to Core. |
+| Codex Worker and Git / GitHub adapters | Workers implement, review, and draft PR text. Adapters read remote state and perform authorized writes such as publishing or merging PRs. |
+| SQLite and read-only views | Store run progress, candidate revisions, acceptance evidence, and operation records for `status` and `history`. |
+
+On resume, the runner checks that the previous executor has exited and uses any saved results. If the response to a GitHub write is lost, the runner checks what happened on GitHub before deciding whether to retry. [Runtime architecture](docs/architecture.md)
 
 ## Acknowledgments
 

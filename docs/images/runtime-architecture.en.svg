@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" xml:lang="en" viewBox="0 0 1120 586" width="1120" height="586" role="img" aria-labelledby="title description">
+  <title id="title">agent-run Runtime Architecture</title>
+  <desc id="description">CLI lifecycle commands go through Run Control, which submits actions to Core and starts tasks through the Executor Host. Core schedules work and authorizes writes. The task executor runs Codex workers and Git or GitHub operations, then reports results. Core saves progress and evidence in local SQLite. The status and history commands read the saved state.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0 L8 4 L0 8 Z" fill="#526780"/>
+    </marker>
+    <marker id="blue-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0 L8 4 L0 8 Z" fill="#376eae"/>
+    </marker>
+    <style>
+      text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; fill: #182739; }
+      .heading { font-size: 32px; font-weight: 700; }
+      .name { font-size: 24px; font-weight: 650; }
+      .service-name { font-size: 21px; font-weight: 650; }
+      .muted { font-size: 18px; fill: #4a6078; }
+      .edge-label { font-size: 17px; fill: #41638c; }
+      .card { fill: #fff; stroke: #cad8e7; }
+      .connector { fill: none; stroke: #526780; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
+      .control-line { stroke: #376eae; }
+    </style>
+  </defs>
+
+  <rect x="1" y="1" width="1118" height="584" rx="22" fill="#f7f9fd" stroke="#d9e3ef"/>
+  <text class="heading" x="44" y="58">agent-run Runtime Architecture</text>
+
+  <rect x="665" y="88" width="427" height="455" rx="16" fill="#edf3fc" stroke="#d2dff0"/>
+  <text class="edge-label" x="682" y="77">Task execution and external operations</text>
+
+  <!-- Public commands route through control. Reads use their own path. -->
+  <rect class="card" x="44" y="100" width="210" height="83" rx="12"/>
+  <text class="name" x="65" y="133">CLI</text>
+  <text class="muted" x="65" y="161">Start, stop, approve</text>
+
+  <rect class="card" x="312" y="100" width="292" height="83" rx="12"/>
+  <text class="name" x="334" y="133">Run Control</text>
+  <text class="muted" x="334" y="161">Submit, start, or attach</text>
+
+  <rect class="card" x="732" y="100" width="344" height="83" rx="12"/>
+  <text class="name" x="754" y="133">Executor Host</text>
+  <text class="muted" x="754" y="161">Start, monitor, and reap processes</text>
+
+  <path class="connector control-line" d="M254 141.5 H305" marker-end="url(#blue-arrow)"/>
+  <path class="connector control-line" d="M604 141.5 H725" marker-end="url(#blue-arrow)"/>
+  <path class="connector control-line" d="M458 183 V232" marker-end="url(#blue-arrow)"/>
+  <path class="connector" d="M904 183 V232" marker-end="url(#arrow)"/>
+
+  <!-- Core decides the next operation. The executor reports what happened. -->
+  <rect x="312" y="239" width="292" height="112" rx="13" fill="#e7effc" stroke="#b4cae9"/>
+  <text class="name" x="334" y="276">Core</text>
+  <text class="muted" x="334" y="305">Plan work, manage budgets</text>
+  <text class="muted" x="334" y="329">Verify and authorize writes</text>
+
+  <rect class="card" x="732" y="239" width="344" height="112" rx="13"/>
+  <text class="name" x="754" y="276">Task Executor</text>
+  <text class="muted" x="754" y="305">Run agents and authorized actions</text>
+  <text class="muted" x="754" y="329">Monitor processes, report results</text>
+
+  <path class="connector control-line" d="M604 281 H725" marker-end="url(#blue-arrow)"/>
+  <text class="edge-label" x="668" y="271" text-anchor="middle">Request</text>
+  <path class="connector" d="M732 315 H611" marker-end="url(#arrow)"/>
+  <text class="edge-label" x="668" y="339" text-anchor="middle">Result</text>
+
+  <!-- Durable facts and external capabilities sit below their callers. -->
+  <path class="connector" d="M149 183 V413" marker-end="url(#arrow)"/>
+  <text class="edge-label" x="167" y="305">status / history</text>
+  <path class="connector control-line" d="M458 351 V413" marker-end="url(#blue-arrow)"/>
+  <text class="edge-label" x="475" y="388">Read and commit</text>
+
+  <rect class="card" x="44" y="420" width="210" height="107" rx="12"/>
+  <text class="name" x="65" y="459">Read-only</text>
+  <text class="muted" x="65" y="488">Progress, history</text>
+  <path class="connector" d="M254 474 H305" marker-end="url(#arrow)"/>
+
+  <rect x="312" y="420" width="292" height="107" rx="12" fill="#eaf6f2" stroke="#acd3c6"/>
+  <text class="name" x="334" y="459">Local SQLite</text>
+  <text class="muted" x="334" y="488">Progress, candidate revisions</text>
+  <text class="muted" x="334" y="512">Evidence and action log</text>
+
+  <path class="connector" d="M904 351 V380 H782 V413" marker-end="url(#arrow)"/>
+  <path class="connector" d="M904 380 H989 V413" marker-end="url(#arrow)"/>
+  <rect class="card" x="681" y="420" width="202" height="107" rx="12"/>
+  <rect class="card" x="903" y="420" width="173" height="107" rx="12"/>
+  <text class="service-name" x="699" y="459">Codex Worker</text>
+  <text class="muted" x="699" y="488">Code, review, draft</text>
+  <text class="service-name" x="921" y="459">Git / GitHub</text>
+  <text class="muted" x="918" y="488">Checks</text>
+  <text class="muted" x="918" y="512">PRs and merges</text>
+</svg>

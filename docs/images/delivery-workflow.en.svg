@@ -1,0 +1,123 @@
+<svg xmlns="http://www.w3.org/2000/svg" xml:lang="en" viewBox="0 0 1120 1034" width="1120" height="1034" role="img" aria-labelledby="title description">
+  <title id="title">From GitHub Issue to Final Merge</title>
+  <desc id="description">Blue nodes are local runner and agent operations. Purple nodes are GitHub operations. Ready tickets go through development and independent review in parallel. Each ticket queues for local integration, then merges into the Run Branch after its PR passes checks. A conflict or Git error goes back to a development agent for repair. A ticket CI failure goes back to that ticket's development agent, as shown with Ticket A. The fix is reviewed if configured, then queued for integration again. Once all tickets are complete, the runner previews the merge and starts independent acceptance. Conflicts, findings, or final PR CI failures trigger run-level repair. An independently reviewed fix goes through a repair PR and merges into the Run Branch. The final PR goes through checks again while acceptance remains valid. The maintainer approves the current PR before it merges into the default branch.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0 L8 4 L0 8 Z" fill="#526780"/>
+    </marker>
+    <marker id="repair-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0 0 L8 4 L0 8 Z" fill="#a45538"/>
+    </marker>
+    <style>
+      text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; fill: #182739; }
+      .heading { font-size: 32px; font-weight: 700; }
+      .step { font-size: 21px; font-weight: 650; }
+      .compact-step { font-size: 17px; }
+      .label { font-size: 19px; fill: #4a6078; }
+      .edge { font-size: 18px; fill: #873c25; }
+      .local { fill: #e6f1fc; stroke: #7fa7cb; stroke-width: 1.4; }
+      .github { fill: #f1e9fb; stroke: #a38ac0; stroke-width: 1.4; }
+      .lane { fill: #fff; stroke: #d2deeb; }
+      .connector { fill: none; stroke: #526780; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
+      .feedback { stroke: #a45538; stroke-dasharray: 5 5; }
+    </style>
+  </defs>
+
+  <rect x="1" y="1" width="1118" height="1032" rx="22" fill="#f7f9fd" stroke="#d9e3ef"/>
+  <text class="heading" x="44" y="59">From GitHub Issue to Final Merge</text>
+  <rect class="local" x="727" y="37" width="22" height="22" rx="5"/>
+  <text class="label" x="760" y="55">Local runner / agent</text>
+  <rect class="github" x="977" y="37" width="22" height="22" rx="5"/>
+  <text class="label" x="1010" y="55">GitHub</text>
+
+  <rect class="github" x="435" y="90" width="250" height="48" rx="9"/>
+  <text class="step" x="560" y="122" text-anchor="middle">GitHub Issues</text>
+  <path class="connector" d="M560 138 V163"/>
+  <path class="connector" d="M560 163 H293 V185" marker-end="url(#arrow)"/>
+  <path class="connector" d="M560 163 H827 V185" marker-end="url(#arrow)"/>
+  <text class="label" x="560" y="188" text-anchor="middle">Schedule by dependency</text>
+
+  <g id="ticket-a">
+    <rect class="lane" x="44" y="192" width="498" height="138" rx="12"/>
+    <text class="label" x="64" y="222">Ticket A</text>
+    <rect class="local" x="64" y="237" width="174" height="49" rx="9"/>
+    <text class="step" x="151" y="269" text-anchor="middle">Dev Agent</text>
+    <rect class="local" x="308" y="237" width="214" height="49" rx="9"/>
+    <text class="step compact-step" x="415" y="268" text-anchor="middle">Independent Review</text>
+    <path class="connector" d="M238 261.5 H301" marker-end="url(#arrow)"/>
+    <path class="connector feedback" d="M375 286 V310 H151 V293" marker-end="url(#repair-arrow)"/>
+    <text class="edge" x="265" y="303" text-anchor="middle">Findings</text>
+  </g>
+  <g id="ticket-b">
+    <rect class="lane" x="578" y="192" width="498" height="138" rx="12"/>
+    <text class="label" x="598" y="222">Ticket B</text>
+    <rect class="local" x="598" y="237" width="174" height="49" rx="9"/>
+    <text class="step" x="685" y="269" text-anchor="middle">Dev Agent</text>
+    <rect class="local" x="842" y="237" width="214" height="49" rx="9"/>
+    <text class="step compact-step" x="949" y="268" text-anchor="middle">Independent Review</text>
+    <path class="connector" d="M772 261.5 H835" marker-end="url(#arrow)"/>
+    <path class="connector feedback" d="M909 286 V310 H685 V293" marker-end="url(#repair-arrow)"/>
+    <text class="edge" x="799" y="303" text-anchor="middle">Findings</text>
+  </g>
+
+  <!-- Each Ticket enters the integration queue independently. -->
+  <path class="connector" d="M455 286 V350 H355 V385" marker-end="url(#arrow)"/>
+  <path class="connector" d="M989 286 V350 H505 V385" marker-end="url(#arrow)"/>
+  <text class="label" x="430" y="374" text-anchor="middle">Queue on pass</text>
+
+  <g id="ticket-integration">
+    <rect class="local" x="220" y="392" width="420" height="55" rx="9"/>
+    <text class="step" x="430" y="428" text-anchor="middle">Integrate Locally, One at a Time</text>
+    <path class="connector" d="M430 447 V477" marker-end="url(#arrow)"/>
+    <rect class="github" x="220" y="484" width="420" height="54" rx="9"/>
+    <text class="step" x="430" y="519" text-anchor="middle">Check PR, Merge to Run Branch</text>
+    <path class="connector feedback" d="M220 511 H24 V261.5 H57" marker-end="url(#repair-arrow)"/>
+    <text class="edge" x="122" y="501" text-anchor="middle">CI fails (Ticket A)</text>
+
+    <rect class="local" x="804" y="457" width="260" height="54" rx="9"/>
+    <text class="step" x="934" y="492" text-anchor="middle">Dev Agent Repairs</text>
+    <path class="connector feedback" d="M640 409 H842 V450" marker-end="url(#repair-arrow)"/>
+    <text class="edge" x="740" y="400" text-anchor="middle">Conflict / Git error</text>
+    <path class="connector feedback" d="M804 480 H758 V434 H647" marker-end="url(#repair-arrow)"/>
+    <text class="edge" x="696" y="460" text-anchor="middle">Reintegrate</text>
+  </g>
+
+  <path class="connector" d="M430 538 V600" marker-end="url(#arrow)"/>
+  <text class="label" x="450" y="578">All tickets complete</text>
+
+  <g id="run-acceptance">
+    <rect class="local" x="220" y="607" width="420" height="54" rx="9"/>
+    <text class="step" x="430" y="642" text-anchor="middle">Merge Preview + Full Acceptance</text>
+
+    <rect class="local" x="804" y="607" width="260" height="58" rx="9"/>
+    <text class="step" x="934" y="644" text-anchor="middle">Dev Agent Fixes Run</text>
+    <path class="connector feedback" d="M640 630 H797" marker-end="url(#repair-arrow)"/>
+    <text class="edge" x="720" y="620" text-anchor="middle">Conflict or issues</text>
+
+    <path class="connector" d="M934 665 V691" marker-end="url(#arrow)"/>
+    <rect class="local" x="804" y="698" width="260" height="53" rx="9"/>
+    <text class="step" x="934" y="732" text-anchor="middle">Independent Review</text>
+    <path class="connector" d="M934 751 V777" marker-end="url(#arrow)"/>
+    <rect class="github" x="804" y="784" width="260" height="53" rx="9"/>
+    <text class="step compact-step" x="934" y="817" text-anchor="middle">Check + Merge Repair PR</text>
+  </g>
+
+  <g id="final-merge">
+    <path class="connector" d="M430 661 V750" marker-end="url(#arrow)"/>
+    <text class="label" x="450" y="714">Acceptance passes</text>
+
+    <rect class="github" x="220" y="757" width="420" height="54" rx="9"/>
+    <text class="step" x="430" y="792" text-anchor="middle">Publish and Check Final PR</text>
+    <path class="connector feedback" d="M640 782 H767 V652 H797" marker-end="url(#repair-arrow)"/>
+    <text class="edge" x="704" y="772" text-anchor="middle">CI fails</text>
+    <path class="connector" d="M804 821 H670 V804 H647" marker-end="url(#arrow)"/>
+    <text class="label" x="750" y="862" text-anchor="middle">Acceptance still valid</text>
+
+    <path class="connector" d="M430 811 V851" marker-end="url(#arrow)"/>
+    <rect class="local" x="220" y="858" width="420" height="54" rx="9"/>
+    <text class="step" x="430" y="893" text-anchor="middle">Maintainer Approval</text>
+    <path class="connector" d="M430 912 V950" marker-end="url(#arrow)"/>
+    <rect class="github" x="220" y="957" width="420" height="54" rx="9"/>
+    <text class="step" x="430" y="992" text-anchor="middle">Merge to Default Branch</text>
+  </g>
+</svg>
